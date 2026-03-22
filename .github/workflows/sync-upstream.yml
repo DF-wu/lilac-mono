@@ -8,7 +8,7 @@ on:
 
 permissions:
   contents: write
-  actions: write
+  pull-requests: write
 
 jobs:
   sync:
@@ -30,6 +30,8 @@ jobs:
         run: |
           LOCAL=$(git rev-parse HEAD)
           UPSTREAM=$(git rev-parse upstream/main)
+          echo "local_sha=$LOCAL" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM" >> "$GITHUB_OUTPUT"
           if [ "$LOCAL" = "$UPSTREAM" ]; then
             echo "already up to date"
             echo "behind=0" >> "$GITHUB_OUTPUT"
@@ -42,25 +44,49 @@ jobs:
               echo "changed=false" >> "$GITHUB_OUTPUT"
             else
               echo "changed=true" >> "$GITHUB_OUTPUT"
+              git log --oneline HEAD..upstream/main > /tmp/upstream-sync-commits.txt
             fi
           fi
 
-      - name: Merge upstream
+      - name: Prepare sync branch
         if: steps.check.outputs.changed == 'true'
+        env:
+          SYNC_BRANCH: chore/sync-upstream-auto
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH"
           git merge upstream/main --no-edit
-          git push origin main
+          git push --force-with-lease origin "$SYNC_BRANCH"
 
-      - name: Trigger Docker image build
+      - name: Create or update sync PR
         if: steps.check.outputs.changed == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: "build-image.yml",
-              ref: "main",
-            });
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_BRANCH: chore/sync-upstream-auto
+        run: |
+          TITLE="chore: sync upstream/main ($(date -u +%Y-%m-%d))"
+          BODY_FILE=/tmp/upstream-sync-pr-body.md
+
+          {
+            echo "This automated PR syncs the latest \\`upstream/main\\` into this fork."
+            echo
+            echo "- Base main SHA: \\`${{ steps.check.outputs.local_sha }}\\`"
+            echo "- Upstream main SHA: \\`${{ steps.check.outputs.upstream_sha }}\\`"
+            echo "- New upstream commits: **${{ steps.check.outputs.behind }}**"
+            echo
+            echo "Upstream commits included:"
+            echo
+            sed 's/^/- `/' /tmp/upstream-sync-commits.txt | sed 's/$/`/'
+            echo
+            echo "Validation runs on this PR via the normal CI workflow."
+            echo
+            echo "> This workflow intentionally opens/updates a PR instead of pushing directly to \\`main\\`, so upstream sync follows the same review + CI path as the rest of the repo."
+          } > "$BODY_FILE"
+
+          PR_NUMBER=$(gh pr list --base main --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // ""')
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" --title "$TITLE" --body-file "$BODY_FILE"
+          else
+            gh pr create --base main --head "$SYNC_BRANCH" --title "$TITLE" --body-file "$BODY_FILE"
+          fi
