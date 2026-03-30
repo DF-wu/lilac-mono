@@ -2,6 +2,8 @@ type ReactionTarget =
   | { kind: "issue"; issueNumber: number }
   | { kind: "comment"; commentId: number; issueNumber: number };
 
+const SELF_AUTHORED_ISSUE_COMMENT_TTL_MS = 30 * 60 * 1000;
+
 export type GithubRequestMeta = {
   requestId: string;
   sessionId: string;
@@ -24,6 +26,15 @@ export type GithubAckState = {
 const latestBySession = new Map<string, string>();
 const metaByRequest = new Map<string, GithubRequestMeta>();
 const ackByRequest = new Map<string, GithubAckState>();
+const selfAuthoredIssueCommentExpirations = new Map<number, number>();
+
+function pruneExpiredSelfAuthoredIssueComments(now: number) {
+  for (const [commentId, exp] of selfAuthoredIssueCommentExpirations) {
+    if (exp <= now) {
+      selfAuthoredIssueCommentExpirations.delete(commentId);
+    }
+  }
+}
 
 export function setGithubLatestRequestForSession(sessionId: string, requestId: string) {
   latestBySession.set(sessionId, requestId);
@@ -51,4 +62,20 @@ export function getGithubAck(requestId: string): GithubAckState | undefined {
 
 export function clearGithubAck(requestId: string) {
   ackByRequest.delete(requestId);
+}
+
+export function rememberGithubSelfAuthoredIssueComment(
+  commentId: number,
+  ttlMs = SELF_AUTHORED_ISSUE_COMMENT_TTL_MS,
+) {
+  const now = Date.now();
+  pruneExpiredSelfAuthoredIssueComments(now);
+  selfAuthoredIssueCommentExpirations.set(commentId, now + ttlMs);
+}
+
+export function isRecentGithubSelfAuthoredIssueComment(commentId: number): boolean {
+  const now = Date.now();
+  pruneExpiredSelfAuthoredIssueComments(now);
+  const exp = selfAuthoredIssueCommentExpirations.get(commentId);
+  return typeof exp === "number" && exp > now;
 }
