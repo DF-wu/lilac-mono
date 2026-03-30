@@ -10,6 +10,7 @@ import {
   addEyesReactionToIssue,
   addEyesReactionToIssueComment,
   getGithubAppSlugOrNull,
+  getPreferredGithubActorLoginOrNull,
   getGithubUserLoginOrNull,
   getIssue,
   getPullRequest,
@@ -20,6 +21,7 @@ import {
   getGithubLatestRequestForSession,
   getGithubAck,
   getGithubRequestMeta,
+  isRecentGithubSelfAuthoredIssueComment,
   setGithubAck,
   setGithubLatestRequestForSession,
   setGithubRequestMeta,
@@ -72,13 +74,9 @@ async function resolveBotMentions(): Promise<string[]> {
   return [...new Set(out)];
 }
 
-function stripBotMentions(text: string, botLogins: readonly string[]): string {
-  let out = text;
-  for (const login of botLogins) {
-    // Replace '@login' mentions with empty string.
-    out = out.replaceAll(`@${login}`, "");
-  }
-  return out.trim();
+async function resolveSelfActorLogins(): Promise<string[]> {
+  const actorLogin = await getPreferredGithubActorLoginOrNull().catch(() => null);
+  return actorLogin ? [actorLogin] : [];
 }
 
 function isLilacCommand(text: string): boolean {
@@ -91,6 +89,91 @@ function extractLilacCommandText(text: string): string {
   if (t === "/lilac") return "";
   if (!t.startsWith("/lilac ")) return t;
   return t.slice("/lilac ".length).trim();
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function extractMentionCommandText(
+  text: string,
+  botLogins: readonly string[],
+): { login: string; commandText: string } | null {
+  const line = text.trim();
+  const sortedLogins = [...botLogins].sort((a, b) => b.length - a.length);
+  for (const login of sortedLogins) {
+    const mentionPattern = new RegExp(`^@${escapeRegExp(login)}(?:\\s+(.*))?$`, "u");
+    const match = mentionPattern.exec(line);
+    if (!match) continue;
+    return {
+      login,
+      commandText: typeof match[1] === "string" ? match[1].trim() : "",
+    };
+  }
+  return null;
+}
+
+function joinTriggerCommandText(
+  firstLineRemainder: string,
+  trailingLines: readonly string[],
+): string {
+  const parts: string[] = [];
+  const head = firstLineRemainder.trim();
+  if (head.length > 0) {
+    parts.push(head);
+  }
+  const tail = trailingLines.join("\n").trim();
+  if (tail.length > 0) {
+    parts.push(tail);
+  }
+  return parts.join("\n");
+}
+
+export type ParsedIssueCommentTrigger =
+  | { kind: "lilac"; commandText: string }
+  | { kind: "mention"; commandText: string; login: string };
+
+export function parseIssueCommentTrigger(
+  body: string,
+  botLogins: readonly string[],
+): ParsedIssueCommentTrigger | null {
+  const lines = body.split(/\r?\n/u);
+  let inFence = false;
+
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const rawLine = lines[idx] ?? "";
+    const trimmedStart = rawLine.trimStart();
+
+    if (trimmedStart.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    if (trimmedStart.startsWith(">")) continue;
+
+    const trimmed = rawLine.trim();
+    if (trimmed.length === 0) continue;
+
+    if (isLilacCommand(trimmed)) {
+      return {
+        kind: "lilac",
+        commandText: joinTriggerCommandText(extractLilacCommandText(trimmed), lines.slice(idx + 1)),
+      };
+    }
+
+    const mentionTrigger = extractMentionCommandText(trimmed, botLogins);
+    if (mentionTrigger) {
+      return {
+        kind: "mention",
+        login: mentionTrigger.login,
+        commandText: joinTriggerCommandText(mentionTrigger.commandText, lines.slice(idx + 1)),
+      };
+    }
+
+    return null;
+  }
+
+  return null;
 }
 
 function buildIssuePrompt(input: {
@@ -210,10 +293,12 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
   }
 
   const botLogins = await resolveBotMentions();
+  const selfActorLogins = await resolveSelfActorLogins();
   logger.info("GitHub webhook server init", {
     port,
     path,
     botLogins,
+    selfActorLogins,
   });
 
   const seen = new Map<string, number>();
@@ -278,7 +363,14 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
     }
 
     try {
-      const result = await handleEvent({ bus: options.bus, logger, event, payload, botLogins });
+      const result = await handleEvent({
+        bus: options.bus,
+        logger,
+        event,
+        payload,
+        botLogins,
+        selfActorLogins,
+      });
       logger.info("github.webhook.ingress", {
         event,
         deliveryId,
@@ -328,6 +420,7 @@ async function handleEvent(input: {
   event: string;
   payload: unknown;
   botLogins: readonly string[];
+  selfActorLogins: readonly string[];
 }): Promise<{
   handled: boolean;
   reason?: string;
@@ -361,6 +454,7 @@ async function handleEvent(input: {
       repoFullName,
       payload: p as Record<string, unknown>,
       botLogins: input.botLogins,
+      selfActorLogins: input.selfActorLogins,
     });
     return {
       handled: Boolean(requestId),
@@ -425,6 +519,7 @@ async function onIssueCommentCreated(input: {
   repoFullName: string;
   payload: Record<string, unknown>;
   botLogins: readonly string[];
+  selfActorLogins: readonly string[];
 }): Promise<string | null> {
   const issue = input.payload["issue"];
   const comment = input.payload["comment"];
@@ -444,9 +539,36 @@ async function onIssueCommentCreated(input: {
   if (typeof issueNumber !== "number" || typeof commentId !== "number") return null;
   if (typeof body !== "string" || body.trim().length === 0) return null;
 
-  const shouldTrigger =
-    isLilacCommand(body) || input.botLogins.some((login) => body.includes(`@${login}`));
-  if (!shouldTrigger) {
+  if (isRecentGithubSelfAuthoredIssueComment(commentId)) {
+    input.logger.debug("github.webhook.ignored", {
+      event: "issue_comment",
+      action: "created",
+      repo: input.repoFullName,
+      issueNumber,
+      commentId,
+      reason: "self_authored_comment_id",
+    });
+    return null;
+  }
+
+  if (
+    typeof author === "string" &&
+    input.selfActorLogins.some((login) => login.toLowerCase() === author.toLowerCase())
+  ) {
+    input.logger.debug("github.webhook.ignored", {
+      event: "issue_comment",
+      action: "created",
+      repo: input.repoFullName,
+      issueNumber,
+      commentId,
+      author,
+      reason: "self_authored_comment_author",
+    });
+    return null;
+  }
+
+  const parsedTrigger = parseIssueCommentTrigger(body, input.botLogins);
+  if (!parsedTrigger) {
     input.logger.debug("github.webhook.ignored", {
       event: "issue_comment",
       action: "created",
@@ -492,9 +614,7 @@ async function onIssueCommentCreated(input: {
   const issueData = await getIssue({ owner, repo, number: issueNumber });
   const recent = await listIssueComments({ owner, repo, number: issueNumber, limit: 30 });
 
-  const commandText = isLilacCommand(body)
-    ? extractLilacCommandText(body)
-    : stripBotMentions(body, input.botLogins);
+  const commandText = parsedTrigger.commandText;
   const triggerText = commandText.trim().length > 0 ? commandText : body;
 
   const prompt = buildIssuePrompt({

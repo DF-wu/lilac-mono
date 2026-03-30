@@ -9,6 +9,7 @@ import {
   getPreferredGithubAuthOrNull,
   getPreferredGithubAuthOrThrow,
 } from "./github-auth";
+import { rememberGithubSelfAuthoredIssueComment } from "./github-state";
 
 type GithubApiCtx = {
   apiBaseUrl: string;
@@ -136,12 +137,14 @@ export async function createIssueComment(input: {
   body: string;
 }): Promise<{ id: number; html_url?: string }> {
   const c = await ctx();
-  return await githubFetchJson<{ id: number; html_url?: string }>({
+  const out = await githubFetchJson<{ id: number; html_url?: string }>({
     ...c,
     path: `/repos/${input.owner}/${input.repo}/issues/${input.issueNumber}/comments`,
     method: "POST",
     body: { body: input.body },
   });
+  rememberGithubSelfAuthoredIssueComment(out.id);
+  return out;
 }
 
 export async function getIssueComment(input: {
