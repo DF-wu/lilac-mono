@@ -63,10 +63,24 @@ export type AdapterRequestCancelEvent = AdapterEventBase & {
   messageId?: string;
 };
 
+export type AdapterCommandInvokedEvent = AdapterEventBase & {
+  type: "adapter.command.invoked";
+  requestId: string;
+  sessionId: string;
+  commandName: string;
+  args: unknown[];
+  prompt?: string;
+  text: string;
+  sessionMode: "mention" | "active";
+  sessionConfigId: string;
+  modelOverride?: string;
+};
+
 export type AdapterEvent =
   | AdapterMessageCreatedEvent
   | AdapterMessageUpdatedEvent
   | AdapterMessageDeletedEvent
   | AdapterReactionAddedEvent
   | AdapterReactionRemovedEvent
-  | AdapterRequestCancelEvent;
+  | AdapterRequestCancelEvent
+  | AdapterCommandInvokedEvent;
