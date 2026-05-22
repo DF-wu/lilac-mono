@@ -7,6 +7,7 @@ import {
 
 // Intentionally copied/adapted from ref/js-llmcord.
 // Keep these tests to prevent regressions in markdown completion / streaming behavior.
+const ZWSP = "\u200b";
 
 describe("token-complete", () => {
   describe("no splitting needed", () => {
@@ -85,6 +86,13 @@ describe("token-complete", () => {
       const result = tokenComplete(input, 8);
       expect(result.completed).toBe("```js\nhe\n```");
       expect(result.overflow).toBe("```js\nllo world\n```");
+    });
+
+    it("should normalize four-backtick code fences when split", () => {
+      const input = "````txt\nhello world\n````";
+      const result = tokenComplete(input, 12);
+      expect(result.completed).toBe("```txt\nhell\n```");
+      expect(completeMarkdown(result.overflow)).toBe("```txt\no world\n```");
     });
   });
 
@@ -277,6 +285,46 @@ describe("token-complete", () => {
     it("completeMarkdown should close fences even without trailing newline", () => {
       const input = "text\n```js\nconsole.log(1)";
       expect(completeMarkdown(input)).toBe("text\n```js\nconsole.log(1)\n```");
+    });
+
+    it("completeMarkdown should neutralize nested fences inside four-backtick source fences", () => {
+      const input = "````txt\n```txt\n****\n```\n````";
+      expect(completeMarkdown(input)).toBe(
+        `\`\`\`txt\n\`${ZWSP}\`\`txt\n****\n\`${ZWSP}\`\`\n\`\`\``,
+      );
+    });
+
+    it("completeMarkdown should neutralize nested fences inside markdown fences", () => {
+      const input = [
+        "```md",
+        "**Short title when useful**",
+        "",
+        "```ts",
+        "code stays native and readable",
+        "```",
+        "",
+        "Lilac",
+        "```",
+      ].join("\n");
+
+      expect(completeMarkdown(input)).toBe(
+        [
+          "```md",
+          "**Short title when useful**",
+          "",
+          `\`${ZWSP}\`\`ts`,
+          "code stays native and readable",
+          `\`${ZWSP}\`\``,
+          "",
+          "Lilac",
+          "```",
+        ].join("\n"),
+      );
+    });
+
+    it("completeMarkdown should preserve newlines after closed code fences", () => {
+      const input = "```yaml\nconfigVersion: 1\n```\nThen continue.";
+      expect(completeMarkdown(input)).toBe(input);
     });
   });
 });
