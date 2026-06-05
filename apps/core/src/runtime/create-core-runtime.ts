@@ -4,7 +4,9 @@ import {
   createLogger,
   env,
   getCoreConfig,
+  readCoreConfigVersion,
   resolveCoreConfigPath,
+  resolveCustomCommandsDir,
   resolveDiscoveryDbPath,
   resolveDiscordSearchDbPath,
   resolveTranscriptDbPath,
@@ -48,6 +50,7 @@ import {
   type RequestMessageCache,
 } from "../tool-server/request-message-cache";
 import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plugins";
+import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 
@@ -130,7 +133,23 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
   const bus: LilacBus = createLilacBus(raw);
 
-  const adapter = new DiscordAdapter();
+  const customCommands = new CustomCommandManager(env.dataDir);
+  await customCommands.init();
+  const loadedCustomCommands = customCommands.list();
+  const customCommandWarnings = customCommands.listWarnings();
+  logger.info("custom commands initialized", {
+    dataDir: env.dataDir,
+    commandsDir: resolveCustomCommandsDir(env.dataDir),
+    discoveredCount: loadedCustomCommands.length + customCommandWarnings.length,
+    loadedCount: loadedCustomCommands.length,
+    warningCount: customCommandWarnings.length,
+    loadedNames: loadedCustomCommands.map((command) => command.def.name),
+  });
+  for (const warning of customCommandWarnings) {
+    logger.warn("custom command skipped", { warning });
+  }
+
+  const adapter = new DiscordAdapter({ customCommands });
   const githubAdapter = new GithubAdapter();
   const workflowStore = new SqliteWorkflowStore();
   const workflowQueries = createWorkflowStoreQueries(workflowStore);
@@ -162,6 +181,15 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   let coreConfigValidationTimer: ReturnType<typeof setTimeout> | null = null;
   let coreConfigValidationHadError = false;
   let lastCoreConfigValidationError: string | null = null;
+
+  async function readCoreConfigParserVersion(configPath: string): Promise<number | "unknown"> {
+    try {
+      const raw = Bun.YAML.parse(await fs.readFile(configPath, "utf8")) as unknown;
+      return readCoreConfigVersion(raw);
+    } catch {
+      return "unknown";
+    }
+  }
 
   let toolServer: {
     init(): Promise<void>;
@@ -300,17 +328,19 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     const configPath = resolveCoreConfigPath();
 
     try {
-      await getCoreConfig({ forceReload: true });
+      const config = await getCoreConfig({ forceReload: true });
 
       if (coreConfigValidationHadError) {
         logger.info("core-config hot-reload validation recovered", {
           reason,
           path: configPath,
+          parserVersion: config.configVersion,
         });
       } else {
         logger.info("core-config hot-reload validation succeeded", {
           reason,
           path: configPath,
+          parserVersion: config.configVersion,
         });
       }
 
@@ -319,9 +349,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (!coreConfigValidationHadError || lastCoreConfigValidationError !== msg) {
+        const parserVersion = await readCoreConfigParserVersion(configPath);
         logger.warn("core-config hot-reload validation failed", {
           reason,
           path: configPath,
+          parserVersion,
           error: msg,
         });
       }
@@ -369,6 +401,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
       logger.info("Core config hot-reload validator started", {
         path: configPath,
+        parserVersion: await readCoreConfigParserVersion(configPath),
       });
     } catch (e) {
       logger.warn("Core config hot-reload validator disabled", { path: configPath }, e);
@@ -489,6 +522,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         adapter,
         bus,
         subscriptionId: subId(subscriptionPrefix, "router"),
+        customCommands,
         shouldSuppressAdapterEvent: async ({ evt }) =>
           shouldSuppressRouterForWorkflowReply({ queries: workflowQueries, evt }),
         transcriptStore: transcriptStore ?? undefined,
@@ -589,6 +623,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         bus,
         subscriptionId: subId(subscriptionPrefix, "agent-runner"),
         pluginManager,
+        customCommands,
         cwd,
         transcriptStore: transcriptStore ?? undefined,
       });

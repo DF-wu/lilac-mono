@@ -2,23 +2,23 @@
   "name": "lilac-mono",
   "private": true,
   "license": "MIT",
-  "packageManager": "bun@1.3.10",
+  "packageManager": "bun@1.3.11",
   "scripts": {
     "build:info": "bun scripts/write-build-info.ts",
     "docker:build": "bun scripts/docker-build.ts build",
     "docker:compose:build": "bun scripts/docker-build.ts compose-build",
-    "lint": "oxlint --tsconfig tsconfig.json apps packages __tests__",
-    "lint:fix": "oxlint --tsconfig tsconfig.json --fix apps packages __tests__",
+    "lint": "oxlint --tsconfig tsconfig.json apps packages examples __tests__",
+    "lint:fix": "oxlint --tsconfig tsconfig.json --fix apps packages examples __tests__",
     "typecheck": "set -e; pids=''; for dir in apps/* packages/*; do if [ -f \"$dir/tsconfig.json\" ]; then bunx tsc -p \"$dir/tsconfig.json\" --noEmit & pids=\"$pids $!\"; fi; done; for pid in $pids; do wait \"$pid\"; done",
-    "fmt": "oxfmt --write \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
-    "fmt:check": "oxfmt --check \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
+    "fmt": "oxfmt --write \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
+    "fmt:check": "oxfmt --check \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
     "ci": "bun test && bun run lint && bun run typecheck && bun run fmt:check && echo 'check passed'"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.9",
-    "oxfmt": "^0.32.0",
-    "oxlint": "^1.47.0",
-    "typescript": "^5.9.3"
+    "@types/bun": "^1.3.11",
+    "oxfmt": "^0.44.0",
+    "oxlint": "^1.59.0",
+    "typescript": "^6.0.2"
   },
   "workspaces": [
     "apps/*",

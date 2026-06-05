@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import {
   CODEX_BASE_INSTRUCTIONS,
-  coreConfigSchema,
+  parseCoreConfigV1ToUniversal,
   providers,
   resolveModelRef,
   resolveModelSlot,
@@ -10,7 +10,7 @@ import {
 } from "../index";
 
 function baseConfig(): CoreConfig {
-  const parsed = coreConfigSchema.parse({});
+  const parsed = parseCoreConfigV1ToUniversal({});
   return {
     ...parsed,
     agent: { ...parsed.agent, systemPrompt: "test" },
@@ -197,6 +197,36 @@ describe("resolveModelSlot", () => {
 
     // Ensure the meta key is not forwarded.
     expect(resolved.providerOptions?.response_commentary).toBeUndefined();
+  });
+
+  it("uses anthropic_prompt_cache as a top-level meta option", () => {
+    const cfg = baseConfig();
+    cfg.models.main = {
+      model: "openrouter/anthropic/claude-sonnet-4.5",
+      options: {
+        anthropic_prompt_cache: true,
+        openrouter: {
+          route: "fallback",
+        },
+      },
+    };
+
+    const resolved = resolveModelSlot(cfg, "main");
+    expect(resolved.anthropicPromptCache).toBe(true);
+    expect(resolved.providerOptions?.openrouter?.route).toBe("fallback");
+
+    // Ensure the meta key is not forwarded.
+    expect(resolved.providerOptions?.anthropic_prompt_cache).toBeUndefined();
+  });
+
+  it("defaults anthropic_prompt_cache to disabled", () => {
+    const cfg = baseConfig();
+    cfg.models.main = {
+      model: "openrouter/anthropic/claude-sonnet-4.5",
+    };
+
+    const resolved = resolveModelSlot(cfg, "main");
+    expect(resolved.anthropicPromptCache).toBeUndefined();
   });
 
   it("uses response_commentary as a top-level meta option for codex", () => {

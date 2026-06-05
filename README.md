@@ -1,79 +1,146 @@
-# Lilac Monorepo（DF Fork）
+# Lilac Monorepo
 
-這個 repository 是 `lilac-mono` 的 fork，主要用於 DF 的部署與實驗。原則上 `main` 會盡量貼近 `upstream/main`；任何 fork-only 的行為會被清楚標註，並儘量用 feature flag / config 來收斂影響面。
+<p align="center">
+  <strong>Bun monorepo for a Redis-backed AI agent runtime with Discord ingress, optional GitHub ingress, layered tools, and durable workflow resume.</strong>
+</p>
 
-| Item | Value |
+<p align="center">
+  <a href="./PROJECT.md">Architecture</a>
+  ·
+  <a href="./AGENTS.md">Agent Guide</a>
+  ·
+  <a href="./apps/acp-controller/README.md">ACP CLI</a>
+  ·
+  <a href="https://github.com/stanley2058/lilac-mono">Upstream</a>
+</p>
+
+Lilac is an event-driven runtime for request-scoped LLM work. It keeps surface ingress, routing, agent execution, tool access, and workflow resume in one system instead of splitting them across separate bots, scripts, and operator glue.
+
+This repository is a maintained fork of [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono). The fork context matters, but the main thing this repo provides is the runtime, toolchain, and operator workflows described below.
+
+## What This Repo Does
+
+- Receives work from **Discord** and optional **GitHub issue/PR webhook** flows.
+- Routes requests through a **typed Redis Streams event bus**.
+- Runs agent turns with **local tools**, **HTTP tool-server callables**, and **on-disk skills**.
+- Sends results back to Discord and GitHub surfaces.
+- Supports **pause/resume**, scheduled wakeups, and long-lived workflows.
+- Ships operator-facing tooling through the **`tools` bridge** and **`lilac-acp` controller**.
+
+## Core Capabilities
+
+### 1. Runtime-first architecture
+
+The center of gravity is `apps/core/`. That runtime wires together Redis, the event bus, Discord ingress, GitHub webhook ingress, routing, agent execution, tool serving, workflow services, transcript/search stores, and heartbeat-driven background prompting.
+
+### 2. Typed event model
+
+`packages/event-bus/` defines the canonical event contract and Redis Streams transport used across ingress, routing, execution, and output delivery.
+
+### 3. Layered tools and skills
+
+The runtime exposes three capability layers:
+
+- **Local tools** such as shell, file reads, search, and patching.
+- **Tool-server namespaces** for web, workflow, surface, attachments, onboarding, generation, summarize, SSH, and related runtime operations.
+- **On-disk skills** that can be discovered and loaded into runs when needed.
+
+### 4. Durable workflows
+
+The repo includes workflow services for wait-for-reply, send-and-wait, scheduling, cancellation, and resume. This is built into the runtime rather than bolted on as a separate job system.
+
+### 5. Operator tooling
+
+Two supporting apps matter operationally:
+
+- `apps/tool-bridge/`: builds the `tools` bridge and standalone tool-server entrypoints.
+- `apps/acp-controller/`: builds `lilac-acp`, a CLI for ACP harness discovery, session inspection, and detached prompt execution.
+
+## How It Works
+
+The runtime flow is:
+
+1. Discord adapter events enter through the surface bridge.
+2. The router turns Discord events into request messages.
+3. GitHub webhook handlers can publish request messages directly.
+4. The agent runner executes with models, tools, and skills.
+5. Output is delivered back to Discord or GitHub through the surface layer.
+6. Workflow services can resume work later when time or user input arrives.
+
+For the full system mental model, terminology, and file-level architecture, see [`PROJECT.md`](./PROJECT.md).
+
+## Repository Map
+
+| Path | Purpose |
 | --- | --- |
-| Upstream repo | https://github.com/stanley2058/lilac-mono |
-| Upstream README | https://github.com/stanley2058/lilac-mono/blob/main/README.md |
+| `apps/core/` | Main runtime process and supporting subsystems. |
+| `apps/tool-bridge/` | `tools` bridge CLI and standalone tool-server entrypoints. |
+| `apps/acp-controller/` | `lilac-acp` CLI for ACP harness operations. |
+| `packages/event-bus/` | Typed event spec and Redis Streams bus implementation. |
+| `packages/agent/` | AI SDK-based agent execution, streaming, and turn control. |
+| `packages/utils/` | Runtime config, model/provider resolution, prompts, and skill discovery. |
+| `packages/plugin-runtime/` | Shared plugin contract and runtime support. |
+| `data/` | Local runtime data and seeded config. |
+| `ref/` | Vendored/reference repos; treat as read-only. |
 
-上游 README 會維護完整的「專案介紹 / 結構 / build/test」說明；本 README 只聚焦在 **這個 fork 的差異與運維習慣**，讓 review/sync 成本最低。
+## Verified Commands
 
----
-
-## Repo Layout（Quick glance）
-
-- `apps/core/`: core runtime（Discord / GitHub surfaces、router、agent runner、workflow、tool server）
-- `apps/tool-bridge/`: dev-mode tool server entry + `tools` CLI
-- `apps/acp-controller/`: ACP harness controller CLI（`lilac-acp`）
-- `packages/*`: utils / agent / event-bus / plugin runtime
-- `ref/`: vendored/reference repos（預設視為 read-only）
-
----
-
-## Fork Policy
-
-第一，`main` 盡量保持可快速 sync 回 `upstream/main`。第二，fork-only 的需求優先走 **config/feature flag**，避免「每次 merge 都手工解衝突」。第三，已被 upstream 接受的工作，會集中記錄在下方的 **PR ACCEPTED** 區。
-
----
-
-## Current Fork-Only Differences
-
-| Area | Files | Difference | Why |
-| --- | --- | --- | --- |
-| CI (fork ops) | `.github/workflows/sync-upstream.yml` | Adds scheduled/manual upstream sync workflow for this fork. | Keep fork branch current with upstream automatically. |
-| CI (image publish) | `.github/workflows/build-image.yml` | Adds Docker image build/push workflow for this fork registry flow. | Keep fork-specific container image pipeline. |
-| Container image variants | `Dockerfile`, `.github/workflows/build-image.yml` | CI workflow directly defines variant build args for runtime identity and publishes tags (`catalinna`, `claudia`), with `latest` aligned to `catalinna`. | Keep upstream defaults while producing fork-specific image variants. |
-| Empty-reply guardrail (default off) | `packages/utils/env.ts`, `.env.example`, `apps/core/src/surface/bridge/bus-agent-runner.ts` | Adds feature flag `LILAC_SKIP_EMPTY_REASONING_REPLY`; when enabled, reasoning-only + empty final reply is skipped with diagnostics instead of posting empty placeholder text. | Keep upstream default behavior by default, but allow operational mitigation when needed. |
-
----
-
-## Feature Flag: `LILAC_SKIP_EMPTY_REASONING_REPLY`
-
-預設：**disabled**（保留 upstream 行為）。
+### Workspace validation
 
 ```bash
-LILAC_SKIP_EMPTY_REASONING_REPLY=true
+bun install
+bun test
+bun run lint
+bun run typecheck
+bun run fmt:check
 ```
 
-啟用後效果：如果一次 run 的 terminal output 只有 reasoning 而 final text 為空，bridge 會跳過送出「空白回覆」，並在 logs 留下可追查的 diagnostics。
-
----
-
-## Upstream-Accepted Contributions From This Fork（PR ACCEPTED）
-
-這些變更最初在本 fork 完成，且已合併回 upstream（以下連結都是 upstream repo）。
-
-| Status | Upstream PR | Title | Merged At |
-| --- | --- | --- | --- |
-| PR ACCEPTED | https://github.com/stanley2058/lilac-mono/pull/1 | `feat(core): add Exa web search provider` | 2026-02-19 |
-| PR ACCEPTED | https://github.com/stanley2058/lilac-mono/pull/4 | `add support for custom Tavily API endpoint.` | 2026-02-20 |
-| PR ACCEPTED | https://github.com/stanley2058/lilac-mono/pull/5 | `Cleaning up for #4` | 2026-02-21 |
-
----
-
-## Quick Validation Commands
+### Build commands
 
 ```bash
-git diff --name-status upstream/main..main
-git log --oneline --decorate main..upstream/main
-git log --oneline --decorate upstream/main..main
+cd apps/tool-bridge && bun run build
+cd apps/acp-controller && bun run build
 ```
 
----
+Remote runner build used by the core package:
+
+```bash
+cd apps/core && bun run build:remote-runner
+```
+
+### ACP controller workflow
+
+```bash
+cd apps/acp-controller
+bun run build
+./dist/index.js --help
+./dist/index.js harnesses list
+./dist/index.js sessions list --directory /path/to/repo --search "failing tests"
+```
+
+### Containerized operator stack
+
+```bash
+docker compose up --build
+```
+
+This container path is real, but it is an operator workflow rather than a zero-config quick start. The runtime expects Redis plus runtime configuration such as surface credentials.
+
+## Operational Prerequisites
+
+- The runtime expects **Redis** and reads seeded runtime config from `data/core-config.yaml`.
+- Discord uses `DISCORD_TOKEN` by default unless `surface.discord.tokenEnv` is changed in `core-config.yaml`.
+- GitHub webhook ingress requires `GITHUB_WEBHOOK_SECRET`.
+- GitHub auth can be configured through user or app credentials, depending on the workflow.
+
+## Further Reading
+
+- [`PROJECT.md`](./PROJECT.md): architecture, terminology, and runtime flow
+- [`AGENTS.md`](./AGENTS.md): repo-specific coding and validation rules
+- [`apps/acp-controller/README.md`](./apps/acp-controller/README.md): ACP controller usage details
 
 ## License
 
-This repository is licensed under MIT. See `LICENSE` for details.
+This repository is licensed under MIT. See [`LICENSE`](./LICENSE) for details.
 
-The `ref/` directory is vendored upstream/reference code and keeps each upstream project's own license terms.
+The `ref/` directory contains vendored or reference material that keeps its own upstream license terms.

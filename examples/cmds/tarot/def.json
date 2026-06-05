@@ -1,0 +1,13 @@
+{
+  "name": "tarot",
+  "description": "Draw a tarot spread and give the assistant structured reading context.",
+  "args": [
+    {
+      "key": "mode",
+      "type": "string",
+      "description": "Spread",
+      "choices": ["single", "past-present-future", "situation-obstacle-advice", "mind-body-spirit"],
+      "required": false
+    }
+  ]
+}

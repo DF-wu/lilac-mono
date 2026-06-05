@@ -10,8 +10,13 @@ import {
   type ToolSet,
   type UserContent,
 } from "ai";
-import type { CoreConfig, ModelCapabilityInfo } from "@stanley2058/lilac-utils";
+import type {
+  CoreConfig,
+  CustomCommandResult,
+  ModelCapabilityInfo,
+} from "@stanley2058/lilac-utils";
 import {
+  CUSTOM_COMMAND_TOOL_NAME,
   discoverSkills,
   env,
   findWorkspaceRoot,
@@ -87,6 +92,7 @@ import {
 } from "./bus-agent-runner/anthropic-fallback-media";
 import {
   type AgentRunProfile,
+  parseCustomCommandFromRaw,
   parseBufferedForActiveRequestIdFromRaw,
   parseRequestControlFromRaw,
   parseRequestModelOverrideFromRaw,
@@ -96,6 +102,7 @@ import {
   requestRawReferencesMessage,
 } from "./bus-agent-runner/raw";
 import { messagesContainSurfaceMetadata } from "./surface-metadata";
+import type { CustomCommandManager } from "../../custom-commands/manager";
 
 function consumerId(prefix: string): string {
   return `${prefix}:${process.pid}:${Math.random().toString(16).slice(2)}`;
@@ -249,7 +256,32 @@ function isOpenAIBackedModel(provider: string, modelId: string): boolean {
   return modelId.startsWith("openai/");
 }
 
+function isAnthropicBackedModel(provider: string, modelId: string): boolean {
+  if (provider === "anthropic") return true;
+  return modelId.startsWith("anthropic/");
+}
+
+function isAnthropicOpus47Model(provider: string, modelId: string): boolean {
+  if (!isAnthropicBackedModel(provider, modelId)) return false;
+
+  const normalizedModelId = modelId.toLowerCase();
+  return (
+    normalizedModelId.includes("claude-opus-4.7") ||
+    normalizedModelId.includes("claude-opus-4-7") ||
+    normalizedModelId.includes("claude-opus-4.8") ||
+    normalizedModelId.includes("claude-opus-4-8")
+  );
+}
+
+export function shouldEnableAnthropicPromptCache(params: {
+  spec: string;
+  anthropicPromptCache?: boolean;
+}): boolean {
+  return params.anthropicPromptCache === true && isAnthropicModelSpec(params.spec);
+}
+
 const OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH = 64;
+const OPENAI_REASONING_ENCRYPTED_CONTENT_INCLUDE = "reasoning.encrypted_content";
 
 export function toOpenAIPromptCacheKey(sessionId: string): string {
   if (sessionId.length <= OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH) {
@@ -275,15 +307,85 @@ export function withReasoningSummaryDefaultForOpenAIModels(params: {
       ? (rawOpenAI as JSONObject)
       : {};
 
+  const include = existingOpenAI["include"];
+  const openAIWithReasoningInclude =
+    Array.isArray(include) && include.includes(OPENAI_REASONING_ENCRYPTED_CONTENT_INCLUDE)
+      ? existingOpenAI
+      : {
+          ...existingOpenAI,
+          include: Array.isArray(include)
+            ? [...include, OPENAI_REASONING_ENCRYPTED_CONTENT_INCLUDE]
+            : [OPENAI_REASONING_ENCRYPTED_CONTENT_INCLUDE],
+        };
+
   if ("reasoningSummary" in existingOpenAI) {
-    return params.providerOptions;
+    return {
+      ...base,
+      openai: openAIWithReasoningInclude,
+    };
   }
 
   return {
     ...base,
     openai: {
-      ...existingOpenAI,
+      ...openAIWithReasoningInclude,
       reasoningSummary: "detailed",
+    },
+  };
+}
+
+export function withReasoningDisplayDefaultForAnthropicOpus47Models(params: {
+  reasoningDisplay: CoreConfig["agent"]["reasoningDisplay"];
+  provider: string;
+  modelId: string;
+  providerOptions: { [x: string]: JSONObject } | undefined;
+}): { [x: string]: JSONObject } | undefined {
+  if (params.reasoningDisplay === "none") return params.providerOptions;
+  if (!isAnthropicOpus47Model(params.provider, params.modelId)) return params.providerOptions;
+
+  const base = params.providerOptions ?? {};
+  const rawAnthropic = base["anthropic"];
+  const existingAnthropic: JSONObject =
+    rawAnthropic && typeof rawAnthropic === "object" && !Array.isArray(rawAnthropic)
+      ? (rawAnthropic as JSONObject)
+      : {};
+
+  const rawThinking = existingAnthropic["thinking"];
+  if (!rawThinking || typeof rawThinking !== "object" || Array.isArray(rawThinking)) {
+    return params.providerOptions;
+  }
+
+  const existingThinking = rawThinking as JSONObject;
+  if ("display" in existingThinking) {
+    return params.providerOptions;
+  }
+
+  const thinkingType = existingThinking["type"];
+  if (thinkingType === "disabled") {
+    return params.providerOptions;
+  }
+
+  let nextThinking: JSONObject;
+  if (thinkingType === "adaptive") {
+    nextThinking = {
+      ...existingThinking,
+      display: "summarized",
+    };
+  } else if (thinkingType === "enabled") {
+    nextThinking = {
+      ...existingThinking,
+      type: "adaptive",
+      display: "summarized",
+    };
+  } else {
+    return params.providerOptions;
+  }
+
+  return {
+    ...base,
+    anthropic: {
+      ...existingAnthropic,
+      thinking: nextThinking,
     },
   };
 }
@@ -642,6 +744,54 @@ function buildSubagentResultToolCallId(childRequestId: string): string {
     prefix: "subagent_result",
     seed: childRequestId,
   });
+}
+
+function buildCustomCommandToolCallId(requestId: string, name: string): string {
+  return buildSyntheticToolCallId({
+    prefix: CUSTOM_COMMAND_TOOL_NAME,
+    seed: `${requestId}:${name}`,
+  });
+}
+
+function buildCustomCommandMessages(params: {
+  toolCallId: string;
+  name: string;
+  args: readonly unknown[];
+  prompt?: string;
+  text: string;
+  source: "text" | "discord-slash";
+  output: CustomCommandResult;
+}): ModelMessage[] {
+  return [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: params.toolCallId,
+          toolName: CUSTOM_COMMAND_TOOL_NAME,
+          input: {
+            name: params.name,
+            args: params.args,
+            ...(params.prompt ? { prompt: params.prompt } : {}),
+            text: params.text,
+            source: params.source,
+          },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: params.toolCallId,
+          toolName: CUSTOM_COMMAND_TOOL_NAME,
+          output: params.output,
+        },
+      ],
+    },
+  ];
 }
 
 function buildDeferredSubagentResultMessages(
@@ -2077,6 +2227,7 @@ type SessionQueue = {
     queue: RequestQueueMode;
     runPolicy: RequestRunPolicy;
     origin?: RequestOrigin;
+    messages: ModelMessage[];
     modelOverride?: string;
     raw?: unknown;
     partialText: string;
@@ -2091,6 +2242,7 @@ export async function startBusAgentRunner(params: {
   subscriptionId: string;
   config?: CoreConfig;
   pluginManager: CoreToolPluginManager;
+  customCommands?: CustomCommandManager;
   /** Where core tools operate (fs tool root). */
   cwd?: string;
   transcriptStore?: TranscriptStore;
@@ -2558,7 +2710,22 @@ export async function startBusAgentRunner(params: {
   };
 
   function buildActiveRecoveryEntry(state: SessionQueue): AgentRunnerRecoveryEntry | null {
-    if (!state.running || !state.agent || !state.activeRun) return null;
+    if (!state.running || !state.activeRun) return null;
+
+    if (!state.agent) {
+      return {
+        kind: "active",
+        requestId: state.activeRun.requestId,
+        sessionId: state.activeRun.sessionId,
+        requestClient: state.activeRun.requestClient,
+        queue: "prompt",
+        runPolicy: state.activeRun.runPolicy,
+        origin: state.activeRun.origin,
+        messages: state.activeRun.messages,
+        ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
+        raw: state.activeRun.raw,
+      };
+    }
 
     const checkpointMessages = buildSafeRecoveryCheckpoint(
       state.agent.state.messages,
@@ -2600,7 +2767,7 @@ export async function startBusAgentRunner(params: {
     if (!hasRunning()) return;
 
     for (const state of bySession.values()) {
-      if (!state.running || !state.agent || !state.activeRun) continue;
+      if (!state.running || !state.activeRun) continue;
 
       const recovery = buildActiveRecoveryEntry(state);
       if (recovery) {
@@ -2608,7 +2775,7 @@ export async function startBusAgentRunner(params: {
         restartAbortRequestIds.add(recovery.requestId);
       }
 
-      state.agent.abort();
+      state.agent?.abort();
     }
 
     await new Promise((r) => setTimeout(r, 150));
@@ -2738,6 +2905,7 @@ export async function startBusAgentRunner(params: {
       queue: next.queue,
       runPolicy: next.runPolicy,
       origin: next.origin,
+      messages: next.messages,
       modelOverride: next.modelOverride,
       raw: next.raw,
       partialText: next.recovery?.partialText ?? "",
@@ -2745,6 +2913,8 @@ export async function startBusAgentRunner(params: {
     };
 
     let initialMessages: ModelMessage[] = [];
+    const parsedCustomCommand = next.recovery ? null : parseCustomCommandFromRaw(next.raw);
+    let customCommandMessages: ModelMessage[] = [];
     let responseStartIndex = 0;
     const runStats: {
       totalUsage?: LanguageModelUsage;
@@ -2800,6 +2970,115 @@ export async function startBusAgentRunner(params: {
       });
       await bus.publish(lilacEventTypes.EvtRequestReply, {}, { headers });
 
+      if (parsedCustomCommand) {
+        const toolCallId = buildCustomCommandToolCallId(next.requestId, parsedCustomCommand.name);
+        const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
+
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputToolCall,
+          {
+            toolCallId,
+            status: "start",
+            display,
+          },
+          { headers },
+        );
+
+        let output: CustomCommandResult = { type: "json", value: null };
+        let customError = parsedCustomCommand.error ?? null;
+        const command = params.customCommands?.get(parsedCustomCommand.name) ?? null;
+
+        if (!customError && !params.customCommands) {
+          customError = "Custom command manager is unavailable.";
+        }
+        if (!customError && !command) {
+          customError = `Unknown custom command '${parsedCustomCommand.name}'.`;
+        }
+
+        if (!customError && command && params.customCommands) {
+          try {
+            output = await params.customCommands.execute({
+              command,
+              args: parsedCustomCommand.args,
+              context: {
+                cwd,
+                dataDir: env.dataDir,
+                commandDir: command.dir,
+                commandName: command.def.name,
+                requestId: next.requestId,
+                sessionId: next.sessionId,
+              },
+            });
+          } catch (error) {
+            customError = error instanceof Error ? error.message : String(error);
+          }
+        }
+
+        if (customError) {
+          output = { type: "error-text", value: customError };
+        }
+
+        customCommandMessages = buildCustomCommandMessages({
+          toolCallId,
+          name: parsedCustomCommand.name,
+          args: parsedCustomCommand.args,
+          prompt: parsedCustomCommand.prompt,
+          text: parsedCustomCommand.text,
+          source: parsedCustomCommand.source,
+          output,
+        });
+
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputToolCall,
+          {
+            toolCallId,
+            status: "end",
+            display,
+            ok: !customError,
+            error: customError ?? undefined,
+          },
+          { headers },
+        );
+
+        if (customError) {
+          const finalText = `Error running ${parsedCustomCommand.text}: ${customError}`;
+          resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
+
+          if (params.transcriptStore) {
+            try {
+              params.transcriptStore.saveRequestTranscript({
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                requestClient: headers.request_client,
+                messages: [
+                  ...customCommandMessages,
+                  { role: "assistant", content: finalText } satisfies ModelMessage,
+                ],
+                finalText,
+                modelLabel: resolvedModelLabel,
+              });
+            } catch (error) {
+              logger.error(
+                "failed to persist transcript after custom command error",
+                { requestId: headers.request_id, sessionId: headers.session_id },
+                error,
+              );
+            }
+          }
+
+          await publishLifecycle({ bus, headers, state: "failed", detail: customError });
+          await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+
+          logger.warn("custom command failed", {
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            commandName: parsedCustomCommand.name,
+            error: customError,
+          });
+          return;
+        }
+      }
+
       const subagentProfileConfig =
         runProfile === "primary" ? null : subagents.profiles[runProfile];
 
@@ -2846,26 +3125,42 @@ export async function startBusAgentRunner(params: {
         modelId: resolved.modelId,
       });
 
-      const anthropicPromptCachingEnabled = isAnthropicModelSpec(resolved.spec);
+      const anthropicModel = isAnthropicModelSpec(resolved.spec);
+      const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
+        spec: resolved.spec,
+        anthropicPromptCache: resolved.anthropicPromptCache,
+      });
 
       // Improve prompt caching stability by providing a session-scoped cache key.
       // This helps when many requests share a large common prefix (e.g. a long system prompt).
       // Also, when reasoning display is enabled, request detailed reasoning summaries
       // for OpenAI-backed models (including gateway/openrouter openai/* model IDs).
-      const providerOptionsWithReasoningSummary = withReasoningSummaryDefaultForOpenAIModels({
+      const providerOptionsWithOpenAIReasoningSummary = withReasoningSummaryDefaultForOpenAIModels({
         reasoningDisplay: cfg.agent.reasoningDisplay,
         provider: resolved.provider,
         modelId: resolved.modelId,
         providerOptions: resolved.providerOptions,
       });
 
+      // Anthropic Opus 4.7 defaults to omitting thinking text unless
+      // anthropic.thinking.display="summarized" is set. When the user wants a
+      // reasoning lane and has thinking enabled, upgrade the legacy enabled mode
+      // to adaptive and request summarized thinking text.
+      const providerOptionsWithReasoningDisplay =
+        withReasoningDisplayDefaultForAnthropicOpus47Models({
+          reasoningDisplay: cfg.agent.reasoningDisplay,
+          provider: resolved.provider,
+          modelId: resolved.modelId,
+          providerOptions: providerOptionsWithOpenAIReasoningSummary,
+        });
+
       // Prompt cache key only applies for direct OpenAI/Codex providers.
       const providerOptionsWithPromptCacheKey = (() => {
         const provider = resolved.provider;
         const supports = provider === "openai" || provider === "codex";
-        if (!supports) return providerOptionsWithReasoningSummary;
+        if (!supports) return providerOptionsWithReasoningDisplay;
 
-        const base = providerOptionsWithReasoningSummary ?? {};
+        const base = providerOptionsWithReasoningDisplay ?? {};
         const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
 
         return {
@@ -2877,7 +3172,7 @@ export async function startBusAgentRunner(params: {
         };
       })();
 
-      const providerOptionsForAgent = anthropicPromptCachingEnabled
+      const providerOptionsForAgent = anthropicModel
         ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithPromptCacheKey)
         : providerOptionsWithPromptCacheKey;
       const experimentalDownloadForAgent = buildExperimentalDownloadForAnthropicFallback({
@@ -3591,17 +3886,26 @@ export async function startBusAgentRunner(params: {
 
       if (next.recovery) {
         initialMessages = [buildResumePrompt(next.recovery.partialText)];
+        responseStartIndex = agent.state.messages.length + initialMessages.length;
+      } else if (parsedCustomCommand) {
+        initialMessages = [...next.messages];
+        agent.appendMessages(initialMessages);
+        responseStartIndex = agent.state.messages.length;
+        agent.appendMessages(customCommandMessages);
       } else {
         // First message should be a prompt.
         // If additional messages for the same request id were queued before the run started,
         // merge them into the initial prompt so they don't become separate runs.
         const mergedInitial = mergeQueuedForSameRequest(next, state.queue);
         initialMessages = [...mergedInitial];
+        responseStartIndex = agent.state.messages.length + initialMessages.length;
       }
 
-      responseStartIndex = agent.state.messages.length + initialMessages.length;
-
-      await agent.prompt(initialMessages);
+      if (parsedCustomCommand) {
+        await agent.continue();
+      } else {
+        await agent.prompt(initialMessages);
+      }
 
       while (true) {
         await agent.waitForIdle();

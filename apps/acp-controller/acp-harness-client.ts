@@ -104,7 +104,7 @@ export class AcpHarnessClient {
     });
 
     const input = Writable.toWeb(child.stdin!);
-    const output = Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>;
+    const output = Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>;
     const stream = ndJsonStream(input, output);
     const client = new ControllerClient(
       params.permissionBehavior,
@@ -217,9 +217,6 @@ export class AcpHarnessClient {
 
   async close(): Promise<void> {
     try {
-      if (this.initializeResponse.agentCapabilities?.sessionCapabilities?.stop) {
-        // No session scope available here; worker handles session stop lifecycle separately.
-      }
       this.child.kill();
       await Promise.race([
         this.connection.closed,

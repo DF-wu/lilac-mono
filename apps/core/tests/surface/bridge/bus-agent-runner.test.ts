@@ -37,10 +37,13 @@ import {
   resolveSessionAdditionalPrompts,
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
+  shouldEnableAnthropicPromptCache,
   toOpenAIPromptCacheKey,
+  withReasoningDisplayDefaultForAnthropicOpus47Models,
   withBlankLineBetweenTextParts,
   withReasoningSummaryDefaultForOpenAIModels,
 } from "../../../src/surface/bridge/bus-agent-runner";
+import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
 import {
   buildExperimentalDownloadForAnthropicFallback,
   shouldForceUrlDownloadForAnthropicFallback,
@@ -290,6 +293,7 @@ describe("withReasoningSummaryDefaultForOpenAIModels", () => {
 
     expect(next).toEqual({
       openai: {
+        include: ["reasoning.encrypted_content"],
         reasoningSummary: "detailed",
       },
     });
@@ -311,10 +315,12 @@ describe("withReasoningSummaryDefaultForOpenAIModels", () => {
     });
 
     expect(vercel?.openai?.reasoningSummary).toBe("detailed");
+    expect(vercel?.openai?.include).toEqual(["reasoning.encrypted_content"]);
     expect(openrouter?.openai?.reasoningSummary).toBe("detailed");
+    expect(openrouter?.openai?.include).toEqual(["reasoning.encrypted_content"]);
   });
 
-  it("does not override explicit reasoningSummary", () => {
+  it("does not override explicit reasoningSummary and injects encrypted reasoning include", () => {
     const next = withReasoningSummaryDefaultForOpenAIModels({
       reasoningDisplay: "simple",
       provider: "openai",
@@ -331,8 +337,185 @@ describe("withReasoningSummaryDefaultForOpenAIModels", () => {
       openai: {
         reasoningSummary: "auto",
         parallelToolCalls: true,
+        include: ["reasoning.encrypted_content"],
       },
     });
+  });
+
+  it("preserves existing encrypted reasoning include", () => {
+    const next = withReasoningSummaryDefaultForOpenAIModels({
+      reasoningDisplay: "simple",
+      provider: "codex",
+      modelId: "gpt-5.5",
+      providerOptions: {
+        openai: {
+          include: ["reasoning.encrypted_content"],
+        },
+      },
+    });
+
+    expect(next?.openai?.include).toEqual(["reasoning.encrypted_content"]);
+  });
+});
+
+describe("withReasoningDisplayDefaultForAnthropicOpus47Models", () => {
+  it("does not inject summarized thinking when display is none", () => {
+    const next = withReasoningDisplayDefaultForAnthropicOpus47Models({
+      reasoningDisplay: "none",
+      provider: "anthropic",
+      modelId: "claude-opus-4.7",
+      providerOptions: {
+        anthropic: {
+          thinking: {
+            type: "enabled",
+            budgetTokens: 12000,
+          },
+        },
+      },
+    });
+
+    expect(next).toEqual({
+      anthropic: {
+        thinking: {
+          type: "enabled",
+          budgetTokens: 12000,
+        },
+      },
+    });
+  });
+
+  it("upgrades enabled thinking to adaptive summarized for opus 4.7", () => {
+    const next = withReasoningDisplayDefaultForAnthropicOpus47Models({
+      reasoningDisplay: "simple",
+      provider: "anthropic",
+      modelId: "claude-opus-4.7",
+      providerOptions: {
+        anthropic: {
+          thinking: {
+            type: "enabled",
+            budgetTokens: 12000,
+          },
+        },
+      },
+    });
+
+    expect(next).toEqual({
+      anthropic: {
+        thinking: {
+          type: "adaptive",
+          budgetTokens: 12000,
+          display: "summarized",
+        },
+      },
+    });
+  });
+
+  it("injects summarized display for vercel/openrouter anthropic opus 4.7 models", () => {
+    const vercel = withReasoningDisplayDefaultForAnthropicOpus47Models({
+      reasoningDisplay: "detailed",
+      provider: "vercel",
+      modelId: "anthropic/claude-opus-4.7",
+      providerOptions: {
+        anthropic: {
+          thinking: {
+            type: "adaptive",
+          },
+        },
+        gateway: {
+          order: ["anthropic"],
+        },
+      },
+    });
+
+    const openrouter = withReasoningDisplayDefaultForAnthropicOpus47Models({
+      reasoningDisplay: "detailed",
+      provider: "openrouter",
+      modelId: "anthropic/claude-opus-4-7",
+      providerOptions: {
+        anthropic: {
+          thinking: {
+            type: "adaptive",
+          },
+        },
+        openrouter: {
+          route: "fallback",
+        },
+      },
+    });
+
+    expect(vercel).toEqual({
+      anthropic: {
+        thinking: {
+          type: "adaptive",
+          display: "summarized",
+        },
+      },
+      gateway: {
+        order: ["anthropic"],
+      },
+    });
+    expect(openrouter).toEqual({
+      anthropic: {
+        thinking: {
+          type: "adaptive",
+          display: "summarized",
+        },
+      },
+      openrouter: {
+        route: "fallback",
+      },
+    });
+  });
+
+  it("does not override explicit anthropic thinking display", () => {
+    const next = withReasoningDisplayDefaultForAnthropicOpus47Models({
+      reasoningDisplay: "simple",
+      provider: "anthropic",
+      modelId: "claude-opus-4.7",
+      providerOptions: {
+        anthropic: {
+          thinking: {
+            type: "adaptive",
+            display: "omitted",
+          },
+        },
+      },
+    });
+
+    expect(next).toEqual({
+      anthropic: {
+        thinking: {
+          type: "adaptive",
+          display: "omitted",
+        },
+      },
+    });
+  });
+});
+
+describe("shouldEnableAnthropicPromptCache", () => {
+  it("keeps Anthropic prompt caching disabled by default", () => {
+    expect(
+      shouldEnableAnthropicPromptCache({
+        spec: "openrouter/anthropic/claude-sonnet-4.5",
+      }),
+    ).toBe(false);
+  });
+
+  it("enables Anthropic prompt caching only when explicitly opted in", () => {
+    expect(
+      shouldEnableAnthropicPromptCache({
+        spec: "openrouter/anthropic/claude-sonnet-4.5",
+        anthropicPromptCache: true,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldEnableAnthropicPromptCache({
+        spec: "openrouter/openai/gpt-4o",
+        anthropicPromptCache: true,
+      }),
+    ).toBe(false);
   });
 });
 
@@ -1241,6 +1424,23 @@ describe("buildSurfaceMetadataOverlay", () => {
     expect(overlay).toContain("trusted injected tag");
     expect(overlay).toContain("first line of a user-message block");
     expect(overlay).toContain("&lt;LILAC_META:v1>");
+  });
+
+  it("returns instructions for slash-command metadata without message id", () => {
+    const overlay = buildSurfaceMetadataOverlay([
+      {
+        role: "user",
+        content: `${formatSurfaceMetadataLine({
+          platform: "discord",
+          user_id: "u1",
+          user_name: "Alice",
+          message_time: new Date(1_234).toISOString(),
+        })}\n/lilac:tarot 3 focus`,
+      },
+    ] satisfies ModelMessage[]);
+
+    expect(overlay).toContain("trusted injected tag");
+    expect(overlay).toContain("first line of a user-message block");
   });
 });
 
