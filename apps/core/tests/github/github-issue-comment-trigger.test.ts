@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
 import {
-  isRecentGithubSelfAuthoredIssueComment,
-  rememberGithubSelfAuthoredIssueComment,
-} from "../../src/github/github-state";
+  isMarkedGithubAgentComment,
+  markGithubAgentComment,
+} from "../../src/github/github-comment-marker";
 import { parseIssueCommentTrigger } from "../../src/github/webhook/github-webhook-server";
 
 const BOT_LOGINS = ["catalinna-df[bot]", "DF-wu"] as const;
@@ -15,10 +15,7 @@ describe("github issue comment trigger parsing", () => {
       BOT_LOGINS,
     );
 
-    expect(parsed).toEqual({
-      kind: "lilac",
-      commandText: "inspect this\nKeep the stack trace in the reply.",
-    });
+    expect(parsed).toBe("inspect this\nKeep the stack trace in the reply.");
   });
 
   it("parses a leading mention command and strips only the trigger mention", () => {
@@ -27,11 +24,7 @@ describe("github issue comment trigger parsing", () => {
       BOT_LOGINS,
     );
 
-    expect(parsed).toEqual({
-      kind: "mention",
-      login: "catalinna-df[bot]",
-      commandText: "please review\nFocus on the webhook path.",
-    });
+    expect(parsed).toBe("please review\nFocus on the webhook path.");
   });
 
   it("ignores quoted lines before evaluating the first real trigger line", () => {
@@ -40,11 +33,7 @@ describe("github issue comment trigger parsing", () => {
       BOT_LOGINS,
     );
 
-    expect(parsed).toEqual({
-      kind: "mention",
-      login: "catalinna-df[bot]",
-      commandText: "new trigger",
-    });
+    expect(parsed).toBe("new trigger");
   });
 
   it("does not trigger on fenced code that contains bot mentions or /lilac", () => {
@@ -73,18 +62,15 @@ describe("github issue comment trigger parsing", () => {
   });
 });
 
-describe("github self-authored issue comment tracking", () => {
-  it("remembers recent self-authored issue comments", () => {
-    const commentId = 9_000_001;
-    rememberGithubSelfAuthoredIssueComment(commentId);
+describe("github agent comment marker", () => {
+  it("marks outbound GitHub comments with a hidden marker", () => {
+    const marked = markGithubAgentComment("hello");
 
-    expect(isRecentGithubSelfAuthoredIssueComment(commentId)).toBe(true);
+    expect(marked).toBe("<!-- lilac:agent-comment -->\nhello");
+    expect(isMarkedGithubAgentComment(marked)).toBe(true);
   });
 
-  it("expires remembered self-authored issue comments after ttl", () => {
-    const commentId = 9_000_002;
-    rememberGithubSelfAuthoredIssueComment(commentId, -1);
-
-    expect(isRecentGithubSelfAuthoredIssueComment(commentId)).toBe(false);
+  it("does not treat normal comments as marked agent comments", () => {
+    expect(isMarkedGithubAgentComment("/lilac hello")).toBe(false);
   });
 });
