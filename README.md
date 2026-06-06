@@ -11,12 +11,28 @@
   ·
   <a href="./apps/acp-controller/README.md">ACP CLI</a>
   ·
+  <a href="#quick-differences-from-upstream">Differences</a>
+  ·
   <a href="https://github.com/stanley2058/lilac-mono">Upstream</a>
 </p>
 
 Lilac is an event-driven runtime for request-scoped LLM work. It keeps surface ingress, routing, agent execution, tool access, and workflow resume in one system instead of splitting them across separate bots, scripts, and operator glue.
 
-This repository is a maintained fork of [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono). The fork context matters, but the main thing this repo provides is the runtime, toolchain, and operator workflows described below.
+This repository is a maintained fork of [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono). The fork context matters: most architecture and runtime concepts still follow upstream, while this fork adds a small set of operator-focused changes for GitHub automation, container delivery, and ACP reliability.
+
+## Quick Differences From Upstream
+
+If you already know upstream Lilac, start here. This fork keeps the same Bun workspace layout and event-driven runtime model, but currently differs in these practical areas:
+
+| Area | This fork adds or changes | Why it matters |
+| --- | --- | --- |
+| GitHub issue/PR comments | `/lilac` and `@bot` triggers are parsed from the first non-empty, non-quoted, non-code-fenced content line. Agent-authored comments are marked with `<!-- lilac:agent-comment -->` and ignored by webhook ingress. | Users can invoke the agent from GitHub comments more predictably, while avoiding self-trigger loops. |
+| GitHub surface output | GitHub comments created by the adapter, output stream, or `surface.messages.send` are automatically marked as agent comments. | Outbound GitHub replies remain machine-identifiable across both runtime output and tool-driven messages. |
+| ACP controller robustness | Detached ACP runs treat Linux zombie worker processes as dead, and cancellation closes the harness client so workers can settle instead of hanging indefinitely. | Long-running local/automation prompt workflows recover more cleanly from stuck harness transports. |
+| Container delivery | GitHub Actions build and publish GHCR images for `catalinna` and `claudia` variants, with `latest` pointing at the `catalinna` image. The Docker image also includes `rsync`. | Operators can consume prebuilt images and have a more complete shell toolbox inside the runtime container. |
+| Upstream maintenance | A scheduled GitHub Actions workflow checks `stanley2058/lilac-mono` every 6 hours and merges upstream `main` when possible, then triggers image rebuilds. | This fork is intended to stay close to upstream while keeping local operational patches visible. |
+
+The fork-specific code is intentionally small and easy to audit. Useful entry points are `apps/core/src/github/github-comment-marker.ts`, `apps/core/src/github/webhook/github-webhook-server.ts`, `apps/core/src/surface/github/`, `apps/acp-controller/controller.ts`, and `.github/workflows/`.
 
 ## What This Repo Does
 
