@@ -34,7 +34,6 @@ import {
   parseGithubRequestId,
   parseGithubSessionId,
 } from "../../github/github-ids";
-import { markGithubAgentComment } from "../../github/github-comment-marker";
 import {
   createIssueComment,
   createIssueCommentReaction,
@@ -2417,7 +2416,7 @@ export class Surface implements ServerTool {
         owner: thread.owner,
         repo: thread.repo,
         issueNumber: thread.number,
-        body: markGithubAgentComment(input.text),
+        body: input.text,
       });
 
       const ref = asGithubMsgRef(sessionId, String(res.id));
