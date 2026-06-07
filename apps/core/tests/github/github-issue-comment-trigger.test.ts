@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
   isMarkedGithubAgentComment,
   markGithubAgentComment,
+  sanitizeGithubAgentCommentBody,
 } from "../../src/github/github-comment-marker";
 import { parseIssueCommentTrigger } from "../../src/github/webhook/github-webhook-server";
 
@@ -72,5 +73,39 @@ describe("github agent comment marker", () => {
 
   it("does not treat normal comments as marked agent comments", () => {
     expect(isMarkedGithubAgentComment("/lilac hello")).toBe(false);
+  });
+
+  it("strips provider thinking blocks before marking outbound comments", () => {
+    const marked = markGithubAgentComment(
+      "Before\n\n<thinking>private chain-of-thought</thinking>\n\nAfter",
+    );
+
+    expect(marked).toBe("<!-- lilac:agent-comment -->\nBefore\n\nAfter");
+  });
+
+  it("preserves literal thinking tags inside markdown fences", () => {
+    const body = [
+      "Before",
+      "",
+      "<thinking>remove this</thinking>",
+      "",
+      "```xml",
+      "<thinking>keep this literal sample</thinking>",
+      "```",
+      "",
+      "After",
+    ].join("\n");
+
+    expect(sanitizeGithubAgentCommentBody(body)).toBe(
+      [
+        "Before",
+        "",
+        "```xml",
+        "<thinking>keep this literal sample</thinking>",
+        "```",
+        "",
+        "After",
+      ].join("\n"),
+    );
   });
 });

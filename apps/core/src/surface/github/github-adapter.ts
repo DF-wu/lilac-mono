@@ -185,7 +185,7 @@ export class GithubAdapter implements SurfaceAdapter {
       owner: thread.owner,
       repo: thread.repo,
       commentId,
-      body,
+      body: markGithubAgentComment(body),
     });
   }
 
