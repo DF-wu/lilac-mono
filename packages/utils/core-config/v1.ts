@@ -194,6 +194,9 @@ const discordSurfaceSchema = z
     /** Final reply style used after Discord preview mode finishes. */
     previewFinalOutputStyle: z.enum(["embed", "plain"]).default("embed"),
 
+    /** Feature flag for rendering stats-for-nerds in Discord preview plain finals. */
+    outputPreviewPlainFinalStats: z.boolean().default(true),
+
     /**
      * Optional global override for Discord output notifications.
      * true = allow reply ping + @mentions, false = suppress by default.
@@ -216,6 +219,7 @@ const discordSurfaceSchema = z
     botName: "lilac",
     outputMode: "inline",
     previewFinalOutputStyle: "embed",
+    outputPreviewPlainFinalStats: true,
     workingIndicators: cloneDefaultDiscordWorkingIndicators(),
     experimental: {
       markdownTableRender: {
@@ -518,6 +522,7 @@ export const coreConfigInputSchemaV1 = z.object({
         botName: "lilac",
         outputMode: "inline",
         previewFinalOutputStyle: "embed",
+        outputPreviewPlainFinalStats: true,
         workingIndicators: cloneDefaultDiscordWorkingIndicators(),
         experimental: {
           markdownTableRender: {

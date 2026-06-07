@@ -90,6 +90,7 @@ const discordSurfaceSchema = z
     memberPresence: z.boolean().optional(),
     outputMode: z.enum(["inline", "preview"]).default("preview"),
     outputPreviewModeFinalStyle: z.enum(["embed", "plain"]).default("plain"),
+    outputPreviewPlainFinalStats: z.boolean().default(true),
     outputNotification: z.boolean().default(true),
     workingIndicators: z
       .array(z.string().trim().min(1))
@@ -104,6 +105,7 @@ const discordSurfaceSchema = z
     botName: "lilac",
     outputMode: "preview",
     outputPreviewModeFinalStyle: "plain",
+    outputPreviewPlainFinalStats: true,
     outputNotification: true,
     workingIndicators: cloneDefaultDiscordWorkingIndicators(),
     markdownTableRender: {
@@ -165,6 +167,7 @@ export const coreConfigInputSchemaV2 = z.object({
         botName: "lilac",
         outputMode: "preview",
         outputPreviewModeFinalStyle: "plain",
+        outputPreviewPlainFinalStats: true,
         outputNotification: true,
         workingIndicators: cloneDefaultDiscordWorkingIndicators(),
         markdownTableRender: {
