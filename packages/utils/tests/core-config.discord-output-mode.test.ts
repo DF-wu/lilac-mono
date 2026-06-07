@@ -40,6 +40,24 @@ describe("coreConfigSchema surface.discord.outputMode", () => {
     expect(parsed.surface.discord.previewFinalOutputStyle).toBe("plain");
   });
 
+  it("defaults preview plain final stats to enabled", () => {
+    const parsed = coreConfigSchema.parse({});
+    expect(parsed.surface.discord.outputPreviewPlainFinalStats).toBe(true);
+  });
+
+  it("accepts preview plain final stats feature flag off", () => {
+    const parsed = coreConfigSchema.parse({
+      surface: {
+        discord: {
+          botName: "lilac",
+          outputPreviewPlainFinalStats: false,
+        },
+      },
+    });
+
+    expect(parsed.surface.discord.outputPreviewPlainFinalStats).toBe(false);
+  });
+
   it("keeps outputNotification optional by default", () => {
     const parsed = coreConfigSchema.parse({});
     expect(parsed.surface.discord.outputNotification).toBeUndefined();

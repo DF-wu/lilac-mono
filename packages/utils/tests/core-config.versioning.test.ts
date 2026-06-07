@@ -18,6 +18,7 @@ describe("core config versioning", () => {
     expect(parsed.configVersion).toBe(1);
     expect(parsed.surface.discord.outputMode).toBe("inline");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
+    expect(parsed.surface.discord.outputPreviewPlainFinalStats).toBe(true);
     expect(parsed.surface.discord.markdownTableRender.enabled).toBe(false);
     expect(parsed.agent.reasoningDisplay).toBe("simple");
     expect(parsed.tools.web.fetch.mode).toBe("auto");
@@ -31,6 +32,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputMode).toBe("preview");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
+    expect(parsed.surface.discord.outputPreviewPlainFinalStats).toBe(true);
     expect(parsed.surface.discord.outputNotification).toBe(true);
     expect(parsed.surface.discord.markdownTableRender).toEqual({
       enabled: true,
@@ -68,6 +70,7 @@ describe("core config versioning", () => {
       surface: {
         discord: {
           outputPreviewModeFinalStyle: "embed",
+          outputPreviewPlainFinalStats: false,
           markdownTableRender: {
             enabled: false,
             style: "ascii",
@@ -80,6 +83,7 @@ describe("core config versioning", () => {
 
     expect(parsed.tools.editFile.hashline).toBe(false);
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
+    expect(parsed.surface.discord.outputPreviewPlainFinalStats).toBe(false);
     expect(parsed.surface.discord.markdownTableRender).toEqual({
       enabled: false,
       style: "ascii",
@@ -98,6 +102,7 @@ describe("core config versioning", () => {
         discord: {
           botName: "lilac",
           previewFinalOutputStyle: "plain",
+          outputPreviewPlainFinalStats: false,
           experimental: {
             markdownTableRender: {
               enabled: true,
@@ -112,6 +117,7 @@ describe("core config versioning", () => {
 
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
+    expect(parsed.surface.discord.outputPreviewPlainFinalStats).toBe(false);
     expect(parsed.surface.discord.markdownTableRender).toEqual({
       enabled: true,
       style: "ascii",
