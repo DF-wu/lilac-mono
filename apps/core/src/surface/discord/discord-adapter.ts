@@ -1076,7 +1076,6 @@ export class DiscordAdapter implements SurfaceAdapter {
       reasoningDisplayMode: cfg.agent.reasoningDisplay ?? "simple",
       outputMode: cfg.surface.discord.outputMode ?? "inline",
       outputPreviewModeFinalStyle: cfg.surface.discord.outputPreviewModeFinalStyle ?? "embed",
-      outputPreviewPlainFinalStats: cfg.surface.discord.outputPreviewPlainFinalStats,
       outputNotification: resolveOutputNotificationEnabled({
         configured: cfg.surface.discord.outputNotification,
         silent: opts?.silent,
