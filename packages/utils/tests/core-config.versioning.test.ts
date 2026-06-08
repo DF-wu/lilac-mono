@@ -120,6 +120,31 @@ describe("core config versioning", () => {
     });
   });
 
+  it("ignores the removed preview plain stats flag in stale config files", async () => {
+    const parsedV1 = await parseCoreConfig({
+      configVersion: 1,
+      surface: {
+        discord: {
+          botName: "lilac",
+          outputPreviewPlainFinalStats: false,
+        },
+      },
+    });
+    const parsedV2 = await parseCoreConfig({
+      configVersion: 2,
+      surface: {
+        discord: {
+          outputPreviewPlainFinalStats: false,
+        },
+      },
+    });
+
+    expect(parsedV1.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
+    expect("outputPreviewPlainFinalStats" in parsedV1.surface.discord).toBe(false);
+    expect(parsedV2.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
+    expect("outputPreviewPlainFinalStats" in parsedV2.surface.discord).toBe(false);
+  });
+
   it("rejects unsupported config versions", async () => {
     expect(() => readCoreConfigVersion({ configVersion: 3 })).toThrow(
       "Unsupported core config version: 3",
