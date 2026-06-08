@@ -2,9 +2,9 @@ export const GITHUB_AGENT_COMMENT_MARKER = "<!-- lilac:agent-comment -->";
 
 export function markGithubAgentComment(body: string): string {
   const trimmed = body.trim();
-  return trimmed.startsWith(GITHUB_AGENT_COMMENT_MARKER)
+  return isMarkedGithubAgentComment(trimmed)
     ? trimmed
-    : `${GITHUB_AGENT_COMMENT_MARKER}\n${trimmed}`;
+    : [GITHUB_AGENT_COMMENT_MARKER, trimmed].filter((line) => line.length > 0).join("\n");
 }
 
 export function isMarkedGithubAgentComment(body: string): boolean {

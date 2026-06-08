@@ -93,25 +93,38 @@ function joinTriggerCommandText(
   return parts.join("\n");
 }
 
+type FenceMarker = "`" | "~";
+
+function parseFenceMarker(trimmedStart: string): FenceMarker | null {
+  if (trimmedStart.startsWith("```")) return "`";
+  if (trimmedStart.startsWith("~~~")) return "~";
+  return null;
+}
+
 export function parseIssueCommentTrigger(
   body: string,
   botLogins: readonly string[],
 ): string | null {
   const mentionPattern = botLogins.length
-    ? new RegExp(`^@(?:${botLogins.map(escapeRegExp).join("|")})(?:\\s+(.*))?$`, "iu")
+    ? new RegExp(`^@(?:${botLogins.map(escapeRegExp).join("|")})(?:(?:[,:]\\s*|\\s+)(.*))?$`, "iu")
     : null;
   const lines = body.split(/\r?\n/u);
-  let inFence = false;
+  let activeFence: FenceMarker | null = null;
 
   for (let idx = 0; idx < lines.length; idx += 1) {
     const rawLine = lines[idx] ?? "";
     const trimmedStart = rawLine.trimStart();
 
-    if (trimmedStart.startsWith("```")) {
-      inFence = !inFence;
+    const fenceMarker = parseFenceMarker(trimmedStart);
+    if (fenceMarker) {
+      if (activeFence === null) {
+        activeFence = fenceMarker;
+      } else if (activeFence === fenceMarker) {
+        activeFence = null;
+      }
       continue;
     }
-    if (inFence) continue;
+    if (activeFence !== null) continue;
     if (trimmedStart.startsWith(">")) continue;
 
     const trimmed = rawLine.trim();

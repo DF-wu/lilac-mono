@@ -27,6 +27,13 @@ describe("github issue comment trigger parsing", () => {
     expect(parsed).toBe("please review\nFocus on the webhook path.");
   });
 
+  it("parses a leading mention command followed by punctuation", () => {
+    expect(parseIssueCommentTrigger("@catalinna-df[bot], please review", BOT_LOGINS)).toBe(
+      "please review",
+    );
+    expect(parseIssueCommentTrigger("@DF-wu: please inspect", BOT_LOGINS)).toBe("please inspect");
+  });
+
   it("ignores quoted lines before evaluating the first real trigger line", () => {
     const parsed = parseIssueCommentTrigger(
       "> @catalinna-df[bot] old trigger\n> /lilac old trigger\n\n@catalinna-df[bot] new trigger",
@@ -52,6 +59,22 @@ describe("github issue comment trigger parsing", () => {
     expect(parsed).toBeNull();
   });
 
+  it("does not trigger on tilde fenced code that contains bot mentions or /lilac", () => {
+    const parsed = parseIssueCommentTrigger(
+      [
+        "~~~md",
+        "@catalinna-df[bot] hi",
+        "/lilac inspect this issue",
+        "~~~",
+        "",
+        "@catalinna-df[bot] real trigger",
+      ].join("\n"),
+      BOT_LOGINS,
+    );
+
+    expect(parsed).toBe("real trigger");
+  });
+
   it("does not trigger when a later line mentions the bot after normal prose", () => {
     const parsed = parseIssueCommentTrigger(
       "I am summarizing the previous attempt.\n\n@catalinna-df[bot] this should not retrigger.",
@@ -67,6 +90,13 @@ describe("github agent comment marker", () => {
     const marked = markGithubAgentComment("hello");
 
     expect(marked).toBe("<!-- lilac:agent-comment -->\nhello");
+    expect(isMarkedGithubAgentComment(marked)).toBe(true);
+  });
+
+  it("prepends a marker when marker-like text is not on its own content line", () => {
+    const marked = markGithubAgentComment("<!-- lilac:agent-comment --> hello");
+
+    expect(marked).toBe("<!-- lilac:agent-comment -->\n<!-- lilac:agent-comment --> hello");
     expect(isMarkedGithubAgentComment(marked)).toBe(true);
   });
 
