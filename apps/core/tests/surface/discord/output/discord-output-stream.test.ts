@@ -434,38 +434,6 @@ describe("preview final output style", () => {
     expect(res.last.messageId).toBe(finalSend.messageId);
   });
 
-  it("omits preview plain final stats when the feature flag is disabled", async () => {
-    const { client, operations } = createFakeDiscordClient();
-
-    const out = new DiscordOutputStream({
-      client,
-      sessionRef: { platform: "discord", channelId: "chan" },
-      useSmartSplitting: false,
-      outputMode: "preview",
-      outputPreviewModeFinalStyle: "plain",
-      outputPreviewPlainFinalStats: false,
-      reasoningDisplayMode: "none",
-      workingIndicators: ["Working"],
-    });
-
-    await out.push({ type: "text.delta", delta: "preview text" });
-    await out.push({ type: "meta.stats", line: "nerd stats" });
-    const res = await out.finish();
-
-    const finalSend = operations.find(
-      (op) =>
-        op.kind === "send" &&
-        contentFromOptions(op.options) === "preview text" &&
-        !hasEmbeds(op.options),
-    );
-
-    expect(finalSend).toBeDefined();
-    if (!finalSend) {
-      throw new Error("expected plain final send");
-    }
-    expect(res.last.messageId).toBe(finalSend.messageId);
-  });
-
   it("reserves room for stats in the final plain preview chunk", async () => {
     const { client, operations } = createFakeDiscordClient();
 

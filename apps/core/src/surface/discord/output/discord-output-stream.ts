@@ -212,15 +212,11 @@ function buildFinalStatsFieldValue(line: string): string {
 function buildPlainFinalContentChunks(input: {
   content: string;
   statsLine: string | null;
-  includeStats: boolean;
   maxChunkLength: number;
   useSmartSplitting: boolean;
   hardMaxChunkLength: number;
 }): string[] {
-  const statsSuffix =
-    input.includeStats && input.statsLine
-      ? `\n\n${buildFinalStatsFieldValue(input.statsLine)}`
-      : "";
+  const statsSuffix = input.statsLine ? `\n\n${buildFinalStatsFieldValue(input.statsLine)}` : "";
   const chunks = chunkMarkdownForEmbeds(input.content, {
     maxChunkLength: input.maxChunkLength,
     // Stats are appended after markdown chunk rendering so they stay outside the
@@ -344,7 +340,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       markdownTableRender?: MarkdownTableRenderOptions;
       outputMode: DiscordOutputMode;
       outputPreviewModeFinalStyle?: DiscordPreviewFinalOutputStyle;
-      outputPreviewPlainFinalStats?: boolean;
       outputNotification?: boolean;
       reasoningDisplayMode: "none" | "simple" | "detailed";
       workingIndicators: readonly string[];
@@ -956,7 +951,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const displayChunks = buildPlainFinalContentChunks({
       content,
       statsLine: this.statsForNerdsLine,
-      includeStats: this.deps.outputPreviewPlainFinalStats !== false,
       maxChunkLength,
       useSmartSplitting: this.deps.useSmartSplitting,
       hardMaxChunkLength: DISCORD_CONTENT_MAX_CHARS,

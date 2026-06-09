@@ -15,6 +15,10 @@ Rules:
 - New behavior-changing defaults only apply to configs on the version that introduced them.
 - If a newer field cannot be represented safely in an older version, that field requires the newer `configVersion`.
 
+Removed fields:
+
+- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview + plain final output now appends the stats footer whenever stats metadata is produced.
+
 ## v1
 
 `configVersion: 1` is the initial versioned config contract and matches the defaults used before config versioning was introduced.

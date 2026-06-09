@@ -102,7 +102,6 @@ export type UniversalCoreConfig = {
       memberPresence?: boolean;
       outputMode: "inline" | "preview";
       outputPreviewModeFinalStyle: "embed" | "plain";
-      outputPreviewPlainFinalStats: boolean;
       outputNotification?: boolean;
       workingIndicators: string[];
       markdownTableRender: {
