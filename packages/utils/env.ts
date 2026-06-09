@@ -59,9 +59,13 @@ export function parseEnv() {
         baseUrl: env.OPENAI_BASE_URL,
         apiKey: env.OPENAI_API_KEY,
         responsesTransport: parseResponsesTransportMode(env.OPENAI_RESPONSES_TRANSPORT),
+        responsesChatCompletionFallback: parseBoolean(
+          env.OPENAI_RESPONSES_CHAT_COMPLETION_FALLBACK,
+        ),
       },
       codex: {
         responsesTransport: parseResponsesTransportMode(env.CODEX_RESPONSES_TRANSPORT),
+        responsesChatCompletionFallback: parseBoolean(env.CODEX_RESPONSES_CHAT_COMPLETION_FALLBACK),
       },
       openaiCompatible: {
         baseUrl: env.OPENAI_COMPATIBLE_BASE_URL,

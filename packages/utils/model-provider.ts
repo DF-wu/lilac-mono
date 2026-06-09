@@ -16,6 +16,7 @@ import {
 } from "./codex-oauth";
 import { createLogger } from "./logging";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
+import { withOpenAIResponsesChatFallbackFetch } from "./openai-responses-chat-fallback-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
 
 export type Providers =
@@ -125,15 +126,27 @@ export function getModelProviders() {
     },
   });
 
+  const openaiResponsesFallbackFetch = withOpenAIResponsesChatFallbackFetch({
+    enabled: env.providers.openai.responsesChatCompletionFallback,
+    fetchFn: openaiResponsesFetch,
+    warn: (message, details) => logger.warn(message, { provider: "openai", ...details }),
+  });
+
+  const codexResponsesFallbackFetch = withOpenAIResponsesChatFallbackFetch({
+    enabled: env.providers.codex.responsesChatCompletionFallback,
+    fetchFn: codexResponsesFetch,
+    warn: (message, details) => logger.warn(message, { provider: "codex", ...details }),
+  });
+
   const openaiFetch = withLlmWireDebugFetch({
     provider: "openai",
-    fetchFn: openaiResponsesFetch,
+    fetchFn: openaiResponsesFallbackFetch,
     warn: (message, details) => logger.warn(message, details),
   });
 
   const codexFetch = withLlmWireDebugFetch({
     provider: "codex",
-    fetchFn: codexResponsesFetch,
+    fetchFn: codexResponsesFallbackFetch,
     warn: (message, details) => logger.warn(message, details),
   });
 
