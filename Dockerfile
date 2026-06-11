@@ -90,6 +90,9 @@ RUN if id -u "$LILAC_USER" >/dev/null 2>&1; then \
   else \
   useradd -m -u "$LILAC_UID" -s /bin/bash "$LILAC_USER"; \
   fi
+RUN if [ "$LILAC_USER" = "Catalina" ] && [ ! -e /home/Catalinna ]; then \
+  ln -s /home/Catalina /home/Catalinna; \
+  fi
 ENV HOME=/home/${LILAC_USER}
 ENV DATA_DIR=/data
 ENV LILAC_WORKSPACE_DIR=${DATA_DIR}/workspace

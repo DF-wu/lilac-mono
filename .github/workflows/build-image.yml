@@ -19,8 +19,8 @@ jobs:
     strategy:
       matrix:
         variant:
-          - tag: catalinna
-            container_user: Catalinna
+          - tag: catalina
+            container_user: Catalina
             container_uid: 3000
           - tag: claudia
             container_user: Claudia
@@ -48,7 +48,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ matrix.variant.tag }}
-            type=raw,value=latest,enable=${{ matrix.variant.tag == 'catalinna' }}
+            type=raw,value=latest,enable=${{ matrix.variant.tag == 'catalina' }}
             type=sha,prefix=${{ matrix.variant.tag }}-,format=short
 
       - name: Build and push
