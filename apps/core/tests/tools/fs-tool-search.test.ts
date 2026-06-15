@@ -257,4 +257,215 @@ describe("fs tool search wrappers", () => {
     expect(defaults.results.length).toBe(2);
     expect(defaults.truncated).toBe(true);
   });
+
+  it("supports the fff backend for local glob and grep", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+
+    const globOut = await resolveExecuteResult(
+      tools.glob.execute!({ patterns: ["src/**/*.ts"] }, { toolCallId: "fff-glob", messages: [] }),
+    );
+
+    expect(globOut.mode).toBe("default");
+    expect(globOut.error).toBeUndefined();
+    if (globOut.mode !== "default") {
+      throw new Error("expected default glob output");
+    }
+    expect(globOut.paths.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+
+    const grepOut = await resolveExecuteResult(
+      tools.grep.execute!(
+        {
+          pattern: "alpha",
+          fileExtensions: ["ts"],
+          mode: "detailed",
+        },
+        { toolCallId: "fff-grep", messages: [] },
+      ),
+    );
+
+    expect(grepOut.mode).toBe("detailed");
+    expect(grepOut.error).toBeUndefined();
+    if (grepOut.mode !== "detailed") {
+      throw new Error("expected detailed grep output");
+    }
+
+    const files = grepOut.results.map((r: { file: string }) => r.file.replace(/^\.\//, "")).sort();
+    expect(files).toEqual(["src/a.ts", "src/b.ts"]);
+  });
+
+  it("fff backend preserves glob exclusions when early matches are excluded", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+    await mkdir(path.join(baseDir, "aaa"), { recursive: true });
+    await mkdir(path.join(baseDir, "zzz"), { recursive: true });
+    for (let i = 0; i < 10; i++) {
+      await writeFile(path.join(baseDir, "aaa", `${i}.ts`), "export const excluded = true;\n");
+    }
+    await writeFile(path.join(baseDir, "zzz", "keep.ts"), "export const kept = true;\n");
+
+    const out = await resolveExecuteResult(
+      tools.glob.execute!(
+        {
+          patterns: ["**/*.ts", "!aaa/**"],
+          maxEntries: 1,
+        },
+        { toolCallId: "fff-glob-exclude", messages: [] },
+      ),
+    );
+
+    expect(out.mode).toBe("default");
+    if (out.mode !== "default") {
+      throw new Error("expected default glob output");
+    }
+    expect(out.paths.length).toBe(1);
+    expect(out.paths[0]?.startsWith("aaa/")).toBe(false);
+  });
+
+  it("fff backend preserves explicit node_modules glob results", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+    await mkdir(path.join(baseDir, "node_modules", "pkg"), { recursive: true });
+    await writeFile(
+      path.join(baseDir, "node_modules", "pkg", "types.ts"),
+      "export type T = string;\n",
+    );
+
+    const out = await resolveExecuteResult(
+      tools.glob.execute!(
+        {
+          patterns: ["node_modules/**/*.ts"],
+        },
+        { toolCallId: "fff-glob-node-modules", messages: [] },
+      ),
+    );
+
+    expect(out.mode).toBe("default");
+    if (out.mode !== "default") {
+      throw new Error("expected default glob output");
+    }
+    expect(out.paths).toEqual(["node_modules/pkg/types.ts"]);
+  });
+
+  it("fff backend preserves directory-capable glob results", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+    await mkdir(path.join(baseDir, "src", "nested"), { recursive: true });
+    await writeFile(path.join(baseDir, "src", "nested", "c.ts"), "export const gamma = 1;\n");
+
+    const out = await resolveExecuteResult(
+      tools.glob.execute!(
+        {
+          patterns: ["src/**"],
+          mode: "detailed",
+          maxEntries: 20,
+        },
+        { toolCallId: "fff-glob-dir", messages: [] },
+      ),
+    );
+
+    expect(out.mode).toBe("detailed");
+    if (out.mode !== "detailed") {
+      throw new Error("expected detailed glob output");
+    }
+    expect(
+      out.entries.some((entry) => entry.path === "src/nested" && entry.type === "directory"),
+    ).toBe(true);
+  });
+
+  it("fff backend preserves multi-extension grep behavior", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+    await writeFile(path.join(baseDir, "src", "component.tsx"), "export const alphaView = true;\n");
+
+    const out = await resolveExecuteResult(
+      tools.grep.execute!(
+        {
+          pattern: "alpha",
+          fileExtensions: ["ts", "tsx"],
+          mode: "detailed",
+          maxResults: 10,
+        },
+        { toolCallId: "fff-grep-exts", messages: [] },
+      ),
+    );
+
+    expect(out.mode).toBe("detailed");
+    if (out.mode !== "detailed") {
+      throw new Error("expected detailed grep output");
+    }
+    const files = out.results.map((result) => result.file.replace(/^\.\//, "")).sort();
+    expect(files).toContain("src/a.ts");
+    expect(files).toContain("src/b.ts");
+    expect(files).toContain("src/component.tsx");
+  });
+
+  it("fff backend preserves case-sensitive literal grep behavior", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+    await writeFile(path.join(baseDir, "src", "upper.ts"), "export const Alpha = 1;\n");
+
+    const out = await resolveExecuteResult(
+      tools.grep.execute!(
+        {
+          pattern: "alpha",
+          fileExtensions: ["ts"],
+          mode: "detailed",
+          maxResults: 10,
+        },
+        { toolCallId: "fff-grep-case", messages: [] },
+      ),
+    );
+
+    expect(out.mode).toBe("detailed");
+    if (out.mode !== "detailed") {
+      throw new Error("expected detailed grep output");
+    }
+    const files = out.results.map((result) => result.file.replace(/^\.\//, "")).sort();
+    expect(files).toContain("src/a.ts");
+    expect(files).toContain("src/b.ts");
+    expect(files).not.toContain("src/upper.ts");
+  });
+
+  it("fff backend preserves invalid regex errors", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+
+    const out = await resolveExecuteResult(
+      tools.grep.execute!(
+        {
+          pattern: "[",
+          regex: true,
+          mode: "default",
+        },
+        { toolCallId: "fff-grep-bad-regex", messages: [] },
+      ),
+    );
+
+    expect(out.mode).toBe("default");
+    expect(out.error).toBeDefined();
+    expect(out.results).toEqual([]);
+  });
+
+  it("exposes fuzzy_search only for the fff backend", async () => {
+    const defaultTools = fsTool(baseDir);
+    expect("fuzzy_search" in defaultTools).toBe(false);
+
+    const fffTools = fsTool(baseDir, { fsBackend: "fff" }) as Record<string, unknown>;
+    expect("fuzzy_search" in fffTools).toBe(true);
+
+    const fuzzySearch = fffTools["fuzzy_search"] as {
+      execute?: (input: unknown, options: { toolCallId: string; messages: [] }) => unknown;
+    };
+    if (!fuzzySearch.execute) {
+      throw new Error("expected fuzzy_search execute");
+    }
+
+    const out = await resolveExecuteResult(
+      fuzzySearch.execute(
+        { query: "src/a.ts", maxResults: 5 },
+        { toolCallId: "fuzzy-1", messages: [] },
+      ),
+    );
+
+    expect(out).toMatchObject({
+      truncated: false,
+    });
+    const result = out as { results: { path: string }[]; error?: string };
+    expect(result.error).toBeUndefined();
+    expect(Array.isArray(result.results)).toBe(true);
+  });
 });

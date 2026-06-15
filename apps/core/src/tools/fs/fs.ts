@@ -1,22 +1,26 @@
 import { tool } from "ai";
 import { z } from "zod/v4";
-import { createLogger, env } from "@stanley2058/lilac-utils";
-import { fileTypeFromBuffer } from "file-type";
 import {
   EDIT_ERROR_CODES,
-  READ_ERROR_CODES,
   FileSystem,
+  READ_ERROR_CODES,
   expandTilde,
+  type EffectiveSearchBackend,
   type FileEdit,
+  type FsBackend,
   type GrepMode,
-} from "./fs-impl";
+  type HashlineEdit,
+  type HashlineWarning,
+} from "@stanley2058/lilac-fs";
+import { createLogger, env } from "@stanley2058/lilac-utils";
+import { fileTypeFromBuffer } from "file-type";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
-import { type HashlineEdit, type HashlineWarning } from "./hashline";
 
+import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import {
+  remoteFuzzySearch,
   remoteGrep,
   remoteGlob,
   remoteEditFile,
@@ -48,6 +52,7 @@ const MAX_INSTRUCTION_CHARS = 20_000;
 
 const REMOTE_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
 const REMOTE_MAX_ATTACHMENT_BYTES = 10_000_000;
+const FFF_CACHE_DIR = path.join(env.dataDir, ".cache", "fff");
 
 function resolveRemoteDenyPaths(dangerouslyAllow?: boolean): readonly string[] {
   return dangerouslyAllow === true ? [] : REMOTE_DENY_PATHS;
@@ -278,6 +283,44 @@ const globOutputZod = z.discriminatedUnion("mode", [
 ]);
 
 type GlobOutput = z.infer<typeof globOutputZod>;
+
+export const fuzzySearchInputZod = z.object({
+  query: z
+    .string()
+    .min(1)
+    .describe(
+      "Approximate filename/path query. Use this for fuzzy path discovery, not file content search.",
+    ),
+  cwd: z.string().optional().describe("Optional base directory to search from (supports ~)."),
+  maxResults: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Maximum number of ranked files to return (default: 50)."),
+  dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
+});
+
+type FuzzySearchInput = z.infer<typeof fuzzySearchInputZod>;
+
+const fuzzySearchOutputZod = z.object({
+  results: z.array(
+    z.object({
+      path: z.string(),
+      fileName: z.string(),
+      size: z.number(),
+      gitStatus: z.string(),
+      score: z.number().optional(),
+      matchType: z.string().optional(),
+    }),
+  ),
+  totalMatched: z.number(),
+  totalFiles: z.number(),
+  truncated: z.boolean(),
+  error: z.string().optional(),
+});
+
+type FuzzySearchOutput = z.infer<typeof fuzzySearchOutputZod>;
 
 function buildGrepInputZod(hashlineEnabled: boolean) {
   return z.object({
@@ -597,6 +640,25 @@ function countGrepItems(output: GrepOutput): number {
   return output.results.length;
 }
 
+type SearchBackendMetadata = { effectiveBackend?: EffectiveSearchBackend };
+
+function stripGlobMetadata(output: GlobOutput & SearchBackendMetadata): GlobOutput {
+  const { effectiveBackend: _effectiveBackend, ...rest } = output;
+  return rest;
+}
+
+function stripFuzzySearchMetadata(
+  output: FuzzySearchOutput & SearchBackendMetadata,
+): FuzzySearchOutput {
+  const { effectiveBackend: _effectiveBackend, ...rest } = output;
+  return rest;
+}
+
+function stripGrepMetadata(output: GrepOutput & SearchBackendMetadata): GrepOutput {
+  const { effectiveBackend: _effectiveBackend, ...rest } = output;
+  return rest;
+}
+
 const instructionFieldsZod = z.object({
   loadedInstructions: z
     .array(z.string())
@@ -763,13 +825,14 @@ function normalizeEditOutput(output: {
 
 export function fsTool(
   cwd: string,
-  opts?: { includeEditFile?: boolean; experimentalHashlineEdit?: boolean },
+  opts?: { includeEditFile?: boolean; experimentalHashlineEdit?: boolean; fsBackend?: FsBackend },
 ) {
   const logger = createLogger({
     module: "tool:fs",
   });
   const includeEditFile = opts?.includeEditFile ?? false;
   const hashlineEnabled = opts?.experimentalHashlineEdit === true;
+  const fsBackend = opts?.fsBackend ?? "node-rg";
   const readFileSchema = buildReadFileInputZod(hashlineEnabled);
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
   const grepInputSchema = buildGrepInputZod(hashlineEnabled);
@@ -780,6 +843,8 @@ export function fsTool(
 
   const fileSystem = new FileSystem(cwd, {
     denyPaths: [path.join(env.dataDir, "secret"), "~/.ssh", "~/.aws", "~/.gnupg"],
+    fsBackend,
+    fffCacheDir: FFF_CACHE_DIR,
   });
 
   const attachmentExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"]);
@@ -1247,6 +1312,7 @@ export function fsTool(
             maxEntries: input.maxEntries,
             mode,
             denyPaths: remoteDenyPaths,
+            fsBackend,
           });
 
           logger.info("fs.glob done", {
@@ -1254,9 +1320,10 @@ export function fsTool(
             truncated: res.truncated,
             error: res.error,
             mode: res.mode,
+            effectiveBackend: res.effectiveBackend,
           });
 
-          return res;
+          return stripGlobMetadata(res);
         }
 
         const res = await fileSystem.glob({
@@ -1272,16 +1339,79 @@ export function fsTool(
           truncated: res.truncated,
           error: res.error,
           mode: res.mode,
+          effectiveBackend: res.effectiveBackend,
         });
 
-        return res;
+        return stripGlobMetadata(res);
       },
     }),
 
+    ...(fsBackend === "fff"
+      ? {
+          fuzzy_search: tool<FuzzySearchInput, FuzzySearchOutput>({
+            description:
+              "Fuzzy-ranked file/path search powered by FFF. Use this when you know an approximate filename, symbol-adjacent path, or path fragment and want likely files. Use grep instead when searching file contents or exact text inside files. Supports SSH cwd targets when the remote fff runner can be installed. Denylisted paths require dangerouslyAllow=true.",
+            inputSchema: fuzzySearchInputZod,
+            outputSchema: fuzzySearchOutputZod,
+            execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }) => {
+              const cwdTarget = parseSshCwdTarget(opCwd);
+
+              logger.info("fs.fuzzySearch", {
+                query: input.query,
+                cwd: opCwd,
+                target: cwdTarget.kind,
+                maxResults: input.maxResults,
+                dangerouslyAllow: dangerouslyAllow === true,
+              });
+
+              if (cwdTarget.kind === "ssh") {
+                const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
+                const res = await remoteFuzzySearch({
+                  host: cwdTarget.host,
+                  cwd: cwdTarget.cwd,
+                  input: {
+                    query: input.query,
+                    maxResults: input.maxResults,
+                  },
+                  denyPaths: remoteDenyPaths,
+                });
+
+                logger.info("fs.fuzzySearch done", {
+                  resultCount: res.results.length,
+                  totalMatched: res.totalMatched,
+                  truncated: res.truncated,
+                  error: res.error,
+                  effectiveBackend: res.effectiveBackend,
+                });
+
+                return stripFuzzySearchMetadata(res);
+              }
+
+              const res = await fileSystem.fuzzySearchFiles({
+                query: input.query,
+                maxResults: input.maxResults,
+                baseDir: opCwd,
+                dangerouslyAllow,
+              });
+
+              logger.info("fs.fuzzySearch done", {
+                resultCount: res.results.length,
+                totalMatched: res.totalMatched,
+                truncated: res.truncated,
+                error: res.error,
+                effectiveBackend: res.effectiveBackend,
+              });
+
+              return stripFuzzySearchMetadata(res);
+            },
+          }),
+        }
+      : {}),
+
     grep: tool<GrepInput, GrepOutput>({
       description: hashlineEnabled
-        ? "Search file contents with ripgrep. Recommended mode='default'; use mode='hashline' when you want grep output that can be turned into edit anchors. Use mode='detailed' only when you need column/submatches metadata. Very long lines may downgrade hashline output back to default with a warning that tells you to use bash instead. Denylisted paths require dangerouslyAllow=true."
-        : "Search file contents with ripgrep. Recommended mode='default'; use mode='detailed' only when you need column/submatches metadata. Denylisted paths require dangerouslyAllow=true.",
+        ? "Search file contents. Recommended mode='default'; use mode='hashline' when you want grep output that can be turned into edit anchors. Use mode='detailed' only when you need column/submatches metadata. Very long lines may downgrade hashline output back to default with a warning that tells you to use bash instead. Denylisted paths require dangerouslyAllow=true."
+        : "Search file contents. Recommended mode='default'; use mode='detailed' only when you need column/submatches metadata. Denylisted paths require dangerouslyAllow=true.",
       inputSchema: grepInputSchema,
       outputSchema: grepOutputSchema,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }) => {
@@ -1314,6 +1444,7 @@ export function fsTool(
               mode,
             },
             denyPaths: remoteDenyPaths,
+            fsBackend,
           });
 
           if (res.mode === "hashline") {
@@ -1333,9 +1464,10 @@ export function fsTool(
             truncated: res.truncated,
             error: res.error,
             mode: res.mode,
+            effectiveBackend: res.effectiveBackend,
           });
 
-          return res;
+          return stripGrepMetadata(res);
         }
 
         const res = await fileSystem.grep({
@@ -1354,9 +1486,10 @@ export function fsTool(
           truncated: res.truncated,
           error: res.error,
           mode: res.mode,
+          effectiveBackend: res.effectiveBackend,
         });
 
-        return res;
+        return stripGrepMetadata(res);
       },
     }),
   };

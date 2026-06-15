@@ -26,13 +26,14 @@ function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
     experimentalHashlineEdit:
       context.editingToolMode === "edit_file" &&
       context.runtime.config?.tools.editFile.hashline === true,
+    fsBackend: context.runtime.config?.tools.fsBackend,
   });
   localFsToolsByBuildContext.set(context, tools);
   return tools;
 }
 
 function getFsReadOnlyTool(
-  name: "read_file" | "glob" | "grep",
+  name: "read_file" | "glob" | "grep" | "fuzzy_search",
   context: CoreToolBuildContext,
 ): unknown {
   const tools = getFsTools(context);
@@ -89,6 +90,13 @@ function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
       supportsBatch: true,
       isEnabled: ({ requestContext }) => requestContext?.safetyMode !== "restricted",
       createTool: (context) => getFsReadOnlyTool("grep", context),
+    }),
+    withBuiltinMetadata({
+      name: "fuzzy_search",
+      supportsBatch: true,
+      isEnabled: ({ runtime, requestContext }) =>
+        runtime.config?.tools.fsBackend === "fff" && requestContext?.safetyMode !== "restricted",
+      createTool: (context) => getFsReadOnlyTool("fuzzy_search", context),
     }),
     withBuiltinMetadata({
       name: "edit_file",

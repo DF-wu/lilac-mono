@@ -53,6 +53,7 @@ import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plug
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
+import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 
 export type CoreRuntime = {
   start(): Promise<void>;
@@ -73,6 +74,18 @@ export type CoreRuntimeOptions = {
 
 function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
+}
+
+function runtimeFsDenyPaths(): readonly string[] {
+  const home = process.env.HOME;
+  return [
+    path.resolve(env.dataDir, "secret"),
+    ...(home ? [path.join(home, ".ssh"), path.join(home, ".aws"), path.join(home, ".gnupg")] : []),
+  ];
+}
+
+function fffCacheDir(): string {
+  return path.join(env.dataDir, ".cache", "fff");
 }
 
 export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<CoreRuntime> {
@@ -452,6 +465,19 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
       // Ensure data dir exists before creating sqlite-backed stores.
       await fs.mkdir(env.dataDir, { recursive: true });
+
+      const startupConfig = await getCoreConfig();
+      if (startupConfig.tools.fsBackend === "fff") {
+        void prewarmFffFinders({
+          basePaths: ["/data", "/data/workspace", "/app", cwd],
+          denyPaths: runtimeFsDenyPaths(),
+          cacheDir: fffCacheDir(),
+        }).then((results) => {
+          logger.info("fff finder prewarm completed", {
+            results,
+          });
+        });
+      }
 
       await startCoreConfigWatcher();
 
