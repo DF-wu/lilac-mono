@@ -273,10 +273,10 @@ function buildRemoteFsRunnerCommand(): string {
   const packageSpec = shellSingleQuote(
     process.env.LILAC_REMOTE_FS_RUNNER_PACKAGE ?? readRemoteFsRunnerPackageSpec(),
   );
-  return `if command -v npx >/dev/null 2>&1; then
-  npx -y ${packageSpec} request
-elif command -v bunx >/dev/null 2>&1; then
+  return `if command -v bunx >/dev/null 2>&1; then
   bunx ${packageSpec} request
+elif command -v npx >/dev/null 2>&1; then
+  npx --no-workspaces -y ${packageSpec} request
 else
   echo '{"ok":false,"error":"Remote host has neither npx nor bunx in PATH"}'
 fi`;
@@ -318,9 +318,11 @@ if [ -n "$REMOTE_CWD" ]; then
   fi
 fi
 
-cat <<'__LILAC_INPUT__' | (
+run_remote_fs_runner() {
 ${runnerCommand}
-)
+}
+
+run_remote_fs_runner <<'__LILAC_INPUT__'
 ${inputJson}
 __LILAC_INPUT__
 `;
