@@ -114,6 +114,8 @@ USER ${LILAC_USER}
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # bun (user-level)
 RUN curl -fsSL https://bun.sh/install | bash
+# smart-search (official npm package; bootstraps its isolated Python runtime)
+RUN npm install -g @konbakuyomu/smart-search@latest
 USER root
 
 ############################
