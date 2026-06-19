@@ -29,7 +29,7 @@ If you already know upstream Lilac, start here. This fork keeps the same Bun wor
 | GitHub issue/PR comments | `/lilac` and `@bot` triggers are parsed from the first non-empty, non-quoted, non-code-fenced content line. Agent-authored comments are marked with `<!-- lilac:agent-comment -->` and ignored by webhook ingress. | Users can invoke the agent from GitHub comments more predictably, while avoiding self-trigger loops. |
 | GitHub surface output | GitHub comments created by the adapter, output stream, or `surface.messages.send` are automatically marked as agent comments. | Outbound GitHub replies remain machine-identifiable across both runtime output and tool-driven messages. |
 | ACP controller robustness | Detached ACP runs treat Linux zombie worker processes as dead, and cancellation closes the harness client so workers can settle instead of hanging indefinitely. | Long-running local/automation prompt workflows recover more cleanly from stuck harness transports. |
-| Container delivery | GitHub Actions build and publish GHCR images for `catalina` and `claudia` variants, with `latest` pointing at the `catalina` image. The Docker image also includes `rsync`. | Operators can consume prebuilt images and have a more complete shell toolbox inside the runtime container. |
+| Container delivery | GitHub Actions build and publish GHCR images for `catalina` and `claudia` variants, with `latest` pointing at the `catalina` image. The Docker image also includes `rsync` and the upstream `smart-search` CLI runtime. | Operators can consume prebuilt images and have a more complete shell toolbox plus an official `smart-search` runtime inside the container. |
 | Upstream maintenance | A scheduled GitHub Actions workflow checks `stanley2058/lilac-mono` every 6 hours and merges upstream `main` when possible, then triggers image rebuilds. | This fork is intended to stay close to upstream while keeping local operational patches visible. |
 
 The fork-specific code is intentionally small and easy to audit. Useful entry points are `apps/core/src/github/github-comment-marker.ts`, `apps/core/src/github/webhook/github-webhook-server.ts`, `apps/core/src/surface/github/`, `apps/acp-controller/controller.ts`, and `.github/workflows/`.
@@ -141,6 +141,28 @@ docker compose up --build
 ```
 
 This container path is real, but it is an operator workflow rather than a zero-config quick start. The runtime expects Redis plus runtime configuration such as surface credentials.
+
+### `smart-search` runtime in the image
+
+The runtime container installs the official `@konbakuyomu/smart-search` npm package during image build. That package creates and manages its own isolated Python runtime as part of its upstream install flow, so the image does not need a custom wrapper layer for basic CLI availability.
+
+The image already includes the upstream prerequisites that `smart-search` expects, including `nodejs`, `npm`, `python3`, `python3-pip`, and `python3-venv`.
+
+Because the container sets `XDG_CONFIG_HOME=${DATA_DIR}/.config`, the default `smart-search` config path resolves inside the runtime data directory, typically:
+
+```bash
+/data/.config/smart-search/config.json
+```
+
+Useful checks inside the container:
+
+```bash
+smart-search --version
+smart-search doctor --format json
+smart-search setup
+```
+
+If you persist `/data`, the `smart-search` config and provider credentials persist with it.
 
 ## Operational Prerequisites
 
