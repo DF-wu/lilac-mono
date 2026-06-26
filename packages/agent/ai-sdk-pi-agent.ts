@@ -2,7 +2,7 @@
   ai-sdk-pi-agent.ts
 
   Demo wrapper that provides a pi-agent-like DX (event stream + steering/follow-up queues)
-  on top of AI SDK v6 `streamText().fullStream`.
+  on top of AI SDK `streamText().stream`.
 
   This is intentionally self-contained and not part of any package.
 */
@@ -23,6 +23,7 @@ import {
   type ToolSet,
 } from "ai";
 import {
+  type ModelReasoningEffort,
   normalizeReplayMessages,
   normalizeAssistantToolCallInputMessage,
   normalizeToolCallInputValue,
@@ -50,7 +51,7 @@ export type FollowUpMode = "one-at-a-time" | "all";
 /**
  * Fine-grained events emitted while an assistant message is streaming.
  *
- * These are derived from AI SDK `streamText(...).fullStream` parts.
+ * These are derived from AI SDK `streamText(...).stream` parts.
  */
 export type AiSdkPiAssistantMessageEvent<TOOLS extends ToolSet> =
   | {
@@ -229,6 +230,8 @@ export interface AiSdkPiAgentState<TOOLS extends ToolSet> {
   error?: string;
   /** Provider-specific options. */
   providerOptions?: { [x: string]: JSONObject };
+  /** Portable AI SDK reasoning effort. */
+  reasoning?: ModelReasoningEffort;
 
   /** Debug-only state (optional, can be large). */
   debug?: {
@@ -298,6 +301,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   providerOptions?: {
     [x: string]: JSONObject;
   };
+  /** Optional portable AI SDK reasoning effort. */
+  reasoning?: ModelReasoningEffort;
 
   /** Optional custom URL download hook forwarded to AI SDK. */
   experimentalDownload?: DownloadFunction;
@@ -382,8 +387,6 @@ function sumLanguageModelUsage(
       ),
     },
     totalTokens: sumOptionalNumber(a.totalTokens, b.totalTokens),
-    reasoningTokens: sumOptionalNumber(a.reasoningTokens, b.reasoningTokens),
-    cachedInputTokens: sumOptionalNumber(a.cachedInputTokens, b.cachedInputTokens),
     raw: undefined,
   };
 }
@@ -438,15 +441,20 @@ function mergeUserMessages(messages: ModelMessage[]): ModelMessage[] {
   return [{ role: "user", content: merged }];
 }
 
-function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): TOOLS {
+function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet {
   // We keep the schema/description/title so the model can call tools,
   // but remove execution so we can run tools ourselves (enables steering).
   return Object.fromEntries(
     Object.entries(tools).map(([name, tool]) => {
-      const { execute: _execute, needsApproval: _needsApproval, ...rest } = tool;
+      const {
+        execute: _execute,
+        needsApproval: _needsApproval,
+        contextSchema: _contextSchema,
+        ...rest
+      } = tool;
       return [name, rest];
     }),
-  ) as TOOLS;
+  ) as ToolSet;
 }
 
 function upsertTextPart<A extends Array<any>>(
@@ -558,7 +566,7 @@ function truncateToLastValidBoundary(messages: ModelMessage[]): {
 
 /**
  * A small wrapper that provides a `pi-agent`-style event stream on top of
- * AI SDK v6 `streamText(...).fullStream`.
+ * AI SDK `streamText(...).stream`.
  *
  * Notable behavior:
  * - The model can emit tool calls, but tools are executed locally by this wrapper.
@@ -605,6 +613,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       tools: (options.tools ?? ({} as TOOLS)) as TOOLS,
       messages: normalizeReplayMessages(options.messages ?? []),
       providerOptions: options.providerOptions,
+      reasoning: options.reasoning,
       isStreaming: false,
       streamMessage: null,
       pendingToolCalls: new Set<string>(),
@@ -633,12 +642,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     model: LanguageModel,
     providerOptions?: { [x: string]: JSONObject },
     modelSpecifier?: string,
+    reasoning?: ModelReasoningEffort,
   ) {
     this.state.model = model;
     this.state.modelSpecifier = modelSpecifier;
 
     // (When not provided) Reset provider options in case incompatible.
     this.state.providerOptions = providerOptions;
+    this.state.reasoning = reasoning;
   }
 
   /** Replace the toolset used for subsequent turns. */
@@ -1067,12 +1078,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const toolsForModel = stripToolExecuteForModel(this.state.tools);
     const result = streamText({
       model: this.state.model,
-      system: this.state.system,
+      instructions: this.state.system,
       messages: messagesForModel,
       tools: toolsForModel,
+      reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
-      experimental_context: this.context,
       abortSignal,
     });
 
@@ -1083,13 +1094,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       role: "assistant",
       content: [],
     };
-    // Tool calls observed in `fullStream` may still have raw/unvalidated JSON.
+    // Tool calls observed in `stream` may still have raw/unvalidated JSON.
     // They are useful for UI events, but we must execute tools only from the
     // finalized `response.messages` (post-parse + schema validation).
 
     let aborted = false;
 
-    for await (const part of result.fullStream) {
+    for await (const part of result.stream) {
       if (part.type === "abort") {
         aborted = true;
         break;
@@ -1415,7 +1426,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               ? await tool.needsApproval(call.input, {
                   toolCallId: call.toolCallId,
                   messages: this.state.messages,
-                  experimental_context: this.context,
+                  context: this.context,
                 })
               : Boolean(tool.needsApproval);
 
@@ -1433,7 +1444,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               toolCallId: call.toolCallId,
               messages: this.state.messages,
               abortSignal: this.abortController?.signal,
-              experimental_context: this.context,
+              context: this.context,
             });
 
             if (isAsyncIterable(raw)) {
