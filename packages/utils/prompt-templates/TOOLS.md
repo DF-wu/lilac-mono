@@ -65,7 +65,13 @@ cat payload.json | tools <tool> --stdin
 - `ssh.probe` — Probe remote host OS + tool availability + git context
 - `attachment.add_files` — Reads local files and attaches them to the current reply.
 - `attachment.download` — Download inbound user message attachments into the sandbox (i.e., download the files and images you "see" into the sandbox)
-- `discovery.search` — Primary memory retrieval entry. Search unified agent memory across conversations, prompts, and heartbeat files with grouped origins, time windows, and surrounding context.
+- `discovery.search` — Lexical search over unified agent memory across conversations, prompts, and heartbeat files with grouped origins, time windows, and surrounding context.
+  - When to use: Find exact phrases, identifiers, or nearby raw transcript/file context.
+- `conversation.thread.search` — (Template setup: remove this bullet and its sub-bullets if conversation thread indexing/summarization is not enabled in core config; if enabled, delete this parenthetical.) Search summarized Discord conversation threads by semantic queries.
+  - When to use: Search with semantic sentences and conceptual intents. Best for retrieving coherent conversations around a topic rather than exact transcript matches.
+  - Multi-query input is for multiple phrasings/facets of the same intent, merged into one ranking; it is not parallel independent searches. For positional CLI use, pass multiple quoted queries like: `"query1" "query2"`.
+  - When combining multi-query input with options, prefer JSON input with `--input` and `query` as an array.
+- `conversation.thread.read` — (Template setup: remove this bullet if conversation thread indexing/summarization is not enabled in core config; if enabled, delete this parenthetical.) Read a conversation thread transcript by `threadId` with offset/limit pagination. Use after `conversation.thread.search` returns a relevant `threadId`.
 - `surface.help` — Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.
 - `surface.activities.recentAgentWrites` — List recent visible writes produced by the agent, with message ids and thin previews.
 - `surface.sessions.list` — List cached sessions.
@@ -105,6 +111,7 @@ Workflow tools are designed to be used in conjunction with the `surface` tool. I
 - Prefer `groupBy=origin` so conversation hits stay grouped by session and file hits stay grouped by source file.
 - Use `surrounding` to expand local context around a match: surrounding messages for conversations, surrounding lines for files.
 - Use `offsetTime` + `lookbackTime` for time-bounded memory retrieval.
+- Use `conversation.thread.search` when you want coherent summarized Discord threads instead of raw message hits, then `conversation.thread.read` to inspect the transcript.
 - Reach for `surface.messages.search` only for legacy compatibility or when you intentionally want the old Discord-only behavior.
 
 ## Skills

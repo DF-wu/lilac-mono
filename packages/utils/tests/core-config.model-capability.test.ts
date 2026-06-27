@@ -7,25 +7,43 @@ import {
 } from "../core-config";
 
 describe("coreConfigSchema models.capability", () => {
-  it("defaults conversation thread summarization and embedding config", () => {
+  it("defaults conversation thread summarization, embedding, and auto injection config", () => {
     const v1 = parseCoreConfigV1ToUniversal({});
     expect(v1.conversation.thread.summarization).toEqual({
       enabled: false,
       model: "fast",
+      concurrency: 1,
+      includePromptContext: false,
     });
     expect(v1.conversation.thread.embedding).toEqual({
       enabled: false,
       model: "openai/text-embedding-3-small",
+    });
+    expect(v1.conversation.thread.autoInject).toEqual({
+      enabled: false,
+      minTextUnits: 80,
+      limit: 3,
+      mode: "hybrid",
+      filterCurrentParticipants: false,
     });
 
     const v2 = coreConfigInputSchemaV2.parse({ configVersion: 2 });
     expect(v2.conversation.thread.summarization).toEqual({
       enabled: false,
       model: "fast",
+      concurrency: 1,
+      includePromptContext: false,
     });
     expect(v2.conversation.thread.embedding).toEqual({
       enabled: false,
       model: "openai/text-embedding-3-small",
+    });
+    expect(v2.conversation.thread.autoInject).toEqual({
+      enabled: false,
+      minTextUnits: 80,
+      limit: 3,
+      mode: "hybrid",
+      filterCurrentParticipants: false,
     });
   });
 
@@ -37,6 +55,8 @@ describe("coreConfigSchema models.capability", () => {
           summarization: {
             enabled: true,
             model: "openrouter/openai/gpt-4o-mini",
+            concurrency: 4,
+            includePromptContext: true,
           },
         },
       },
@@ -45,6 +65,8 @@ describe("coreConfigSchema models.capability", () => {
     expect(parsed.conversation.thread.summarization).toEqual({
       enabled: true,
       model: "openrouter/openai/gpt-4o-mini",
+      concurrency: 4,
+      includePromptContext: true,
     });
   });
 

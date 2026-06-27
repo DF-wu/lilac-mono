@@ -261,24 +261,70 @@ const conversationSchemaV2 = z
           .object({
             enabled: z.boolean().default(false),
             model: z.string().trim().min(1).default("fast"),
+            concurrency: z.number().int().min(1).max(128).default(1),
+            includePromptContext: z.boolean().default(false),
           })
-          .default({ enabled: false, model: "fast" }),
+          .default({
+            enabled: false,
+            model: "fast",
+            concurrency: 1,
+            includePromptContext: false,
+          }),
         embedding: z
           .object({
             enabled: z.boolean().default(false),
             model: z.string().trim().min(1).default("openai/text-embedding-3-small"),
           })
           .default({ enabled: false, model: "openai/text-embedding-3-small" }),
+        autoInject: z
+          .object({
+            enabled: z.boolean().default(false),
+            minTextUnits: z.number().int().positive().default(80),
+            limit: z.number().int().positive().max(10).default(3),
+            mode: z.enum(["hybrid", "semantic", "lexical"]).default("hybrid"),
+            filterCurrentParticipants: z.boolean().default(false),
+          })
+          .default({
+            enabled: false,
+            minTextUnits: 80,
+            limit: 3,
+            mode: "hybrid",
+            filterCurrentParticipants: false,
+          }),
       })
       .default({
-        summarization: { enabled: false, model: "fast" },
+        summarization: {
+          enabled: false,
+          model: "fast",
+          concurrency: 1,
+          includePromptContext: false,
+        },
         embedding: { enabled: false, model: "openai/text-embedding-3-small" },
+        autoInject: {
+          enabled: false,
+          minTextUnits: 80,
+          limit: 3,
+          mode: "hybrid",
+          filterCurrentParticipants: false,
+        },
       }),
   })
   .default({
     thread: {
-      summarization: { enabled: false, model: "fast" },
+      summarization: {
+        enabled: false,
+        model: "fast",
+        concurrency: 1,
+        includePromptContext: false,
+      },
       embedding: { enabled: false, model: "openai/text-embedding-3-small" },
+      autoInject: {
+        enabled: false,
+        minTextUnits: 80,
+        limit: 3,
+        mode: "hybrid",
+        filterCurrentParticipants: false,
+      },
     },
   });
 

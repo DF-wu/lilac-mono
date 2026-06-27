@@ -12,6 +12,44 @@ import {
   resolveBuildId,
 } from "./client";
 
+const CLIENT_ENTRY = path.join(import.meta.dir, "client.ts");
+
+async function runToolBridgeCli(params: {
+  args: readonly string[];
+  backendUrl: string;
+  stdin?: string;
+  env?: Record<string, string>;
+}): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const proc = Bun.spawn(["bun", CLIENT_ENTRY, ...params.args], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      ...params.env,
+      TOOL_SERVER_BACKEND_URL: params.backendUrl,
+      NO_COLOR: "1",
+    },
+    stdin: params.stdin === undefined ? "ignore" : "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  if (params.stdin !== undefined) {
+    if (!proc.stdin) {
+      throw new Error("expected writable stdin");
+    }
+    proc.stdin.write(params.stdin);
+    proc.stdin.end();
+  }
+
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  return { stdout, stderr, exitCode };
+}
+
 describe("tool-bridge entrypoint detection", () => {
   it("treats the generated dist index wrapper as the main CLI entrypoint", () => {
     expect(
@@ -99,6 +137,142 @@ describe("tool-bridge build id", () => {
   });
 });
 
+describe("tool-bridge CLI runtime", () => {
+  it("posts stdin JSON to the backend and forwards Lilac request headers", async () => {
+    const requests: Array<{ pathname: string; headers: Headers; body: unknown }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const url = new URL(req.url);
+        requests.push({
+          pathname: url.pathname,
+          headers: req.headers,
+          body: (await req.json()) as unknown,
+        });
+
+        return new Response(
+          JSON.stringify({
+            isError: false,
+            output: {
+              ok: true,
+              value: 42,
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["demo.echo", "--stdin", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+        stdin: JSON.stringify({ message: "hello", nested: { count: 2 } }),
+        env: {
+          LILAC_REQUEST_ID: "request-123",
+          LILAC_SESSION_ID: "session-456",
+          LILAC_REQUEST_CLIENT: "test-client",
+          LILAC_CWD: "/workspace/project",
+        },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout) as unknown).toEqual({ ok: true, value: 42 });
+
+      expect(requests).toHaveLength(1);
+      const request = requests[0];
+      if (!request) {
+        throw new Error("expected backend request");
+      }
+      expect(request.pathname).toBe("/call");
+      expect(request.headers.get("content-type")).toContain("application/json");
+      expect(request.headers.get("x-lilac-request-id")).toBe("request-123");
+      expect(request.headers.get("x-lilac-session-id")).toBe("session-456");
+      expect(request.headers.get("x-lilac-request-client")).toBe("test-client");
+      expect(request.headers.get("x-lilac-cwd")).toBe("/workspace/project");
+      expect(request.body).toEqual({
+        callableId: "demo.echo",
+        input: {
+          message: "hello",
+          nested: { count: 2 },
+        },
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("exits nonzero and writes stderr when the backend returns a tool error", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return new Response(JSON.stringify({ isError: true, output: "tool failed" }), {
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["demo.fail", "--input={}", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Error: tool failed");
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("suggests a nearby callable when an HTTP error reports an unknown callable", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/list") {
+          return new Response(
+            JSON.stringify({
+              tools: [{ callableId: "workflow.create" }, { callableId: "fs.read" }],
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+
+        if (url.pathname === "/call") {
+          await req.text();
+          return new Response(JSON.stringify({ message: "Unknown callable ID 'workflo.create'" }), {
+            status: 404,
+            headers: { "content-type": "application/json" },
+          });
+        }
+
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["workflo.create", "--input={}"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(
+        "Unknown callable ID 'workflo.create'. Did you mean 'workflow.create'?",
+      );
+    } finally {
+      server.stop(true);
+    }
+  });
+});
+
 describe("tool-bridge positional input", () => {
   it("parses a bare positional argument for tool calls", () => {
     const parsed = parseArgs(["fetch", "https://example.com", "--mode=browser"]);
@@ -109,6 +283,25 @@ describe("tool-bridge positional input", () => {
     expect(parsed.callableId).toBe("fetch");
     expect(parsed.positionalArgs).toEqual(["https://example.com"]);
     expect(parsed.fieldInputs).toEqual([{ field: "mode", value: "browser" }]);
+  });
+
+  it("treats bare tool flags as boolean true without consuming the next token", () => {
+    const parsed = parseArgs(["search", "query", "--case-sensitive", "next"]);
+
+    expect(parsed.type).toBe("call");
+    if (parsed.type !== "call") return;
+
+    expect(parsed.positionalArgs).toEqual(["query", "next"]);
+    expect(parsed.fieldInputs).toEqual([{ field: "caseSensitive", value: true }]);
+  });
+
+  it("requires equals syntax for value-required control flags", () => {
+    expect(() => parseArgs(["fetch", "--output", "json"])).toThrow(
+      "--output requires a value: --output=compact|json",
+    );
+    expect(() => parseArgs(["fetch", "--input", "payload.json"])).toThrow(
+      "--input requires a value",
+    );
   });
 
   it("supports `--` for positional values that begin with dashes", () => {
@@ -151,23 +344,29 @@ describe("tool-bridge positional input", () => {
     });
   });
 
-  it("rejects mixed flags with variadic primary positionals", async () => {
-    const parsed = parseArgs(["attachment.add_files", "a.png", "--filenames=renamed.png"]);
+  it("allows flags alongside variadic primary positionals", async () => {
+    const parsed = parseArgs([
+      "attachment.add_files",
+      "a.png",
+      "b.png",
+      '--filenames:json=["renamed-a.png","renamed-b.png"]',
+    ]);
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
-    await expect(buildToolInput(parsed, { field: "paths", variadic: true })).rejects.toThrow(
-      "does not support mixing variadic positional <paths...> with flags or JSON input",
-    );
+    await expect(buildToolInput(parsed, { field: "paths", variadic: true })).resolves.toEqual({
+      paths: ["a.png", "b.png"],
+      filenames: ["renamed-a.png", "renamed-b.png"],
+    });
   });
 
-  it("rejects mixed JSON input with variadic primary positionals", async () => {
+  it("rejects duplicate variadic positional and named input for the same field", async () => {
     const parsed = parseArgs(["attachment.add_files", "a.png", '--input={"paths":["b.png"]}']);
     expect(parsed.type).toBe("call");
     if (parsed.type !== "call") return;
 
     await expect(buildToolInput(parsed, { field: "paths", variadic: true })).rejects.toThrow(
-      "does not support mixing variadic positional <paths...> with flags or JSON input",
+      "Primary positional <paths...> conflicts with an existing 'paths' value",
     );
   });
 

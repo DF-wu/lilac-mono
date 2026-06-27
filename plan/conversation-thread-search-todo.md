@@ -31,3 +31,10 @@
 - [x] Push Discord allowlist filtering into store-level thread search before SQL `LIMIT`.
 - [x] Add thread summary importance metadata and a small ranking nudge.
 - [x] Add configurable `conversation.thread.summarization.model`.
+- [x] Add configurable summarization concurrency and force reruns.
+- [x] Exclude one-message threads from summarization eligibility.
+- [x] Normalize Discord entities before thread summarization.
+- [x] Add English-first summarizer guidance and retrieval hints for colloquial search.
+- [x] Add positive-only aboutness summary fields and weighted semantic facets.
+- [x] If aboutness facets are insufficient, add one request-time LLM aboutness interpretation pass over all query variants plus generic coverage scoring.
+- [-] If query interpretation is insufficient, add a top-N LLM reranker for subject-level relevance judgment.

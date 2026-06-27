@@ -93,10 +93,19 @@ export type UniversalCoreConfig = {
       summarization: {
         enabled: boolean;
         model: string;
+        concurrency: number;
+        includePromptContext: boolean;
       };
       embedding: {
         enabled: boolean;
         model: string;
+      };
+      autoInject: {
+        enabled: boolean;
+        minTextUnits: number;
+        limit: number;
+        mode: "hybrid" | "semantic" | "lexical";
+        filterCurrentParticipants: boolean;
       };
     };
   };

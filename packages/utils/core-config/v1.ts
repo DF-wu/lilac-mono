@@ -703,10 +703,19 @@ export function parseCoreConfigV1ToUniversal(raw: unknown): UniversalCoreConfig 
         summarization: {
           enabled: false,
           model: "fast",
+          concurrency: 1,
+          includePromptContext: false,
         },
         embedding: {
           enabled: false,
           model: "openai/text-embedding-3-small",
+        },
+        autoInject: {
+          enabled: false,
+          minTextUnits: 80,
+          limit: 3,
+          mode: "hybrid",
+          filterCurrentParticipants: false,
         },
       },
     },

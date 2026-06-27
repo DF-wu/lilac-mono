@@ -6,12 +6,21 @@ import {
   type JSONObject,
 } from "@stanley2058/lilac-utils";
 
-export type ConversationThreadEmbeddingFacet = "combined" | "brief" | "topics" | "title";
+export type ConversationThreadEmbeddingFacet =
+  | "combined"
+  | "aboutnessDomains"
+  | "aboutnessSituations"
+  | "aboutnessComplaintTargets"
+  | "aboutnessEntities"
+  | "userWouldAskForThisAs"
+  | "brief"
+  | "retrievalHints"
+  | "topics"
+  | "title";
 
 export type ConversationThreadFacetInput = {
   facet: ConversationThreadEmbeddingFacet;
   text: string;
-  weight: number;
 };
 
 export type ConversationThreadEmbeddingAdapter = {
