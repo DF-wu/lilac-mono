@@ -1,4 +1,11 @@
-import { generateText, Output, streamText, type ModelMessage } from "ai";
+import {
+  generateText,
+  Output,
+  streamText,
+  type FinishReason,
+  type LanguageModelUsage,
+  type ModelMessage,
+} from "ai";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
@@ -21,7 +28,7 @@ import {
   type ConversationThreadSummaryInput,
   CONVERSATION_THREAD_SUMMARY_VERSION,
 } from "./thread-store";
-import type { ConversationThreadEmbeddingAdapter } from "./thread-embedding";
+import type { ConversationThreadEmbeddingAdapterResolver } from "./thread-embedding";
 import type { EntityMapper } from "../entity/entity-mapper";
 
 const SUMMARY_QUIET_MS = 60 * 60 * 1000;
@@ -37,6 +44,10 @@ const COVERAGE_RECALL_MULTIPLIER = 5;
 const WEAK_COVERAGE_MULTIPLIER = 0.25;
 const DOMAIN_MISMATCH_COVERAGE_MULTIPLIER = 0.35;
 const PARTIAL_COVERAGE_MULTIPLIER = 0.55;
+
+const threadLogger = createLogger({
+  module: "conversation-thread",
+});
 
 const COVERAGE_STOP_WORDS = new Set([
   "a",
@@ -281,7 +292,9 @@ export type ConversationThreadReadOutput = {
 
 export type ConversationThreadSummarizer = (input: {
   cfg: CoreConfig;
+  jobId?: string;
   threadId: string;
+  attempt?: number;
   previousSummary: ConversationThreadSummary | null;
   promptContext: ConversationThreadPromptContext | null;
   messages: readonly ConversationThreadMessage[];
@@ -292,6 +305,60 @@ type ConversationThreadPromptContext = {
   hash: string;
   text: string;
 };
+
+type ThreadLanguageModelUsageOperation = "summary" | "query_aboutness" | "auto_inject_query_plan";
+
+type ThreadLanguageModelCallEndEvent = {
+  provider: string;
+  modelId: string;
+  finishReason: FinishReason;
+  usage: LanguageModelUsage;
+  performance: {
+    responseTimeMs: number;
+    outputTokensPerSecond: number | undefined;
+    timeToFirstOutputMs: number | undefined;
+  };
+};
+
+function createThreadLanguageModelUsageLogger(input: {
+  operation: ThreadLanguageModelUsageOperation;
+  modelSpec: string;
+  jobId?: string;
+  threadId?: string;
+  attempt?: number;
+  messageCount?: number;
+  omittedMessages?: number;
+  queryCount?: number;
+  inputChars?: number;
+}) {
+  return (event: ThreadLanguageModelCallEndEvent) => {
+    threadLogger.info("conversation.thread.llm.usage", {
+      operation: input.operation,
+      jobId: input.jobId,
+      threadId: input.threadId,
+      attempt: input.attempt,
+      messageCount: input.messageCount,
+      omittedMessages: input.omittedMessages,
+      queryCount: input.queryCount,
+      inputChars: input.inputChars,
+      modelSpec: input.modelSpec,
+      provider: event.provider,
+      modelId: event.modelId,
+      finishReason: event.finishReason,
+      inputTokens: event.usage.inputTokens,
+      outputTokens: event.usage.outputTokens,
+      totalTokens: event.usage.totalTokens,
+      cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
+      cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
+      noCacheTokens: event.usage.inputTokenDetails.noCacheTokens,
+      reasoningTokens: event.usage.outputTokenDetails.reasoningTokens,
+      textTokens: event.usage.outputTokenDetails.textTokens,
+      responseTimeMs: event.performance.responseTimeMs,
+      timeToFirstOutputMs: event.performance.timeToFirstOutputMs,
+      outputTokensPerSecond: event.performance.outputTokensPerSecond,
+    });
+  };
+}
 
 export class ConversationThreadSummaryParseError extends Error {
   readonly rawOutput?: string;
@@ -781,7 +848,9 @@ function clampSummarizationConcurrency(input: number): number {
 
 async function defaultSummarizer(input: {
   cfg: CoreConfig;
+  jobId?: string;
   threadId: string;
+  attempt?: number;
   previousSummary: ConversationThreadSummary | null;
   promptContext: ConversationThreadPromptContext | null;
   messages: readonly ConversationThreadMessage[];
@@ -830,6 +899,15 @@ async function defaultSummarizer(input: {
   ] satisfies ModelMessage[];
 
   const instructions = buildThreadSummaryInstructions();
+  const onLanguageModelCallEnd = createThreadLanguageModelUsageLogger({
+    operation: "summary",
+    modelSpec: resolved.spec,
+    jobId: input.jobId,
+    threadId: input.threadId,
+    attempt: input.attempt,
+    messageCount: input.messages.length,
+    omittedMessages: input.omittedMessages ?? 0,
+  });
 
   if (resolved.provider === "codex") {
     const result = streamText({
@@ -838,6 +916,7 @@ async function defaultSummarizer(input: {
       messages,
       reasoning: resolved.reasoning,
       providerOptions: resolved.providerOptions,
+      onLanguageModelCallEnd,
     });
 
     try {
@@ -862,6 +941,7 @@ async function defaultSummarizer(input: {
     maxOutputTokens: 4096,
     reasoning: resolved.reasoning,
     providerOptions: resolved.providerOptions,
+    onLanguageModelCallEnd,
   });
 
   return result.output;
@@ -885,6 +965,11 @@ async function defaultQueryAboutnessSummarizer(input: {
     },
   ] satisfies ModelMessage[];
   const instructions = buildQueryAboutnessInstructions();
+  const onLanguageModelCallEnd = createThreadLanguageModelUsageLogger({
+    operation: "query_aboutness",
+    modelSpec: resolved.spec,
+    queryCount: input.queries.length,
+  });
 
   if (resolved.provider === "codex") {
     const result = streamText({
@@ -893,6 +978,7 @@ async function defaultQueryAboutnessSummarizer(input: {
       messages,
       reasoning: resolved.reasoning,
       providerOptions: resolved.providerOptions,
+      onLanguageModelCallEnd,
     });
     return parseQueryAboutnessJson(await result.text);
   }
@@ -905,6 +991,7 @@ async function defaultQueryAboutnessSummarizer(input: {
     maxOutputTokens: 2048,
     reasoning: resolved.reasoning,
     providerOptions: resolved.providerOptions,
+    onLanguageModelCallEnd,
   });
 
   return normalizeQueryAboutness(result.output);
@@ -929,6 +1016,11 @@ async function defaultAutoInjectQueryPlanner(input: {
     },
   ] satisfies ModelMessage[];
   const instructions = buildAutoInjectQueryPlanInstructions();
+  const onLanguageModelCallEnd = createThreadLanguageModelUsageLogger({
+    operation: "auto_inject_query_plan",
+    modelSpec: resolved.spec,
+    inputChars: input.text.length,
+  });
 
   if (resolved.provider === "codex") {
     const result = streamText({
@@ -937,6 +1029,7 @@ async function defaultAutoInjectQueryPlanner(input: {
       messages,
       reasoning: resolved.reasoning,
       providerOptions: resolved.providerOptions,
+      onLanguageModelCallEnd,
     });
     return parseAutoInjectQueryPlanJson(await result.text);
   }
@@ -949,6 +1042,7 @@ async function defaultAutoInjectQueryPlanner(input: {
     maxOutputTokens: 2048,
     reasoning: resolved.reasoning,
     providerOptions: resolved.providerOptions,
+    onLanguageModelCallEnd,
   });
 
   return normalizeAutoInjectQueryPlan(result.output);
@@ -1056,9 +1150,7 @@ export function buildThreadSummaryInstructions(): string {
 }
 
 export class ConversationThreadService {
-  private readonly logger = createLogger({
-    module: "conversation-thread",
-  });
+  private readonly logger = threadLogger;
 
   constructor(
     private readonly params: {
@@ -1067,7 +1159,7 @@ export class ConversationThreadService {
       summarizer?: ConversationThreadSummarizer;
       queryAboutnessSummarizer?: ConversationThreadQueryAboutnessSummarizer;
       autoInjectQueryPlanner?: ConversationThreadAutoInjectQueryPlanner;
-      embeddingAdapter?: ConversationThreadEmbeddingAdapter;
+      getEmbeddingAdapter?: ConversationThreadEmbeddingAdapterResolver;
       entityMapper?: Pick<EntityMapper, "normalizeIncomingText">;
     },
   ) {}
@@ -1093,6 +1185,9 @@ export class ConversationThreadService {
     const mode = input.mode ?? "hybrid";
     const queries = normalizeSearchQueries(input.query);
     const cfg = await this.params.getConfig();
+    const embeddingAdapter = this.params.getEmbeddingAdapter
+      ? await this.params.getEmbeddingAdapter()
+      : null;
     const filters = buildSearchFilters(input);
     const recallLimit =
       mode === "lexical" ? limit : Math.min(50, Math.max(limit * COVERAGE_RECALL_MULTIPLIER, 10));
@@ -1101,6 +1196,7 @@ export class ConversationThreadService {
       limit: recallLimit,
       mode,
       cfg,
+      embeddingAdapter,
       filters,
       allowlist: buildSearchAllowlist(cfg),
     });
@@ -1120,8 +1216,7 @@ export class ConversationThreadService {
         limit,
         mode,
         count: hits.length,
-        vectorAvailable:
-          this.params.store.isVectorSearchAvailable() && !!this.params.embeddingAdapter,
+        vectorAvailable: this.params.store.isVectorSearchAvailable() && !!embeddingAdapter,
         vectorError: this.params.store.getVectorLoadError() ?? undefined,
         ...(input.verbose && queryAboutness ? { queryAboutness } : {}),
         ...(input.verbose && queryAboutnessError ? { queryAboutnessError } : {}),
@@ -1215,13 +1310,13 @@ export class ConversationThreadService {
     input: ConversationThreadRunSummarizationInput = {},
   ): Promise<ConversationThreadRunSummarizationResult> {
     const jobId = input.jobId;
-    this.logger.info("thread summarization refresh started", { jobId });
+    this.logger.debug("thread summarization refresh started", { jobId });
     const refreshed = this.refreshThreads();
-    this.logger.info("thread summarization refresh completed", { jobId, refreshed });
+    this.logger.debug("thread summarization refresh completed", { jobId, refreshed });
 
     if (input.clear === true && input.dryRun === true) {
       const clearTargets = this.params.store.listThreadsForSummarizationClear();
-      this.logger.info("thread summarization clear dry run completed", {
+      this.logger.debug("thread summarization clear dry run completed", {
         jobId,
         clearTargets: clearTargets.length,
         threadId: input.threadId,
@@ -1243,7 +1338,7 @@ export class ConversationThreadService {
     const clearedThreadIds =
       input.clear === true ? this.params.store.clearSummarizationState() : [];
     if (input.clear === true) {
-      this.logger.info("thread summarization state cleared", {
+      this.logger.debug("thread summarization state cleared", {
         jobId,
         cleared: clearedThreadIds.length,
         threadId: input.threadId,
@@ -1253,11 +1348,14 @@ export class ConversationThreadService {
     }
 
     const cfg = await this.params.getConfig();
+    const embeddingAdapter = this.params.getEmbeddingAdapter
+      ? await this.params.getEmbeddingAdapter()
+      : null;
     const promptContext = cfg.conversation.thread.summarization.includePromptContext
       ? await loadPromptContext()
       : null;
     if (promptContext) {
-      this.logger.info("thread summarization prompt context loaded", {
+      this.logger.debug("thread summarization prompt context loaded", {
         jobId,
         hash: promptContext.hash,
       });
@@ -1269,12 +1367,12 @@ export class ConversationThreadService {
       threadId: input.threadId,
       beforeTs: input.beforeTs,
       afterTs: input.afterTs,
-      includeEmbeddingStale:
-        !!this.params.embeddingAdapter && this.params.store.isVectorSearchAvailable(),
+      includeEmbeddingStale: !!embeddingAdapter && this.params.store.isVectorSearchAvailable(),
+      embeddingModelId: embeddingAdapter?.modelId,
       summaryPromptContextHash: promptContext?.hash,
       force: input.force === true,
     });
-    this.logger.info("thread summarization eligibility completed", {
+    this.logger.debug("thread summarization eligibility completed", {
       jobId,
       eligible: eligible.length,
       dryRun: input.dryRun === true,
@@ -1298,9 +1396,18 @@ export class ConversationThreadService {
     };
 
     if (input.dryRun) {
-      this.logger.info("thread summarization dry run completed", {
+      this.logger.debug("thread summarization dry run completed", {
         jobId,
         eligible: result.eligible,
+      });
+      return result;
+    }
+
+    if (eligible.length === 0) {
+      this.logger.debug("thread summarization skipped: no eligible threads", {
+        jobId,
+        force: input.force === true,
+        clear: input.clear === true,
       });
       return result;
     }
@@ -1321,7 +1428,7 @@ export class ConversationThreadService {
 
     const processThread = async (thread: (typeof eligible)[number]): Promise<void> => {
       const threadStartedAt = Date.now();
-      this.logger.info("thread summarization thread started", {
+      this.logger.debug("thread summarization thread started", {
         jobId,
         threadId: thread.thread_id,
         kind: thread.kind,
@@ -1332,7 +1439,7 @@ export class ConversationThreadService {
       });
       const summaryRead = readSummaryMessages(this.params.store, thread.thread_id);
       if (summaryRead.totalMessages === 0) {
-        this.logger.info("thread summarization deleting empty thread", {
+        this.logger.debug("thread summarization deleting empty thread", {
           jobId,
           threadId: thread.thread_id,
         });
@@ -1350,7 +1457,7 @@ export class ConversationThreadService {
           (promptContext !== null && thread.summary_prompt_context_hash !== promptContext.hash);
         const previousSummary = this.params.store.getSummary(thread.thread_id);
         if (summaryRead.omittedMessages > 0) {
-          this.logger.info("thread summarization transcript truncated", {
+          this.logger.debug("thread summarization transcript truncated", {
             jobId,
             threadId: thread.thread_id,
             totalMessages: summaryRead.totalMessages,
@@ -1360,7 +1467,7 @@ export class ConversationThreadService {
         }
         const summaryWrite = summaryIsStale
           ? await (async () => {
-              this.logger.info("thread summary generation started", {
+              this.logger.debug("thread summary generation started", {
                 jobId,
                 threadId: thread.thread_id,
                 totalMessages: summaryRead.totalMessages,
@@ -1389,7 +1496,7 @@ export class ConversationThreadService {
                 this.params.store.computeEmbeddingInputHash(thread.thread_id) ?? "",
             };
         if (summaryIsStale) {
-          this.logger.info("thread summary generation completed", {
+          this.logger.debug("thread summary generation completed", {
             jobId,
             threadId: thread.thread_id,
             facets: summaryWrite.facets.length,
@@ -1399,11 +1506,12 @@ export class ConversationThreadService {
         await this.tryEmbedThread({
           jobId,
           threadId: thread.thread_id,
+          embeddingAdapter,
           embeddingInputHash: summaryWrite.embeddingInputHash,
           facets: summaryWrite.facets,
         });
         if (summaryIsStale) result.summarized += 1;
-        this.logger.info("thread summarization thread completed", {
+        this.logger.debug("thread summarization thread completed", {
           jobId,
           threadId: thread.thread_id,
           durationMs: Date.now() - threadStartedAt,
@@ -1493,7 +1601,9 @@ export class ConversationThreadService {
       try {
         return await input.summarize({
           cfg: input.cfg,
+          jobId: input.jobId,
           threadId: input.threadId,
+          attempt,
           promptContext: input.promptContext,
           previousSummary: input.previousSummary,
           messages: input.messages,
@@ -1531,10 +1641,11 @@ export class ConversationThreadService {
   private async tryEmbedThread(input: {
     jobId?: string;
     threadId: string;
+    embeddingAdapter: Awaited<ReturnType<ConversationThreadEmbeddingAdapterResolver>>;
     embeddingInputHash: string;
     facets: ReturnType<ConversationThreadStore["listFacets"]>;
   }): Promise<void> {
-    const adapter = this.params.embeddingAdapter;
+    const adapter = input.embeddingAdapter;
     if (!adapter) return;
     if (!this.params.store.isVectorSearchAvailable()) {
       const err = this.params.store.getVectorLoadError();
@@ -1548,7 +1659,7 @@ export class ConversationThreadService {
 
     const embeddings = [];
     let dimensions: number | null = null;
-    this.logger.info("thread embedding generation started", {
+    this.logger.debug("thread embedding generation started", {
       jobId: input.jobId,
       threadId: input.threadId,
       facets: input.facets.length,
@@ -1569,7 +1680,7 @@ export class ConversationThreadService {
     }
 
     if (dimensions === null) {
-      this.logger.info("thread embedding generation skipped: no facets", {
+      this.logger.debug("thread embedding generation skipped: no facets", {
         jobId: input.jobId,
         threadId: input.threadId,
       });
@@ -1583,7 +1694,7 @@ export class ConversationThreadService {
       dimensions,
       embeddings,
     });
-    this.logger.info("thread embedding generation completed", {
+    this.logger.debug("thread embedding generation completed", {
       jobId: input.jobId,
       threadId: input.threadId,
       facets: embeddings.length,
@@ -1648,6 +1759,7 @@ export class ConversationThreadService {
     limit: number;
     mode: "hybrid" | "semantic" | "lexical";
     cfg: CoreConfig;
+    embeddingAdapter: Awaited<ReturnType<ConversationThreadEmbeddingAdapterResolver>>;
     filters: ConversationThreadSearchFilters;
     allowlist: ConversationThreadSearchAllowlist;
   }): Promise<ConversationThreadSearchHit[]> {
@@ -1690,7 +1802,7 @@ export class ConversationThreadService {
       }
     }
 
-    const adapter = this.params.embeddingAdapter;
+    const adapter = input.embeddingAdapter;
     if (input.mode !== "lexical" && adapter && this.params.store.isVectorSearchAvailable()) {
       try {
         const queryEmbedding = await adapter.embed({ text: input.query, facet: "query" });
@@ -1728,6 +1840,7 @@ export class ConversationThreadService {
     limit: number;
     mode: "hybrid" | "semantic" | "lexical";
     cfg: CoreConfig;
+    embeddingAdapter: Awaited<ReturnType<ConversationThreadEmbeddingAdapterResolver>>;
     filters: ConversationThreadSearchFilters;
     allowlist: ConversationThreadSearchAllowlist;
   }): Promise<ConversationThreadSearchHitWithAttribution[]> {
@@ -1737,6 +1850,7 @@ export class ConversationThreadService {
         limit: input.limit,
         mode: input.mode,
         cfg: input.cfg,
+        embeddingAdapter: input.embeddingAdapter,
         filters: input.filters,
         allowlist: input.allowlist,
       });
@@ -1751,6 +1865,7 @@ export class ConversationThreadService {
           limit: perQueryLimit,
           mode: input.mode,
           cfg: input.cfg,
+          embeddingAdapter: input.embeddingAdapter,
           filters: input.filters,
           allowlist: input.allowlist,
         }),
