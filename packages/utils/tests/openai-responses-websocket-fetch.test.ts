@@ -658,6 +658,258 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     wsFetch.close();
   });
 
+  it("retries codex incremental replay without previous response id when server forgot it", async () => {
+    globals.fetch = (async () => {
+      throw new Error("should not fallback");
+    }) as unknown as typeof globalThis.fetch;
+
+    const selections: unknown[] = [];
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "websocket",
+      onTransportSelected: (details) => selections.push(details),
+    });
+
+    const firstResponse = await wsFetch("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        stream: true,
+        store: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      }),
+    });
+
+    const socket = FakeWebSocket.instances[0];
+    expect(socket).toBeDefined();
+
+    const firstTextPromise = firstResponse.text();
+    socket?.emitMessage(JSON.stringify({ type: "response.created", response: { id: "resp_1" } }));
+    socket?.emitMessage(
+      JSON.stringify({
+        type: "response.output_item.done",
+        item: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "Checking the file.", annotations: [] }],
+        },
+      }),
+    );
+    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+    await firstTextPromise;
+
+    const secondResponse = await wsFetch("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        stream: true,
+        store: false,
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "hello" }] },
+          { role: "assistant", content: [{ type: "output_text", text: "Checking the file." }] },
+          { role: "user", content: [{ type: "input_text", text: "continue" }] },
+        ],
+      }),
+    });
+
+    expect(FakeWebSocket.instances.length).toBe(1);
+    expect(sentBody(socket, 1)).toEqual({
+      type: "response.create",
+      store: false,
+      previous_response_id: "resp_1",
+      input: [{ role: "user", content: [{ type: "input_text", text: "continue" }] }],
+    });
+
+    const secondTextPromise = secondResponse.text();
+    socket?.emitMessage(
+      JSON.stringify({ type: "response.created", response: { id: "resp_stale_attempt" } }),
+    );
+    socket?.emitMessage(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          code: "previous_response_not_found",
+          message: "Previous response with id 'resp_1' not found.",
+          param: "previous_response_id",
+        },
+      }),
+    );
+    await Promise.resolve();
+
+    expect(sentBody(socket, 2)).toEqual({
+      type: "response.create",
+      store: false,
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "hello" }] },
+        { role: "assistant", content: [{ type: "output_text", text: "Checking the file." }] },
+        { role: "user", content: [{ type: "input_text", text: "continue" }] },
+      ],
+    });
+
+    socket?.emitMessage(JSON.stringify({ type: "response.created", response: { id: "resp_2" } }));
+    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+
+    const secondText = await secondTextPromise;
+    expect(secondText).not.toContain("previous_response_not_found");
+    expect(secondText).not.toContain("resp_stale_attempt");
+    expect(secondText).toContain("resp_2");
+    expect(secondText).toContain("[DONE]");
+    expect(selections).toEqual([
+      {
+        mode: "websocket",
+        requestUrl: "https://chatgpt.com/backend-api/codex/responses",
+        transport: "websocket",
+        optimizationEnabled: false,
+        optimizationReason: "no_continuation_state",
+      },
+      {
+        mode: "websocket",
+        requestUrl: "https://chatgpt.com/backend-api/codex/responses",
+        transport: "websocket",
+        optimizationEnabled: true,
+        optimizationReason: "incremental_replay",
+      },
+      {
+        mode: "websocket",
+        requestUrl: "https://chatgpt.com/backend-api/codex/responses",
+        transport: "websocket",
+        optimizationEnabled: false,
+        optimizationReason: "stale_previous_response_id_retry",
+      },
+    ]);
+    wsFetch.close();
+  });
+
+  it("does not reuse codex previous response id for unrelated input prefixes", async () => {
+    globals.fetch = (async () => {
+      throw new Error("should not fallback");
+    }) as unknown as typeof globalThis.fetch;
+
+    const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "websocket" });
+
+    const firstResponse = await wsFetch("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        stream: true,
+        store: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "thread alpha" }] }],
+      }),
+    });
+
+    const socket = FakeWebSocket.instances[0];
+    expect(socket).toBeDefined();
+
+    const firstTextPromise = firstResponse.text();
+    socket?.emitMessage(JSON.stringify({ type: "response.created", response: { id: "resp_1" } }));
+    socket?.emitMessage(
+      JSON.stringify({
+        type: "response.output_item.done",
+        item: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "Alpha summary" }],
+        },
+      }),
+    );
+    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+    await firstTextPromise;
+
+    const secondResponse = await wsFetch("https://chatgpt.com/backend-api/codex/responses", {
+      method: "POST",
+      body: JSON.stringify({
+        stream: true,
+        store: false,
+        input: [{ role: "user", content: [{ type: "input_text", text: "thread beta" }] }],
+      }),
+    });
+
+    expect(sentBody(socket, 1)).toEqual({
+      type: "response.create",
+      store: false,
+      input: [{ role: "user", content: [{ type: "input_text", text: "thread beta" }] }],
+    });
+
+    const secondTextPromise = secondResponse.text();
+    socket?.emitMessage(JSON.stringify({ type: "response.created", response: { id: "resp_2" } }));
+    socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+    await secondTextPromise;
+    wsFetch.close();
+  });
+
+  it("expires websocket continuation prefixes after thirty minutes", async () => {
+    globals.fetch = (async () => {
+      throw new Error("should not fallback");
+    }) as unknown as typeof globalThis.fetch;
+
+    const originalDateNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+
+    try {
+      const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "websocket" });
+
+      const firstResponse = await wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({
+          stream: true,
+          input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+        }),
+      });
+
+      const socket = FakeWebSocket.instances[0];
+      expect(socket).toBeDefined();
+
+      const firstTextPromise = firstResponse.text();
+      socket?.emitMessage(JSON.stringify({ type: "response.created", response: { id: "resp_1" } }));
+      socket?.emitMessage(
+        JSON.stringify({
+          type: "response.output_item.done",
+          item: {
+            id: "msg_1",
+            type: "message",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: "Let me check." }],
+          },
+        }),
+      );
+      socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+      await firstTextPromise;
+
+      now += 30 * 60 * 1000 + 1;
+      const secondResponse = await wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({
+          stream: true,
+          input: [
+            { role: "user", content: [{ type: "input_text", text: "hello" }] },
+            { type: "item_reference", id: "msg_1" },
+            { role: "user", content: [{ type: "input_text", text: "continue" }] },
+          ],
+        }),
+      });
+
+      expect(sentBody(socket, 1)).toEqual({
+        type: "response.create",
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "hello" }] },
+          { type: "item_reference", id: "msg_1" },
+          { role: "user", content: [{ type: "input_text", text: "continue" }] },
+        ],
+      });
+
+      const secondTextPromise = secondResponse.text();
+      socket?.emitMessage(JSON.stringify({ type: "response.created", response: { id: "resp_2" } }));
+      socket?.emitMessage(JSON.stringify({ type: "response.completed" }));
+      await secondTextPromise;
+      wsFetch.close();
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
   it("builds codex delta state from websocket deltas when done items are skeletal", async () => {
     const selections: Array<Record<string, unknown>> = [];
     globals.fetch = (async () => {

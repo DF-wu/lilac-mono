@@ -172,6 +172,152 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
+  it("treats LILAC_SESSION_DIVIDER as an inferred thread boundary", async () => {
+    const searchDbPath = await createDbPath();
+    const surfaceDbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(searchDbPath);
+    const surfaceStore = new DiscordSurfaceStore(surfaceDbPath);
+    const threadStore = new ConversationThreadStore(searchDbPath, {
+      surfaceDbPath,
+      mainAgentUserNames: ["lilac"],
+    });
+
+    surfaceStore.upsertSession({
+      channelId: "c1",
+      type: "channel",
+      updatedTs: 1,
+    });
+
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m1", userId: "u1", text: "before", ts: 1 }),
+      msg({
+        channelId: "c1",
+        messageId: "m2",
+        userId: "bot",
+        userName: "lilac",
+        text: "before reply",
+        ts: 2,
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "divider",
+        userId: "bot",
+        userName: "lilac",
+        text: "[LILAC_SESSION_DIVIDER] (by user)",
+        ts: 3,
+      }),
+      msg({ channelId: "c1", messageId: "m3", userId: "u1", text: "after", ts: 4 }),
+      msg({
+        channelId: "c1",
+        messageId: "m4",
+        userId: "bot",
+        userName: "lilac",
+        text: "after reply",
+        ts: 5,
+      }),
+    ]);
+
+    for (const message of [
+      { messageId: "m1", authorId: "u1", ts: 1 },
+      { messageId: "m2", authorId: "bot", ts: 2 },
+      { messageId: "divider", authorId: "bot", ts: 3 },
+      { messageId: "m3", authorId: "u1", ts: 4 },
+      { messageId: "m4", authorId: "bot", ts: 5 },
+    ]) {
+      surfaceStore.upsertMessageRelation({
+        channelId: "c1",
+        messageId: message.messageId,
+        authorId: message.authorId,
+        ts: message.ts,
+        isChat: true,
+        updatedTs: 1,
+      });
+    }
+
+    const refreshed = threadStore.refreshInferredThreads();
+    expect(refreshed.threads).toBe(2);
+
+    const before = threadStore.readThread("discord:channel:c1:m1", 0, 10);
+    expect(before?.messages.map((item) => item.messageId)).toEqual(["m1", "m2"]);
+
+    const after = threadStore.readThread("discord:channel:c1:m3", 0, 10);
+    expect(after?.messages.map((item) => item.messageId)).toEqual(["m3", "m4"]);
+    expect(threadStore.readThread("discord:channel:c1:divider", 0, 10)).toBeNull();
+
+    searchStore.close();
+    surfaceStore.close();
+    threadStore.close();
+  });
+
+  it("does not make earlier active-gap threads stale after identical heal upserts", async () => {
+    const originalDateNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    const oneHour = 60 * 60 * 1000;
+    const messages = [
+      msg({ channelId: "c1", messageId: "old-1", userId: "u1", text: "old topic", ts: 1 }),
+      msg({ channelId: "c1", messageId: "old-2", userId: "u2", text: "old reply", ts: 2 }),
+      msg({
+        channelId: "c1",
+        messageId: "new-1",
+        userId: "u1",
+        text: "new topic",
+        ts: 2 * oneHour,
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "new-2",
+        userId: "u2",
+        text: "new reply",
+        ts: 2 * oneHour + 1,
+      }),
+    ];
+
+    try {
+      searchStore.upsertMessages(messages);
+      const service = new ConversationThreadService({
+        store: threadStore,
+        getConfig: async () => testConfig(),
+        summarizer: async ({ threadId }) => ({
+          title: threadId,
+          brief: threadId,
+          topics: [],
+          retrievalHints: [],
+        }),
+      });
+
+      const eligibleNow = 4 * oneHour;
+      expect((await service.runSummarization({ now: eligibleNow })).summarized).toBe(2);
+
+      now = 2_000;
+      searchStore.upsertMessages([
+        ...messages,
+        msg({
+          channelId: "c1",
+          messageId: "new-3",
+          userId: "u3",
+          text: "new follow-up",
+          ts: 2 * oneHour + 2,
+        }),
+      ]);
+      threadStore.refreshInferredThreads({ cfg: testConfig() });
+
+      const eligible = threadStore.listEligibleForSummarization({ now: eligibleNow });
+      expect(eligible.map((thread) => thread.thread_id)).toEqual(["discord:channel:c1:new-1"]);
+      expect(threadStore.readThread("discord:channel:c1:old-1")?.summary?.title).toBe(
+        "discord:channel:c1:old-1",
+      );
+    } finally {
+      searchStore.close();
+      threadStore.close();
+      Date.now = originalDateNow;
+    }
+  });
+
   it("only forms threads that include the main agent when configured", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);
@@ -255,7 +401,7 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
-  it("forms native Discord threads and follows reply relations for inferred threads", async () => {
+  it("infers conversation chunks inside native Discord threads and follows reply relations", async () => {
     const searchDbPath = await createDbPath();
     const surfaceDbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(searchDbPath);
@@ -319,6 +465,24 @@ describe("conversation thread store", () => {
         text: "thread reply",
         ts: 11,
       }),
+      msg({
+        channelId: "th1",
+        guildId: "g1",
+        parentChannelId: "c1",
+        messageId: "t3",
+        userId: "u1",
+        text: "later thread topic",
+        ts: 2 * 60 * 60 * 1000,
+      }),
+      msg({
+        channelId: "th1",
+        guildId: "g1",
+        parentChannelId: "c1",
+        messageId: "t4",
+        userId: "u2",
+        text: "later thread reply",
+        ts: 2 * 60 * 60 * 1000 + 1,
+      }),
     ]);
 
     for (const message of [
@@ -333,6 +497,8 @@ describe("conversation thread store", () => {
       { channelId: "c1", messageId: "m3", authorId: "u3", ts: 6 * 60 * 60 * 1000 },
       { channelId: "th1", messageId: "t1", authorId: "u1", ts: 10 },
       { channelId: "th1", messageId: "t2", authorId: "u2", ts: 11 },
+      { channelId: "th1", messageId: "t3", authorId: "u1", ts: 2 * 60 * 60 * 1000 },
+      { channelId: "th1", messageId: "t4", authorId: "u2", ts: 2 * 60 * 60 * 1000 + 1 },
     ]) {
       surfaceStore.upsertMessageRelation({
         channelId: message.channelId,
@@ -347,12 +513,17 @@ describe("conversation thread store", () => {
     }
 
     const refreshed = threadStore.refreshInferredThreads();
-    expect(refreshed.threads).toBe(3);
+    expect(refreshed.threads).toBe(4);
 
-    const native = threadStore.readThread("discord:thread:th1", 0, 10);
-    expect(native?.thread.kind).toBe("discord_thread");
-    expect(native?.thread.parent_channel_id).toBe("c1");
-    expect(native?.messages.map((item) => item.messageId)).toEqual(["t1", "t2"]);
+    const nativeFirst = threadStore.readThread("discord:channel:th1:t1", 0, 10);
+    expect(nativeFirst?.thread.kind).toBe("inferred_channel_thread");
+    expect(nativeFirst?.thread.parent_channel_id).toBe("c1");
+    expect(nativeFirst?.messages.map((item) => item.messageId)).toEqual(["t1", "t2"]);
+
+    const nativeSecond = threadStore.readThread("discord:channel:th1:t3", 0, 10);
+    expect(nativeSecond?.thread.kind).toBe("inferred_channel_thread");
+    expect(nativeSecond?.thread.parent_channel_id).toBe("c1");
+    expect(nativeSecond?.messages.map((item) => item.messageId)).toEqual(["t3", "t4"]);
 
     const replied = threadStore.readThread("discord:channel:c1:m1", 0, 10);
     expect(replied?.messages.map((item) => item.messageId)).toEqual(["m1", "m2"]);
@@ -364,14 +535,134 @@ describe("conversation thread store", () => {
       store: threadStore,
       getConfig: async () => testConfig(),
       summarizer: async ({ threadId }) => ({
-        title: threadId === "discord:thread:th1" ? "Native parent thread" : "Other thread",
-        brief: threadId === "discord:thread:th1" ? "native parent allowlist" : "other thread",
+        title: threadId === "discord:channel:th1:t1" ? "Native parent thread" : "Other thread",
+        brief: threadId === "discord:channel:th1:t1" ? "native parent allowlist" : "other thread",
         topics: [],
       }),
     });
     await service.runSummarization({ now: Date.now() + 7 * 60 * 60 * 1000 });
-    const allowedByParent = await service.read({ threadId: "discord:thread:th1" });
+    const allowedByParent = await service.read({ threadId: "discord:channel:th1:t1" });
     expect(allowedByParent.thread.session.parentChannelId).toBe("c1");
+
+    searchStore.close();
+    surfaceStore.close();
+    threadStore.close();
+  });
+
+  it("uses mention-mode reply-chain grouping inside native Discord threads", async () => {
+    const searchDbPath = await createDbPath();
+    const surfaceDbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(searchDbPath);
+    const surfaceStore = new DiscordSurfaceStore(surfaceDbPath);
+    const threadStore = new ConversationThreadStore(searchDbPath, { surfaceDbPath });
+    const cfg = parseCoreConfigV1ToUniversal({
+      surface: {
+        discord: {
+          botName: "lilac",
+          allowedChannelIds: ["parent-channel"],
+        },
+        router: {
+          defaultMode: "active",
+          sessionModes: {
+            "parent-channel": { mode: "mention" },
+          },
+        },
+      },
+    });
+
+    surfaceStore.upsertSession({
+      channelId: "parent-channel",
+      guildId: "guild-1",
+      type: "channel",
+      updatedTs: 1,
+    });
+    surfaceStore.upsertSession({
+      channelId: "thread-channel",
+      guildId: "guild-1",
+      parentChannelId: "parent-channel",
+      type: "thread",
+      updatedTs: 1,
+    });
+
+    searchStore.upsertMessages([
+      msg({
+        channelId: "thread-channel",
+        guildId: "guild-1",
+        parentChannelId: "parent-channel",
+        messageId: "a0",
+        userId: "user-a",
+        text: "first topic preface",
+        ts: 500,
+      }),
+      msg({
+        channelId: "thread-channel",
+        guildId: "guild-1",
+        parentChannelId: "parent-channel",
+        messageId: "a1",
+        userId: "user-a",
+        text: "first topic question",
+        ts: 1_000,
+      }),
+      msg({
+        channelId: "thread-channel",
+        guildId: "guild-1",
+        parentChannelId: "parent-channel",
+        messageId: "a2",
+        userId: "bot",
+        userName: "lilac",
+        text: "first topic answer",
+        ts: 2_000,
+      }),
+      msg({
+        channelId: "thread-channel",
+        guildId: "guild-1",
+        parentChannelId: "parent-channel",
+        messageId: "b1",
+        userId: "user-b",
+        text: "second topic question",
+        ts: 3_000,
+      }),
+      msg({
+        channelId: "thread-channel",
+        guildId: "guild-1",
+        parentChannelId: "parent-channel",
+        messageId: "b2",
+        userId: "bot",
+        userName: "lilac",
+        text: "second topic answer",
+        ts: 4_000,
+      }),
+    ]);
+
+    for (const message of [
+      { messageId: "a0", authorId: "user-a", ts: 500 },
+      { messageId: "a1", authorId: "user-a", ts: 1_000 },
+      { messageId: "a2", authorId: "bot", ts: 2_000, replyToMessageId: "a1" },
+      { messageId: "b1", authorId: "user-b", ts: 3_000 },
+      { messageId: "b2", authorId: "bot", ts: 4_000, replyToMessageId: "b1" },
+    ]) {
+      surfaceStore.upsertMessageRelation({
+        channelId: "thread-channel",
+        messageId: message.messageId,
+        guildId: "guild-1",
+        authorId: message.authorId,
+        ts: message.ts,
+        isChat: true,
+        replyToMessageId: message.replyToMessageId,
+        updatedTs: 1,
+      });
+    }
+
+    const refreshed = threadStore.refreshInferredThreads({ cfg });
+    expect(refreshed.threads).toBe(2);
+
+    const first = threadStore.readThread("discord:channel:thread-channel:a0", 0, 10);
+    expect(first?.thread.parent_channel_id).toBe("parent-channel");
+    expect(first?.messages.map((item) => item.messageId)).toEqual(["a0", "a1", "a2"]);
+
+    const second = threadStore.readThread("discord:channel:thread-channel:b1", 0, 10);
+    expect(second?.thread.parent_channel_id).toBe("parent-channel");
+    expect(second?.messages.map((item) => item.messageId)).toEqual(["b1", "b2"]);
 
     searchStore.close();
     surfaceStore.close();
@@ -602,6 +893,75 @@ describe("conversation thread store", () => {
       service.runSummarization({ now: Date.now() + 3 * 60 * 60 * 1000 }),
     ).rejects.toThrow("thread summarization aborted after failure");
     expect(attemptedThreadIds).toEqual(["discord:channel:c1:a1"]);
+
+    searchStore.close();
+    threadStore.close();
+  });
+
+  it("continues summarization after sqlite busy failures", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    searchStore.upsertMessages([
+      msg({
+        channelId: "c1",
+        messageId: "busy-a1",
+        userId: "u1",
+        text: "first eligible thread",
+        ts: 1,
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "busy-a2",
+        userId: "u2",
+        text: "first eligible reply",
+        ts: 2,
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "busy-b1",
+        userId: "u1",
+        text: "second eligible thread",
+        ts: 2 * 60 * 60 * 1000,
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "busy-b2",
+        userId: "u2",
+        text: "second eligible reply",
+        ts: 2 * 60 * 60 * 1000 + 1,
+      }),
+    ]);
+
+    const attemptedThreadIds: string[] = [];
+    const service = new ConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+      summarizer: async ({ threadId }) => {
+        attemptedThreadIds.push(threadId);
+        if (threadId === "discord:channel:c1:busy-a1") {
+          throw new Error("SQLITE_BUSY: database is locked");
+        }
+        return {
+          title: threadId,
+          brief: threadId,
+          topics: [],
+          retrievalHints: [],
+        };
+      },
+    });
+
+    const run = await service.runSummarization({ now: Date.now() + 3 * 60 * 60 * 1000 });
+    expect(run.failed).toBe(1);
+    expect(run.summarized).toBe(1);
+    expect(run.failures[0]?.threadId).toBe("discord:channel:c1:busy-a1");
+    expect(attemptedThreadIds).toEqual([
+      "discord:channel:c1:busy-a1",
+      "discord:channel:c1:busy-b1",
+    ]);
+    expect(threadStore.readThread("discord:channel:c1:busy-b1")?.summary?.title).toBe(
+      "discord:channel:c1:busy-b1",
+    );
 
     searchStore.close();
     threadStore.close();

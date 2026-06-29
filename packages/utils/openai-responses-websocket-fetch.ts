@@ -1,6 +1,10 @@
+import { createHash } from "node:crypto";
+
 import type { ResponsesTransportMode } from "./env";
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
+const CONTINUATION_CACHE_MAX_ENTRIES = 128;
+const CONTINUATION_CACHE_TTL_MS = 30 * 60 * 1000;
 
 export type CreateOpenAIResponsesWebSocketFetchOptions = {
   mode: ResponsesTransportMode;
@@ -34,10 +38,13 @@ type ResponsesRequestBody = JsonObject & {
   store?: JsonValue;
 };
 
-type ResponsesContinuationState = {
-  requestBody: ResponsesRequestBody;
+type ResponsesContinuationCacheEntry = {
+  requestShapeHash: string;
+  prefixHash: string;
+  prefix: JsonValue[];
   responseId: string;
-  outputItems: readonly JsonObject[];
+  createdAt: number;
+  lastUsedAt: number;
 };
 
 type ResponsesOptimizationReason =
@@ -48,7 +55,8 @@ type ResponsesOptimizationReason =
   | "request_shape_changed"
   | "unreplayable_output_items"
   | "not_prefix_extension"
-  | "incremental_replay";
+  | "incremental_replay"
+  | "stale_previous_response_id_retry";
 
 export type ResponsesTransportSelectionDetails = {
   mode: ResponsesTransportMode;
@@ -82,7 +90,7 @@ export function createOpenAIResponsesWebSocketFetch(
   let reusableBusy = false;
   let idleCloseTimer: ReturnType<typeof setTimeout> | null = null;
   let connectionHeadersKey: string | null = null;
-  let reusableContinuationState: ResponsesContinuationState | null = null;
+  const reusableContinuationCache = new Map<string, ResponsesContinuationCacheEntry>();
 
   function reportAutoFallback(details: {
     reason: "websocket_connect_failed";
@@ -148,7 +156,7 @@ export function createOpenAIResponsesWebSocketFetch(
       closeSocket(ws);
       ws = null;
       connectionHeadersKey = null;
-      reusableContinuationState = null;
+      clearReusableContinuationState();
       return;
     }
 
@@ -157,14 +165,46 @@ export function createOpenAIResponsesWebSocketFetch(
         closeSocket(ws);
         ws = null;
         connectionHeadersKey = null;
-        reusableContinuationState = null;
+        clearReusableContinuationState();
       }
       idleCloseTimer = null;
     }, idleTimeoutMs);
   }
 
   function clearReusableContinuationState(): void {
-    reusableContinuationState = null;
+    reusableContinuationCache.clear();
+  }
+
+  function pruneContinuationCache(now: number): void {
+    for (const [key, entry] of reusableContinuationCache) {
+      if (now - entry.createdAt > CONTINUATION_CACHE_TTL_MS) {
+        reusableContinuationCache.delete(key);
+      }
+    }
+
+    while (reusableContinuationCache.size > CONTINUATION_CACHE_MAX_ENTRIES) {
+      const oldestKey = reusableContinuationCache.keys().next().value;
+      if (typeof oldestKey !== "string") return;
+      reusableContinuationCache.delete(oldestKey);
+    }
+  }
+
+  function touchContinuationCacheEntry(key: string, entry: ResponsesContinuationCacheEntry): void {
+    reusableContinuationCache.delete(key);
+    reusableContinuationCache.set(key, entry);
+  }
+
+  function storeReusableContinuation(input: {
+    requestBody: ResponsesRequestBody;
+    requestUrl: URL;
+    responseId: string;
+    outputItems: readonly JsonObject[];
+  }): void {
+    const entry = buildContinuationCacheEntry({ ...input, now: Date.now() });
+    if (!entry) return;
+
+    touchContinuationCacheEntry(continuationCacheKey(entry), entry);
+    pruneContinuationCache(entry.createdAt);
   }
 
   function connectWebSocket(
@@ -323,19 +363,19 @@ export function createOpenAIResponsesWebSocketFetch(
 
     const { stream: _stream, ...requestBody } = parsedBody;
     const fullRequestBody = cloneJsonObject(requestBody);
+    pruneContinuationCache(Date.now());
     const payloadResult =
-      useReusableConnection && reusableContinuationState
+      useReusableConnection && reusableContinuationCache.size > 0
         ? buildIncrementalWebSocketPayload({
             requestBody: fullRequestBody,
-            continuationState: reusableContinuationState,
-            requestUrl,
+            continuationCache: reusableContinuationCache,
           })
         : {
             payload: cloneJsonObject(fullRequestBody),
             optimizationEnabled: false,
             optimizationReason: "no_continuation_state" as const,
           };
-    const websocketPayload = payloadResult.payload;
+    let websocketPayload = payloadResult.payload;
     reportTransportSelected({
       requestUrl,
       transport: "websocket",
@@ -348,9 +388,60 @@ export function createOpenAIResponsesWebSocketFetch(
       start(controller) {
         let cleanedUp = false;
         let responseId: string | null = null;
-        const outputItems: JsonObject[] = [];
-        const outputItemDrafts = new Map<string, JsonObject>();
+        let outputItems: JsonObject[] = [];
+        let outputItemDrafts = new Map<string, JsonObject>();
         let canPersistContinuation = true;
+        let forwardedEventCount = 0;
+        let pendingPreOutputEvents: Record<string, unknown>[] = [];
+        let stalePreviousResponseRetryAttempted = false;
+
+        const sendPayload = (payload: ResponsesRequestBody) => {
+          connection.send(JSON.stringify({ type: "response.create", ...payload }));
+        };
+
+        const retryWithoutOptimization = (): boolean => {
+          if (!payloadResult.optimizationEnabled) return false;
+          if (stalePreviousResponseRetryAttempted) return false;
+          if (forwardedEventCount > 0) return false;
+
+          stalePreviousResponseRetryAttempted = true;
+          clearReusableContinuationState();
+          websocketPayload = cloneJsonObject(fullRequestBody);
+          responseId = null;
+          outputItems = [];
+          outputItemDrafts = new Map<string, JsonObject>();
+          canPersistContinuation = true;
+          pendingPreOutputEvents = [];
+          reportTransportSelected({
+            requestUrl,
+            transport: "websocket",
+            optimizationEnabled: false,
+            optimizationReason: "stale_previous_response_id_retry",
+          });
+          sendPayload(websocketPayload);
+          return true;
+        };
+
+        const enqueueNormalizedEvent = (event: Record<string, unknown>): boolean => {
+          const bytes = encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
+          try {
+            controller.enqueue(bytes);
+            forwardedEventCount++;
+            return true;
+          } catch {
+            cleanup({ closeConnection: true });
+            return false;
+          }
+        };
+
+        const flushPendingPreOutputEvents = (): boolean => {
+          for (const event of pendingPreOutputEvents) {
+            if (!enqueueNormalizedEvent(event)) return false;
+          }
+          pendingPreOutputEvents = [];
+          return true;
+        };
+
         const cleanup = (params?: { closeConnection?: boolean }) => {
           if (cleanedUp) return;
           cleanedUp = true;
@@ -412,14 +503,19 @@ export function createOpenAIResponsesWebSocketFetch(
 
             const normalized = normalizeResponsesEvent(eventJson, options.normalizeEvent);
 
-            try {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(normalized)}\n\n`));
-            } catch {
-              cleanup({ closeConnection: true });
+            if (isPreviousResponseNotFoundError(normalized) && retryWithoutOptimization()) {
               return;
             }
 
             const type = typeof normalized.type === "string" ? normalized.type : "";
+            if (forwardedEventCount === 0 && isPreOutputMetadataEvent(type)) {
+              pendingPreOutputEvents.push(normalized);
+              return;
+            }
+
+            if (!flushPendingPreOutputEvents()) return;
+            if (!enqueueNormalizedEvent(normalized)) return;
+
             if (type === "error") {
               canPersistContinuation = false;
             }
@@ -431,11 +527,12 @@ export function createOpenAIResponsesWebSocketFetch(
                 connection === ws &&
                 connection.readyState === WebSocket.OPEN
               ) {
-                reusableContinuationState = {
+                storeReusableContinuation({
                   requestBody: fullRequestBody,
+                  requestUrl,
                   responseId,
                   outputItems,
-                };
+                });
               }
               try {
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -489,7 +586,7 @@ export function createOpenAIResponsesWebSocketFetch(
         }
 
         try {
-          connection.send(JSON.stringify({ type: "response.create", ...websocketPayload }));
+          sendPayload(websocketPayload);
         } catch (error) {
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
@@ -522,10 +619,9 @@ export function createOpenAIResponsesWebSocketFetch(
 
 function buildIncrementalWebSocketPayload(input: {
   requestBody: ResponsesRequestBody;
-  continuationState: ResponsesContinuationState;
-  requestUrl: URL;
+  continuationCache: Map<string, ResponsesContinuationCacheEntry>;
 }): IncrementalPayloadResult {
-  const { requestBody, continuationState, requestUrl } = input;
+  const { requestBody, continuationCache } = input;
   if (requestBody.previous_response_id != null) {
     return {
       payload: cloneJsonObject(requestBody),
@@ -535,8 +631,7 @@ function buildIncrementalWebSocketPayload(input: {
   }
 
   const currentInput = asJsonArray(requestBody.input);
-  const previousInput = asJsonArray(continuationState.requestBody.input);
-  if (!currentInput || !previousInput) {
+  if (!currentInput) {
     return {
       payload: cloneJsonObject(requestBody),
       optimizationEnabled: false,
@@ -545,34 +640,25 @@ function buildIncrementalWebSocketPayload(input: {
   }
 
   const currentWithoutInput = omitRequestInputFields(requestBody);
-  const previousWithoutInput = omitRequestInputFields(continuationState.requestBody);
-  if (!deepEqualJson(currentWithoutInput, previousWithoutInput)) {
-    return {
-      payload: cloneJsonObject(requestBody),
-      optimizationEnabled: false,
-      optimizationReason: "request_shape_changed",
-    };
+  const requestShapeHash = stableJsonHash(currentWithoutInput);
+  let best: { key: string; entry: ResponsesContinuationCacheEntry; suffix: JsonValue[] } | null =
+    null;
+
+  for (const [key, entry] of continuationCache) {
+    if (entry.requestShapeHash !== requestShapeHash) continue;
+    if (entry.prefix.length >= currentInput.length) continue;
+    const suffix = sliceJsonArrayPrefix(currentInput, entry.prefix);
+    if (!suffix || suffix.length === 0) continue;
+    if (
+      !best ||
+      entry.prefix.length > best.entry.prefix.length ||
+      (entry.prefix.length === best.entry.prefix.length && entry.lastUsedAt > best.entry.lastUsedAt)
+    ) {
+      best = { key, entry, suffix };
+    }
   }
 
-  const replayedItems = continuationState.outputItems
-    .map((item) =>
-      normalizeOutputItemForReplay(item, {
-        useStoreReferences: shouldUseStoreReferences(requestBody),
-        stripCodexIds: isCodexResponsesRequest(requestUrl),
-      }),
-    )
-    .filter(isJsonObject);
-  if (replayedItems.length !== continuationState.outputItems.length) {
-    return {
-      payload: cloneJsonObject(requestBody),
-      optimizationEnabled: false,
-      optimizationReason: "unreplayable_output_items",
-    };
-  }
-
-  const baseline = [...previousInput, ...replayedItems];
-  const suffix = sliceJsonArrayPrefix(currentInput, baseline);
-  if (!suffix) {
+  if (!best) {
     return {
       payload: cloneJsonObject(requestBody),
       optimizationEnabled: false,
@@ -580,15 +666,56 @@ function buildIncrementalWebSocketPayload(input: {
     };
   }
 
+  best.entry.lastUsedAt = Date.now();
+  continuationCache.delete(best.key);
+  continuationCache.set(best.key, best.entry);
+
   return {
     payload: {
       ...cloneJsonObject(currentWithoutInput),
-      previous_response_id: continuationState.responseId,
-      input: suffix,
+      previous_response_id: best.entry.responseId,
+      input: best.suffix,
     },
     optimizationEnabled: true,
     optimizationReason: "incremental_replay",
   };
+}
+
+function buildContinuationCacheEntry(input: {
+  requestBody: ResponsesRequestBody;
+  requestUrl: URL;
+  responseId: string;
+  outputItems: readonly JsonObject[];
+  now: number;
+}): ResponsesContinuationCacheEntry | null {
+  const requestInput = asJsonArray(input.requestBody.input);
+  if (!requestInput) return null;
+
+  const replayedItems = input.outputItems
+    .map((item) =>
+      normalizeOutputItemForReplay(item, {
+        useStoreReferences: shouldUseStoreReferences(input.requestBody),
+        stripCodexIds: isCodexResponsesRequest(input.requestUrl),
+      }),
+    )
+    .filter(isJsonObject);
+  if (replayedItems.length !== input.outputItems.length) return null;
+
+  const prefix = [...requestInput.map(cloneJsonValue), ...replayedItems.map(cloneJsonValue)];
+  if (prefix.length === 0) return null;
+
+  return {
+    requestShapeHash: stableJsonHash(omitRequestInputFields(input.requestBody)),
+    prefixHash: stableJsonHash(prefix),
+    prefix,
+    responseId: input.responseId,
+    createdAt: input.now,
+    lastUsedAt: input.now,
+  };
+}
+
+function continuationCacheKey(entry: ResponsesContinuationCacheEntry): string {
+  return `${entry.requestShapeHash}:${entry.prefixHash}`;
 }
 
 function parseJsonObject(text: string): ResponsesRequestBody {
@@ -992,6 +1119,23 @@ function cloneJsonValue(value: JsonValue): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
 
+function stableJsonHash(value: JsonValue | undefined): string {
+  return createHash("sha256").update(stableJsonStringify(value)).digest("hex");
+}
+
+function stableJsonStringify(value: JsonValue | undefined): string {
+  if (value === undefined) return "undefined";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(",")}]`;
+
+  const record = asRecord(value);
+  if (!record) return JSON.stringify(value);
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key] as JsonValue)}`)
+    .join(",")}}`;
+}
+
 function deepEqualJson(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
   if (left === right) return true;
   if (left == null || right == null) return left === right;
@@ -1215,6 +1359,26 @@ function normalizeErrorEventShape(event: Record<string, unknown>): Record<string
       param,
     },
   };
+}
+
+function isPreviousResponseNotFoundError(event: Record<string, unknown>): boolean {
+  if (readString(event.type) !== "error") return false;
+
+  const error = asRecord(event.error);
+  const message = readString(error?.message) ?? "";
+  const code = readString(error?.code) ?? "";
+  const param = readString(error?.param) ?? "";
+  const lowerMessage = message.toLowerCase();
+
+  return (
+    code === "previous_response_not_found" ||
+    param === "previous_response_id" ||
+    (lowerMessage.includes("previous response") && lowerMessage.includes("not found"))
+  );
+}
+
+function isPreOutputMetadataEvent(type: string): boolean {
+  return type === "response.created" || type === "response.in_progress";
 }
 
 function extractErrorDetails(

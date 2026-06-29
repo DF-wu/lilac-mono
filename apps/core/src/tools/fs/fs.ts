@@ -876,7 +876,9 @@ export function fsTool(
     ];
 
     if (readFileDirectAttachmentSupported) {
-      parts.push("Reading image files and PDFs directly is supported.");
+      parts.push(
+        "Use this tool to read image files and PDFs directly, prefer this over OCR or other tools.",
+      );
     }
 
     parts.push("Denylisted paths require dangerouslyAllow=true.");
@@ -1283,7 +1285,12 @@ export function fsTool(
             value: [
               { type: "text", text: intro },
               ...instructionParts,
-              { type: "image-data", mediaType: mimeType, data: base64 },
+              {
+                type: "file",
+                mediaType: mimeType,
+                filename,
+                data: { type: "data", data: base64 },
+              },
             ],
           };
         }
@@ -1294,10 +1301,10 @@ export function fsTool(
             { type: "text", text: intro },
             ...instructionParts,
             {
-              type: "file-data",
+              type: "file",
               mediaType: mimeType,
               filename,
-              data: base64,
+              data: { type: "data", data: base64 },
             },
           ],
         };

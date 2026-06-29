@@ -727,11 +727,13 @@ function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelM
         const item = value[j];
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
 
-        const t = item.type;
-        if (t !== "image-data" && t !== "file-data") continue;
+        if (item.type !== "file") continue;
 
-        const data = item.data;
-        if (typeof data !== "string") continue;
+        const fileData = item.data;
+        if (!fileData || typeof fileData !== "object" || Array.isArray(fileData)) continue;
+        if (fileData.type !== "data" || typeof fileData.data !== "string") continue;
+
+        const data = fileData.data;
 
         const bytes = estimateBase64Bytes(data);
         const tooBig = bytes > MODEL_VIEW_MAX_BINARY_BYTES_PER_PART;
@@ -961,8 +963,11 @@ export type AutoInjectedThreadSearchPayload = {
   entries: Array<{
     threadId: string;
     title: string;
+    timeRange?: string;
   }>;
 };
+
+type AutoInjectedThreadSearchEntry = AutoInjectedThreadSearchPayload["entries"][number];
 
 type AutoInjectedThreadSearchAppendedEvent = {
   toolCallId: string;
@@ -970,18 +975,19 @@ type AutoInjectedThreadSearchAppendedEvent = {
   limit: number;
   queries: readonly string[];
   participantFilterUserCount: number;
-  entries: readonly { threadId: string; title: string }[];
+  entries: readonly AutoInjectedThreadSearchEntry[];
 };
 
 export function buildAutoInjectedThreadSearchMessages(params: {
   toolCallId: string;
-  entries: readonly { threadId: string; title: string }[];
+  entries: readonly AutoInjectedThreadSearchEntry[];
 }): ModelMessage[] {
   const payload: AutoInjectedThreadSearchPayload = {
     note: AUTO_INJECTED_THREAD_SEARCH_NOTICE,
     entries: params.entries.map((entry) => ({
       threadId: entry.threadId,
       title: entry.title,
+      ...(entry.timeRange ? { timeRange: entry.timeRange } : {}),
     })),
   };
 
@@ -1016,11 +1022,64 @@ export function buildAutoInjectedThreadSearchMessages(params: {
   ];
 }
 
+function collectAutoInjectedThreadIds(messages: readonly ModelMessage[]): Set<string> {
+  const threadIds = new Set<string>();
+
+  for (const message of messages) {
+    const content: unknown = message.content;
+    if (message.role !== "tool" || !Array.isArray(content)) continue;
+
+    for (const part of content) {
+      if (!isRecord(part)) continue;
+      if (part.type !== "tool-result" || part.toolName !== AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME) {
+        continue;
+      }
+
+      const output = part.output;
+      const payload = isRecord(output) && output.type === "json" ? output.value : output;
+      const entries = isRecord(payload) ? payload.entries : undefined;
+      if (!Array.isArray(entries)) continue;
+
+      for (const entry of entries) {
+        if (!isRecord(entry)) continue;
+        const threadId = entry.threadId;
+        if (typeof threadId === "string" && threadId.length > 0) threadIds.add(threadId);
+      }
+    }
+  }
+
+  return threadIds;
+}
+
+function padLocalDatePart(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatLocalThreadTime(value: string): string | null {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+
+  const year = date.getFullYear();
+  const month = padLocalDatePart(date.getMonth() + 1);
+  const day = padLocalDatePart(date.getDate());
+  const hour = padLocalDatePart(date.getHours());
+  const minute = padLocalDatePart(date.getMinutes());
+  return `${year}/${month}/${day} ${hour}:${minute}`;
+}
+
+function formatInjectedThreadTimeRange(input: { start: string; end: string }): string | undefined {
+  const start = formatLocalThreadTime(input.start);
+  const end = formatLocalThreadTime(input.end);
+  if (!start || !end) return undefined;
+  return `${start} - ${end}`;
+}
+
 export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   cfg: CoreConfig;
   conversationThreads?: ConversationThreadToolService;
   requestId: string;
   raw?: unknown;
+  previousMessages?: readonly ModelMessage[];
   userMessages: readonly ModelMessage[];
   publishToolStatus: (update: {
     toolCallId: string;
@@ -1071,12 +1130,22 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
       queryAboutness: plan.aboutness,
       limit: autoInject.limit,
       mode: autoInject.mode,
+      verbose: true,
       ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
     });
-    const entries = search.results.map((result) => ({
-      threadId: result.threadId,
-      title: result.title,
-    }));
+    const previouslyInjectedThreadIds = collectAutoInjectedThreadIds(params.previousMessages ?? []);
+    const entries = search.results
+      .filter((result) => !previouslyInjectedThreadIds.has(result.threadId))
+      .map((result) => {
+        const timeRange = result.timeRange
+          ? formatInjectedThreadTimeRange(result.timeRange)
+          : undefined;
+        return {
+          threadId: result.threadId,
+          title: result.title,
+          ...(timeRange ? { timeRange } : {}),
+        };
+      });
 
     await publishToolStatusBestEffort({
       toolCallId,
@@ -4540,6 +4609,7 @@ export async function startBusAgentRunner(params: {
                 conversationThreads: params.conversationThreads,
                 requestId: headers.request_id,
                 raw: next.raw,
+                previousMessages: agent.state.messages,
                 userMessages: mergedInitial,
                 publishToolStatus: async (update) => {
                   await bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, { headers });
