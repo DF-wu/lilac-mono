@@ -1,6 +1,6 @@
 import { lilacEventTypes, outReqTopic, type LilacBus } from "@stanley2058/lilac-event-bus";
 
-import { createLogger, env } from "@stanley2058/lilac-utils";
+import { createLogger, env, errorMessage } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 
 import type {
@@ -16,6 +16,7 @@ import type { MsgRef, SessionRef, SurfaceAttachment } from "../types";
 
 import { deleteIssueCommentReactionById, deleteIssueReactionById } from "../../github/github-api";
 import { parseGithubRequestId, parseGithubSessionId } from "../../github/github-ids";
+import { parseRequestId } from "./request-ids";
 import {
   clearGithubAck,
   getGithubAck,
@@ -37,18 +38,14 @@ function isTypingIndicatorProvider(
 }
 
 function parseDiscordReplyTo(params: { requestId: string; sessionId: string }): MsgRef | null {
-  const parts = params.requestId.split(":");
-  if (parts.length !== 3) return null;
-  const [surface, sessionId] = parts;
-  const surfaceSpecificId = parts[2];
-  if (!surfaceSpecificId) return null;
-  if (surface !== "discord") return null;
-  if (sessionId !== params.sessionId) return null;
+  const parsed = parseRequestId(params.requestId);
+  if (parsed?.kind !== "discord_message") return null;
+  if (parsed.channelId !== params.sessionId) return null;
 
   return {
     platform: "discord",
     channelId: params.sessionId,
-    messageId: surfaceSpecificId,
+    messageId: parsed.messageId,
   };
 }
 
@@ -145,7 +142,7 @@ async function cleanupGithubAck(input: { logger: Logger; requestId: string; sess
       });
     }
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = errorMessage(e);
     // Best-effort: ignore if already removed.
     if (!msg.includes("404")) {
       input.logger.warn("failed to delete github ack reaction", { requestId: input.requestId }, e);

@@ -3,15 +3,14 @@ import {
   ApplicationCommandType,
   ApplicationCommandOptionType,
   type AutocompleteInteraction,
+  type CacheType,
   Client,
   EmbedBuilder,
   type GuildMember,
-  type CacheType,
   type ChatInputCommandInteraction,
   GatewayIntentBits,
   MessageFlags,
   type MessageContextMenuCommandInteraction,
-  MessageType,
   PermissionFlagsBits,
   Partials,
   type Presence,
@@ -47,7 +46,6 @@ import type {
   SessionRef,
   SurfaceMessage,
   SurfaceSessionParticipant,
-  SurfaceSessionParticipantActivity,
   SurfaceSessionParticipantsResult,
   SurfaceReactionDetail,
   SurfaceSelf,
@@ -68,14 +66,52 @@ import { splitByDiscordWindowOldestToNewest } from "./merge-window";
 import { DiscordOutputStream, sendDiscordStyledMessage } from "./output/discord-output-stream";
 import { parseCancelCustomId } from "./discord-cancel";
 import { buildDiscordSessionDividerText } from "./discord-session-divider";
+import { formatDiscordMessageRequestId, formatDiscordSlashRequestId } from "../bridge/request-ids";
 import {
-  buildDiscordTaggedTextFromContentAndEmbeds,
-  normalizeDiscordEmbeds,
-  type DiscordEmbedTextMeta,
-} from "./discord-embed-text";
+  editOrReplyEphemeral,
+  hasExplicitDiscordUserMentionInContent,
+  isExplicitDiscordUserMention,
+  isRoutableDiscordUserMessage,
+  resolveTextSendableChannel,
+  shouldAllowMessage,
+  tryEditOrReplyEphemeral,
+  tryReplyEphemeral,
+} from "./discord-channel-guards";
+import {
+  buildForwardMessageSnapshots,
+  collectDiscordAttachmentMeta,
+  getChannelName,
+  getDiscordMessageTypeName,
+  getDisplayName,
+  getForwardSnapshotPayload,
+  getMessageEditedTs,
+  getMessageEmbeds,
+  getMessageTs,
+  getReplyReference,
+  getStoredTextFromDiscordMessage,
+  isDiscordChatLikeMessage,
+  normalizeDiscordReference,
+  previewText,
+  sortSurfaceParticipants,
+  toSurfaceParticipantActivities,
+} from "./discord-message-meta";
+import {
+  resolveDiscordSurfaceEditTarget,
+  resolveEffectiveSessionModelOverride,
+} from "./discord-session-model";
 import type { MarkdownTableRenderOptions } from "../../shared/markdown-table-renderer";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 import { getSessionMode, resolveSessionConfigId } from "../bridge/bus-request-router/common";
+
+export {
+  hasExplicitDiscordUserMentionInContent,
+  isExplicitDiscordUserMention,
+  isRoutableDiscordUserMessage,
+} from "./discord-channel-guards";
+export {
+  resolveDiscordSurfaceEditTarget,
+  resolveEffectiveSessionModelOverride,
+} from "./discord-session-model";
 
 export type DiscordAdapterOptions = {
   /** Dependency injection for tests. */
@@ -153,407 +189,6 @@ function getLatestGatewayPingAt(client: Client): number | undefined {
   return latestGatewayPingAt;
 }
 
-export function resolveDiscordSurfaceEditTarget(input: {
-  authorId?: string | null;
-  selfUserId: string;
-  embedCount: number;
-  content?: string | null;
-}): "content" | "embed_description" {
-  if (input.authorId !== input.selfUserId) {
-    throw new Error(
-      "surface.messages.edit only supports messages authored by the Lilac Discord bot",
-    );
-  }
-
-  if (typeof input.content === "string" && input.content.trim().length > 0) {
-    return "content";
-  }
-
-  if (input.embedCount <= 0) {
-    return "content";
-  }
-
-  if (input.embedCount === 1) {
-    return "embed_description";
-  }
-
-  throw new Error(
-    "surface.messages.edit only supports Discord messages with plain content or a single embed",
-  );
-}
-
-function getChannelName<T extends { isDMBased?: () => boolean } | { name?: string }>(
-  channel: T | null,
-): string | undefined {
-  if (!channel) return undefined;
-  if ("isDMBased" in channel && typeof channel.isDMBased === "function" && channel.isDMBased()) {
-    return "dm";
-  }
-  const n = "name" in channel ? channel.name : undefined;
-  return typeof n === "string" ? n : undefined;
-}
-
-function getMessageTs(msg: Message): number {
-  // createdTimestamp is ms
-  return msg.createdTimestamp;
-}
-
-function getMessageEditedTs(msg: Message): number | undefined {
-  return msg.editedTimestamp ?? undefined;
-}
-
-function getDisplayName(msg: Message): string {
-  const memberName = msg.member && "displayName" in msg.member ? msg.member.displayName : undefined;
-  return memberName ?? msg.author.globalName ?? msg.author.username;
-}
-
-function toSurfaceParticipantActivities(
-  presence: Presence | null | undefined,
-): SurfaceSessionParticipantActivity[] {
-  if (!presence) return [];
-
-  const out: SurfaceSessionParticipantActivity[] = [];
-  for (const activity of presence.activities) {
-    const typeName = ActivityType[activity.type];
-    const mapped: SurfaceSessionParticipantActivity = {
-      type: typeof typeName === "string" ? typeName.toLowerCase() : String(activity.type),
-    };
-
-    if (typeof activity.name === "string" && activity.name.length > 0) {
-      mapped.name = activity.name;
-    }
-    if (typeof activity.state === "string" && activity.state.length > 0) {
-      mapped.state = activity.state;
-    }
-    if (typeof activity.details === "string" && activity.details.length > 0) {
-      mapped.details = activity.details;
-    }
-    if (typeof activity.url === "string" && activity.url.length > 0) {
-      mapped.url = activity.url;
-    }
-    if (activity.emoji?.name && activity.emoji.name.length > 0) {
-      mapped.emoji = activity.emoji.name;
-    }
-
-    out.push(mapped);
-  }
-
-  return out;
-}
-
-function sortSurfaceParticipants(
-  participants: readonly SurfaceSessionParticipant[],
-): SurfaceSessionParticipant[] {
-  return [...participants].sort((a, b) => {
-    const aName = (a.displayName ?? a.userName ?? a.userId).toLowerCase();
-    const bName = (b.displayName ?? b.userName ?? b.userId).toLowerCase();
-    if (aName !== bName) return aName.localeCompare(bName);
-    return a.userId.localeCompare(b.userId);
-  });
-}
-
-type DiscordAttachmentMeta = {
-  url: string;
-  filename?: string;
-  mimeType?: string;
-  size?: number;
-};
-
-const DISCORD_REFERENCE_TYPE_DEFAULT = 0;
-const DISCORD_REFERENCE_TYPE_FORWARD = 1;
-
-function normalizeDiscordReference(msg: Message): {
-  messageId?: string;
-  channelId?: string;
-  guildId?: string;
-  type?: number;
-} | null {
-  const ref = msg.reference;
-  if (!ref) return null;
-
-  const messageId = typeof ref.messageId === "string" ? ref.messageId : undefined;
-  const channelId = typeof ref.channelId === "string" ? ref.channelId : undefined;
-  const guildId = typeof ref.guildId === "string" ? ref.guildId : undefined;
-  const type = typeof ref.type === "number" ? ref.type : undefined;
-
-  if (!messageId && !channelId && !guildId && type === undefined) {
-    return null;
-  }
-
-  return {
-    ...(messageId ? { messageId } : {}),
-    ...(channelId ? { channelId } : {}),
-    ...(guildId ? { guildId } : {}),
-    ...(type !== undefined ? { type } : {}),
-  };
-}
-
-function getReplyReference(msg: Message): {
-  messageId: string;
-  channelId?: string;
-} | null {
-  const ref = normalizeDiscordReference(msg);
-  if (!ref?.messageId) return null;
-
-  const type = ref.type ?? DISCORD_REFERENCE_TYPE_DEFAULT;
-  if (type === DISCORD_REFERENCE_TYPE_FORWARD) return null;
-
-  return {
-    messageId: ref.messageId,
-    ...(ref.channelId ? { channelId: ref.channelId } : {}),
-  };
-}
-
-function toDiscordAttachmentMeta(x: unknown): DiscordAttachmentMeta | null {
-  if (!x || typeof x !== "object") return null;
-  const o = x as Record<string, unknown>;
-
-  const url = typeof o.url === "string" ? o.url : null;
-  if (!url) return null;
-
-  const filename =
-    typeof o.name === "string" ? o.name : typeof o.filename === "string" ? o.filename : undefined;
-
-  const mimeType =
-    typeof o.contentType === "string"
-      ? o.contentType
-      : typeof o.mimeType === "string"
-        ? o.mimeType
-        : undefined;
-
-  const size = typeof o.size === "number" ? o.size : undefined;
-
-  return {
-    url,
-    ...(filename ? { filename } : {}),
-    ...(mimeType ? { mimeType } : {}),
-    ...(size !== undefined ? { size } : {}),
-  };
-}
-
-function collectDiscordAttachmentMeta(input: unknown): DiscordAttachmentMeta[] {
-  const out: DiscordAttachmentMeta[] = [];
-
-  if (!input) return out;
-
-  if (Array.isArray(input)) {
-    for (const item of input) {
-      const normalized = toDiscordAttachmentMeta(item);
-      if (normalized) out.push(normalized);
-    }
-    return out;
-  }
-
-  if (typeof input === "object") {
-    const maybeValues = (input as { values?: unknown }).values;
-    if (typeof maybeValues === "function") {
-      for (const item of (maybeValues as () => Iterable<unknown>).call(input)) {
-        const normalized = toDiscordAttachmentMeta(item);
-        if (normalized) out.push(normalized);
-      }
-    }
-  }
-
-  return out;
-}
-
-function getSnapshotEmbeds(snapshot: Record<string, unknown>): DiscordEmbedTextMeta[] {
-  return normalizeDiscordEmbeds(snapshot.embeds);
-}
-
-function normalizeFlagsNumber(v: unknown): number | undefined {
-  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
-  if (typeof v === "bigint") {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : undefined;
-  }
-  if (!v || typeof v !== "object") return undefined;
-
-  const bitfield = (v as Record<string, unknown>).bitfield;
-  if (typeof bitfield === "number") return Number.isFinite(bitfield) ? bitfield : undefined;
-  if (typeof bitfield === "bigint") {
-    const n = Number(bitfield);
-    return Number.isFinite(n) ? n : undefined;
-  }
-
-  return undefined;
-}
-
-function getForwardSnapshotPayload(msg: Message): {
-  content: string;
-  embeds: DiscordEmbedTextMeta[];
-  attachments: DiscordAttachmentMeta[];
-  timestamp?: number;
-  editedTimestamp?: number;
-  flags?: number;
-} | null {
-  const ref = normalizeDiscordReference(msg);
-  const referenceType = ref?.type ?? DISCORD_REFERENCE_TYPE_DEFAULT;
-  if (referenceType !== DISCORD_REFERENCE_TYPE_FORWARD) return null;
-
-  const snapshots = msg.messageSnapshots;
-  if (!snapshots || snapshots.size === 0) return null;
-
-  let firstSnapshot: unknown;
-  for (const snapshot of snapshots.values()) {
-    firstSnapshot = snapshot;
-    break;
-  }
-  if (!firstSnapshot || typeof firstSnapshot !== "object") return null;
-
-  const snapshot = firstSnapshot as Record<string, unknown>;
-
-  const content = typeof snapshot.content === "string" ? snapshot.content : "";
-  const embeds = getSnapshotEmbeds(snapshot);
-  const attachments = collectDiscordAttachmentMeta(snapshot.attachments);
-  const timestamp =
-    typeof snapshot.createdTimestamp === "number" ? snapshot.createdTimestamp : undefined;
-  const editedTimestamp =
-    typeof snapshot.editedTimestamp === "number" ? snapshot.editedTimestamp : undefined;
-  const flags = normalizeFlagsNumber(snapshot.flags);
-
-  return {
-    content,
-    embeds,
-    attachments,
-    ...(timestamp !== undefined ? { timestamp } : {}),
-    ...(editedTimestamp !== undefined ? { editedTimestamp } : {}),
-    ...(flags !== undefined ? { flags } : {}),
-  };
-}
-
-function buildForwardMessageSnapshots(
-  forwardSnapshot: ReturnType<typeof getForwardSnapshotPayload>,
-): Array<{ message: Record<string, unknown> }> | undefined {
-  if (!forwardSnapshot) return undefined;
-
-  return [
-    {
-      message: {
-        content: forwardSnapshot.content,
-        embeds: forwardSnapshot.embeds,
-        attachments: forwardSnapshot.attachments,
-        ...(forwardSnapshot.timestamp !== undefined
-          ? { timestamp: forwardSnapshot.timestamp }
-          : {}),
-        ...(forwardSnapshot.editedTimestamp !== undefined
-          ? { editedTimestamp: forwardSnapshot.editedTimestamp }
-          : {}),
-        ...(forwardSnapshot.flags !== undefined ? { flags: forwardSnapshot.flags } : {}),
-      },
-    },
-  ];
-}
-
-function getMessageEmbeds(msg: Message): DiscordEmbedTextMeta[] {
-  return normalizeDiscordEmbeds(msg.embeds);
-}
-
-function joinNonEmptyTextBlocks(blocks: readonly string[]): string {
-  const nonEmpty = blocks.filter((block) => block.length > 0);
-  return nonEmpty.join("\n\n");
-}
-
-function getStoredTextFromDiscordMessage(input: {
-  msg: Message;
-  forwardSnapshot: ReturnType<typeof getForwardSnapshotPayload>;
-}): string {
-  const { msg, forwardSnapshot } = input;
-  const embeds = getMessageEmbeds(msg);
-  const hasOnlyEmbeds = (msg.content ?? "").trim().length === 0 && embeds.length > 0;
-  const topText = buildDiscordTaggedTextFromContentAndEmbeds({
-    content: msg.content ?? "",
-    embeds,
-    labelEmbeds: !(msg.author.bot && hasOnlyEmbeds),
-  });
-  const snapshotText = forwardSnapshot
-    ? buildDiscordTaggedTextFromContentAndEmbeds({
-        content: forwardSnapshot.content,
-        embeds: forwardSnapshot.embeds,
-      })
-    : "";
-
-  return joinNonEmptyTextBlocks([topText, snapshotText]);
-}
-
-function isDiscordChatLikeMessage(msg: Message): boolean {
-  // Treat only real chat/reply messages as context candidates.
-  // Discord system messages can still have MessageType.Default; exclude via `msg.system`.
-  if (msg.system) return false;
-  return msg.type === MessageType.Default || msg.type === MessageType.Reply;
-}
-
-function getDiscordMessageTypeName(msg: Message): string {
-  // `MessageType` is a numeric enum; reverse mapping yields a stable label.
-  const name = (MessageType as unknown as Record<number, unknown>)[msg.type];
-  return typeof name === "string" && name.length > 0 ? name : String(msg.type);
-}
-
-function previewText(text: string, max = 400): string {
-  const trimmed = text.trim();
-  if (trimmed.length <= max) return trimmed;
-  return `${trimmed.slice(0, max)}...`;
-}
-
-function shouldAllowMessage(params: {
-  cfg: CoreConfig;
-  channelId: string;
-  guildId?: string | null;
-}): boolean {
-  const allowedChannelIds = new Set(params.cfg.surface.discord.allowedChannelIds);
-  const allowedGuildIds = new Set(params.cfg.surface.discord.allowedGuildIds);
-
-  if (allowedChannelIds.size === 0 && allowedGuildIds.size === 0) return false;
-
-  if (allowedChannelIds.has(params.channelId)) return true;
-
-  const gid = params.guildId ?? null;
-  if (gid && allowedGuildIds.has(gid)) return true;
-
-  return false;
-}
-
-type SendableDiscordChannel = {
-  send(options: unknown): Promise<unknown>;
-};
-
-function isTextSendableChannel(ch: unknown): ch is SendableDiscordChannel {
-  if (!ch || typeof ch !== "object") return false;
-  if (!("send" in ch)) return false;
-  const send = (ch as Record<string, unknown>)["send"];
-  return typeof send === "function";
-}
-
-export function isRoutableDiscordUserMessage(msg: Message): boolean {
-  if (msg.author.bot) return false;
-  if (msg.system) return false;
-
-  return msg.type === MessageType.Default || msg.type === MessageType.Reply;
-}
-
-export function hasExplicitDiscordUserMentionInContent(input: {
-  content: string;
-  userId: string;
-}): boolean {
-  return (
-    input.content.includes(`<@${input.userId}>`) || input.content.includes(`<@!${input.userId}>`)
-  );
-}
-
-export function isExplicitDiscordUserMention(input: {
-  content: string;
-  userId: string;
-  hasParsedMention: boolean;
-}): boolean {
-  return (
-    input.hasParsedMention &&
-    hasExplicitDiscordUserMentionInContent({
-      content: input.content,
-      userId: input.userId,
-    })
-  );
-}
-
 function compareDiscordSnowflake(a: string, b: string): number {
   // Prefer numeric comparison (snowflakes are numeric strings).
   // Fall back to localeCompare if parsing fails.
@@ -566,19 +201,6 @@ function compareDiscordSnowflake(a: string, b: string): number {
   } catch {
     return a.localeCompare(b);
   }
-}
-
-export function resolveEffectiveSessionModelOverride(input: {
-  sessionId: string;
-  parentChannelId?: string | null;
-  overrides: ReadonlyMap<string, string>;
-}): string | undefined {
-  const threadOverride = input.overrides.get(input.sessionId);
-  if (threadOverride) return threadOverride;
-
-  const parentChannelId = input.parentChannelId?.trim();
-  if (!parentChannelId) return undefined;
-  return input.overrides.get(parentChannelId);
 }
 
 const CONTEXT_MENU_CANCEL_REQUEST_NAME = "Cancel Request";
@@ -1965,21 +1587,7 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     // Guard against mismatched sessions (e.g. copied components).
     if (interaction.channelId && parsed.sessionId !== interaction.channelId) {
-      try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.followUp({
-            content: "This cancel button is not for this channel.",
-            flags: MessageFlags.Ephemeral,
-          });
-        } else {
-          await interaction.reply({
-            content: "This cancel button is not for this channel.",
-            flags: MessageFlags.Ephemeral,
-          });
-        }
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "This cancel button is not for this channel.");
       return;
     }
 
@@ -1996,21 +1604,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
 
     // Acknowledge quickly; actual cancellation is handled asynchronously via the bus.
-    try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({
-          content: "Cancel requested.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } else {
-        await interaction.reply({
-          content: "Cancel requested.",
-          flags: MessageFlags.Ephemeral,
-        });
-      }
-    } catch {
-      // ignore
-    }
+    await tryReplyEphemeral(interaction, "Cancel requested.");
   }
 
   private async onMessageContextMenuCommand(
@@ -2020,53 +1614,25 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const cfg = this.cfg;
     if (!cfg) {
-      try {
-        await interaction.reply({
-          content: "Bot is not ready yet.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "Bot is not ready yet.");
       return;
     }
 
     const channelId = interaction.channelId;
     const guildId = interaction.guildId;
     if (!channelId) {
-      try {
-        await interaction.reply({
-          content: "This command must be used in a channel.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "This command must be used in a channel.");
       return;
     }
 
     if (!shouldAllowMessage({ cfg, channelId, guildId })) {
-      try {
-        await interaction.reply({
-          content: "Not allowed in this channel.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "Not allowed in this channel.");
       return;
     }
 
     const targetMessageId = interaction.targetMessage?.id;
     if (!targetMessageId) {
-      try {
-        await interaction.reply({
-          content: "Could not resolve target message.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "Could not resolve target message.");
       return;
     }
 
@@ -2074,7 +1640,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       type: "adapter.request.cancel",
       platform: "discord",
       ts: Date.now(),
-      requestId: `discord:${channelId}:${targetMessageId}`,
+      requestId: formatDiscordMessageRequestId({ channelId, messageId: targetMessageId }),
       sessionId: channelId,
       cancelScope: "active_or_queued",
       source: "context_menu",
@@ -2082,14 +1648,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       messageId: targetMessageId,
     });
 
-    try {
-      await interaction.reply({
-        content: "Cancel requested.",
-        flags: MessageFlags.Ephemeral,
-      });
-    } catch {
-      // ignore
-    }
+    await tryReplyEphemeral(interaction, "Cancel requested.");
   }
 
   private async registerSlashCommands(): Promise<void> {
@@ -2207,14 +1766,7 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     if (!cfg || !client || !self) {
       // Not ready; best-effort ack.
-      try {
-        await interaction.reply({
-          content: "Bot is not ready yet.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "Bot is not ready yet.");
       return;
     }
 
@@ -2229,26 +1781,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const guildId = interaction.guildId;
 
     if (!channelId) {
-      try {
-        await interaction.reply({
-          content: "This command must be used in a channel.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "This command must be used in a channel.");
       return;
     }
 
     if (!shouldAllowMessage({ cfg, channelId, guildId })) {
-      try {
-        await interaction.reply({
-          content: "Not allowed in this channel.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "Not allowed in this channel.");
       return;
     }
 
@@ -2278,18 +1816,9 @@ export class DiscordAdapter implements SurfaceAdapter {
           // ignore
         }
 
-        const ch = await client.channels.fetch(channelId).catch(() => null);
-        if (!isTextSendableChannel(ch)) {
-          if (interaction.deferred || interaction.replied) {
-            await interaction.editReply({
-              content: "Channel not found or not text-based.",
-            });
-          } else {
-            await interaction.reply({
-              content: "Channel not found or not text-based.",
-              flags: MessageFlags.Ephemeral,
-            });
-          }
+        const ch = await resolveTextSendableChannel(client, channelId);
+        if (!ch) {
+          await editOrReplyEphemeral(interaction, "Channel not found or not text-based.");
           return;
         }
 
@@ -2298,44 +1827,17 @@ export class DiscordAdapter implements SurfaceAdapter {
           allowedMentions: { parse: [] },
         });
 
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply({ content: "Inserted session divider." });
-        } else {
-          await interaction.reply({
-            content: "Inserted session divider.",
-            flags: MessageFlags.Ephemeral,
-          });
-        }
+        await editOrReplyEphemeral(interaction, "Inserted session divider.");
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        try {
-          if (interaction.deferred || interaction.replied) {
-            await interaction.editReply({
-              content: `Failed to insert divider: ${msg}`,
-            });
-          } else {
-            await interaction.reply({
-              content: `Failed to insert divider: ${msg}`,
-              flags: MessageFlags.Ephemeral,
-            });
-          }
-        } catch {
-          // ignore
-        }
+        await tryEditOrReplyEphemeral(interaction, `Failed to insert divider: ${msg}`);
       }
       return;
     }
 
     const custom = this.opts?.customCommands?.get(sub ?? "");
     if (!custom) {
-      try {
-        await interaction.reply({
-          content: "Unknown subcommand.",
-          flags: MessageFlags.Ephemeral,
-        });
-      } catch {
-        // ignore
-      }
+      await tryReplyEphemeral(interaction, "Unknown subcommand.");
       return;
     }
 
@@ -2373,13 +1875,17 @@ export class DiscordAdapter implements SurfaceAdapter {
 
       await interaction.reply({
         content: preview,
+        allowedMentions: { parse: [] },
       });
 
       this.emit({
         type: "adapter.command.invoked",
         platform: "discord",
         ts: Date.now(),
-        requestId: `discord:${channelId}:slash:${interaction.id}`,
+        requestId: formatDiscordSlashRequestId({
+          channelId,
+          interactionId: interaction.id,
+        }),
         sessionId: channelId,
         commandName: custom.def.name,
         args: parsed.args,
@@ -2399,19 +1905,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      try {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply({
-            content: `Failed to run custom command: ${msg}`,
-          });
-        } else {
-          await interaction.reply({
-            content: `Failed to run custom command: ${msg}`,
-          });
-        }
-      } catch {
-        // ignore
-      }
+      await tryEditOrReplyEphemeral(interaction, `Failed to run custom command: ${msg}`);
     }
   }
 
@@ -2474,22 +1968,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const guildId = interaction.guildId;
 
     if (!channelId) {
-      await interaction
-        .reply({
-          content: "This command must be used in a channel.",
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
+      await tryReplyEphemeral(interaction, "This command must be used in a channel.");
       return;
     }
 
     if (!shouldAllowMessage({ cfg, channelId, guildId })) {
-      await interaction
-        .reply({
-          content: "Not allowed in this channel.",
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
+      await tryReplyEphemeral(interaction, "Not allowed in this channel.");
       return;
     }
 
@@ -2516,12 +2000,10 @@ export class DiscordAdapter implements SurfaceAdapter {
         // Keep best-effort display when config changed and override is stale.
       }
 
-      await interaction
-        .reply({
-          content: `Current model for this session: \`${currentRef}\` (resolved: \`${resolvedDisplay}\`)`,
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
+      await tryReplyEphemeral(
+        interaction,
+        `Current model for this session: \`${currentRef}\` (resolved: \`${resolvedDisplay}\`)`,
+      );
       return;
     }
 
@@ -2535,23 +2017,16 @@ export class DiscordAdapter implements SurfaceAdapter {
       resolvedSpec = resolved.spec;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      await interaction
-        .reply({
-          content: `Invalid model: ${msg}`,
-          flags: MessageFlags.Ephemeral,
-        })
-        .catch(() => {});
+      await tryReplyEphemeral(interaction, `Invalid model: ${msg}`);
       return;
     }
 
     this.sessionModelOverrides.set(channelId, trimmedModelInput);
 
-    await interaction
-      .reply({
-        content: `Session model set to \`${trimmedModelInput}\` (resolved: \`${resolvedSpec}\`)`,
-        flags: MessageFlags.Ephemeral,
-      })
-      .catch(() => {});
+    await tryReplyEphemeral(
+      interaction,
+      `Session model set to \`${trimmedModelInput}\` (resolved: \`${resolvedSpec}\`)`,
+    );
   }
 
   private async fetchDiscordMessage(input: {

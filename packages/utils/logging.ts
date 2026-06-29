@@ -9,6 +9,8 @@ import {
   type WriteStream,
 } from "@stanley2058/simple-module-logger";
 
+import { isRecord } from "./runtime-utils";
+
 const LOG_LEVEL_VALUES: readonly LogLevel[] = ["debug", "info", "warn", "error", "fatal"];
 
 function hasTestGlobals(): boolean {
@@ -121,10 +123,6 @@ function toSingleLine(text: string): string {
 }
 
 const MAX_OBJECT_FIELDS_PER_ARG = 40;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isPrimitive(value: unknown): value is string | number | boolean | null {
   return (
@@ -382,7 +380,7 @@ class MirroredLogger extends Logger {
     });
   }
 
-  override log(level: LogLevel, message: any, ...args: any[]): void {
+  override log(level: LogLevel, message: unknown, ...args: unknown[]): void {
     if (level === "fatal") {
       this.mirrorLogger.log(level, message, ...args);
       this.localLogger.log(level, message, ...args);
@@ -393,52 +391,52 @@ class MirroredLogger extends Logger {
     this.mirrorLogger.log(level, message, ...args);
   }
 
-  override logDebug(message: any, ...args: any[]): void {
+  override logDebug(message: unknown, ...args: unknown[]): void {
     this.localLogger.logDebug(message, ...args);
     this.mirrorLogger.logDebug(message, ...args);
   }
 
-  override logInfo(message: any, ...args: any[]): void {
+  override logInfo(message: unknown, ...args: unknown[]): void {
     this.localLogger.logInfo(message, ...args);
     this.mirrorLogger.logInfo(message, ...args);
   }
 
-  override logWarn(message: any, ...args: any[]): void {
+  override logWarn(message: unknown, ...args: unknown[]): void {
     this.localLogger.logWarn(message, ...args);
     this.mirrorLogger.logWarn(message, ...args);
   }
 
-  override logError(message: any, ...args: any[]): void {
+  override logError(message: unknown, ...args: unknown[]): void {
     this.localLogger.logError(message, ...args);
     this.mirrorLogger.logError(message, ...args);
   }
 
-  override logFatal(message: any, ...args: any[]): void {
+  override logFatal(message: unknown, ...args: unknown[]): void {
     this.mirrorLogger.logFatal(message, ...args);
     this.localLogger.logFatal(message, ...args);
   }
 
-  override debug(message: any, ...args: any[]): void {
+  override debug(message: unknown, ...args: unknown[]): void {
     this.localLogger.debug(message, ...args);
     this.mirrorLogger.debug(message, ...args);
   }
 
-  override info(message: any, ...args: any[]): void {
+  override info(message: unknown, ...args: unknown[]): void {
     this.localLogger.info(message, ...args);
     this.mirrorLogger.info(message, ...args);
   }
 
-  override warn(message: any, ...args: any[]): void {
+  override warn(message: unknown, ...args: unknown[]): void {
     this.localLogger.warn(message, ...args);
     this.mirrorLogger.warn(message, ...args);
   }
 
-  override error(message: any, ...args: any[]): void {
+  override error(message: unknown, ...args: unknown[]): void {
     this.localLogger.error(message, ...args);
     this.mirrorLogger.error(message, ...args);
   }
 
-  override fatal(message: any, ...args: any[]): void {
+  override fatal(message: unknown, ...args: unknown[]): void {
     this.mirrorLogger.fatal(message, ...args);
     this.localLogger.fatal(message, ...args);
   }

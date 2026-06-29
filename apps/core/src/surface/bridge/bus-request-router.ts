@@ -1,6 +1,12 @@
 import { type ModelMessage } from "ai";
 
-import { createLogger, getCoreConfig, env, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  getCoreConfig,
+  env,
+  errorMessage,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 import {
   lilacEventTypes,
   type EvtAdapterMessageCreatedData,
@@ -10,6 +16,7 @@ import type { SurfaceAdapter } from "../adapter";
 import type { MsgRef } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { composeRequestMessages, composeSingleMessage } from "./request-composition";
+import { formatDiscordMessageRequestId } from "./request-ids";
 
 import {
   type SessionMode,
@@ -63,6 +70,7 @@ import {
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
   resolveRepliedToMessageText as resolveRepliedToMessageTextImpl,
 } from "./bus-request-router/context";
+import { decideActiveRequestRoute } from "./bus-request-router/decisions";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 
 type ActiveSessionState = {
@@ -136,7 +144,7 @@ export async function startBusRequestRouter(params: {
       coreConfigReloadHadError = false;
       lastCoreConfigReloadError = null;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      const msg = errorMessage(e);
       if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
         logger.warn("core-config reload failed; using last known config", {
           path: "core-config.yaml",
@@ -446,7 +454,10 @@ export async function startBusRequestRouter(params: {
 
       const customName = customCommands?.peekTextName(msg.data.text) ?? null;
       if (customName) {
-        const requestId = `discord:${sessionId}:${msgRef.messageId}`;
+        const requestId = formatDiscordMessageRequestId({
+          channelId: sessionId,
+          messageId: msgRef.messageId,
+        });
         const raw = (() => {
           const known = customCommands?.get(customName);
           if (!known) {
@@ -729,7 +740,10 @@ export async function startBusRequestRouter(params: {
     if (!batch || batch.items.length === 0) return;
 
     const last = batch.items[batch.items.length - 1]!;
-    const requestId = `discord:${input.sessionId}:${last.msgRef.messageId}`;
+    const requestId = formatDiscordMessageRequestId({
+      channelId: input.sessionId,
+      messageId: last.msgRef.messageId,
+    });
 
     const self = await adapter.getSelf();
     const discordUserAliasById = buildDiscordUserAliasById(cfg);
@@ -945,7 +959,10 @@ export async function startBusRequestRouter(params: {
       }
 
       if (replyToBot) {
-        const requestId = `discord:${sessionId}:${msgRef.messageId}`;
+        const requestId = formatDiscordMessageRequestId({
+          channelId: sessionId,
+          messageId: msgRef.messageId,
+        });
 
         await publishActiveChannelPrompt({
           adapter,
@@ -984,7 +1001,10 @@ export async function startBusRequestRouter(params: {
       return;
     }
 
-    const requestId = `discord:${sessionId}:${msgRef.messageId}`;
+    const requestId = formatDiscordMessageRequestId({
+      channelId: sessionId,
+      messageId: msgRef.messageId,
+    });
 
     const triggerType: "mention" | "reply" | undefined = replyToBot
       ? "reply"
@@ -1083,25 +1103,27 @@ export async function startBusRequestRouter(params: {
       // - Mentions (not replies) can steer the active request (plus output reanchor).
       // - Replies to other bot messages fork into a queued-behind prompt.
       // - Everything else becomes a follow-up into the running request.
-      const isReplyToActiveOutput =
-        replyToBot &&
-        typeof input.replyToMessageId === "string" &&
-        active.activeOutputMessageIds.has(input.replyToMessageId);
+      const routeDecision = decideActiveRequestRoute({
+        activeOutputMessageIds: active.activeOutputMessageIds,
+        replyToBot,
+        mentionsBot,
+        replyToMessageId: input.replyToMessageId,
+        userText,
+        botMentionNames,
+        allowMentionSteer: true,
+        plainMessageBehavior: "buffered_prompt",
+      });
 
-      if (isReplyToActiveOutput) {
-        if (mentionsBot) {
-          const steerMode = parseSteerDirectiveMode({
-            text: userText,
-            botNames: botMentionNames,
-          });
-
+      switch (routeDecision.kind) {
+        case "active_output_steer":
+        case "active_mention_steer": {
           await publishSurfaceOutputReanchor({
             bus,
             requestId: active.requestId,
             sessionId,
-            inheritReplyTo: false,
-            replyTo: msgRef,
-            mode: steerMode,
+            inheritReplyTo: routeDecision.inheritReplyTo,
+            ...(routeDecision.inheritReplyTo ? {} : { replyTo: msgRef }),
+            mode: routeDecision.queue,
           });
           active.activeOutputMessageIds.clear();
 
@@ -1111,7 +1133,7 @@ export async function startBusRequestRouter(params: {
             cfg,
             requestId: active.requestId,
             sessionId,
-            queue: steerMode,
+            queue: routeDecision.queue,
             msgRef,
             sessionMode,
             sessionConfigId,
@@ -1119,7 +1141,7 @@ export async function startBusRequestRouter(params: {
             transformUserText: combineTextTransforms(
               modelOverrideTransform,
               continueDirectiveTransform,
-              steerMode === "interrupt"
+              routeDecision.queue === "interrupt"
                 ? (text) =>
                     stripLeadingInterruptDirective({
                       text,
@@ -1130,115 +1152,77 @@ export async function startBusRequestRouter(params: {
           });
           return;
         }
+        case "active_output_follow_up":
+        case "plain_follow_up": {
+          await publishSingleMessageToActiveRequest({
+            adapter,
+            bus,
+            cfg,
+            requestId: active.requestId,
+            sessionId,
+            queue: "followUp",
+            msgRef,
+            sessionMode,
+            sessionConfigId,
+            parentChannelId,
+            transformUserText: combineTextTransforms(
+              modelOverrideTransform,
+              continueDirectiveTransform,
+            ),
+          });
+          return;
+        }
+        case "fork_reply_prompt": {
+          const requestId = formatDiscordMessageRequestId({
+            channelId: sessionId,
+            messageId: msgRef.messageId,
+          });
 
-        await publishSingleMessageToActiveRequest({
-          adapter,
-          bus,
-          cfg,
-          requestId: active.requestId,
-          sessionId,
-          queue: "followUp",
-          msgRef,
-          sessionMode,
-          sessionConfigId,
-          parentChannelId,
-          transformUserText: combineTextTransforms(
-            modelOverrideTransform,
-            continueDirectiveTransform,
-          ),
-        });
-        return;
+          await publishActiveChannelPrompt({
+            adapter,
+            bus,
+            cfg,
+            requestId,
+            sessionId,
+            triggerMsgRef: msgRef,
+            triggerType: "reply",
+            sessionMode,
+            sessionConfigId,
+            parentChannelId,
+            botMentionNames,
+            transformTriggerUserText: combineTextTransforms(
+              modelOverrideTransform,
+              continueDirectiveTransform,
+            ),
+            transformUserTextForMessageId: msgRef.messageId,
+            modelOverride,
+            markActive: false,
+          });
+          return;
+        }
+        case "buffered_prompt": {
+          await publishSingleMessagePrompt({
+            adapter,
+            bus,
+            cfg,
+            requestId: bufferedPromptRequestIdForActiveRequest(active.requestId),
+            sessionId,
+            sessionConfigId,
+            parentChannelId,
+            msgRef,
+            sessionMode,
+            modelOverride,
+            transformUserText: combineTextTransforms(
+              modelOverrideTransform,
+              continueDirectiveTransform,
+            ),
+            raw: {
+              bufferedForActiveRequestId: active.requestId,
+            },
+          });
+          return;
+        }
       }
-
-      // Active channel @mention (not a reply) can steer the running request.
-      // IMPORTANT: replies to non-active bot messages must still fork into a queued prompt.
-      if (!replyToBot && mentionsBot) {
-        const steerMode = parseSteerDirectiveMode({
-          text: userText,
-          botNames: botMentionNames,
-        });
-
-        await publishSurfaceOutputReanchor({
-          bus,
-          requestId: active.requestId,
-          sessionId,
-          inheritReplyTo: true,
-          mode: steerMode,
-        });
-        active.activeOutputMessageIds.clear();
-
-        await publishSingleMessageToActiveRequest({
-          adapter,
-          bus,
-          cfg,
-          requestId: active.requestId,
-          sessionId,
-          queue: steerMode,
-          msgRef,
-          sessionMode,
-          sessionConfigId,
-          parentChannelId,
-          transformUserText: combineTextTransforms(
-            modelOverrideTransform,
-            continueDirectiveTransform,
-            steerMode === "interrupt"
-              ? (text) =>
-                  stripLeadingInterruptDirective({
-                    text,
-                    botNames: botMentionNames,
-                  })
-              : undefined,
-          ),
-        });
-        return;
-      }
-
-      if (replyToBot) {
-        const requestId = `discord:${sessionId}:${msgRef.messageId}`;
-
-        await publishActiveChannelPrompt({
-          adapter,
-          bus,
-          cfg,
-          requestId,
-          sessionId,
-          triggerMsgRef: msgRef,
-          triggerType: "reply",
-          sessionMode,
-          sessionConfigId,
-          parentChannelId,
-          botMentionNames,
-          transformTriggerUserText: combineTextTransforms(
-            modelOverrideTransform,
-            continueDirectiveTransform,
-          ),
-          transformUserTextForMessageId: msgRef.messageId,
-          modelOverride,
-          markActive: false,
-        });
-        return;
-      }
-
-      await publishSingleMessagePrompt({
-        adapter,
-        bus,
-        cfg,
-        requestId: bufferedPromptRequestIdForActiveRequest(active.requestId),
-        sessionId,
-        sessionConfigId,
-        parentChannelId,
-        msgRef,
-        sessionMode,
-        modelOverride,
-        transformUserText: combineTextTransforms(
-          modelOverrideTransform,
-          continueDirectiveTransform,
-        ),
-        raw: {
-          bufferedForActiveRequestId: active.requestId,
-        },
-      });
-      return;
     }
 
     // No active request.
@@ -1274,7 +1258,10 @@ export async function startBusRequestRouter(params: {
       clearDebounceBuffer(sessionId);
 
       const triggerType: "mention" | "reply" = replyToBot ? "reply" : "mention";
-      const requestId = `discord:${sessionId}:${msgRef.messageId}`;
+      const requestId = formatDiscordMessageRequestId({
+        channelId: sessionId,
+        messageId: msgRef.messageId,
+      });
 
       await publishActiveChannelPrompt({
         adapter,
@@ -1441,6 +1428,7 @@ export async function startBusRequestRouter(params: {
       requestId: randomRequestId(),
       sessionId,
       sessionConfigId: b.sessionConfigId,
+      parentChannelId: b.parentChannelId,
       // Use newest message as the context anchor (not a reply trigger).
       triggerMsgRef: b.messages[b.messages.length - 1]?.msgRef,
       triggerType: undefined,
@@ -1530,7 +1518,10 @@ export async function startBusRequestRouter(params: {
       return;
     }
 
-    const requestId = `discord:${sessionId}:${msgRef.messageId}`;
+    const requestId = formatDiscordMessageRequestId({
+      channelId: sessionId,
+      messageId: msgRef.messageId,
+    });
 
     // Special case: if the user is replying to the currently active output message chain,
     // treat mention replies as steer/interrupt into the running request, and
