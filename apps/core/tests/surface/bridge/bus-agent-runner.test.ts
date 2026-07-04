@@ -26,6 +26,7 @@ import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
+  buildAutoInjectedThreadSearchOverlay,
   consumeAssistantTextDelta,
   computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
@@ -341,7 +342,6 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        note: "Auto-injected conversation-thread metadata for possible context. Use only if relevant; thread transcripts were not loaded.",
         entries: [
           {
             threadId: "thread-1",
@@ -376,6 +376,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 1,
             followUpMinTextUnits: 1,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -409,6 +410,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             query: "meaningful message",
             limit: 3,
             mode: "hybrid",
+            minScore: 0.1,
             count: 3,
             vectorAvailable: false,
           },
@@ -441,7 +443,6 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        note: "Auto-injected conversation-thread metadata for possible context. Use only if relevant; thread transcripts were not loaded.",
         entries: [
           { threadId: "thread-1", title: "Below display", brief: belowDisplayBrief },
           { threadId: "thread-2", title: "Near threshold", brief: nearThresholdBrief },
@@ -475,6 +476,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 80,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -522,6 +524,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               query: "lol",
               limit: 3,
               mode: "hybrid",
+              minScore: 0.1,
               count: 1,
               vectorAvailable: false,
             },
@@ -567,6 +570,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 80,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.42,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -579,6 +583,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     const endTime = "2026-06-28T13:23:00.000Z";
     let plannedText = "";
     let searchVerbose: boolean | undefined;
+    let searchMinScore: number | undefined;
 
     const messages = await maybeBuildAutoInjectedThreadSearchMessages({
       cfg: autoInjectCfg,
@@ -613,11 +618,13 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
         },
         search: async (input) => {
           searchVerbose = input.verbose;
+          searchMinScore = input.minScore;
           return {
             meta: {
               query: "OAuth callback mobile login loop",
               limit: 3,
               mode: "hybrid",
+              minScore: 0.42,
               count: 1,
               vectorAvailable: false,
             },
@@ -651,6 +658,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(plannedText).toBe(body);
     expect(plannedText).not.toContain("LILAC_META");
     expect(searchVerbose).toBe(true);
+    expect(searchMinScore).toBe(0.42);
     expect(messages).toHaveLength(2);
     const toolMessage = messages[1];
     if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
@@ -661,7 +669,6 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        note: "Auto-injected conversation-thread metadata for possible context. Use only if relevant; thread transcripts were not loaded.",
         entries: [
           {
             threadId: "thread-1",
@@ -693,6 +700,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 1,
             followUpMinTextUnits: 1,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -728,6 +736,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             query: "meaningful message",
             limit: 3,
             mode: "hybrid",
+            minScore: 0.1,
             count: 1,
             vectorAvailable: false,
           },
@@ -777,6 +786,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 80,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -816,6 +826,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             query: "cookie callback subdomain",
             limit: 3,
             mode: "hybrid",
+            minScore: 0.1,
             count: 1,
             vectorAvailable: false,
           },
@@ -859,6 +870,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 80,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -905,6 +917,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               query: "cookie callback subdomain",
               limit: 3,
               mode: "hybrid",
+              minScore: 0.1,
               count: 1,
               vectorAvailable: false,
             },
@@ -950,6 +963,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 80,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -993,6 +1007,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             query: "edge middleware redirect host header",
             limit: 3,
             mode: "hybrid",
+            minScore: 0.1,
             count: 1,
             vectorAvailable: false,
           },
@@ -1036,6 +1051,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 1,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: true,
           },
@@ -1072,6 +1088,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               query: "meaningful message",
               limit: 3,
               mode: "hybrid",
+              minScore: 0.1,
               count: 1,
               vectorAvailable: false,
             },
@@ -1117,6 +1134,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             minTextUnits: 1,
             followUpMinTextUnits: 110,
             limit: 3,
+            minScore: 0.1,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -1155,6 +1173,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             query: "meaningful message",
             limit: 3,
             mode: "hybrid",
+            minScore: 0.1,
             count: 1,
             vectorAvailable: false,
           },
@@ -2490,6 +2509,35 @@ describe("assistant text part boundary accumulation", () => {
 
     expect(streamed).toEqual(["...update the notes.", "\n", "\nWorks without the old patch..."]);
     expect(finalText).toBe("...update the notes.\n\nWorks without the old patch...");
+  });
+});
+
+describe("buildAutoInjectedThreadSearchOverlay", () => {
+  it("returns the notice only for primary runs when auto-inject is enabled", () => {
+    const baseCfg = parseCoreConfigV1ToUniversal({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      conversation: {
+        ...baseCfg.conversation,
+        thread: {
+          ...baseCfg.conversation.thread,
+          autoInject: {
+            ...baseCfg.conversation.thread.autoInject,
+            enabled: true,
+          },
+        },
+      },
+    };
+
+    const overlay = buildAutoInjectedThreadSearchOverlay({ cfg, runProfile: "primary" });
+
+    expect(overlay).toBe(
+      "Notice on auto-injected possibly related threads:\nThese search results may appear before your reply, treat them as retrieval hints only, and use them when relevant to the current context.",
+    );
+    expect(
+      buildAutoInjectedThreadSearchOverlay({ cfg: baseCfg, runProfile: "primary" }),
+    ).toBeNull();
+    expect(buildAutoInjectedThreadSearchOverlay({ cfg, runProfile: "explore" })).toBeNull();
   });
 });
 
