@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="960" viewBox="0 0 1600 960" role="img" aria-labelledby="title desc">
+  <title id="title">PR 23 Root Cause and Fix Boundary Map</title>
+  <desc id="desc">A two-lane engineering diagram explaining the Catalina subagent_delegate failure chain and the PR 23 fix boundary.</desc>
+  <defs>
+    <marker id="arrow-dark" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#1F2937"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#B91C1C"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#15803D"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .title { font: 700 32px Arial, "Noto Sans CJK TC", sans-serif; fill: #0F172A; }
+      .subtitle { font: 400 16px Arial, "Noto Sans CJK TC", sans-serif; fill: #475569; }
+      .lane-title { font: 700 18px Arial, "Noto Sans CJK TC", sans-serif; fill: #0F172A; }
+      .lane-note { font: 400 13px Arial, "Noto Sans CJK TC", sans-serif; fill: #64748B; }
+      .box-title { font: 700 17px Arial, "Noto Sans CJK TC", sans-serif; fill: #111827; }
+      .box-text { font: 400 14px Arial, "Noto Sans CJK TC", sans-serif; fill: #374151; }
+      .code { font: 600 14px "SFMono-Regular", Consolas, monospace; fill: #111827; }
+      .small { font: 400 12px Arial, "Noto Sans CJK TC", sans-serif; fill: #64748B; }
+      .tag { font: 700 12px Arial, "Noto Sans CJK TC", sans-serif; letter-spacing: 0.5px; }
+      .edge-label { font: 700 12px Arial, "Noto Sans CJK TC", sans-serif; fill: #334155; }
+      .panel { fill: #F8FAFC; stroke: #CBD5E1; stroke-width: 1.4; rx: 18; }
+      .failure { fill: #FEF2F2; stroke: #DC2626; stroke-width: 2; rx: 14; filter: url(#shadow); }
+      .warning { fill: #FFFBEB; stroke: #D97706; stroke-width: 2; rx: 14; filter: url(#shadow); }
+      .neutral { fill: #EFF6FF; stroke: #2563EB; stroke-width: 2; rx: 14; filter: url(#shadow); }
+      .fix { fill: #ECFDF5; stroke: #16A34A; stroke-width: 2; rx: 14; filter: url(#shadow); }
+      .deploy { fill: #F5F3FF; stroke: #7C3AED; stroke-width: 2; rx: 14; filter: url(#shadow); }
+      .metric { fill: #FFFFFF; stroke: #CBD5E1; stroke-width: 1.4; rx: 12; }
+      .arrow { fill: none; stroke: #1F2937; stroke-width: 2.4; marker-end: url(#arrow-dark); }
+      .arrow-red { fill: none; stroke: #B91C1C; stroke-width: 2.8; marker-end: url(#arrow-red); }
+      .arrow-green { fill: none; stroke: #15803D; stroke-width: 2.8; marker-end: url(#arrow-green); }
+      .arrow-dash { fill: none; stroke: #64748B; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrow-dark); }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="960" fill="#FFFFFF"/>
+  <text x="60" y="58" class="title">PR #23 報告主圖：Catalina subagent_delegate 失敗鏈與修正邊界</text>
+  <text x="60" y="88" class="subtitle">核心結論：deferred 模式中的空 blockingReason 是可容忍的無效資訊，不應在 tool execute 前造成整個 request failure。</text>
+
+  <rect x="52" y="124" width="1496" height="348" class="panel"/>
+  <text x="80" y="162" class="lane-title">上半部：事故前失敗鏈</text>
+  <text x="80" y="186" class="lane-note">錯誤不是 Catalina container 掛掉，也不是 upstream API 無回應；主要失敗點在本地 tool input validation。</text>
+
+  <rect x="88" y="220" width="210" height="130" class="neutral"/>
+  <text x="116" y="254" class="box-title">1. 使用者請求</text>
+  <text x="116" y="284" class="box-text">Catalina 接收 prompt</text>
+  <text x="116" y="308" class="box-text">進入 agent runner</text>
+  <text x="116" y="332" class="small">runtime 正常、healthz 正常</text>
+
+  <rect x="352" y="220" width="245" height="130" class="warning"/>
+  <text x="380" y="254" class="box-title">2. 模型產生 tool call</text>
+  <text x="380" y="286" class="code">{ mode: "deferred",</text>
+  <text x="380" y="310" class="code">  blockingReason: "" }</text>
+  <text x="380" y="334" class="small">這是常見模型輸出形態</text>
+
+  <rect x="650" y="220" width="255" height="130" class="failure"/>
+  <text x="678" y="254" class="box-title">3. 舊 schema 過度嚴格</text>
+  <text x="678" y="286" class="code">z.string().min(1)</text>
+  <text x="678" y="310" class="box-text">只要欄位存在且空字串</text>
+  <text x="678" y="334" class="box-text">就先被判定 invalid</text>
+
+  <rect x="958" y="220" width="235" height="130" class="failure"/>
+  <text x="986" y="254" class="box-title">4. AI SDK 拒絕輸入</text>
+  <text x="986" y="286" class="box-text">AI_InvalidToolInputError</text>
+  <text x="986" y="310" class="box-text">Zod too_small</text>
+  <text x="986" y="334" class="small">tool execute 尚未執行</text>
+
+  <rect x="1248" y="220" width="245" height="130" class="failure"/>
+  <text x="1276" y="254" class="box-title">5. 外層錯誤被誤導</text>
+  <text x="1276" y="286" class="box-text">No assistant text produced</text>
+  <text x="1276" y="310" class="box-text">finishReason="tool-calls"</text>
+  <text x="1276" y="334" class="small">看起來像模型沒收尾</text>
+
+  <path d="M298 285 H346" class="arrow"/>
+  <path d="M597 285 H644" class="arrow-red"/>
+  <path d="M905 285 H952" class="arrow-red"/>
+  <path d="M1193 285 H1242" class="arrow-red"/>
+  <text x="307" y="266" class="edge-label">產生 subagent_delegate</text>
+  <text x="603" y="266" class="edge-label">空字串碰到 min(1)</text>
+  <text x="912" y="266" class="edge-label">pre-execute fail</text>
+  <text x="1200" y="266" class="edge-label">runner 只能看到無 final text</text>
+
+  <rect x="88" y="386" width="1405" height="58" class="metric"/>
+  <text x="116" y="422" class="box-text">
+    調查定位：container health / Discord / Redis 皆正常；近期錯誤 request 的共同特徵是 deferred subagent_delegate 帶入 empty blockingReason，失敗發生在本地 schema validation。
+  </text>
+
+  <rect x="52" y="514" width="1496" height="336" class="panel"/>
+  <text x="80" y="552" class="lane-title">下半部：PR #23 修正鏈</text>
+  <text x="80" y="576" class="lane-note">修正採最小改動：放寬 mode-agnostic schema，保留 sync mode 專屬必填規則與 execute-time guard。</text>
+
+  <rect x="88" y="616" width="245" height="130" class="fix"/>
+  <text x="116" y="650" class="box-title">A. schema 改為容忍欄位</text>
+  <text x="116" y="682" class="code">z.string().optional()</text>
+  <text x="116" y="706" class="box-text">允許欄位存在但為空字串</text>
+  <text x="116" y="730" class="small">避免 deferred 無關欄位阻斷工具</text>
+
+  <rect x="390" y="616" width="270" height="130" class="neutral"/>
+  <text x="418" y="650" class="box-title">B. 保留 mode-specific guard</text>
+  <text x="418" y="682" class="code">mode === "sync"</text>
+  <text x="418" y="706" class="box-text">仍要求非空 blockingReason</text>
+  <text x="418" y="730" class="small">安全語義沒有被放寬</text>
+
+  <rect x="718" y="586" width="245" height="112" class="fix"/>
+  <text x="746" y="620" class="box-title">C1. deferred path</text>
+  <text x="746" y="652" class="box-text">empty string treated as omitted</text>
+  <text x="746" y="676" class="small">tool call accepted</text>
+
+  <rect x="718" y="724" width="245" height="112" class="neutral"/>
+  <text x="746" y="758" class="box-title">C2. sync path</text>
+  <text x="746" y="790" class="box-text">missing / blank still rejected</text>
+  <text x="746" y="814" class="small">regression test locks this rule</text>
+
+  <rect x="1020" y="616" width="230" height="130" class="fix"/>
+  <text x="1048" y="650" class="box-title">D. 測試與 review</text>
+  <text x="1048" y="682" class="box-text">13 subagent tests pass</text>
+  <text x="1048" y="706" class="box-text">typecheck / lint / fmt pass</text>
+  <text x="1048" y="730" class="small">PR review comment: no issues</text>
+
+  <rect x="1308" y="616" width="185" height="130" class="deploy"/>
+  <text x="1332" y="650" class="box-title">E. 部署邊界</text>
+  <text x="1332" y="682" class="box-text">source 已 merge</text>
+  <text x="1332" y="706" class="box-text">live container 尚需</text>
+  <text x="1332" y="730" class="box-text">rebuild / redeploy</text>
+
+  <path d="M333 681 H384" class="arrow-green"/>
+  <path d="M660 681 C684 681 684 642 712 642" class="arrow-green"/>
+  <path d="M660 681 C684 681 684 780 712 780" class="arrow"/>
+  <path d="M963 642 H1014" class="arrow-green"/>
+  <path d="M963 780 C992 780 992 681 1014 681" class="arrow"/>
+  <path d="M1250 681 H1302" class="arrow"/>
+  <text x="345" y="662" class="edge-label">語義移到 mode 判斷</text>
+  <text x="670" y="624" class="edge-label">mode=deferred</text>
+  <text x="670" y="804" class="edge-label">mode=sync</text>
+  <text x="976" y="624" class="edge-label">tests cover</text>
+  <text x="1262" y="662" class="edge-label">merge done</text>
+
+  <rect x="88" y="874" width="1405" height="46" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.4" rx="12"/>
+  <rect x="116" y="889" width="16" height="16" fill="#FEF2F2" stroke="#DC2626"/>
+  <text x="142" y="902" class="small">紅色：事故失敗點</text>
+  <rect x="282" y="889" width="16" height="16" fill="#FFFBEB" stroke="#D97706"/>
+  <text x="308" y="902" class="small">黃色：模型輸出/觸發條件</text>
+  <rect x="500" y="889" width="16" height="16" fill="#ECFDF5" stroke="#16A34A"/>
+  <text x="526" y="902" class="small">綠色：PR 修正與通過路徑</text>
+  <rect x="746" y="889" width="16" height="16" fill="#EFF6FF" stroke="#2563EB"/>
+  <text x="772" y="902" class="small">藍色：保留的安全規則</text>
+  <rect x="974" y="889" width="16" height="16" fill="#F5F3FF" stroke="#7C3AED"/>
+  <text x="1000" y="902" class="small">紫色：source merge 之外的部署工作</text>
+</svg>
