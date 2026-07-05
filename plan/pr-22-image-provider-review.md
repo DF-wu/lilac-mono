@@ -303,6 +303,22 @@ tools:
     image:
       models:
         - "openai-compatible/{provider-image-model-id}"
+      defaults:
+        size: "1024x1024"
+      profiles:
+        "openai-compatible/nanobanana":
+          useWhen: "Fast drafts, image edits, and lower-cost exploration."
+          defaults:
+            size: "1024x1024"
+            options:
+              quality: "high"
+        "openai-compatible/gpt-image-2":
+          useWhen: "Final high-fidelity product images."
+          defaults:
+            size: "1536x1024"
+            options:
+              openaiCompatible:
+                quality: "high"
 ```
 
 `models` 是 ordered default list，且會去重：
@@ -316,6 +332,66 @@ parsed:
 ```
 
 去重保留第一次出現的順序，原因是 default order 本身就是 operator policy，後面重複的同一模型沒有新增資訊。
+
+`defaults` 與 `profiles` 是參數調整層：
+
+```txt
+tools.generate.image.defaults
+      │
+      ▼
+全域圖片生成預設參數
+
+tools.generate.image.profiles[model]
+      │
+      ├─ useWhen: 給 agent/maintainer 的選模提示
+      └─ defaults: 這個模型自己的預設參數
+```
+
+參數合併順序：
+
+```txt
+global defaults
+      │
+      ▼
+model profile defaults
+      │
+      ▼
+caller input
+```
+
+caller input 最後套用，所以單次 tool call 明確傳入的 `size`、`aspectRatio`、`seed` 會覆蓋 config。這讓 operator 可以設定穩定預設，但不會阻止 agent 在特定任務中調整輸出比例或 seed。
+
+`options` 採用 AI SDK `providerOptions` mental model。若 `options` 看起來已經是 provider namespace map，就原樣轉交；若是 shorthand，Lilac 會根據實際解析出的 provider 包 namespace：
+
+```txt
+openai-compatible/...  -> openaiCompatible
+openai/...             -> openai
+openrouter/...         -> openrouter
+vercel/...             -> gateway
+```
+
+這對 built-in alias 也成立：例如 `gpt-5-image` 若實際解析到 OpenAI，就套 `openai`；若 fallback 到 OpenRouter，就套 `openrouter`。
+
+OpenAI-compatible image adapter 的重要限制：
+
+```txt
+portable size        -> 會轉送
+provider options     -> 會轉送
+portable aspectRatio -> 只產生 warning，不會轉送
+portable seed        -> 只產生 warning，不會轉送
+```
+
+所以自家 OpenAI-compatible 圖片 provider 若需要特殊參數，建議放在 `options`，例如：
+
+```yaml
+profiles:
+  "openai-compatible/nanobanana":
+    defaults:
+      size: "1024x1024"
+      options:
+        quality: "high"
+        seed: 7
+```
 
 ### 7.3 v1 shape frozen
 

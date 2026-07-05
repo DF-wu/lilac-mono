@@ -700,6 +700,8 @@ export function parseCoreConfigV1ToUniversal(raw: unknown): UniversalCoreConfig 
       generate: {
         image: {
           models: [],
+          defaults: {},
+          profiles: {},
         },
       },
     },

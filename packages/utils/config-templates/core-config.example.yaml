@@ -31,6 +31,35 @@ tools:
       #   - "openrouter/google/gemini-3.1-flash-image-preview"
       #   - "xai/grok-imagine-image"
       models: []
+      # Global defaults applied to every generate.image call before model profiles
+      # and caller input. Use only one of size or aspectRatio.
+      defaults: {}
+      # defaults:
+      #   size: "1024x1024"
+      #   # Provider-specific AI SDK options. If these are not already grouped by
+      #   # provider namespace, Lilac wraps them for the resolved provider.
+      #   # For OpenAI-compatible image APIs, use size and options for provider
+      #   # parameters; portable aspectRatio/seed are not forwarded by the AI SDK
+      #   # OpenAI-compatible image adapter.
+      #   options:
+      #     quality: "standard"
+      # Per-model tuning and selection guidance. Keys use the same model string
+      # that appears in models or in the generate.image model argument.
+      profiles: {}
+      # profiles:
+      #   "openai-compatible/nanobanana":
+      #     useWhen: "Fast drafts, image edits, and lower-cost exploration."
+      #     defaults:
+      #       size: "1024x1024"
+      #       options:
+      #         quality: "high"
+      #   "openai-compatible/gpt-image-2":
+      #     useWhen: "Final high-fidelity product images and text-heavy layouts."
+      #     defaults:
+      #       size: "1536x1024"
+      #       options:
+      #         openaiCompatible:
+      #           quality: "high"
 
 plugins:
   disabled: []

@@ -62,6 +62,19 @@ export type ModelCapabilityOverride = {
   };
 };
 
+export type ImageGenerationParameterDefaults = {
+  size?: string;
+  aspectRatio?: string;
+  seed?: number;
+  maxRetries?: number;
+  options?: JSONObject;
+};
+
+export type ImageGenerationModelProfile = {
+  useWhen?: string;
+  defaults: ImageGenerationParameterDefaults;
+};
+
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
 
@@ -84,6 +97,8 @@ export type UniversalCoreConfig = {
     generate: {
       image: {
         models: string[];
+        defaults: ImageGenerationParameterDefaults;
+        profiles: Record<string, ImageGenerationModelProfile>;
       };
     };
   };
