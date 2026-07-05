@@ -282,6 +282,9 @@ type ResolvedImageModel = {
   validateInput: (input: ImageGenerateInput) => void;
 };
 
+// Keep explicit provider/model specs bounded to providers that are already
+// wired through the AI SDK and expose image factories. This gives third-party
+// URL flexibility without inventing a second HTTP image client in the tool.
 const CONFIGURABLE_IMAGE_PROVIDER_IDS = [
   "openai",
   "openai-compatible",
@@ -310,6 +313,8 @@ function isConfiguredProvider(provider: ImageProviderId): boolean {
   const apiKey = "apiKey" in config ? config.apiKey : undefined;
   const baseUrl = "baseUrl" in config ? config.baseUrl : undefined;
 
+  // The OpenAI-compatible provider has no safe default endpoint. An API key
+  // alone cannot identify where image requests should be sent.
   if (provider === "openai-compatible") {
     return Boolean(baseUrl?.trim());
   }
@@ -327,6 +332,8 @@ function parseProviderModelSpec(spec: string):
       modelId: string;
     }
   | undefined {
+  // Split only the first slash so upstream model IDs can contain their own
+  // namespaces, e.g. openrouter/google/... or openai-compatible/acme/image.
   const separator = spec.indexOf("/");
   if (separator <= 0 || separator === spec.length - 1) return undefined;
   return {
@@ -369,6 +376,9 @@ export function createExplicitProviderImageModel(params: {
   if (!params.configuredProviderIds.includes(parsed.provider)) return undefined;
 
   const provider = params.providers[parsed.provider];
+  // Prefer imageModel because OpenRouter and OpenAI-compatible expose the
+  // provider-neutral AI SDK image interface there. Fall back to image for
+  // providers such as OpenAI/xAI that expose that convenience method.
   if (hasImageModel(provider)) {
     return provider.imageModel(parsed.modelId);
   }
@@ -504,6 +514,10 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
 ];
 
+// Built-in aliases carry local validation and provider fallback logic. Explicit
+// provider/model specs below intentionally skip local capability rules because
+// third-party providers often add provider-specific models faster than Lilac can
+// encode their size/aspect-ratio matrix.
 const IMAGE_MODEL_DESCRIPTOR_BY_ID = new Map<SupportedImageModelId, ImageModelDescriptor>(
   IMAGE_MODEL_DESCRIPTORS.map((descriptor) => [descriptor.id, descriptor]),
 );
@@ -577,6 +591,8 @@ export function resolveConfiguredImageModelSpecs(
   config: Pick<CoreConfig, "tools"> | undefined,
 ): readonly string[] {
   const configured = config?.tools.generate.image.models ?? [];
+  // Empty config preserves historical behavior: use Lilac's built-in aliases
+  // and provider-aware fallback order.
   return configured.length > 0 ? configured : DEFAULT_IMAGE_MODEL_FALLBACK_ORDER;
 }
 
@@ -593,6 +609,9 @@ export function resolveAvailableImageModels(params: {
   const ids: string[] = [];
 
   for (const spec of params.modelSpecs) {
+    // First resolve stable Lilac aliases such as gpt-5-image or nanobanana-2.
+    // These aliases can point at different concrete providers while retaining
+    // one user-facing model name and local input validation.
     const builtInDescriptor = IMAGE_MODEL_DESCRIPTOR_BY_ID.get(spec as SupportedImageModelId);
     if (builtInDescriptor) {
       const model = builtInDescriptor.createModel(params.providers);
@@ -608,6 +627,9 @@ export function resolveAvailableImageModels(params: {
       continue;
     }
 
+    // Then resolve direct provider/model specs. This is the escape hatch for
+    // third-party image APIs configured via OPENAI_COMPATIBLE_BASE_URL and for
+    // operators who want to pin concrete upstream provider model IDs.
     const model = createExplicitProviderImageModel({
       spec,
       providers: params.providers,
@@ -687,6 +709,9 @@ function pickImageModel(params: {
     const configuredModel = params.availableModels.byId.get(params.requested);
     if (configuredModel) return configuredModel;
 
+    // A caller-supplied model is allowed to bypass tools.generate.image.models.
+    // That lets agents/operators use a one-off third-party model as soon as the
+    // provider URL is configured, without changing the default model order.
     const explicitModel = createExplicitProviderImageModel({
       spec: params.requested,
       providers: params.providers,
@@ -719,6 +744,8 @@ function pickImageModel(params: {
     .map((provider) => `${provider}/<model-id>`)
     .join(", ");
 
+  // If a generic provider is configured but no default image model is named,
+  // keep the tool discoverable while requiring the caller to choose a model.
   if (explicitProviders) {
     throw new Error(
       `No default image generation model is configured. Set tools.generate.image.models or pass model as one of: ${explicitProviders}.`,
@@ -943,6 +970,9 @@ export class Generate implements ServerTool {
     const tools = [];
 
     if (imageModels.length > 0 || explicitImageProviders.length > 0) {
+      // A configured explicit provider is enough to advertise generate.image:
+      // the tool description tells agents how to pass provider/model manually
+      // even when the operator has not selected a default model.
       const explicitProviderSpecs = explicitImageProviders.map(
         (provider) => `${provider}/<model-id>`,
       );

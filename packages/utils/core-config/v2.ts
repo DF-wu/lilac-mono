@@ -238,6 +238,8 @@ const toolsSchema = z
       .object({
         image: z
           .object({
+            // Ordered default image model specs for generate.image. Empty means
+            // "use built-in aliases"; explicit specs use provider/model format.
             models: z
               .array(z.string().trim().min(1))
               .transform((models) => Array.from(new Set(models)))
