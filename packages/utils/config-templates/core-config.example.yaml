@@ -13,6 +13,24 @@ tools:
     model: google/gemini-3.5-flash
   editFile:
     hashline: true
+  generate:
+    image:
+      # Ordered default image models exposed by generate.image.
+      #
+      # Leave empty to use the built-in provider-aware defaults:
+      # nanobanana-2, nanobanana-pro, gpt-5-image,
+      # grok-imagine-image-pro, grok-imagine-image, nanobanana.
+      #
+      # For a third-party OpenAI-compatible image API, set
+      # OPENAI_COMPATIBLE_BASE_URL/OPENAI_COMPATIBLE_API_KEY and add:
+      # models:
+      #   - "openai-compatible/<provider-image-model-id>"
+      #
+      # You can also pin official/provider models explicitly, for example:
+      #   - "openai/gpt-image-1.5"
+      #   - "openrouter/google/gemini-3.1-flash-image-preview"
+      #   - "xai/grok-imagine-image"
+      models: []
 
 plugins:
   disabled: []

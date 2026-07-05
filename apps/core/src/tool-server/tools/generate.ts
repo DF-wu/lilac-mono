@@ -1,4 +1,4 @@
-import { env, getModelProviders } from "@stanley2058/lilac-utils";
+import { env, getModelProviders, type CoreConfig } from "@stanley2058/lilac-utils";
 import {
   experimental_generateVideo as generateVideo,
   generateImage,
@@ -269,11 +269,113 @@ type VideoModelDescriptor = ModelDescriptor<
   VideoGenerateInput
 >;
 
-function isConfiguredProvider(provider: "openai" | "openrouter" | "xai" | "vercel"): boolean {
-  const config = env.providers[provider];
+type ImageProviderId = "openai" | "openai-compatible" | "openrouter" | "xai" | "vercel";
+
+type GenerateOptions = {
+  config?: Pick<CoreConfig, "tools">;
+  getConfig?: () => Promise<Pick<CoreConfig, "tools">>;
+};
+
+type ResolvedImageModel = {
+  id: string;
+  model: ImageModel;
+  validateInput: (input: ImageGenerateInput) => void;
+};
+
+const CONFIGURABLE_IMAGE_PROVIDER_IDS = [
+  "openai",
+  "openai-compatible",
+  "openrouter",
+  "xai",
+  "vercel",
+] as const satisfies readonly ImageProviderId[];
+
+function isImageProviderId(value: string): value is ImageProviderId {
+  return (CONFIGURABLE_IMAGE_PROVIDER_IDS as readonly string[]).includes(value);
+}
+
+function getImageProviderConfig(provider: ImageProviderId): {
+  apiKey?: string;
+  baseUrl?: string;
+} {
+  if (provider === "openai-compatible") {
+    return env.providers.openaiCompatible;
+  }
+
+  return env.providers[provider];
+}
+
+function isConfiguredProvider(provider: ImageProviderId): boolean {
+  const config = getImageProviderConfig(provider);
   const apiKey = "apiKey" in config ? config.apiKey : undefined;
   const baseUrl = "baseUrl" in config ? config.baseUrl : undefined;
+
+  if (provider === "openai-compatible") {
+    return Boolean(baseUrl?.trim());
+  }
+
   return Boolean(apiKey?.trim() || baseUrl?.trim());
+}
+
+function configuredExplicitImageProviderIds(): ImageProviderId[] {
+  return CONFIGURABLE_IMAGE_PROVIDER_IDS.filter((provider) => isConfiguredProvider(provider));
+}
+
+function parseProviderModelSpec(spec: string):
+  | {
+      provider: string;
+      modelId: string;
+    }
+  | undefined {
+  const separator = spec.indexOf("/");
+  if (separator <= 0 || separator === spec.length - 1) return undefined;
+  return {
+    provider: spec.slice(0, separator),
+    modelId: spec.slice(separator + 1),
+  };
+}
+
+type ProviderWithImageModel = {
+  imageModel(modelId: string): ImageModel;
+};
+
+type ProviderWithImage = {
+  image(modelId: string): ImageModel;
+};
+
+function hasImageModel(provider: unknown): provider is ProviderWithImageModel {
+  return (
+    typeof provider === "object" &&
+    provider !== null &&
+    typeof Reflect.get(provider, "imageModel") === "function"
+  );
+}
+
+function hasImage(provider: unknown): provider is ProviderWithImage {
+  return (
+    typeof provider === "object" &&
+    provider !== null &&
+    typeof Reflect.get(provider, "image") === "function"
+  );
+}
+
+export function createExplicitProviderImageModel(params: {
+  spec: string;
+  providers: Record<string, unknown>;
+  configuredProviderIds: readonly string[];
+}): ImageModel | undefined {
+  const parsed = parseProviderModelSpec(params.spec);
+  if (!parsed || !isImageProviderId(parsed.provider)) return undefined;
+  if (!params.configuredProviderIds.includes(parsed.provider)) return undefined;
+
+  const provider = params.providers[parsed.provider];
+  if (hasImageModel(provider)) {
+    return provider.imageModel(parsed.modelId);
+  }
+  if (hasImage(provider)) {
+    return provider.image(parsed.modelId);
+  }
+  return undefined;
 }
 
 function isOneOf<const T extends readonly string[]>(allowed: T, value: string): value is T[number] {
@@ -402,6 +504,10 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
 ];
 
+const IMAGE_MODEL_DESCRIPTOR_BY_ID = new Map<SupportedImageModelId, ImageModelDescriptor>(
+  IMAGE_MODEL_DESCRIPTORS.map((descriptor) => [descriptor.id, descriptor]),
+);
+
 function validateGrokVideoInput(input: VideoGenerateInput): void {
   if (input.aspectRatio && !isOneOf(GROK_VIDEO_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
     throw new Error(
@@ -467,9 +573,72 @@ function resolveAvailableModels<TId extends string, TModel, TInput>(
   };
 }
 
-function getAvailableImageModels() {
+export function resolveConfiguredImageModelSpecs(
+  config: Pick<CoreConfig, "tools"> | undefined,
+): readonly string[] {
+  const configured = config?.tools.generate.image.models ?? [];
+  return configured.length > 0 ? configured : DEFAULT_IMAGE_MODEL_FALLBACK_ORDER;
+}
+
+export function resolveAvailableImageModels(params: {
+  providers: ReturnType<typeof getModelProviders>;
+  modelSpecs: readonly string[];
+}): {
+  available: ReadonlyMap<string, ImageModel>;
+  byId: ReadonlyMap<string, ResolvedImageModel>;
+  ids: string[];
+} {
+  const available = new Map<string, ImageModel>();
+  const byId = new Map<string, ResolvedImageModel>();
+  const ids: string[] = [];
+
+  for (const spec of params.modelSpecs) {
+    const builtInDescriptor = IMAGE_MODEL_DESCRIPTOR_BY_ID.get(spec as SupportedImageModelId);
+    if (builtInDescriptor) {
+      const model = builtInDescriptor.createModel(params.providers);
+      if (!model) continue;
+
+      available.set(spec, model);
+      byId.set(spec, {
+        id: spec,
+        model,
+        validateInput: builtInDescriptor.validateInput,
+      });
+      ids.push(spec);
+      continue;
+    }
+
+    const model = createExplicitProviderImageModel({
+      spec,
+      providers: params.providers,
+      configuredProviderIds: configuredExplicitImageProviderIds(),
+    });
+    if (!model) continue;
+
+    available.set(spec, model);
+    byId.set(spec, {
+      id: spec,
+      model,
+      validateInput: () => {},
+    });
+    ids.push(spec);
+  }
+
+  return {
+    available,
+    byId,
+    ids,
+  };
+}
+
+async function getAvailableImageModels(options?: GenerateOptions) {
   const providers = getModelProviders();
-  return resolveAvailableModels(IMAGE_MODEL_DESCRIPTORS, providers);
+  const config = options?.config ?? (options?.getConfig ? await options.getConfig() : undefined);
+  const modelSpecs = resolveConfiguredImageModelSpecs(config);
+  return resolveAvailableImageModels({
+    providers,
+    modelSpecs,
+  });
 }
 
 function getAvailableVideoModels() {
@@ -506,6 +675,58 @@ function pickModel<TId extends string, TModel>(
 
   throw new Error(
     `No ${modalityLabel} generation models are configured. Configure at least one provider for ${modalityLabel} generation.`,
+  );
+}
+
+function pickImageModel(params: {
+  availableModels: Awaited<ReturnType<typeof getAvailableImageModels>>;
+  requested: string | undefined;
+  providers: ReturnType<typeof getModelProviders>;
+}): ResolvedImageModel {
+  if (params.requested) {
+    const configuredModel = params.availableModels.byId.get(params.requested);
+    if (configuredModel) return configuredModel;
+
+    const explicitModel = createExplicitProviderImageModel({
+      spec: params.requested,
+      providers: params.providers,
+      configuredProviderIds: configuredExplicitImageProviderIds(),
+    });
+    if (explicitModel) {
+      return {
+        id: params.requested,
+        model: explicitModel,
+        validateInput: () => {},
+      };
+    }
+
+    const configured = params.availableModels.ids.join(", ") || "none";
+    const explicitProviders = configuredExplicitImageProviderIds()
+      .map((provider) => `${provider}/<model-id>`)
+      .join(", ");
+    throw new Error(
+      `Requested model '${params.requested}' is not available for image generation (configured defaults: ${configured}; explicit providers: ${explicitProviders || "none"}).`,
+    );
+  }
+
+  const first = params.availableModels.ids[0];
+  if (first) {
+    const model = params.availableModels.byId.get(first);
+    if (model) return model;
+  }
+
+  const explicitProviders = configuredExplicitImageProviderIds()
+    .map((provider) => `${provider}/<model-id>`)
+    .join(", ");
+
+  if (explicitProviders) {
+    throw new Error(
+      `No default image generation model is configured. Set tools.generate.image.models or pass model as one of: ${explicitProviders}.`,
+    );
+  }
+
+  throw new Error(
+    "No image generation models are configured. Configure an image provider or set tools.generate.image.models.",
   );
 }
 
@@ -710,21 +931,28 @@ export function generateVideoWithModel(
 export class Generate implements ServerTool {
   id = "generate";
 
+  constructor(private readonly options: GenerateOptions = {}) {}
+
   async init(): Promise<void> {}
   async destroy(): Promise<void> {}
 
   async list() {
-    const imageModels = getAvailableImageModels().ids;
+    const imageModels = (await getAvailableImageModels(this.options)).ids;
+    const explicitImageProviders = configuredExplicitImageProviderIds();
     const videoModels = getAvailableVideoModels().ids;
     const tools = [];
 
-    if (imageModels.length > 0) {
+    if (imageModels.length > 0 || explicitImageProviders.length > 0) {
+      const explicitProviderSpecs = explicitImageProviders.map(
+        (provider) => `${provider}/<model-id>`,
+      );
       tools.push({
         callableId: "generate.image",
         name: "Generate Image",
         description:
           "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
-          `Available models: ${imageModels.join(", ")}`,
+          `Default models: ${imageModels.join(", ") || "none"}. ` +
+          `Explicit model specs: ${explicitProviderSpecs.join(", ") || "none"}`,
         shortInput: zodObjectToCliLines(imageGenerateInputSchema, {
           mode: "required",
         }),
@@ -780,19 +1008,15 @@ export class Generate implements ServerTool {
     },
   ): Promise<unknown> {
     const payload = imageGenerateInputSchema.parse(input);
-    const availableModels = getAvailableImageModels();
-    const picked = pickModel(
-      availableModels.available,
-      payload.model,
-      DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
-      "image",
-    );
+    const providers = getModelProviders();
+    const availableModels = await getAvailableImageModels(this.options);
+    const picked = pickImageModel({
+      availableModels,
+      requested: payload.model,
+      providers,
+    });
 
-    const descriptor = availableModels.byId.get(picked.id);
-    if (!descriptor) {
-      throw new Error(`Model descriptor not found for '${picked.id}'.`);
-    }
-    descriptor.validateInput(payload);
+    picked.validateInput(payload);
 
     const cwd = opts?.context?.cwd ?? process.cwd();
     const resolvedOutputDir = resolveToolPathForRequestContext({

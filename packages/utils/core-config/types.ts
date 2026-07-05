@@ -81,6 +81,11 @@ export type UniversalCoreConfig = {
     editFile: {
       hashline: boolean;
     };
+    generate: {
+      image: {
+        models: string[];
+      };
+    };
   };
 
   plugins: {

@@ -1,11 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import type { CoreConfig } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
 import {
   buildImageGenerationPrompt,
   buildVideoGenerationPrompt,
+  createExplicitProviderImageModel,
   imageGenerateInputSchema,
+  resolveConfiguredImageModelSpecs,
   resolveImageEditInputs,
   videoGenerateInputSchema,
 } from "../src/tool-server/tools/generate";
@@ -50,6 +54,83 @@ describe("tool-server image generation", () => {
         prompt: "Generate a portrait",
       }),
     ).toThrow("Unrecognized key");
+  });
+
+  it("uses built-in image model defaults when config does not specify models", () => {
+    expect(resolveConfiguredImageModelSpecs(undefined)).toEqual([
+      "nanobanana-2",
+      "nanobanana-pro",
+      "gpt-5-image",
+      "grok-imagine-image-pro",
+      "grok-imagine-image",
+      "nanobanana",
+    ]);
+  });
+
+  it("uses configured image model specs as the default order", () => {
+    const config = {
+      tools: {
+        fsBackend: "fff",
+        web: {
+          extract: {
+            providers: ["tavily"],
+          },
+          fetch: {
+            mode: "auto",
+          },
+        },
+        inspect: {
+          model: "google/gemini-3.5-flash",
+        },
+        editFile: {
+          hashline: true,
+        },
+        generate: {
+          image: {
+            models: ["openai-compatible/acme-image-model"],
+          },
+        },
+      },
+    } satisfies Pick<CoreConfig, "tools">;
+
+    expect(resolveConfiguredImageModelSpecs(config)).toEqual([
+      "openai-compatible/acme-image-model",
+    ]);
+  });
+
+  it("creates explicit OpenAI-compatible image models from provider/model specs", () => {
+    const requestedModelIds: string[] = [];
+    const model = createExplicitProviderImageModel({
+      spec: "openai-compatible/acme/image-model",
+      configuredProviderIds: ["openai-compatible"],
+      providers: {
+        "openai-compatible": {
+          imageModel(modelId: string) {
+            requestedModelIds.push(modelId);
+            return `image:${modelId}`;
+          },
+        },
+      },
+    });
+
+    expect(model).toBe("image:acme/image-model");
+    expect(requestedModelIds).toEqual(["acme/image-model"]);
+  });
+
+  it("does not create explicit image models for unconfigured providers", () => {
+    const model = createExplicitProviderImageModel({
+      spec: "openai-compatible/acme/image-model",
+      configuredProviderIds: [],
+      providers: {
+        "openai-compatible": {
+          imageModel(modelId: string) {
+            return `image:${modelId}`;
+          },
+        },
+      },
+    });
+
+    expect(model).toBeUndefined();
   });
 
   it("returns plain text prompt when inputImages are not provided", async () => {

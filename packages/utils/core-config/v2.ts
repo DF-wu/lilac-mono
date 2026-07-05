@@ -234,6 +234,24 @@ const toolsSchema = z
       .default({
         hashline: true,
       }),
+    generate: z
+      .object({
+        image: z
+          .object({
+            models: z
+              .array(z.string().trim().min(1))
+              .transform((models) => Array.from(new Set(models)))
+              .default([]),
+          })
+          .default({
+            models: [],
+          }),
+      })
+      .default({
+        image: {
+          models: [],
+        },
+      }),
   })
   .default({
     fsBackend: "fff",
@@ -250,6 +268,11 @@ const toolsSchema = z
     },
     editFile: {
       hashline: true,
+    },
+    generate: {
+      image: {
+        models: [],
+      },
     },
   });
 

@@ -31,6 +31,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.web.fetch.mode).toBe("auto");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(false);
+    expect(parsed.tools.generate.image.models).toEqual([]);
   });
 
   it("parses explicit v2 configs with v2 defaults", async () => {
@@ -40,6 +41,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.fsBackend).toBe("fff");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3.5-flash");
     expect(parsed.tools.editFile.hashline).toBe(true);
+    expect(parsed.tools.generate.image.models).toEqual([]);
     expect(parsed.surface.discord.outputMode).toBe("preview");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
     expect(parsed.surface.discord.outputNotification).toBe(true);
@@ -59,6 +61,28 @@ describe("core config versioning", () => {
     expect(parsed.agent.subagents.defaultTimeoutMs).toBe(10 * 60 * 1000);
     expect(parsed.agent.subagents.maxTimeoutMs).toBe(20 * 60 * 1000);
     expect(parsed.models.main.reasoning).toBeUndefined();
+  });
+
+  it("parses v2 generate.image model defaults", async () => {
+    const parsed = await parseCoreConfig({
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            models: [
+              "openai-compatible/acme-image-model",
+              "openai-compatible/acme-image-model",
+              "openrouter/google/gemini-3.1-flash-image-preview",
+            ],
+          },
+        },
+      },
+    });
+
+    expect(parsed.tools.generate.image.models).toEqual([
+      "openai-compatible/acme-image-model",
+      "openrouter/google/gemini-3.1-flash-image-preview",
+    ]);
   });
 
   it("parses v2 portable model reasoning fields", async () => {
