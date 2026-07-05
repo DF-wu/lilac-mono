@@ -30,7 +30,6 @@ const subagentDelegateInputSchema = z
       ),
     blockingReason: z
       .string()
-      .min(1)
       .optional()
       .describe(
         'Required when mode is "sync". Explain why the child result is immediately required before continuing.',
