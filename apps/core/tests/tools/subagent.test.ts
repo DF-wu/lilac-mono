@@ -168,6 +168,57 @@ describe("subagent_delegate tool", () => {
     ]);
   });
 
+  it("treats an empty deferred blockingReason as omitted", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+
+    const launches: Array<{ childRequestId: string; childSessionId: string; task: string }> = [];
+
+    const tools = subagentTools({
+      bus,
+      defaultTimeoutMs: 2_000,
+      maxTimeoutMs: 4_000,
+      maxDepth: 1,
+      onDeferredDelegate: async (registration) => {
+        launches.push({
+          childRequestId: registration.childRequestId,
+          childSessionId: registration.childSessionId,
+          task: registration.task,
+        });
+      },
+    });
+
+    const res = await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        {
+          profile: "explore",
+          task: "Map auth flow",
+          mode: "deferred",
+          blockingReason: "",
+        },
+        {
+          toolCallId: "tool-deferred-empty-blocking-reason",
+          messages: [],
+          context: {
+            requestId: "r:deferred-empty-blocking-reason",
+            sessionId: "s:deferred-empty-blocking-reason",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    );
+
+    expect(res.status).toBe("accepted");
+    expect(launches).toEqual([
+      {
+        childRequestId: res.childRequestId,
+        childSessionId: res.childSessionId,
+        task: "Map auth flow",
+      },
+    ]);
+  });
+
   it("ignores legacy raw sessionId input and creates an anonymous child session", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -237,6 +288,22 @@ describe("subagent_delegate tool", () => {
           context: {
             requestId: "r:sync-validation",
             sessionId: "s:sync-validation",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    ).rejects.toThrow(/blockingReason is required/i);
+
+    await expect(
+      tools.subagent_delegate.execute!(
+        { profile: "explore", task: "Map auth flow", mode: "sync", blockingReason: "" },
+        {
+          toolCallId: "tool-sync-empty-blocking-reason-validation",
+          messages: [],
+          context: {
+            requestId: "r:sync-empty-blocking-reason-validation",
+            sessionId: "s:sync-empty-blocking-reason-validation",
             requestClient: "discord",
             subagentDepth: 0,
           },

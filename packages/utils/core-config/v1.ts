@@ -697,6 +697,13 @@ export function parseCoreConfigV1ToUniversal(raw: unknown): UniversalCoreConfig 
       editFile: {
         hashline,
       },
+      generate: {
+        image: {
+          models: [],
+          defaults: {},
+          profiles: {},
+        },
+      },
     },
     conversation: {
       thread: {

@@ -85,6 +85,66 @@ The runtime flow is:
 
 For the full system mental model, terminology, and file-level architecture, see [`PROJECT.md`](./PROJECT.md).
 
+## Image Generation Providers
+
+The `generate.image` tool supports built-in provider aliases and explicit image model specs.
+For third-party OpenAI-compatible image APIs, configure the provider URL with environment
+variables and choose the default image model in `core-config.yaml`.
+
+```dotenv
+OPENAI_COMPATIBLE_BASE_URL=https://provider.example/v1
+OPENAI_COMPATIBLE_API_KEY=...
+```
+
+```yaml
+configVersion: 2
+
+tools:
+  generate:
+    image:
+      models:
+        - "openai-compatible/nanobanana"
+        - "openai-compatible/gpt-image-2"
+      defaults:
+        size: "1024x1024"
+      profiles:
+        "openai-compatible/nanobanana":
+          useWhen: "Fast drafts and image edits."
+          defaults:
+            size: "1024x1024"
+            options:
+              quality: "high"
+        "openai-compatible/gpt-image-2":
+          useWhen: "Final high-fidelity product images."
+          defaults:
+            size: "1536x1024"
+            options:
+              openaiCompatible:
+                quality: "high"
+```
+
+`tools.generate.image.models` is ordered. The first configured and available model becomes the
+default when the caller omits `model`. Agents and direct tool callers can also pass a full
+`model` value such as `openai-compatible/<provider-image-model-id>`,
+`openai/gpt-image-1.5`, `openrouter/google/gemini-3.1-flash-image-preview`, or
+`xai/grok-imagine-image`.
+
+`tools.generate.image.defaults` sets global generation defaults. `profiles` tunes individual
+models and adds `useWhen` guidance to the tool description so the agent can choose between
+multiple configured models. Parameter resolution order is: global defaults, then
+`profiles[model].defaults`, then caller input. Caller-provided `size`, `aspectRatio`, or `seed`
+always wins for that call. `options` is passed as AI SDK `providerOptions`; shorthand options are
+wrapped for the resolved provider namespace, e.g. `openaiCompatible` for
+`openai-compatible`. For OpenAI-compatible image APIs, prefer `size` and provider-specific
+`options`; the AI SDK OpenAI-compatible image adapter does not forward portable `aspectRatio` or
+`seed`.
+
+If `tools.generate.image.models` is empty, Lilac keeps the built-in provider-aware fallback
+order: `nanobanana-2`, `nanobanana-pro`, `gpt-5-image`,
+`grok-imagine-image-pro`, `grok-imagine-image`, then `nanobanana`. A configured
+OpenAI-compatible base URL still exposes the tool, but calls without `model` need a configured
+default model.
+
 ## Repository Map
 
 | Path | Purpose |
