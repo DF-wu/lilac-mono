@@ -120,6 +120,27 @@ describe("tool-server image generation", () => {
     expect(requestedModelIds).toEqual(["acme/image-model"]);
   });
 
+  it("creates explicit image models from function-shaped AI SDK providers", () => {
+    const requestedModelIds: string[] = [];
+    const provider = Object.assign(() => undefined, {
+      imageModel(modelId: string) {
+        requestedModelIds.push(modelId);
+        return `image:${modelId}`;
+      },
+    });
+
+    const model = createExplicitProviderImageModel({
+      spec: "openai-compatible/gpt-image-2",
+      configuredProviderIds: ["openai-compatible"],
+      providers: {
+        "openai-compatible": provider,
+      },
+    });
+
+    expect(model).toBe("image:gpt-image-2");
+    expect(requestedModelIds).toEqual(["gpt-image-2"]);
+  });
+
   it("does not create explicit image models for unconfigured providers", () => {
     const model = createExplicitProviderImageModel({
       spec: "openai-compatible/acme/image-model",

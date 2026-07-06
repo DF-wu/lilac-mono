@@ -81,10 +81,9 @@ tools:
       #   "openai-compatible/gpt-image-2":
       #     useWhen: "Final high-fidelity product images and text-heavy layouts."
       #     defaults:
-      #       size: "1536x1024"
+      #       size: "1024x1024"
       #       options:
-      #         openaiCompatible:
-      #           quality: "high"
+      #         quality: "high"
 
 plugins:
   disabled: []

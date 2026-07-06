@@ -440,8 +440,12 @@ function parseProviderModelSpec(spec: string):
   };
 }
 
+function isReflectable(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function";
+}
+
 function getImageModelProviderNamespace(model: ImageModel, fallbackModelId: string): string {
-  if (typeof model === "object" && model !== null && "provider" in model) {
+  if (isReflectable(model) && "provider" in model) {
     const provider = Reflect.get(model, "provider");
     if (typeof provider === "string" && provider.trim().length > 0) {
       return providerOptionsNamespace(provider.split(".")[0] ?? provider);
@@ -574,19 +578,11 @@ type ProviderWithImage = {
 };
 
 function hasImageModel(provider: unknown): provider is ProviderWithImageModel {
-  return (
-    typeof provider === "object" &&
-    provider !== null &&
-    typeof Reflect.get(provider, "imageModel") === "function"
-  );
+  return isReflectable(provider) && typeof Reflect.get(provider, "imageModel") === "function";
 }
 
 function hasImage(provider: unknown): provider is ProviderWithImage {
-  return (
-    typeof provider === "object" &&
-    provider !== null &&
-    typeof Reflect.get(provider, "image") === "function"
-  );
+  return isReflectable(provider) && typeof Reflect.get(provider, "image") === "function";
 }
 
 export function createExplicitProviderImageModel(params: {
