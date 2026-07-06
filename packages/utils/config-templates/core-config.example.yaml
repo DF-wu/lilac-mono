@@ -81,6 +81,9 @@ tools:
       #   "openai-compatible/gpt-image-2":
       #     useWhen: "Final high-fidelity product images and text-heavy layouts."
       #     defaults:
+      #       # This shape is intentionally provider-specific. Some gateways
+      #       # expose gpt-image-2 in /models but require quality=high for
+      #       # successful /images/generations requests.
       #       size: "1024x1024"
       #       options:
       #         quality: "high"

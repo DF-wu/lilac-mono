@@ -103,24 +103,23 @@ tools:
   generate:
     image:
       models:
-        - "openai-compatible/nanobanana"
         - "openai-compatible/gpt-image-2"
+        - "openai-compatible/nanobanana"
       defaults:
         size: "1024x1024"
       profiles:
+        "openai-compatible/gpt-image-2":
+          useWhen: "Final high-fidelity product images."
+          defaults:
+            size: "1024x1024"
+            options:
+              quality: "high"
         "openai-compatible/nanobanana":
           useWhen: "Fast drafts and image edits."
           defaults:
             size: "1024x1024"
             options:
               quality: "high"
-        "openai-compatible/gpt-image-2":
-          useWhen: "Final high-fidelity product images."
-          defaults:
-            size: "1536x1024"
-            options:
-              openaiCompatible:
-                quality: "high"
 ```
 
 `tools.generate.image.models` is ordered. The first configured and available model becomes the
@@ -139,11 +138,37 @@ wrapped for the resolved provider namespace, e.g. `openaiCompatible` for
 `options`; the AI SDK OpenAI-compatible image adapter does not forward portable `aspectRatio` or
 `seed`.
 
+For OpenAI-compatible gateways that expose `gpt-image-2`, keep model-specific upstream
+parameters under the matching profile. In the Catalina provider setup, `gpt-image-2` requires
+`options.quality: "high"`; without that provider option the upstream may return 429s or time out
+even though the model appears in `/models`.
+
 If `tools.generate.image.models` is empty, Lilac keeps the built-in provider-aware fallback
 order: `nanobanana-2`, `nanobanana-pro`, `gpt-5-image`,
 `grok-imagine-image-pro`, `grok-imagine-image`, then `nanobanana`. A configured
 OpenAI-compatible base URL still exposes the tool, but calls without `model` need a configured
 default model.
+
+To verify the effective configuration inside a running environment:
+
+```bash
+tools --help generate.image
+```
+
+The help text should show the configured default models and any model profile defaults. Then run
+one real generation request:
+
+```bash
+tools generate.image \
+  --output=json \
+  --prompt="A tiny red cube on a plain white background, product photo, no text" \
+  --output-dir=/tmp/lilac-image-test
+```
+
+The JSON result should include `ok: true`, the chosen `model`, a PNG/JPEG `mimeType`, and the
+written file path. If the tool lists `Default models: none`, the runtime is not reading the
+expected `core-config.yaml` or is running an older build. If the request reaches the provider but
+fails with an upstream error or timeout, check the model id and `profiles.<model>.defaults.options`.
 
 ## Repository Map
 
