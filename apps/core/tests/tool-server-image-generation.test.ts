@@ -7,8 +7,10 @@ import { join } from "node:path";
 import {
   buildImageGenerationPrompt,
   buildVideoGenerationPrompt,
+  canRequestImageModel,
   createExplicitProviderImageModel,
   imageGenerateInputSchema,
+  normalizeImageGenerationParametersForModel,
   resolveConfiguredImageModelSpecs,
   resolveImageGenerationParameters,
   resolveImageEditInputs,
@@ -155,6 +157,65 @@ describe("tool-server image generation", () => {
     });
 
     expect(model).toBeUndefined();
+  });
+
+  it("treats configured image models as the explicit request allowlist", () => {
+    expect(
+      canRequestImageModel({
+        configuredModelSpecs: ["openai-compatible/gpt-image-2"],
+        requested: "openai-compatible/gpt-image-2",
+      }),
+    ).toBe(true);
+
+    expect(
+      canRequestImageModel({
+        configuredModelSpecs: ["openai-compatible/gpt-image-2"],
+        requested: "openai-compatible/nanobanana-pro",
+      }),
+    ).toBe(false);
+
+    expect(
+      canRequestImageModel({
+        configuredModelSpecs: [],
+        requested: "openai-compatible/nanobanana-pro",
+      }),
+    ).toBe(true);
+  });
+
+  it("normalizes gpt-image-2 sizes before sending them to the provider", () => {
+    const normalized = normalizeImageGenerationParametersForModel({
+      modelId: "openai-compatible/gpt-image-2",
+      parameters: {
+        size: "2304x4096",
+      },
+    });
+
+    expect(normalized.parameters.size).toBe("2160x3840");
+    expect(normalized.warnings).toEqual([
+      {
+        type: "parameter-adjusted",
+        parameter: "size",
+        from: "2304x4096",
+        to: "2160x3840",
+        reason:
+          "gpt-image-2 image sizes must use 16-pixel multiples and stay within the provider pixel limit.",
+      },
+    ]);
+  });
+
+  it("converts gpt-image-2 aspectRatio into a concrete provider size", () => {
+    const normalized = normalizeImageGenerationParametersForModel({
+      modelId: "openai-compatible/gpt-image-2",
+      parameters: {
+        aspectRatio: "3:4",
+      },
+    });
+
+    expect(normalized.parameters).toMatchObject({
+      size: "880x1184",
+      aspectRatio: undefined,
+    });
+    expect(normalized.warnings[0]?.parameter).toBe("aspectRatio");
   });
 
   it("resolves image generation parameters from global defaults and model profiles", () => {

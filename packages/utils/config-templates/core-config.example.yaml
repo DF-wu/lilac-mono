@@ -23,10 +23,13 @@ tools:
       #
       # Model selection order:
       # 1. A tool call that passes `model` uses that exact model for the call.
+      #    When this `models` list is non-empty, the requested model must appear
+      #    in the list. This keeps agents from bypassing your configured image
+      #    provider policy with an unverified one-off model name.
       # 2. If `model` is omitted, Lilac walks this `models` list in order and
       #    picks the first configured/available model.
       # 3. If `models` is empty, Lilac uses the built-in provider-aware fallback
-      #    aliases listed below.
+      #    aliases listed below and still allows explicit provider/model specs.
       #
       # Leave empty to use the built-in provider-aware defaults:
       # nanobanana-2, nanobanana-pro, gpt-5-image,
@@ -36,6 +39,9 @@ tools:
       # models:
       #   - "openai-compatible/nanobanana"
       #   - "openai-compatible/gpt-image-2"
+      # With this example, both models are allowed; any other explicit
+      # `--model=openai-compatible/...` request is rejected locally before Lilac
+      # sends an invalid or unsupported model to the upstream provider.
       #
       # You can also mix official/provider models explicitly, for example:
       #   - "openai/gpt-image-1.5"
@@ -49,6 +55,9 @@ tools:
       # 2. tools.generate.image.profiles.<model>.defaults
       # 3. Caller tool input (`size`, `aspectRatio`, `seed`) wins for that call
       # 4. The upstream provider/AI SDK supplies anything still unset
+      # 5. Model-specific local normalization runs after the final value is
+      #    resolved, before the provider request is sent. Example: gpt-image-2
+      #    sizes are rounded/clamped to provider-safe dimensions.
       #
       # Use only one of size or aspectRatio. `size` is safest for
       # OpenAI-compatible image APIs because the current AI SDK adapter forwards
@@ -84,6 +93,9 @@ tools:
       #       # This shape is intentionally provider-specific. Some gateways
       #       # expose gpt-image-2 in /models but require quality=high for
       #       # successful /images/generations requests.
+      #       # Lilac normalizes gpt-image-2 sizes to 16-pixel multiples and
+      #       # clamps very large requests to the provider pixel limit before
+      #       # sending the request upstream.
       #       size: "1024x1024"
       #       options:
       #         quality: "high"

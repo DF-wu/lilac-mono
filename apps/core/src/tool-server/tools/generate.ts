@@ -171,6 +171,7 @@ export const imageGenerateInputSchema = z
       .describe(
         [
           "Optional output size as '{width}x{height}'. (Use only one of --size or --aspect-ratio)",
+          "- For gpt-image-2: arbitrary sizes are normalized to 16-pixel multiples and clamped to the provider pixel limit.",
           "- For gpt-5-image: 1024x1024 | 1536x1024 | 1024x1536.",
           "- For nanobanana(-2|-pro): calculate based-on 1K, 2K, 4K. E.g.,",
           "  - 1:1 @ 1K/2K/4K: 1024^2 / 2048^2 / 4096^2",
@@ -305,6 +306,14 @@ type ImageGenerationResolvedParameters = {
   providerOptions?: ImageProviderOptions;
 };
 
+type ImageGenerationParameterWarning = {
+  type: "parameter-adjusted";
+  parameter: "size" | "aspectRatio";
+  from?: string;
+  to: string;
+  reason: string;
+};
+
 // Keep explicit provider/model specs bounded to providers that are already
 // wired through the AI SDK and expose image factories. This gives third-party
 // URL flexibility without inventing a second HTTP image client in the tool.
@@ -315,6 +324,10 @@ const CONFIGURABLE_IMAGE_PROVIDER_IDS = [
   "xai",
   "vercel",
 ] as const satisfies readonly ImageProviderId[];
+
+const GPT_IMAGE_2_MAX_PIXELS = 8_294_400;
+const GPT_IMAGE_2_SIZE_MULTIPLE = 16;
+const GPT_IMAGE_2_DEFAULT_PIXELS = 1024 * 1024;
 
 function isImageProviderId(value: string): value is ImageProviderId {
   return (CONFIGURABLE_IMAGE_PROVIDER_IDS as readonly string[]).includes(value);
@@ -569,6 +582,135 @@ export function resolveImageGenerationParameters(params: {
   return resolved;
 }
 
+function parseSize(value: string): { width: number; height: number } {
+  const [widthRaw, heightRaw] = value.split("x");
+  const width = Number(widthRaw);
+  const height = Number(heightRaw);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new Error(
+      `Invalid image size '${value}'. Expected positive integer size like 1024x1024.`,
+    );
+  }
+  return { width, height };
+}
+
+function parseAspectRatio(value: string): { width: number; height: number } {
+  const [widthRaw, heightRaw] = value.split(":");
+  const width = Number(widthRaw);
+  const height = Number(heightRaw);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error(`Invalid image aspectRatio '${value}'. Expected positive ratio like 3:4.`);
+  }
+  return { width, height };
+}
+
+function formatSize(width: number, height: number): `${number}x${number}` {
+  return `${width}x${height}` as `${number}x${number}`;
+}
+
+function floorToMultiple(value: number, multiple: number): number {
+  return Math.max(multiple, Math.floor(value / multiple) * multiple);
+}
+
+function roundToMultiple(value: number, multiple: number): number {
+  return Math.max(multiple, Math.round(value / multiple) * multiple);
+}
+
+function clampGptImage2Size(width: number, height: number): `${number}x${number}` {
+  let normalizedWidth = roundToMultiple(width, GPT_IMAGE_2_SIZE_MULTIPLE);
+  let normalizedHeight = roundToMultiple(height, GPT_IMAGE_2_SIZE_MULTIPLE);
+
+  if (normalizedWidth * normalizedHeight > GPT_IMAGE_2_MAX_PIXELS) {
+    const scale = Math.sqrt(GPT_IMAGE_2_MAX_PIXELS / (normalizedWidth * normalizedHeight));
+    normalizedWidth = floorToMultiple(normalizedWidth * scale, GPT_IMAGE_2_SIZE_MULTIPLE);
+    normalizedHeight = floorToMultiple(normalizedHeight * scale, GPT_IMAGE_2_SIZE_MULTIPLE);
+  }
+
+  while (normalizedWidth * normalizedHeight > GPT_IMAGE_2_MAX_PIXELS) {
+    if (normalizedWidth >= normalizedHeight) {
+      normalizedWidth -= GPT_IMAGE_2_SIZE_MULTIPLE;
+    } else {
+      normalizedHeight -= GPT_IMAGE_2_SIZE_MULTIPLE;
+    }
+  }
+
+  return formatSize(normalizedWidth, normalizedHeight);
+}
+
+function gptImage2AspectRatioToSize(aspectRatio: string): `${number}x${number}` {
+  const ratio = parseAspectRatio(aspectRatio);
+  const width = Math.sqrt(GPT_IMAGE_2_DEFAULT_PIXELS * (ratio.width / ratio.height));
+  const height = width * (ratio.height / ratio.width);
+  return clampGptImage2Size(width, height);
+}
+
+function isGptImage2ModelId(modelId: string): boolean {
+  const parsed = parseProviderModelSpec(modelId);
+  const concreteModelId = parsed?.modelId ?? modelId;
+  return concreteModelId.split("/").at(-1) === "gpt-image-2";
+}
+
+export function normalizeImageGenerationParametersForModel(params: {
+  modelId: string;
+  parameters: ImageGenerationResolvedParameters;
+}): {
+  parameters: ImageGenerationResolvedParameters;
+  warnings: ImageGenerationParameterWarning[];
+} {
+  if (!isGptImage2ModelId(params.modelId)) {
+    return { parameters: params.parameters, warnings: [] };
+  }
+
+  if (params.parameters.size) {
+    const parsed = parseSize(params.parameters.size);
+    const normalizedSize = clampGptImage2Size(parsed.width, parsed.height);
+    if (normalizedSize === params.parameters.size) {
+      return { parameters: params.parameters, warnings: [] };
+    }
+
+    return {
+      parameters: {
+        ...params.parameters,
+        size: normalizedSize,
+        aspectRatio: undefined,
+      },
+      warnings: [
+        {
+          type: "parameter-adjusted",
+          parameter: "size",
+          from: params.parameters.size,
+          to: normalizedSize,
+          reason:
+            "gpt-image-2 image sizes must use 16-pixel multiples and stay within the provider pixel limit.",
+        },
+      ],
+    };
+  }
+
+  if (params.parameters.aspectRatio) {
+    const normalizedSize = gptImage2AspectRatioToSize(params.parameters.aspectRatio);
+    return {
+      parameters: {
+        ...params.parameters,
+        size: normalizedSize,
+        aspectRatio: undefined,
+      },
+      warnings: [
+        {
+          type: "parameter-adjusted",
+          parameter: "aspectRatio",
+          from: params.parameters.aspectRatio,
+          to: normalizedSize,
+          reason:
+            "The OpenAI-compatible gpt-image-2 adapter does not forward aspectRatio, so Lilac converted it to a concrete size.",
+        },
+      ],
+    };
+  }
+
+  return { parameters: params.parameters, warnings: [] };
+}
+
 type ProviderWithImageModel = {
   imageModel(modelId: string): ImageModel;
 };
@@ -815,6 +957,16 @@ export function resolveConfiguredImageModelSpecs(
   return configured.length > 0 ? configured : DEFAULT_IMAGE_MODEL_FALLBACK_ORDER;
 }
 
+export function canRequestImageModel(params: {
+  configuredModelSpecs: readonly string[];
+  requested: string;
+}): boolean {
+  return (
+    params.configuredModelSpecs.length === 0 ||
+    params.configuredModelSpecs.includes(params.requested)
+  );
+}
+
 export function resolveAvailableImageModels(params: {
   providers: ReturnType<typeof getModelProviders>;
   modelSpecs: readonly string[];
@@ -969,14 +1121,25 @@ function pickImageModel(params: {
   availableModels: Awaited<ReturnType<typeof getAvailableImageModels>>;
   requested: string | undefined;
   providers: ReturnType<typeof getModelProviders>;
+  configuredModelSpecs: readonly string[];
 }): ResolvedImageModel {
   if (params.requested) {
+    if (
+      !canRequestImageModel({
+        configuredModelSpecs: params.configuredModelSpecs,
+        requested: params.requested,
+      })
+    ) {
+      throw new Error(
+        `Requested image model '${params.requested}' is not listed in tools.generate.image.models. Configured image models: ${params.configuredModelSpecs.join(", ") || "none"}.`,
+      );
+    }
+
     const configuredModel = params.availableModels.byId.get(params.requested);
     if (configuredModel) return configuredModel;
 
-    // A caller-supplied model is allowed to bypass tools.generate.image.models.
-    // That lets agents/operators use a one-off third-party model as soon as the
-    // provider URL is configured, without changing the default model order.
+    // If no image model allowlist is configured, a caller-supplied provider
+    // model can still be used as an operator escape hatch.
     const explicitModel = createExplicitProviderImageModel({
       spec: params.requested,
       providers: params.providers,
@@ -1243,6 +1406,7 @@ export class Generate implements ServerTool {
       })
     ).ids;
     const explicitImageProviders = configuredExplicitImageProviderIds();
+    const configuredImageModelSpecs = config?.tools.generate.image.models ?? [];
     const videoModels = getAvailableVideoModels().ids;
     const tools = [];
 
@@ -1250,9 +1414,10 @@ export class Generate implements ServerTool {
       // A configured explicit provider is enough to advertise generate.image:
       // the tool description tells agents how to pass provider/model manually
       // even when the operator has not selected a default model.
-      const explicitProviderSpecs = explicitImageProviders.map(
-        (provider) => `${provider}/<model-id>`,
-      );
+      const explicitProviderSpecs =
+        configuredImageModelSpecs.length > 0
+          ? configuredImageModelSpecs
+          : explicitImageProviders.map((provider) => `${provider}/<model-id>`);
       const globalDefaults = describeImageParameterDefaults(config?.tools.generate.image.defaults);
       const modelProfiles = describeImageModelProfiles(config, imageModels);
       tools.push({
@@ -1329,14 +1494,20 @@ export class Generate implements ServerTool {
       availableModels,
       requested: payload.model,
       providers,
+      configuredModelSpecs: config?.tools.generate.image.models ?? [],
     });
 
-    const generationParameters = resolveImageGenerationParameters({
+    const resolvedGenerationParameters = resolveImageGenerationParameters({
       config,
       modelId: picked.id,
       model: picked.model,
       input: payload,
     });
+    const generationParameterNormalization = normalizeImageGenerationParametersForModel({
+      modelId: picked.id,
+      parameters: resolvedGenerationParameters,
+    });
+    const generationParameters = generationParameterNormalization.parameters;
     picked.validateInput({
       ...payload,
       size: generationParameters.size,
@@ -1386,7 +1557,7 @@ export class Generate implements ServerTool {
       bytes: image.uint8Array.byteLength,
       mimeType: image.mediaType,
       model: picked.id,
-      warnings: res.warnings,
+      warnings: [...generationParameterNormalization.warnings, ...res.warnings],
     };
   }
 
