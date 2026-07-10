@@ -65,7 +65,10 @@ import {
   HEARTBEAT_HANDOFF_SESSION_ID,
 } from "../../transcript/heartbeat-handoff";
 import type { TranscriptStore } from "../../transcript/transcript-store";
-import type { ConversationThreadToolService } from "../../conversation/thread-service";
+import type {
+  ConversationThreadSearchResult,
+  ConversationThreadToolService,
+} from "../../conversation/thread-service";
 import { buildSafeRecoveryCheckpoint } from "./recovery-checkpoint";
 import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
@@ -483,20 +486,27 @@ type DeferredSubagentTerminalStatus = "resolved" | "failed" | "cancelled" | "tim
 type DeferredSubagentBufferedCompletion = {
   parentToolCallId: string;
   profile: DeferredSubagentRegistration["profile"];
+  sessionName: string;
   childRequestId: string;
   childSessionId: string;
   status: DeferredSubagentTerminalStatus;
   ok: boolean;
-  timeoutMs: number;
-  durationMs: number;
   finalText: string;
   detail?: string;
   childTools: ChildToolState[];
 };
 
+type DeferredSubagentBufferedCompletionSnapshot = Omit<
+  DeferredSubagentBufferedCompletion,
+  "sessionName"
+> & {
+  sessionName?: string;
+};
+
 type DeferredSubagentHandleSnapshot = {
   parentToolCallId: string;
   profile: DeferredSubagentRegistration["profile"];
+  sessionName?: string;
   childRequestId: string;
   childSessionId: string;
   timeoutMs: number;
@@ -511,12 +521,13 @@ type DeferredSubagentHandleSnapshot = {
 
 type DeferredSubagentRecoveryState = {
   outstanding: DeferredSubagentHandleSnapshot[];
-  bufferedCompletions: DeferredSubagentBufferedCompletion[];
+  bufferedCompletions: DeferredSubagentBufferedCompletionSnapshot[];
 };
 
 type DeferredSubagentHandle = {
   parentToolCallId: string;
   profile: DeferredSubagentRegistration["profile"];
+  sessionName: string;
   childRequestId: string;
   childSessionId: string;
   timeoutMs: number;
@@ -538,17 +549,14 @@ function isDeferredSubagentAcceptedResult(result: unknown): result is {
   ok: true;
   mode: "deferred";
   status: "accepted";
-  childRequestId: string;
-  childSessionId: string;
-  timeoutMs: number;
+  sessionName: string;
 } {
   if (!result || typeof result !== "object" || Array.isArray(result)) return false;
   return (
     (result as Record<string, unknown>)["ok"] === true &&
     (result as Record<string, unknown>)["mode"] === "deferred" &&
     (result as Record<string, unknown>)["status"] === "accepted" &&
-    typeof (result as Record<string, unknown>)["childRequestId"] === "string" &&
-    typeof (result as Record<string, unknown>)["childSessionId"] === "string"
+    typeof (result as Record<string, unknown>)["sessionName"] === "string"
   );
 }
 
@@ -557,6 +565,36 @@ function buildSubagentResultToolCallId(childRequestId: string): string {
     prefix: "subagent_result",
     seed: childRequestId,
   });
+}
+
+function resolveRecoveredSubagentSessionName(
+  snapshot: Pick<
+    DeferredSubagentHandleSnapshot,
+    "sessionName" | "childSessionId" | "childRequestId" | "profile"
+  >,
+): string {
+  if (
+    typeof snapshot.sessionName === "string" &&
+    snapshot.sessionName.length <= 64 &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(snapshot.sessionName)
+  ) {
+    return snapshot.sessionName;
+  }
+
+  const namedMarker = ":named:";
+  const namedIndex = snapshot.childSessionId.lastIndexOf(namedMarker);
+  if (namedIndex >= 0) {
+    const name = snapshot.childSessionId.slice(namedIndex + namedMarker.length);
+    if (name.length <= 64 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) {
+      return name;
+    }
+  }
+
+  const requestToken = snapshot.childRequestId
+    .toLowerCase()
+    .replace(/[^a-z0-9]/gu, "")
+    .slice(-8);
+  return `${snapshot.profile}-${requestToken || "recovered"}`;
 }
 
 function buildCustomCommandToolCallId(requestId: string, name: string): string {
@@ -655,11 +693,17 @@ export type AutoInjectedThreadSearchPayload = {
 
 type AutoInjectedThreadSearchEntry = AutoInjectedThreadSearchPayload["entries"][number];
 
+type AutoInjectedThreadSearchCandidate = AutoInjectedThreadSearchEntry & {
+  score: number;
+  searchIndex: number;
+  rank: number;
+};
+
 type AutoInjectedThreadSearchAppendedEvent = {
   toolCallId: string;
   mode: "hybrid" | "semantic" | "lexical";
   limit: number;
-  queries: readonly string[];
+  searches: readonly (readonly string[])[];
   participantFilterUserCount: number;
   entries: readonly AutoInjectedThreadSearchEntry[];
 };
@@ -714,6 +758,96 @@ function formatAutoInjectedThreadBrief(brief: string): string | undefined {
   if (trimmed.length <= AUTO_INJECTED_THREAD_BRIEF_FULL_THRESHOLD) return trimmed;
 
   return `${trimmed.slice(0, AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH).trimEnd()} ...(${trimmed.length - AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH} remaining)`;
+}
+
+function compareAutoInjectedThreadSearchCandidates(
+  left: AutoInjectedThreadSearchCandidate,
+  right: AutoInjectedThreadSearchCandidate,
+): number {
+  if (left.score !== right.score) return right.score - left.score;
+  if (left.searchIndex !== right.searchIndex) return left.searchIndex - right.searchIndex;
+  return left.rank - right.rank;
+}
+
+function stripAutoInjectedThreadSearchCandidate(
+  candidate: AutoInjectedThreadSearchCandidate,
+): AutoInjectedThreadSearchEntry {
+  return {
+    threadId: candidate.threadId,
+    title: candidate.title,
+    ...(candidate.brief ? { brief: candidate.brief } : {}),
+    ...(candidate.timeRange ? { timeRange: candidate.timeRange } : {}),
+  };
+}
+
+function selectAutoInjectedThreadSearchEntries(
+  groups: readonly (readonly AutoInjectedThreadSearchCandidate[])[],
+  limit: number,
+): AutoInjectedThreadSearchEntry[] {
+  const selected: AutoInjectedThreadSearchCandidate[] = [];
+  const selectedThreadIds = new Set<string>();
+  const earlierGroupThreadIds = new Set<string>();
+
+  for (const group of groups) {
+    if (selected.length >= limit) break;
+    const candidate = group.find(
+      (item) => !selectedThreadIds.has(item.threadId) && !earlierGroupThreadIds.has(item.threadId),
+    );
+    for (const item of group) {
+      earlierGroupThreadIds.add(item.threadId);
+    }
+    if (!candidate) continue;
+    selected.push(candidate);
+    selectedThreadIds.add(candidate.threadId);
+  }
+
+  if (selected.length < limit) {
+    const remainingByThreadId = new Map<string, AutoInjectedThreadSearchCandidate>();
+    for (const group of groups) {
+      for (const candidate of group) {
+        if (selectedThreadIds.has(candidate.threadId)) continue;
+        const existing = remainingByThreadId.get(candidate.threadId);
+        if (!existing || compareAutoInjectedThreadSearchCandidates(candidate, existing) < 0) {
+          remainingByThreadId.set(candidate.threadId, candidate);
+        }
+      }
+    }
+
+    const remaining = [...remainingByThreadId.values()].sort(
+      compareAutoInjectedThreadSearchCandidates,
+    );
+    for (const candidate of remaining) {
+      if (selected.length >= limit) break;
+      selected.push(candidate);
+      selectedThreadIds.add(candidate.threadId);
+    }
+  }
+
+  return selected.map(stripAutoInjectedThreadSearchCandidate);
+}
+
+function buildAutoInjectedThreadSearchCandidates(input: {
+  search: ConversationThreadSearchResult;
+  searchIndex: number;
+  previouslyInjectedThreadIds: ReadonlySet<string>;
+}): AutoInjectedThreadSearchCandidate[] {
+  return input.search.results
+    .filter((result) => !input.previouslyInjectedThreadIds.has(result.threadId))
+    .map((result, index) => {
+      const timeRange = result.timeRange
+        ? formatInjectedThreadTimeRange(result.timeRange)
+        : undefined;
+      const brief = formatAutoInjectedThreadBrief(result.brief);
+      return {
+        threadId: result.threadId,
+        title: result.title,
+        ...(brief ? { brief } : {}),
+        ...(timeRange ? { timeRange } : {}),
+        score: result.score ?? 0,
+        searchIndex: input.searchIndex,
+        rank: index + 1,
+      };
+    });
 }
 
 function collectAutoInjectedThreadIds(messages: readonly ModelMessage[]): Set<string> {
@@ -788,6 +922,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   const autoInject = params.cfg.conversation.thread.autoInject;
   if (!autoInject.enabled) return [];
   if (!params.conversationThreads) return [];
+  const conversationThreads = params.conversationThreads;
 
   const text = latestUserText(params.userMessages);
   const previouslyInjectedThreadIds = collectAutoInjectedThreadIds(params.previousMessages ?? []);
@@ -823,30 +958,40 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   await publishToolStatusBestEffort({ toolCallId, status: "start", display });
 
   try {
-    const plan = await params.conversationThreads.planAutoInjectSearch({ text });
-    const search = await params.conversationThreads.search({
-      query: plan.queries,
-      queryAboutness: plan.aboutness,
-      limit: autoInject.limit,
-      minScore: autoInject.minScore,
-      mode: autoInject.mode,
-      verbose: true,
-      ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
-    });
-    const entries = search.results
-      .filter((result) => !previouslyInjectedThreadIds.has(result.threadId))
-      .map((result) => {
-        const timeRange = result.timeRange
-          ? formatInjectedThreadTimeRange(result.timeRange)
-          : undefined;
-        const brief = formatAutoInjectedThreadBrief(result.brief);
-        return {
-          threadId: result.threadId,
-          title: result.title,
-          ...(brief ? { brief } : {}),
-          ...(timeRange ? { timeRange } : {}),
-        };
+    const plan = await conversationThreads.planAutoInjectSearch({ text });
+    const searchRecallLimit = Math.min(50, autoInject.limit * plan.searches.length);
+    const settledSearches = await Promise.allSettled(
+      plan.searches.map((searchPlan) =>
+        conversationThreads.search({
+          query: searchPlan.queries,
+          queryAboutness: searchPlan.aboutness,
+          limit: searchRecallLimit,
+          minScore: autoInject.minScore,
+          mode: autoInject.mode,
+          verbose: true,
+          ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
+        }),
+      ),
+    );
+    let fulfilledSearches = 0;
+    const candidateGroups = settledSearches.map((result, searchIndex) => {
+      if (result.status === "fulfilled") {
+        fulfilledSearches += 1;
+        return buildAutoInjectedThreadSearchCandidates({
+          search: result.value,
+          searchIndex,
+          previouslyInjectedThreadIds,
+        });
+      }
+
+      params.onError("auto-injected thread search failed; continuing with partial metadata", {
+        searchIndex,
+        error: result.reason,
       });
+      return [];
+    });
+    if (fulfilledSearches === 0) throw new Error("all auto-injected thread searches failed");
+    const entries = selectAutoInjectedThreadSearchEntries(candidateGroups, autoInject.limit);
 
     await publishToolStatusBestEffort({
       toolCallId,
@@ -861,7 +1006,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         toolCallId,
         mode: autoInject.mode,
         limit: autoInject.limit,
-        queries: plan.queries,
+        searches: plan.searches.map((searchPlan) => searchPlan.queries),
         participantFilterUserCount: participantIds.length,
         entries,
       });
@@ -889,11 +1034,10 @@ function buildDeferredSubagentResultMessages(
   const toolCallId = buildSubagentResultToolCallId(completion.childRequestId);
   const payload = {
     ok: completion.ok,
+    mode: "deferred" as const,
     status: completion.status,
     profile: completion.profile,
-    childRequestId: completion.childRequestId,
-    childSessionId: completion.childSessionId,
-    durationMs: completion.durationMs,
+    sessionName: completion.sessionName,
     finalText: completion.finalText,
     ...(completion.detail ? { detail: completion.detail } : {}),
   };
@@ -908,8 +1052,7 @@ function buildDeferredSubagentResultMessages(
           toolName: "subagent_result",
           input: {
             profile: completion.profile,
-            childRequestId: completion.childRequestId,
-            childSessionId: completion.childSessionId,
+            sessionName: completion.sessionName,
             status: completion.status,
           },
         },
@@ -949,6 +1092,7 @@ function buildDeferredSubagentRecoveryState(params: {
   const outstanding = Array.from(params.handles, (handle) => ({
     parentToolCallId: handle.parentToolCallId,
     profile: handle.profile,
+    sessionName: handle.sessionName,
     childRequestId: handle.childRequestId,
     childSessionId: handle.childSessionId,
     timeoutMs: handle.timeoutMs,
@@ -1111,12 +1255,11 @@ export function createDeferredSubagentManager(params: {
     const completion: DeferredSubagentBufferedCompletion = {
       parentToolCallId: handle.parentToolCallId,
       profile: handle.profile,
+      sessionName: handle.sessionName,
       childRequestId: handle.childRequestId,
       childSessionId: handle.childSessionId,
       status,
       ok: status === "resolved",
-      timeoutMs: handle.timeoutMs,
-      durationMs: Math.max(0, Date.now() - handle.startedAtMs),
       finalText: handle.finalText,
       ...(handle.detail ? { detail: handle.detail } : {}),
       childTools: Array.from(handle.childTools.values()),
@@ -1152,6 +1295,7 @@ export function createDeferredSubagentManager(params: {
     const handle: DeferredSubagentHandle = {
       parentToolCallId: snapshot.parentToolCallId,
       profile: snapshot.profile,
+      sessionName: resolveRecoveredSubagentSessionName(snapshot),
       childRequestId: snapshot.childRequestId,
       childSessionId: snapshot.childSessionId,
       timeoutMs: snapshot.timeoutMs,
@@ -1302,6 +1446,7 @@ export function createDeferredSubagentManager(params: {
       await restoreOutstandingHandle({
         parentToolCallId: registration.parentToolCallId,
         profile: registration.profile,
+        sessionName: registration.sessionName,
         childRequestId: registration.childRequestId,
         childSessionId: registration.childSessionId,
         timeoutMs: registration.timeoutMs,
@@ -1340,7 +1485,12 @@ export function createDeferredSubagentManager(params: {
 
     async restore(recovery: DeferredSubagentRecoveryState | undefined) {
       if (!recovery) return;
-      bufferedCompletions.push(...recovery.bufferedCompletions);
+      bufferedCompletions.push(
+        ...recovery.bufferedCompletions.map((completion) => ({
+          ...completion,
+          sessionName: resolveRecoveredSubagentSessionName(completion),
+        })),
+      );
       for (const outstanding of recovery.outstanding) {
         await restoreOutstandingHandle(outstanding, { replayExisting: true });
       }
@@ -3525,8 +3675,9 @@ export async function startBusAgentRunner(params: {
                     toolCallId: event.toolCallId,
                     mode: event.mode,
                     limit: event.limit,
-                    queryCount: event.queries.length,
-                    queries: event.queries,
+                    searchCount: event.searches.length,
+                    queryCount: event.searches.reduce((sum, queries) => sum + queries.length, 0),
+                    searches: event.searches,
                     participantFilterUserCount: event.participantFilterUserCount,
                     appendedCount: event.entries.length,
                     entries: event.entries,

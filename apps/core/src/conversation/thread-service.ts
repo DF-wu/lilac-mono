@@ -47,6 +47,8 @@ const SUMMARY_PARSE_MAX_ATTEMPTS = 3;
 const HYBRID_LEXICAL_WEIGHT = 0.35;
 const PROMPT_CONTEXT_FILES = ["MEMORY.md", "USER.md", "ENTITIES.md"] as const;
 const MULTI_QUERY_MAX = 10;
+const AUTO_INJECT_SEARCH_MAX = 3;
+const AUTO_INJECT_QUERIES_PER_SEARCH_MAX = 3;
 const COVERAGE_RECALL_MULTIPLIER = 5;
 const WEAK_COVERAGE_MULTIPLIER = 0.25;
 const DOMAIN_MISMATCH_COVERAGE_MULTIPLIER = 0.35;
@@ -109,9 +111,13 @@ const queryAboutnessSchema = z.object({
   intentSummary: z.string(),
 });
 
-const autoInjectQueryPlanSchema = z.object({
+const autoInjectSearchPlanSchema = z.object({
   queries: z.array(z.string()).min(1).max(MULTI_QUERY_MAX),
   aboutness: queryAboutnessSchema,
+});
+
+const autoInjectQueryPlanSchema = z.object({
+  searches: z.array(autoInjectSearchPlanSchema).min(1).max(MULTI_QUERY_MAX),
 });
 
 export type ConversationThreadQueryAboutness = z.infer<typeof queryAboutnessSchema>;
@@ -472,7 +478,10 @@ function stableHash(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
-function normalizeSearchQueries(input: string | readonly string[]): string[] {
+function normalizeSearchQueries(
+  input: string | readonly string[],
+  max = MULTI_QUERY_MAX,
+): string[] {
   const seen = new Set<string>();
   const queries: string[] = [];
   for (const raw of Array.isArray(input) ? input : [input]) {
@@ -482,7 +491,7 @@ function normalizeSearchQueries(input: string | readonly string[]): string[] {
     if (seen.has(key)) continue;
     seen.add(key);
     queries.push(query);
-    if (queries.length >= MULTI_QUERY_MAX) break;
+    if (queries.length >= max) break;
   }
   if (queries.length === 0) throw new Error("conversation thread search query is required");
   return queries;
@@ -524,10 +533,11 @@ function normalizeQueryAboutness(
 function normalizeAutoInjectQueryPlan(
   plan: ConversationThreadAutoInjectQueryPlan,
 ): ConversationThreadAutoInjectQueryPlan {
-  const queries = normalizeSearchQueries(plan.queries);
   return {
-    queries,
-    aboutness: normalizeQueryAboutness(plan.aboutness),
+    searches: plan.searches.slice(0, AUTO_INJECT_SEARCH_MAX).map((search) => ({
+      queries: normalizeSearchQueries(search.queries, AUTO_INJECT_QUERIES_PER_SEARCH_MAX),
+      aboutness: normalizeQueryAboutness(search.aboutness),
+    })),
   };
 }
 
@@ -1121,7 +1131,7 @@ async function defaultAutoInjectQueryPlanner(input: {
       content: [
         "Create compact conversation-memory search queries for this new user message.",
         "Do not answer the message. Extract what prior conversation threads would be relevant context for responding.",
-        "Return search queries and positive aboutness evidence only.",
+        "Return grouped search plans and positive aboutness evidence only.",
         "",
         "## User message",
         input.text,
@@ -1184,15 +1194,17 @@ function buildAutoInjectQueryPlanInstructions(): string {
   return [
     "You create retrieval queries for an automatic conversation-memory lookup.",
     "Return exactly one JSON object and nothing else.",
-    'Shape: {"queries":["..."],"aboutness":{"domains":["..."],"situations":["..."],"targets":["..."],"entities":["..."],"userWouldAskForThisAs":["..."],"intentSummary":"..."}}',
+    'Shape: {"searches":[{"queries":["..."],"aboutness":{"domains":["..."],"situations":["..."],"targets":["..."],"entities":["..."],"userWouldAskForThisAs":["..."],"intentSummary":"..."}}]}',
     "",
     "The input is a newly received user message, possibly a long article or essay.",
     "Do not summarize the article for the final answer. Instead, generate semantic search queries that would find prior conversation threads useful for responding to it.",
-    "Use 2-6 query variants for substantive long input. Prefer compact natural phrases over dense paragraphs.",
+    "Produce 1-3 searches, ordered by expected usefulness. Each search is one distinct retrieval category or intent.",
+    "Within each search, use 1-3 query variants/facets for the same intent. Prefer 1 query unless aliases, exact entities, or meaningfully different wording improve recall.",
+    "Do not split near-duplicate phrasings into separate searches; keep them as query variants inside one search.",
     "Queries should name the durable subject, task, decision, complaint target, project, technology, entities, or situation.",
     "Avoid copying long passages. Preserve exact names, code identifiers, errors, and source-language phrases only when central.",
     "Use only positive aboutness evidence: what relevant prior threads would be about, not what should be excluded.",
-    "The aboutness object follows the same meaning as conversation-thread search query aboutness.",
+    "Each search's aboutness object describes only that search intent and follows the same meaning as conversation-thread search query aboutness.",
     "Write primarily in English.",
   ].join("\n");
 }
@@ -1213,13 +1225,13 @@ export function buildThreadSummaryInstructions(): string {
     "- title: concise thread title, under 120 characters.",
     "- brief: compact summary, under 1024 characters.",
     "- topics: short descriptive subject phrases, not canonical tags.",
-    "- retrievalHints: short search-query-like phrases a future user might type to find this thread.",
+    "- retrievalHints: short search-query-like phrases a future user might type from memory to find this thread.",
     "- aboutness: positive-only retrieval evidence for what the thread is actually about.",
-    "- aboutness.domains: broad real-world or project domains, such as day job, workplace, Discord social conflict, architecture, debugging, or career planning.",
-    "- aboutness.situations: concrete situations in the thread, such as false accusation, design handoff issue, review frustration, migration planning, or API failure.",
-    "- aboutness.complaintTargets: what frustration, venting, or criticism is directed at when present, such as company process, coworker handoff, DF's accusation, or a flaky API. Use an empty array when the thread is not a complaint or vent.",
+    "- aboutness.domains: broad real-world or project domains.",
+    "- aboutness.situations: concrete situations, actions, or events in the thread.",
+    "- aboutness.complaintTargets: what frustration, venting, or criticism is directed at when present. Use an empty array when the thread is not a complaint or vent.",
     "- aboutness.entities: important people, projects, tools, organizations, files, commands, errors, or named concepts.",
-    "- aboutness.userWouldAskForThisAs: natural future-search phrases someone might type to find this exact thread.",
+    "- aboutness.userWouldAskForThisAs: natural future-search phrases someone might type to find this kind of prior thread.",
     "- importance: low, medium, or high, based on durable future value.",
     "- importanceReasons: brief reasons explaining the rating for debugging.",
     "",
@@ -1233,16 +1245,12 @@ export function buildThreadSummaryInstructions(): string {
     "- Retrieval hints are alternate semantic access paths, not tags or summaries.",
     "- Use 4-8 hints for substantive threads; use fewer for shallow threads.",
     "- Each hint should usually be 2-12 words.",
-    "- Prefer natural user-intent phrases someone might actually type later, not dense implementation notes.",
-    "- Include distinct ways the user might search for this thread later:",
-    "  - the user's goal, task, or question",
-    "  - the concrete problem, symptom, decision, tradeoff, or outcome",
-    "  - exact tools, APIs, files, commands, identifiers, errors, quotes, or product names only when central to the thread",
-    "  - alternate wording, aliases, abbreviations, colloquial phrasing, or source-language phrases",
-    "  - emotional or personal framing when clearly present, such as rant, vent, frustration, career, job, compensation, debugging, architecture, incident, or process",
-    "- For any substantive thread, include broad domain phrases and concrete target/object phrases when accurate. Cover the actual domain instead of defaulting to workplace framing: technical debugging, architecture, product/process decisions, interpersonal conflict, project coordination, career planning, personal logistics, finance, incidents, travel, health, or other recurring subjects.",
-    "- When emotional framing is clearly present, pair it with what the emotion is about, such as API debugging frustration, Discord social anxiety, migration planning stress, career uncertainty, deployment incident pressure, billing concern, travel logistics worry, or workplace complaint.",
-    "- Avoid package versions, CSS syntax, exact dependency versions, long code identifiers, and other technical minutiae in retrieval hints unless the thread is primarily about finding that exact detail.",
+    "- Prefer natural user-intent phrases someone might actually type later, not dense mini-summaries or implementation notes.",
+    "- Cover multiple abstraction levels: broad remembered wording, moderate subject/object wording, and exact names only when they are likely search handles.",
+    "- Keep each hint focused on one access path. Do not pack every important detail into every hint.",
+    "- Prefer the wording a person would remember later over the most precise wording present in the transcript.",
+    "- Drop incidental qualifiers, counts, durations, severities, versions, and exact identifiers unless they are central to why someone would search for the thread.",
+    "- Do not solve broad lookup with fixed domain-specific synonym lists. Infer the right abstraction level from the transcript.",
     "- Avoid generic standalone hints like help, code, app, bug, AI, question, discussion, or notes.",
     "- Avoid near-duplicates; each hint should add a meaningfully different retrieval path.",
     "- Do not invent context, labels, emotions, tools, or technologies not present or strongly implied.",
@@ -1250,9 +1258,9 @@ export function buildThreadSummaryInstructions(): string {
     "",
     "## Aboutness",
     "- Aboutness fields should capture the intended subject, domain, and object of discussion, not just emotional tone.",
-    "- For emotionally similar threads, distinguish what the emotion is about: technical debugging, project boundaries, interpersonal conflict, career uncertainty, family logistics, financial planning, deployment incidents, workplace process, architecture planning, and so on.",
-    "- userWouldAskForThisAs should contain 3-8 realistic user queries for substantive threads, especially phrases that name the target domain or complaint target.",
-    "- complaintTargets should be specific and positive-only. Prefer concrete objects such as a broken API, unclear requirement, migration blocker, DF's accusation, billing issue, travel constraint, family-home pressure, company process, designer handoff, PR review, or deployment failure over generic frustration.",
+    "- For emotionally similar threads, distinguish what the emotion is about without turning the phrase into a full summary.",
+    "- userWouldAskForThisAs should contain 3-8 realistic user queries for substantive threads, using the same broad-to-specific abstraction ladder as retrievalHints.",
+    "- complaintTargets should be specific and positive-only, but avoid encoding incidental details as targets.",
     "- Do not invent domains, entities, situations, or complaint targets not present or strongly implied by the transcript.",
     "",
     "## Importance",
