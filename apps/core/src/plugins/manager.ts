@@ -8,7 +8,11 @@ import {
 import { createLogger, getCoreConfig, resolveCoreConfigPath } from "@stanley2058/lilac-utils";
 
 import { createBuiltinCoreToolPlugins } from "./builtin";
-import type { CoreLevel1ToolSpec, CoreToolPluginRuntime } from "./types";
+import {
+  hasBoundedBuiltinOutput,
+  type CoreLevel1ToolSpec,
+  type CoreToolPluginRuntime,
+} from "./types";
 
 async function listServerToolCallableIds(tool: ServerTool): Promise<readonly string[]> {
   const entries = await tool.list();
@@ -22,8 +26,7 @@ export type BuildLevel1ToolsetParams = {
   subagentDepth: number;
   subagentConfig: {
     enabled: boolean;
-    defaultTimeoutMs: number;
-    maxTimeoutMs: number;
+    idleTimeoutMs: number;
     maxDepth: number;
   };
   requestContext?: Level1ExecutionRequestContext;
@@ -39,6 +42,7 @@ export type BuildLevel1ToolsetParams = {
 export type BuiltLevel1Toolset = {
   tools: ToolSet;
   specs: ReadonlyMap<string, CoreLevel1ToolSpec>;
+  genericOutputNormalizerBypassTools: ReadonlySet<string>;
 };
 
 export type CoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
@@ -119,6 +123,9 @@ export function createCoreToolPluginManager(params: {
       return {
         tools,
         specs,
+        genericOutputNormalizerBypassTools: new Set(
+          enabledSpecs.filter(hasBoundedBuiltinOutput).map((spec) => spec.name),
+        ),
       };
     },
   };

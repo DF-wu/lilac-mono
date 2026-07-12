@@ -11,14 +11,21 @@ import {
   type GrepMode,
   type HashlineEdit,
   type HashlineWarning,
+  type ReadFileStart,
 } from "@stanley2058/lilac-fs";
 import { createLogger, env } from "@stanley2058/lilac-utils";
 import { fileTypeFromBuffer } from "file-type";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
+import {
+  TOOL_RESULT_UNAVAILABLE_MESSAGE,
+  TOOL_RESULT_URI_PREFIX,
+  type ToolResultArtifactStore,
+} from "../../artifacts/tool-result-artifact-store";
 import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
+import { BATCH_CHILD_CONTEXT_FLAG } from "../batch";
 import {
   remoteFuzzySearch,
   remoteGrep,
@@ -51,7 +58,6 @@ const INSTRUCTION_FILENAMES = ["AGENTS.md"] as const;
 const MAX_INSTRUCTION_CHARS = 20_000;
 
 const REMOTE_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
-const REMOTE_MAX_ATTACHMENT_BYTES = 10_000_000;
 const FFF_CACHE_DIR = path.join(env.dataDir, ".cache", "fff");
 
 function resolveRemoteDenyPaths(dangerouslyAllow?: boolean): readonly string[] {
@@ -179,18 +185,35 @@ function buildReadFileInputZod(hashlineEnabled: boolean) {
       .describe(
         "Optional working directory to resolve relative paths against (supports ~). Also supports ssh-style '<host>:<path>' to run on a configured SSH host alias. Defaults to the tool root.",
       ),
-    startLine: z
-      .number()
+    start: z
+      .discriminatedUnion("type", [
+        z.object({
+          type: z.literal("offset"),
+          offset: z.number().int().nonnegative(),
+        }),
+        z.object({
+          type: z.literal("line"),
+          line: z.number().int().positive(),
+          column: z.number().int().nonnegative().optional(),
+        }),
+      ])
       .optional()
-      .describe("1-based line number to start reading from. Defaults to 1."),
+      .describe(
+        "Start or continuation position for any text resource. Use {type:'offset',offset:N} for an absolute Unicode character position, or {type:'line',line:N,column?:N} for a line position. Lines are 1-based; offsets and columns are 0-based.",
+      ),
     maxLines: z
       .number()
+      .int()
+      .positive()
       .optional()
       .describe("Maximum number of lines to return. Defaults to 2000."),
     maxCharacters: z
       .number()
+      .int()
+      .positive()
+      .max(40 * 1024)
       .optional()
-      .describe("Maximum number of characters to return. Defaults to 10000."),
+      .describe("Maximum number of characters to return (max: 40960). Defaults to 10000."),
     format: (hashlineEnabled
       ? z.enum(["raw", "numbered", "hashline"])
       : z.enum(["raw", "numbered"])
@@ -213,7 +236,7 @@ export const readFileInputZod = buildReadFileInputZod(false);
 type ReadFileInput = {
   path: string;
   cwd?: string;
-  startLine?: number;
+  start?: ReadFileStart;
   maxLines?: number;
   maxCharacters?: number;
   format?: "raw" | "numbered" | "hashline";
@@ -235,6 +258,7 @@ export const globInputZod = z.object({
   patterns: z
     .array(z.string().min(1))
     .min(1)
+    .max(100)
     .describe("Glob patterns (supports include + negate patterns)"),
   cwd: z
     .string()
@@ -246,6 +270,7 @@ export const globInputZod = z.object({
     .number()
     .int()
     .positive()
+    .max(10_000)
     .optional()
     .describe("Maximum number of matched paths to return (default: 100)."),
   mode: searchModeSchema
@@ -267,6 +292,7 @@ const globOutputZod = z.discriminatedUnion("mode", [
     truncated: z.boolean(),
     paths: z.array(z.string()),
     error: z.string().optional(),
+    truncationHint: z.string().optional(),
   }),
   z.object({
     mode: z.literal("detailed"),
@@ -279,6 +305,7 @@ const globOutputZod = z.discriminatedUnion("mode", [
       }),
     ),
     error: z.string().optional(),
+    truncationHint: z.string().optional(),
   }),
 ]);
 
@@ -296,6 +323,7 @@ export const fuzzySearchInputZod = z.object({
     .number()
     .int()
     .positive()
+    .max(10_000)
     .optional()
     .describe("Maximum number of ranked files to return (default: 50)."),
   dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
@@ -318,6 +346,7 @@ const fuzzySearchOutputZod = z.object({
   totalFiles: z.number(),
   truncated: z.boolean(),
   error: z.string().optional(),
+  truncationHint: z.string().optional(),
 });
 
 type FuzzySearchOutput = z.infer<typeof fuzzySearchOutputZod>;
@@ -339,16 +368,19 @@ function buildGrepInputZod(hashlineEnabled: boolean) {
       .number()
       .int()
       .positive()
+      .max(10_000)
       .optional()
       .describe("Maximum number of matches to return (default: 100)."),
     fileExtensions: z
       .array(z.string().min(1))
+      .max(100)
       .optional()
       .describe('Optional file extension filters (e.g. ["ts", "tsx"]).'),
     includeContextLines: z
       .number()
       .int()
       .nonnegative()
+      .max(100)
       .optional()
       .describe("Include N context lines around each match."),
     mode: (hashlineEnabled ? grepModeSchema : searchModeSchema)
@@ -383,6 +415,7 @@ const grepOutputBase = z.object({
   warnings: z.array(warningZod).optional(),
   degradedFromHashline: z.boolean().optional(),
   error: z.string().optional(),
+  truncationHint: z.string().optional(),
 });
 
 function buildGrepOutputZod(hashlineEnabled: boolean) {
@@ -456,6 +489,7 @@ type GrepOutput =
       degradedFromHashline?: boolean;
       results: { file: string; line: number; text: string }[];
       error?: string;
+      truncationHint?: string;
     }
   | {
       mode: "detailed";
@@ -470,6 +504,7 @@ type GrepOutput =
         submatches?: { match: string; start: number; end: number }[];
       }[];
       error?: string;
+      truncationHint?: string;
     }
   | {
       mode: "hashline";
@@ -484,6 +519,7 @@ type GrepOutput =
         text: string;
       }[];
       error?: string;
+      truncationHint?: string;
     };
 
 const expectedMatchesSchema = z.union([z.literal("any"), z.number().int().positive()]);
@@ -659,6 +695,132 @@ function stripGrepMetadata(output: GrepOutput & SearchBackendMetadata): GrepOutp
   return rest;
 }
 
+const SEARCH_TRUNCATION_HINT =
+  "Search output reached the serialized-size limit. Narrow the query or inspect source files with read_file.";
+
+function buildInlineMediaLimitMessage(params: {
+  filename: string;
+  mimeType: string;
+  maxBytes: number;
+  detail?: string;
+}): string {
+  const guidance = params.mimeType.startsWith("image/")
+    ? "Resize or compress the image, then read the smaller file."
+    : "Reduce or compress the file, then read the smaller file.";
+  return `Cannot inline '${params.filename}' (${params.mimeType}): it exceeds the ${params.maxBytes}-byte media limit${params.detail ? ` (${params.detail})` : ""}. ${guidance}`;
+}
+
+function truncateUnicodeString(
+  value: string,
+  maxCharacters: number,
+  preservePrefixWhenTiny = false,
+): string {
+  const characters = Array.from(value);
+  if (characters.length <= maxCharacters) return value;
+
+  const marker = "...[truncated]";
+  if (maxCharacters <= marker.length) {
+    return preservePrefixWhenTiny
+      ? characters.slice(0, maxCharacters).join("")
+      : marker.slice(0, maxCharacters);
+  }
+  return `${characters.slice(0, maxCharacters - marker.length).join("")}${marker}`;
+}
+
+function truncateSearchEntryStrings(value: unknown, maxStringCharacters: number): unknown {
+  if (typeof value === "string") {
+    return truncateUnicodeString(value, maxStringCharacters);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => truncateSearchEntryStrings(item, maxStringCharacters));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        truncateSearchEntryStrings(item, maxStringCharacters),
+      ]),
+    );
+  }
+  return value;
+}
+
+function boundSearchOutput<T extends { truncated: boolean }>(
+  output: T,
+  entriesKey: "paths" | "entries" | "results",
+  maxBytes: number,
+): T {
+  if (maxBytes < 2) throw new RangeError("Search maxBytes must be at least 2.");
+  const serializedBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+  if (serializedBytes(output) <= maxBytes) return output;
+
+  const next = structuredClone(output);
+  const record = next as unknown as Record<string, unknown>;
+  next.truncated = true;
+  record["truncationHint"] = SEARCH_TRUNCATION_HINT;
+  const entries = record[entriesKey];
+  const minimum = structuredClone(next);
+  const minimumRecord = minimum as unknown as Record<string, unknown>;
+  minimumRecord[entriesKey] = [];
+  delete minimumRecord["warnings"];
+  delete minimumRecord["degradedFromHashline"];
+  if (typeof minimumRecord["error"] === "string") {
+    minimumRecord["error"] = truncateUnicodeString(minimumRecord["error"], 160, true);
+  }
+  const effectiveMaxBytes = Math.max(maxBytes, serializedBytes(minimum));
+
+  if (Array.isArray(entries)) {
+    while (entries.length > 1 && serializedBytes(next) > effectiveMaxBytes) entries.pop();
+
+    let maxStringCharacters = Math.max(1, Math.floor(effectiveMaxBytes / 4));
+    while (entries.length === 1 && serializedBytes(next) > effectiveMaxBytes) {
+      entries[0] = truncateSearchEntryStrings(entries[0], maxStringCharacters);
+      if (maxStringCharacters === 1) {
+        entries.pop();
+        break;
+      }
+      maxStringCharacters = Math.max(1, Math.floor(maxStringCharacters / 2));
+    }
+  }
+
+  if (serializedBytes(next) <= effectiveMaxBytes) return next;
+
+  // Error results should continue to communicate failure, even when their details are bounded.
+  const originalError = typeof record["error"] === "string" ? record["error"] : undefined;
+  delete record["warnings"];
+  delete record["degradedFromHashline"];
+
+  if (originalError !== undefined && serializedBytes(next) > effectiveMaxBytes) {
+    const errorCharacters = Array.from(originalError).length;
+    let low = 1;
+    let high = errorCharacters;
+    let best = "Error";
+
+    record["error"] = best;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = truncateUnicodeString(originalError, middle, true);
+      record["error"] = candidate;
+      if (serializedBytes(next) <= effectiveMaxBytes) {
+        best = candidate;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    record["error"] = best;
+  }
+
+  if (serializedBytes(next) > effectiveMaxBytes && Array.isArray(entries)) entries.splice(0);
+  if (serializedBytes(next) > effectiveMaxBytes && originalError !== undefined) {
+    record["error"] = "Error";
+  }
+
+  if (serializedBytes(next) > effectiveMaxBytes) return minimum;
+
+  return next;
+}
+
 const instructionFieldsZod = z.object({
   loadedInstructions: z
     .array(z.string())
@@ -672,6 +834,20 @@ const instructionFieldsZod = z.object({
   degradedFromHashline: z.boolean().optional(),
 });
 
+const readFileOffsetStartZod = z.object({
+  type: z.literal("offset"),
+  offset: z.number().int().nonnegative(),
+});
+const readFileLineStartZod = z.object({
+  type: z.literal("line"),
+  line: z.number().int().positive(),
+  column: z.number().int().nonnegative().optional(),
+});
+const readFileStartZod = z.discriminatedUnion("type", [
+  readFileOffsetStartZod,
+  readFileLineStartZod,
+]);
+
 const readFileSuccessBaseZod = z
   .object({
     success: z.literal(true),
@@ -682,6 +858,7 @@ const readFileSuccessBaseZod = z
     totalLines: z.number(),
     hasMoreLines: z.boolean(),
     truncatedByChars: z.boolean(),
+    nextStart: readFileStartZod.optional(),
   })
   .extend(instructionFieldsZod.shape);
 
@@ -696,6 +873,18 @@ const readFileAttachmentSuccessZod = z
     bytes: z.number(),
   })
   .extend(instructionFieldsZod.shape);
+
+const readFileArtifactSuccessZod = z.object({
+  success: z.literal(true),
+  kind: z.literal("artifact"),
+  resolvedPath: z.string(),
+  content: z.string(),
+  startOffset: z.number(),
+  endOffset: z.number(),
+  totalCharacters: z.number(),
+  nextStart: readFileStartZod.optional(),
+  hasMore: z.boolean(),
+});
 
 function buildReadFileOutputZod(hashlineEnabled: boolean) {
   return z.union([
@@ -716,6 +905,7 @@ function buildReadFileOutputZod(hashlineEnabled: boolean) {
         ]
       : []),
     readFileAttachmentSuccessZod,
+    readFileArtifactSuccessZod,
     z.object({
       success: z.literal(false),
       resolvedPath: z.string(),
@@ -735,6 +925,17 @@ type InstructionFields = {
 };
 
 type ReadFileOutput =
+  | {
+      success: true;
+      kind: "artifact";
+      resolvedPath: string;
+      content: string;
+      startOffset: number;
+      endOffset: number;
+      totalCharacters: number;
+      nextStart?: ReadFileStart;
+      hasMore: boolean;
+    }
   | ({
       success: true;
       resolvedPath: string;
@@ -744,6 +945,7 @@ type ReadFileOutput =
       totalLines: number;
       hasMoreLines: boolean;
       truncatedByChars: boolean;
+      nextStart?: ReadFileStart;
       format: "raw";
       content: string;
     } & InstructionFields)
@@ -756,6 +958,7 @@ type ReadFileOutput =
       totalLines: number;
       hasMoreLines: boolean;
       truncatedByChars: boolean;
+      nextStart?: ReadFileStart;
       format: "numbered";
       numberedContent: string;
     } & InstructionFields)
@@ -768,6 +971,7 @@ type ReadFileOutput =
       totalLines: number;
       hasMoreLines: boolean;
       truncatedByChars: boolean;
+      nextStart?: ReadFileStart;
       format: "hashline";
       hashlineContent: string;
     } & InstructionFields)
@@ -830,6 +1034,14 @@ export function fsTool(
     experimentalHashlineEdit?: boolean;
     fsBackend?: FsBackend;
     readFileDirectAttachmentSupported?: boolean;
+    maxOutputBytes?: number;
+    maxInlineMediaBytesPerPart?: number;
+    artifactOnly?: boolean;
+    toolResultArtifacts?: ToolResultArtifactStore;
+    requestContext?: {
+      requestId: string;
+      sessionId: string;
+    };
   },
 ) {
   const logger = createLogger({
@@ -839,6 +1051,8 @@ export function fsTool(
   const hashlineEnabled = opts?.experimentalHashlineEdit === true;
   const fsBackend = opts?.fsBackend ?? "node-rg";
   const readFileDirectAttachmentSupported = opts?.readFileDirectAttachmentSupported === true;
+  const maxOutputBytes = opts?.maxOutputBytes ?? 40 * 1024;
+  const maxInlineMediaBytesPerPart = opts?.maxInlineMediaBytesPerPart ?? 10 * 1024 * 1024;
   const readFileSchema = buildReadFileInputZod(hashlineEnabled);
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
   const grepInputSchema = buildGrepInputZod(hashlineEnabled);
@@ -848,7 +1062,13 @@ export function fsTool(
   const toolRootAbs = path.resolve(expandTilde(cwd));
 
   const fileSystem = new FileSystem(cwd, {
-    denyPaths: [path.join(env.dataDir, "secret"), "~/.ssh", "~/.aws", "~/.gnupg"],
+    denyPaths: [
+      path.join(env.dataDir, "secret"),
+      path.join(env.dataDir, "tool-results"),
+      "~/.ssh",
+      "~/.aws",
+      "~/.gnupg",
+    ],
     fsBackend,
     fffCacheDir: FFF_CACHE_DIR,
   });
@@ -881,6 +1101,9 @@ export function fsTool(
       );
     }
 
+    parts.push(
+      "Use maxCharacters with either absolute offset or line/column start positions to page through text resources. Absolute offsets count Unicode characters including newlines. Reuse nextStart unchanged to continue.",
+    );
     parts.push("Denylisted paths require dangerouslyAllow=true.");
     return parts.join(" ");
   }
@@ -1028,6 +1251,51 @@ export function fsTool(
       inputSchema: readFileSchema,
       outputSchema: readFileOutputSchema,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: ReadFileInput, options) => {
+        if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
+          const sessionId = opts?.requestContext?.sessionId;
+          const artifact =
+            opts?.toolResultArtifacts && sessionId
+              ? await opts.toolResultArtifacts.readWindow(input.path, sessionId, {
+                  start: input.start ?? { type: "offset", offset: 0 },
+                  maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
+                  maxLines: Math.max(1, input.maxLines ?? 2_000),
+                })
+              : { ok: false as const };
+          if (!artifact.ok) {
+            return {
+              success: false as const,
+              resolvedPath: input.path,
+              error: {
+                code: "UNKNOWN" as const,
+                message: TOOL_RESULT_UNAVAILABLE_MESSAGE,
+              },
+            };
+          }
+
+          return {
+            success: true as const,
+            kind: "artifact" as const,
+            resolvedPath: input.path,
+            content: artifact.content,
+            startOffset: artifact.startOffset,
+            endOffset: artifact.endOffset,
+            totalCharacters: artifact.totalCharacters,
+            ...(artifact.nextStart ? { nextStart: artifact.nextStart } : {}),
+            hasMore: artifact.hasMore,
+          };
+        }
+
+        if (opts?.artifactOnly) {
+          return {
+            success: false as const,
+            resolvedPath: input.path,
+            error: {
+              code: "PERMISSION" as const,
+              message: "Restricted sessions can use read_file only with tool-result:// artifacts.",
+            },
+          };
+        }
+
         const cwdTarget = parseSshCwdTarget(opCwd);
         const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
 
@@ -1035,7 +1303,7 @@ export function fsTool(
           path: input.path,
           cwd: opCwd,
           target: cwdTarget.kind,
-          startLine: input.startLine,
+          start: input.start,
           maxLines: input.maxLines,
           maxCharacters: input.maxCharacters,
           format: input.format ?? "raw",
@@ -1045,6 +1313,23 @@ export function fsTool(
         const ext = path.extname(input.path).toLowerCase();
         const wantsAttachment = attachmentExts.has(ext);
 
+        if (
+          wantsAttachment &&
+          options.context &&
+          typeof options.context === "object" &&
+          BATCH_CHILD_CONTEXT_FLAG in options.context
+        ) {
+          return {
+            success: false as const,
+            resolvedPath: input.path,
+            error: {
+              code: "UNKNOWN" as const,
+              message:
+                "Media files cannot be read through batch. Call read_file directly so the attachment can be sent safely.",
+            },
+          };
+        }
+
         const res = wantsAttachment
           ? await (async () => {
               if (cwdTarget.kind === "ssh") {
@@ -1053,16 +1338,26 @@ export function fsTool(
                   cwd: cwdTarget.cwd,
                   filePath: input.path,
                   denyPaths: remoteDenyPaths,
-                  maxBytes: REMOTE_MAX_ATTACHMENT_BYTES,
+                  maxBytes: maxInlineMediaBytesPerPart,
                 });
 
                 if (!bytesRes.ok) {
+                  const filename = path.basename(input.path);
+                  const mimeType = inferMimeTypeFromFilename(filename);
+                  const message = /too large|media limit|maximum \d+ bytes/i.test(bytesRes.error)
+                    ? buildInlineMediaLimitMessage({
+                        filename,
+                        mimeType,
+                        maxBytes: maxInlineMediaBytesPerPart,
+                        detail: bytesRes.error,
+                      })
+                    : bytesRes.error;
                   return {
                     success: false as const,
                     resolvedPath: toRemoteDebugPath(cwdTarget.host, input.path),
                     error: {
                       code: "UNKNOWN" as const,
-                      message: bytesRes.error,
+                      message,
                     },
                   };
                 }
@@ -1101,10 +1396,30 @@ export function fsTool(
               }
 
               const bytesRes = await fileSystem.readFileBytes(
-                { path: input.path, dangerouslyAllow },
+                {
+                  path: input.path,
+                  dangerouslyAllow,
+                  maxBytes: maxInlineMediaBytesPerPart,
+                },
                 opCwd,
               );
               if (!bytesRes.success) {
+                if (/too large|media limit|maximum \d+ bytes/i.test(bytesRes.error.message)) {
+                  const filename = path.basename(bytesRes.resolvedPath);
+                  const mimeType = inferMimeTypeFromFilename(filename);
+                  return {
+                    ...bytesRes,
+                    error: {
+                      ...bytesRes.error,
+                      message: buildInlineMediaLimitMessage({
+                        filename,
+                        mimeType,
+                        maxBytes: maxInlineMediaBytesPerPart,
+                        detail: bytesRes.error.message,
+                      }),
+                    },
+                  };
+                }
                 return bytesRes;
               }
 
@@ -1149,7 +1464,10 @@ export function fsTool(
                 const remoteRes = await remoteReadTextFile({
                   host: cwdTarget.host,
                   cwd: cwdTarget.cwd,
-                  input,
+                  input: {
+                    ...input,
+                    start: input.start,
+                  },
                   denyPaths: remoteDenyPaths,
                 });
                 if (remoteRes.success) {
@@ -1163,7 +1481,14 @@ export function fsTool(
                 }
                 return remoteRes;
               })()
-            : await fileSystem.readFile({ ...input, dangerouslyAllow }, opCwd);
+            : await fileSystem.readFile(
+                {
+                  ...input,
+                  start: input.start,
+                  dangerouslyAllow,
+                },
+                opCwd,
+              );
 
         const resQualified = (() => {
           if (cwdTarget.kind !== "ssh") return res;
@@ -1259,11 +1584,20 @@ export function fsTool(
         } else {
           const bytesRes = await fileSystem.readFileBytes({
             path: output.resolvedPath,
+            maxBytes: maxInlineMediaBytesPerPart,
           });
           if (!bytesRes.success) {
+            const message = /too large|media limit|maximum \d+ bytes/i.test(bytesRes.error.message)
+              ? buildInlineMediaLimitMessage({
+                  filename,
+                  mimeType,
+                  maxBytes: maxInlineMediaBytesPerPart,
+                  detail: bytesRes.error.message,
+                })
+              : bytesRes.error.message;
             return {
               type: "error-text",
-              value: `Failed to read attachment bytes: ${bytesRes.error.message}`,
+              value: `Failed to read attachment bytes: ${message}`,
             };
           }
           base64 = Buffer.from(bytesRes.bytes).toString("base64");
@@ -1347,7 +1681,12 @@ export function fsTool(
             effectiveBackend: res.effectiveBackend,
           });
 
-          return stripGlobMetadata(res);
+          const output = stripGlobMetadata(res);
+          return boundSearchOutput(
+            output,
+            output.mode === "default" ? "paths" : "entries",
+            maxOutputBytes,
+          );
         }
 
         const res = await fileSystem.glob({
@@ -1366,7 +1705,12 @@ export function fsTool(
           effectiveBackend: res.effectiveBackend,
         });
 
-        return stripGlobMetadata(res);
+        const output = stripGlobMetadata(res);
+        return boundSearchOutput(
+          output,
+          output.mode === "default" ? "paths" : "entries",
+          maxOutputBytes,
+        );
       },
     }),
 
@@ -1408,7 +1752,7 @@ export function fsTool(
                   effectiveBackend: res.effectiveBackend,
                 });
 
-                return stripFuzzySearchMetadata(res);
+                return boundSearchOutput(stripFuzzySearchMetadata(res), "results", maxOutputBytes);
               }
 
               const res = await fileSystem.fuzzySearchFiles({
@@ -1426,7 +1770,7 @@ export function fsTool(
                 effectiveBackend: res.effectiveBackend,
               });
 
-              return stripFuzzySearchMetadata(res);
+              return boundSearchOutput(stripFuzzySearchMetadata(res), "results", maxOutputBytes);
             },
           }),
         }
@@ -1491,7 +1835,7 @@ export function fsTool(
             effectiveBackend: res.effectiveBackend,
           });
 
-          return stripGrepMetadata(res);
+          return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
         }
 
         const res = await fileSystem.grep({
@@ -1513,7 +1857,7 @@ export function fsTool(
           effectiveBackend: res.effectiveBackend,
         });
 
-        return stripGrepMetadata(res);
+        return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
       },
     }),
   };

@@ -62,19 +62,6 @@ export type ModelCapabilityOverride = {
   };
 };
 
-export type ImageGenerationParameterDefaults = {
-  size?: string;
-  aspectRatio?: string;
-  seed?: number;
-  maxRetries?: number;
-  options?: JSONObject;
-};
-
-export type ImageGenerationModelProfile = {
-  useWhen?: string;
-  defaults: ImageGenerationParameterDefaults;
-};
-
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
 
@@ -94,12 +81,22 @@ export type UniversalCoreConfig = {
     editFile: {
       hashline: boolean;
     };
-    generate: {
-      image: {
-        models: string[];
-        defaults: ImageGenerationParameterDefaults;
-        profiles: Record<string, ImageGenerationModelProfile>;
-      };
+    output: {
+      maxPreviewBytes: number;
+      artifactTtlMs: number;
+      artifactMaxBytesPerSession: number;
+    };
+    historicalResultPruning: {
+      enabled: boolean;
+      protectTokens: number;
+      minimumTokens: number;
+    };
+    batch: {
+      maxCalls: number;
+    };
+    media: {
+      maxInlineBytesPerPart: number;
+      maxInlineBytesTotal: number;
     };
   };
 
@@ -200,8 +197,7 @@ export type UniversalCoreConfig = {
     subagents: {
       enabled: boolean;
       maxDepth: number;
-      defaultTimeoutMs: number;
-      maxTimeoutMs: number;
+      idleTimeoutMs: number;
       profiles: {
         explore: SubagentProfileConfig;
         general: SubagentProfileConfig;

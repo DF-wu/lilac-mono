@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { cloneDefaultDiscordWorkingIndicators } from "../discord-working-indicators";
+import { parseFriendlyByteSize, parseFriendlyDurationMs } from "../friendly-units";
 
 import {
   coreConfigInputSchemaV1,
@@ -127,41 +128,26 @@ const modelCapabilitySchemaV2 = z
     overrides: {},
   });
 
-const subagentsSchemaV2 = z
-  .object({
-    enabled: z.boolean().default(true),
-    maxDepth: z.number().int().min(0).max(2).default(2),
-    defaultTimeoutMs: z
-      .number()
-      .int()
-      .positive()
-      .default(10 * 60 * 1000),
-    maxTimeoutMs: z
-      .number()
-      .int()
-      .positive()
-      .default(20 * 60 * 1000),
-    profiles: z
-      .object({
-        explore: subagentProfileSchemaV2.default({ modelSlot: "main" }),
-        general: subagentProfileSchemaV2.default({ modelSlot: "main" }),
-        self: subagentProfileSchemaV2.default({ modelSlot: "main" }),
-      })
-      .default({
-        explore: { modelSlot: "main" },
-        general: { modelSlot: "main" },
-        self: { modelSlot: "main" },
-      }),
-  })
-  .superRefine((input, ctx) => {
-    if (input.defaultTimeoutMs > input.maxTimeoutMs) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["defaultTimeoutMs"],
-        message: "defaultTimeoutMs must be <= maxTimeoutMs",
-      });
-    }
-  });
+const subagentsSchemaV2 = z.object({
+  enabled: z.boolean().default(true),
+  maxDepth: z.number().int().min(0).max(2).default(2),
+  idleTimeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .default(6 * 60 * 1000),
+  profiles: z
+    .object({
+      explore: subagentProfileSchemaV2.default({ modelSlot: "main" }),
+      general: subagentProfileSchemaV2.default({ modelSlot: "main" }),
+      self: subagentProfileSchemaV2.default({ modelSlot: "main" }),
+    })
+    .default({
+      explore: { modelSlot: "main" },
+      general: { modelSlot: "main" },
+      self: { modelSlot: "main" },
+    }),
+});
 
 const discordMarkdownTableRenderSchema = z
   .object({
@@ -216,31 +202,8 @@ const discordSurfaceSchema = z
     },
   });
 
-const imageGenerationParameterDefaultsSchema = z
-  .object({
-    size: z
-      .string()
-      .trim()
-      .regex(/^\d+x\d+$/)
-      .optional(),
-    aspectRatio: z
-      .string()
-      .trim()
-      .regex(/^\d+(?:\.\d+)?:\d+(?:\.\d+)?$/)
-      .optional(),
-    seed: z.number().int().optional(),
-    maxRetries: z.number().int().min(0).optional(),
-    /** AI SDK providerOptions-style object, with shorthand support in generate.image. */
-    options: jsonObjectSchema.optional(),
-  })
-  .superRefine((input, ctx) => {
-    if (input.size && input.aspectRatio) {
-      ctx.addIssue({
-        code: "custom",
-        message: "Provide only one of size or aspectRatio (not both).",
-      });
-    }
-  });
+const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
+const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
 const toolsSchema = z
   .object({
@@ -260,44 +223,41 @@ const toolsSchema = z
       .default({
         hashline: true,
       }),
-    generate: z
+    output: z
       .object({
-        image: z
-          .object({
-            // Ordered default image model specs for generate.image. Empty means
-            // "use built-in aliases"; explicit specs use provider/model format.
-            models: z
-              .array(z.string().trim().min(1))
-              .transform((models) => Array.from(new Set(models)))
-              .default([]),
-            // Global default parameters applied before model-specific profiles
-            // and before caller input. Keep these portable; provider-specific
-            // fields go under options.
-            defaults: imageGenerationParameterDefaultsSchema.default({}),
-            // Optional per-model tuning and selection guidance, keyed by the
-            // same model spec/alias string used in models or tool input.
-            profiles: z
-              .record(
-                z.string().trim().min(1),
-                z.object({
-                  useWhen: z.string().trim().min(1).optional(),
-                  defaults: imageGenerationParameterDefaultsSchema.default({}),
-                }),
-              )
-              .default({}),
-          })
-          .default({
-            models: [],
-            defaults: {},
-            profiles: {},
-          }),
+        maxPreviewBytes: byteSizeSchema.default(40 * 1024),
+        artifactTtl: durationMsSchema.default(7 * 24 * 60 * 60 * 1000),
+        artifactMaxBytesPerSession: byteSizeSchema.default(50 * 1024 * 1024),
       })
       .default({
-        image: {
-          models: [],
-          defaults: {},
-          profiles: {},
-        },
+        maxPreviewBytes: 40 * 1024,
+        artifactTtl: 7 * 24 * 60 * 60 * 1000,
+        artifactMaxBytesPerSession: 50 * 1024 * 1024,
+      }),
+    historicalResultPruning: z
+      .object({
+        enabled: z.boolean().default(false),
+        protectTokens: z.number().int().nonnegative().default(40_000),
+        minimumTokens: z.number().int().nonnegative().default(20_000),
+      })
+      .default({
+        enabled: false,
+        protectTokens: 40_000,
+        minimumTokens: 20_000,
+      }),
+    batch: z
+      .object({
+        maxCalls: z.number().int().positive().max(8).default(8),
+      })
+      .default({ maxCalls: 8 }),
+    media: z
+      .object({
+        maxInlineBytesPerPart: byteSizeSchema.default(10 * 1024 * 1024),
+        maxInlineBytesTotal: byteSizeSchema.default(20 * 1024 * 1024),
+      })
+      .default({
+        maxInlineBytesPerPart: 10 * 1024 * 1024,
+        maxInlineBytesTotal: 20 * 1024 * 1024,
       }),
   })
   .default({
@@ -316,12 +276,20 @@ const toolsSchema = z
     editFile: {
       hashline: true,
     },
-    generate: {
-      image: {
-        models: [],
-        defaults: {},
-        profiles: {},
-      },
+    output: {
+      maxPreviewBytes: 40 * 1024,
+      artifactTtl: 7 * 24 * 60 * 60 * 1000,
+      artifactMaxBytesPerSession: 50 * 1024 * 1024,
+    },
+    historicalResultPruning: {
+      enabled: false,
+      protectTokens: 40_000,
+      minimumTokens: 20_000,
+    },
+    batch: { maxCalls: 8 },
+    media: {
+      maxInlineBytesPerPart: 10 * 1024 * 1024,
+      maxInlineBytesTotal: 20 * 1024 * 1024,
     },
   });
 
@@ -516,8 +484,7 @@ export const coreConfigInputSchemaV2 = z.object({
       subagents: subagentsSchemaV2.default({
         enabled: true,
         maxDepth: 2,
-        defaultTimeoutMs: 10 * 60 * 1000,
-        maxTimeoutMs: 20 * 60 * 1000,
+        idleTimeoutMs: 6 * 60 * 1000,
         profiles: {
           explore: { modelSlot: "main" },
           general: { modelSlot: "main" },
@@ -537,8 +504,7 @@ export const coreConfigInputSchemaV2 = z.object({
       subagents: {
         enabled: true,
         maxDepth: 2,
-        defaultTimeoutMs: 10 * 60 * 1000,
-        maxTimeoutMs: 20 * 60 * 1000,
+        idleTimeoutMs: 6 * 60 * 1000,
         profiles: {
           explore: { modelSlot: "main" },
           general: { modelSlot: "main" },
@@ -560,9 +526,17 @@ export function parseCoreConfigV2(raw: unknown): ParsedCoreConfigV2 {
 
 export function parseCoreConfigV2ToUniversal(raw: unknown): UniversalCoreConfig {
   const parsed = parseCoreConfigV2(raw);
+  const { artifactTtl, ...output } = parsed.tools.output;
 
   return {
     ...parsed,
+    tools: {
+      ...parsed.tools,
+      output: {
+        ...output,
+        artifactTtlMs: artifactTtl,
+      },
+    },
     agent: {
       ...parsed.agent,
       systemPrompt: "",

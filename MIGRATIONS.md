@@ -40,6 +40,11 @@ Field renames from v1:
 - `tools.experimental_hashline_edit` -> `tools.editFile.hashline`
 - `surface.discord.previewFinalOutputStyle` -> `surface.discord.outputPreviewModeFinalStyle`
 - `surface.discord.experimental.markdownTableRender` -> `surface.discord.markdownTableRender`
+- `agent.subagents.defaultTimeoutMs` -> `agent.subagents.idleTimeoutMs`; the timeout now measures inactivity rather than total runtime.
+
+Removed v2 fields:
+
+- `agent.subagents.maxTimeoutMs`; the universal runtime config no longer exposes a hard timeout cap. Frozen v1 configs may still contain this field, but it is not carried into the universal config.
 
 New v2 fields:
 
@@ -54,6 +59,12 @@ New v2 fields:
 - `conversation.thread.autoInject.minTextUnits`: minimum authored text mass before auto-injecting conversation thread metadata; defaults to `80`.
 - `conversation.thread.autoInject.followUpMinTextUnits`: higher text-mass threshold after prior auto-injected thread metadata exists in the same conversation; defaults to `110`.
 - `conversation.thread.autoInject.minScore`: minimum final `conversation.thread.search` score for auto-injected metadata; defaults to `0.1`.
+- `tools.output`: direct-result preview and transient artifact policy. Defaults to `40KiB`, `7d`, and `50MiB` per session.
+- `tools.historicalResultPruning`: compatibility policy for rewriting old tool results. It defaults to disabled with the prior `40000`/`20000` token thresholds retained when enabled.
+- `tools.batch.maxCalls`: maximum calls accepted by one batch; defaults to `8`.
+- `tools.media`: model-view inline binary limits. Defaults to `10MiB` per part and `20MiB` in total.
+
+Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
 
 Default changes from v1:
 
@@ -65,5 +76,4 @@ Default changes from v1:
 - `surface.discord.outputNotification: true`
 - `surface.discord.markdownTableRender: { enabled: true, style: unicode, maxWidth: 50, fallbackMode: list }`
 - `agent.reasoningDisplay: detailed`
-- `agent.subagents.defaultTimeoutMs: 600000`
-- `agent.subagents.maxTimeoutMs: 1200000`
+- `agent.subagents.idleTimeoutMs: 360000`; explicit v1 `defaultTimeoutMs` values are preserved, while omitted values use the new universal default.

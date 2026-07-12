@@ -56,8 +56,7 @@ export type Level1ToolFailureSummary = {
 
 export type Level1SubagentConfig = {
   enabled: boolean;
-  defaultTimeoutMs: number;
-  maxTimeoutMs: number;
+  idleTimeoutMs: number;
   maxDepth: number;
 };
 
@@ -95,6 +94,7 @@ export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRunt
 
 export interface Level1ToolSpec<TRuntimeContext> {
   name: string;
+  /** Batch is opt-in. Omitted and false values are not batch-callable. */
   supportsBatch?: boolean;
   createTool(buildContext: Level1ToolBuildContext<TRuntimeContext>): unknown;
   isEnabled(runContext: Level1ToolRunContext<TRuntimeContext>): boolean;

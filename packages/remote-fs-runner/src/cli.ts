@@ -5,7 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-import { FileSystem, type FileEdit, type HashlineEdit } from "@stanley2058/lilac-fs";
+import {
+  FileSystem,
+  type FileEdit,
+  type HashlineEdit,
+  type ReadFileStart,
+} from "@stanley2058/lilac-fs";
 
 declare const PACKAGE_VERSION: string;
 
@@ -40,6 +45,27 @@ function numberOrUndefined(value: unknown): number | undefined {
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : [];
+}
+
+function ordinaryFileStartOrUndefined(value: unknown): ReadFileStart | undefined {
+  if (!isRecord(value)) return undefined;
+
+  if (value["type"] === "offset") {
+    const offset = value["offset"];
+    return typeof offset === "number" && Number.isFinite(offset)
+      ? { type: "offset", offset }
+      : undefined;
+  }
+  if (value["type"] !== "line") return undefined;
+
+  const line = value["line"];
+  const column = value["column"];
+  if (typeof line !== "number" || !Number.isFinite(line)) return undefined;
+  if (column !== undefined && (typeof column !== "number" || !Number.isFinite(column))) {
+    return undefined;
+  }
+
+  return column === undefined ? { type: "line", line } : { type: "line", line, column };
 }
 
 function parseEnvelope(value: unknown): RequestEnvelope {
@@ -130,7 +156,7 @@ function normalizeEditOutput(result: unknown): unknown {
   };
 }
 
-async function handleRequest(envelope: RequestEnvelope): Promise<unknown> {
+export async function handleRequest(envelope: RequestEnvelope): Promise<unknown> {
   const fsTool = new FileSystem(envelope.cwd, {
     denyPaths: envelope.denyPaths,
     fsBackend: "fff",
@@ -139,9 +165,10 @@ async function handleRequest(envelope: RequestEnvelope): Promise<unknown> {
   const input = envelope.input;
 
   if (envelope.op === "fs.read_text") {
+    const start = ordinaryFileStartOrUndefined(input["start"]);
     return await fsTool.readFile({
       path: String(input["path"] ?? ""),
-      startLine: numberOrUndefined(input["startLine"]),
+      start,
       maxLines: numberOrUndefined(input["maxLines"]),
       maxCharacters: numberOrUndefined(input["maxCharacters"]),
       format:
@@ -154,15 +181,16 @@ async function handleRequest(envelope: RequestEnvelope): Promise<unknown> {
   }
 
   if (envelope.op === "fs.read_bytes") {
-    const result = await fsTool.readFileBytes({ path: String(input["path"] ?? "") });
-    if (!result.success) return result;
-
     const maxBytes = numberOrUndefined(input["maxBytes"]);
-    if (maxBytes !== undefined && result.bytesLength > maxBytes) {
+    const result = await fsTool.readFileBytes({
+      path: String(input["path"] ?? ""),
+      maxBytes,
+    });
+    if (!result.success) {
       return {
         ok: false,
         resolvedPath: result.resolvedPath,
-        error: `Remote file too large (${result.bytesLength} bytes). Max allowed is ${maxBytes}.`,
+        error: result.error.message,
       };
     }
 
@@ -450,7 +478,9 @@ async function main(): Promise<void> {
   writeJson({ ok: false, error: `Unknown command: ${command}` } satisfies ResponseEnvelope);
 }
 
-main().catch((error) => {
-  writeJson(responseError(error));
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    writeJson(responseError(error));
+    process.exitCode = 1;
+  });
+}

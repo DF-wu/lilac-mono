@@ -44,6 +44,7 @@ import {
   attachAutoCompaction,
   buildSyntheticToolCallId,
   type AiSdkPiAgentEvent,
+  type NormalizeToolResultOutputFn,
   type TransformMessagesFn,
 } from "@stanley2058/lilac-agent";
 
@@ -51,11 +52,18 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { CoreToolPluginManager } from "../../plugins";
+import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
+import {
+  createToolResultOutputNormalizer,
+  normalizeSubagentFinalText,
+  normalizeSubagentFinalTextForSnapshot,
+} from "../../artifacts/tool-result-output-normalizer";
 import {
   renderSubagentDisplay,
   type ChildToolState,
   type DeferredSubagentRegistration,
 } from "../../tools/subagent";
+import { createSubagentIdleTimer, type SubagentIdleTimer } from "../../tools/subagent-idle-timer";
 import { formatToolArgsForDisplayWithSpecs } from "../../tools/tool-args-display";
 import { isHeartbeatAckText, isHeartbeatSessionId } from "../../heartbeat/common";
 
@@ -64,7 +72,10 @@ import {
   extractHeartbeatSurfaceSendHandoffs,
   HEARTBEAT_HANDOFF_SESSION_ID,
 } from "../../transcript/heartbeat-handoff";
-import type { TranscriptStore } from "../../transcript/transcript-store";
+import {
+  COMPACTION_CHECKPOINT_FORMAT_VERSION,
+  type TranscriptStore,
+} from "../../transcript/transcript-store";
 import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
@@ -196,13 +207,7 @@ function buildResumePrompt(partialText: string): ModelMessage {
 // - Track compacted toolCallIds in-memory per session for stability (cache hits).
 const TOOL_OUTPUT_PLACEHOLDER = "[Old tool result content cleared]";
 const TOOL_OUTPUT_CHARS_PER_TOKEN = 4;
-const TOOL_OUTPUT_PRUNE_PROTECT_TOKENS = 40_000;
-const TOOL_OUTPUT_PRUNE_MINIMUM_TOKENS = 20_000;
 const TOOL_OUTPUT_PRUNE_PROTECTED_TOOLS = new Set(["skill"]);
-
-const MODEL_VIEW_MAX_BINARY_BYTES_PER_PART = 256 * 1024;
-const MODEL_VIEW_MAX_BINARY_BYTES_TOTAL = 2 * 1024 * 1024;
-const MODEL_VIEW_BINARY_OMITTED = "[binary omitted]";
 
 export function withBlankLineBetweenTextParts(params: {
   accumulatedText: string;
@@ -283,10 +288,12 @@ function estimateTokensFromValue(value: unknown): number {
   return Math.max(0, Math.round(chars / TOOL_OUTPUT_CHARS_PER_TOKEN));
 }
 
-function maybeMarkOldToolOutputsCompacted(params: {
+export function maybeMarkOldToolOutputsCompacted(params: {
   messages: readonly ModelMessage[];
   compactedToolCallIds: Set<string>;
-}): boolean {
+  protectTokens: number;
+  minimumTokens: number;
+}): number {
   let turns = 0;
   let total = 0;
   let pruned = 0;
@@ -318,14 +325,14 @@ function maybeMarkOldToolOutputsCompacted(params: {
       const estimate = estimateTokensFromValue(output);
       total += estimate;
 
-      if (total > TOOL_OUTPUT_PRUNE_PROTECT_TOKENS) {
+      if (total > params.protectTokens) {
         pruned += estimate;
         toCompact.add(toolCallId);
       }
     }
   }
 
-  if (pruned <= TOOL_OUTPUT_PRUNE_MINIMUM_TOKENS) return false;
+  if (pruned <= params.minimumTokens) return 0;
 
   let changed = false;
   for (const id of toCompact) {
@@ -333,10 +340,10 @@ function maybeMarkOldToolOutputsCompacted(params: {
     params.compactedToolCallIds.add(id);
     changed = true;
   }
-  return changed;
+  return changed ? pruned : 0;
 }
 
-function applyToolOutputCompactionView(params: {
+export function applyToolOutputCompactionView(params: {
   messages: readonly ModelMessage[];
   compactedToolCallIds: ReadonlySet<string>;
 }): ModelMessage[] {
@@ -375,7 +382,10 @@ function applyToolOutputCompactionView(params: {
   return changed ? out : [...params.messages];
 }
 
-function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelMessage[] {
+export function scrubLargeBinaryForModelView(
+  messages: readonly ModelMessage[],
+  limits: { maxBytesPerPart: number; maxBytesTotal: number },
+): ModelMessage[] {
   let totalBytes = 0;
 
   const estimateBase64Bytes = (b64: string): number => {
@@ -386,17 +396,17 @@ function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelM
     return Math.max(0, bytes);
   };
 
-  const out: ModelMessage[] = [];
+  const out = [...messages];
 
-  for (const msg of messages) {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const msg = messages[messageIndex]!;
     if (msg.role !== "tool" || !Array.isArray(msg.content)) {
-      out.push(msg);
       continue;
     }
 
     let nextContent: ToolContent | null = null;
 
-    for (let i = 0; i < msg.content.length; i++) {
+    for (let i = msg.content.length - 1; i >= 0; i -= 1) {
       const part = msg.content[i];
       if (part?.type !== "tool-result") continue;
 
@@ -410,7 +420,7 @@ function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelM
       const value = rawValue;
       let nextValue: typeof rawValue | null = null;
 
-      for (let j = 0; j < value.length; j++) {
+      for (let j = value.length - 1; j >= 0; j -= 1) {
         const item = value[j];
         if (!item || typeof item !== "object" || Array.isArray(item)) continue;
 
@@ -423,8 +433,8 @@ function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelM
         const data = fileData.data;
 
         const bytes = estimateBase64Bytes(data);
-        const tooBig = bytes > MODEL_VIEW_MAX_BINARY_BYTES_PER_PART;
-        const tooMuch = totalBytes + bytes > MODEL_VIEW_MAX_BINARY_BYTES_TOTAL;
+        const tooBig = bytes > limits.maxBytesPerPart;
+        const tooMuch = totalBytes + bytes > limits.maxBytesTotal;
         if (!tooBig && !tooMuch) {
           totalBytes += bytes;
           continue;
@@ -439,9 +449,12 @@ function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelM
         const detail =
           filename || mediaType ? ` (${[filename, mediaType].filter(Boolean).join(", ")})` : "";
 
+        const instruction = mediaType.startsWith("image/")
+          ? "Image exceeds the inline limit. Resize the image before reading it again."
+          : "File exceeds the inline limit and must be reduced before reading it again.";
         nextValue[j] = {
           type: "text",
-          text: `${MODEL_VIEW_BINARY_OMITTED}${detail}`,
+          text: `${instruction}${detail}`,
         };
       }
 
@@ -458,12 +471,9 @@ function scrubLargeBinaryForModelView(messages: readonly ModelMessage[]): ModelM
       nextPart["output"] = nextOutput;
     }
 
-    if (!nextContent) {
-      out.push(msg);
-      continue;
-    }
+    if (!nextContent) continue;
 
-    out.push({ ...msg, content: nextContent });
+    out[messageIndex] = { ...msg, content: nextContent };
   }
 
   return out;
@@ -509,8 +519,9 @@ type DeferredSubagentHandleSnapshot = {
   sessionName?: string;
   childRequestId: string;
   childSessionId: string;
-  timeoutMs: number;
-  startedAtMs: number;
+  idleTimeoutMs?: number;
+  /** Compatibility with snapshots written immediately before idle timeouts shipped. */
+  timeoutMs?: number;
   finalText: string;
   detail?: string;
   childUpdateSeq: number;
@@ -530,8 +541,7 @@ type DeferredSubagentHandle = {
   sessionName: string;
   childRequestId: string;
   childSessionId: string;
-  timeoutMs: number;
-  startedAtMs: number;
+  idleTimeoutMs: number;
   finalText: string;
   detail?: string;
   childUpdateSeq: number;
@@ -540,7 +550,7 @@ type DeferredSubagentHandle = {
   evtCursor?: string;
   outSub: { stop(): Promise<void> } | null;
   evtSub: { stop(): Promise<void> } | null;
-  timeout: ReturnType<typeof setTimeout> | null;
+  idleTimer: SubagentIdleTimer | null;
   settled: boolean;
   handlingEvtSubscriptionMessage: boolean;
 };
@@ -674,6 +684,17 @@ function buildCustomCommandMessages(params: {
       ],
     },
   ];
+}
+
+export function buildCustomCommandFailureFinalText(params: {
+  commandText: string;
+  normalizedOutput: CustomCommandResult;
+}): string {
+  const normalizedError =
+    params.normalizedOutput.type === "error-text"
+      ? params.normalizedOutput.value
+      : "Custom command failed.";
+  return `Error running ${params.commandText}: ${normalizedError}`;
 }
 
 const AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME = "conversation_thread_search";
@@ -1088,6 +1109,7 @@ function buildDeferredSubagentDisplay(completion: {
 function buildDeferredSubagentRecoveryState(params: {
   handles: Iterable<DeferredSubagentHandle>;
   bufferedCompletions: readonly DeferredSubagentBufferedCompletion[];
+  normalizeFinalText?: (finalText: string) => string;
 }): DeferredSubagentRecoveryState | undefined {
   const outstanding = Array.from(params.handles, (handle) => ({
     parentToolCallId: handle.parentToolCallId,
@@ -1095,9 +1117,8 @@ function buildDeferredSubagentRecoveryState(params: {
     sessionName: handle.sessionName,
     childRequestId: handle.childRequestId,
     childSessionId: handle.childSessionId,
-    timeoutMs: handle.timeoutMs,
-    startedAtMs: handle.startedAtMs,
-    finalText: handle.finalText,
+    idleTimeoutMs: handle.idleTimeoutMs,
+    finalText: params.normalizeFinalText?.(handle.finalText) ?? handle.finalText,
     ...(handle.detail ? { detail: handle.detail } : {}),
     childUpdateSeq: handle.childUpdateSeq,
     childTools: Array.from(handle.childTools.values()),
@@ -1111,7 +1132,10 @@ function buildDeferredSubagentRecoveryState(params: {
 
   return {
     outstanding,
-    bufferedCompletions: [...params.bufferedCompletions],
+    bufferedCompletions: params.bufferedCompletions.map((completion) => ({
+      ...completion,
+      finalText: params.normalizeFinalText?.(completion.finalText) ?? completion.finalText,
+    })),
   };
 }
 
@@ -1124,9 +1148,12 @@ export function createDeferredSubagentManager(params: {
     request_client: AdapterPlatform;
     router_session_mode?: "mention" | "active";
   };
+  normalizeFinalText?: (params: { finalText: string; toolCallId: string }) => Promise<string>;
+  normalizeFinalTextForSnapshot?: (finalText: string) => string;
 }) {
   const { bus, logger, parentHeaders } = params;
   const handles = new Map<string, DeferredSubagentHandle>();
+  const detachedStops = new Set<Promise<void>>();
   const bufferedCompletions: DeferredSubagentBufferedCompletion[] = [];
   let waiters: Array<() => void> = [];
   let signalVersion = 0;
@@ -1172,10 +1199,8 @@ export function createDeferredSubagentManager(params: {
     handle: DeferredSubagentHandle,
     options?: { deferEvtSubStop?: boolean },
   ) => {
-    if (handle.timeout) {
-      clearTimeout(handle.timeout);
-      handle.timeout = null;
-    }
+    handle.idleTimer?.stop();
+    handle.idleTimer = null;
 
     const outSub = handle.outSub;
     const evtSub = handle.evtSub;
@@ -1190,7 +1215,7 @@ export function createDeferredSubagentManager(params: {
 
     if (evtSub) {
       if (options?.deferEvtSubStop) {
-        void evtSub.stop().catch((e: unknown) => {
+        const detachedStop = evtSub.stop().catch((e: unknown) => {
           logger.warn(
             "deferred subagent lifecycle subscription stop failed",
             {
@@ -1201,6 +1226,8 @@ export function createDeferredSubagentManager(params: {
             e,
           );
         });
+        detachedStops.add(detachedStop);
+        void detachedStop.finally(() => detachedStops.delete(detachedStop));
       } else {
         stopPromises.push(evtSub.stop());
       }
@@ -1226,6 +1253,7 @@ export function createDeferredSubagentManager(params: {
         raw: {
           cancel: true,
           requiresActive: true,
+          cancelQueued: true,
           subagent: {
             profile: handle.profile,
             parentRequestId: parentHeaders.request_id,
@@ -1250,8 +1278,15 @@ export function createDeferredSubagentManager(params: {
   ) => {
     if (handle.settled) return;
     handle.settled = true;
+    handle.idleTimer?.stop();
     handle.detail = detail ?? handle.detail;
 
+    const finalText = params.normalizeFinalText
+      ? await params.normalizeFinalText({
+          finalText: handle.finalText,
+          toolCallId: buildSubagentResultToolCallId(handle.childRequestId),
+        })
+      : handle.finalText;
     const completion: DeferredSubagentBufferedCompletion = {
       parentToolCallId: handle.parentToolCallId,
       profile: handle.profile,
@@ -1260,7 +1295,7 @@ export function createDeferredSubagentManager(params: {
       childSessionId: handle.childSessionId,
       status,
       ok: status === "resolved",
-      finalText: handle.finalText,
+      finalText,
       ...(handle.detail ? { detail: handle.detail } : {}),
       childTools: Array.from(handle.childTools.values()),
     };
@@ -1270,7 +1305,7 @@ export function createDeferredSubagentManager(params: {
     notifyWaiters();
 
     if (handle.handlingEvtSubscriptionMessage) {
-      void stopHandle(handle, { deferEvtSubStop: true }).catch((e: unknown) => {
+      const detachedStop = stopHandle(handle, { deferEvtSubStop: true }).catch((e: unknown) => {
         logger.warn(
           "deferred subagent stop after settlement failed",
           {
@@ -1282,6 +1317,8 @@ export function createDeferredSubagentManager(params: {
           e,
         );
       });
+      detachedStops.add(detachedStop);
+      void detachedStop.finally(() => detachedStops.delete(detachedStop));
       return;
     }
 
@@ -1292,14 +1329,18 @@ export function createDeferredSubagentManager(params: {
     snapshot: DeferredSubagentHandleSnapshot,
     options?: { replayExisting?: boolean },
   ) => {
+    const idleTimeoutMs = snapshot.idleTimeoutMs ?? snapshot.timeoutMs;
+    if (!idleTimeoutMs || idleTimeoutMs <= 0) {
+      throw new Error("deferred subagent snapshot is missing a valid idle timeout");
+    }
+
     const handle: DeferredSubagentHandle = {
       parentToolCallId: snapshot.parentToolCallId,
       profile: snapshot.profile,
       sessionName: resolveRecoveredSubagentSessionName(snapshot),
       childRequestId: snapshot.childRequestId,
       childSessionId: snapshot.childSessionId,
-      timeoutMs: snapshot.timeoutMs,
-      startedAtMs: snapshot.startedAtMs,
+      idleTimeoutMs,
       finalText: snapshot.finalText,
       detail: snapshot.detail,
       childUpdateSeq: snapshot.childUpdateSeq,
@@ -1308,7 +1349,7 @@ export function createDeferredSubagentManager(params: {
       evtCursor: snapshot.evtCursor,
       outSub: null,
       evtSub: null,
-      timeout: null,
+      idleTimer: null,
       settled: false,
       handlingEvtSubscriptionMessage: false,
     };
@@ -1330,6 +1371,7 @@ export function createDeferredSubagentManager(params: {
             mode: "fanout",
             subscriptionId: `deferred-subagent:out:${subId}`,
             consumerId: `deferred-subagent:out:${subId}`,
+            ephemeral: true,
             offset: { type: "now" },
             batch: { maxWaitMs: 250 },
           },
@@ -1338,6 +1380,8 @@ export function createDeferredSubagentManager(params: {
           await subCtx.commit();
           return;
         }
+
+        handle.idleTimer?.reset();
 
         if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           handle.finalText += msg.data.delta;
@@ -1399,6 +1443,7 @@ export function createDeferredSubagentManager(params: {
             mode: "fanout",
             subscriptionId: `deferred-subagent:evt:${subId}`,
             consumerId: `deferred-subagent:evt:${subId}`,
+            ephemeral: true,
             offset: { type: "now" },
             batch: { maxWaitMs: 250 },
           },
@@ -1410,6 +1455,8 @@ export function createDeferredSubagentManager(params: {
             await subCtx.commit();
             return;
           }
+
+          handle.idleTimer?.reset();
 
           if (msg.type === lilacEventTypes.EvtRequestLifecycleChanged) {
             handle.detail = msg.data.detail ?? handle.detail;
@@ -1433,12 +1480,17 @@ export function createDeferredSubagentManager(params: {
       },
     );
 
-    const elapsedMs = Math.max(0, Date.now() - handle.startedAtMs);
-    const remainingMs = Math.max(1, handle.timeoutMs - elapsedMs);
-    handle.timeout = setTimeout(() => {
-      void cancelChild(handle, `timed out after ${handle.timeoutMs}ms`).catch(() => undefined);
-      void settleHandle(handle, "timeout", `timed out after ${handle.timeoutMs}ms`);
-    }, remainingMs);
+    if (handle.settled) {
+      await stopHandle(handle);
+      return;
+    }
+
+    handle.idleTimer = createSubagentIdleTimer(handle.idleTimeoutMs, () => {
+      const detail = `idle timed out after ${handle.idleTimeoutMs}ms without child activity`;
+      void cancelChild(handle, detail).catch(() => undefined);
+      void settleHandle(handle, "timeout", detail);
+    });
+    handle.idleTimer.reset();
   };
 
   return {
@@ -1449,8 +1501,7 @@ export function createDeferredSubagentManager(params: {
         sessionName: registration.sessionName,
         childRequestId: registration.childRequestId,
         childSessionId: registration.childSessionId,
-        timeoutMs: registration.timeoutMs,
-        startedAtMs: Date.now(),
+        idleTimeoutMs: registration.idleTimeoutMs,
         finalText: "",
         childUpdateSeq: 0,
         childTools: [],
@@ -1485,12 +1536,18 @@ export function createDeferredSubagentManager(params: {
 
     async restore(recovery: DeferredSubagentRecoveryState | undefined) {
       if (!recovery) return;
-      bufferedCompletions.push(
-        ...recovery.bufferedCompletions.map((completion) => ({
+      for (const completion of recovery.bufferedCompletions) {
+        bufferedCompletions.push({
           ...completion,
           sessionName: resolveRecoveredSubagentSessionName(completion),
-        })),
-      );
+          finalText: params.normalizeFinalText
+            ? await params.normalizeFinalText({
+                finalText: completion.finalText,
+                toolCallId: buildSubagentResultToolCallId(completion.childRequestId),
+              })
+            : completion.finalText,
+        });
+      }
       for (const outstanding of recovery.outstanding) {
         await restoreOutstandingHandle(outstanding, { replayExisting: true });
       }
@@ -1517,6 +1574,7 @@ export function createDeferredSubagentManager(params: {
       return buildDeferredSubagentRecoveryState({
         handles: handles.values(),
         bufferedCompletions,
+        normalizeFinalText: params.normalizeFinalTextForSnapshot,
       });
     },
 
@@ -1572,6 +1630,7 @@ export function createDeferredSubagentManager(params: {
           await stopHandle(handle);
         }),
       );
+      await Promise.all(detachedStops);
 
       bufferedCompletions.length = 0;
       notifyWaiters();
@@ -1581,7 +1640,7 @@ export function createDeferredSubagentManager(params: {
       const active = [...handles.values()];
       handles.clear();
       bufferedCompletions.length = 0;
-      await Promise.all(active.map((handle) => stopHandle(handle)));
+      await Promise.all([...active.map((handle) => stopHandle(handle)), ...detachedStops]);
       notifyWaiters();
     },
   };
@@ -1758,8 +1817,7 @@ type SubagentConfig = NonNullable<CoreConfig["agent"]["subagents"]>;
 const DEFAULT_SUBAGENT_CONFIG: SubagentConfig = {
   enabled: true,
   maxDepth: 2,
-  defaultTimeoutMs: 3 * 60 * 1000,
-  maxTimeoutMs: 8 * 60 * 1000,
+  idleTimeoutMs: 6 * 60 * 1000,
   profiles: {
     explore: {
       modelSlot: "main",
@@ -1854,6 +1912,7 @@ export async function startBusAgentRunner(params: {
   /** Where core tools operate (fs tool root). */
   cwd?: string;
   transcriptStore?: TranscriptStore;
+  toolResultArtifacts?: ToolResultArtifactStore;
 }) {
   const { bus, subscriptionId } = params;
 
@@ -1910,7 +1969,10 @@ export async function startBusAgentRunner(params: {
       batch: { maxWaitMs: 1000 },
     },
     async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.CmdRequestMessage) return;
+      if (msg.type !== lilacEventTypes.CmdRequestMessage) {
+        await ctx.commit();
+        return;
+      }
 
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
@@ -2500,10 +2562,29 @@ export async function startBusAgentRunner(params: {
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
     };
 
+    const normalizeToolResultOutput: NormalizeToolResultOutputFn = createToolResultOutputNormalizer(
+      {
+        artifacts: params.toolResultArtifacts,
+        owner: {
+          requestId: next.requestId,
+          sessionId: next.sessionId,
+        },
+        getOutputConfig: () => cfg.tools.output,
+      },
+    );
+
     const deferredSubagents = createDeferredSubagentManager({
       bus,
       logger,
       parentHeaders: headers,
+      normalizeFinalText: ({ finalText, toolCallId }) =>
+        normalizeSubagentFinalText({
+          normalize: normalizeToolResultOutput,
+          finalText,
+          toolCallId,
+        }),
+      normalizeFinalTextForSnapshot: (finalText) =>
+        normalizeSubagentFinalTextForSnapshot(finalText, cfg.tools.output.maxPreviewBytes),
     });
 
     state.activeRun = {
@@ -2532,6 +2613,7 @@ export async function startBusAgentRunner(params: {
       lastTurnFinishReason?: FinishReason;
       lastTurnEndAt?: number;
     } = {};
+    let completedCompactionCount = 0;
     const streamWarnings: CallWarning[] = [];
     const modelCapabilityConfig = cfg.models.capability;
     const modelCapability = new ModelCapability({
@@ -2627,6 +2709,11 @@ export async function startBusAgentRunner(params: {
           output = { type: "error-text", value: customError };
         }
 
+        output = await normalizeToolResultOutput(output, {
+          toolCallId,
+          toolName: CUSTOM_COMMAND_TOOL_NAME,
+        });
+
         customCommandMessages = buildCustomCommandMessages({
           toolCallId,
           name: parsedCustomCommand.name,
@@ -2650,7 +2737,10 @@ export async function startBusAgentRunner(params: {
         );
 
         if (customError) {
-          const finalText = `Error running ${parsedCustomCommand.text}: ${customError}`;
+          const finalText = buildCustomCommandFailureFinalText({
+            commandText: parsedCustomCommand.text,
+            normalizedOutput: output,
+          });
           resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
 
           if (params.transcriptStore) {
@@ -2939,15 +3029,18 @@ export async function startBusAgentRunner(params: {
         queuedForSession: state.queue.length,
       });
 
-      const { tools, specs: level1ToolSpecs } = await params.pluginManager.buildLevel1Toolset({
+      const {
+        tools,
+        specs: level1ToolSpecs,
+        genericOutputNormalizerBypassTools,
+      } = await params.pluginManager.buildLevel1Toolset({
         cwd,
         runProfile,
         editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
         subagentDepth: subagentMeta.depth,
         subagentConfig: {
           enabled: subagents.enabled,
-          defaultTimeoutMs: subagents.defaultTimeoutMs,
-          maxTimeoutMs: subagents.maxTimeoutMs,
+          idleTimeoutMs: subagents.idleTimeoutMs,
           maxDepth: subagents.maxDepth,
         },
         requestContext: {
@@ -3003,6 +3096,8 @@ export async function startBusAgentRunner(params: {
         providerOptions: providerOptionsForAgent,
         reasoning: resolved.reasoning,
         turnErrorHandler: transientRetryController.handler,
+        normalizeToolResultOutput,
+        genericOutputNormalizerBypassTools,
         experimentalDownload: experimentalDownloadForAgent,
         debug: {
           captureModelViewMessages: env.debug.contextDump.enabled,
@@ -3025,18 +3120,35 @@ export async function startBusAgentRunner(params: {
 
       const toolPruneTransform: TransformMessagesFn = async (messages) => {
         // First, remove pathological binary blobs from the *model-facing* view.
-        const scrubbed = scrubLargeBinaryForModelView(messages);
+        const scrubbed = scrubLargeBinaryForModelView(messages, {
+          maxBytesPerPart: cfg.tools.media.maxInlineBytesPerPart,
+          maxBytesTotal: cfg.tools.media.maxInlineBytesTotal,
+        });
 
         // Then, compact older tool outputs (placeholder) with session-stable state.
-        maybeMarkOldToolOutputsCompacted({
-          messages: scrubbed,
-          compactedToolCallIds: state.compactedToolCallIds,
-        });
+        if (cfg.tools.historicalResultPruning.enabled) {
+          const estimatedPrunedTokens = maybeMarkOldToolOutputsCompacted({
+            messages: scrubbed,
+            compactedToolCallIds: state.compactedToolCallIds,
+            protectTokens: cfg.tools.historicalResultPruning.protectTokens,
+            minimumTokens: cfg.tools.historicalResultPruning.minimumTokens,
+          });
+          if (estimatedPrunedTokens > 0) {
+            logger.info("agent.historical_result_pruned", {
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              compactedToolCallCount: state.compactedToolCallIds.size,
+              estimatedPrunedTokens,
+            });
+          }
+        }
 
-        const compacted = applyToolOutputCompactionView({
-          messages: scrubbed,
-          compactedToolCallIds: state.compactedToolCallIds,
-        });
+        const compacted = cfg.tools.historicalResultPruning.enabled
+          ? applyToolOutputCompactionView({
+              messages: scrubbed,
+              compactedToolCallIds: state.compactedToolCallIds,
+            })
+          : scrubbed;
 
         if (!anthropicPromptCachingEnabled) return compacted;
         return withProviderOptionsOnLastUserMessage(
@@ -3188,6 +3300,7 @@ export async function startBusAgentRunner(params: {
             estimatedOutputTokens,
           };
           if (status === "completed") {
+            completedCompactionCount += 1;
             logger.info("auto-compaction end", payload);
             return;
           }
@@ -3757,13 +3870,25 @@ export async function startBusAgentRunner(params: {
       if (params.transcriptStore && (!shouldSkipSurfaceReply || runProfile !== "primary")) {
         try {
           const finalMessagesForPersistence = runStats.finalMessages ?? agent.state.messages;
-          const responseMessages = finalMessagesForPersistence.slice(responseStartIndex);
+          const checkpointMeta = resolveCompactionCheckpointMeta({
+            runSucceeded: true,
+            isPrimary: runProfile === "primary",
+            isCancelled,
+            shouldSkipSurfaceReply,
+            completedCompactionCount,
+          });
+          const isCompactionCheckpoint = checkpointMeta !== undefined;
           const persistedMessages = (() => {
             if (isHeartbeatSessionId(headers.session_id)) {
               return buildPersistedHeartbeatMessages(finalText);
             }
 
-            return runProfile === "primary" ? responseMessages : finalMessagesForPersistence;
+            return selectPersistedTranscriptMessages({
+              finalMessages: finalMessagesForPersistence,
+              responseStartIndex,
+              isPrimary: runProfile === "primary",
+              didCompact: isCompactionCheckpoint,
+            });
           })();
 
           params.transcriptStore.saveRequestTranscript({
@@ -3775,7 +3900,17 @@ export async function startBusAgentRunner(params: {
             messages: persistedMessages,
             finalText,
             modelLabel: resolvedModelLabel,
+            contextMeta: checkpointMeta,
           });
+          if (isCompactionCheckpoint) {
+            logger.info("compaction checkpoint persisted", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              messageCount: persistedMessages.length,
+              compactionCount: completedCompactionCount,
+              formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
+            });
+          }
         } catch (e) {
           logger.error(
             "failed to persist transcript",
@@ -4177,6 +4312,39 @@ async function applyToRunningAgent(
       return _exhaustive;
     }
   }
+}
+
+export function selectPersistedTranscriptMessages(input: {
+  finalMessages: readonly ModelMessage[];
+  responseStartIndex: number;
+  isPrimary: boolean;
+  didCompact: boolean;
+}): ModelMessage[] {
+  if (!input.isPrimary || input.didCompact) return [...input.finalMessages];
+  return input.finalMessages.slice(input.responseStartIndex);
+}
+
+export function resolveCompactionCheckpointMeta(input: {
+  runSucceeded: boolean;
+  isPrimary: boolean;
+  isCancelled: boolean;
+  shouldSkipSurfaceReply: boolean;
+  completedCompactionCount: number;
+}) {
+  if (
+    !input.runSucceeded ||
+    !input.isPrimary ||
+    input.isCancelled ||
+    input.shouldSkipSurfaceReply ||
+    input.completedCompactionCount <= 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    type: "compaction",
+    formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
+  } as const;
 }
 
 export function mergeToSingleUserMessage(messages: ModelMessage[]): ModelMessage {
