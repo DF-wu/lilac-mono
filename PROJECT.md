@@ -369,6 +369,7 @@ Key sections:
 - `surface.discord`: bot token env var name, allowlists, botName.
 - `tools.web.extract.providers`: ordered web provider list shared by `web.search` and provider-backed `web.fetch`/extract (`tavily`, `exa`, `firecrawl`).
 - `tools.web.fetch.mode`: default fetch strategy (`auto`, `fetch`, `browser`, `extract`, or `provider-only`).
+- `tools.generate.image.provider`: transport routing switch (`default` | `openai-compatible`). When set to `openai-compatible`, image generation calls route through the OpenAI-compatible provider configured via `OPENAI_COMPATIBLE_BASE_URL` and `OPENAI_COMPATIBLE_API_KEY`. Aliases and adapters remain unchanged; all aliases route together. Canonical model IDs are fixed. Selecting third-party routing has no automatic fallback. See `docs/generate-image-openai-compatible.md` for setup and usage.
 - `agent.subagents`: subagent enablement/depth/timeout/profile config.
   - Built-in profiles: `explore` (read/search only), `general` (full primary-equivalent tools with subagent framing), `self` (isolated primary-prompt fork with full tools).
   - Delegation policy: `explore`/`general` cannot delegate; `self` may delegate but cannot delegate to `self`.

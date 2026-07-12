@@ -54,6 +54,7 @@ New v2 fields:
 - `tools.historicalResultPruning`: compatibility policy for rewriting old tool results. It defaults to disabled with the prior `40000`/`20000` token thresholds retained when enabled.
 - `tools.batch.maxCalls`: maximum calls accepted by one batch; defaults to `8`.
 - `tools.media`: model-view inline binary limits. Defaults to `10MiB` per part and `20MiB` in total.
+- `tools.generate.image.provider`: transport routing switch for `generate.image`; values are `default` (built-in aliases) or `openai-compatible` (route through the OpenAI-compatible provider). Aliases and adapters remain unchanged; all aliases route together. Canonical model IDs are fixed. Selecting third-party routing has no automatic fallback.
 
 Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
 

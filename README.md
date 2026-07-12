@@ -4,6 +4,7 @@ Lilac is an event-driven agent runtime: a typed Redis Streams event bus + surfac
 
 - Architecture/terminology: `PROJECT.md`
 - Repo conventions for coding agents: `AGENTS.md`
+- OpenAI-compatible image generation: `docs/generate-image-openai-compatible.md`
 
 ## Layout
 
