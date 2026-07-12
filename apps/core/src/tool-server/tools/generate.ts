@@ -1,4 +1,4 @@
-import { env, getModelProviders } from "@stanley2058/lilac-utils";
+import { env, getModelProviders, type CoreConfig } from "@stanley2058/lilac-utils";
 import {
   experimental_generateVideo as generateVideo,
   generateImage,
@@ -63,6 +63,10 @@ type SupportedImageModelId =
    *   9:19.5, 20:9, 9:20
    */
   | "grok-imagine-image-pro";
+
+type GenerateOptions = {
+  readonly getConfig?: () => Promise<Pick<CoreConfig, "tools">>;
+};
 
 type SupportedVideoModelId =
   /**
@@ -284,7 +288,13 @@ type ModelDescriptor<TId extends string, TModel, TInput> = {
   validateInput: (input: TInput) => void;
 };
 
-type ImageModelDescriptor = ModelDescriptor<SupportedImageModelId, ImageModel, ImageGenerateInput>;
+type ImageModelDescriptor = ModelDescriptor<
+  SupportedImageModelId,
+  ImageModel,
+  ImageGenerateInput
+> & {
+  readonly openAICompatibleModelId: string;
+};
 type VideoModelDescriptor = ModelDescriptor<
   SupportedVideoModelId,
   VideoModelObject,
@@ -430,6 +440,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "gpt-5-image",
+    openAICompatibleModelId: "gpt-image-1.5",
     createModel: (providers) => {
       if (isConfiguredProvider("openai")) {
         const model = providers.openai?.image("gpt-image-1.5");
@@ -446,6 +457,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "nanobanana",
+    openAICompatibleModelId: "google/gemini-2.5-flash-image",
     createModel: (providers) => {
       if (isConfiguredProvider("openrouter")) {
         return providers.openrouter?.imageModel("google/gemini-2.5-flash-image");
@@ -456,6 +468,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "nanobanana-2",
+    openAICompatibleModelId: "google/gemini-3.1-flash-image-preview",
     createModel: (providers) => {
       if (isConfiguredProvider("openrouter")) {
         return providers.openrouter?.imageModel("google/gemini-3.1-flash-image-preview");
@@ -476,6 +489,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "nanobanana-pro",
+    openAICompatibleModelId: "google/gemini-3-pro-image-preview",
     createModel: (providers) => {
       if (isConfiguredProvider("openrouter")) {
         return providers.openrouter?.imageModel("google/gemini-3-pro-image-preview");
@@ -486,6 +500,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "grok-imagine-image",
+    openAICompatibleModelId: "grok-imagine-image",
     createModel: (providers) => {
       if (!isConfiguredProvider("xai")) {
         return undefined;
@@ -496,6 +511,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "grok-imagine-image-pro",
+    openAICompatibleModelId: "grok-imagine-image-pro",
     createModel: (providers) => {
       if (!isConfiguredProvider("xai")) {
         return undefined;
@@ -571,8 +587,25 @@ function resolveAvailableModels<TId extends string, TModel, TInput>(
   };
 }
 
-function getAvailableImageModels() {
+function getAvailableImageModels(provider: "default" | "openai-compatible" = "default") {
   const providers = getModelProviders();
+  if (provider === "openai-compatible") {
+    const compatibleProvider = providers["openai-compatible"];
+    if (!env.providers.openaiCompatible.baseUrl?.trim() || !compatibleProvider) {
+      throw new Error(
+        "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.",
+      );
+    }
+
+    return resolveAvailableModels(
+      IMAGE_MODEL_DESCRIPTORS.map((descriptor) => ({
+        ...descriptor,
+        createModel: () => compatibleProvider.imageModel(descriptor.openAICompatibleModelId),
+      })),
+      providers,
+    );
+  }
+
   return resolveAvailableModels(IMAGE_MODEL_DESCRIPTORS, providers);
 }
 
@@ -809,6 +842,7 @@ export function generateImageWithModel(
     abortSignal?: AbortSignal;
     size?: `${number}x${number}`;
     aspectRatio?: `${number}:${number}`;
+    maxRetries?: number;
   },
 ) {
   return generateImage({
@@ -817,6 +851,7 @@ export function generateImageWithModel(
     abortSignal: opts?.abortSignal,
     size: opts?.size,
     aspectRatio: opts?.aspectRatio,
+    maxRetries: opts?.maxRetries,
   });
 }
 
@@ -843,11 +878,19 @@ export function generateVideoWithModel(
 export class Generate implements ServerTool {
   id = "generate";
 
+  constructor(private readonly options: GenerateOptions = {}) {}
+
   async init(): Promise<void> {}
   async destroy(): Promise<void> {}
 
   async list() {
-    const imageModels = orderImageModelIds(getAvailableImageModels().ids);
+    const config = await this.options.getConfig?.();
+    const imageProvider = config?.tools.generate.image.provider ?? "default";
+    const imageModels = orderImageModelIds(
+      imageProvider === "openai-compatible"
+        ? IMAGE_MODEL_DESCRIPTORS.map((descriptor) => descriptor.id)
+        : getAvailableImageModels().ids,
+    );
     const videoModels = getAvailableVideoModels().ids;
     const tools = [];
 
@@ -913,8 +956,10 @@ export class Generate implements ServerTool {
       context?: RequestContext;
     },
   ): Promise<unknown> {
+    const config = await this.options.getConfig?.();
     const payload = imageGenerateInputSchema.parse(input);
-    const availableModels = getAvailableImageModels();
+    const imageProvider = config?.tools.generate.image.provider ?? "default";
+    const availableModels = getAvailableImageModels(imageProvider);
     const picked = pickModel(
       availableModels.available,
       payload.model,
@@ -942,6 +987,7 @@ export class Generate implements ServerTool {
       abortSignal: opts?.signal,
       size,
       aspectRatio,
+      maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
     });
 
     const image = res.image;
