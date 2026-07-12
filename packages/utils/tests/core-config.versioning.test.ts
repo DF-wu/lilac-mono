@@ -3,6 +3,115 @@ import { describe, expect, it } from "bun:test";
 import { parseCoreConfig, readCoreConfigVersion } from "../core-config";
 
 describe("core config versioning", () => {
+  it("preserves explicit v1 web tool settings", async () => {
+    // Given
+    const raw = {
+      configVersion: 1,
+      tools: {
+        web: {
+          extract: {
+            providers: ["exa", "firecrawl"],
+          },
+          fetch: {
+            mode: "browser",
+          },
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.web.extract.providers).toEqual(["exa", "firecrawl"]);
+    expect(parsed.tools.web.fetch.mode).toBe("browser");
+  });
+
+  it("preserves explicit v2 batch and media tool settings", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        batch: {
+          maxCalls: 4,
+        },
+        media: {
+          maxInlineBytesPerPart: 1_024,
+          maxInlineBytesTotal: 2_048,
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.batch.maxCalls).toBe(4);
+    expect(parsed.tools.media).toEqual({
+      maxInlineBytesPerPart: 1_024,
+      maxInlineBytesTotal: 2_048,
+    });
+  });
+
+  it("defaults the v1 universal image provider", async () => {
+    // Given
+    const raw = { configVersion: 1 };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.generate.image.provider).toBe("default");
+  });
+
+  it("defaults an omitted v2 image provider", async () => {
+    // Given
+    const raw = { configVersion: 2 };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.generate.image.provider).toBe("default");
+  });
+
+  it("accepts the v2 openai-compatible image provider", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            provider: "openai-compatible",
+          },
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.generate.image.provider).toBe("openai-compatible");
+  });
+
+  it("rejects an unknown v2 image provider", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            provider: "unknown",
+          },
+        },
+      },
+    };
+
+    // When / Then
+    await expect(parseCoreConfig(raw)).rejects.toThrow();
+  });
+
   it("treats missing configVersion as v1", async () => {
     expect(readCoreConfigVersion({})).toBe(1);
 

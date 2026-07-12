@@ -282,6 +282,15 @@ const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
+    generate: z
+      .object({
+        image: z
+          .object({
+            provider: z.enum(["default", "openai-compatible"]).default("default"),
+          })
+          .default({ provider: "default" }),
+      })
+      .default({ image: { provider: "default" } }),
     web: webExtractConfigSchema,
     inspect: z
       .object({
@@ -336,6 +345,11 @@ const toolsSchema = z
   })
   .default({
     fsBackend: "fff",
+    generate: {
+      image: {
+        provider: "default",
+      },
+    },
     web: {
       extract: {
         providers: ["tavily"],
