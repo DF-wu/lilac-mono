@@ -65,8 +65,11 @@ export type ModelCapabilityOverride = {
 export type ImageGenerationParameterDefaults = {
   size?: string;
   aspectRatio?: string;
-  seed?: number;
   maxRetries?: number;
+  /**
+   * Provider-specific AI SDK providerOptions payload.
+   * Shorthand objects are namespaced for the resolved provider at runtime.
+   */
   options?: JSONObject;
 };
 

@@ -193,12 +193,6 @@ export const imageGenerateInputSchema = z
           "- For grok-imagine-image(-pro): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3 | 2:1 | 1:2 | 19.5:9 | 9:19.5 | 20:9 | 9:20.",
         ].join("\n"),
       ),
-
-    seed: z.coerce
-      .number()
-      .int()
-      .optional()
-      .describe("Optional generation seed. If omitted, uses model/profile/provider default."),
   })
   .strict()
   .superRefine((input, ctx) => {
@@ -301,7 +295,6 @@ type ImageProviderOptions = NonNullable<GenerateImageCallOptions["providerOption
 type ImageGenerationResolvedParameters = {
   size?: `${number}x${number}`;
   aspectRatio?: `${number}:${number}`;
-  seed?: number;
   maxRetries?: number;
   providerOptions?: ImageProviderOptions;
 };
@@ -326,6 +319,8 @@ const CONFIGURABLE_IMAGE_PROVIDER_IDS = [
 ] as const satisfies readonly ImageProviderId[];
 
 const GPT_IMAGE_2_MAX_PIXELS = 8_294_400;
+// gpt-image-2 accepts at most 4096px per side; dimensions sent upstream must be 16px multiples.
+const GPT_IMAGE_2_MAX_DIMENSION = 4096;
 const GPT_IMAGE_2_SIZE_MULTIPLE = 16;
 const GPT_IMAGE_2_DEFAULT_PIXELS = 1024 * 1024;
 
@@ -388,24 +383,32 @@ function deepMergeObjects(base?: JSONObject, override?: JSONObject): JSONObject 
   return deepMergeJson(base, override) as JSONObject;
 }
 
-function looksLikeProviderOptionsMap(obj: JSONObject): boolean {
-  const values = Object.values(obj);
-  if (values.length === 0) return false;
-
-  for (const value of values) {
-    if (value === undefined) continue;
-    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  }
-
-  return true;
-}
-
 function providerOptionsNamespace(provider: string): string {
   if (provider === "openai-compatible" || provider === "openaiCompatible") {
     return "openaiCompatible";
   }
   if (provider === "vercel") return "gateway";
   return provider;
+}
+
+const KNOWN_PROVIDER_OPTION_NAMESPACES = new Set(
+  CONFIGURABLE_IMAGE_PROVIDER_IDS.flatMap((provider) => {
+    const namespace = providerOptionsNamespace(provider);
+    return namespace === provider ? [provider] : [provider, namespace];
+  }),
+);
+
+function looksLikeProviderOptionsMap(obj: JSONObject): boolean {
+  const entries = Object.entries(obj);
+  if (entries.length === 0) return false;
+
+  for (const [provider, value] of entries) {
+    if (!KNOWN_PROVIDER_OPTION_NAMESPACES.has(provider)) return false;
+    if (value === undefined) continue;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  }
+
+  return true;
 }
 
 function getImageProviderConfig(provider: ImageProviderId): {
@@ -484,11 +487,16 @@ function normalizeImageProviderOptions(
   const normalized: Record<string, JSONObject> = {};
   for (const [provider, value] of Object.entries(raw)) {
     if (value === undefined) continue;
+    // Canonicalize aliases so providerOptions match AI SDK expectations.
+    // `vercel` is accepted as config shorthand, but gateway models read `gateway`.
+    const namespace = providerOptionsNamespace(provider);
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      normalized[provider] = {};
+      normalized[namespace] = {};
       continue;
     }
-    normalized[provider] = cloneJson(value as JSONValue) as JSONObject;
+    const next = cloneJson(value as JSONValue) as JSONObject;
+    const existing = normalized[namespace];
+    normalized[namespace] = existing ? (deepMergeJson(existing, next) as JSONObject) : next;
   }
 
   return normalized as ImageProviderOptions;
@@ -532,7 +540,6 @@ function applyParameterDefaults(
     next.size = undefined;
   }
 
-  if (defaults.seed !== undefined) next.seed = defaults.seed;
   if (defaults.maxRetries !== undefined) next.maxRetries = defaults.maxRetries;
 
   next.providerOptions = mergeImageProviderOptions(
@@ -547,7 +554,7 @@ export function resolveImageGenerationParameters(params: {
   config: Pick<CoreConfig, "tools"> | undefined;
   modelId: string;
   model: ImageModel;
-  input: Pick<ImageGenerateInput, "size" | "aspectRatio" | "seed">;
+  input: Pick<ImageGenerateInput, "size" | "aspectRatio">;
 }): ImageGenerationResolvedParameters {
   const imageConfig = params.config?.tools.generate.image;
   const providerNamespace = getImageModelProviderNamespace(params.model, params.modelId);
@@ -569,13 +576,6 @@ export function resolveImageGenerationParameters(params: {
       ...resolved,
       size: undefined,
       aspectRatio: params.input.aspectRatio as `${number}:${number}`,
-    };
-  }
-
-  if (params.input.seed !== undefined) {
-    resolved = {
-      ...resolved,
-      seed: params.input.seed,
     };
   }
 
@@ -617,20 +617,54 @@ function roundToMultiple(value: number, multiple: number): number {
 }
 
 function clampGptImage2Size(width: number, height: number): `${number}x${number}` {
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    width > GPT_IMAGE_2_MAX_DIMENSION ||
+    height > GPT_IMAGE_2_MAX_DIMENSION
+  ) {
+    throw new Error(
+      `gpt-image-2 dimensions must be positive finite values no larger than ${GPT_IMAGE_2_MAX_DIMENSION}px per side.`,
+    );
+  }
+
   let normalizedWidth = roundToMultiple(width, GPT_IMAGE_2_SIZE_MULTIPLE);
   let normalizedHeight = roundToMultiple(height, GPT_IMAGE_2_SIZE_MULTIPLE);
 
-  if (normalizedWidth * normalizedHeight > GPT_IMAGE_2_MAX_PIXELS) {
-    const scale = Math.sqrt(GPT_IMAGE_2_MAX_PIXELS / (normalizedWidth * normalizedHeight));
-    normalizedWidth = floorToMultiple(normalizedWidth * scale, GPT_IMAGE_2_SIZE_MULTIPLE);
-    normalizedHeight = floorToMultiple(normalizedHeight * scale, GPT_IMAGE_2_SIZE_MULTIPLE);
+  const pixels = normalizedWidth * normalizedHeight;
+  if (!Number.isFinite(pixels)) {
+    throw new Error("Image dimensions are too large to normalize safely.");
   }
 
-  while (normalizedWidth * normalizedHeight > GPT_IMAGE_2_MAX_PIXELS) {
+  if (pixels > GPT_IMAGE_2_MAX_PIXELS) {
     if (normalizedWidth >= normalizedHeight) {
-      normalizedWidth -= GPT_IMAGE_2_SIZE_MULTIPLE;
+      normalizedWidth = floorToMultiple(
+        GPT_IMAGE_2_MAX_PIXELS / normalizedHeight,
+        GPT_IMAGE_2_SIZE_MULTIPLE,
+      );
     } else {
-      normalizedHeight -= GPT_IMAGE_2_SIZE_MULTIPLE;
+      normalizedHeight = floorToMultiple(
+        GPT_IMAGE_2_MAX_PIXELS / normalizedWidth,
+        GPT_IMAGE_2_SIZE_MULTIPLE,
+      );
+    }
+  }
+
+  // Final safety: if floor-to-multiple still overshoots due to integer rounding,
+  // shrink the larger side by one multiple once.
+  if (normalizedWidth * normalizedHeight > GPT_IMAGE_2_MAX_PIXELS) {
+    if (normalizedWidth >= normalizedHeight) {
+      normalizedWidth = Math.max(
+        GPT_IMAGE_2_SIZE_MULTIPLE,
+        normalizedWidth - GPT_IMAGE_2_SIZE_MULTIPLE,
+      );
+    } else {
+      normalizedHeight = Math.max(
+        GPT_IMAGE_2_SIZE_MULTIPLE,
+        normalizedHeight - GPT_IMAGE_2_SIZE_MULTIPLE,
+      );
     }
   }
 
@@ -1032,7 +1066,6 @@ function describeImageParameterDefaults(
   const parts: string[] = [];
   if (defaults.size) parts.push(`size=${defaults.size}`);
   if (defaults.aspectRatio) parts.push(`aspectRatio=${defaults.aspectRatio}`);
-  if (defaults.seed !== undefined) parts.push(`seed=${defaults.seed}`);
   if (defaults.maxRetries !== undefined) parts.push(`maxRetries=${defaults.maxRetries}`);
   if (defaults.options && Object.keys(defaults.options).length > 0) {
     parts.push("providerOptions=configured");
@@ -1352,7 +1385,6 @@ export function generateImageWithModel(
     abortSignal?: AbortSignal;
     size?: `${number}x${number}`;
     aspectRatio?: `${number}:${number}`;
-    seed?: number;
     maxRetries?: number;
     providerOptions?: ImageProviderOptions;
   },
@@ -1363,7 +1395,6 @@ export function generateImageWithModel(
     abortSignal: opts?.abortSignal,
     size: opts?.size,
     aspectRatio: opts?.aspectRatio,
-    seed: opts?.seed,
     maxRetries: opts?.maxRetries,
     providerOptions: opts?.providerOptions,
   });
@@ -1512,7 +1543,6 @@ export class Generate implements ServerTool {
       ...payload,
       size: generationParameters.size,
       aspectRatio: generationParameters.aspectRatio,
-      seed: generationParameters.seed,
     });
 
     const cwd = opts?.context?.cwd ?? process.cwd();
@@ -1539,7 +1569,6 @@ export class Generate implements ServerTool {
       abortSignal: opts?.signal,
       size,
       aspectRatio,
-      seed: generationParameters.seed,
       maxRetries: generationParameters.maxRetries,
       providerOptions: generationParameters.providerOptions,
     });

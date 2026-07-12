@@ -54,6 +54,9 @@ New v2 fields:
 - `conversation.thread.autoInject.minTextUnits`: minimum authored text mass before auto-injecting conversation thread metadata; defaults to `80`.
 - `conversation.thread.autoInject.followUpMinTextUnits`: higher text-mass threshold after prior auto-injected thread metadata exists in the same conversation; defaults to `110`.
 - `conversation.thread.autoInject.minScore`: minimum final `conversation.thread.search` score for auto-injected metadata; defaults to `0.1`.
+- `tools.generate.image.models`: optional ordered default/allowlist of image model specs for `generate.image`. Empty keeps built-in aliases; non-empty entries must be a built-in alias or `provider/model` with provider in `openai`, `openai-compatible`, `openrouter`, `xai`, `vercel`.
+- `tools.generate.image.defaults`: global portable image parameter defaults (`size`, `aspectRatio`, `maxRetries`, provider `options`). Portable `seed` is not part of the contract.
+- `tools.generate.image.profiles`: per-model defaults and `useWhen` guidance keyed by the same model spec string used in `models` or tool input.
 
 Default changes from v1:
 

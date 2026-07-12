@@ -89,6 +89,38 @@ describe("core config versioning", () => {
     ]);
   });
 
+  it("rejects unsupported generate.image model specs", async () => {
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        tools: {
+          generate: {
+            image: {
+              models: ["typo-provider/model"],
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow(/Unsupported image model spec/);
+  });
+
+  it("rejects portable seed under generate.image defaults", async () => {
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        tools: {
+          generate: {
+            image: {
+              defaults: {
+                seed: 7,
+              },
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow();
+  });
+
   it("parses v2 generate.image parameter defaults and model profiles", async () => {
     const parsed = await parseCoreConfig({
       configVersion: 2,
@@ -97,7 +129,6 @@ describe("core config versioning", () => {
           image: {
             defaults: {
               aspectRatio: "1:1",
-              seed: 7,
               options: {
                 quality: "standard",
               },
@@ -123,7 +154,6 @@ describe("core config versioning", () => {
 
     expect(parsed.tools.generate.image.defaults).toEqual({
       aspectRatio: "1:1",
-      seed: 7,
       options: {
         quality: "standard",
       },

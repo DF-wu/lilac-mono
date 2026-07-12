@@ -190,13 +190,13 @@ describe("tool-server image generation", () => {
       },
     });
 
-    expect(normalized.parameters.size).toBe("2160x3840");
+    expect(normalized.parameters.size).toBe("2304x3600");
     expect(normalized.warnings).toEqual([
       {
         type: "parameter-adjusted",
         parameter: "size",
         from: "2304x4096",
-        to: "2160x3840",
+        to: "2304x3600",
         reason:
           "gpt-image-2 image sizes must use 16-pixel multiples and stay within the provider pixel limit.",
       },
@@ -241,7 +241,6 @@ describe("tool-server image generation", () => {
             models: ["openai-compatible/nanobanana", "openai-compatible/gpt-image-2"],
             defaults: {
               aspectRatio: "1:1",
-              seed: 11,
               options: {
                 quality: "standard",
               },
@@ -281,7 +280,6 @@ describe("tool-server image generation", () => {
     expect(params).toEqual({
       size: "1024x1024",
       aspectRatio: undefined,
-      seed: 11,
       providerOptions: {
         openaiCompatible: {
           quality: "high",
@@ -314,7 +312,6 @@ describe("tool-server image generation", () => {
             models: ["openai-compatible/gpt-image-2"],
             defaults: {
               aspectRatio: "1:1",
-              seed: 11,
             },
             profiles: {},
           },
@@ -336,13 +333,101 @@ describe("tool-server image generation", () => {
       },
       input: {
         size: "1536x1024",
-        seed: 42,
       },
     });
 
     expect(params.size).toBe("1536x1024");
     expect(params.aspectRatio).toBeUndefined();
-    expect(params.seed).toBe(42);
+  });
+
+  it("rejects gpt-image-2 dimensions above 4096 pixels", () => {
+    expect(() =>
+      normalizeImageGenerationParametersForModel({
+        modelId: "openai-compatible/gpt-image-2",
+        parameters: {
+          size: "4097x16",
+        },
+      }),
+    ).toThrow("no larger than 4096px per side");
+  });
+
+  it("rejects extreme gpt-image-2 aspect ratios before provider execution", () => {
+    expect(() =>
+      normalizeImageGenerationParametersForModel({
+        modelId: "openai-compatible/gpt-image-2",
+        parameters: {
+          aspectRatio: `${Number.MAX_SAFE_INTEGER}:1`,
+        },
+      }),
+    ).toThrow("no larger than 4096px per side");
+  });
+
+  it("accepts the gpt-image-2 maximum dimension boundary", () => {
+    const normalized = normalizeImageGenerationParametersForModel({
+      modelId: "openai-compatible/gpt-image-2",
+      parameters: {
+        size: "4096x16",
+      },
+    });
+
+    expect(normalized.parameters.size).toBe("4096x16");
+    expect(normalized.warnings).toEqual([]);
+  });
+
+  it("canonicalizes vercel provider options to gateway", () => {
+    const config = {
+      tools: {
+        fsBackend: "fff",
+        web: {
+          extract: {
+            providers: ["tavily"],
+          },
+          fetch: {
+            mode: "auto",
+          },
+        },
+        inspect: {
+          model: "google/gemini-3.5-flash",
+        },
+        editFile: {
+          hashline: true,
+        },
+        generate: {
+          image: {
+            models: ["vercel/some-image-model"],
+            defaults: {
+              options: {
+                vercel: {
+                  quality: "high",
+                },
+              },
+            },
+            profiles: {},
+          },
+        },
+      },
+    } satisfies Pick<CoreConfig, "tools">;
+
+    const params = resolveImageGenerationParameters({
+      config,
+      modelId: "vercel/some-image-model",
+      model: {
+        specificationVersion: "v4",
+        provider: "gateway.image",
+        modelId: "some-image-model",
+        maxImagesPerCall: 1,
+        doGenerate() {
+          throw new Error("not called");
+        },
+      },
+      input: {},
+    });
+
+    expect(params.providerOptions).toEqual({
+      gateway: {
+        quality: "high",
+      },
+    });
   });
 
   it("returns plain text prompt when inputImages are not provided", async () => {

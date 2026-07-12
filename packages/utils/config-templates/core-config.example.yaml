@@ -48,12 +48,15 @@ tools:
       #   - "openrouter/google/gemini-3.1-flash-image-preview"
       #   - "xai/grok-imagine-image"
       models: []
+      # Model specs are validated at config parse time. Unsupported prefixes or
+      # unknown built-in aliases fail startup instead of falling through at
+      # generation time.
       # Global defaults applied to every generate.image call.
       #
       # Parameter precedence:
       # 1. tools.generate.image.defaults
       # 2. tools.generate.image.profiles.<model>.defaults
-      # 3. Caller tool input (`size`, `aspectRatio`, `seed`) wins for that call
+      # 3. Caller tool input (`size`, `aspectRatio`) wins for that call
       # 4. The upstream provider/AI SDK supplies anything still unset
       # 5. Model-specific local normalization runs after the final value is
       #    resolved, before the provider request is sent. Example: gpt-image-2
@@ -86,8 +89,7 @@ tools:
       #       size: "1024x1024"
       #       options:
       #         quality: "high"
-      #         seed: 7
-      #   "openai-compatible/gpt-image-2":
+            #   "openai-compatible/gpt-image-2":
       #     useWhen: "Final high-fidelity product images and text-heavy layouts."
       #     defaults:
       #       # This shape is intentionally provider-specific. Some gateways

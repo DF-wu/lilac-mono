@@ -216,6 +216,35 @@ const discordSurfaceSchema = z
     },
   });
 
+const BUILTIN_IMAGE_MODEL_ALIASES = [
+  "gpt-5-image",
+  "nanobanana",
+  "nanobanana-2",
+  "nanobanana-pro",
+  "grok-imagine-image",
+  "grok-imagine-image-pro",
+] as const;
+
+const IMAGE_GENERATION_MODEL_PROVIDERS = [
+  "openai",
+  "openai-compatible",
+  "openrouter",
+  "xai",
+  "vercel",
+] as const;
+
+function isBuiltinImageModelAlias(value: string): boolean {
+  return (BUILTIN_IMAGE_MODEL_ALIASES as readonly string[]).includes(value);
+}
+
+function isSupportedImageModelSpec(value: string): boolean {
+  if (isBuiltinImageModelAlias(value)) return true;
+  const separator = value.indexOf("/");
+  if (separator <= 0 || separator === value.length - 1) return false;
+  const provider = value.slice(0, separator);
+  return (IMAGE_GENERATION_MODEL_PROVIDERS as readonly string[]).includes(provider);
+}
+
 const imageGenerationParameterDefaultsSchema = z
   .object({
     size: z
@@ -228,11 +257,11 @@ const imageGenerationParameterDefaultsSchema = z
       .trim()
       .regex(/^\d+(?:\.\d+)?:\d+(?:\.\d+)?$/)
       .optional(),
-    seed: z.number().int().optional(),
     maxRetries: z.number().int().min(0).optional(),
     /** AI SDK providerOptions-style object, with shorthand support in generate.image. */
     options: jsonObjectSchema.optional(),
   })
+  .strict()
   .superRefine((input, ctx) => {
     if (input.size && input.aspectRatio) {
       ctx.addIssue({
@@ -267,7 +296,22 @@ const toolsSchema = z
             // Ordered default image model specs for generate.image. Empty means
             // "use built-in aliases"; explicit specs use provider/model format.
             models: z
-              .array(z.string().trim().min(1))
+              .array(
+                z
+                  .string()
+                  .trim()
+                  .min(1)
+                  .superRefine((value, ctx) => {
+                    if (isSupportedImageModelSpec(value)) return;
+                    ctx.addIssue({
+                      code: "custom",
+                      message:
+                        `Unsupported image model spec '${value}'. Use a built-in alias ` +
+                        `(${BUILTIN_IMAGE_MODEL_ALIASES.join(", ")}) or provider/model with one of: ` +
+                        `${IMAGE_GENERATION_MODEL_PROVIDERS.join(", ")}.`,
+                    });
+                  }),
+              )
               .transform((models) => Array.from(new Set(models)))
               .default([]),
             // Global default parameters applied before model-specific profiles
