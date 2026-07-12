@@ -69,6 +69,7 @@ New v2 fields:
 - `agent.subagents.delegatePromptOverlay`: optional free-form guidance appended to the parent-visible `subagent_delegate` tool description.
 - `models.def.<alias>.comment`: optional guidance shown when an agent selects a model for a subagent.
 - `models.def.<alias>.agentCanSelect`: explicitly opts an alias into dynamic selection through `subagent_delegate`; defaults to `false`. It does not restrict static profiles, model slots, or explicit human overrides.
+- `tools.generate.image.provider`: transport routing switch for `generate.image`; values are `default` (built-in aliases) or `openai-compatible` (route through the OpenAI-compatible provider). Aliases and adapters remain unchanged; all aliases route together. Canonical model IDs are fixed. Selecting third-party routing has no automatic fallback. Frozen v1 configs receive the same `default` fallback but cannot opt in.
 
 Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
 
