@@ -714,6 +714,11 @@ export function parseCoreConfigV1ToUniversal(
     tools: {
       ...toolsRest,
       fsBackend: parsed.tools.fsBackend,
+      generate: {
+        image: {
+          provider: "default",
+        },
+      },
       inspect: {
         model: "google/gemini-3-flash",
       },
