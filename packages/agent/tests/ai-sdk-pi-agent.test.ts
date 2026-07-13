@@ -355,6 +355,78 @@ describe("AiSdkPiAgent model spec tracking", () => {
     expect(output).toEqual({ type: "text", value: "[tool result is not JSON-serializable]" });
   });
 
+  it("executes parsed tool calls when the provider reports finish reason other", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "call-1",
+                toolName: "test_tool",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "other", raw: "other" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "text-1" },
+              { type: "text-delta", id: "text-1", delta: "done" },
+              { type: "text-end", id: "text-1" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+
+    let executions = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        test_tool: tool({
+          description: "records execution",
+          inputSchema: jsonSchema({
+            type: "object",
+            additionalProperties: false,
+          }),
+          execute: () => {
+            executions += 1;
+            return { ok: true };
+          },
+        }),
+      },
+    });
+
+    await agent.prompt("call the test tool");
+
+    expect(executions).toBe(1);
+    expect(agent.state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+    });
+    expect(
+      agent.state.messages.some((message) => {
+        if (message.role !== "tool") return false;
+        const part = message.content[0];
+        return part?.type === "tool-result" && part.toolCallId === "call-1";
+      }),
+    ).toBe(true);
+  });
+
   it("serializes non-finite successful tool outputs through JSON fallback", async () => {
     const model = new MockLanguageModelV4({
       doStream: [
