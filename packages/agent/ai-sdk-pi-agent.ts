@@ -988,7 +988,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               totalUsage: turn.totalUsage,
             });
 
-            if (turn.finishReason === "tool-calls" && turn.toolCalls.length > 0) {
+            // Some OpenAI-compatible providers return a non-standard finish reason
+            // (for example, "other") even when the finalized response contains
+            // valid local tool calls. The parsed calls are the authoritative signal:
+            // leaving one unexecuted creates an orphan assistant tool-call that makes
+            // the next model request fail with AI_MissingToolResultsError.
+            if (turn.toolCalls.length > 0) {
               const steeringInjected = await this.executeToolCallsAndMaybeSteer(turn.toolCalls);
               if (steeringInjected) {
                 // continue immediately to respond to steering message(s)
