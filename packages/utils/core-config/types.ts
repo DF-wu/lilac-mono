@@ -8,8 +8,15 @@ export type CoreConfigVersion = 1 | 2;
 
 export type CoreConfigKeyPath = readonly (string | number)[];
 
+export type CoreConfigModelOptionWarning = {
+  namespace: string;
+  option: string;
+  suggestion?: string;
+};
+
 export type CoreConfigParseOptions = {
   onUnknownKey?: (path: CoreConfigKeyPath) => void;
+  onUnknownModelOption?: (warning: CoreConfigModelOptionWarning, source: string) => void;
 };
 
 export type DiscordUserAliasConfig = {
@@ -32,14 +39,17 @@ export type SubagentProfileConfig = {
   promptOverlay?: string;
 };
 
-export type ModelReasoningEffort =
-  | "provider-default"
-  | "none"
-  | "minimal"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh";
+export const MODEL_REASONING_EFFORTS = [
+  "provider-default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const;
+
+export type ModelReasoningEffort = (typeof MODEL_REASONING_EFFORTS)[number];
 
 export type ModelCapabilityOverride = {
   inherit?: string;
@@ -205,6 +215,7 @@ export type UniversalCoreConfig = {
       enabled: boolean;
       maxDepth: number;
       idleTimeoutMs: number;
+      delegatePromptOverlay?: string;
       profiles: {
         explore: SubagentProfileConfig;
         general: SubagentProfileConfig;
@@ -220,6 +231,8 @@ export type UniversalCoreConfig = {
         model: string;
         reasoning?: ModelReasoningEffort;
         options?: JSONObject;
+        comment?: string;
+        agentCanSelect?: boolean;
       }
     >;
     main: {
