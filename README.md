@@ -103,7 +103,7 @@ The following checks were completed while updating the branch with fork `main`:
 - Root lint auto-fix: **0 warnings, 0 errors**.
 - Root formatter: completed successfully.
 
-These results describe the checked commit/worktree, not a permanent guarantee. GitHub CI remains authoritative after a PR is opened or the branch is pushed.
+These results describe the checked commit/worktree, not a permanent guarantee. GitHub CI runs after a PR targeting `main` is opened and on pushes to `main`; a feature-branch push by itself does not trigger that workflow.
 
 ## Pull Request Status
 
