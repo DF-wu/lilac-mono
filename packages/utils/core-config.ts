@@ -4,6 +4,12 @@ import fs from "node:fs/promises";
 import { env } from "./env";
 import { errorMessage, isRecord } from "./runtime-utils";
 import { findWorkspaceRoot } from "./find-root";
+import { createLogger } from "./logging";
+import { parseModelSpecifier } from "./model-capability";
+import {
+  formatModelProviderOptionWarning,
+  validateConfiguredModelProviderOptions,
+} from "./model-provider-option-validation";
 import {
   buildAgentSystemPrompt,
   CORE_PROMPT_FILES,
@@ -25,12 +31,16 @@ import {
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
 } from "./core-config/v2";
+import { formatCoreConfigKeyPath } from "./core-config/unknown-keys";
 import type {
   ConfigParser,
   CoreConfig,
+  CoreConfigModelOptionWarning,
+  CoreConfigParseOptions,
   CoreConfigVersion,
   DiscordSessionAliasConfig,
   DiscordUserAliasConfig,
+  JSONObject,
 } from "./core-config/types";
 
 export {
@@ -42,9 +52,13 @@ export {
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
 };
+export { MODEL_REASONING_EFFORTS } from "./core-config/types";
 export type {
   ConfigParser,
   CoreConfig,
+  CoreConfigKeyPath,
+  CoreConfigModelOptionWarning,
+  CoreConfigParseOptions,
   CoreConfigVersion,
   DiscordSessionAliasConfig,
   DiscordUserAliasConfig,
@@ -62,6 +76,7 @@ const CORE_CONFIG_PARSERS: ReadonlyMap<CoreConfigVersion, ConfigParser> = new Ma
   [1, new V1CoreConfigParser()],
   [2, new V2CoreConfigParser()],
 ]);
+const logger = createLogger({ module: "core-config" });
 
 export function getDiscordUserAliasValue(alias: DiscordUserAliasConfig | undefined): {
   discordId: string;
@@ -162,7 +177,32 @@ export function readCoreConfigVersion(raw: unknown): CoreConfigVersion {
   );
 }
 
-export async function parseCoreConfig(raw: unknown): Promise<CoreConfig> {
+function reportConfiguredModelOptionWarnings(
+  cfg: CoreConfig,
+  report: (warning: CoreConfigModelOptionWarning, source: string) => void,
+): void {
+  const validate = (model: string, options: JSONObject | undefined, source: string) => {
+    if (!options) return;
+    const modelSpec = model.includes("/") ? model : cfg.models.def[model]?.model;
+    if (!modelSpec?.includes("/")) return;
+
+    const provider = parseModelSpecifier(modelSpec).provider;
+    for (const warning of validateConfiguredModelProviderOptions(provider, options)) {
+      report(warning, source);
+    }
+  };
+
+  for (const [alias, preset] of Object.entries(cfg.models.def)) {
+    validate(preset.model, preset.options, `models.def.${alias}.options`);
+  }
+  validate(cfg.models.main.model, cfg.models.main.options, "models.main.options");
+  validate(cfg.models.fast.model, cfg.models.fast.options, "models.fast.options");
+}
+
+export async function parseCoreConfig(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): Promise<CoreConfig> {
   const version = readCoreConfigVersion(raw);
   const parser = CORE_CONFIG_PARSERS.get(version);
 
@@ -176,7 +216,21 @@ export async function parseCoreConfig(raw: unknown): Promise<CoreConfig> {
     throw new Error("Core config must be an object");
   }
 
-  return parser.parse(raw);
+  const onUnknownKey =
+    options?.onUnknownKey ??
+    ((path) => {
+      logger.warn("unknown core-config key ignored", {
+        path: formatCoreConfigKeyPath(path),
+        parserVersion: version,
+      });
+    });
+
+  const cfg = await parser.parse(raw, { onUnknownKey });
+  const onUnknownModelOption =
+    options?.onUnknownModelOption ??
+    ((warning, source) => logger.warn(formatModelProviderOptionWarning(warning, source)));
+  reportConfiguredModelOptionWarnings(cfg, onUnknownModelOption);
+  return cfg;
 }
 
 async function listPromptTemplateNewFiles(promptDir: string): Promise<string[]> {

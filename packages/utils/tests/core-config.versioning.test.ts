@@ -130,6 +130,7 @@ describe("core config versioning", () => {
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
     expect(parsed.surface.discord.markdownTableRender.enabled).toBe(false);
     expect(parsed.agent.reasoningDisplay).toBe("simple");
+    expect(parsed.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(parsed.agent.retry).toEqual({
       enabled: false,
       maxRetries: 0,
@@ -140,6 +141,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.web.fetch.mode).toBe("auto");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(false);
+    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
   });
 
   it("parses explicit v2 configs with v2 defaults", async () => {
@@ -159,14 +161,14 @@ describe("core config versioning", () => {
       fallbackMode: "list",
     });
     expect(parsed.agent.reasoningDisplay).toBe("detailed");
+    expect(parsed.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(parsed.agent.retry).toEqual({
       enabled: true,
       maxRetries: 3,
       baseDelayMs: 2_000,
       maxDelayMs: 30_000,
     });
-    expect(parsed.agent.subagents.defaultTimeoutMs).toBe(10 * 60 * 1000);
-    expect(parsed.agent.subagents.maxTimeoutMs).toBe(20 * 60 * 1000);
+    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
     expect(parsed.models.main.reasoning).toBeUndefined();
   });
 
@@ -207,6 +209,88 @@ describe("core config versioning", () => {
     expect(parsed.agent.subagents.profiles.explore.reasoning).toBe("minimal");
   });
 
+  it("parses v2 subagent delegation guidance and model selection metadata", async () => {
+    const parsed = await parseCoreConfig({
+      configVersion: 2,
+      agent: {
+        subagents: {
+          delegatePromptOverlay: "Prefer scout for mechanical exploration.",
+        },
+      },
+      models: {
+        def: {
+          scout: {
+            model: "openrouter/google/gemini-2.5-flash",
+            comment: "Fast and inexpensive.",
+            agentCanSelect: true,
+          },
+          defaultAlias: {
+            model: "openai/gpt-5.5-mini",
+          },
+          manual: {
+            model: "openai/gpt-5.5",
+            agentCanSelect: false,
+          },
+        },
+      },
+    });
+
+    expect(parsed.agent.subagents.delegatePromptOverlay).toBe(
+      "Prefer scout for mechanical exploration.",
+    );
+    expect(parsed.models.def.scout).toMatchObject({
+      comment: "Fast and inexpensive.",
+      agentCanSelect: true,
+    });
+    expect(parsed.models.def.defaultAlias?.agentCanSelect).toBe(false);
+    expect(parsed.models.def.manual?.agentCanSelect).toBe(false);
+  });
+
+  it("normalizes v1 model aliases as unavailable for agent selection", async () => {
+    const parsed = await parseCoreConfig({
+      configVersion: 1,
+      models: {
+        def: {
+          legacy: {
+            model: "openai/gpt-4o",
+          },
+        },
+      },
+    });
+
+    expect(parsed.models.def.legacy?.agentCanSelect).toBe(false);
+    expect(parsed.models.def.legacy?.comment).toBeUndefined();
+    expect(parsed.agent.subagents.delegatePromptOverlay).toBeUndefined();
+  });
+
+  it("rejects v2 model aliases that cannot be resolved as aliases", async () => {
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        models: {
+          def: {
+            "invalid/alias": {
+              model: "openai/gpt-5.5",
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow("model alias must not contain '/'");
+
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        models: {
+          def: {
+            invalidTarget: {
+              model: "gpt-5.5",
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow("models.def model must use provider/model format");
+  });
+
   it("rejects invalid v2 model reasoning values", async () => {
     await expect(
       parseCoreConfig({
@@ -221,7 +305,7 @@ describe("core config versioning", () => {
     ).rejects.toThrow();
   });
 
-  it("uses v2 subagent timeout defaults for partial v2 subagent configs", async () => {
+  it("uses the v2 subagent idle timeout default for partial configs", async () => {
     const parsed = await parseCoreConfig({
       configVersion: 2,
       agent: {
@@ -231,8 +315,23 @@ describe("core config versioning", () => {
       },
     });
 
-    expect(parsed.agent.subagents.defaultTimeoutMs).toBe(10 * 60 * 1000);
-    expect(parsed.agent.subagents.maxTimeoutMs).toBe(20 * 60 * 1000);
+    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+  });
+
+  it("does not expose legacy subagent timeout fields in v2", async () => {
+    const parsed = await parseCoreConfig({
+      configVersion: 2,
+      agent: {
+        subagents: {
+          defaultTimeoutMs: 240_000,
+          maxTimeoutMs: 480_000,
+        },
+      },
+    });
+
+    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+    expect("defaultTimeoutMs" in parsed.agent.subagents).toBe(false);
+    expect("maxTimeoutMs" in parsed.agent.subagents).toBe(false);
   });
 
   it("parses v2 configs with universal field names", async () => {
@@ -258,6 +357,12 @@ describe("core config versioning", () => {
           },
         },
       },
+      agent: {
+        idleTimeoutMs: 1_200_000,
+        subagents: {
+          idleTimeoutMs: 240_000,
+        },
+      },
     });
 
     expect(parsed.tools.fsBackend).toBe("node-rg");
@@ -269,6 +374,17 @@ describe("core config versioning", () => {
       style: "ascii",
       maxWidth: 120,
       fallbackMode: "passthrough",
+    });
+    expect(parsed.agent.idleTimeoutMs).toBe(1_200_000);
+    expect(parsed.agent.subagents).toEqual({
+      enabled: true,
+      maxDepth: 2,
+      idleTimeoutMs: 240_000,
+      profiles: {
+        explore: { modelSlot: "main" },
+        general: { modelSlot: "main" },
+        self: { modelSlot: "main" },
+      },
     });
   });
 
@@ -296,6 +412,12 @@ describe("core config versioning", () => {
           },
         },
       },
+      agent: {
+        subagents: {
+          defaultTimeoutMs: 240_000,
+          maxTimeoutMs: 480_000,
+        },
+      },
     });
 
     expect(parsed.tools.fsBackend).toBe("fff");
@@ -308,6 +430,9 @@ describe("core config versioning", () => {
       maxWidth: 100,
       fallbackMode: "passthrough",
     });
+    expect(parsed.agent.subagents.idleTimeoutMs).toBe(240_000);
+    expect("defaultTimeoutMs" in parsed.agent.subagents).toBe(false);
+    expect("maxTimeoutMs" in parsed.agent.subagents).toBe(false);
   });
 
   it("rejects unsupported config versions", async () => {

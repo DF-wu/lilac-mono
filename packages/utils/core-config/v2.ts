@@ -16,8 +16,15 @@ import {
   statsForNerdsSchema,
   webExtractConfigSchema,
 } from "./v1";
+import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { MODEL_REASONING_EFFORTS } from "./types";
 
-import type { ConfigParser, CoreConfigVersion, UniversalCoreConfig } from "./types";
+import type {
+  ConfigParser,
+  CoreConfigParseOptions,
+  CoreConfigVersion,
+  UniversalCoreConfig,
+} from "./types";
 
 export const V2_CORE_CONFIG_VERSION = 2 satisfies CoreConfigVersion;
 export const CURRENT_CORE_CONFIG_VERSION = V2_CORE_CONFIG_VERSION;
@@ -30,15 +37,7 @@ const configVersionSchema = z.literal(V2_CORE_CONFIG_VERSION).default(V2_CORE_CO
 
 const reasoningDisplaySchema = z.enum(["none", "simple", "detailed"]).default("detailed");
 
-const modelReasoningEffortSchema = z.enum([
-  "provider-default",
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-]);
+const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS);
 
 const subagentProfileSchemaV2 = z
   .object({
@@ -128,41 +127,27 @@ const modelCapabilitySchemaV2 = z
     overrides: {},
   });
 
-const subagentsSchemaV2 = z
-  .object({
-    enabled: z.boolean().default(true),
-    maxDepth: z.number().int().min(0).max(2).default(2),
-    defaultTimeoutMs: z
-      .number()
-      .int()
-      .positive()
-      .default(10 * 60 * 1000),
-    maxTimeoutMs: z
-      .number()
-      .int()
-      .positive()
-      .default(20 * 60 * 1000),
-    profiles: z
-      .object({
-        explore: subagentProfileSchemaV2.default({ modelSlot: "main" }),
-        general: subagentProfileSchemaV2.default({ modelSlot: "main" }),
-        self: subagentProfileSchemaV2.default({ modelSlot: "main" }),
-      })
-      .default({
-        explore: { modelSlot: "main" },
-        general: { modelSlot: "main" },
-        self: { modelSlot: "main" },
-      }),
-  })
-  .superRefine((input, ctx) => {
-    if (input.defaultTimeoutMs > input.maxTimeoutMs) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["defaultTimeoutMs"],
-        message: "defaultTimeoutMs must be <= maxTimeoutMs",
-      });
-    }
-  });
+const subagentsSchemaV2 = z.object({
+  enabled: z.boolean().default(true),
+  maxDepth: z.number().int().min(0).max(2).default(2),
+  idleTimeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .default(6 * 60 * 1000),
+  delegatePromptOverlay: z.string().trim().min(1).optional(),
+  profiles: z
+    .object({
+      explore: subagentProfileSchemaV2.default({ modelSlot: "main" }),
+      general: subagentProfileSchemaV2.default({ modelSlot: "main" }),
+      self: subagentProfileSchemaV2.default({ modelSlot: "main" }),
+    })
+    .default({
+      explore: { modelSlot: "main" },
+      general: { modelSlot: "main" },
+      self: { modelSlot: "main" },
+    }),
+});
 
 const discordMarkdownTableRenderSchema = z
   .object({
@@ -419,6 +404,10 @@ const modelsSchemaV2 = z
           reasoning: modelReasoningEffortSchema.optional(),
           /** AI SDK providerOptions-style object (nested JSON allowed). */
           options: jsonObjectSchema.optional(),
+          /** Optional parent-agent guidance shown alongside this model alias. */
+          comment: z.string().trim().min(1).optional(),
+          /** Whether subagent_delegate may dynamically select this alias. */
+          agentCanSelect: z.boolean().default(false),
         }),
       )
       .default({}),
@@ -448,6 +437,24 @@ const modelsSchemaV2 = z
       }),
 
     capability: modelCapabilitySchemaV2,
+  })
+  .superRefine((models, ctx) => {
+    for (const [alias, preset] of Object.entries(models.def)) {
+      if (alias.includes("/")) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["def", alias],
+          message: "model alias must not contain '/'",
+        });
+      }
+      if (!/^[^/]+\/.+/u.test(preset.model)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["def", alias, "model"],
+          message: "models.def model must use provider/model format",
+        });
+      }
+    }
   })
   .default({
     def: {},
@@ -509,12 +516,16 @@ export const coreConfigInputSchemaV2 = z.object({
     .object({
       statsForNerds: statsForNerdsSchema,
       reasoningDisplay: reasoningDisplaySchema,
+      idleTimeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .default(15 * 60 * 1000),
       retry: agentRetrySchema,
       subagents: subagentsSchemaV2.default({
         enabled: true,
         maxDepth: 2,
-        defaultTimeoutMs: 10 * 60 * 1000,
-        maxTimeoutMs: 20 * 60 * 1000,
+        idleTimeoutMs: 6 * 60 * 1000,
         profiles: {
           explore: { modelSlot: "main" },
           general: { modelSlot: "main" },
@@ -525,6 +536,7 @@ export const coreConfigInputSchemaV2 = z.object({
     .default({
       statsForNerds: false,
       reasoningDisplay: "detailed",
+      idleTimeoutMs: 15 * 60 * 1000,
       retry: {
         enabled: true,
         maxRetries: 3,
@@ -534,8 +546,7 @@ export const coreConfigInputSchemaV2 = z.object({
       subagents: {
         enabled: true,
         maxDepth: 2,
-        defaultTimeoutMs: 10 * 60 * 1000,
-        maxTimeoutMs: 20 * 60 * 1000,
+        idleTimeoutMs: 6 * 60 * 1000,
         profiles: {
           explore: { modelSlot: "main" },
           general: { modelSlot: "main" },
@@ -555,8 +566,16 @@ export function parseCoreConfigV2(raw: unknown): ParsedCoreConfigV2 {
   return coreConfigInputSchemaV2.parse(raw);
 }
 
-export function parseCoreConfigV2ToUniversal(raw: unknown): UniversalCoreConfig {
+export function parseCoreConfigV2ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): UniversalCoreConfig {
   const parsed = parseCoreConfigV2(raw);
+  if (options?.onUnknownKey) {
+    for (const path of collectUnknownConfigKeyPaths(raw, parsed)) {
+      options.onUnknownKey(path);
+    }
+  }
   const { artifactTtl, ...output } = parsed.tools.output;
 
   return {
@@ -578,7 +597,7 @@ export function parseCoreConfigV2ToUniversal(raw: unknown): UniversalCoreConfig 
 export class V2CoreConfigParser implements ConfigParser {
   readonly version = V2_CORE_CONFIG_VERSION;
 
-  async parse(input: object): Promise<UniversalCoreConfig> {
-    return parseCoreConfigV2ToUniversal(input);
+  async parse(input: object, options?: CoreConfigParseOptions): Promise<UniversalCoreConfig> {
+    return parseCoreConfigV2ToUniversal(input, options);
   }
 }

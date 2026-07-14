@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { asSchema } from "ai";
 import {
   createLilacBus,
   lilacEventTypes,
@@ -113,7 +114,238 @@ function createInMemoryRawBus(): RawBus {
   };
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
 describe("subagent_delegate tool", () => {
+  it("documents selectable model aliases and appends delegation guidance", () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const tools = subagentTools({
+      bus,
+      idleTimeoutMs: 2_000,
+      maxDepth: 1,
+      delegatePromptOverlay: "Escalate critical reviews to a stronger model.",
+      modelPresets: {
+        scout: {
+          model: "openrouter/google/gemini-2.5-flash",
+          comment: "Fast repository exploration.",
+          agentCanSelect: true,
+        },
+        coder: {
+          model: "openai/gpt-5.5",
+          comment: "Bounded implementation work.",
+          agentCanSelect: true,
+        },
+        architect: {
+          model: "vercel/anthropic/claude-opus-4.8",
+          reasoning: "high",
+          comment: "Architecture and critical review.",
+          agentCanSelect: true,
+        },
+        reviewer: {
+          model: "openai/gpt-5.5",
+          comment: "Independent review.",
+          agentCanSelect: true,
+        },
+        vision: {
+          model: "openai/gpt-5.5",
+          comment: "Visual analysis.",
+          agentCanSelect: true,
+        },
+        overflow: {
+          model: "openai/gpt-5.5",
+          comment: "Sixth comment is omitted.",
+          agentCanSelect: true,
+        },
+        manual: {
+          model: "openai/gpt-5.5",
+          comment: "Operator-only model.",
+          agentCanSelect: false,
+        },
+        "invalid/alias": {
+          model: "openai/gpt-5.5",
+          comment: "Alias cannot be resolved as an alias.",
+          agentCanSelect: true,
+        },
+        invalidTarget: {
+          model: "gpt-5.5",
+          comment: "Target is not a canonical model spec.",
+          agentCanSelect: true,
+        },
+      },
+    });
+    const delegate = tools.subagent_delegate as unknown as {
+      description?: string;
+      inputSchema: unknown;
+    };
+    const schema = asSchema(delegate.inputSchema as never).jsonSchema as unknown as {
+      properties?: {
+        model?: { enum?: string[]; description?: string };
+        reasoning?: { enum?: string[] };
+      };
+    };
+
+    expect(schema.properties?.model?.enum).toEqual([
+      "scout",
+      "coder",
+      "architect",
+      "reviewer",
+      "vision",
+      "overflow",
+    ]);
+    expect(schema.properties?.model?.description).toContain("scout: Fast repository exploration.");
+    expect(schema.properties?.model?.description).toContain(
+      "architect: Architecture and critical review.",
+    );
+    expect(schema.properties?.model?.description).not.toContain("Sixth comment is omitted.");
+    expect(schema.properties?.model?.description).not.toContain("Operator-only model.");
+    expect(schema.properties?.model?.enum).not.toContain("invalid/alias");
+    expect(schema.properties?.model?.enum).not.toContain("invalidTarget");
+    expect(schema.properties?.reasoning?.enum).toContain("xhigh");
+    expect(delegate.description).toContain("Escalate critical reviews to a stronger model.");
+  });
+
+  it("omits the model field when no aliases are selectable", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const tools = subagentTools({
+      bus,
+      idleTimeoutMs: 2_000,
+      maxDepth: 1,
+      modelPresets: {
+        defaultAlias: {
+          model: "openai/gpt-5.5-mini",
+        },
+        manual: {
+          model: "openai/gpt-5.5",
+          agentCanSelect: false,
+        },
+      },
+    });
+    const delegate = tools.subagent_delegate as unknown as { inputSchema: unknown };
+    const schema = asSchema(delegate.inputSchema as never).jsonSchema as unknown as {
+      properties?: { model?: unknown; reasoning?: unknown };
+    };
+
+    expect(schema.properties?.model).toBeUndefined();
+    expect(schema.properties?.reasoning).toBeUndefined();
+    await expect(
+      resolveExecuteResult(
+        tools.subagent_delegate.execute!(
+          {
+            profile: "explore",
+            task: "Try a hidden model",
+            mode: "deferred",
+            model: "manual",
+          },
+          {
+            toolCallId: "tool-no-selectable-models",
+            messages: [],
+            context: {
+              requestId: "r:no-selectable-models",
+              sessionId: "s:no-selectable-models",
+              requestClient: "discord",
+              subagentDepth: 0,
+            },
+          },
+        ),
+      ),
+    ).rejects.toThrow("not available for agent selection");
+    await expect(
+      resolveExecuteResult(
+        tools.subagent_delegate.execute!(
+          {
+            profile: "explore",
+            task: "Try a reasoning override",
+            mode: "deferred",
+            reasoning: "high",
+          },
+          {
+            toolCallId: "tool-no-reasoning-override",
+            messages: [],
+            context: {
+              requestId: "r:no-reasoning-override",
+              sessionId: "s:no-reasoning-override",
+              requestClient: "discord",
+              subagentDepth: 0,
+            },
+          },
+        ),
+      ),
+    ).rejects.toThrow("Reasoning override requires an agent-selectable model alias");
+  });
+
+  it("passes selected model and reasoning to deferred registration", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    let selected:
+      | {
+          modelOverride?: string;
+          reasoningOverride?: string;
+        }
+      | undefined;
+    const tools = subagentTools({
+      bus,
+      idleTimeoutMs: 2_000,
+      maxDepth: 1,
+      modelPresets: {
+        scout: {
+          model: "openrouter/google/gemini-2.5-flash",
+          agentCanSelect: true,
+        },
+        manual: {
+          model: "openai/gpt-5.5",
+          agentCanSelect: false,
+        },
+      },
+      onDeferredDelegate: async (registration) => {
+        selected = registration;
+      },
+    });
+
+    await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        {
+          profile: "explore",
+          task: "Map auth flow",
+          mode: "deferred",
+          model: "scout",
+          reasoning: "high",
+        },
+        {
+          toolCallId: "tool-model-override",
+          messages: [],
+          context: {
+            requestId: "r:model-override",
+            sessionId: "s:model-override",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    );
+
+    expect(selected?.modelOverride).toBe("scout");
+    expect(selected?.reasoningOverride).toBe("high");
+
+    await expect(
+      resolveExecuteResult(
+        tools.subagent_delegate.execute!(
+          { profile: "explore", task: "Try manual", mode: "deferred", model: "manual" },
+          {
+            toolCallId: "tool-manual-model",
+            messages: [],
+            context: {
+              requestId: "r:manual-model",
+              sessionId: "s:manual-model",
+              requestClient: "discord",
+              subagentDepth: 0,
+            },
+          },
+        ),
+      ),
+    ).rejects.toThrow();
+  });
+
   it("returns an accepted handle by default in deferred mode", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -127,8 +359,7 @@ describe("subagent_delegate tool", () => {
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDeferredDelegate: async (registration) => {
         launches.push({
@@ -182,8 +413,7 @@ describe("subagent_delegate tool", () => {
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDeferredDelegate: async (registration) => {
         launches.push({
@@ -231,8 +461,7 @@ describe("subagent_delegate tool", () => {
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 
@@ -356,14 +585,158 @@ describe("subagent_delegate tool", () => {
     expect(res).not.toHaveProperty("durationMs");
   });
 
+  it("times out after the configured period without child activity", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    let cancelQueued = false;
+
+    const tools = subagentTools({
+      bus,
+      idleTimeoutMs: 30,
+      maxDepth: 1,
+    });
+
+    await bus.subscribeTopic(
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "subagent-idle-timeout-worker",
+        consumerId: "subagent-idle-timeout-worker",
+        offset: { type: "now" },
+      },
+      async (msg, ctx) => {
+        if (msg.type === lilacEventTypes.CmdRequestMessage && msg.data.queue === "interrupt") {
+          cancelQueued = Reflect.get(msg.data.raw ?? {}, "cancelQueued") === true;
+        }
+        await ctx.commit();
+      },
+    );
+
+    const res = await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        { profile: "explore", task: "Wait forever", mode: "sync" },
+        {
+          toolCallId: "tool-idle-timeout",
+          messages: [],
+          context: {
+            requestId: "r:idle-timeout",
+            sessionId: "s:idle-timeout",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    );
+
+    expect(res.mode).toBe("sync");
+    if (res.mode !== "sync") throw new Error("expected sync subagent result");
+    expect(res.status).toBe("timeout");
+    expect(res.detail).toContain("without child activity");
+    expect(cancelQueued).toBe(true);
+  });
+
+  it("resets the idle timeout on reasoning, tool, and lifecycle activity", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+
+    let localActivityCount = 0;
+    const tools = subagentTools({
+      bus,
+      idleTimeoutMs: 40,
+      maxDepth: 1,
+      onActivity: () => {
+        localActivityCount += 1;
+      },
+    });
+    const parentActivitySources: string[] = [];
+
+    await bus.subscribeTopic(
+      outReqTopic("r:idle-reset"),
+      { mode: "tail", offset: { type: "begin" } },
+      async (msg, ctx) => {
+        if (msg.type === lilacEventTypes.EvtAgentOutputActivity) {
+          parentActivitySources.push(msg.data.source);
+        }
+        await ctx.commit();
+      },
+    );
+
+    await bus.subscribeTopic(
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "subagent-idle-reset-worker",
+        consumerId: "subagent-idle-reset-worker",
+        offset: { type: "now" },
+      },
+      async (msg, ctx) => {
+        if (msg.type !== lilacEventTypes.CmdRequestMessage || msg.data.queue !== "prompt") {
+          await ctx.commit();
+          return;
+        }
+
+        const headers = msg.headers;
+        await sleep(25);
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputDeltaReasoning,
+          { delta: "still thinking" },
+          { headers },
+        );
+        await sleep(25);
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputToolCall,
+          { toolCallId: "child-tool", status: "start", display: "working" },
+          { headers },
+        );
+        await sleep(25);
+        await bus.publish(
+          lilacEventTypes.EvtRequestLifecycleChanged,
+          { state: "running" },
+          { headers },
+        );
+        await sleep(25);
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseText,
+          { finalText: "finished" },
+          { headers },
+        );
+        await ctx.commit();
+      },
+    );
+
+    const startedAt = Date.now();
+    const res = await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        { profile: "explore", task: "Work for a while", mode: "sync" },
+        {
+          toolCallId: "tool-idle-reset",
+          messages: [],
+          context: {
+            requestId: "r:idle-reset",
+            sessionId: "s:idle-reset",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    );
+
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(90);
+    expect(res.mode).toBe("sync");
+    if (res.mode !== "sync") throw new Error("expected sync subagent result");
+    expect(res.status).toBe("resolved");
+    expect(res.finalText).toBe("finished");
+    expect(parentActivitySources).toEqual(["subagent"]);
+    expect(localActivityCount).toBe(4);
+  });
+
   it("supports general and self delegation profiles", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 
@@ -473,8 +846,7 @@ describe("subagent_delegate tool", () => {
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 
@@ -574,8 +946,7 @@ describe("subagent_delegate tool", () => {
     const bus = createLilacBus(raw);
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 
@@ -606,8 +977,7 @@ describe("subagent_delegate tool", () => {
     const bus = createLilacBus(raw);
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 
@@ -633,8 +1003,7 @@ describe("subagent_delegate tool", () => {
     const bus = createLilacBus(raw);
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 2,
     });
 
@@ -678,8 +1047,7 @@ describe("subagent_delegate tool", () => {
     const bus = createLilacBus(raw);
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 2,
     });
 
@@ -787,43 +1155,41 @@ describe("subagent_delegate tool", () => {
     expect(res.profile).toBe("explore");
   });
 
-  it("clamps timeoutMs to configured max", async () => {
+  it("ignores legacy caller timeouts and uses the configured idle timeout", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
-    let capturedTimeoutMs: number | undefined;
+    let capturedIdleTimeoutMs: number | undefined;
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDeferredDelegate: async (registration) => {
-        capturedTimeoutMs = registration.timeoutMs;
+        capturedIdleTimeoutMs = registration.idleTimeoutMs;
       },
     });
 
+    const inputWithLegacyTimeout = {
+      profile: "explore" as const,
+      task: "Map auth flow",
+      mode: "deferred" as const,
+      timeoutMs: 999_999,
+    };
+
     const res = await resolveExecuteResult(
-      tools.subagent_delegate.execute!(
-        {
-          profile: "explore",
-          task: "Map auth flow",
-          mode: "deferred",
-          timeoutMs: 999_999,
+      tools.subagent_delegate.execute!(inputWithLegacyTimeout, {
+        toolCallId: "tool-3",
+        messages: [],
+        context: {
+          requestId: "r:3",
+          sessionId: "s:3",
+          requestClient: "discord",
+          subagentDepth: 0,
         },
-        {
-          toolCallId: "tool-3",
-          messages: [],
-          context: {
-            requestId: "r:3",
-            sessionId: "s:3",
-            requestClient: "discord",
-            subagentDepth: 0,
-          },
-        },
-      ),
+      }),
     );
 
-    expect(capturedTimeoutMs).toBe(4_000);
+    expect(capturedIdleTimeoutMs).toBe(2_000);
     expect(res.status).toBe("accepted");
   });
 
@@ -833,8 +1199,7 @@ describe("subagent_delegate tool", () => {
 
     const tools = subagentTools({
       bus,
-      defaultTimeoutMs: 2_000,
-      maxTimeoutMs: 4_000,
+      idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 

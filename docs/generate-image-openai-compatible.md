@@ -59,9 +59,11 @@ Lilac sends the corresponding canonical model ID to the provider.
 
 | Lilac alias | Canonical model ID sent upstream |
 | --- | --- |
+| `gpt-image-2` | `gpt-image-2` |
 | `gpt-5-image` | `gpt-image-1.5` |
 | `nanobanana` | `google/gemini-2.5-flash-image` |
 | `nanobanana-2` | `google/gemini-3.1-flash-image-preview` |
+| `nanobanana-2-lite` | `google/gemini-3.1-flash-lite-image` |
 | `nanobanana-pro` | `google/gemini-3-pro-image-preview` |
 | `grok-imagine-image` | `grok-imagine-image` |
 | `grok-imagine-image-pro` | `grok-imagine-image-pro` |

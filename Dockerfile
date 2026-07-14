@@ -22,18 +22,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN install -d -m 0755 /etc/apt/keyrings \
   && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
   && chmod a+r /etc/apt/keyrings/nodesource.gpg \
   && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
-    > /etc/apt/sources.list.d/nodesource.list \
+  > /etc/apt/sources.list.d/nodesource.list \
   && ARCH="$(dpkg --print-architecture)" \
   && if [ "$ARCH" = "amd64" ]; then \
-       curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-         | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg; \
-       chmod a+r /etc/apt/keyrings/google-chrome.gpg; \
-       echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-         > /etc/apt/sources.list.d/google-chrome.list; \
-     fi
+  curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+  | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg; \
+  chmod a+r /etc/apt/keyrings/google-chrome.gpg; \
+  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+  > /etc/apt/sources.list.d/google-chrome.list; \
+  fi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
@@ -64,10 +64,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   tar \
   unzip \
   vulkan-tools \
+  rsync \ 
   && ARCH="$(dpkg --print-architecture)" \
   && if [ "$ARCH" = "amd64" ]; then \
-       apt-get install -y --no-install-recommends google-chrome-stable; \
-     fi \
+  apt-get install -y --no-install-recommends google-chrome-stable; \
+  fi \
   && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu/Debian call it "fdfind"
@@ -75,20 +76,23 @@ RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
 # Non-root user (needed for bun/npm global installs)
 RUN if id -u "$LILAC_USER" >/dev/null 2>&1; then \
-      if [ "$(id -u "$LILAC_USER")" != "$LILAC_UID" ]; then \
-        usermod -u "$LILAC_UID" "$LILAC_USER"; \
-      fi; \
-      usermod -d "/home/$LILAC_USER" -m -s /bin/bash "$LILAC_USER"; \
-    elif getent passwd "$LILAC_UID" >/dev/null 2>&1; then \
-      existing_user="$(getent passwd "$LILAC_UID" | cut -d: -f1)"; \
-      usermod -l "$LILAC_USER" "$existing_user"; \
-      usermod -d "/home/$LILAC_USER" -m -s /bin/bash "$LILAC_USER"; \
-      if getent group "$existing_user" >/dev/null 2>&1; then \
-        groupmod -n "$LILAC_USER" "$existing_user"; \
-      fi; \
-    else \
-      useradd -m -u "$LILAC_UID" -s /bin/bash "$LILAC_USER"; \
-    fi
+  if [ "$(id -u "$LILAC_USER")" != "$LILAC_UID" ]; then \
+  usermod -u "$LILAC_UID" "$LILAC_USER"; \
+  fi; \
+  usermod -d "/home/$LILAC_USER" -m -s /bin/bash "$LILAC_USER"; \
+  elif getent passwd "$LILAC_UID" >/dev/null 2>&1; then \
+  existing_user="$(getent passwd "$LILAC_UID" | cut -d: -f1)"; \
+  usermod -l "$LILAC_USER" "$existing_user"; \
+  usermod -d "/home/$LILAC_USER" -m -s /bin/bash "$LILAC_USER"; \
+  if getent group "$existing_user" >/dev/null 2>&1; then \
+  groupmod -n "$LILAC_USER" "$existing_user"; \
+  fi; \
+  else \
+  useradd -m -u "$LILAC_UID" -s /bin/bash "$LILAC_USER"; \
+  fi
+RUN if [ "$LILAC_USER" = "Catalina" ] && [ ! -e /home/Catalinna ]; then \
+  ln -s /home/Catalina /home/Catalinna; \
+  fi
 ENV HOME=/home/${LILAC_USER}
 ENV DATA_DIR=/data
 ENV LILAC_WORKSPACE_DIR=${DATA_DIR}/workspace

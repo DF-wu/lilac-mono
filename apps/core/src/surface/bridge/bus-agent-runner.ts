@@ -13,11 +13,13 @@ import type {
   CoreConfig,
   CustomCommandResult,
   ModelCapabilityInfo,
+  ModelReasoningEffort,
 } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_TOOL_NAME,
   discoverSkills,
   env,
+  extractAiErrorLogDetails,
   findWorkspaceRoot,
   formatAvailableSkillsSection,
   getCoreConfig,
@@ -53,6 +55,8 @@ import path from "node:path";
 
 import type { CoreToolPluginManager } from "../../plugins";
 import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
+import { createAgentOutputActivityPublisher } from "../../shared/agent-output-activity";
+import { createIdleTimer, type IdleTimer } from "../../shared/idle-timer";
 import {
   createToolResultOutputNormalizer,
   normalizeSubagentFinalText,
@@ -71,7 +75,10 @@ import {
   extractHeartbeatSurfaceSendHandoffs,
   HEARTBEAT_HANDOFF_SESSION_ID,
 } from "../../transcript/heartbeat-handoff";
-import type { TranscriptStore } from "../../transcript/transcript-store";
+import {
+  COMPACTION_CHECKPOINT_FORMAT_VERSION,
+  type TranscriptStore,
+} from "../../transcript/transcript-store";
 import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
@@ -114,6 +121,7 @@ import {
   parseSessionConfigIdFromRaw,
   parseSubagentMetaFromRaw,
   requestRawReferencesMessage,
+  type AgentRunProfile,
 } from "./bus-agent-runner/raw";
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import {
@@ -515,8 +523,9 @@ type DeferredSubagentHandleSnapshot = {
   sessionName?: string;
   childRequestId: string;
   childSessionId: string;
-  timeoutMs: number;
-  startedAtMs: number;
+  idleTimeoutMs?: number;
+  /** Compatibility with snapshots written immediately before idle timeouts shipped. */
+  timeoutMs?: number;
   finalText: string;
   detail?: string;
   childUpdateSeq: number;
@@ -536,8 +545,7 @@ type DeferredSubagentHandle = {
   sessionName: string;
   childRequestId: string;
   childSessionId: string;
-  timeoutMs: number;
-  startedAtMs: number;
+  idleTimeoutMs: number;
   finalText: string;
   detail?: string;
   childUpdateSeq: number;
@@ -546,7 +554,7 @@ type DeferredSubagentHandle = {
   evtCursor?: string;
   outSub: { stop(): Promise<void> } | null;
   evtSub: { stop(): Promise<void> } | null;
-  timeout: ReturnType<typeof setTimeout> | null;
+  idleTimer: IdleTimer | null;
   settled: boolean;
   handlingEvtSubscriptionMessage: boolean;
 };
@@ -1113,8 +1121,7 @@ function buildDeferredSubagentRecoveryState(params: {
     sessionName: handle.sessionName,
     childRequestId: handle.childRequestId,
     childSessionId: handle.childSessionId,
-    timeoutMs: handle.timeoutMs,
-    startedAtMs: handle.startedAtMs,
+    idleTimeoutMs: handle.idleTimeoutMs,
     finalText: params.normalizeFinalText?.(handle.finalText) ?? handle.finalText,
     ...(handle.detail ? { detail: handle.detail } : {}),
     childUpdateSeq: handle.childUpdateSeq,
@@ -1147,12 +1154,15 @@ export function createDeferredSubagentManager(params: {
   };
   normalizeFinalText?: (params: { finalText: string; toolCallId: string }) => Promise<string>;
   normalizeFinalTextForSnapshot?: (finalText: string) => string;
+  onActivity?: () => void;
 }) {
   const { bus, logger, parentHeaders } = params;
   const handles = new Map<string, DeferredSubagentHandle>();
+  const detachedStops = new Set<Promise<void>>();
   const bufferedCompletions: DeferredSubagentBufferedCompletion[] = [];
   let waiters: Array<() => void> = [];
   let signalVersion = 0;
+  let closed = false;
 
   const notifyWaiters = () => {
     signalVersion += 1;
@@ -1195,10 +1205,8 @@ export function createDeferredSubagentManager(params: {
     handle: DeferredSubagentHandle,
     options?: { deferEvtSubStop?: boolean },
   ) => {
-    if (handle.timeout) {
-      clearTimeout(handle.timeout);
-      handle.timeout = null;
-    }
+    handle.idleTimer?.stop();
+    handle.idleTimer = null;
 
     const outSub = handle.outSub;
     const evtSub = handle.evtSub;
@@ -1213,7 +1221,7 @@ export function createDeferredSubagentManager(params: {
 
     if (evtSub) {
       if (options?.deferEvtSubStop) {
-        void evtSub.stop().catch((e: unknown) => {
+        const detachedStop = evtSub.stop().catch((e: unknown) => {
           logger.warn(
             "deferred subagent lifecycle subscription stop failed",
             {
@@ -1224,6 +1232,8 @@ export function createDeferredSubagentManager(params: {
             e,
           );
         });
+        detachedStops.add(detachedStop);
+        void detachedStop.finally(() => detachedStops.delete(detachedStop));
       } else {
         stopPromises.push(evtSub.stop());
       }
@@ -1249,6 +1259,7 @@ export function createDeferredSubagentManager(params: {
         raw: {
           cancel: true,
           requiresActive: true,
+          cancelQueued: true,
           subagent: {
             profile: handle.profile,
             parentRequestId: parentHeaders.request_id,
@@ -1273,6 +1284,7 @@ export function createDeferredSubagentManager(params: {
   ) => {
     if (handle.settled) return;
     handle.settled = true;
+    handle.idleTimer?.stop();
     handle.detail = detail ?? handle.detail;
 
     const finalText = params.normalizeFinalText
@@ -1299,7 +1311,7 @@ export function createDeferredSubagentManager(params: {
     notifyWaiters();
 
     if (handle.handlingEvtSubscriptionMessage) {
-      void stopHandle(handle, { deferEvtSubStop: true }).catch((e: unknown) => {
+      const detachedStop = stopHandle(handle, { deferEvtSubStop: true }).catch((e: unknown) => {
         logger.warn(
           "deferred subagent stop after settlement failed",
           {
@@ -1311,6 +1323,8 @@ export function createDeferredSubagentManager(params: {
           e,
         );
       });
+      detachedStops.add(detachedStop);
+      void detachedStop.finally(() => detachedStops.delete(detachedStop));
       return;
     }
 
@@ -1321,14 +1335,20 @@ export function createDeferredSubagentManager(params: {
     snapshot: DeferredSubagentHandleSnapshot,
     options?: { replayExisting?: boolean },
   ) => {
+    if (closed) return;
+
+    const idleTimeoutMs = snapshot.idleTimeoutMs ?? snapshot.timeoutMs;
+    if (!idleTimeoutMs || idleTimeoutMs <= 0) {
+      throw new Error("deferred subagent snapshot is missing a valid idle timeout");
+    }
+
     const handle: DeferredSubagentHandle = {
       parentToolCallId: snapshot.parentToolCallId,
       profile: snapshot.profile,
       sessionName: resolveRecoveredSubagentSessionName(snapshot),
       childRequestId: snapshot.childRequestId,
       childSessionId: snapshot.childSessionId,
-      timeoutMs: snapshot.timeoutMs,
-      startedAtMs: snapshot.startedAtMs,
+      idleTimeoutMs,
       finalText: snapshot.finalText,
       detail: snapshot.detail,
       childUpdateSeq: snapshot.childUpdateSeq,
@@ -1337,7 +1357,7 @@ export function createDeferredSubagentManager(params: {
       evtCursor: snapshot.evtCursor,
       outSub: null,
       evtSub: null,
-      timeout: null,
+      idleTimer: null,
       settled: false,
       handlingEvtSubscriptionMessage: false,
     };
@@ -1345,7 +1365,7 @@ export function createDeferredSubagentManager(params: {
     handles.set(handle.childRequestId, handle);
 
     const subId = `${handle.childRequestId}:${Math.random().toString(16).slice(2)}`;
-    handle.outSub = await bus.subscribeTopic(
+    const outSub = await bus.subscribeTopic(
       outReqTopic(handle.childRequestId),
       options?.replayExisting
         ? {
@@ -1359,6 +1379,7 @@ export function createDeferredSubagentManager(params: {
             mode: "fanout",
             subscriptionId: `deferred-subagent:out:${subId}`,
             consumerId: `deferred-subagent:out:${subId}`,
+            ephemeral: true,
             offset: { type: "now" },
             batch: { maxWaitMs: 250 },
           },
@@ -1367,6 +1388,9 @@ export function createDeferredSubagentManager(params: {
           await subCtx.commit();
           return;
         }
+
+        params.onActivity?.();
+        handle.idleTimer?.reset();
 
         if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           handle.finalText += msg.data.delta;
@@ -1413,8 +1437,14 @@ export function createDeferredSubagentManager(params: {
         await subCtx.commit();
       },
     );
+    if (closed) {
+      handles.delete(handle.childRequestId);
+      await outSub.stop();
+      return;
+    }
+    handle.outSub = outSub;
 
-    handle.evtSub = await bus.subscribeTopic(
+    const evtSub = await bus.subscribeTopic(
       "evt.request",
       options?.replayExisting
         ? {
@@ -1428,6 +1458,7 @@ export function createDeferredSubagentManager(params: {
             mode: "fanout",
             subscriptionId: `deferred-subagent:evt:${subId}`,
             consumerId: `deferred-subagent:evt:${subId}`,
+            ephemeral: true,
             offset: { type: "now" },
             batch: { maxWaitMs: 250 },
           },
@@ -1439,6 +1470,9 @@ export function createDeferredSubagentManager(params: {
             await subCtx.commit();
             return;
           }
+
+          params.onActivity?.();
+          handle.idleTimer?.reset();
 
           if (msg.type === lilacEventTypes.EvtRequestLifecycleChanged) {
             handle.detail = msg.data.detail ?? handle.detail;
@@ -1461,29 +1495,43 @@ export function createDeferredSubagentManager(params: {
         }
       },
     );
+    if (closed) {
+      handles.delete(handle.childRequestId);
+      handle.evtSub = evtSub;
+      await stopHandle(handle);
+      return;
+    }
+    handle.evtSub = evtSub;
 
-    const elapsedMs = Math.max(0, Date.now() - handle.startedAtMs);
-    const remainingMs = Math.max(1, handle.timeoutMs - elapsedMs);
-    handle.timeout = setTimeout(() => {
-      void cancelChild(handle, `timed out after ${handle.timeoutMs}ms`).catch(() => undefined);
-      void settleHandle(handle, "timeout", `timed out after ${handle.timeoutMs}ms`);
-    }, remainingMs);
+    if (handle.settled) {
+      await stopHandle(handle);
+      return;
+    }
+
+    handle.idleTimer = createIdleTimer(handle.idleTimeoutMs, () => {
+      const detail = `idle timed out after ${handle.idleTimeoutMs}ms without child activity`;
+      void cancelChild(handle, detail).catch(() => undefined);
+      void settleHandle(handle, "timeout", detail);
+    });
+    handle.idleTimer.reset();
   };
 
   return {
     async register(registration: DeferredSubagentRegistration) {
+      if (closed) throw new Error("deferred subagent manager is closed");
+
       await restoreOutstandingHandle({
         parentToolCallId: registration.parentToolCallId,
         profile: registration.profile,
         sessionName: registration.sessionName,
         childRequestId: registration.childRequestId,
         childSessionId: registration.childSessionId,
-        timeoutMs: registration.timeoutMs,
-        startedAtMs: Date.now(),
+        idleTimeoutMs: registration.idleTimeoutMs,
         finalText: "",
         childUpdateSeq: 0,
         childTools: [],
       });
+      if (closed || !handles.has(registration.childRequestId)) return;
 
       try {
         await bus.publish(
@@ -1491,12 +1539,16 @@ export function createDeferredSubagentManager(params: {
           {
             queue: "prompt",
             messages: registration.initialMessages,
+            ...(registration.modelOverride ? { modelOverride: registration.modelOverride } : {}),
             raw: {
               subagent: {
                 profile: registration.profile,
                 depth: registration.depth,
                 parentRequestId: registration.parentRequestId,
                 parentToolCallId: registration.parentToolCallId,
+                ...(registration.reasoningOverride
+                  ? { reasoning: registration.reasoningOverride }
+                  : {}),
               },
             },
           },
@@ -1513,7 +1565,7 @@ export function createDeferredSubagentManager(params: {
     },
 
     async restore(recovery: DeferredSubagentRecoveryState | undefined) {
-      if (!recovery) return;
+      if (!recovery || closed) return;
       for (const completion of recovery.bufferedCompletions) {
         bufferedCompletions.push({
           ...completion,
@@ -1589,6 +1641,7 @@ export function createDeferredSubagentManager(params: {
     },
 
     async cancelAll(detail: string) {
+      closed = true;
       const active = [...handles.values()];
       handles.clear();
 
@@ -1608,16 +1661,18 @@ export function createDeferredSubagentManager(params: {
           await stopHandle(handle);
         }),
       );
+      await Promise.all(detachedStops);
 
       bufferedCompletions.length = 0;
       notifyWaiters();
     },
 
     async stop() {
+      closed = true;
       const active = [...handles.values()];
       handles.clear();
       bufferedCompletions.length = 0;
-      await Promise.all(active.map((handle) => stopHandle(handle)));
+      await Promise.all([...active.map((handle) => stopHandle(handle)), ...detachedStops]);
       notifyWaiters();
     },
   };
@@ -1718,6 +1773,69 @@ class RestartDrainingAbort extends Error {
   }
 }
 
+export class AgentIdleTimeoutError extends Error {
+  constructor(readonly idleTimeoutMs: number) {
+    super(
+      `agent idle timed out after ${idleTimeoutMs}ms without model, tool, or subagent activity`,
+    );
+    this.name = "AgentIdleTimeoutError";
+  }
+}
+
+class PreAgentRunCancelledError extends Error {
+  constructor() {
+    super("cancelled before agent start");
+    this.name = "PreAgentRunCancelledError";
+  }
+}
+
+const AGENT_TIMEOUT_ABORT_GRACE_MS = 5_000;
+
+export function createAgentRunIdleWatchdog(params: {
+  idleTimeoutMs: number;
+  onTimeout: (error: AgentIdleTimeoutError) => void;
+}) {
+  let timedOut = false;
+  let monitoring = false;
+  let rejectTimeout: ((error: AgentIdleTimeoutError) => void) | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    rejectTimeout = reject;
+  });
+  void timeoutPromise.catch(() => undefined);
+
+  const timer = createIdleTimer(params.idleTimeoutMs, () => {
+    if (timedOut) return;
+    timedOut = true;
+    const error = new AgentIdleTimeoutError(params.idleTimeoutMs);
+    params.onTimeout(error);
+    rejectTimeout?.(error);
+    rejectTimeout = null;
+  });
+
+  return {
+    start() {
+      if (timedOut) return;
+      monitoring = true;
+      timer.reset();
+    },
+    reset() {
+      if (!timedOut && monitoring) timer.reset();
+    },
+    waitFor<T>(promise: Promise<T>): Promise<T> {
+      return Promise.race([promise, timeoutPromise]);
+    },
+    pause() {
+      monitoring = false;
+      timer.stop();
+    },
+    stop() {
+      monitoring = false;
+      timer.stop();
+      rejectTimeout = null;
+    },
+  };
+}
+
 function isCancelControlEntry(entry: Enqueued): boolean {
   const raw = entry.raw;
   if (!raw || typeof raw !== "object") return false;
@@ -1794,8 +1912,7 @@ type SubagentConfig = NonNullable<CoreConfig["agent"]["subagents"]>;
 const DEFAULT_SUBAGENT_CONFIG: SubagentConfig = {
   enabled: true,
   maxDepth: 2,
-  defaultTimeoutMs: 3 * 60 * 1000,
-  maxTimeoutMs: 8 * 60 * 1000,
+  idleTimeoutMs: 6 * 60 * 1000,
   profiles: {
     explore: {
       modelSlot: "main",
@@ -1858,6 +1975,57 @@ export function shouldCancelRunPolicyRequest(params: {
   return Boolean(state?.running);
 }
 
+export function resolveAgentRunModel(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+  reasoningOverride?: ModelReasoningEffort;
+}) {
+  const subagentProfileConfig =
+    params.runProfile === "primary" ? null : params.cfg.agent.subagents.profiles[params.runProfile];
+
+  if (params.runProfile !== "primary" && params.requestModelOverride) {
+    const selectedPreset = params.cfg.models.def[params.requestModelOverride];
+    if (!selectedPreset || params.requestModelOverride.includes("/")) {
+      throw new Error(
+        `Subagent model override must be a models.def alias (got '${params.requestModelOverride}')`,
+      );
+    }
+    if (selectedPreset.agentCanSelect !== true) {
+      throw new Error(
+        `Subagent model alias '${params.requestModelOverride}' is not available for agent selection`,
+      );
+    }
+  }
+
+  if (params.requestModelOverride) {
+    return resolveModelRef(
+      params.cfg,
+      {
+        model: params.requestModelOverride,
+        reasoning: params.runProfile === "primary" ? undefined : params.reasoningOverride,
+      },
+      "cmd.request.message.modelOverride",
+    );
+  }
+
+  if (subagentProfileConfig?.model) {
+    return resolveModelRef(
+      params.cfg,
+      {
+        model: subagentProfileConfig.model,
+        reasoning: params.reasoningOverride ?? subagentProfileConfig.reasoning,
+        options: subagentProfileConfig.options,
+      },
+      `agent.subagents.profiles.${params.runProfile}.model`,
+    );
+  }
+
+  const slotResolved = resolveModelSlot(params.cfg, subagentProfileConfig?.modelSlot ?? "main");
+  const reasoning = params.reasoningOverride ?? subagentProfileConfig?.reasoning;
+  return reasoning ? { ...slotResolved, reasoning } : slotResolved;
+}
+
 type SessionQueue = {
   running: boolean;
   agent: AiSdkPiAgent<ToolSet> | null;
@@ -1875,6 +2043,8 @@ type SessionQueue = {
     raw?: unknown;
     partialText: string;
     deferred: ReturnType<typeof createDeferredSubagentManager>;
+    cancel: () => void;
+    started: boolean;
   } | null;
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
@@ -1947,7 +2117,10 @@ export async function startBusAgentRunner(params: {
       batch: { maxWaitMs: 1000 },
     },
     async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.CmdRequestMessage) return;
+      if (msg.type !== lilacEventTypes.CmdRequestMessage) {
+        await ctx.commit();
+        return;
+      }
 
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
@@ -2172,7 +2345,11 @@ export async function startBusAgentRunner(params: {
           typeof targetMessageIdForActive === "string" &&
           requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
 
-        if (!state.running || !state.activeRequestId || !state.agent) {
+        if (
+          !state.running ||
+          !state.activeRequestId ||
+          (!state.agent && !state.activeRun?.cancel)
+        ) {
           await dropCancelNoTarget("request not queued or active");
           return;
         }
@@ -2183,12 +2360,16 @@ export async function startBusAgentRunner(params: {
             requestId: state.activeRequestId,
             requestClient: state.activeRun?.requestClient ?? entry.requestClient,
           };
-          await applyToRunningAgent(
-            state.agent,
-            activeCancelEntry,
-            cancelledByRequestId,
-            state.activeRun,
-          );
+          if (state.activeRun?.started === false) {
+            state.activeRun.cancel();
+          } else if (state.agent) {
+            await applyToRunningAgent(
+              state.agent,
+              activeCancelEntry,
+              cancelledByRequestId,
+              state.activeRun,
+            );
+          }
           logQueueTransition({
             action: "apply_to_active",
             queueDepthBefore: state.queue.length,
@@ -2240,6 +2421,23 @@ export async function startBusAgentRunner(params: {
           logger.error("drainSessionQueue failed", { sessionId, requestId }, e);
         });
       } else {
+        if (
+          state.activeRequestId === requestId &&
+          requestControl.cancel &&
+          state.activeRun?.started === false &&
+          state.activeRun?.cancel
+        ) {
+          state.activeRun.cancel();
+          logQueueTransition({
+            action: "apply_to_active",
+            queueDepthBefore: state.queue.length,
+            queueDepthAfter: state.queue.length,
+            reason: "cancel_active_before_agent_start",
+          });
+          await ctx.commit();
+          return;
+        }
+
         // If the message is intended for the currently active request, apply immediately.
         if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
           const queueDepthBefore = state.queue.length;
@@ -2530,11 +2728,64 @@ export async function startBusAgentRunner(params: {
 
     const routerSessionMode = parseRouterSessionModeFromRaw(next.raw);
 
+    let activeAgent: AiSdkPiAgent<ToolSet> | null = null;
+    let activeRunOperation: Promise<unknown> | null = null;
+    let customCommandAbortController: AbortController | null = null;
+    let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
+    let rejectPreAgentCancellation: ((error: PreAgentRunCancelledError) => void) | null = null;
+    const preAgentCancellationPromise = new Promise<never>((_, reject) => {
+      rejectPreAgentCancellation = reject;
+    });
+    void preAgentCancellationPromise.catch(() => undefined);
+    let unsubscribe = () => {};
+    let unsubscribeCompaction = () => {};
+
     const headers = {
       request_id: next.requestId,
       session_id: next.sessionId,
       request_client: next.requestClient,
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
+    };
+    const publishAgentActivity = createAgentOutputActivityPublisher({
+      bus,
+      headers,
+      onError: (error) => {
+        logger.debug("agent activity publish failed", {
+          requestId: next.requestId,
+          sessionId: next.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
+    const runIdleWatchdog =
+      runProfile === "primary"
+        ? createAgentRunIdleWatchdog({
+            idleTimeoutMs: cfg.agent.idleTimeoutMs,
+            onTimeout: () => {
+              logger.warn("agent run idle timeout", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                idleTimeoutMs: cfg.agent.idleTimeoutMs,
+              });
+              customCommandAbortController?.abort();
+              activeAgent?.abort();
+            },
+          })
+        : null;
+    const waitForRun = <T>(promise: Promise<T>): Promise<T> => {
+      let tracked: Promise<T>;
+      tracked = promise.finally(() => {
+        if (activeRunOperation === tracked) activeRunOperation = null;
+      });
+      activeRunOperation = tracked;
+      return runIdleWatchdog ? runIdleWatchdog.waitFor(tracked) : tracked;
+    };
+    const getActiveRunOperation = (): Promise<unknown> | null => activeRunOperation;
+    const waitForPreAgent = <T>(promise: Promise<T>): Promise<T> =>
+      Promise.race([promise, preAgentCancellationPromise]);
+    const markRunActivity = (source: "model" | "tool" | "subagent") => {
+      publishAgentActivity(source);
+      runIdleWatchdog?.reset();
     };
 
     const normalizeToolResultOutput: NormalizeToolResultOutputFn = createToolResultOutputNormalizer(
@@ -2560,6 +2811,7 @@ export async function startBusAgentRunner(params: {
         }),
       normalizeFinalTextForSnapshot: (finalText) =>
         normalizeSubagentFinalTextForSnapshot(finalText, cfg.tools.output.maxPreviewBytes),
+      onActivity: () => markRunActivity("subagent"),
     });
 
     state.activeRun = {
@@ -2574,6 +2826,13 @@ export async function startBusAgentRunner(params: {
       raw: next.raw,
       partialText: next.recovery?.partialText ?? "",
       deferred: deferredSubagents,
+      cancel: () => {
+        cancelledByRequestId.add(headers.request_id);
+        customCommandAbortController?.abort();
+        rejectPreAgentCancellation?.(new PreAgentRunCancelledError());
+        rejectPreAgentCancellation = null;
+      },
+      started: false,
     };
 
     let initialMessages: ModelMessage[] = [];
@@ -2588,6 +2847,7 @@ export async function startBusAgentRunner(params: {
       lastTurnFinishReason?: FinishReason;
       lastTurnEndAt?: number;
     } = {};
+    let completedCompactionCount = 0;
     const streamWarnings: CallWarning[] = [];
     const modelCapabilityConfig = cfg.models.capability;
     const modelCapability = new ModelCapability({
@@ -2601,10 +2861,6 @@ export async function startBusAgentRunner(params: {
     let roundEstimatedCostCount = 0;
 
     let resolvedModelLabel = "unknown";
-    let activeAgent: AiSdkPiAgent<ToolSet> | null = null;
-    let unsubscribe = () => {};
-    let unsubscribeCompaction = () => {};
-
     try {
       const maxSubagentDepth = subagents.maxDepth;
       if (subagentMeta.depth > maxSubagentDepth) {
@@ -2638,6 +2894,7 @@ export async function startBusAgentRunner(params: {
       if (parsedCustomCommand) {
         const toolCallId = buildCustomCommandToolCallId(next.requestId, parsedCustomCommand.name);
         const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
+        activeCustomCommandTool = { toolCallId, display };
 
         await bus.publish(
           lilacEventTypes.EvtAgentOutputToolCall,
@@ -2662,31 +2919,81 @@ export async function startBusAgentRunner(params: {
 
         if (!customError && command && params.customCommands) {
           try {
-            output = await params.customCommands.execute({
-              command,
-              args: parsedCustomCommand.args,
-              context: {
-                cwd,
-                dataDir: env.dataDir,
-                commandDir: command.dir,
-                commandName: command.def.name,
-                requestId: next.requestId,
-                sessionId: next.sessionId,
-              },
-            });
+            if (cancelledByRequestId.has(headers.request_id)) {
+              throw new PreAgentRunCancelledError();
+            }
+            customCommandAbortController = new AbortController();
+            runIdleWatchdog?.start();
+            output = await waitForPreAgent(
+              waitForRun(
+                params.customCommands.execute({
+                  command,
+                  args: parsedCustomCommand.args,
+                  context: {
+                    cwd,
+                    dataDir: env.dataDir,
+                    commandDir: command.dir,
+                    commandName: command.def.name,
+                    requestId: next.requestId,
+                    sessionId: next.sessionId,
+                    abortSignal: customCommandAbortController.signal,
+                    reportActivity: () => markRunActivity("tool"),
+                  },
+                }),
+              ),
+            );
           } catch (error) {
+            if (
+              error instanceof AgentIdleTimeoutError ||
+              error instanceof PreAgentRunCancelledError
+            ) {
+              throw error;
+            }
             customError = error instanceof Error ? error.message : String(error);
+          } finally {
+            runIdleWatchdog?.pause();
+            customCommandAbortController = null;
           }
+        }
+
+        const customCancelled = cancelledByRequestId.has(headers.request_id);
+
+        if (customCancelled) {
+          const finalText = "Cancelled.";
+          await bus.publish(
+            lilacEventTypes.EvtAgentOutputToolCall,
+            {
+              toolCallId,
+              status: "end",
+              display,
+              ok: false,
+              error: "cancelled by interrupt",
+            },
+            { headers },
+          );
+          activeCustomCommandTool = null;
+          await publishLifecycle({
+            bus,
+            headers,
+            state: "cancelled",
+            detail: "cancelled by interrupt",
+          });
+          await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+          return;
         }
 
         if (customError) {
           output = { type: "error-text", value: customError };
         }
 
-        output = await normalizeToolResultOutput(output, {
-          toolCallId,
-          toolName: CUSTOM_COMMAND_TOOL_NAME,
-        });
+        output = await waitForPreAgent(
+          Promise.resolve(
+            normalizeToolResultOutput(output, {
+              toolCallId,
+              toolName: CUSTOM_COMMAND_TOOL_NAME,
+            }),
+          ),
+        );
 
         customCommandMessages = buildCustomCommandMessages({
           toolCallId,
@@ -2709,6 +3016,7 @@ export async function startBusAgentRunner(params: {
           },
           { headers },
         );
+        activeCustomCommandTool = null;
 
         if (customError) {
           const finalText = buildCustomCommandFailureFinalText({
@@ -2752,50 +3060,26 @@ export async function startBusAgentRunner(params: {
         }
       }
 
-      const subagentProfileConfig =
-        runProfile === "primary" ? null : subagents.profiles[runProfile];
-
       const requestModelOverride =
         runProfile === "primary"
           ? (next.modelOverride ?? parseRequestModelOverrideFromRaw(next.raw) ?? undefined)
-          : undefined;
-
-      const resolved = requestModelOverride
-        ? resolveModelRef(
-            cfg,
-            {
-              model: requestModelOverride,
-            },
-            "cmd.request.message.modelOverride",
-          )
-        : subagentProfileConfig?.model
-          ? resolveModelRef(
-              cfg,
-              {
-                model: subagentProfileConfig.model,
-                reasoning: subagentProfileConfig.reasoning,
-                options: subagentProfileConfig.options,
-              },
-              `agent.subagents.profiles.${runProfile}.model`,
-            )
-          : (() => {
-              const slotResolved = resolveModelSlot(
-                cfg,
-                subagentProfileConfig?.modelSlot ?? "main",
-              );
-              return subagentProfileConfig?.reasoning
-                ? { ...slotResolved, reasoning: subagentProfileConfig.reasoning }
-                : slotResolved;
-            })();
+          : next.modelOverride;
+      const resolved = resolveAgentRunModel({
+        cfg,
+        runProfile,
+        requestModelOverride,
+        reasoningOverride: subagentMeta.reasoning,
+      });
       resolvedModelLabel = resolved.modelId;
       try {
-        modelCapabilityInfo = await modelCapability.resolve(resolved.spec);
+        modelCapabilityInfo = await waitForPreAgent(modelCapability.resolve(resolved.spec));
         if (modelCapabilityInfo.cost) {
           costEstimateStatus = "estimated";
         } else {
           costEstimateReason = "model_cost_missing";
         }
       } catch (error) {
+        if (error instanceof PreAgentRunCancelledError) throw error;
         costEstimateReason =
           error instanceof Error
             ? `capability_resolve_failed:${error.message}`
@@ -2868,7 +3152,10 @@ export async function startBusAgentRunner(params: {
         exploreOverlay: subagents.profiles.explore.promptOverlay,
         generalOverlay: subagents.profiles.general.promptOverlay,
         selfOverlay: subagents.profiles.self.promptOverlay,
-        skillsSection: runProfile === "explore" ? null : await maybeBuildSkillsSectionForPrimary(),
+        skillsSection:
+          runProfile === "explore"
+            ? null
+            : await waitForPreAgent(maybeBuildSkillsSectionForPrimary()),
       });
 
       const baseSystemPromptWithAliases = appendConfiguredAliasPromptBlock({
@@ -2885,20 +3172,22 @@ export async function startBusAgentRunner(params: {
         parentChannelId,
       );
 
-      const additionalSessionPrompts = await resolveSessionAdditionalPrompts({
-        entries: cfg.surface.router.sessionModes[sessionConfigId]?.additionalPrompts,
-        onWarn: (warning) => {
-          logger.warn("skipping invalid session additionalPrompts entry", {
-            requestId: next.requestId,
-            sessionId,
-            sessionConfigId,
-            reason: warning.reason,
-            value: warning.value,
-            filePath: warning.filePath,
-            error: warning.error,
-          });
-        },
-      });
+      const additionalSessionPrompts = await waitForPreAgent(
+        resolveSessionAdditionalPrompts({
+          entries: cfg.surface.router.sessionModes[sessionConfigId]?.additionalPrompts,
+          onWarn: (warning) => {
+            logger.warn("skipping invalid session additionalPrompts entry", {
+              requestId: next.requestId,
+              sessionId,
+              sessionConfigId,
+              reason: warning.reason,
+              value: warning.value,
+              filePath: warning.filePath,
+              error: warning.error,
+            });
+          },
+        }),
+      );
 
       const systemPromptWithSessionMemo = appendAdditionalSessionMemoBlock(
         baseSystemPromptWithAliases,
@@ -3007,50 +3296,52 @@ export async function startBusAgentRunner(params: {
         tools,
         specs: level1ToolSpecs,
         genericOutputNormalizerBypassTools,
-      } = await params.pluginManager.buildLevel1Toolset({
-        cwd,
-        runProfile,
-        editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
-        subagentDepth: subagentMeta.depth,
-        subagentConfig: {
-          enabled: subagents.enabled,
-          defaultTimeoutMs: subagents.defaultTimeoutMs,
-          maxTimeoutMs: subagents.maxTimeoutMs,
-          maxDepth: subagents.maxDepth,
-        },
-        requestContext: {
-          requestId: next.requestId,
-          sessionId: next.sessionId,
-          requestClient: next.requestClient,
+      } = await waitForPreAgent(
+        params.pluginManager.buildLevel1Toolset({
+          cwd,
+          runProfile,
+          editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
           subagentDepth: subagentMeta.depth,
-          subagentProfile: runProfile,
-          safetyMode,
-          metadata: {
-            readFileDirectAttachmentSupported:
-              supportsReadFileDirectAttachments(modelCapabilityInfo),
-            onDeferredDelegate: async (registration: DeferredSubagentRegistration) => {
-              await deferredSubagents.register(registration);
+          subagentConfig: {
+            enabled: subagents.enabled,
+            idleTimeoutMs: subagents.idleTimeoutMs,
+            maxDepth: subagents.maxDepth,
+          },
+          requestContext: {
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+            requestClient: next.requestClient,
+            subagentDepth: subagentMeta.depth,
+            subagentProfile: runProfile,
+            safetyMode,
+            metadata: {
+              readFileDirectAttachmentSupported:
+                supportsReadFileDirectAttachments(modelCapabilityInfo),
+              onActivity: (source: "tool" | "subagent") => markRunActivity(source),
+              onDeferredDelegate: async (registration: DeferredSubagentRegistration) => {
+                await deferredSubagents.register(registration);
+              },
             },
           },
-        },
-        reportToolStatus: (update) => {
-          bus
-            .publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
-              headers,
-            })
-            .catch((e: unknown) => {
-              logger.error(
-                "failed to publish batch tool status",
-                {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: update.toolCallId,
-                },
-                e,
-              );
-            });
-        },
-      });
+          reportToolStatus: (update) => {
+            bus
+              .publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
+                headers,
+              })
+              .catch((e: unknown) => {
+                logger.error(
+                  "failed to publish batch tool status",
+                  {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    toolCallId: update.toolCallId,
+                  },
+                  e,
+                );
+              });
+          },
+        }),
+      );
 
       let transientRetryOutputStarted = false;
       const transientRetryController = createTransientModelRetryController({
@@ -3164,127 +3455,140 @@ export async function startBusAgentRunner(params: {
         autoCompactionPublishChain = autoCompactionPublishChain.then(publishOne, publishOne);
       };
 
-      unsubscribeCompaction = await attachAutoCompaction(agent, {
-        model: resolved.spec,
-        modelCapability,
-        resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
-        baseTransformMessages: toolPruneTransform,
-        baseTurnErrorHandler: transientRetryController.handler,
-        onUnknownCapability: ({ spec, reason, error }) => {
-          logger.warn(
-            "auto-compaction capability unknown; disabling threshold compaction",
-            {
+      unsubscribeCompaction = await waitForPreAgent(
+        attachAutoCompaction(agent, {
+          model: resolved.spec,
+          modelCapability,
+          resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
+          baseTransformMessages: toolPruneTransform,
+          baseTurnErrorHandler: transientRetryController.handler,
+          onUnknownCapability: ({ spec, reason, error }) => {
+            logger.warn(
+              "auto-compaction capability unknown; disabling threshold compaction",
+              {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                modelSpec: spec,
+                reason,
+              },
+              error,
+            );
+          },
+          onOverflowRecoveryAttempt: ({ spec, attempt, maxAttempts }) => {
+            logger.info("auto-compaction overflow recovery retry", {
               requestId: headers.request_id,
               sessionId: headers.session_id,
               modelSpec: spec,
-              reason,
-            },
-            error,
-          );
-        },
-        onOverflowRecoveryAttempt: ({ spec, attempt, maxAttempts }) => {
-          logger.info("auto-compaction overflow recovery retry", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            modelSpec: spec,
-            attempt,
-            maxAttempts,
-          });
-        },
-        onOverflowRecoveryExhausted: ({ spec, attempts, maxAttempts }) => {
-          logger.warn("auto-compaction overflow recovery exhausted", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            modelSpec: spec,
-            attempts,
-            maxAttempts,
-          });
-        },
-        onCompactionStart: ({ spec, reason, messageCountBefore, estimatedInputTokens, budget }) => {
-          autoCompactionSeq += 1;
-          activeAutoCompactionToolCallId = buildSyntheticToolCallId({
-            prefix: "auto_compaction",
-            seed: `${headers.request_id}:${autoCompactionSeq}`,
-          });
-
-          publishAutoCompactionToolStatus({
-            toolCallId: activeAutoCompactionToolCallId,
-            status: "start",
-            display: formatAutoCompactionToolDisplay({
-              phase: "start",
-              messageCountBefore,
-            }),
-          });
-
-          logger.info("auto-compaction start", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            subagentDepth: subagentMeta.depth,
-            modelSpec: spec,
+              attempt,
+              maxAttempts,
+            });
+          },
+          onOverflowRecoveryExhausted: ({ spec, attempts, maxAttempts }) => {
+            logger.warn("auto-compaction overflow recovery exhausted", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              modelSpec: spec,
+              attempts,
+              maxAttempts,
+            });
+          },
+          onCompactionStart: ({
+            spec,
             reason,
             messageCountBefore,
             estimatedInputTokens,
-            inputBudget: budget.inputBudget,
-            safeInputBudget: budget.safeInputBudget,
-            reservedOutputTokens: budget.reservedOutputTokens,
-          });
-        },
-        onCompactionEnd: ({
-          spec,
-          reason,
-          messageCountBefore,
-          messageCountAfter,
-          estimatedInputTokens,
-          estimatedOutputTokens,
-          durationMs,
-          status,
-          error,
-        }) => {
-          const toolCallId =
-            activeAutoCompactionToolCallId ??
-            buildSyntheticToolCallId({
+            budget,
+          }) => {
+            autoCompactionSeq += 1;
+            activeAutoCompactionToolCallId = buildSyntheticToolCallId({
               prefix: "auto_compaction",
-              seed: `${headers.request_id}:orphan-end`,
+              seed: `${headers.request_id}:${autoCompactionSeq}`,
             });
-          activeAutoCompactionToolCallId = null;
 
-          publishAutoCompactionToolStatus({
-            toolCallId,
-            status: "end",
-            display: formatAutoCompactionToolDisplay({
-              phase: "end",
-              ok: status === "completed",
+            publishAutoCompactionToolStatus({
+              toolCallId: activeAutoCompactionToolCallId,
+              status: "start",
+              display: formatAutoCompactionToolDisplay({
+                phase: "start",
+                messageCountBefore,
+              }),
+            });
+
+            logger.info("auto-compaction start", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              subagentDepth: subagentMeta.depth,
+              modelSpec: spec,
+              reason,
               messageCountBefore,
-              messageCountAfter,
-            }),
-            ok: status === "completed",
-            error: status === "completed" ? undefined : "auto compaction failed",
-          });
-
-          const payload = {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            subagentDepth: subagentMeta.depth,
-            modelSpec: spec,
+              estimatedInputTokens,
+              inputBudget: budget.inputBudget,
+              safeInputBudget: budget.safeInputBudget,
+              reservedOutputTokens: budget.reservedOutputTokens,
+            });
+          },
+          onCompactionEnd: ({
+            spec,
             reason,
-            status,
-            durationMs,
             messageCountBefore,
             messageCountAfter,
             estimatedInputTokens,
             estimatedOutputTokens,
-          };
-          if (status === "completed") {
-            logger.info("auto-compaction end", payload);
-            return;
-          }
-          logger.warn("auto-compaction end", payload, error);
-        },
-      });
+            durationMs,
+            status,
+            error,
+          }) => {
+            const toolCallId =
+              activeAutoCompactionToolCallId ??
+              buildSyntheticToolCallId({
+                prefix: "auto_compaction",
+                seed: `${headers.request_id}:orphan-end`,
+              });
+            activeAutoCompactionToolCallId = null;
+
+            publishAutoCompactionToolStatus({
+              toolCallId,
+              status: "end",
+              display: formatAutoCompactionToolDisplay({
+                phase: "end",
+                ok: status === "completed",
+                messageCountBefore,
+                messageCountAfter,
+              }),
+              ok: status === "completed",
+              error: status === "completed" ? undefined : "auto compaction failed",
+            });
+
+            const payload = {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              subagentDepth: subagentMeta.depth,
+              modelSpec: spec,
+              reason,
+              status,
+              durationMs,
+              messageCountBefore,
+              messageCountAfter,
+              estimatedInputTokens,
+              estimatedOutputTokens,
+            };
+            if (status === "completed") {
+              completedCompactionCount += 1;
+              logger.info("auto-compaction end", payload);
+              return;
+            }
+            logger.warn(
+              "auto-compaction end",
+              { ...payload, ...extractAiErrorLogDetails(error) },
+              error,
+            );
+          },
+        }),
+      );
 
       state.agent = agent;
 
-      await deferredSubagents.restore(next.recovery?.deferredSubagents);
+      await waitForPreAgent(deferredSubagents.restore(next.recovery?.deferredSubagents));
 
       let finalText = "";
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
@@ -3370,6 +3674,14 @@ export async function startBusAgentRunner(params: {
       };
 
       unsubscribe = agent.subscribe((event: AiSdkPiAgentEvent<ToolSet>) => {
+        markRunActivity(
+          event.type === "tool_execution_start" ||
+            event.type === "tool_execution_update" ||
+            event.type === "tool_execution_end"
+            ? "tool"
+            : "model",
+        );
+
         if (event.type === "agent_end") {
           runStats.totalUsage = event.totalUsage;
           runStats.finalMessages = event.messages;
@@ -3735,59 +4047,77 @@ export async function startBusAgentRunner(params: {
           !isHeartbeatSessionId(headers.session_id) &&
           !control.cancel &&
           !control.requiresActive
-            ? await maybeBuildAutoInjectedThreadSearchMessages({
-                cfg,
-                conversationThreads: params.conversationThreads,
-                requestId: headers.request_id,
-                raw: next.raw,
-                previousMessages: agent.state.messages,
-                userMessages: mergedInitial,
-                publishToolStatus: async (update) => {
-                  await bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, { headers });
-                },
-                onError: (message, error) => {
-                  logger.warn(
-                    message,
-                    {
+            ? await waitForPreAgent(
+                maybeBuildAutoInjectedThreadSearchMessages({
+                  cfg,
+                  conversationThreads: params.conversationThreads,
+                  requestId: headers.request_id,
+                  raw: next.raw,
+                  previousMessages: agent.state.messages,
+                  userMessages: mergedInitial,
+                  publishToolStatus: async (update) => {
+                    await bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, { headers });
+                  },
+                  onError: (message, error) => {
+                    logger.warn(
+                      message,
+                      {
+                        requestId: headers.request_id,
+                        sessionId: headers.session_id,
+                        ...extractAiErrorLogDetails(error),
+                      },
+                      error,
+                    );
+                  },
+                  onInjected: (event) => {
+                    logger.info("conversation.thread.auto_inject.appended", {
                       requestId: headers.request_id,
                       sessionId: headers.session_id,
-                    },
-                    error,
-                  );
-                },
-                onInjected: (event) => {
-                  logger.info("conversation.thread.auto_inject.appended", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    toolCallId: event.toolCallId,
-                    mode: event.mode,
-                    limit: event.limit,
-                    searchCount: event.searches.length,
-                    queryCount: event.searches.reduce((sum, queries) => sum + queries.length, 0),
-                    searches: event.searches,
-                    participantFilterUserCount: event.participantFilterUserCount,
-                    appendedCount: event.entries.length,
-                    entries: event.entries,
-                  });
-                },
-              })
+                      toolCallId: event.toolCallId,
+                      mode: event.mode,
+                      limit: event.limit,
+                      searchCount: event.searches.length,
+                      queryCount: event.searches.reduce((sum, queries) => sum + queries.length, 0),
+                      searches: event.searches,
+                      participantFilterUserCount: event.participantFilterUserCount,
+                      appendedCount: event.entries.length,
+                      entries: event.entries,
+                    });
+                  },
+                }),
+              )
             : [];
         initialMessages = [...mergedInitial, ...autoInjectedThreadSearchMessages];
         initialMessagesEndWithInjectedTool = autoInjectedThreadSearchMessages.length > 0;
         responseStartIndex = agent.state.messages.length + initialMessages.length;
       }
 
+      if (cancelledByRequestId.has(headers.request_id)) {
+        const finalText = "Cancelled.";
+        await publishLifecycle({
+          bus,
+          headers,
+          state: "cancelled",
+          detail: "cancelled by interrupt",
+        });
+        await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+        return;
+      }
+
+      if (state.activeRun) state.activeRun.started = true;
+      runIdleWatchdog?.start();
+
       if (parsedCustomCommand) {
-        await agent.continue();
+        await waitForRun(agent.continue());
       } else if (initialMessagesEndWithInjectedTool) {
         agent.appendMessages(initialMessages);
-        await agent.continue();
+        await waitForRun(agent.continue());
       } else {
-        await agent.prompt(initialMessages);
+        await waitForRun(agent.prompt(initialMessages));
       }
 
       while (true) {
-        await agent.waitForIdle();
+        await waitForRun(agent.waitForIdle());
 
         if (restartAbortRequestIds.delete(headers.request_id)) {
           throw new RestartDrainingAbort();
@@ -3796,8 +4126,9 @@ export async function startBusAgentRunner(params: {
         const deferredWaitState = deferredSubagents.snapshotWaitState();
 
         if (deferredWaitState.hasBufferedCompletions) {
-          await deferredSubagents.injectBuffered(agent);
-          await agent.continue();
+          await waitForRun(deferredSubagents.injectBuffered(agent));
+          if (cancelledByRequestId.has(headers.request_id)) break;
+          await waitForRun(agent.continue());
           continue;
         }
 
@@ -3805,11 +4136,12 @@ export async function startBusAgentRunner(params: {
           break;
         }
 
-        await deferredSubagents.waitForSignalSince(deferredWaitState.signalVersion);
+        await waitForRun(deferredSubagents.waitForSignalSince(deferredWaitState.signalVersion));
         if (agent.state.isStreaming) {
           continue;
         }
       }
+      runIdleWatchdog?.stop();
 
       const isCancelled = cancelledByRequestId.has(headers.request_id);
       if (isCancelled && !finalText) {
@@ -3844,13 +4176,25 @@ export async function startBusAgentRunner(params: {
       if (params.transcriptStore && (!shouldSkipSurfaceReply || runProfile !== "primary")) {
         try {
           const finalMessagesForPersistence = runStats.finalMessages ?? agent.state.messages;
-          const responseMessages = finalMessagesForPersistence.slice(responseStartIndex);
+          const checkpointMeta = resolveCompactionCheckpointMeta({
+            runSucceeded: true,
+            isPrimary: runProfile === "primary",
+            isCancelled,
+            shouldSkipSurfaceReply,
+            completedCompactionCount,
+          });
+          const isCompactionCheckpoint = checkpointMeta !== undefined;
           const persistedMessages = (() => {
             if (isHeartbeatSessionId(headers.session_id)) {
               return buildPersistedHeartbeatMessages(finalText);
             }
 
-            return runProfile === "primary" ? responseMessages : finalMessagesForPersistence;
+            return selectPersistedTranscriptMessages({
+              finalMessages: finalMessagesForPersistence,
+              responseStartIndex,
+              isPrimary: runProfile === "primary",
+              didCompact: isCompactionCheckpoint,
+            });
           })();
 
           params.transcriptStore.saveRequestTranscript({
@@ -3862,7 +4206,17 @@ export async function startBusAgentRunner(params: {
             messages: persistedMessages,
             finalText,
             modelLabel: resolvedModelLabel,
+            contextMeta: checkpointMeta,
           });
+          if (isCompactionCheckpoint) {
+            logger.info("compaction checkpoint persisted", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              messageCount: persistedMessages.length,
+              compactionCount: completedCompactionCount,
+              formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
+            });
+          }
         } catch (e) {
           logger.error(
             "failed to persist transcript",
@@ -3977,12 +4331,72 @@ export async function startBusAgentRunner(params: {
         detail: isCancelled ? "cancelled by interrupt" : undefined,
       });
     } catch (e) {
+      runIdleWatchdog?.stop();
+
+      if (activeCustomCommandTool) {
+        const { toolCallId, display } = activeCustomCommandTool;
+        activeCustomCommandTool = null;
+        await bus
+          .publish(
+            lilacEventTypes.EvtAgentOutputToolCall,
+            {
+              toolCallId,
+              status: "end",
+              display,
+              ok: false,
+              error:
+                e instanceof PreAgentRunCancelledError
+                  ? "cancelled by interrupt"
+                  : e instanceof Error
+                    ? e.message
+                    : String(e),
+            },
+            { headers },
+          )
+          .catch(() => undefined);
+      }
+
+      const timedOutOperation = getActiveRunOperation();
+      if (
+        (e instanceof AgentIdleTimeoutError || e instanceof PreAgentRunCancelledError) &&
+        timedOutOperation
+      ) {
+        const settled = await Promise.race([
+          timedOutOperation.then(
+            () => true,
+            () => true,
+          ),
+          Bun.sleep(AGENT_TIMEOUT_ABORT_GRACE_MS).then(() => false),
+        ]);
+        if (!settled) {
+          logger.warn("agent operation did not settle after cancellation grace period", {
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            reason: e instanceof AgentIdleTimeoutError ? "idle_timeout" : "cancelled",
+            abortGraceMs: AGENT_TIMEOUT_ABORT_GRACE_MS,
+          });
+        }
+      }
+
       if (e instanceof RestartDrainingAbort) {
         logger.info("agent run interrupted for graceful restart", {
           requestId: headers.request_id,
           sessionId: headers.session_id,
           durationMs: Date.now() - runStartedAt,
         });
+        return;
+      }
+
+      if (e instanceof PreAgentRunCancelledError) {
+        await deferredSubagents.cancelAll("parent request cancelled").catch(() => undefined);
+        const finalText = "Cancelled.";
+        await publishLifecycle({
+          bus,
+          headers,
+          state: "cancelled",
+          detail: "cancelled by interrupt",
+        });
+        await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
         return;
       }
 
@@ -4066,10 +4480,14 @@ export async function startBusAgentRunner(params: {
           requestId: headers.request_id,
           sessionId: headers.session_id,
           durationMs: Date.now() - runStartedAt,
+          model: resolvedModelLabel,
+          ...extractAiErrorLogDetails(e),
         },
         e,
       );
     } finally {
+      runIdleWatchdog?.stop();
+      rejectPreAgentCancellation = null;
       unsubscribe();
       unsubscribeCompaction();
       await deferredSubagents.stop();
@@ -4264,6 +4682,39 @@ async function applyToRunningAgent(
       return _exhaustive;
     }
   }
+}
+
+export function selectPersistedTranscriptMessages(input: {
+  finalMessages: readonly ModelMessage[];
+  responseStartIndex: number;
+  isPrimary: boolean;
+  didCompact: boolean;
+}): ModelMessage[] {
+  if (!input.isPrimary || input.didCompact) return [...input.finalMessages];
+  return input.finalMessages.slice(input.responseStartIndex);
+}
+
+export function resolveCompactionCheckpointMeta(input: {
+  runSucceeded: boolean;
+  isPrimary: boolean;
+  isCancelled: boolean;
+  shouldSkipSurfaceReply: boolean;
+  completedCompactionCount: number;
+}) {
+  if (
+    !input.runSucceeded ||
+    !input.isPrimary ||
+    input.isCancelled ||
+    input.shouldSkipSurfaceReply ||
+    input.completedCompactionCount <= 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    type: "compaction",
+    formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
+  } as const;
 }
 
 export function mergeToSingleUserMessage(messages: ModelMessage[]): ModelMessage {

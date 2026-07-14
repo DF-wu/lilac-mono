@@ -15,6 +15,10 @@ Rules:
 - New behavior-changing defaults only apply to configs on the version that introduced them.
 - If a newer field cannot be represented safely in an older version, that field requires the newer `configVersion`.
 
+Removed fields:
+
+- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview + plain final output now appends the stats footer whenever stats metadata is produced.
+
 ## v1
 
 `configVersion: 1` is the initial versioned config contract and matches the defaults used before config versioning was introduced.
@@ -36,9 +40,15 @@ Field renames from v1:
 - `tools.experimental_hashline_edit` -> `tools.editFile.hashline`
 - `surface.discord.previewFinalOutputStyle` -> `surface.discord.outputPreviewModeFinalStyle`
 - `surface.discord.experimental.markdownTableRender` -> `surface.discord.markdownTableRender`
+- `agent.subagents.defaultTimeoutMs` -> `agent.subagents.idleTimeoutMs`; the timeout now measures inactivity rather than total runtime.
+
+Removed v2 fields:
+
+- `agent.subagents.maxTimeoutMs`; the universal runtime config no longer exposes a hard timeout cap. Frozen v1 configs may still contain this field, but it is not carried into the universal config.
 
 New v2 fields:
 
+- `agent.idleTimeoutMs`: primary agent inactivity timeout; defaults to `900000` (15 minutes). Active runs have no total runtime cap. Frozen v1 configs receive the same universal fallback but cannot override it.
 - `tools.inspect.model`: configurable Gemini model for `content.inspect`; must start with `google/`.
 - `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment input support.
 - `conversation.thread.summarization.enabled`: default-false gate for background conversation thread summarization.
@@ -55,6 +65,9 @@ New v2 fields:
 - `tools.batch.maxCalls`: maximum calls accepted by one batch; defaults to `8`.
 - `tools.media`: model-view inline binary limits. Defaults to `10MiB` per part and `20MiB` in total.
 - `tools.generate.image.provider`: transport routing switch for `generate.image`; values are `default` (built-in aliases) or `openai-compatible` (route through the OpenAI-compatible provider). Aliases and adapters remain unchanged; all aliases route together. Canonical model IDs are fixed. Selecting third-party routing has no automatic fallback.
+- `agent.subagents.delegatePromptOverlay`: optional free-form guidance appended to the parent-visible `subagent_delegate` tool description.
+- `models.def.<alias>.comment`: optional guidance shown when an agent selects a model for a subagent.
+- `models.def.<alias>.agentCanSelect`: explicitly opts an alias into dynamic selection through `subagent_delegate`; defaults to `false`. It does not restrict static profiles, model slots, or explicit human overrides.
 
 Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
 
@@ -68,5 +81,4 @@ Default changes from v1:
 - `surface.discord.outputNotification: true`
 - `surface.discord.markdownTableRender: { enabled: true, style: unicode, maxWidth: 50, fallbackMode: list }`
 - `agent.reasoningDisplay: detailed`
-- `agent.subagents.defaultTimeoutMs: 600000`
-- `agent.subagents.maxTimeoutMs: 1200000`
+- `agent.subagents.idleTimeoutMs: 360000`; explicit v1 `defaultTimeoutMs` values are preserved, while omitted values use the new universal default.

@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import {
   createLilacBus,
   lilacEventTypes,
+  outReqTopic,
   type HandleContext,
   type Message,
   type PublishOptions,
@@ -31,6 +32,7 @@ import {
   consumeAssistantTextDelta,
   computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
+  createAgentRunIdleWatchdog,
   createDeferredSubagentManager,
   createTransientModelRetryController,
   formatAutoCompactionToolDisplay,
@@ -47,16 +49,22 @@ import {
   mergeToSingleUserMessage,
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
+  resolveAgentRunModel,
   shouldRunAutoInjectedThreadSearch,
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
   shouldEnableAnthropicPromptCache,
+  selectPersistedTranscriptMessages,
+  resolveCompactionCheckpointMeta,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
   withReasoningSummaryDefaultForOpenAIModels,
 } from "../../../src/surface/bridge/bus-agent-runner";
+import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
+import { createIdleTimer } from "../../../src/shared/idle-timer";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
+import { parseSubagentMetaFromRaw } from "../../../src/surface/bridge/bus-agent-runner/raw";
 import {
   buildExperimentalDownloadForAnthropicFallback,
   shouldForceUrlDownloadForAnthropicFallback,
@@ -66,6 +74,281 @@ import {
 function fakeModel(): LanguageModel {
   return {} as LanguageModel;
 }
+
+describe("subagent model selection", () => {
+  it("parses a subagent reasoning override from raw request metadata", () => {
+    expect(
+      parseSubagentMetaFromRaw({
+        subagent: { profile: "explore", depth: 1, reasoning: "xhigh" },
+      }),
+    ).toEqual({ profile: "explore", depth: 1, reasoning: "xhigh" });
+  });
+
+  it("preserves subagent profile and depth when reasoning metadata is invalid", () => {
+    expect(
+      parseSubagentMetaFromRaw({
+        subagent: { profile: "explore", depth: 2, reasoning: "future-effort" },
+      }),
+    ).toEqual({ profile: "explore", depth: 2 });
+  });
+
+  it("resolves an agent-selectable alias and applies per-call reasoning", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      scout: {
+        model: "openai/gpt-4o-mini",
+        reasoning: "low",
+        agentCanSelect: true,
+      },
+    };
+
+    const resolved = resolveAgentRunModel({
+      cfg,
+      runProfile: "explore",
+      requestModelOverride: "scout",
+      reasoningOverride: "high",
+    });
+
+    expect(resolved.alias).toBe("scout");
+    expect(resolved.spec).toBe("openai/gpt-4o-mini");
+    expect(resolved.reasoning).toBe("high");
+  });
+
+  it("rejects direct and opted-out subagent model overrides", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      manual: {
+        model: "openai/gpt-4o",
+        agentCanSelect: false,
+      },
+    };
+
+    expect(() =>
+      resolveAgentRunModel({
+        cfg,
+        runProfile: "general",
+        requestModelOverride: "openai/gpt-4o",
+      }),
+    ).toThrow("must be a models.def alias");
+    expect(() =>
+      resolveAgentRunModel({
+        cfg,
+        runProfile: "general",
+        requestModelOverride: "manual",
+      }),
+    ).toThrow("not available for agent selection");
+  });
+
+  it("allows an opted-out alias in an explicit static profile", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      manual: {
+        model: "openai/gpt-4o",
+        agentCanSelect: false,
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      modelSlot: "main",
+      model: "manual",
+    };
+
+    const resolved = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+    });
+
+    expect(resolved.alias).toBe("manual");
+  });
+
+  it("applies reasoning overrides to the configured profile fallback", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.agent.subagents.profiles.explore = {
+      modelSlot: "fast",
+      reasoning: "low",
+    };
+
+    const resolved = resolveAgentRunModel({
+      cfg,
+      runProfile: "explore",
+      reasoningOverride: "medium",
+    });
+
+    expect(resolved).toMatchObject({ slot: "fast" });
+    expect(resolved.reasoning).toBe("medium");
+  });
+});
+
+describe("agent run activity", () => {
+  it("fails a wait after the configured idle interval", async () => {
+    const timedOut: Error[] = [];
+    const watchdog = createAgentRunIdleWatchdog({
+      idleTimeoutMs: 30,
+      onTimeout: (error) => timedOut.push(error),
+    });
+
+    watchdog.start();
+    await expect(watchdog.waitFor(new Promise<void>(() => {}))).rejects.toThrow(
+      "agent idle timed out after 30ms",
+    );
+
+    expect(timedOut).toHaveLength(1);
+    watchdog.stop();
+  });
+
+  it("extends the idle deadline when activity continues", async () => {
+    let timeoutCount = 0;
+    const watchdog = createAgentRunIdleWatchdog({
+      idleTimeoutMs: 45,
+      onTimeout: () => {
+        timeoutCount += 1;
+      },
+    });
+
+    watchdog.start();
+    await Bun.sleep(30);
+    watchdog.reset();
+
+    await expect(watchdog.waitFor(Bun.sleep(30).then(() => "resolved"))).resolves.toBe("resolved");
+    watchdog.stop();
+    await Bun.sleep(20);
+    expect(timeoutCount).toBe(0);
+  });
+
+  it("can pause between separately raced operations", async () => {
+    let timeoutCount = 0;
+    const watchdog = createAgentRunIdleWatchdog({
+      idleTimeoutMs: 20,
+      onTimeout: () => {
+        timeoutCount += 1;
+      },
+    });
+
+    watchdog.start();
+    watchdog.pause();
+    await Bun.sleep(30);
+
+    expect(timeoutCount).toBe(0);
+    watchdog.stop();
+  });
+
+  it("does not clamp large idle deadlines to an immediate timer", async () => {
+    let timeoutCount = 0;
+    const timer = createIdleTimer(30 * 24 * 60 * 60 * 1000, () => {
+      timeoutCount += 1;
+    });
+
+    timer.reset();
+    await Bun.sleep(10);
+
+    expect(timeoutCount).toBe(0);
+    timer.stop();
+  });
+
+  it("publishes throttled activity on the request output topic", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const requestId = "activity-request";
+    const sources: string[] = [];
+    const sub = await bus.subscribeTopic(
+      outReqTopic(requestId),
+      { mode: "tail", offset: { type: "begin" } },
+      async (msg, ctx) => {
+        if (msg.type === lilacEventTypes.EvtAgentOutputActivity) {
+          sources.push(msg.data.source);
+        }
+        await ctx.commit();
+      },
+    );
+    const publishActivity = createAgentOutputActivityPublisher({
+      bus,
+      headers: { request_id: requestId },
+      intervalMs: 25,
+    });
+
+    publishActivity("model");
+    publishActivity("tool");
+    await Bun.sleep(30);
+    publishActivity("subagent");
+    await Bun.sleep(0);
+
+    expect(sources).toEqual(["model", "subagent"]);
+    await sub.stop();
+  });
+});
+
+describe("selectPersistedTranscriptMessages", () => {
+  const finalMessages = [
+    { role: "user", content: "compacted summary" },
+    { role: "assistant", content: "retained response" },
+    { role: "tool", content: [] },
+    { role: "assistant", content: "final response" },
+  ] satisfies ModelMessage[];
+
+  it("persists response-only messages for ordinary primary runs", () => {
+    expect(
+      selectPersistedTranscriptMessages({
+        finalMessages,
+        responseStartIndex: 3,
+        isPrimary: true,
+        didCompact: false,
+      }),
+    ).toEqual([finalMessages[3]!]);
+  });
+
+  it("persists the full final canonical transcript after compaction despite a stale index", () => {
+    expect(
+      selectPersistedTranscriptMessages({
+        finalMessages,
+        responseStartIndex: 99,
+        isPrimary: true,
+        didCompact: true,
+      }),
+    ).toEqual(finalMessages);
+  });
+
+  it("keeps non-primary full-transcript persistence unchanged", () => {
+    expect(
+      selectPersistedTranscriptMessages({
+        finalMessages,
+        responseStartIndex: 3,
+        isPrimary: false,
+        didCompact: false,
+      }),
+    ).toEqual(finalMessages);
+  });
+
+  it("creates one checkpoint marker after one or many completed compactions", () => {
+    for (const completedCompactionCount of [1, 3]) {
+      expect(
+        resolveCompactionCheckpointMeta({
+          runSucceeded: true,
+          isPrimary: true,
+          isCancelled: false,
+          shouldSkipSurfaceReply: false,
+          completedCompactionCount,
+        }),
+      ).toEqual({ type: "compaction", formatVersion: 1 });
+    }
+  });
+
+  it("does not mark failed, cancelled, skipped, uncompacted, or non-primary runs", () => {
+    const base = {
+      runSucceeded: true,
+      isPrimary: true,
+      isCancelled: false,
+      shouldSkipSurfaceReply: false,
+      completedCompactionCount: 1,
+    };
+    expect(resolveCompactionCheckpointMeta({ ...base, runSucceeded: false })).toBeUndefined();
+    expect(resolveCompactionCheckpointMeta({ ...base, isCancelled: true })).toBeUndefined();
+    expect(
+      resolveCompactionCheckpointMeta({ ...base, shouldSkipSurfaceReply: true }),
+    ).toBeUndefined();
+    expect(
+      resolveCompactionCheckpointMeta({ ...base, completedCompactionCount: 0 }),
+    ).toBeUndefined();
+    expect(resolveCompactionCheckpointMeta({ ...base, isPrimary: false })).toBeUndefined();
+  });
+});
 
 function formatExpectedLocalThreadTimeRange(start: string, end: string): string {
   const format = (value: string) => {
@@ -3043,6 +3326,195 @@ describe("custom command failures", () => {
 });
 
 describe("createDeferredSubagentManager", () => {
+  it("publishes deferred model and reasoning overrides", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const parentHeaders = {
+      request_id: "parent-model-override",
+      session_id: "parent-session",
+      request_client: "discord" as const,
+    };
+    const childHeaders = {
+      request_id: "child-model-override",
+      session_id: "child-session",
+      request_client: "unknown" as const,
+      parent_request_id: parentHeaders.request_id,
+      parent_tool_call_id: "tool-model-override",
+      subagent_profile: "explore" as const,
+      subagent_depth: "1",
+    };
+    let publishedModel: string | undefined;
+    let publishedReasoning: unknown;
+    const commandSub = await bus.subscribeTopic(
+      "cmd.request",
+      {
+        mode: "fanout",
+        subscriptionId: "deferred-model-override-test",
+        consumerId: "deferred-model-override-test",
+        offset: { type: "now" },
+      },
+      async (msg, ctx) => {
+        if (msg.type === lilacEventTypes.CmdRequestMessage && msg.data.queue === "prompt") {
+          publishedModel = msg.data.modelOverride;
+          const subagent = Reflect.get(msg.data.raw ?? {}, "subagent");
+          publishedReasoning =
+            subagent && typeof subagent === "object"
+              ? Reflect.get(subagent, "reasoning")
+              : undefined;
+        }
+        await ctx.commit();
+      },
+    );
+    const manager = createDeferredSubagentManager({
+      bus,
+      logger: createLogger({ module: "bus-agent-runner-test" }),
+      parentHeaders,
+    });
+
+    await manager.register({
+      profile: "explore",
+      sessionName: "explore-model-override",
+      task: "Map auth flow",
+      idleTimeoutMs: 2_000,
+      depth: 1,
+      parentRequestId: parentHeaders.request_id,
+      parentSessionId: parentHeaders.session_id,
+      parentRequestClient: parentHeaders.request_client,
+      parentToolCallId: "tool-model-override",
+      childRequestId: childHeaders.request_id,
+      childSessionId: childHeaders.session_id,
+      parentHeaders,
+      childHeaders,
+      initialMessages: [{ role: "user", content: "Map auth flow" }],
+      modelOverride: "scout",
+      reasoningOverride: "high",
+    });
+
+    expect(publishedModel).toBe("scout");
+    expect(publishedReasoning).toBe("high");
+    await manager.stop();
+    await commandSub.stop();
+  });
+
+  it("keeps a deferred child alive while matching activity continues", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const parentHeaders = {
+      request_id: "parent-idle-reset",
+      session_id: "parent-session",
+      request_client: "discord" as const,
+    };
+    const childHeaders = {
+      request_id: "child-idle-reset",
+      session_id: "child-session",
+      request_client: "unknown" as const,
+      parent_request_id: parentHeaders.request_id,
+      parent_tool_call_id: "tool-idle-reset",
+      subagent_profile: "explore" as const,
+      subagent_depth: "1",
+    };
+    let activityCount = 0;
+    const manager = createDeferredSubagentManager({
+      bus,
+      logger: createLogger({ module: "bus-agent-runner-test" }),
+      parentHeaders,
+      onActivity: () => {
+        activityCount += 1;
+      },
+    });
+
+    await manager.register({
+      profile: "explore",
+      sessionName: "explore-idle-reset",
+      task: "Keep working",
+      idleTimeoutMs: 40,
+      depth: 1,
+      parentRequestId: parentHeaders.request_id,
+      parentSessionId: parentHeaders.session_id,
+      parentRequestClient: parentHeaders.request_client,
+      parentToolCallId: "tool-idle-reset",
+      childRequestId: childHeaders.request_id,
+      childSessionId: childHeaders.session_id,
+      parentHeaders,
+      childHeaders,
+      initialMessages: [{ role: "user", content: "Keep working" }],
+    });
+
+    await Bun.sleep(25);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaReasoning,
+      { delta: "thinking" },
+      { headers: childHeaders },
+    );
+    await Bun.sleep(25);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseBinary,
+      { mimeType: "text/plain", dataBase64: "YQ==" },
+      { headers: childHeaders },
+    );
+    await Bun.sleep(25);
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running" },
+      { headers: childHeaders },
+    );
+    await Bun.sleep(25);
+
+    expect(manager.snapshotWaitState().hasOutstandingChildren).toBe(true);
+    expect(manager.hasBufferedCompletions()).toBe(false);
+    expect(activityCount).toBe(3);
+    await manager.stop();
+  });
+
+  it("grants restored deferred children a fresh idle interval", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const parentHeaders = {
+      request_id: "parent-recovery-idle",
+      session_id: "parent-session",
+      request_client: "discord" as const,
+    };
+    const logger = createLogger({ module: "bus-agent-runner-test" });
+    const manager = createDeferredSubagentManager({ bus, logger, parentHeaders });
+
+    await manager.register({
+      profile: "explore",
+      sessionName: "explore-recovery-idle",
+      task: "Keep waiting",
+      idleTimeoutMs: 80,
+      depth: 1,
+      parentRequestId: parentHeaders.request_id,
+      parentSessionId: parentHeaders.session_id,
+      parentRequestClient: parentHeaders.request_client,
+      parentToolCallId: "tool-recovery-idle",
+      childRequestId: "child-recovery-idle",
+      childSessionId: "child-session",
+      parentHeaders,
+      childHeaders: {
+        request_id: "child-recovery-idle",
+        session_id: "child-session",
+        request_client: "unknown",
+        parent_request_id: parentHeaders.request_id,
+        parent_tool_call_id: "tool-recovery-idle",
+        subagent_profile: "explore",
+        subagent_depth: "1",
+      },
+      initialMessages: [{ role: "user", content: "Keep waiting" }],
+    });
+
+    const recovery = manager.buildRecoveryState();
+    await manager.stop();
+    await Bun.sleep(100);
+
+    const restored = createDeferredSubagentManager({ bus, logger, parentHeaders });
+    await restored.restore(recovery);
+    await Bun.sleep(40);
+
+    expect(restored.snapshotWaitState().hasOutstandingChildren).toBe(true);
+    expect(restored.hasBufferedCompletions()).toBe(false);
+
+    await waitFor(() => restored.hasBufferedCompletions(), 100);
+    expect(restored.snapshotWaitState().hasOutstandingChildren).toBe(false);
+    await restored.stop();
+  });
+
   it("bounds outstanding finalText in graceful-restart snapshots", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const parentHeaders = {
@@ -3061,7 +3533,7 @@ describe("createDeferredSubagentManager", () => {
       profile: "explore",
       sessionName: "explore-snapshot",
       task: "Map auth flow",
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
       depth: 1,
       parentRequestId: parentHeaders.request_id,
       parentSessionId: parentHeaders.session_id,
@@ -3115,7 +3587,7 @@ describe("createDeferredSubagentManager", () => {
       profile: "explore",
       sessionName: "explore-test0001",
       task: "Map auth flow",
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
       depth: 1,
       parentRequestId: parentHeaders.request_id,
       parentSessionId: parentHeaders.session_id,
@@ -3225,7 +3697,7 @@ describe("createDeferredSubagentManager", () => {
       profile: "explore",
       sessionName: "explore-test0002",
       task: "Map auth flow",
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
       depth: 1,
       parentRequestId: parentHeaders.request_id,
       parentSessionId: parentHeaders.session_id,
@@ -3327,7 +3799,7 @@ describe("createDeferredSubagentManager", () => {
       profile: "explore",
       sessionName: "explore-test0003",
       task: "Map auth flow",
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
       depth: 1,
       parentRequestId: parentHeaders.request_id,
       parentSessionId: parentHeaders.session_id,
@@ -3441,7 +3913,7 @@ describe("createDeferredSubagentManager", () => {
       profile: "explore",
       sessionName: "explore-test0004",
       task: "Map auth flow",
-      timeoutMs: 5_000,
+      idleTimeoutMs: 5_000,
       depth: 1,
       parentRequestId: parentHeaders.request_id,
       parentSessionId: parentHeaders.session_id,

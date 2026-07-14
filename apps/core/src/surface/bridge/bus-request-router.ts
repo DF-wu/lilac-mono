@@ -2,6 +2,7 @@ import { type ModelMessage } from "ai";
 
 import {
   createLogger,
+  extractAiErrorLogDetails,
   getCoreConfig,
   env,
   errorMessage,
@@ -219,7 +220,10 @@ export async function startBusRequestRouter(params: {
       batch: { maxWaitMs: 1000 },
     },
     async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtRequestLifecycleChanged) return;
+      if (msg.type !== lilacEventTypes.EvtRequestLifecycleChanged) {
+        await ctx.commit();
+        return;
+      }
 
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
@@ -275,7 +279,10 @@ export async function startBusRequestRouter(params: {
       batch: { maxWaitMs: 1000 },
     },
     async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtSurfaceOutputMessageCreated) return;
+      if (msg.type !== lilacEventTypes.EvtSurfaceOutputMessageCreated) {
+        await ctx.commit();
+        return;
+      }
 
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
@@ -323,8 +330,14 @@ export async function startBusRequestRouter(params: {
       batch: { maxWaitMs: 1000 },
     },
     async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtAdapterMessageCreated) return;
-      if (msg.data.platform !== "discord") return;
+      if (msg.type !== lilacEventTypes.EvtAdapterMessageCreated) {
+        await ctx.commit();
+        return;
+      }
+      if (msg.data.platform !== "discord") {
+        await ctx.commit();
+        return;
+      }
 
       if (env.perf.log) {
         const lagMs = Date.now() - msg.ts;
@@ -568,7 +581,11 @@ export async function startBusRequestRouter(params: {
             repliedToMessageText,
           },
         }).catch((e: unknown) => {
-          logger.error("router direct-reply gate failed; forwarding", { sessionId }, e);
+          logger.error(
+            "router direct-reply gate failed; forwarding",
+            { sessionId, ...extractAiErrorLogDetails(e) },
+            e,
+          );
           return {
             forward: true,
             reason: "error-fail-open",
@@ -753,6 +770,7 @@ export async function startBusRequestRouter(params: {
       botUserId: self.userId,
       botName: cfg.surface.discord.botName,
       transcriptStore: params.transcriptStore,
+      currentRequestId: requestId,
       discordUserAliasById,
       transformUserText: transformPendingUserText(last),
       transformUserTextForMessageId: last.msgRef.messageId,
@@ -1365,7 +1383,11 @@ export async function startBusRequestRouter(params: {
             previousMessageText,
           },
         }).catch((e: unknown) => {
-          logger.error("router gate failed; skipping", { sessionId }, e);
+          logger.error(
+            "router gate failed; skipping",
+            { sessionId, ...extractAiErrorLogDetails(e) },
+            e,
+          );
           return { forward: false, reason: "error" };
         })
       : ({ forward: true as const, reason: "disabled" } satisfies {

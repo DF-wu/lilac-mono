@@ -2,8 +2,11 @@ import { z } from "zod";
 
 import { cloneDefaultDiscordWorkingIndicators } from "../discord-working-indicators";
 
+import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+
 import type {
   ConfigParser,
+  CoreConfigParseOptions,
   CoreConfigVersion,
   JSONObject,
   JSONValue,
@@ -681,10 +684,29 @@ export function parseCoreConfigV1(raw: unknown): ParsedCoreConfigV1 {
   return coreConfigInputSchemaV1.parse(raw);
 }
 
-export function parseCoreConfigV1ToUniversal(raw: unknown): UniversalCoreConfig {
+function readExplicitV1SubagentTimeoutMs(raw: unknown): number | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const agent = Reflect.get(raw, "agent");
+  if (!agent || typeof agent !== "object" || Array.isArray(agent)) return undefined;
+  const subagents = Reflect.get(agent, "subagents");
+  if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return undefined;
+  const timeoutMs = Reflect.get(subagents, "defaultTimeoutMs");
+  return typeof timeoutMs === "number" ? timeoutMs : undefined;
+}
+
+export function parseCoreConfigV1ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): UniversalCoreConfig {
   const parsed = parseCoreConfigV1(raw);
+  if (options?.onUnknownKey) {
+    for (const path of collectUnknownConfigKeyPaths(raw, parsed)) {
+      options.onUnknownKey(path);
+    }
+  }
   const { experimental_hashline_edit: hashline, ...toolsRest } = parsed.tools;
   const { previewFinalOutputStyle, experimental, ...discordRest } = parsed.surface.discord;
+  const { subagents, ...agentRest } = parsed.agent;
 
   return {
     ...parsed,
@@ -752,9 +774,25 @@ export function parseCoreConfigV1ToUniversal(raw: unknown): UniversalCoreConfig 
       },
     },
     agent: {
-      ...parsed.agent,
+      ...agentRest,
       systemPrompt: "",
+      idleTimeoutMs: 15 * 60 * 1000,
       retry: { ...DEFAULT_AGENT_RETRY },
+      subagents: {
+        enabled: subagents.enabled,
+        maxDepth: subagents.maxDepth,
+        idleTimeoutMs: readExplicitV1SubagentTimeoutMs(raw) ?? 6 * 60 * 1000,
+        profiles: subagents.profiles,
+      },
+    },
+    models: {
+      ...parsed.models,
+      def: Object.fromEntries(
+        Object.entries(parsed.models.def).map(([alias, preset]) => [
+          alias,
+          { ...preset, agentCanSelect: false },
+        ]),
+      ),
     },
   };
 }
@@ -762,7 +800,7 @@ export function parseCoreConfigV1ToUniversal(raw: unknown): UniversalCoreConfig 
 export class V1CoreConfigParser implements ConfigParser {
   readonly version = V1_CORE_CONFIG_VERSION;
 
-  async parse(input: object): Promise<UniversalCoreConfig> {
-    return parseCoreConfigV1ToUniversal(input);
+  async parse(input: object, options?: CoreConfigParseOptions): Promise<UniversalCoreConfig> {
+    return parseCoreConfigV1ToUniversal(input, options);
   }
 }

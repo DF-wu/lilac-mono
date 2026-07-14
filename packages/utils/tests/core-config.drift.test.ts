@@ -102,14 +102,14 @@ describe("core config drift coverage", () => {
       fallbackMode: "list",
     });
     expect(cfg.agent.reasoningDisplay).toBe("detailed");
+    expect(cfg.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
     expect(cfg.agent.retry).toEqual({
       enabled: true,
       maxRetries: 3,
       baseDelayMs: 2_000,
       maxDelayMs: 30_000,
     });
-    expect(cfg.agent.subagents.defaultTimeoutMs).toBe(10 * 60 * 1000);
-    expect(cfg.agent.subagents.maxTimeoutMs).toBe(20 * 60 * 1000);
+    expect(cfg.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
     expect(cfg.models.capability.forceUnknownProviders).toEqual(["openai-compatible"]);
   });
 });
