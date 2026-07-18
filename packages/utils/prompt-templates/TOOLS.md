@@ -8,11 +8,8 @@ You have access to three tiers of tools:
 
 ## Parallel tool calls
 
-- Prefer parallel tool execution whenever calls are independent.
-- For independent filesystem/search operations (`read_file`, `glob`, `grep`, `bash`), prefer a single `batch` call with multiple `tool_calls`.
-- If the model/runtime supports native multiple tool calls in one turn, use that as well for independent calls.
-- Keep dependent operations sequential (for example: discover file path -> read file; edit file -> re-read/verify).
-- Never batch dependent mutations where order matters.
+- Run independent operations in parallel (native multi-call or a single `batch`); keep dependent operations sequential (e.g., discover path → read; edit → verify).
+  - batch expands them into ordinary tool calls and results.
 
 ## bash usage
 
@@ -21,6 +18,7 @@ You have access to three tiers of tools:
 - Bash command logs and returned stdout/stderr may redact secrets as `<redacted>`; this is a display transform, not the runtime value actually used.
   - Use pipes when possible; Reading `.env`/credential files is allowed when the task legitimately requires it.
   - Never surface a secret, give the user the path or command to read it themself.
+
 ## Remote Workdirs (SSH-style cwd)
 
 These tools: `bash`, `read_file`, `glob`, `grep`, `apply_patch` supports SSH-style working directory in `cwd`:
@@ -85,21 +83,7 @@ cat payload.json | tools <tool> --stdin
 - `surface.reactions.listDetailed` — List reactions for a message with per-user details.
 - `surface.reactions.add` — Add a reaction to a message.
 - `surface.reactions.remove` — Remove a reaction from a message.
-- `workflow.wait_for_reply.create` — Create a wait_for_reply workflow that resumes later (tasks wait for strict replies to a messageId in sessionId).
-- `workflow.wait_for_reply.send_and_wait` — Send a message and create a wait_for_reply task waiting for a reply to that message.
-- `workflow.schedule` — Create a scheduled workflow trigger (wait_until / wait_for / cron).
-- `workflow.cancel` — Cancel a workflow and its pending tasks.
-- `workflow.list` — List workflows from the local workflow store (scheduled only).
-
-### Instructions on workflow
-
-Workflow tools are designed to be used in conjunction with the `surface` tool. Imagine this workflow:
-
-1. User A asked you to DM another user B
-2. You sent a message to B via `surface.messages.send` and gets back a messageId
-3. You create a workflow task that waits for a reply to that messageId via `workflow.wait_for_reply.create`
-4. The workflow service will resume you with the context you set when you created the task after a reply is received from B
-   (In the above example, 2 and 3 can be simplified with `workflow.wait_for_reply.send_and_wait`)
+- Programmatic workflows are Level-2 APIs documented by the progressively loaded `workflow-authoring` skill. Load that skill before authoring, scheduling, or inspecting workflows.
 
 ### Surface tool notes
 
@@ -123,35 +107,7 @@ Workflow tools are designed to be used in conjunction with the `surface` tool. I
 
 ### Mental model
 
-A **Skill** is a **directory** containing:
-
-- A required `SKILL.md` that provides **metadata + operational instructions**
-- Optional additional docs (guides, references)
-- Optional executable scripts/utilities
-- Optional templates/resources/data files
-
-### Skill directory structure
-
-Minimum:
-
-```
-your-skill/
-└── SKILL.md
-```
-
-Typical:
-
-```
-your-skill/
-├── SKILL.md
-├── REFERENCE.md          # optional (schemas, rules, templates)
-├── GUIDE.md              # optional (longer workflows)
-└── scripts/
-    ├── validate.py       # optional deterministic helper
-    └── transform.ts      # optional deterministic helper
-```
-
-`SKILL.md` is mandatory; everything else is optional.
+A **Skill** is a directory with a required `SKILL.md` (metadata + operational instructions), plus optional extra docs (guides, references), executable scripts/utilities, and templates/resources. Load full details on demand via `tools skills.full` or by reading the directory.
 
 ---
 

@@ -102,6 +102,10 @@ const plugin: LilacToolPlugin<unknown, Level1ToolSpec<unknown>, ServerTool> = {
 export default plugin;
 ```
 
+Native subagent availability is deployment-owned under `agent.subagents.profiles`. Level-1 tools are selected by both plugin id and tool name; Level-2 tools are selected by both plugin id and callable id. The same resolved profile is used for direct, generated-delegation, and user-authored workflow launches. A `"*"` entry includes every globally enabled contribution at that level.
+
+Plugins should keep `isEnabled` for runtime prerequisites, not caller classification.
+
 ## Lifecycle
 
 - `create(context)` runs when Lilac loads or reloads the plugin.
@@ -124,6 +128,7 @@ plugins:
 
 - `plugins.disabled` disables a plugin without uninstalling it.
 - `plugins.config.<pluginId>` is passed through as `context.pluginConfig`.
+- `agent.subagents.profiles.<profile>.level1` and `.level2` select plugin contributions for that native profile.
 - Plugins are expected to validate their own config, typically with Zod.
 
 ## Runtime Notes
@@ -141,4 +146,6 @@ plugins:
 - Oversized text and JSON are preserved as transient, session-owned `tool-result://` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read_file`.
 - Media and provider-reference content parts are not converted into text artifacts.
 - Truncation does not change whether the tool execution succeeded or failed.
-- `supportsBatch` defaults to false when omitted. Set it to true only when the raw `execute` result is intrinsically bounded, because batch invokes child `execute` directly rather than applying `toModelOutput` or an aggregate artifact layer.
+- Level 1 tools are batch-callable by default. Set `supportsBatch: false` when a tool must not be expanded into a batch child.
+- Batch children execute as ordinary Level 1 calls, so approval checks, streaming, `toModelOutput`, output normalization, media parts, and tool lifecycle events behave the same as direct calls.
+- Writer tools should implement `editTargets` so batch can reject children that would concurrently edit the same resource. Set `supportsBatch: false` when targets cannot be determined safely.

@@ -1,3 +1,5 @@
+import { expandTilde } from "@stanley2058/lilac-fs";
+import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { posix as posixPath } from "node:path";
@@ -18,13 +20,11 @@ import {
   type IFileSystem,
 } from "just-bash";
 
-import { withLimitedBashOutput, type BashToolInput, type BashToolOutput } from "./bash-impl";
-import { sanitizeBashOutputText } from "./bash-output-sanitizer";
-import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
-import { expandTilde } from "@stanley2058/lilac-fs";
 import { resolveRestrictedSessionTmpDir } from "../shared/attachment-utils";
 import { parseSshCwdTarget } from "../ssh/ssh-cwd";
+import { withLimitedBashOutput, type BashToolInput, type BashToolOutput } from "./bash-impl";
+import { sanitizeBashOutputText } from "./bash-output-sanitizer";
 
 const WORKSPACE_MOUNT = "/workspace";
 const TMP_MOUNT = "/tmp";
@@ -37,6 +37,10 @@ type RestrictedBashContext = {
   requestId?: string;
   sessionId?: string;
   requestClient?: string;
+  controlCapability?: string;
+  toolCallId?: string;
+  workspaceWritable?: boolean;
+  subagentProfile?: "explore" | "general" | "self";
 };
 
 type RestrictedBashFsCacheEntry = {
@@ -60,61 +64,72 @@ function normalizeVirtualPath(p: string): string {
   return posixPath.normalize(prefixed);
 }
 
-function isDeniedWorkspacePath(p: string): boolean {
-  const normalized = normalizeVirtualPath(p);
-  if (normalized === "/" || normalized === WORKSPACE_MOUNT) return false;
-
-  const rel = normalized.startsWith(`${WORKSPACE_MOUNT}/`)
-    ? normalized.slice(WORKSPACE_MOUNT.length + 1)
-    : normalized.slice(1);
-  const parts = rel.split("/").filter(Boolean);
-  if (parts.length === 0) return false;
-
-  if (parts.some((part) => part === ".ssh" || part === ".aws" || part === ".gnupg")) {
-    return true;
-  }
-
-  if (parts[0] === ".git" && parts[1] === "config") return true;
-  if (parts.some((part) => part === "core-config.yaml" || part === "core-config.yml")) {
-    return true;
-  }
-
-  const leaf = parts[parts.length - 1] ?? "";
-  if (leaf === ".env" || leaf.startsWith(".env.")) return true;
-
-  return false;
-}
-
 function accessDenied(pathName: string): Error {
   const err = new Error(`Access denied in restricted mode: ${pathName}`);
   return Object.assign(err, { code: "EACCES" });
 }
 
 class RestrictedReadFs implements IFileSystem {
-  constructor(private readonly inner: IFileSystem) {}
+  constructor(
+    private readonly inner: IFileSystem,
+    private readonly denyOutsideMount = false,
+    private readonly hostRoot?: string,
+  ) {}
 
-  private assertReadable(pathName: string): void {
-    if (isDeniedWorkspacePath(pathName)) throw accessDenied(pathName);
+  private async assertReadable(pathName: string): Promise<void> {
+    if (this.denyOutsideMount && normalizeVirtualPath(pathName) !== "/") {
+      throw accessDenied(pathName);
+    }
+    if (!this.hostRoot) return;
+    const virtual = normalizeVirtualPath(pathName);
+    const relative = virtual.startsWith(`${WORKSPACE_MOUNT}/`)
+      ? virtual.slice(WORKSPACE_MOUNT.length + 1)
+      : virtual.slice(1);
+    const candidate = path.resolve(this.hostRoot, relative);
+    if (candidate !== this.hostRoot && !candidate.startsWith(`${this.hostRoot}${path.sep}`)) {
+      throw accessDenied(pathName);
+    }
+    const stat = await fs.lstat(candidate).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (stat?.isFile() && stat.nlink > 1) throw accessDenied(pathName);
   }
 
-  private filterChild(parent: string, name: string): boolean {
-    return !isDeniedWorkspacePath(posixPath.join(normalizeVirtualPath(parent), name));
+  private async assertWritable(pathName: string): Promise<void> {
+    if (this.denyOutsideMount || normalizeVirtualPath(pathName) === "/") {
+      throw accessDenied(pathName);
+    }
+    if (!this.hostRoot) return;
+    const virtual = normalizeVirtualPath(pathName);
+    const relative = virtual.startsWith(`${WORKSPACE_MOUNT}/`)
+      ? virtual.slice(WORKSPACE_MOUNT.length + 1)
+      : virtual.slice(1);
+    const candidate = path.resolve(this.hostRoot, relative);
+    if (candidate !== this.hostRoot && !candidate.startsWith(`${this.hostRoot}${path.sep}`)) {
+      throw accessDenied(pathName);
+    }
+    const stat = await fs.lstat(candidate).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (stat?.isFile() && stat.nlink > 1) throw accessDenied(pathName);
   }
 
   async readFile(pathName: string, options?: Parameters<IFileSystem["readFile"]>[1]) {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     return await this.inner.readFile(pathName, options);
   }
 
   async readFileBytes(pathName: string) {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     if (this.inner.readFileBytes) return await this.inner.readFileBytes(pathName);
     const buffer = await this.inner.readFileBuffer(pathName);
     return unsafeBytesFromLatin1(Buffer.from(buffer).toString("latin1"));
   }
 
   async readFileBuffer(pathName: string) {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     return await this.inner.readFileBuffer(pathName);
   }
 
@@ -123,6 +138,7 @@ class RestrictedReadFs implements IFileSystem {
     content: Parameters<IFileSystem["writeFile"]>[1],
     options?: Parameters<IFileSystem["writeFile"]>[2],
   ) {
+    await this.assertWritable(pathName);
     return await this.inner.writeFile(pathName, content, options);
   }
 
@@ -131,47 +147,57 @@ class RestrictedReadFs implements IFileSystem {
     content: Parameters<IFileSystem["appendFile"]>[1],
     options?: Parameters<IFileSystem["appendFile"]>[2],
   ) {
+    await this.assertWritable(pathName);
     return await this.inner.appendFile(pathName, content, options);
   }
 
   async exists(pathName: string) {
-    if (isDeniedWorkspacePath(pathName)) return false;
+    if (this.denyOutsideMount && normalizeVirtualPath(pathName) !== "/") return false;
+    try {
+      await this.assertReadable(pathName);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "EACCES") return false;
+      throw error;
+    }
     return await this.inner.exists(pathName);
   }
 
   async stat(pathName: string): Promise<FsStat> {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     return await this.inner.stat(pathName);
   }
 
   async mkdir(pathName: string, options?: Parameters<IFileSystem["mkdir"]>[1]) {
+    await this.assertWritable(pathName);
     return await this.inner.mkdir(pathName, options);
   }
 
   async readdir(pathName: string) {
-    this.assertReadable(pathName);
-    const entries = await this.inner.readdir(pathName);
-    return entries.filter((name) => this.filterChild(pathName, name));
+    await this.assertReadable(pathName);
+    return await this.inner.readdir(pathName);
   }
 
   async readdirWithFileTypes(pathName: string) {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     const entries = await this.inner.readdirWithFileTypes?.(pathName);
-    if (entries) return entries.filter((entry) => this.filterChild(pathName, entry.name));
+    if (entries) return entries;
     return [];
   }
 
   async rm(pathName: string, options?: Parameters<IFileSystem["rm"]>[1]) {
+    await this.assertWritable(pathName);
     return await this.inner.rm(pathName, options);
   }
 
   async cp(src: string, dest: string, options?: Parameters<IFileSystem["cp"]>[2]) {
-    this.assertReadable(src);
+    await this.assertReadable(src);
+    await this.assertWritable(dest);
     return await this.inner.cp(src, dest, options);
   }
 
   async mv(src: string, dest: string) {
-    this.assertReadable(src);
+    await this.assertWritable(src);
+    await this.assertWritable(dest);
     return await this.inner.mv(src, dest);
   }
 
@@ -180,38 +206,43 @@ class RestrictedReadFs implements IFileSystem {
   }
 
   getAllPaths() {
-    return this.inner.getAllPaths().filter((p) => !isDeniedWorkspacePath(p));
+    if (this.denyOutsideMount) return [];
+    return this.inner.getAllPaths();
   }
 
   async chmod(pathName: string, mode: number) {
+    await this.assertWritable(pathName);
     return await this.inner.chmod(pathName, mode);
   }
 
   async symlink(target: string, linkPath: string) {
-    return await this.inner.symlink(target, linkPath);
+    await this.assertWritable(linkPath);
+    throw accessDenied(`${linkPath} -> ${target}`);
   }
 
   async link(existingPath: string, newPath: string) {
-    this.assertReadable(existingPath);
-    return await this.inner.link(existingPath, newPath);
+    await this.assertReadable(existingPath);
+    await this.assertWritable(newPath);
+    throw accessDenied(`${newPath} -> ${existingPath}`);
   }
 
   async readlink(pathName: string) {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     return await this.inner.readlink(pathName);
   }
 
   async lstat(pathName: string): Promise<FsStat> {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     return await this.inner.lstat(pathName);
   }
 
   async realpath(pathName: string) {
-    this.assertReadable(pathName);
+    await this.assertReadable(pathName);
     return await this.inner.realpath(pathName);
   }
 
   async utimes(pathName: string, atime: Date, mtime: Date) {
+    await this.assertWritable(pathName);
     return await this.inner.utimes(pathName, atime, mtime);
   }
 }
@@ -253,6 +284,11 @@ function buildToolServerHeaders(
   if (context.requestId) headers["x-lilac-request-id"] = context.requestId;
   if (context.sessionId) headers["x-lilac-session-id"] = context.sessionId;
   if (context.requestClient) headers["x-lilac-request-client"] = context.requestClient;
+  if (context.controlCapability) {
+    headers["x-lilac-control-capability"] = context.controlCapability;
+  }
+  if (context.toolCallId) headers["x-lilac-tool-call-id"] = context.toolCallId;
+  if (context.subagentProfile) headers["x-lilac-subagent-profile"] = context.subagentProfile;
   headers["x-lilac-cwd"] = cwd;
   return headers;
 }
@@ -455,7 +491,7 @@ function resolveRestrictedCwd(input: {
   if (input.cwd === WORKSPACE_MOUNT || input.cwd.startsWith(`${WORKSPACE_MOUNT}/`))
     return input.cwd;
 
-  return WORKSPACE_MOUNT;
+  throw new Error("Restricted bash cwd is outside the approved workspace and session temp roots");
 }
 
 async function createRestrictedBash(params: {
@@ -464,14 +500,32 @@ async function createRestrictedBash(params: {
   context: RestrictedBashContext;
 }): Promise<Bash> {
   await fs.mkdir(params.sessionTmpDir, { recursive: true, mode: 0o700 });
+  if (params.context.workspaceWritable) {
+    const workspaceStats = await fs.lstat(params.workspaceRoot);
+    if (
+      workspaceStats.isSymbolicLink() ||
+      !workspaceStats.isDirectory() ||
+      (await fs.realpath(params.workspaceRoot)) !== params.workspaceRoot
+    ) {
+      throw new Error("Restricted writable workspace must be a canonical real directory");
+    }
+  }
 
   const workspaceFs = new RestrictedReadFs(
-    new OverlayFs({
-      root: params.workspaceRoot,
-      mountPoint: "/",
-      maxFileReadSize: MAX_RESTRICTED_FILE_READ_BYTES,
-      allowSymlinks: false,
-    }),
+    params.context.workspaceWritable
+      ? new ReadWriteFs({
+          root: params.workspaceRoot,
+          maxFileReadSize: MAX_RESTRICTED_FILE_READ_BYTES,
+          allowSymlinks: false,
+        })
+      : new OverlayFs({
+          root: params.workspaceRoot,
+          mountPoint: "/",
+          maxFileReadSize: MAX_RESTRICTED_FILE_READ_BYTES,
+          allowSymlinks: false,
+        }),
+    false,
+    params.workspaceRoot,
   );
 
   const tmpFs = new ReadWriteFs({
@@ -481,7 +535,7 @@ async function createRestrictedBash(params: {
   });
 
   const mountable = new MountableFs({
-    base: new InMemoryFs(),
+    base: new RestrictedReadFs(new InMemoryFs(), true),
     mounts: [
       { mountPoint: WORKSPACE_MOUNT, filesystem: workspaceFs },
       { mountPoint: TMP_MOUNT, filesystem: tmpFs },
@@ -536,6 +590,8 @@ async function getRestrictedBash(params: {
     params.context.sessionId ?? "",
     params.requestId,
     params.workspaceRoot,
+    params.context.toolCallId ?? "",
+    params.context.workspaceWritable ? "write" : "read",
   ]);
 
   const cached = restrictedBashByRequest.get(cacheKey);
@@ -564,7 +620,7 @@ export async function executeRestrictedBash(
     // just-bash commands see empty stdin by default; keep accepting this compatibility flag.
   }
 
-  const context = options.context ?? {};
+  const context = { ...options.context, toolCallId: options.toolCallId };
   const workspaceRoot = path.resolve(expandTilde(options.workspaceRoot ?? process.cwd()));
   const sessionTmpDir = resolveRestrictedSessionTmpDir(context.sessionId);
 

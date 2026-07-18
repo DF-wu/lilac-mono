@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { asSchema } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 
@@ -56,6 +57,18 @@ function getToolDescription(tools: Record<string, unknown>, name: string): strin
   return description;
 }
 
+function getBatchToolNames(tools: Record<string, unknown>): string[] {
+  const batch = tools["batch"];
+  if (!batch || typeof batch !== "object") throw new Error("missing batch tool");
+  const inputSchema = (batch as { inputSchema?: unknown }).inputSchema;
+  const schema = asSchema(inputSchema as never).jsonSchema as {
+    properties?: {
+      tool_calls?: { items?: { properties?: { tool?: { enum?: string[] } } } };
+    };
+  };
+  return schema.properties?.tool_calls?.items?.properties?.tool?.enum ?? [];
+}
+
 const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "attachment.add_files",
   "attachment.download",
@@ -102,11 +115,20 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "surface.reactions.remove",
   "surface.sessions.list",
   "surface.sessions.listParticipants",
-  "workflow.cancel",
-  "workflow.list",
-  "workflow.schedule",
-  "workflow.wait_for_reply.create",
-  "workflow.wait_for_reply.send_and_wait",
+  "workflow.definition.get",
+  "workflow.definition.list",
+  "workflow.definition.save",
+  "workflow.definition.validate",
+  "workflow.run.cancel",
+  "workflow.run.get",
+  "workflow.run.list",
+  "workflow.run.pause",
+  "workflow.run.resume",
+  "workflow.run.trigger",
+  "workflow.trigger.cancel",
+  "workflow.trigger.create",
+  "workflow.trigger.get",
+  "workflow.trigger.list",
 ].sort();
 
 const OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS = new Set(["generate.image", "generate.video"]);
@@ -321,7 +343,7 @@ describe("core tool plugin manager", () => {
     });
 
     expect(getToolDescription(toolset.tools, "read_file")).toContain(
-      "Use this tool to read image files and PDFs directly, prefer this over OCR or other tools.",
+      "calling read_file attaches the original file to your context for native visual or document analysis",
     );
   });
 
@@ -539,6 +561,11 @@ describe("core tool plugin manager", () => {
         .filter((id) => OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS.has(id))
         .every((id) => OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS.has(id)),
     ).toBe(true);
+
+    const contributionByTool = manager.getLevel2ContributionInfo();
+    const webTool = manager.getLevel2Tools().find((tool) => tool.id === "web");
+    if (!webTool) throw new Error("missing web tool");
+    expect(contributionByTool.get(webTool)?.pluginId).toBe("web");
   });
 
   it("skips capability-dependent plugins in dev mode", async () => {
@@ -579,7 +606,6 @@ describe("core tool plugin manager", () => {
     return {
       level1: [{
         name: "fixture_level1",
-        supportsBatch: true,
         bypassGenericOutputNormalizer: true,
         createTool() { return { execute() { return { ok: true }; } }; },
         isEnabled() { return true; },
@@ -618,6 +644,8 @@ describe("core tool plugin manager", () => {
     });
     expect(level1.specs.has("fixture_level1")).toBe(true);
     expect(level1.genericOutputNormalizerBypassTools.has("fixture_level1")).toBe(false);
+    expect(getBatchToolNames(level1.tools)).toContain("fixture_level1");
+    expect(getBatchToolNames(level1.tools)).not.toContain("batch");
 
     const callableIds = (
       await Promise.all(
@@ -627,5 +655,103 @@ describe("core tool plugin manager", () => {
       )
     ).flat();
     expect(callableIds).toContain("fixture.echo");
+  });
+
+  it("uses the same native profile plugin gates with and without a request context", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "profile-fixture",
+      entryBody: `export default {
+  meta: { id: "profile-fixture" },
+  create() { return {
+    level1: [{
+      name: "fixture_write",
+      createTool() { return { execute() { return { ok: true }; } }; },
+      isEnabled() { return true; },
+    }],
+    level2: [{
+      id: "fixture",
+      async init() {}, async destroy() {},
+      async list() { return [{ callableId: "fixture.echo", name: "Fixture", description: "Fixture", shortInput: [] }]; },
+      async call() { return { ok: true }; },
+    }],
+  }; },
+};`,
+    });
+    const base = testConfig({});
+    const makeManager = (enabled: boolean) =>
+      createCoreToolPluginManager({
+        runtime: {
+          config: {
+            ...base,
+            agent: {
+              ...base.agent,
+              subagents: {
+                ...base.agent.subagents,
+                profiles: {
+                  ...base.agent.subagents.profiles,
+                  general: {
+                    ...base.agent.subagents.profiles.general,
+                    level1: {
+                      ...base.agent.subagents.profiles.general.level1,
+                      plugins: enabled ? ["profile-fixture"] : [],
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        dataDir,
+      });
+    const requestContext = {
+      requestId: "profile-plugin",
+      sessionId: "profile-plugin",
+      requestClient: "unknown",
+      subagentDepth: 1,
+      subagentProfile: "general" as const,
+    };
+
+    const denied = makeManager(false);
+    await denied.init();
+    expect(
+      (
+        await denied.buildLevel1Toolset({
+          cwd: dataDir,
+          runProfile: "general",
+          editingToolMode: "none",
+          subagentDepth: 1,
+          subagentConfig: base.agent.subagents!,
+          requestContext,
+        })
+      ).specs.has("fixture_write"),
+    ).toBe(false);
+    await denied.destroy();
+
+    const enabled = makeManager(true);
+    await enabled.init();
+    expect(
+      (
+        await enabled.buildLevel1Toolset({
+          cwd: dataDir,
+          runProfile: "general",
+          editingToolMode: "none",
+          subagentDepth: 1,
+          subagentConfig: base.agent.subagents!,
+          requestContext,
+        })
+      ).specs.has("fixture_write"),
+    ).toBe(true);
+    const direct = await enabled.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "general",
+      editingToolMode: "none",
+      subagentDepth: 1,
+      subagentConfig: base.agent.subagents,
+    });
+    expect(direct.specs.has("fixture_write")).toBe(true);
+    await enabled.destroy();
   });
 });

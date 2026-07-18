@@ -4,6 +4,7 @@ import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lila
 
 import {
   DiscordAdapter,
+  classifyDiscordSurfaceNotFound,
   buildDiscordSlashOption,
   hasExplicitDiscordUserMentionInContent,
   isExplicitDiscordUserMention,
@@ -12,6 +13,7 @@ import {
   resolveOutputNotificationEnabled,
   resolveEffectiveSessionModelOverride,
 } from "../../../src/surface/discord/discord-adapter";
+import { SurfaceMessageNotFoundError } from "../../../src/surface/adapter";
 
 function testConfigWithStatusMessage(statusMessage?: string): CoreConfig {
   const discord = {
@@ -34,6 +36,18 @@ function makeMessage(input: { bot: boolean; system: boolean; type: MessageType }
     type: input.type,
   } as unknown as Message;
 }
+
+describe("classifyDiscordSurfaceNotFound", () => {
+  it("maps only Discord unknown-channel/message codes to the common typed error", () => {
+    for (const code of [10_003, 10_008]) {
+      const classified = classifyDiscordSurfaceNotFound({ code }, "missing");
+      expect(classified).toBeInstanceOf(SurfaceMessageNotFoundError);
+      expect(classified).toMatchObject({ platform: "discord", code });
+    }
+    expect(classifyDiscordSurfaceNotFound({ code: 50_013 }, "forbidden")).toBeNull();
+    expect(classifyDiscordSurfaceNotFound(new Error("network"), "network")).toBeNull();
+  });
+});
 
 describe("isRoutableDiscordUserMessage", () => {
   it("accepts normal user chat messages", () => {
@@ -431,6 +445,42 @@ describe("DiscordAdapter.editMsg", () => {
     expect(edited?.description).toBe("new-description");
     expect(edited?.fields).toEqual([{ name: "field-1", value: "value-1" }]);
     expect(edited?.footer).toEqual({ text: "keep-footer" });
+  });
+
+  it("clears existing attachments when an edit supplies an empty attachment list", async () => {
+    const editCalls: Array<Record<string, unknown>> = [];
+    const message = {
+      author: { id: "bot" },
+      embeds: [
+        {
+          toJSON: () => ({ description: "old-description" }),
+        },
+      ],
+      edit: async (options: Record<string, unknown>) => {
+        editCalls.push(options);
+      },
+    } as unknown as Message;
+
+    const adapter = new DiscordAdapter();
+    (adapter as unknown as { client: unknown }).client = {
+      user: { id: "bot" },
+      channels: {
+        fetch: async () => ({
+          messages: {
+            fetch: async () => message,
+          },
+        }),
+      },
+    };
+
+    await adapter.editMsg(
+      { platform: "discord", channelId: "c1", messageId: "m1" },
+      { text: "new-description", attachments: [] },
+    );
+
+    expect(editCalls).toHaveLength(1);
+    expect(editCalls[0]?.attachments).toEqual([]);
+    expect(editCalls[0]?.files).toEqual([]);
   });
 
   it("fails for non-bot-authored messages", async () => {

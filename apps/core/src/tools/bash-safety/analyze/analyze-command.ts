@@ -1,72 +1,61 @@
+import { parse, type ScriptNode } from "just-bash";
+
 import { type AnalyzeOptions, type AnalyzeResult, MAX_RECURSION_DEPTH } from "../types";
 
-import { splitShellCommands } from "../shell";
+import { analyzeScript } from "./ast-walker";
 
-import { dangerousInText } from "./dangerous-text";
-import { analyzeSegment, segmentChangesCwd } from "./segment";
-
-const REASON_STRICT_UNPARSEABLE =
-  "Command could not be safely analyzed (strict mode). Verify manually.";
+const REASON_RECURSION_LIMIT =
+  "Command could not be safely analyzed because nested shell recursion exceeded the safety limit.";
 
 export function analyzeCommandInternal(
   command: string,
   depth: number,
   options: AnalyzeOptions,
 ): AnalyzeResult | null {
+  return analyzeCommandAtCwd(command, depth, options, options.cwd);
+}
+
+function analyzeCommandAtCwd(
+  command: string,
+  depth: number,
+  options: AnalyzeOptions,
+  effectiveCwd: string | null | undefined,
+): AnalyzeResult | null {
   if (depth >= MAX_RECURSION_DEPTH) {
-    return null;
+    return { reason: REASON_RECURSION_LIMIT, segment: command };
   }
 
-  const segments = splitShellCommands(command);
-
-  // Strict mode: block if command couldn't be parsed (unclosed quotes, etc.)
-  // Detected when splitShellCommands returns a single segment containing the raw command.
-  if (
-    options.strict &&
-    segments.length === 1 &&
-    segments[0]?.length === 1 &&
-    segments[0][0] === command &&
-    command.includes(" ")
-  ) {
-    return { reason: REASON_STRICT_UNPARSEABLE, segment: command };
+  let script: ScriptNode;
+  try {
+    script = parse(command);
+  } catch (error) {
+    return {
+      reason: `Command could not be safely analyzed because shell parsing failed: ${parserErrorDetail(error)}.`,
+      segment: command,
+    };
   }
 
-  const originalCwd = options.cwd;
-  let effectiveCwd: string | null | undefined = options.cwd;
+  return analyzeScript(
+    script,
+    {
+      depth,
+      options,
+      originalCwd: options.cwd,
+      analyzeNestedCommand: (nestedCommand, nestedDepth, nestedCwd) =>
+        analyzeCommandAtCwd(nestedCommand, nestedDepth, options, nestedCwd),
+    },
+    { cwd: effectiveCwd },
+  );
+}
 
-  for (const segment of segments) {
-    const segmentStr = segment.join(" ");
-
-    if (segment.length === 1 && segment[0]?.includes(" ")) {
-      const textReason = dangerousInText(segment[0]);
-      if (textReason) {
-        return { reason: textReason, segment: segmentStr };
-      }
-
-      if (segmentChangesCwd(segment)) {
-        effectiveCwd = null;
-      }
-
-      continue;
-    }
-
-    const reason = analyzeSegment(segment, {
-      ...options,
-      cwd: originalCwd,
-      effectiveCwd,
-      analyzeNested: (nestedCommand: string): string | null => {
-        return analyzeCommandInternal(nestedCommand, depth + 1, options)?.reason ?? null;
-      },
-    });
-
-    if (reason) {
-      return { reason, segment: segmentStr };
-    }
-
-    if (segmentChangesCwd(segment)) {
-      effectiveCwd = null;
-    }
-  }
-
-  return null;
+function parserErrorDetail(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const withoutQuotedContent = raw
+    .replace(/`[^`]*`/g, "<token>")
+    .replace(/'[^']*'/g, "<token>")
+    .replace(/"[^"]*"/g, "<token>");
+  return withoutQuotedContent
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[^a-zA-Z0-9 _.:()<>/-]/g, "?")
+    .slice(0, 200);
 }

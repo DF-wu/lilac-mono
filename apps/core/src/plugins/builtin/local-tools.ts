@@ -1,4 +1,5 @@
 import type { ServerTool } from "@stanley2058/lilac-plugin-runtime";
+import { resolveNativeSubagentProfile } from "@stanley2058/lilac-utils";
 
 import { applyPatchTool } from "../../tools/apply-patch";
 import {
@@ -8,7 +9,11 @@ import {
 } from "../../tools/batch";
 import { bashToolWithCwd } from "../../tools/bash";
 import { fsTool } from "../../tools/fs/fs";
-import { subagentTools, type DeferredSubagentRegistration } from "../../tools/subagent";
+import {
+  subagentTools,
+  type SubagentDelegationHandle,
+  type SubagentDelegationRegistration,
+} from "../../tools/subagent";
 import { BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS } from "../../surface/bridge/bus-agent-runner/tool-failure-logging";
 import { BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS } from "../../tools/tool-args-display";
 import { markBoundedBuiltinOutput, type CoreLevel1ToolSpec, type CoreToolPlugin } from "../types";
@@ -42,6 +47,7 @@ function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
           sessionId: context.requestContext.sessionId,
         }
       : undefined,
+    loadInstructions: true,
   });
   localFsToolsByBuildContext.set(context, tools);
   return tools;
@@ -75,12 +81,16 @@ function withBoundedOutput(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
   return markBoundedBuiltinOutput(withBuiltinMetadata(spec));
 }
 
-function getDeferredDelegateHandler(requestContext: {
+function getDelegateHandler(requestContext: {
   metadata?: Readonly<Record<string, unknown>>;
-}): ((registration: DeferredSubagentRegistration) => Promise<void>) | undefined {
-  const candidate = requestContext.metadata?.["onDeferredDelegate"];
+}):
+  | ((registration: SubagentDelegationRegistration) => Promise<SubagentDelegationHandle>)
+  | undefined {
+  const candidate = requestContext.metadata?.["onSubagentDelegate"];
   return typeof candidate === "function"
-    ? (candidate as (registration: DeferredSubagentRegistration) => Promise<void>)
+    ? (candidate as (
+        registration: SubagentDelegationRegistration,
+      ) => Promise<SubagentDelegationHandle>)
     : undefined;
 }
 
@@ -97,49 +107,50 @@ function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
   return [
     withBoundedOutput({
       name: "bash",
-      supportsBatch: true,
-      isEnabled: ({ runProfile }) => runProfile !== "explore",
-      createTool: ({ cwd, runtime, requestContext }) => {
+      isEnabled: () => true,
+      createTool: (context) => {
+        const { cwd, runtime, requestContext, runProfile } = context;
         const onActivity = requestContext ? getAgentActivityHandler(requestContext) : undefined;
+        const controlCapability = requestContext?.metadata?.["controlCapability"];
         return bashToolWithCwd(cwd, {
           artifacts: runtime.toolResultArtifacts,
           outputConfig: runtime.config?.tools.output,
           onActivity: onActivity ? () => onActivity("tool") : undefined,
+          controlCapability: typeof controlCapability === "string" ? controlCapability : undefined,
+          nativeProfile:
+            runProfile === "primary" || !runtime.config
+              ? undefined
+              : resolveNativeSubagentProfile(runtime.config, runProfile),
         }).bash;
       },
     }),
     withBoundedOutput({
       name: "read_file",
-      supportsBatch: true,
       isEnabled: () => true,
       createTool: (context) => getFsReadOnlyTool("read_file", context),
     }),
     withBoundedOutput({
       name: "glob",
-      supportsBatch: true,
-      isEnabled: ({ requestContext }) => requestContext?.safetyMode !== "restricted",
+      isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
       createTool: (context) => getFsReadOnlyTool("glob", context),
     }),
     withBoundedOutput({
       name: "grep",
-      supportsBatch: true,
-      isEnabled: ({ requestContext }) => requestContext?.safetyMode !== "restricted",
+      isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
       createTool: (context) => getFsReadOnlyTool("grep", context),
     }),
     withBoundedOutput({
       name: "fuzzy_search",
-      supportsBatch: true,
-      isEnabled: ({ runtime, requestContext }) =>
-        runtime.config?.tools.fsBackend === "fff" && requestContext?.safetyMode !== "restricted",
+      isEnabled: (context) =>
+        context.runtime.config?.tools.fsBackend === "fff" &&
+        context.requestContext?.safetyMode !== "restricted",
       createTool: (context) => getFsReadOnlyTool("fuzzy_search", context),
     }),
     withBoundedOutput({
       name: "edit_file",
-      supportsBatch: true,
-      isEnabled: ({ runProfile, editingToolMode, requestContext }) =>
-        runProfile !== "explore" &&
-        editingToolMode === "edit_file" &&
-        requestContext?.safetyMode !== "restricted",
+      isEnabled: (context) =>
+        context.editingToolMode === "edit_file" &&
+        context.requestContext?.safetyMode !== "restricted",
       createTool: (context) => getEditFileTool(context),
       editTargets: (args, context) => {
         const record = args as Record<string, unknown>;
@@ -151,12 +162,13 @@ function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
     }),
     withBoundedOutput({
       name: "apply_patch",
-      supportsBatch: true,
-      isEnabled: ({ runProfile, editingToolMode, requestContext }) =>
-        runProfile !== "explore" &&
-        editingToolMode === "apply_patch" &&
-        requestContext?.safetyMode !== "restricted",
-      createTool: ({ cwd }) => applyPatchTool({ cwd }).apply_patch,
+      isEnabled: (context) =>
+        context.editingToolMode === "apply_patch" &&
+        context.requestContext?.safetyMode !== "restricted",
+      createTool: (context) =>
+        applyPatchTool({
+          cwd: context.cwd,
+        }).apply_patch,
       editTargets: (args, context) => {
         const record = args as Record<string, unknown>;
         if (typeof record.patchText !== "string") {
@@ -167,9 +179,7 @@ function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
     }),
     withBoundedOutput({
       name: "subagent_delegate",
-      isEnabled: ({ runProfile, runtime, subagentConfig, subagentDepth, requestContext }) =>
-        runProfile !== "explore" &&
-        runProfile !== "general" &&
+      isEnabled: ({ runtime, subagentConfig, subagentDepth, requestContext }) =>
         Boolean(runtime.bus) &&
         subagentConfig.enabled &&
         subagentDepth < subagentConfig.maxDepth &&
@@ -185,30 +195,21 @@ function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
           maxDepth: subagentConfig.maxDepth,
           modelPresets: runtime.config?.models.def,
           delegatePromptOverlay: runtime.config?.agent.subagents.delegatePromptOverlay,
-          onDeferredDelegate: requestContext
-            ? getDeferredDelegateHandler(requestContext)
-            : undefined,
+          onDelegate: requestContext ? getDelegateHandler(requestContext) : undefined,
           onActivity: onActivity ? () => onActivity("subagent") : undefined,
         }).subagent_delegate;
       },
     }),
     withBoundedOutput({
       name: "batch",
+      supportsBatch: false,
       isEnabled: () => true,
-      createTool: ({
-        cwd,
-        editingToolMode,
-        getTools,
-        getLevel1ToolSpecs,
-        reportToolStatus,
-        runtime,
-      }) =>
+      createTool: ({ cwd, editingToolMode, getTools, getLevel1ToolSpecs, runtime }) =>
         batchTool({
           defaultCwd: cwd,
           getTools,
           getToolSpecs: getLevel1ToolSpecs,
           editingMode: editingToolMode,
-          reportToolStatus,
           maxCalls: runtime.config?.tools.batch.maxCalls ?? 8,
         }).batch,
     }),

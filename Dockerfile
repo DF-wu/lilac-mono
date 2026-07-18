@@ -1,17 +1,13 @@
 ARG BASE_IMAGE=ubuntu:24.04
 ARG NODE_MAJOR=22
-ARG CONTAINER_USER=lilac
 ARG CONTAINER_UID=1000
 
 ############################
-# Stage 1: sandbox tools
+# Stage 1: runtime tools
 ############################
 FROM ${BASE_IMAGE} AS tools
 ARG NODE_MAJOR
-ARG CONTAINER_USER
-ARG CONTAINER_UID
-ENV LILAC_USER=${CONTAINER_USER}
-ENV LILAC_UID=${CONTAINER_UID}
+ENV LILAC_USER=lilac
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,18 +18,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN install -d -m 0755 /etc/apt/keyrings \
   && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-  | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
   && chmod a+r /etc/apt/keyrings/nodesource.gpg \
   && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
-  > /etc/apt/sources.list.d/nodesource.list \
+    > /etc/apt/sources.list.d/nodesource.list \
   && ARCH="$(dpkg --print-architecture)" \
   && if [ "$ARCH" = "amd64" ]; then \
-  curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-  | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg; \
-  chmod a+r /etc/apt/keyrings/google-chrome.gpg; \
-  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-  > /etc/apt/sources.list.d/google-chrome.list; \
-  fi
+       curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+         | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg; \
+       chmod a+r /etc/apt/keyrings/google-chrome.gpg; \
+       echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+         > /etc/apt/sources.list.d/google-chrome.list; \
+     fi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
@@ -62,37 +58,53 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ripgrep \
   sqlite3 \
   tar \
+  tini \
   unzip \
+  util-linux \
   vulkan-tools \
-  rsync \ 
   && ARCH="$(dpkg --print-architecture)" \
   && if [ "$ARCH" = "amd64" ]; then \
-  apt-get install -y --no-install-recommends google-chrome-stable; \
-  fi \
+       apt-get install -y --no-install-recommends google-chrome-stable; \
+     fi \
   && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu/Debian call it "fdfind"
 RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
-# Non-root user (needed for bun/npm global installs)
-RUN if id -u "$LILAC_USER" >/dev/null 2>&1; then \
-  if [ "$(id -u "$LILAC_USER")" != "$LILAC_UID" ]; then \
-  usermod -u "$LILAC_UID" "$LILAC_USER"; \
-  fi; \
-  usermod -d "/home/$LILAC_USER" -m -s /bin/bash "$LILAC_USER"; \
-  elif getent passwd "$LILAC_UID" >/dev/null 2>&1; then \
-  existing_user="$(getent passwd "$LILAC_UID" | cut -d: -f1)"; \
-  usermod -l "$LILAC_USER" "$existing_user"; \
-  usermod -d "/home/$LILAC_USER" -m -s /bin/bash "$LILAC_USER"; \
-  if getent group "$existing_user" >/dev/null 2>&1; then \
-  groupmod -n "$LILAC_USER" "$existing_user"; \
-  fi; \
-  else \
-  useradd -m -u "$LILAC_UID" -s /bin/bash "$LILAC_USER"; \
-  fi
-RUN if [ "$LILAC_USER" = "Catalina" ] && [ ! -e /home/Catalinna ]; then \
-  ln -s /home/Catalina /home/Catalinna; \
-  fi
+ARG CONTAINER_UID
+
+# Create a dedicated regular user instead of inheriting an image account's
+# groups or account settings. Ubuntu reserves UID/GID 1000 for `ubuntu`.
+RUN case "$CONTAINER_UID" in \
+      ''|*[!0-9]*) echo "CONTAINER_UID must be a numeric regular-user UID" >&2; exit 1 ;; \
+    esac \
+  && if [ "$CONTAINER_UID" -lt 1000 ] || [ "$CONTAINER_UID" -gt 60000 ]; then \
+       echo "CONTAINER_UID must be between 1000 and 60000" >&2; exit 1; \
+     fi \
+  && if id -u "$LILAC_USER" >/dev/null 2>&1; then \
+       userdel --remove "$LILAC_USER"; \
+     fi \
+  && existing_user="$(getent passwd "$CONTAINER_UID" | cut -d: -f1 || true)" \
+  && if [ -n "$existing_user" ]; then \
+       if [ "$existing_user" != "ubuntu" ]; then \
+         echo "CONTAINER_UID is already assigned to a base-image account" >&2; exit 1; \
+       fi; \
+       userdel --remove ubuntu; \
+     fi \
+  && if getent group "$LILAC_USER" >/dev/null 2>&1; then \
+       groupdel "$LILAC_USER"; \
+     fi \
+  && existing_group="$(getent group "$CONTAINER_UID" | cut -d: -f1 || true)" \
+  && if [ -n "$existing_group" ]; then \
+       if [ "$existing_group" != "ubuntu" ]; then \
+         echo "CONTAINER_UID is already assigned to a base-image group" >&2; exit 1; \
+       fi; \
+       groupdel ubuntu; \
+     fi \
+  && groupadd --gid "$CONTAINER_UID" "$LILAC_USER" \
+  && useradd --create-home --uid "$CONTAINER_UID" --gid "$LILAC_USER" \
+       --shell /bin/bash "$LILAC_USER" \
+  && [ "$(id -G "$LILAC_USER")" = "$CONTAINER_UID" ]
 ENV HOME=/home/${LILAC_USER}
 ENV DATA_DIR=/data
 ENV LILAC_WORKSPACE_DIR=${DATA_DIR}/workspace
@@ -103,7 +115,7 @@ ENV BUN_INSTALL_BIN=${DATA_DIR}/bin
 ENV BUN_INSTALL_CACHE_DIR=${DATA_DIR}/.bun/install/cache
 ENV NPM_CONFIG_PREFIX=${DATA_DIR}/.npm-global
 ENV XDG_CONFIG_HOME=${DATA_DIR}/.config
-ENV PATH=${BUN_INSTALL_BIN}:${NPM_CONFIG_PREFIX}/bin:${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:${BUN_INSTALL_BIN}:${NPM_CONFIG_PREFIX}/bin:${HOME}/.local/bin:${HOME}/.bun/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN mkdir -p $DATA_DIR $DATA_DIR/secret
 RUN chown -R ${LILAC_USER}:$(id -gn "${LILAC_USER}") $DATA_DIR
@@ -167,8 +179,24 @@ ARG LILAC_BUILD_AT=
 # Generate build metadata late so commit-only changes do not invalidate source build layers.
 RUN mkdir -p /app/build && BUILD_AT_FRAGMENT="" && if [ -n "$LILAC_BUILD_AT" ]; then BUILD_AT_FRAGMENT=$(printf ',\n  "builtAt": "%s"' "$LILAC_BUILD_AT"); fi && printf '{\n  "version": "%s",\n  "commit": "%s",\n  "dirty": %s%s\n}\n' "$LILAC_BUILD_VERSION" "$LILAC_BUILD_COMMIT" "$LILAC_BUILD_DIRTY" "$BUILD_AT_FRAGMENT" > /app/build/build-info.json
 RUN chown -R ${LILAC_USER}:$(id -gn "${LILAC_USER}") /app/build
-# Make `tools` available globally
-RUN ln -sf /app/apps/tool-bridge/dist/index.js /usr/local/bin/tools
-USER ${LILAC_USER}
-# Entrypoint: core runtime
-CMD ["bun", "apps/core/src/runtime/main.ts"]
+# Keep the operator CLI outside the lilac-writable application build tree.
+RUN install -d -o root -g root -m 0755 /usr/local/libexec/lilac-tool-bridge \
+  && install -o root -g root -m 0755 \
+       /home/${LILAC_USER}/.bun/bin/bun \
+       /usr/local/bin/bun \
+  && install -o root -g root -m 0755 \
+       /app/apps/tool-bridge/dist/index.js \
+       /usr/local/libexec/lilac-tool-bridge/index.js \
+  && install -o root -g root -m 0644 \
+       /app/apps/tool-bridge/dist/client.js \
+       /usr/local/libexec/lilac-tool-bridge/client.js \
+  && ln -s /usr/local/libexec/lilac-tool-bridge/index.js /usr/local/bin/tools
+
+COPY --chmod=0755 docker/direct-entrypoint.sh /usr/local/sbin/lilac-entrypoint
+COPY docker/create-operator-token.mjs /usr/local/libexec/create-operator-token.mjs
+RUN chown -R root:root /app \
+  && chmod -R go-w /app
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/sbin/lilac-entrypoint"]
+CMD ["/usr/local/bin/bun", "apps/core/src/runtime/main.ts"]

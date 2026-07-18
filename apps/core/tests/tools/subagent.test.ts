@@ -178,6 +178,7 @@ describe("subagent_delegate tool", () => {
     const delegate = tools.subagent_delegate as unknown as {
       description?: string;
       inputSchema: unknown;
+      outputSchema: unknown;
     };
     const schema = asSchema(delegate.inputSchema as never).jsonSchema as unknown as {
       properties?: {
@@ -204,6 +205,9 @@ describe("subagent_delegate tool", () => {
     expect(schema.properties?.model?.enum).not.toContain("invalidTarget");
     expect(schema.properties?.reasoning?.enum).toContain("xhigh");
     expect(delegate.description).toContain("Escalate critical reviews to a stronger model.");
+    expect(JSON.stringify(asSchema(delegate.outputSchema as never).jsonSchema)).toContain(
+      "workflowRunId",
+    );
   });
 
   it("omits the model field when no aliases are selectable", async () => {
@@ -297,8 +301,13 @@ describe("subagent_delegate tool", () => {
           agentCanSelect: false,
         },
       },
-      onDeferredDelegate: async (registration) => {
+      onDelegate: async (registration) => {
         selected = registration;
+        return {
+          runId: "run:model-override",
+          completion: Promise.resolve({ status: "resolved", finalText: "" }),
+          cancel: async () => {},
+        };
       },
     });
 
@@ -361,13 +370,18 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
-      onDeferredDelegate: async (registration) => {
+      onDelegate: async (registration) => {
         launches.push({
           sessionName: registration.sessionName,
           childRequestId: registration.childRequestId,
           childSessionId: registration.childSessionId,
           task: registration.task,
         });
+        return {
+          runId: "run:deferred-1",
+          completion: Promise.resolve({ status: "resolved", finalText: "" }),
+          cancel: async () => {},
+        };
       },
     });
 
@@ -391,6 +405,7 @@ describe("subagent_delegate tool", () => {
       ok: true,
       mode: "deferred",
       status: "accepted",
+      workflowRunId: "run:deferred-1",
       profile: "explore",
       sessionName: expect.stringMatching(/^explore-[0-9a-f]{8}$/u),
     });
@@ -415,12 +430,17 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
-      onDeferredDelegate: async (registration) => {
+      onDelegate: async (registration) => {
         launches.push({
           sessionName: registration.sessionName,
           childRequestId: registration.childRequestId,
           childSessionId: registration.childSessionId,
         });
+        return {
+          runId: "run:legacy-session-id",
+          completion: Promise.resolve({ status: "resolved", finalText: "" }),
+          cancel: async () => {},
+        };
       },
     });
 
@@ -463,6 +483,11 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
+      onDelegate: async () => ({
+        runId: "run:sync-result",
+        completion: Promise.resolve({ status: "resolved", finalText: "hello world" }),
+        cancel: async () => {},
+      }),
     });
 
     await bus.subscribeTopic(
@@ -576,6 +601,7 @@ describe("subagent_delegate tool", () => {
     if (res.mode !== "sync") throw new Error("expected sync subagent result");
     expect(res.ok).toBe(true);
     expect(res.status).toBe("resolved");
+    expect(res.workflowRunId).toBe("run:sync-result");
     expect(res.profile).toBe("explore");
     expect(res.sessionName).toMatch(/^explore-[0-9a-f]{8}$/u);
     expect(res.finalText).toBe("hello world");
@@ -594,6 +620,18 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 30,
       maxDepth: 1,
+      onDelegate: async () => {
+        cancelQueued = true;
+        return {
+          runId: "run:sync-timeout",
+          completion: Promise.resolve({
+            status: "timeout",
+            finalText: "",
+            detail: "idle timed out after 30ms without child activity",
+          }),
+          cancel: async () => {},
+        };
+      },
     });
 
     await bus.subscribeTopic(
@@ -647,6 +685,14 @@ describe("subagent_delegate tool", () => {
       onActivity: () => {
         localActivityCount += 1;
       },
+      onDelegate: async () => ({
+        runId: "run:sync-activity",
+        completion: (async () => {
+          await sleep(100);
+          return { status: "resolved" as const, finalText: "finished" };
+        })(),
+        cancel: async () => {},
+      }),
     });
     const parentActivitySources: string[] = [];
 
@@ -726,8 +772,8 @@ describe("subagent_delegate tool", () => {
     if (res.mode !== "sync") throw new Error("expected sync subagent result");
     expect(res.status).toBe("resolved");
     expect(res.finalText).toBe("finished");
-    expect(parentActivitySources).toEqual(["subagent"]);
-    expect(localActivityCount).toBe(4);
+    expect(parentActivitySources).toEqual([]);
+    expect(localActivityCount).toBe(0);
   });
 
   it("supports general and self delegation profiles", async () => {
@@ -738,6 +784,17 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
+      onDelegate: async (registration) => {
+        seenProfiles.push(registration.profile);
+        return {
+          runId: `run:${registration.profile}`,
+          completion: Promise.resolve({
+            status: "resolved",
+            finalText: `done:${registration.profile}`,
+          }),
+          cancel: async () => {},
+        };
+      },
     });
 
     const seenProfiles: string[] = [];
@@ -848,6 +905,14 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
+      onDelegate: async (registration) => {
+        seenChildSessionId = registration.childSessionId;
+        return {
+          runId: "run:continued-session",
+          completion: Promise.resolve({ status: "resolved", finalText: "continued" }),
+          cancel: async () => {},
+        };
+      },
     });
 
     const sessionName = "session-1";
@@ -1049,6 +1114,11 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 2,
+      onDelegate: async () => ({
+        runId: "run:self-explore",
+        completion: Promise.resolve({ status: "resolved", finalText: "self->explore ok" }),
+        cancel: async () => {},
+      }),
     });
 
     await expect(
@@ -1164,8 +1234,13 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
-      onDeferredDelegate: async (registration) => {
+      onDelegate: async (registration) => {
         capturedIdleTimeoutMs = registration.idleTimeoutMs;
+        return {
+          runId: "run:legacy-timeout",
+          completion: Promise.resolve({ status: "resolved", finalText: "" }),
+          cancel: async () => {},
+        };
       },
     });
 
@@ -1201,6 +1276,11 @@ describe("subagent_delegate tool", () => {
       bus,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
+      onDelegate: async () => ({
+        runId: "run:sync-progress",
+        completion: Promise.resolve({ status: "resolved", finalText: "done" }),
+        cancel: async () => {},
+      }),
     });
 
     const parentRequestId = "r:4";
@@ -1347,9 +1427,6 @@ describe("subagent_delegate tool", () => {
     );
 
     expect(res.status).toBe("resolved");
-    expect(parentUpdates.length).toBeGreaterThan(0);
-    const latestDisplay = parentUpdates[parentUpdates.length - 1]?.display ?? "";
-    expect(latestDisplay).toContain("subagent (explore;");
-    expect(latestDisplay).toContain("grep auth src");
+    expect(parentUpdates).toEqual([]);
   });
 });
