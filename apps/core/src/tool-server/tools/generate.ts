@@ -281,6 +281,7 @@ type ImageGenerationPrompt =
     };
 
 type VideoModelObject = Exclude<Parameters<typeof generateVideo>[0]["model"], string>;
+type ImageProviderOptions = NonNullable<Parameters<typeof generateImage>[0]["providerOptions"]>;
 
 type ModelDescriptor<TId extends string, TModel, TInput> = {
   id: TId;
@@ -843,6 +844,7 @@ export function generateImageWithModel(
     size?: `${number}x${number}`;
     aspectRatio?: `${number}:${number}`;
     maxRetries?: number;
+    providerOptions?: ImageProviderOptions;
   },
 ) {
   return generateImage({
@@ -852,6 +854,7 @@ export function generateImageWithModel(
     size: opts?.size,
     aspectRatio: opts?.aspectRatio,
     maxRetries: opts?.maxRetries,
+    providerOptions: opts?.providerOptions,
   });
 }
 
@@ -982,12 +985,17 @@ export class Generate implements ServerTool {
 
     const { size, aspectRatio } = resolveImageDimensions(picked.id, payload);
     const prompt = await buildImageGenerationPrompt(cwd, payload, opts?.context);
+    const compatibleProviderOptions =
+      imageProvider === "openai-compatible" && aspectRatio
+        ? ({ openaiCompatible: { aspect_ratio: aspectRatio } } satisfies ImageProviderOptions)
+        : undefined;
 
     const res = await generateImageWithModel(picked.model, prompt, {
       abortSignal: opts?.signal,
       size,
-      aspectRatio,
+      aspectRatio: imageProvider === "openai-compatible" ? undefined : aspectRatio,
       maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
+      providerOptions: compatibleProviderOptions,
     });
 
     const image = res.image;
