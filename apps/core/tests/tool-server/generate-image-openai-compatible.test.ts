@@ -211,6 +211,74 @@ describe("Generate OpenAI-compatible image routing", () => {
     });
   });
 
+  it("forwards non-GPT aspect ratios in the compatible JSON request", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-aspect-ratio-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "wide image",
+      model: "grok-imagine-image",
+      aspectRatio: "16:9",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toEqual({
+      model: "grok-imagine-image",
+      prompt: "wide image",
+      n: 1,
+      aspect_ratio: "16:9",
+      response_format: "b64_json",
+    });
+    expect(result).toMatchObject({ warnings: [] });
+  });
+
+  it("forwards non-GPT aspect ratios in the compatible multipart request", async () => {
+    // Given
+    let fields: Record<string, string> | undefined;
+    const server = startServer(async (request) => {
+      fields = {};
+      for (const [key, value] of await request.formData()) {
+        fields[key] = typeof value === "string" ? value : `${value.type}:${value.size}`;
+      }
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-aspect-ratio-edit-"));
+    temporaryPaths.push(outputDir);
+    await writeFile(join(outputDir, "source.png"), PNG_BYTES);
+
+    // When
+    await new Generate({ getConfig: compatibleConfig }).call(
+      "generate.image",
+      {
+        prompt: "wide edit",
+        model: "nanobanana",
+        aspectRatio: "16:9",
+        inputImages: "source.png",
+        outputDir,
+      },
+      { context: { cwd: outputDir } },
+    );
+
+    // Then
+    expect(fields).toEqual({
+      image: "image/png:70",
+      model: "google/gemini-2.5-flash-image",
+      prompt: "wide edit",
+      n: "1",
+      aspect_ratio: "16:9",
+    });
+  });
+
   it("propagates HTTP 500 after exactly one request without official fallback", async () => {
     // Given
     let requestCount = 0;

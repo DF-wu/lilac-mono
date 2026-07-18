@@ -20,6 +20,11 @@ The provider must accept the canonical model IDs listed in
 [Model aliases](#model-aliases). Lilac does not support custom alias-to-model
 mappings in this configuration.
 
+For non-GPT aliases, Lilac forwards a requested aspect ratio as the common
+`aspect_ratio` JSON or multipart field. The compatible endpoint must support
+that extension when callers use `aspectRatio`. GPT aliases continue to map
+their supported ratios to concrete OpenAI `size` values.
+
 ## Configuration
 
 Image routing requires a v2 `core-config.yaml` and two existing environment
