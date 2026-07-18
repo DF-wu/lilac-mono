@@ -48,7 +48,7 @@ afterEach(async () => {
 });
 
 describe("Generate image upstream characterization", () => {
-  it("preserves the image alias list and descriptor order", async () => {
+  it("preserves the image alias list in fallback order", async () => {
     // Given
     configureProviders({
       openai: "http://127.0.0.1",
@@ -61,7 +61,7 @@ describe("Generate image upstream characterization", () => {
 
     // Then
     expect(entries.find((entry) => entry.callableId === "generate.image")?.description).toEndWith(
-      "Available models: gpt-5-image, nanobanana, nanobanana-2, nanobanana-pro, grok-imagine-image, grok-imagine-image-pro",
+      "Available models: gpt-image-2, nanobanana-2, nanobanana-pro, gpt-5-image, grok-imagine-image-pro, grok-imagine-image, nanobanana-2-lite, nanobanana",
     );
   });
 
@@ -117,7 +117,7 @@ describe("Generate image upstream characterization", () => {
         aspectRatio: "1:8",
         inputImages: [join(outputDir, "missing.png")],
       }),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    ).rejects.toThrow("Unsupported aspectRatio '1:8' for gpt-image-2");
   });
 
   it("preserves generation result fields and unique PNG filename behavior", async () => {
