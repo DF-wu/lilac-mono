@@ -1023,6 +1023,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             // unexecuted call would leave an orphan assistant message and make
             // the next model request fail with a missing-tool-result error.
             const hasLocalToolCalls = turn.toolCalls.length > 0;
+            // AI SDK materializes rejected tool inputs as completed tool results.
+            // Continue so the model can inspect the validation error and retry.
+            const hasCompletedToolExchange =
+              turn.finishReason === "tool-calls" && turn.newMessages.at(-1)?.role === "tool";
             const executedToolCallCount = hasLocalToolCalls
               ? await this.executeToolCalls(turn.toolCalls)
               : 0;
@@ -1045,7 +1049,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               continue;
             }
 
-            if (!hasLocalToolCalls) {
+            if (turn.finishReason !== "tool-calls") {
               const followUps = takeQueued(this.followUpMode, this.followUpQueue);
               if (followUps.length > 0) {
                 const merged = mergeUserMessages(followUps);
@@ -1056,7 +1060,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               }
             }
 
-            if (hasLocalToolCalls || boundaryDecision.requiresNextTurn) {
+            if (
+              hasLocalToolCalls ||
+              hasCompletedToolExchange ||
+              boundaryDecision.requiresNextTurn
+            ) {
               continue;
             }
 
