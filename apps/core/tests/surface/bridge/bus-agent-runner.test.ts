@@ -19,12 +19,12 @@ import {
   parseCoreConfigV1ToUniversal,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
-import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
 import type { ModelMessage } from "ai";
-import type { LanguageModel } from "ai";
+import { buildSyntheticToolCallId } from "@stanley2058/lilac-agent";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
+  assertWorkflowDispatchPolicy,
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
   buildAutoInjectedThreadSearchOverlay,
@@ -33,12 +33,14 @@ import {
   computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
   createAgentRunIdleWatchdog,
-  createDeferredSubagentManager,
   createTransientModelRetryController,
   formatAutoCompactionToolDisplay,
   formatUnknownErrorForDisplay,
   buildHeartbeatOverlayForRequest,
   buildAutoInjectedThreadSearchMessages,
+  buildDeferredSubagentResultMessages,
+  hasDeferredSubagentResult,
+  planDeferredSubagentBoundary,
   maybeBuildAutoInjectedThreadSearchMessages,
   buildPersistedHeartbeatMessages,
   buildSurfaceMetadataOverlay,
@@ -64,18 +66,233 @@ import {
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createIdleTimer } from "../../../src/shared/idle-timer";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
-import { parseSubagentMetaFromRaw } from "../../../src/surface/bridge/bus-agent-runner/raw";
+import {
+  parseSubagentMetaFromRaw,
+  parseWorkflowRequestHintFromRaw,
+} from "../../../src/surface/bridge/bus-agent-runner/raw";
 import {
   buildExperimentalDownloadForAnthropicFallback,
   shouldForceUrlDownloadForAnthropicFallback,
   withStableAnthropicUpstreamOrder,
 } from "../../../src/surface/bridge/bus-agent-runner/anthropic-fallback-media";
 
-function fakeModel(): LanguageModel {
-  return {} as LanguageModel;
-}
+describe("deferred subagent result", () => {
+  it("exposes the durable workflow run ID without exposing the child request ID", () => {
+    const messages = buildDeferredSubagentResultMessages({
+      runId: "wfrun:subagent:opaque-run",
+      parentToolCallId: "delegate-call",
+      childRequestId: "sub:synthetic-child-request",
+      profile: "explore",
+      sessionName: "audit",
+      status: "resolved",
+      ok: true,
+      finalText: "complete",
+    });
+
+    expect(messages).toMatchObject([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolName: "subagent_result",
+            input: { workflowRunId: "wfrun:subagent:opaque-run" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolName: "subagent_result",
+            output: {
+              type: "json",
+              value: { workflowRunId: "wfrun:subagent:opaque-run" },
+            },
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("synthetic-child-request");
+  });
+
+  it("deduplicates a recovered legacy child-request result while emitting only the run ID form", () => {
+    const completion = {
+      runId: "wfrun:subagent:recovered-run",
+      parentToolCallId: "delegate-call",
+      childRequestId: "sub:legacy-child-request",
+      profile: "explore" as const,
+      sessionName: "recovered-audit",
+      status: "resolved" as const,
+      ok: true,
+      finalText: "recovered",
+    };
+    const legacyToolCallId = buildSyntheticToolCallId({
+      prefix: "subagent_result",
+      seed: completion.childRequestId,
+    });
+    const checkpointMessages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: legacyToolCallId,
+            toolName: "subagent_result",
+            output: { type: "json", value: { status: "resolved" } },
+          },
+        ],
+      },
+    ];
+
+    expect(hasDeferredSubagentResult(checkpointMessages, completion)).toBe(true);
+
+    const emitted = buildDeferredSubagentResultMessages(completion);
+    const emittedAssistant = emitted[0];
+    if (
+      emittedAssistant?.role !== "assistant" ||
+      !Array.isArray(emittedAssistant.content) ||
+      emittedAssistant.content[0]?.type !== "tool-call"
+    ) {
+      throw new Error("expected a synthetic subagent result tool call");
+    }
+    const emittedToolCallId = emittedAssistant.content[0].toolCallId;
+    expect(emittedToolCallId).toBe(
+      buildSyntheticToolCallId({ prefix: "subagent_result", seed: completion.runId }),
+    );
+    expect(emittedToolCallId).not.toBe(legacyToolCallId);
+    expect(hasDeferredSubagentResult(emitted, completion)).toBe(true);
+
+    const upgrade = planDeferredSubagentBoundary({
+      canonicalMessages: checkpointMessages,
+      modelInputMessages: [],
+      completions: [completion],
+    });
+    expect(upgrade.append).toEqual(emitted);
+    expect(upgrade.forceNextTurn).toBe(true);
+  });
+
+  it("keeps appended results pending until they appear in a model input", () => {
+    const completion = {
+      runId: "wfrun:subagent:boundary-run",
+      parentToolCallId: "delegate-call",
+      childRequestId: "sub:boundary-child",
+      profile: "explore" as const,
+      sessionName: "boundary-audit",
+      status: "resolved" as const,
+      ok: true,
+      finalText: "boundary result",
+    };
+
+    const admitted = planDeferredSubagentBoundary({
+      canonicalMessages: [],
+      modelInputMessages: [],
+      completions: [completion],
+    });
+    expect(admitted.append).toEqual(buildDeferredSubagentResultMessages(completion));
+    expect(admitted.consumedRunIds).toEqual([]);
+    expect(admitted.forceNextTurn).toBe(true);
+
+    const appendedButUnconsumed = planDeferredSubagentBoundary({
+      canonicalMessages: admitted.append,
+      modelInputMessages: [],
+      completions: [completion],
+    });
+    expect(appendedButUnconsumed.append).toEqual([]);
+    expect(appendedButUnconsumed.consumedRunIds).toEqual([]);
+    expect(appendedButUnconsumed.forceNextTurn).toBe(true);
+
+    const consumed = planDeferredSubagentBoundary({
+      canonicalMessages: admitted.append,
+      modelInputMessages: admitted.append,
+      completions: [completion],
+    });
+    expect(consumed.append).toEqual([]);
+    expect(consumed.consumedRunIds).toEqual([completion.runId]);
+    expect(consumed.forceNextTurn).toBe(false);
+  });
+
+  it("recognizes consumption after provider tool-call ID normalization", () => {
+    const completion = {
+      runId: "wfrun:subagent:normalized-run",
+      parentToolCallId: "delegate-call",
+      childRequestId: "sub:normalized-child",
+      profile: "explore" as const,
+      sessionName: "normalized-audit",
+      status: "resolved" as const,
+      ok: true,
+      finalText: "normalized result",
+    };
+    const normalizedModelInput: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "subagentr",
+            toolName: "subagent_result",
+            input: { workflowRunId: completion.runId, status: "resolved" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "subagentr",
+            toolName: "subagent_result",
+            output: {
+              type: "json",
+              value: { workflowRunId: completion.runId, finalText: "normalized result" },
+            },
+          },
+        ],
+      },
+    ];
+
+    const consumed = planDeferredSubagentBoundary({
+      canonicalMessages: buildDeferredSubagentResultMessages(completion),
+      modelInputMessages: normalizedModelInput,
+      completions: [completion],
+    });
+
+    expect(consumed.consumedRunIds).toEqual([completion.runId]);
+    expect(consumed.forceNextTurn).toBe(false);
+
+    const assistantOnly = planDeferredSubagentBoundary({
+      canonicalMessages: buildDeferredSubagentResultMessages(completion),
+      modelInputMessages: [normalizedModelInput[0]!],
+      completions: [completion],
+    });
+    expect(assistantOnly.consumedRunIds).toEqual([]);
+    expect(assistantOnly.forceNextTurn).toBe(true);
+  });
+});
 
 describe("subagent model selection", () => {
+  it("parses the minimal workflow dispatch hint and requires its epoch", () => {
+    expect(
+      parseWorkflowRequestHintFromRaw({
+        workflow: {
+          runId: "run-1",
+          operationId: "operation-1",
+          dispatchEpoch: "dispatch-epoch-0001",
+        },
+      }),
+    ).toEqual({
+      runId: "run-1",
+      operationId: "operation-1",
+      dispatchEpoch: "dispatch-epoch-0001",
+    });
+    expect(
+      parseWorkflowRequestHintFromRaw({
+        workflow: { runId: "run-1", operationId: "operation-1" },
+      }),
+    ).toBeNull();
+  });
+
   it("parses a subagent reasoning override from raw request metadata", () => {
     expect(
       parseSubagentMetaFromRaw({
@@ -148,6 +365,7 @@ describe("subagent model selection", () => {
       },
     };
     cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
       modelSlot: "main",
       model: "manual",
     };
@@ -163,6 +381,7 @@ describe("subagent model selection", () => {
   it("applies reasoning overrides to the configured profile fallback", () => {
     const cfg = parseCoreConfigV1ToUniversal({});
     cfg.agent.subagents.profiles.explore = {
+      ...cfg.agent.subagents.profiles.explore,
       modelSlot: "fast",
       reasoning: "low",
     };
@@ -175,6 +394,77 @@ describe("subagent model selection", () => {
 
     expect(resolved).toMatchObject({ slot: "fast" });
     expect(resolved.reasoning).toBe("medium");
+  });
+
+  it("rehydrates a durable workflow model request without current preset resolution", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      changed: {
+        model: "openai/current-model",
+        options: { openai: { route: "current" } },
+      },
+    };
+    const resolved = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      resolvedModelRequest: {
+        alias: "removed-preset",
+        spec: "codex/durable-model",
+        provider: "codex",
+        modelId: "durable-model",
+        providerOptions: { openai: { route: "durable", store: false } },
+        reasoning: "high",
+        responseCommentary: true,
+        anthropicPromptCache: true,
+        reasoningDisplay: "none",
+      },
+    });
+
+    expect(resolved).toMatchObject({
+      alias: "removed-preset",
+      spec: "codex/durable-model",
+      provider: "codex",
+      modelId: "durable-model",
+      providerOptions: { openai: { route: "durable", store: false } },
+      reasoning: "high",
+      responseCommentary: true,
+      anthropicPromptCache: true,
+    });
+  });
+
+  it("validates workflow reasoning against the operation request, not resolved defaults", () => {
+    const policy = {
+      runId: "run-1",
+      operationId: "operation-1",
+      dispatchEpoch: "dispatch-epoch-0001",
+      profile: "general" as const,
+      model: null,
+      reasoning: null,
+      resolvedModelRequest: {
+        spec: "provider/default-model",
+        provider: "provider",
+        modelId: "default-model",
+        reasoning: "high" as const,
+        reasoningDisplay: "simple" as const,
+      },
+      cwd: "/workspace",
+      originSession: {
+        requestId: null,
+        sessionId: null,
+        client: null,
+        userId: null,
+      },
+    };
+
+    expect(() =>
+      assertWorkflowDispatchPolicy(policy, { profile: "general", depth: 1 }),
+    ).not.toThrow();
+    expect(() =>
+      assertWorkflowDispatchPolicy(
+        { ...policy, reasoning: "medium" },
+        { profile: "general", depth: 1, reasoning: "low" },
+      ),
+    ).toThrow("reasoning does not match the approved operation policy");
   });
 });
 
@@ -462,120 +752,6 @@ function createInMemoryRawBus(): RawBus {
 
     close: async () => {},
   };
-}
-
-function createInMemoryRawBusWithStopWaitingForActiveHandler(): RawBus {
-  const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
-    topic: string;
-    opts: SubscriptionOptions;
-    activeHandlers: number;
-    stopWaiters: Array<() => void>;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
-  }>();
-
-  return {
-    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const stored: Message<unknown> = {
-        topic: opts.topic,
-        id,
-        type: opts.type,
-        ts: Date.now(),
-        key: opts.key,
-        headers: opts.headers,
-        data: msg.data as unknown,
-      };
-
-      const list = topics.get(opts.topic) ?? [];
-      list.push(stored);
-      topics.set(opts.topic, list);
-
-      for (const s of subs) {
-        if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
-      }
-
-      return { id, cursor: id };
-    },
-
-    subscribe: async <TData>(
-      topic: string,
-      opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        opts,
-        activeHandlers: 0,
-        stopWaiters: [] as Array<() => void>,
-        handler: async (msg: Message<unknown>, ctx: HandleContext) => {
-          entry.activeHandlers += 1;
-          try {
-            await handler(msg as unknown as Message<TData>, ctx);
-          } finally {
-            entry.activeHandlers -= 1;
-            if (entry.activeHandlers === 0 && entry.stopWaiters.length > 0) {
-              const waiters = entry.stopWaiters.splice(0, entry.stopWaiters.length);
-              for (const waiter of waiters) waiter();
-            }
-          }
-        },
-      };
-      subs.add(entry);
-
-      const offset = opts.offset;
-      if (offset?.type === "begin" || offset?.type === "cursor") {
-        const existing = topics.get(topic) ?? [];
-        const replay =
-          offset.type === "cursor"
-            ? (() => {
-                const cursorIndex = existing.findIndex((m) => m.id === offset.cursor);
-                return cursorIndex >= 0 ? existing.slice(cursorIndex + 1) : existing;
-              })()
-            : existing;
-        for (const m of replay) {
-          await entry.handler(m, {
-            cursor: m.id,
-            commit: async () => {},
-          });
-        }
-      }
-
-      return {
-        stop: async () => {
-          subs.delete(entry);
-          if (entry.activeHandlers === 0) return;
-          await new Promise<void>((resolve) => {
-            entry.stopWaiters.push(resolve);
-          });
-        },
-      };
-    },
-
-    fetch: async <TData>(topic: string) => {
-      const existing = topics.get(topic) ?? [];
-      return {
-        messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
-          cursor: m.id,
-        })),
-        next: existing.length > 0 ? existing[existing.length - 1]?.id : undefined,
-      };
-    },
-
-    close: async () => {},
-  };
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 100): Promise<void> {
-  const startedAt = Date.now();
-  while (!predicate()) {
-    if (Date.now() - startedAt >= timeoutMs) {
-      throw new Error("timed out waiting for condition");
-    }
-    await Bun.sleep(1);
-  }
 }
 
 describe("formatAutoCompactionToolDisplay", () => {
@@ -3342,695 +3518,5 @@ describe("custom command failures", () => {
     expect(finalText).toBe(
       "Error running /fixture: bounded error [tool result truncated: 100 characters omitted]",
     );
-  });
-});
-
-describe("createDeferredSubagentManager", () => {
-  it("publishes deferred model and reasoning overrides", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const parentHeaders = {
-      request_id: "parent-model-override",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-    const childHeaders = {
-      request_id: "child-model-override",
-      session_id: "child-session",
-      request_client: "unknown" as const,
-      parent_request_id: parentHeaders.request_id,
-      parent_tool_call_id: "tool-model-override",
-      subagent_profile: "explore" as const,
-      subagent_depth: "1",
-    };
-    let publishedModel: string | undefined;
-    let publishedReasoning: unknown;
-    const commandSub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "deferred-model-override-test",
-        consumerId: "deferred-model-override-test",
-        offset: { type: "now" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage && msg.data.queue === "prompt") {
-          publishedModel = msg.data.modelOverride;
-          const subagent = Reflect.get(msg.data.raw ?? {}, "subagent");
-          publishedReasoning =
-            subagent && typeof subagent === "object"
-              ? Reflect.get(subagent, "reasoning")
-              : undefined;
-        }
-        await ctx.commit();
-      },
-    );
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger: createLogger({ module: "bus-agent-runner-test" }),
-      parentHeaders,
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-model-override",
-      task: "Map auth flow",
-      idleTimeoutMs: 2_000,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-model-override",
-      childRequestId: childHeaders.request_id,
-      childSessionId: childHeaders.session_id,
-      parentHeaders,
-      childHeaders,
-      initialMessages: [{ role: "user", content: "Map auth flow" }],
-      modelOverride: "scout",
-      reasoningOverride: "high",
-    });
-
-    expect(publishedModel).toBe("scout");
-    expect(publishedReasoning).toBe("high");
-    await manager.stop();
-    await commandSub.stop();
-  });
-
-  it("keeps a deferred child alive while matching activity continues", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const parentHeaders = {
-      request_id: "parent-idle-reset",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-    const childHeaders = {
-      request_id: "child-idle-reset",
-      session_id: "child-session",
-      request_client: "unknown" as const,
-      parent_request_id: parentHeaders.request_id,
-      parent_tool_call_id: "tool-idle-reset",
-      subagent_profile: "explore" as const,
-      subagent_depth: "1",
-    };
-    let activityCount = 0;
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger: createLogger({ module: "bus-agent-runner-test" }),
-      parentHeaders,
-      onActivity: () => {
-        activityCount += 1;
-      },
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-idle-reset",
-      task: "Keep working",
-      idleTimeoutMs: 40,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-idle-reset",
-      childRequestId: childHeaders.request_id,
-      childSessionId: childHeaders.session_id,
-      parentHeaders,
-      childHeaders,
-      initialMessages: [{ role: "user", content: "Keep working" }],
-    });
-
-    await Bun.sleep(25);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaReasoning,
-      { delta: "thinking" },
-      { headers: childHeaders },
-    );
-    await Bun.sleep(25);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseBinary,
-      { mimeType: "text/plain", dataBase64: "YQ==" },
-      { headers: childHeaders },
-    );
-    await Bun.sleep(25);
-    await bus.publish(
-      lilacEventTypes.EvtRequestLifecycleChanged,
-      { state: "running" },
-      { headers: childHeaders },
-    );
-    await Bun.sleep(25);
-
-    expect(manager.snapshotWaitState().hasOutstandingChildren).toBe(true);
-    expect(manager.hasBufferedCompletions()).toBe(false);
-    expect(activityCount).toBe(3);
-    await manager.stop();
-  });
-
-  it("grants restored deferred children a fresh idle interval", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const parentHeaders = {
-      request_id: "parent-recovery-idle",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-    const manager = createDeferredSubagentManager({ bus, logger, parentHeaders });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-recovery-idle",
-      task: "Keep waiting",
-      idleTimeoutMs: 80,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-recovery-idle",
-      childRequestId: "child-recovery-idle",
-      childSessionId: "child-session",
-      parentHeaders,
-      childHeaders: {
-        request_id: "child-recovery-idle",
-        session_id: "child-session",
-        request_client: "unknown",
-        parent_request_id: parentHeaders.request_id,
-        parent_tool_call_id: "tool-recovery-idle",
-        subagent_profile: "explore",
-        subagent_depth: "1",
-      },
-      initialMessages: [{ role: "user", content: "Keep waiting" }],
-    });
-
-    const recovery = manager.buildRecoveryState();
-    await manager.stop();
-    await Bun.sleep(100);
-
-    const restored = createDeferredSubagentManager({ bus, logger, parentHeaders });
-    await restored.restore(recovery);
-    await Bun.sleep(40);
-
-    expect(restored.snapshotWaitState().hasOutstandingChildren).toBe(true);
-    expect(restored.hasBufferedCompletions()).toBe(false);
-
-    await waitFor(() => restored.hasBufferedCompletions(), 100);
-    expect(restored.snapshotWaitState().hasOutstandingChildren).toBe(false);
-    await restored.stop();
-  });
-
-  it("bounds outstanding finalText in graceful-restart snapshots", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const parentHeaders = {
-      request_id: "parent-request",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger: createLogger({ module: "bus-agent-runner-test" }),
-      parentHeaders,
-      normalizeFinalTextForSnapshot: (finalText) => `bounded:${finalText.slice(-4)}`,
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-snapshot",
-      task: "Map auth flow",
-      idleTimeoutMs: 5_000,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-1",
-      childRequestId: "child-request",
-      childSessionId: "child-session",
-      parentHeaders,
-      childHeaders: {
-        request_id: "child-request",
-        session_id: "child-session",
-        request_client: "unknown",
-        parent_request_id: parentHeaders.request_id,
-        parent_tool_call_id: "tool-1",
-        subagent_profile: "explore",
-        subagent_depth: "1",
-      },
-      initialMessages: [{ role: "user", content: "Map auth flow" }],
-    });
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "unbounded-child-final-text" },
-      { headers: { ...parentHeaders, request_id: "child-request", session_id: "child-session" } },
-    );
-    await waitFor(
-      () => manager.buildRecoveryState()?.outstanding[0]?.finalText.startsWith("bounded:") === true,
-    );
-
-    expect(manager.buildRecoveryState()?.outstanding[0]?.finalText).toBe("bounded:text");
-    await manager.stop();
-  });
-
-  it("replays child completion that happened before restore reattach", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const parentHeaders = {
-      request_id: "parent-request",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders,
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-test0001",
-      task: "Map auth flow",
-      idleTimeoutMs: 5_000,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-1",
-      childRequestId: "child-request",
-      childSessionId: "sub:parent-session:named:legacy-session",
-      parentHeaders,
-      childHeaders: {
-        request_id: "child-request",
-        session_id: "sub:parent-session:named:legacy-session",
-        request_client: "unknown",
-        parent_request_id: parentHeaders.request_id,
-        parent_tool_call_id: "tool-1",
-        subagent_profile: "explore",
-        subagent_depth: "1",
-      },
-      initialMessages: [{ role: "user", content: "Map auth flow" }],
-    });
-
-    const recovery = manager.buildRecoveryState();
-    expect(recovery).toBeDefined();
-    delete recovery?.outstanding[0]?.sessionName;
-    await manager.stop();
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "done after restart" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "sub:parent-session:named:legacy-session",
-          request_client: "unknown",
-        },
-      },
-    );
-    await bus.publish(
-      lilacEventTypes.EvtRequestLifecycleChanged,
-      { state: "resolved" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "sub:parent-session:named:legacy-session",
-          request_client: "unknown",
-        },
-      },
-    );
-
-    const restored = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders,
-    });
-    await restored.restore(recovery);
-
-    await waitFor(() => restored.hasBufferedCompletions());
-
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: fakeModel(),
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const injected = await restored.injectBuffered(agent);
-    expect(injected).toBe(true);
-    expect(agent.state.messages).toHaveLength(3);
-
-    const toolMessage = agent.state.messages[2];
-    expect(toolMessage?.role).toBe("tool");
-    if (toolMessage?.role !== "tool") throw new Error("expected tool message");
-    const toolResult = toolMessage.content[0];
-    expect(toolResult?.type).toBe("tool-result");
-    if (toolResult?.type !== "tool-result") throw new Error("expected tool result");
-    expect(toolResult.output).toEqual({
-      type: "json",
-      value: {
-        ok: true,
-        mode: "deferred",
-        status: "resolved",
-        profile: "explore",
-        sessionName: "legacy-session",
-        finalText: "done after restart",
-      },
-    });
-
-    await restored.stop();
-  });
-
-  it("does not miss a child completion that lands before the parent starts waiting", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const parentHeaders = {
-      request_id: "parent-request",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders,
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-test0002",
-      task: "Map auth flow",
-      idleTimeoutMs: 5_000,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-1",
-      childRequestId: "child-request",
-      childSessionId: "child-session",
-      parentHeaders,
-      childHeaders: {
-        request_id: "child-request",
-        session_id: "child-session",
-        request_client: "unknown",
-        parent_request_id: parentHeaders.request_id,
-        parent_tool_call_id: "tool-1",
-        subagent_profile: "explore",
-        subagent_depth: "1",
-      },
-      initialMessages: [{ role: "user", content: "Map auth flow" }],
-    });
-
-    const waitState = manager.snapshotWaitState();
-    expect(waitState.hasOutstandingChildren).toBe(true);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "done before wait registered" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-    await bus.publish(
-      lilacEventTypes.EvtRequestLifecycleChanged,
-      { state: "resolved" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-
-    await waitFor(() => manager.hasBufferedCompletions());
-    await manager.waitForSignalSince(waitState.signalVersion);
-
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: fakeModel(),
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const injected = await manager.injectBuffered(agent);
-    expect(injected).toBe(true);
-    expect(manager.hasOutstandingChildren()).toBe(false);
-
-    const toolMessage = agent.state.messages[2];
-    expect(toolMessage?.role).toBe("tool");
-    if (toolMessage?.role !== "tool") throw new Error("expected tool message");
-    const toolResult = toolMessage.content[0];
-    expect(toolResult?.type).toBe("tool-result");
-    if (toolResult?.type !== "tool-result") throw new Error("expected tool result");
-    expect(toolResult.output).toEqual({
-      type: "json",
-      value: {
-        ok: true,
-        mode: "deferred",
-        status: "resolved",
-        profile: "explore",
-        sessionName: "explore-test0002",
-        finalText: "done before wait registered",
-      },
-    });
-
-    await manager.stop();
-  });
-
-  it("does not deadlock when a resolved lifecycle event settles from its own subscription callback", async () => {
-    const raw = createInMemoryRawBusWithStopWaitingForActiveHandler();
-    const bus = createLilacBus(raw);
-    const parentHeaders = {
-      request_id: "parent-request",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders,
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-test0003",
-      task: "Map auth flow",
-      idleTimeoutMs: 5_000,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-1",
-      childRequestId: "child-request",
-      childSessionId: "child-session",
-      parentHeaders,
-      childHeaders: {
-        request_id: "child-request",
-        session_id: "child-session",
-        request_client: "unknown",
-        parent_request_id: parentHeaders.request_id,
-        parent_tool_call_id: "tool-1",
-        subagent_profile: "explore",
-        subagent_depth: "1",
-      },
-      initialMessages: [{ role: "user", content: "Map auth flow" }],
-    });
-
-    const waitState = manager.snapshotWaitState();
-    const waitPromise = manager.waitForSignalSince(waitState.signalVersion);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "resolved without deadlock" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-
-    const publishResolved = bus.publish(
-      lilacEventTypes.EvtRequestLifecycleChanged,
-      { state: "resolved" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-
-    const publishResult = await Promise.race([
-      publishResolved.then(() => "resolved" as const),
-      Bun.sleep(100).then(() => "timeout" as const),
-    ]);
-    expect(publishResult).toBe("resolved");
-
-    const waitResult = await Promise.race([
-      waitPromise.then(() => "resolved" as const),
-      Bun.sleep(100).then(() => "timeout" as const),
-    ]);
-    expect(waitResult).toBe("resolved");
-
-    expect(manager.hasBufferedCompletions()).toBe(true);
-    expect(manager.hasOutstandingChildren()).toBe(false);
-
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: fakeModel(),
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const injected = await manager.injectBuffered(agent);
-    expect(injected).toBe(true);
-
-    const toolMessage = agent.state.messages[2];
-    expect(toolMessage?.role).toBe("tool");
-    if (toolMessage?.role !== "tool") throw new Error("expected tool message");
-    const toolResult = toolMessage.content[0];
-    expect(toolResult?.type).toBe("tool-result");
-    if (toolResult?.type !== "tool-result") throw new Error("expected tool result");
-    expect(toolResult.output).toEqual({
-      type: "json",
-      value: {
-        ok: true,
-        mode: "deferred",
-        status: "resolved",
-        profile: "explore",
-        sessionName: "explore-test0003",
-        finalText: "resolved without deadlock",
-      },
-    });
-
-    await manager.stop();
-  });
-
-  it("does not duplicate restored child text when replay settles before response text", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const parentHeaders = {
-      request_id: "parent-request",
-      session_id: "parent-session",
-      request_client: "discord" as const,
-    };
-
-    const logger = createLogger({ module: "bus-agent-runner-test" });
-
-    const manager = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders,
-    });
-
-    await manager.register({
-      profile: "explore",
-      sessionName: "explore-test0004",
-      task: "Map auth flow",
-      idleTimeoutMs: 5_000,
-      depth: 1,
-      parentRequestId: parentHeaders.request_id,
-      parentSessionId: parentHeaders.session_id,
-      parentRequestClient: parentHeaders.request_client,
-      parentToolCallId: "tool-1",
-      childRequestId: "child-request",
-      childSessionId: "child-session",
-      parentHeaders,
-      childHeaders: {
-        request_id: "child-request",
-        session_id: "child-session",
-        request_client: "unknown",
-        parent_request_id: parentHeaders.request_id,
-        parent_tool_call_id: "tool-1",
-        subagent_profile: "explore",
-        subagent_depth: "1",
-      },
-      initialMessages: [{ role: "user", content: "Map auth flow" }],
-    });
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "a" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "b" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-
-    await waitFor(() => manager.buildRecoveryState()?.outstanding[0]?.finalText === "ab");
-
-    const recovery = manager.buildRecoveryState();
-    expect(recovery?.outstanding[0]?.finalText).toBe("ab");
-    await manager.stop();
-
-    await bus.publish(
-      lilacEventTypes.EvtRequestLifecycleChanged,
-      { state: "resolved" },
-      {
-        headers: {
-          request_id: "child-request",
-          session_id: "child-session",
-          request_client: "unknown",
-        },
-      },
-    );
-
-    const restored = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders,
-    });
-    await restored.restore(recovery);
-
-    await waitFor(() => restored.hasBufferedCompletions());
-
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: fakeModel(),
-      messages: [{ role: "user", content: "hello" }],
-    });
-
-    const injected = await restored.injectBuffered(agent);
-    expect(injected).toBe(true);
-
-    const toolMessage = agent.state.messages[2];
-    expect(toolMessage?.role).toBe("tool");
-    if (toolMessage?.role !== "tool") throw new Error("expected tool message");
-    const toolResult = toolMessage.content[0];
-    expect(toolResult?.type).toBe("tool-result");
-    if (toolResult?.type !== "tool-result") throw new Error("expected tool result");
-    expect(toolResult.output).toEqual({
-      type: "json",
-      value: {
-        ok: true,
-        mode: "deferred",
-        status: "resolved",
-        profile: "explore",
-        sessionName: "explore-test0004",
-        finalText: "ab",
-      },
-    });
-
-    await restored.stop();
   });
 });

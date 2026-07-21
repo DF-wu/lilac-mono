@@ -28,12 +28,13 @@ import {
   resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
+  fromDurableResolvedModelRequest,
   resolveModelRef,
   resolveModelSlot,
+  resolveNativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
 import {
   lilacEventTypes,
-  outReqTopic,
   type AdapterPlatform,
   type LilacBus,
   type RequestLifecycleState,
@@ -56,17 +57,23 @@ import path from "node:path";
 import type { CoreToolPluginManager } from "../../plugins";
 import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
 import { createAgentOutputActivityPublisher } from "../../shared/agent-output-activity";
-import { createIdleTimer, type IdleTimer } from "../../shared/idle-timer";
+import { createIdleTimer } from "../../shared/idle-timer";
 import {
   createToolResultOutputNormalizer,
   normalizeSubagentFinalText,
-  normalizeSubagentFinalTextForSnapshot,
 } from "../../artifacts/tool-result-output-normalizer";
-import {
-  renderSubagentDisplay,
-  type ChildToolState,
-  type DeferredSubagentRegistration,
+import type {
+  SubagentDelegationRegistration,
+  TrustedSubagentDelegationRegistration,
 } from "../../tools/subagent";
+import type {
+  WorkflowLiveParentBridge,
+  WorkflowLiveParentCompletion,
+} from "../../workflow/workflow-live-parent-bridge";
+import type { WorkflowSubagentDispatcher } from "../../workflow/workflow-subagent-dispatcher";
+import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store";
+import type { WorkflowUsage } from "../../workflow/workflow-domain";
+import type { WorkflowRequestPolicy } from "../../workflow/workflow-request-authority";
 import { formatToolArgsForDisplayWithSpecs } from "../../tools/tool-args-display";
 import { isHeartbeatAckText, isHeartbeatSessionId } from "../../heartbeat/common";
 
@@ -87,7 +94,6 @@ import { buildSafeRecoveryCheckpoint } from "./recovery-checkpoint";
 import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
-  extractBatchChildFailureEntries,
   formatToolLogPreview,
   summarizeToolFailure,
 } from "./bus-agent-runner/tool-failure-logging";
@@ -114,14 +120,15 @@ import {
   parseCustomCommandFromRaw,
   parseBufferedForActiveRequestIdFromRaw,
   getParticipantUserIdsFromRaw,
-  parseParentChannelIdFromRaw,
   parseRequestControlFromRaw,
   parseRequestModelOverrideFromRaw,
   parseRouterSessionModeFromRaw,
   parseSessionConfigIdFromRaw,
   parseSubagentMetaFromRaw,
+  parseWorkflowRequestHintFromRaw,
   requestRawReferencesMessage,
   type AgentRunProfile,
+  type ParsedSubagentMeta,
 } from "./bus-agent-runner/raw";
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import {
@@ -211,7 +218,7 @@ function buildResumePrompt(partialText: string): ModelMessage {
 // - Track compacted toolCallIds in-memory per session for stability (cache hits).
 const TOOL_OUTPUT_PLACEHOLDER = "[Old tool result content cleared]";
 const TOOL_OUTPUT_CHARS_PER_TOKEN = 4;
-const TOOL_OUTPUT_PRUNE_PROTECTED_TOOLS = new Set(["skill"]);
+const TOOL_OUTPUT_PRUNE_PROTECTED_TOOLS = new Set(["skill", "subagent_result"]);
 
 export function withBlankLineBetweenTextParts(params: {
   accumulatedText: string;
@@ -495,70 +502,6 @@ function getSubagentOkFromResult(result: unknown): boolean | null {
   return typeof v === "boolean" ? v : null;
 }
 
-type DeferredSubagentTerminalStatus = "resolved" | "failed" | "cancelled" | "timeout";
-
-type DeferredSubagentBufferedCompletion = {
-  parentToolCallId: string;
-  profile: DeferredSubagentRegistration["profile"];
-  sessionName: string;
-  childRequestId: string;
-  childSessionId: string;
-  status: DeferredSubagentTerminalStatus;
-  ok: boolean;
-  finalText: string;
-  detail?: string;
-  childTools: ChildToolState[];
-};
-
-type DeferredSubagentBufferedCompletionSnapshot = Omit<
-  DeferredSubagentBufferedCompletion,
-  "sessionName"
-> & {
-  sessionName?: string;
-};
-
-type DeferredSubagentHandleSnapshot = {
-  parentToolCallId: string;
-  profile: DeferredSubagentRegistration["profile"];
-  sessionName?: string;
-  childRequestId: string;
-  childSessionId: string;
-  idleTimeoutMs?: number;
-  /** Compatibility with snapshots written immediately before idle timeouts shipped. */
-  timeoutMs?: number;
-  finalText: string;
-  detail?: string;
-  childUpdateSeq: number;
-  childTools: ChildToolState[];
-  outCursor?: string;
-  evtCursor?: string;
-};
-
-type DeferredSubagentRecoveryState = {
-  outstanding: DeferredSubagentHandleSnapshot[];
-  bufferedCompletions: DeferredSubagentBufferedCompletionSnapshot[];
-};
-
-type DeferredSubagentHandle = {
-  parentToolCallId: string;
-  profile: DeferredSubagentRegistration["profile"];
-  sessionName: string;
-  childRequestId: string;
-  childSessionId: string;
-  idleTimeoutMs: number;
-  finalText: string;
-  detail?: string;
-  childUpdateSeq: number;
-  childTools: Map<string, ChildToolState>;
-  outCursor?: string;
-  evtCursor?: string;
-  outSub: { stop(): Promise<void> } | null;
-  evtSub: { stop(): Promise<void> } | null;
-  idleTimer: IdleTimer | null;
-  settled: boolean;
-  handlingEvtSubscriptionMessage: boolean;
-};
-
 function isDeferredSubagentAcceptedResult(result: unknown): result is {
   ok: true;
   mode: "deferred";
@@ -574,41 +517,11 @@ function isDeferredSubagentAcceptedResult(result: unknown): result is {
   );
 }
 
-function buildSubagentResultToolCallId(childRequestId: string): string {
+function buildSubagentResultToolCallId(seed: string): string {
   return buildSyntheticToolCallId({
     prefix: "subagent_result",
-    seed: childRequestId,
+    seed,
   });
-}
-
-function resolveRecoveredSubagentSessionName(
-  snapshot: Pick<
-    DeferredSubagentHandleSnapshot,
-    "sessionName" | "childSessionId" | "childRequestId" | "profile"
-  >,
-): string {
-  if (
-    typeof snapshot.sessionName === "string" &&
-    snapshot.sessionName.length <= 64 &&
-    /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(snapshot.sessionName)
-  ) {
-    return snapshot.sessionName;
-  }
-
-  const namedMarker = ":named:";
-  const namedIndex = snapshot.childSessionId.lastIndexOf(namedMarker);
-  if (namedIndex >= 0) {
-    const name = snapshot.childSessionId.slice(namedIndex + namedMarker.length);
-    if (name.length <= 64 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) {
-      return name;
-    }
-  }
-
-  const requestToken = snapshot.childRequestId
-    .toLowerCase()
-    .replace(/[^a-z0-9]/gu, "")
-    .slice(-8);
-  return `${snapshot.profile}-${requestToken || "recovered"}`;
 }
 
 function buildCustomCommandToolCallId(requestId: string, name: string): string {
@@ -1053,14 +966,15 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   }
 }
 
-function buildDeferredSubagentResultMessages(
-  completion: DeferredSubagentBufferedCompletion,
+export function buildDeferredSubagentResultMessages(
+  completion: WorkflowLiveParentCompletion,
 ): ModelMessage[] {
-  const toolCallId = buildSubagentResultToolCallId(completion.childRequestId);
+  const toolCallId = buildSubagentResultToolCallId(completion.runId);
   const payload = {
     ok: completion.ok,
     mode: "deferred" as const,
     status: completion.status,
+    workflowRunId: completion.runId,
     profile: completion.profile,
     sessionName: completion.sessionName,
     finalText: completion.finalText,
@@ -1079,6 +993,7 @@ function buildDeferredSubagentResultMessages(
             profile: completion.profile,
             sessionName: completion.sessionName,
             status: completion.status,
+            workflowRunId: completion.runId,
           },
         },
       ],
@@ -1100,581 +1015,104 @@ function buildDeferredSubagentResultMessages(
   ];
 }
 
-function buildDeferredSubagentDisplay(completion: {
-  profile: DeferredSubagentRegistration["profile"];
-  childTools: readonly ChildToolState[];
-}): string {
-  return renderSubagentDisplay({
-    profile: completion.profile,
-    children: new Map(completion.childTools.map((child) => [child.toolCallId, child])),
-  });
+function buildDeferredSubagentDisplay(completion: WorkflowLiveParentCompletion): string {
+  return `subagent (${completion.profile}; ${completion.status})`;
 }
 
-function buildDeferredSubagentRecoveryState(params: {
-  handles: Iterable<DeferredSubagentHandle>;
-  bufferedCompletions: readonly DeferredSubagentBufferedCompletion[];
-  normalizeFinalText?: (finalText: string) => string;
-}): DeferredSubagentRecoveryState | undefined {
-  const outstanding = Array.from(params.handles, (handle) => ({
-    parentToolCallId: handle.parentToolCallId,
-    profile: handle.profile,
-    sessionName: handle.sessionName,
-    childRequestId: handle.childRequestId,
-    childSessionId: handle.childSessionId,
-    idleTimeoutMs: handle.idleTimeoutMs,
-    finalText: params.normalizeFinalText?.(handle.finalText) ?? handle.finalText,
-    ...(handle.detail ? { detail: handle.detail } : {}),
-    childUpdateSeq: handle.childUpdateSeq,
-    childTools: Array.from(handle.childTools.values()),
-    ...(handle.outCursor ? { outCursor: handle.outCursor } : {}),
-    ...(handle.evtCursor ? { evtCursor: handle.evtCursor } : {}),
-  }));
+function hasToolResult(messages: readonly ModelMessage[], toolCallId: string): boolean {
+  return messages.some(
+    (message) =>
+      message.role === "tool" &&
+      message.content.some((part) => part.type === "tool-result" && part.toolCallId === toolCallId),
+  );
+}
 
-  if (outstanding.length === 0 && params.bufferedCompletions.length === 0) {
-    return undefined;
+function hasDeferredSubagentWorkflowRunId(
+  messages: readonly ModelMessage[],
+  workflowRunId: string,
+): boolean {
+  for (const message of messages) {
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (
+          part.type === "tool-call" &&
+          part.toolName === "subagent_result" &&
+          isRecord(part.input) &&
+          part.input["workflowRunId"] === workflowRunId
+        ) {
+          return true;
+        }
+      }
+    }
+    if (message.role !== "tool") continue;
+    for (const part of message.content) {
+      if (
+        part.type === "tool-result" &&
+        part.toolName === "subagent_result" &&
+        part.output.type === "json" &&
+        isRecord(part.output.value) &&
+        part.output.value["workflowRunId"] === workflowRunId
+      ) {
+        return true;
+      }
+    }
   }
-
-  return {
-    outstanding,
-    bufferedCompletions: params.bufferedCompletions.map((completion) => ({
-      ...completion,
-      finalText: params.normalizeFinalText?.(completion.finalText) ?? completion.finalText,
-    })),
-  };
+  return false;
 }
 
-export function createDeferredSubagentManager(params: {
-  bus: LilacBus;
-  logger: ReturnType<typeof createLogger>;
-  parentHeaders: {
-    request_id: string;
-    session_id: string;
-    request_client: AdapterPlatform;
-    router_session_mode?: "mention" | "active";
-  };
-  normalizeFinalText?: (params: { finalText: string; toolCallId: string }) => Promise<string>;
-  normalizeFinalTextForSnapshot?: (finalText: string) => string;
-  onActivity?: () => void;
-}) {
-  const { bus, logger, parentHeaders } = params;
-  const handles = new Map<string, DeferredSubagentHandle>();
-  const detachedStops = new Set<Promise<void>>();
-  const bufferedCompletions: DeferredSubagentBufferedCompletion[] = [];
-  let waiters: Array<() => void> = [];
-  let signalVersion = 0;
-  let closed = false;
-
-  const notifyWaiters = () => {
-    signalVersion += 1;
-    const current = waiters;
-    waiters = [];
-    for (const waiter of current) waiter();
-  };
-
-  const waitForSignalSince = async (version: number) => {
-    if (signalVersion !== version) return;
-
-    await new Promise<void>((resolve) => {
-      if (signalVersion !== version) {
-        resolve();
-        return;
-      }
-      waiters.push(resolve);
-    });
-  };
-
-  const snapshotWaitState = () => ({
-    signalVersion,
-    hasBufferedCompletions: bufferedCompletions.length > 0,
-    hasOutstandingChildren: handles.size > 0,
-  });
-
-  const publishStatus = async (update: {
-    toolCallId: string;
-    status: "update" | "end";
-    display: string;
-    ok?: boolean;
-    error?: string;
-  }) => {
-    await bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
-      headers: parentHeaders,
-    });
-  };
-
-  const stopHandle = async (
-    handle: DeferredSubagentHandle,
-    options?: { deferEvtSubStop?: boolean },
-  ) => {
-    handle.idleTimer?.stop();
-    handle.idleTimer = null;
-
-    const outSub = handle.outSub;
-    const evtSub = handle.evtSub;
-    handle.outSub = null;
-    handle.evtSub = null;
-
-    const stopPromises: Promise<void>[] = [];
-
-    if (outSub) {
-      stopPromises.push(outSub.stop());
-    }
-
-    if (evtSub) {
-      if (options?.deferEvtSubStop) {
-        const detachedStop = evtSub.stop().catch((e: unknown) => {
-          logger.warn(
-            "deferred subagent lifecycle subscription stop failed",
-            {
-              requestId: parentHeaders.request_id,
-              sessionId: parentHeaders.session_id,
-              childRequestId: handle.childRequestId,
-            },
-            e,
-          );
-        });
-        detachedStops.add(detachedStop);
-        void detachedStop.finally(() => detachedStops.delete(detachedStop));
-      } else {
-        stopPromises.push(evtSub.stop());
+function hasConsumedDeferredSubagentResult(
+  messages: readonly ModelMessage[],
+  completion: Pick<WorkflowLiveParentCompletion, "runId">,
+): boolean {
+  for (const message of messages) {
+    if (message.role !== "tool") continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || part.toolName !== "subagent_result") continue;
+      if (
+        part.output.type === "json" &&
+        isRecord(part.output.value) &&
+        part.output.value["workflowRunId"] === completion.runId
+      ) {
+        return true;
       }
     }
+  }
+  return false;
+}
 
-    await Promise.all(stopPromises);
-  };
+export function hasDeferredSubagentResult(
+  messages: readonly ModelMessage[],
+  completion: Pick<WorkflowLiveParentCompletion, "runId" | "childRequestId">,
+): boolean {
+  return (
+    hasDeferredSubagentWorkflowRunId(messages, completion.runId) ||
+    hasToolResult(messages, buildSubagentResultToolCallId(completion.runId)) ||
+    hasToolResult(messages, buildSubagentResultToolCallId(completion.childRequestId))
+  );
+}
 
-  const cancelChild = async (handle: DeferredSubagentHandle, detail: string) => {
-    logger.warn("deferred subagent cancel requested", {
-      requestId: parentHeaders.request_id,
-      sessionId: parentHeaders.session_id,
-      parentToolCallId: handle.parentToolCallId,
-      childRequestId: handle.childRequestId,
-      detail,
-    });
-
-    await bus.publish(
-      lilacEventTypes.CmdRequestMessage,
-      {
-        queue: "interrupt",
-        messages: [],
-        raw: {
-          cancel: true,
-          requiresActive: true,
-          cancelQueued: true,
-          subagent: {
-            profile: handle.profile,
-            parentRequestId: parentHeaders.request_id,
-            parentToolCallId: handle.parentToolCallId,
-          },
-        },
-      },
-      {
-        headers: {
-          request_id: handle.childRequestId,
-          session_id: handle.childSessionId,
-          request_client: "unknown",
-        },
-      },
-    );
-  };
-
-  const settleHandle = async (
-    handle: DeferredSubagentHandle,
-    status: DeferredSubagentTerminalStatus,
-    detail?: string,
-  ) => {
-    if (handle.settled) return;
-    handle.settled = true;
-    handle.idleTimer?.stop();
-    handle.detail = detail ?? handle.detail;
-
-    const finalText = params.normalizeFinalText
-      ? await params.normalizeFinalText({
-          finalText: handle.finalText,
-          toolCallId: buildSubagentResultToolCallId(handle.childRequestId),
-        })
-      : handle.finalText;
-    const completion: DeferredSubagentBufferedCompletion = {
-      parentToolCallId: handle.parentToolCallId,
-      profile: handle.profile,
-      sessionName: handle.sessionName,
-      childRequestId: handle.childRequestId,
-      childSessionId: handle.childSessionId,
-      status,
-      ok: status === "resolved",
-      finalText,
-      ...(handle.detail ? { detail: handle.detail } : {}),
-      childTools: Array.from(handle.childTools.values()),
-    };
-
-    bufferedCompletions.push(completion);
-    handles.delete(handle.childRequestId);
-    notifyWaiters();
-
-    if (handle.handlingEvtSubscriptionMessage) {
-      const detachedStop = stopHandle(handle, { deferEvtSubStop: true }).catch((e: unknown) => {
-        logger.warn(
-          "deferred subagent stop after settlement failed",
-          {
-            requestId: parentHeaders.request_id,
-            sessionId: parentHeaders.session_id,
-            childRequestId: handle.childRequestId,
-            status,
-          },
-          e,
-        );
-      });
-      detachedStops.add(detachedStop);
-      void detachedStop.finally(() => detachedStops.delete(detachedStop));
-      return;
-    }
-
-    await stopHandle(handle);
-  };
-
-  const restoreOutstandingHandle = async (
-    snapshot: DeferredSubagentHandleSnapshot,
-    options?: { replayExisting?: boolean },
-  ) => {
-    if (closed) return;
-
-    const idleTimeoutMs = snapshot.idleTimeoutMs ?? snapshot.timeoutMs;
-    if (!idleTimeoutMs || idleTimeoutMs <= 0) {
-      throw new Error("deferred subagent snapshot is missing a valid idle timeout");
-    }
-
-    const handle: DeferredSubagentHandle = {
-      parentToolCallId: snapshot.parentToolCallId,
-      profile: snapshot.profile,
-      sessionName: resolveRecoveredSubagentSessionName(snapshot),
-      childRequestId: snapshot.childRequestId,
-      childSessionId: snapshot.childSessionId,
-      idleTimeoutMs,
-      finalText: snapshot.finalText,
-      detail: snapshot.detail,
-      childUpdateSeq: snapshot.childUpdateSeq,
-      childTools: new Map(snapshot.childTools.map((child) => [child.toolCallId, child])),
-      outCursor: snapshot.outCursor,
-      evtCursor: snapshot.evtCursor,
-      outSub: null,
-      evtSub: null,
-      idleTimer: null,
-      settled: false,
-      handlingEvtSubscriptionMessage: false,
-    };
-
-    handles.set(handle.childRequestId, handle);
-
-    const subId = `${handle.childRequestId}:${Math.random().toString(16).slice(2)}`;
-    const outSub = await bus.subscribeTopic(
-      outReqTopic(handle.childRequestId),
-      options?.replayExisting
-        ? {
-            mode: "tail",
-            offset: handle.outCursor
-              ? { type: "cursor", cursor: handle.outCursor }
-              : { type: "begin" },
-            batch: { maxWaitMs: 250 },
-          }
-        : {
-            mode: "fanout",
-            subscriptionId: `deferred-subagent:out:${subId}`,
-            consumerId: `deferred-subagent:out:${subId}`,
-            ephemeral: true,
-            offset: { type: "now" },
-            batch: { maxWaitMs: 250 },
-          },
-      async (msg, subCtx) => {
-        if (msg.headers?.request_id !== handle.childRequestId) {
-          await subCtx.commit();
-          return;
-        }
-
-        params.onActivity?.();
-        handle.idleTimer?.reset();
-
-        if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
-          handle.finalText += msg.data.delta;
-        }
-
-        if (msg.type === lilacEventTypes.EvtAgentOutputToolCall) {
-          const existing = handle.childTools.get(msg.data.toolCallId);
-          const next: ChildToolState = {
-            toolCallId: msg.data.toolCallId,
-            status: msg.data.status === "end" ? "done" : "running",
-            ok: msg.data.status === "end" ? msg.data.ok === true : (existing?.ok ?? null),
-            display: msg.data.display,
-            updatedSeq: ++handle.childUpdateSeq,
-          };
-          handle.childTools.set(next.toolCallId, next);
-
-          await publishStatus({
-            toolCallId: handle.parentToolCallId,
-            status: "update",
-            display: renderSubagentDisplay({
-              profile: handle.profile,
-              children: handle.childTools,
-            }),
-          }).catch((e: unknown) => {
-            logger.warn(
-              "deferred subagent progress publish failed",
-              {
-                requestId: parentHeaders.request_id,
-                sessionId: parentHeaders.session_id,
-                parentToolCallId: handle.parentToolCallId,
-                childRequestId: handle.childRequestId,
-              },
-              e,
-            );
-          });
-        }
-
-        if (msg.type === lilacEventTypes.EvtAgentOutputResponseText) {
-          handle.finalText = msg.data.finalText;
-        }
-
-        handle.outCursor = subCtx.cursor;
-
-        await subCtx.commit();
-      },
-    );
-    if (closed) {
-      handles.delete(handle.childRequestId);
-      await outSub.stop();
-      return;
-    }
-    handle.outSub = outSub;
-
-    const evtSub = await bus.subscribeTopic(
-      "evt.request",
-      options?.replayExisting
-        ? {
-            mode: "tail",
-            offset: handle.evtCursor
-              ? { type: "cursor", cursor: handle.evtCursor }
-              : { type: "begin" },
-            batch: { maxWaitMs: 250 },
-          }
-        : {
-            mode: "fanout",
-            subscriptionId: `deferred-subagent:evt:${subId}`,
-            consumerId: `deferred-subagent:evt:${subId}`,
-            ephemeral: true,
-            offset: { type: "now" },
-            batch: { maxWaitMs: 250 },
-          },
-      async (msg, subCtx) => {
-        handle.handlingEvtSubscriptionMessage = true;
-
-        try {
-          if (msg.headers?.request_id !== handle.childRequestId) {
-            await subCtx.commit();
-            return;
-          }
-
-          params.onActivity?.();
-          handle.idleTimer?.reset();
-
-          if (msg.type === lilacEventTypes.EvtRequestLifecycleChanged) {
-            handle.detail = msg.data.detail ?? handle.detail;
-            if (msg.data.state === "failed") {
-              await settleHandle(handle, "failed", msg.data.detail);
-            }
-            if (msg.data.state === "cancelled") {
-              await settleHandle(handle, "cancelled", msg.data.detail);
-            }
-            if (msg.data.state === "resolved") {
-              await settleHandle(handle, "resolved", msg.data.detail);
-            }
-          }
-
-          handle.evtCursor = subCtx.cursor;
-
-          await subCtx.commit();
-        } finally {
-          handle.handlingEvtSubscriptionMessage = false;
-        }
-      },
-    );
-    if (closed) {
-      handles.delete(handle.childRequestId);
-      handle.evtSub = evtSub;
-      await stopHandle(handle);
-      return;
-    }
-    handle.evtSub = evtSub;
-
-    if (handle.settled) {
-      await stopHandle(handle);
-      return;
-    }
-
-    handle.idleTimer = createIdleTimer(handle.idleTimeoutMs, () => {
-      const detail = `idle timed out after ${handle.idleTimeoutMs}ms without child activity`;
-      void cancelChild(handle, detail).catch(() => undefined);
-      void settleHandle(handle, "timeout", detail);
-    });
-    handle.idleTimer.reset();
-  };
+export function planDeferredSubagentBoundary(input: {
+  canonicalMessages: readonly ModelMessage[];
+  modelInputMessages: readonly ModelMessage[];
+  completions: readonly WorkflowLiveParentCompletion[];
+}): {
+  append: ModelMessage[];
+  consumedRunIds: string[];
+  forceNextTurn: boolean;
+} {
+  const consumedRunIds = input.completions
+    .filter((completion) => hasConsumedDeferredSubagentResult(input.modelInputMessages, completion))
+    .map((completion) => completion.runId);
+  const consumed = new Set(consumedRunIds);
+  const unconsumed = input.completions.filter((completion) => !consumed.has(completion.runId));
+  const unseen = unconsumed.filter(
+    (completion) => !hasDeferredSubagentWorkflowRunId(input.canonicalMessages, completion.runId),
+  );
 
   return {
-    async register(registration: DeferredSubagentRegistration) {
-      if (closed) throw new Error("deferred subagent manager is closed");
-
-      await restoreOutstandingHandle({
-        parentToolCallId: registration.parentToolCallId,
-        profile: registration.profile,
-        sessionName: registration.sessionName,
-        childRequestId: registration.childRequestId,
-        childSessionId: registration.childSessionId,
-        idleTimeoutMs: registration.idleTimeoutMs,
-        finalText: "",
-        childUpdateSeq: 0,
-        childTools: [],
-      });
-      if (closed || !handles.has(registration.childRequestId)) return;
-
-      try {
-        await bus.publish(
-          lilacEventTypes.CmdRequestMessage,
-          {
-            queue: "prompt",
-            messages: registration.initialMessages,
-            ...(registration.modelOverride ? { modelOverride: registration.modelOverride } : {}),
-            raw: {
-              subagent: {
-                profile: registration.profile,
-                depth: registration.depth,
-                parentRequestId: registration.parentRequestId,
-                parentToolCallId: registration.parentToolCallId,
-                ...(registration.reasoningOverride
-                  ? { reasoning: registration.reasoningOverride }
-                  : {}),
-              },
-            },
-          },
-          { headers: registration.childHeaders },
-        );
-      } catch (e) {
-        const handle = handles.get(registration.childRequestId);
-        if (handle) {
-          handles.delete(registration.childRequestId);
-          await stopHandle(handle);
-        }
-        throw e;
-      }
-    },
-
-    async restore(recovery: DeferredSubagentRecoveryState | undefined) {
-      if (!recovery || closed) return;
-      for (const completion of recovery.bufferedCompletions) {
-        bufferedCompletions.push({
-          ...completion,
-          sessionName: resolveRecoveredSubagentSessionName(completion),
-          finalText: params.normalizeFinalText
-            ? await params.normalizeFinalText({
-                finalText: completion.finalText,
-                toolCallId: buildSubagentResultToolCallId(completion.childRequestId),
-              })
-            : completion.finalText,
-        });
-      }
-      for (const outstanding of recovery.outstanding) {
-        await restoreOutstandingHandle(outstanding, { replayExisting: true });
-      }
-      if (recovery.bufferedCompletions.length > 0 || recovery.outstanding.length > 0) {
-        notifyWaiters();
-      }
-    },
-
-    hasOutstandingChildren() {
-      return handles.size > 0;
-    },
-
-    hasBufferedCompletions() {
-      return bufferedCompletions.length > 0;
-    },
-
-    waitForSignalSince,
-
-    snapshotWaitState,
-
-    notifyWaiters,
-
-    buildRecoveryState() {
-      return buildDeferredSubagentRecoveryState({
-        handles: handles.values(),
-        bufferedCompletions,
-        normalizeFinalText: params.normalizeFinalTextForSnapshot,
-      });
-    },
-
-    async injectBuffered(agent: AiSdkPiAgent<ToolSet>) {
-      if (bufferedCompletions.length === 0) return false;
-      const completions = bufferedCompletions.splice(0, bufferedCompletions.length);
-      const messages = completions.flatMap((completion) =>
-        buildDeferredSubagentResultMessages(completion),
-      );
-      agent.appendMessages(messages);
-
-      for (const completion of completions) {
-        await publishStatus({
-          toolCallId: completion.parentToolCallId,
-          status: "end",
-          display: buildDeferredSubagentDisplay(completion),
-          ok: completion.ok,
-          error: completion.ok ? undefined : (completion.detail ?? `subagent ${completion.status}`),
-        }).catch((e: unknown) => {
-          logger.warn(
-            "deferred subagent completion publish failed",
-            {
-              requestId: parentHeaders.request_id,
-              sessionId: parentHeaders.session_id,
-              parentToolCallId: completion.parentToolCallId,
-              childRequestId: completion.childRequestId,
-            },
-            e,
-          );
-        });
-      }
-
-      return true;
-    },
-
-    async cancelAll(detail: string) {
-      closed = true;
-      const active = [...handles.values()];
-      handles.clear();
-
-      await Promise.all(
-        active.map(async (handle) => {
-          await cancelChild(handle, detail).catch(() => undefined);
-          await publishStatus({
-            toolCallId: handle.parentToolCallId,
-            status: "end",
-            display: renderSubagentDisplay({
-              profile: handle.profile,
-              children: handle.childTools,
-            }),
-            ok: false,
-            error: detail,
-          }).catch(() => undefined);
-          await stopHandle(handle);
-        }),
-      );
-      await Promise.all(detachedStops);
-
-      bufferedCompletions.length = 0;
-      notifyWaiters();
-    },
-
-    async stop() {
-      closed = true;
-      const active = [...handles.values()];
-      handles.clear();
-      bufferedCompletions.length = 0;
-      await Promise.all([...active.map((handle) => stopHandle(handle)), ...detachedStops]);
-      notifyWaiters();
-    },
+    append: unseen.flatMap(buildDeferredSubagentResultMessages),
+    consumedRunIds,
+    forceNextTurn: unconsumed.length > 0,
   };
 }
 
@@ -1744,7 +1182,6 @@ type Enqueued = {
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
-    deferredSubagents?: DeferredSubagentRecoveryState;
   };
 };
 
@@ -1762,7 +1199,6 @@ export type AgentRunnerRecoveryEntry = {
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
-    deferredSubagents?: DeferredSubagentRecoveryState;
   };
 };
 
@@ -1790,6 +1226,8 @@ class PreAgentRunCancelledError extends Error {
 }
 
 const AGENT_TIMEOUT_ABORT_GRACE_MS = 5_000;
+const LIVE_PARENT_RECONCILE_MS = 1_000;
+const SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS = 3;
 
 export function createAgentRunIdleWatchdog(params: {
   idleTimeoutMs: number;
@@ -1907,25 +1345,6 @@ async function publishAbsorbedQueuedPromptCancelled(input: {
   }
 }
 
-type SubagentConfig = NonNullable<CoreConfig["agent"]["subagents"]>;
-
-const DEFAULT_SUBAGENT_CONFIG: SubagentConfig = {
-  enabled: true,
-  maxDepth: 2,
-  idleTimeoutMs: 6 * 60 * 1000,
-  profiles: {
-    explore: {
-      modelSlot: "main",
-    },
-    general: {
-      modelSlot: "main",
-    },
-    self: {
-      modelSlot: "main",
-    },
-  },
-};
-
 async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
   try {
     const workspaceRoot = findWorkspaceRoot();
@@ -1980,9 +1399,16 @@ export function resolveAgentRunModel(params: {
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
+  resolvedModelRequest?: WorkflowRequestPolicy["resolvedModelRequest"];
 }) {
   const subagentProfileConfig =
-    params.runProfile === "primary" ? null : params.cfg.agent.subagents.profiles[params.runProfile];
+    params.runProfile === "primary"
+      ? null
+      : resolveNativeSubagentProfile(params.cfg, params.runProfile);
+
+  if (params.resolvedModelRequest) {
+    return fromDurableResolvedModelRequest(params.resolvedModelRequest);
+  }
 
   if (params.runProfile !== "primary" && params.requestModelOverride) {
     const selectedPreset = params.cfg.models.def[params.requestModelOverride];
@@ -2026,6 +1452,18 @@ export function resolveAgentRunModel(params: {
   return reasoning ? { ...slotResolved, reasoning } : slotResolved;
 }
 
+export function assertWorkflowDispatchPolicy(
+  workflowPolicy: WorkflowRequestPolicy,
+  subagentMeta: ParsedSubagentMeta,
+): void {
+  if (workflowPolicy.profile !== subagentMeta.profile) {
+    throw new Error("Workflow request profile envelope does not match the runner profile");
+  }
+  if ((workflowPolicy.reasoning ?? null) !== (subagentMeta.reasoning ?? null)) {
+    throw new Error("Workflow request reasoning does not match the approved operation policy");
+  }
+}
+
 type SessionQueue = {
   running: boolean;
   agent: AiSdkPiAgent<ToolSet> | null;
@@ -2035,6 +1473,7 @@ type SessionQueue = {
     requestId: string;
     sessionId: string;
     requestClient: AdapterPlatform;
+    runProfile: AgentRunProfile;
     queue: RequestQueueMode;
     runPolicy: RequestRunPolicy;
     origin?: RequestOrigin;
@@ -2042,12 +1481,28 @@ type SessionQueue = {
     modelOverride?: string;
     raw?: unknown;
     partialText: string;
-    deferred: ReturnType<typeof createDeferredSubagentManager>;
+    liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
+    notifyWaiters: () => void;
     cancel: () => void;
     started: boolean;
+    startedAt: number;
+    activeTools: Map<string, { toolName: string; startedAt: number }>;
   } | null;
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
+};
+
+export type AgentRunnerActiveWork = {
+  requestId: string;
+  requestClient: AdapterPlatform;
+  runProfile: AgentRunProfile;
+  phase: "preparing" | "model" | "tool";
+  runAgeMs: number;
+  tools: readonly {
+    toolCallId: string;
+    toolName: string;
+    ageMs: number;
+  }[];
 };
 
 export async function startBusAgentRunner(params: {
@@ -2061,6 +1516,36 @@ export async function startBusAgentRunner(params: {
   cwd?: string;
   transcriptStore?: TranscriptStore;
   toolResultArtifacts?: ToolResultArtifactStore;
+  workflowLiveParentBridge?: WorkflowLiveParentBridge;
+  workflowSubagentDispatcher?: WorkflowSubagentDispatcher;
+  durableWorkflowStore?: DurableWorkflowStore;
+  resolveParentChannelId?: (sessionId: string) => string | null | undefined;
+  issueControlCapability?: (input: {
+    requestId: string;
+    sessionId: string;
+    requestClient: AdapterPlatform;
+    profile: AgentRunProfile;
+    canonicalCwd: string;
+    safetyMode: SessionSafetyMode;
+    expiresAt: number;
+    principal?: { platform: "discord" | "github"; userId: string };
+  }) =>
+    | {
+        capability: string;
+        principal: { platform: "discord" | "github"; userId: string } | null;
+      }
+    | Promise<{
+        capability: string;
+        principal: { platform: "discord" | "github"; userId: string } | null;
+      }>;
+  issueHeartbeatCapability?: (input: {
+    requestId: string;
+    sessionId: string;
+    requestClient: AdapterPlatform;
+    canonicalCwd: string;
+    expiresAt: number;
+  }) => string | Promise<string>;
+  expireControlCapability?: (requestId: string) => void;
 }) {
   const { bus, subscriptionId } = params;
 
@@ -2100,6 +1585,7 @@ export async function startBusAgentRunner(params: {
     }
   }
   const cwd = params.cwd ?? process.env.LILAC_WORKSPACE_DIR ?? process.cwd();
+  const workflowRunnerOwnerId = `agent-runner:${process.pid}:${crypto.randomUUID()}`;
 
   const bySession = new Map<string, SessionQueue>();
   const cancelledByRequestId = new Set<string>();
@@ -2589,7 +2075,6 @@ export async function startBusAgentRunner(params: {
       recovery: {
         checkpointMessages,
         partialText: state.activeRun.partialText,
-        deferredSubagents: state.activeRun.deferred.buildRecoveryState(),
       },
     };
   }
@@ -2724,7 +2209,16 @@ export async function startBusAgentRunner(params: {
 
     const subagentMeta = parseSubagentMetaFromRaw(next.raw);
     const runProfile = subagentMeta.profile;
-    const subagents = cfg.agent.subagents ?? DEFAULT_SUBAGENT_CONFIG;
+    const workflowHint = parseWorkflowRequestHintFromRaw(next.raw);
+    let workflowDispatchEpoch = workflowHint?.dispatchEpoch;
+    let workflowPolicy: WorkflowRequestPolicy | null = null;
+    let workflowRequestClaimed = false;
+    let workflowClaimTimer: ReturnType<typeof setInterval> | null = null;
+    let preserveWorkflowClaim = false;
+    let controlCapability: string | null = null;
+    let trustedFallbackSurface: TrustedSubagentDelegationRegistration["fallbackSurface"] | null =
+      null;
+    const subagents = cfg.agent.subagents;
 
     const routerSessionMode = parseRouterSessionModeFromRaw(next.raw);
 
@@ -2740,11 +2234,48 @@ export async function startBusAgentRunner(params: {
     let unsubscribe = () => {};
     let unsubscribeCompaction = () => {};
 
-    const headers = {
+    const headers: {
+      request_id: string;
+      session_id: string;
+      request_client: AdapterPlatform;
+      workflow_dispatch_epoch?: string;
+      router_session_mode?: "mention" | "active";
+    } = {
       request_id: next.requestId,
       session_id: next.sessionId,
       request_client: next.requestClient,
+      ...(workflowDispatchEpoch ? { workflow_dispatch_epoch: workflowDispatchEpoch } : {}),
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
+    };
+    const publishCurrentLifecycle = async (input: {
+      state: RequestLifecycleState;
+      detail?: string;
+      output?: string;
+      usage?: WorkflowUsage;
+    }): Promise<void> => {
+      if (
+        workflowPolicy &&
+        workflowRequestClaimed &&
+        workflowDispatchEpoch &&
+        (input.state === "resolved" || input.state === "failed" || input.state === "cancelled")
+      ) {
+        const recorded = params.durableWorkflowStore?.recordWorkflowRequestTerminal({
+          requestId: next.requestId,
+          runId: workflowPolicy.runId,
+          operationId: workflowPolicy.operationId,
+          dispatchEpoch: workflowDispatchEpoch,
+          ownerId: workflowRunnerOwnerId,
+          state: input.state,
+          detail: input.detail,
+          output: input.output,
+          usage: input.usage,
+          now: Date.now(),
+        });
+        if (recorded !== true) {
+          throw new Error("Workflow terminal receipt persistence lost its fenced dispatch claim");
+        }
+      }
+      await publishLifecycle({ bus, headers, ...input });
     };
     const publishAgentActivity = createAgentOutputActivityPublisher({
       bus,
@@ -2799,25 +2330,59 @@ export async function startBusAgentRunner(params: {
       },
     );
 
-    const deferredSubagents = createDeferredSubagentManager({
-      bus,
-      logger,
-      parentHeaders: headers,
-      normalizeFinalText: ({ finalText, toolCallId }) =>
-        normalizeSubagentFinalText({
-          normalize: normalizeToolResultOutput,
-          finalText,
-          toolCallId,
-        }),
-      normalizeFinalTextForSnapshot: (finalText) =>
-        normalizeSubagentFinalTextForSnapshot(finalText, cfg.tools.output.maxPreviewBytes),
+    const liveParentSession = params.workflowLiveParentBridge?.registerParent({
+      parentRequestId: next.requestId,
       onActivity: () => markRunActivity("subagent"),
+      recoverSynchronousDeliveries: next.recovery !== undefined,
     });
+    await liveParentSession?.ready;
+    const workflowSubagentDispatcher = params.workflowSubagentDispatcher;
+    let continuationSignalVersion = 0;
+    const continuationWaiters = new Set<() => void>();
+    const notifyContinuationWaiters = () => {
+      continuationSignalVersion += 1;
+      const current = [...continuationWaiters];
+      continuationWaiters.clear();
+      for (const waiter of current) waiter();
+    };
+    const waitForContinuationSignalSince = async (version: number, abortSignal?: AbortSignal) => {
+      if (continuationSignalVersion !== version || abortSignal?.aborted) return;
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          continuationWaiters.delete(finish);
+          abortSignal?.removeEventListener("abort", finish);
+          resolve();
+        };
+        if (continuationSignalVersion !== version || abortSignal?.aborted) {
+          finish();
+          return;
+        }
+        continuationWaiters.add(finish);
+        abortSignal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+    const waitForDeferredWake = async (
+      liveParentSignalVersion: number,
+      continuationVersion: number,
+    ) => {
+      if (!liveParentSession) return;
+      const controller = new AbortController();
+      try {
+        await Promise.race([
+          liveParentSession.waitForSignalSince(liveParentSignalVersion, controller.signal),
+          waitForContinuationSignalSince(continuationVersion, controller.signal),
+          Bun.sleep(LIVE_PARENT_RECONCILE_MS),
+        ]);
+      } finally {
+        controller.abort();
+      }
+    };
 
     state.activeRun = {
       requestId: next.requestId,
       sessionId: next.sessionId,
       requestClient: next.requestClient,
+      runProfile,
       queue: next.queue,
       runPolicy: next.runPolicy,
       origin: next.origin,
@@ -2825,7 +2390,8 @@ export async function startBusAgentRunner(params: {
       modelOverride: next.modelOverride,
       raw: next.raw,
       partialText: next.recovery?.partialText ?? "",
-      deferred: deferredSubagents,
+      liveParent: liveParentSession,
+      notifyWaiters: notifyContinuationWaiters,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -2833,6 +2399,8 @@ export async function startBusAgentRunner(params: {
         rejectPreAgentCancellation = null;
       },
       started: false,
+      startedAt: runStartedAt,
+      activeTools: new Map(),
     };
 
     let initialMessages: ModelMessage[] = [];
@@ -2862,14 +2430,71 @@ export async function startBusAgentRunner(params: {
 
     let resolvedModelLabel = "unknown";
     try {
+      const looksLikeWorkflowRequest =
+        next.requestId.startsWith("wfr:") || next.sessionId.startsWith("workflow:");
+      if (workflowHint || looksLikeWorkflowRequest) {
+        if (!workflowHint || !params.durableWorkflowStore) {
+          throw new Error("Workflow request is missing server-issued dispatch authority");
+        }
+        const authorized = params.durableWorkflowStore.authorizeWorkflowRequest({
+          requestId: next.requestId,
+          sessionId: next.sessionId,
+          platform: next.requestClient,
+        });
+        if (
+          !authorized ||
+          authorized.policy.runId !== workflowHint.runId ||
+          authorized.policy.operationId !== workflowHint.operationId ||
+          authorized.policy.dispatchEpoch !== workflowHint.dispatchEpoch
+        ) {
+          throw new Error("Workflow request dispatch authority is invalid or inactive");
+        }
+        workflowDispatchEpoch = authorized.policy.dispatchEpoch;
+        headers.workflow_dispatch_epoch = workflowDispatchEpoch;
+        if (
+          !params.durableWorkflowStore.claimWorkflowRequest({
+            requestId: next.requestId,
+            dispatchEpoch: authorized.policy.dispatchEpoch,
+            ownerId: workflowRunnerOwnerId,
+            now: Date.now(),
+          })
+        ) {
+          throw new Error("Workflow request dispatch is owned by another live runner");
+        }
+        workflowRequestClaimed = true;
+        workflowPolicy = authorized.policy;
+        trustedFallbackSurface =
+          authorized.policy.originSession.sessionId &&
+          (authorized.policy.originSession.client === "discord" ||
+            authorized.policy.originSession.client === "github") &&
+          authorized.policy.originSession.userId
+            ? {
+                platform: authorized.policy.originSession.client,
+                sessionId: authorized.policy.originSession.sessionId,
+                userId: authorized.policy.originSession.userId,
+              }
+            : null;
+        workflowClaimTimer = setInterval(() => {
+          const refreshed = params.durableWorkflowStore?.refreshWorkflowRequestClaim(
+            next.requestId,
+            workflowRunnerOwnerId,
+            Date.now(),
+          );
+          if (refreshed === false) {
+            activeAgent?.abort();
+            rejectPreAgentCancellation?.(new PreAgentRunCancelledError());
+          }
+        }, 5_000);
+        workflowClaimTimer.unref?.();
+      }
+      if (workflowPolicy) assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
       const maxSubagentDepth = subagents.maxDepth;
       if (subagentMeta.depth > maxSubagentDepth) {
         const detail = `subagent depth ${subagentMeta.depth} exceeds maxDepth=${maxSubagentDepth}`;
-        await publishLifecycle({
-          bus,
-          headers,
+        await publishCurrentLifecycle({
           state: "failed",
           detail,
+          output: `Error: ${detail}`,
         });
         await bus.publish(
           lilacEventTypes.EvtAgentOutputResponseText,
@@ -2879,9 +2504,7 @@ export async function startBusAgentRunner(params: {
         return;
       }
 
-      await publishLifecycle({
-        bus,
-        headers,
+      await publishCurrentLifecycle({
         state: "running",
         detail: next.recovery
           ? "resumed after server restart"
@@ -2972,11 +2595,10 @@ export async function startBusAgentRunner(params: {
             { headers },
           );
           activeCustomCommandTool = null;
-          await publishLifecycle({
-            bus,
-            headers,
+          await publishCurrentLifecycle({
             state: "cancelled",
             detail: "cancelled by interrupt",
+            output: finalText,
           });
           await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
           return;
@@ -3047,7 +2669,11 @@ export async function startBusAgentRunner(params: {
             }
           }
 
-          await publishLifecycle({ bus, headers, state: "failed", detail: customError });
+          await publishCurrentLifecycle({
+            state: "failed",
+            detail: customError,
+            output: finalText,
+          });
           await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
 
           logger.warn("custom command failed", {
@@ -3064,11 +2690,20 @@ export async function startBusAgentRunner(params: {
         runProfile === "primary"
           ? (next.modelOverride ?? parseRequestModelOverrideFromRaw(next.raw) ?? undefined)
           : next.modelOverride;
+      if (
+        workflowPolicy &&
+        requestModelOverride !== undefined &&
+        requestModelOverride !== workflowPolicy.resolvedModelRequest.alias &&
+        requestModelOverride !== workflowPolicy.resolvedModelRequest.spec
+      ) {
+        throw new Error("Workflow request model does not match the approved operation policy");
+      }
       const resolved = resolveAgentRunModel({
         cfg,
         runProfile,
         requestModelOverride,
         reasoningOverride: subagentMeta.reasoning,
+        resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
       });
       resolvedModelLabel = resolved.modelId;
       try {
@@ -3090,6 +2725,7 @@ export async function startBusAgentRunner(params: {
         provider: resolved.provider,
         modelId: resolved.modelId,
       });
+      const activeEditingToolMode = editingToolMode;
 
       const anthropicModel = isAnthropicModelSpec(resolved.spec);
       const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
@@ -3102,7 +2738,8 @@ export async function startBusAgentRunner(params: {
       // Also, when reasoning display is enabled, request detailed reasoning summaries
       // for OpenAI-backed models (including gateway/openrouter openai/* model IDs).
       const providerOptionsWithOpenAIReasoningSummary = withReasoningSummaryDefaultForOpenAIModels({
-        reasoningDisplay: cfg.agent.reasoningDisplay,
+        reasoningDisplay:
+          workflowPolicy?.resolvedModelRequest.reasoningDisplay ?? cfg.agent.reasoningDisplay,
         provider: resolved.provider,
         modelId: resolved.modelId,
         providerOptions: resolved.providerOptions,
@@ -3112,7 +2749,8 @@ export async function startBusAgentRunner(params: {
       // anthropic.thinking.display="summarized" is set. When the user wants a
       // reasoning lane and has thinking enabled, request summarized thinking text.
       const providerOptionsWithReasoningDisplay = withReasoningDisplayDefaultForAnthropicModels({
-        reasoningDisplay: cfg.agent.reasoningDisplay,
+        reasoningDisplay:
+          workflowPolicy?.resolvedModelRequest.reasoningDisplay ?? cfg.agent.reasoningDisplay,
         provider: resolved.provider,
         modelId: resolved.modelId,
         providerOptions: providerOptionsWithOpenAIReasoningSummary,
@@ -3148,7 +2786,9 @@ export async function startBusAgentRunner(params: {
       const baseSystemPrompt = buildSystemPromptForProfile({
         baseSystemPrompt: cfg.agent.systemPrompt,
         profile: runProfile,
-        activeEditingTool: runProfile === "explore" ? null : editingToolMode,
+        profileConfig:
+          runProfile === "primary" ? undefined : resolveNativeSubagentProfile(cfg, runProfile),
+        activeEditingTool: runProfile === "explore" ? null : activeEditingToolMode,
         exploreOverlay: subagents.profiles.explore.promptOverlay,
         generalOverlay: subagents.profiles.general.promptOverlay,
         selfOverlay: subagents.profiles.self.promptOverlay,
@@ -3165,12 +2805,60 @@ export async function startBusAgentRunner(params: {
       });
 
       const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
-      const parentChannelId = parseParentChannelIdFromRaw(next.raw) ?? undefined;
-      const safetyMode: SessionSafetyMode = resolveSessionSafetyMode(
-        cfg,
-        sessionId,
-        parentChannelId,
-      );
+      const parentChannelResolution =
+        next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
+      const parentChannelId = parentChannelResolution ?? undefined;
+      const safetyMode: SessionSafetyMode =
+        next.requestClient === "discord" && parentChannelResolution === undefined
+          ? "restricted"
+          : resolveSessionSafetyMode(cfg, sessionId, parentChannelId);
+      if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
+        controlCapability =
+          (await params.issueHeartbeatCapability?.({
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+            requestClient: next.requestClient,
+            canonicalCwd: cwd,
+            expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
+          })) ?? null;
+        if (!controlCapability) {
+          throw new Error("Heartbeat request is missing server-issued Level-2 authority");
+        }
+      } else if (
+        workflowPolicy ||
+        next.requestClient === "discord" ||
+        next.requestClient === "github"
+      ) {
+        const capabilityPrincipal = trustedFallbackSurface
+          ? {
+              platform: trustedFallbackSurface.platform,
+              userId: trustedFallbackSurface.userId,
+            }
+          : undefined;
+        const issuedControl = await params.issueControlCapability?.({
+          requestId: next.requestId,
+          sessionId: next.sessionId,
+          requestClient: next.requestClient,
+          profile: runProfile,
+          canonicalCwd: workflowPolicy?.cwd ?? cwd,
+          safetyMode,
+          expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
+          ...(capabilityPrincipal ? { principal: capabilityPrincipal } : {}),
+        });
+        if (!issuedControl) {
+          throw new Error(
+            "Native profile request is missing server-issued Level-2 control authority",
+          );
+        }
+        controlCapability = issuedControl.capability;
+        if (issuedControl.principal) {
+          trustedFallbackSurface = {
+            platform: issuedControl.principal.platform,
+            sessionId: next.sessionId,
+            userId: issuedControl.principal.userId,
+          };
+        }
+      }
 
       const additionalSessionPrompts = await waitForPreAgent(
         resolveSessionAdditionalPrompts({
@@ -3266,14 +2954,6 @@ export async function startBusAgentRunner(params: {
         }
       }
 
-      const agentSystem = anthropicPromptCachingEnabled
-        ? {
-            role: "system" as const,
-            content: systemPrompt,
-            providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-          }
-        : systemPrompt;
-
       logger.info("agent run starting", {
         requestId: next.requestId,
         sessionId: next.sessionId,
@@ -3285,22 +2965,24 @@ export async function startBusAgentRunner(params: {
         requestModelOverride,
         model: resolved.spec,
         responseCommentary: resolved.responseCommentary === true,
-        editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
+        editingToolMode: runProfile === "explore" ? "none" : activeEditingToolMode,
         isRecoveryResume: Boolean(next.recovery),
         messageCount: next.messages.length,
         recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
         queuedForSession: state.queue.length,
       });
 
+      const fallbackSurfaceForDelegation = trustedFallbackSurface;
+      const executionCwd = workflowPolicy?.cwd ?? cwd;
       const {
         tools,
         specs: level1ToolSpecs,
         genericOutputNormalizerBypassTools,
       } = await waitForPreAgent(
         params.pluginManager.buildLevel1Toolset({
-          cwd,
+          cwd: executionCwd,
           runProfile,
-          editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
+          editingToolMode: runProfile === "explore" ? "none" : activeEditingToolMode,
           subagentDepth: subagentMeta.depth,
           subagentConfig: {
             enabled: subagents.enabled,
@@ -3315,12 +2997,19 @@ export async function startBusAgentRunner(params: {
             subagentProfile: runProfile,
             safetyMode,
             metadata: {
+              controlCapability: controlCapability ?? undefined,
               readFileDirectAttachmentSupported:
                 supportsReadFileDirectAttachments(modelCapabilityInfo),
               onActivity: (source: "tool" | "subagent") => markRunActivity(source),
-              onDeferredDelegate: async (registration: DeferredSubagentRegistration) => {
-                await deferredSubagents.register(registration);
-              },
+              onSubagentDelegate:
+                workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
+                  ? async (registration: SubagentDelegationRegistration) =>
+                      await workflowSubagentDispatcher.delegate({
+                        ...registration,
+                        projectRoot: executionCwd,
+                        fallbackSurface: fallbackSurfaceForDelegation,
+                      })
+                  : undefined,
             },
           },
           reportToolStatus: (update) => {
@@ -3342,7 +3031,13 @@ export async function startBusAgentRunner(params: {
           },
         }),
       );
-
+      const agentSystem = anthropicPromptCachingEnabled
+        ? {
+            role: "system" as const,
+            content: systemPrompt,
+            providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+          }
+        : systemPrompt;
       let transientRetryOutputStarted = false;
       const transientRetryController = createTransientModelRetryController({
         retry: cfg.agent.retry,
@@ -3586,9 +3281,146 @@ export async function startBusAgentRunner(params: {
         }),
       );
 
-      state.agent = agent;
+      const publishedDeferredCompletionRunIds = new Set<string>();
+      let lastBoundaryModelInputMessages: readonly ModelMessage[] = [];
+      const drainDeferredCompletions = async (input: {
+        modelInputMessages: readonly ModelMessage[];
+        abortSignal?: AbortSignal;
+      }): Promise<{ append: ModelMessage[]; forceNextTurn: boolean }> => {
+        if (!liveParentSession) {
+          return { append: [], forceNextTurn: false };
+        }
 
-      await waitForPreAgent(deferredSubagents.restore(next.recovery?.deferredSubagents));
+        const pendingIdentities = liveParentSession.listPendingIdentities();
+        const consumedBeforeMaterialization = pendingIdentities
+          .filter((identity) =>
+            hasConsumedDeferredSubagentResult(input.modelInputMessages, identity),
+          )
+          .map((identity) => identity.runId);
+        if (consumedBeforeMaterialization.length > 0) {
+          await liveParentSession.acknowledge(consumedBeforeMaterialization);
+        }
+        if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
+
+        let settled: Awaited<ReturnType<typeof liveParentSession.listPendingSettledAsync>>;
+        try {
+          settled = await liveParentSession.listPendingSettledAsync();
+        } catch (error) {
+          logger.warn(
+            "workflow subagent completion query failed; delivery remains pending",
+            { requestId: headers.request_id, sessionId: headers.session_id },
+            error,
+          );
+          return { append: [], forceNextTurn: false };
+        }
+
+        if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
+
+        const completions: WorkflowLiveParentCompletion[] = [];
+        for (const result of settled) {
+          let completion: WorkflowLiveParentCompletion | null = null;
+          let materializationError: unknown;
+          if (result.loaded) {
+            try {
+              completion = {
+                ...result.completion,
+                finalText: await normalizeSubagentFinalText({
+                  normalize: normalizeToolResultOutput,
+                  finalText: result.completion.finalText,
+                  toolCallId: buildSubagentResultToolCallId(result.completion.runId),
+                }),
+              };
+            } catch (error) {
+              materializationError = error;
+            }
+          } else {
+            materializationError = result.error;
+          }
+
+          if (completion) {
+            liveParentSession.clearMaterializationFailure(completion.runId);
+            completions.push(completion);
+            continue;
+          }
+
+          const identity = result.loaded ? result.completion : result.identity;
+          const errorMessage =
+            materializationError instanceof Error
+              ? materializationError.message
+              : String(materializationError);
+          const attempts = liveParentSession.recordMaterializationFailure(
+            identity.runId,
+            errorMessage,
+          );
+          logger.warn(
+            "workflow subagent completion materialization failed",
+            {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              runId: identity.runId,
+              attempts,
+              maxAttempts: SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS,
+            },
+            materializationError,
+          );
+          if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS) continue;
+
+          completions.push({
+            ...identity,
+            status: "failed",
+            ok: false,
+            finalText: "",
+            detail: `subagent result delivery failed after ${attempts} attempts: ${errorMessage}`,
+          });
+        }
+
+        const plan = planDeferredSubagentBoundary({
+          canonicalMessages: agent.state.messages,
+          modelInputMessages: input.modelInputMessages,
+          completions,
+        });
+
+        for (const completion of completions) {
+          if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
+          try {
+            await bus.publish(
+              lilacEventTypes.EvtAgentOutputToolCall,
+              {
+                toolCallId: completion.parentToolCallId,
+                status: "end",
+                display: buildDeferredSubagentDisplay(completion),
+                ok: completion.ok,
+                error: completion.ok
+                  ? undefined
+                  : (completion.detail ?? `subagent ${completion.status}`),
+              },
+              { headers },
+            );
+            publishedDeferredCompletionRunIds.add(completion.runId);
+          } catch (error) {
+            logger.warn(
+              "workflow subagent completion publish failed",
+              { runId: completion.runId },
+              error,
+            );
+          }
+        }
+
+        if (plan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
+          await liveParentSession.acknowledge(plan.consumedRunIds);
+        }
+
+        return { append: plan.append, forceNextTurn: plan.forceNextTurn };
+      };
+      agent.setTurnBoundaryHandler(async (context) => {
+        lastBoundaryModelInputMessages = context.modelInputMessages;
+        return await drainDeferredCompletions({
+          modelInputMessages: context.modelInputMessages,
+          abortSignal: context.abortSignal,
+        });
+      });
+
+      state.agent = agent;
 
       let finalText = "";
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
@@ -3864,33 +3696,41 @@ export async function startBusAgentRunner(params: {
         }
 
         if (event.type === "tool_execution_start") {
-          toolStartMs.set(event.toolCallId, Date.now());
+          const startedAt = Date.now();
+          toolStartMs.set(event.toolCallId, startedAt);
+          state.activeRun?.activeTools.set(event.toolCallId, {
+            toolName: event.toolName,
+            startedAt,
+          });
 
-          bus
-            .publish(
-              lilacEventTypes.EvtAgentOutputToolCall,
-              {
-                toolCallId: event.toolCallId,
-                status: "start",
-                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
-              },
-              { headers },
-            )
-            .catch((e: unknown) => {
-              logger.error(
-                "failed to publish tool start",
+          if (event.toolName !== "batch") {
+            bus
+              .publish(
+                lilacEventTypes.EvtAgentOutputToolCall,
                 {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
                   toolCallId: event.toolCallId,
-                  toolName: event.toolName,
+                  status: "start",
+                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
                 },
-                e,
-              );
-            });
+                { headers },
+              )
+              .catch((e: unknown) => {
+                logger.error(
+                  "failed to publish tool start",
+                  {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    toolCallId: event.toolCallId,
+                    toolName: event.toolName,
+                  },
+                  e,
+                );
+              });
+          }
         }
 
         if (event.type === "tool_execution_end") {
+          state.activeRun?.activeTools.delete(event.toolCallId);
           const started = toolStartMs.get(event.toolCallId);
           const toolDurationMs = started ? Date.now() - started : undefined;
           const toolFailure = summarizeToolFailure({
@@ -3930,37 +3770,6 @@ export async function startBusAgentRunner(params: {
                 value: event.result,
               }),
             });
-
-            if (event.toolName === "batch") {
-              const childFailures = extractBatchChildFailureEntries({
-                args: event.args,
-                result: event.result,
-              });
-
-              for (const child of childFailures) {
-                logger.warn("tool call failed (batch child)", {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  parentToolCallId: event.toolCallId,
-                  parentToolName: event.toolName,
-                  childIndex: child.index,
-                  childToolCallId: child.toolCallId,
-                  childToolName: child.toolName,
-                  durationMs: toolDurationMs,
-                  error: child.error,
-                  childArgsPreview: formatToolLogPreview({
-                    toolName: event.toolName,
-                    value: child.args,
-                    untruncated: true,
-                  }),
-                  childResultPreview: formatToolLogPreview({
-                    toolName: event.toolName,
-                    value: child.result,
-                    untruncated: true,
-                  }),
-                });
-              }
-            }
           }
 
           logger.debug("tool finished", {
@@ -3974,7 +3783,7 @@ export async function startBusAgentRunner(params: {
             failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
           });
 
-          if (deferredAccepted) {
+          if (event.toolName === "batch" || deferredAccepted) {
             return;
           }
 
@@ -4094,11 +3903,10 @@ export async function startBusAgentRunner(params: {
 
       if (cancelledByRequestId.has(headers.request_id)) {
         const finalText = "Cancelled.";
-        await publishLifecycle({
-          bus,
-          headers,
+        await publishCurrentLifecycle({
           state: "cancelled",
           detail: "cancelled by interrupt",
+          output: finalText,
         });
         await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
         return;
@@ -4123,20 +3931,33 @@ export async function startBusAgentRunner(params: {
           throw new RestartDrainingAbort();
         }
 
-        const deferredWaitState = deferredSubagents.snapshotWaitState();
+        const continuationWaitVersion = continuationSignalVersion;
+        const deferredWaitState = liveParentSession?.snapshot();
 
-        if (deferredWaitState.hasBufferedCompletions) {
-          await waitForRun(deferredSubagents.injectBuffered(agent));
+        if (liveParentSession && deferredWaitState?.hasPendingCompletions) {
+          const decision = await drainDeferredCompletions({
+            modelInputMessages: lastBoundaryModelInputMessages,
+          });
+          if (decision.append.length > 0) agent.appendMessages(decision.append);
           if (cancelledByRequestId.has(headers.request_id)) break;
-          await waitForRun(agent.continue());
+          if (decision.append.length > 0 || decision.forceNextTurn) {
+            await waitForRun(agent.continue());
+          } else if (liveParentSession.snapshot().hasPendingCompletions) {
+            await waitForRun(
+              waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
+            );
+          }
           continue;
         }
 
-        if (!deferredWaitState.hasOutstandingChildren) {
+        if (!deferredWaitState?.hasOutstandingRuns) {
           break;
         }
+        if (!liveParentSession) break;
 
-        await waitForRun(deferredSubagents.waitForSignalSince(deferredWaitState.signalVersion));
+        await waitForRun(
+          waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
+        );
         if (agent.state.isStreaming) {
           continue;
         }
@@ -4296,9 +4117,33 @@ export async function startBusAgentRunner(params: {
       const resolvedCostEstimateReason =
         estimatedCostUsdTotal !== undefined ? undefined : costEstimateReason;
 
+      await publishCurrentLifecycle({
+        state: isCancelled ? "cancelled" : "resolved",
+        detail: isCancelled ? "cancelled by interrupt" : undefined,
+        output: finalText,
+        usage: runStats.totalUsage
+          ? {
+              inputTokens: runStats.totalUsage.inputTokens ?? 0,
+              outputTokens: runStats.totalUsage.outputTokens ?? 0,
+              totalTokens: runStats.totalUsage.totalTokens ?? 0,
+            }
+          : undefined,
+      });
+
       await bus.publish(
         lilacEventTypes.EvtAgentOutputResponseText,
-        { finalText, delivery, statsForNerdsLine },
+        {
+          finalText,
+          delivery,
+          statsForNerdsLine,
+          usage: runStats.totalUsage
+            ? {
+                inputTokens: runStats.totalUsage.inputTokens ?? 0,
+                outputTokens: runStats.totalUsage.outputTokens ?? 0,
+                totalTokens: runStats.totalUsage.totalTokens ?? 0,
+              }
+            : undefined,
+        },
         { headers },
       );
 
@@ -4322,13 +4167,6 @@ export async function startBusAgentRunner(params: {
         estimatedCostUsd: estimatedCostUsdTotal,
         costEstimateStatus: resolvedCostEstimateStatus,
         costEstimateReason: resolvedCostEstimateReason,
-      });
-
-      await publishLifecycle({
-        bus,
-        headers,
-        state: isCancelled ? "cancelled" : "resolved",
-        detail: isCancelled ? "cancelled by interrupt" : undefined,
       });
     } catch (e) {
       runIdleWatchdog?.stop();
@@ -4379,6 +4217,14 @@ export async function startBusAgentRunner(params: {
       }
 
       if (e instanceof RestartDrainingAbort) {
+        preserveWorkflowClaim = true;
+        if (workflowHint) {
+          params.durableWorkflowStore?.releaseWorkflowRequestClaim(
+            next.requestId,
+            workflowRunnerOwnerId,
+            Date.now(),
+          );
+        }
         logger.info("agent run interrupted for graceful restart", {
           requestId: headers.request_id,
           sessionId: headers.session_id,
@@ -4388,13 +4234,12 @@ export async function startBusAgentRunner(params: {
       }
 
       if (e instanceof PreAgentRunCancelledError) {
-        await deferredSubagents.cancelAll("parent request cancelled").catch(() => undefined);
+        await liveParentSession?.cancelAll("parent request cancelled").catch(() => undefined);
         const finalText = "Cancelled.";
-        await publishLifecycle({
-          bus,
-          headers,
+        await publishCurrentLifecycle({
           state: "cancelled",
           detail: "cancelled by interrupt",
+          output: finalText,
         });
         await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
         return;
@@ -4436,7 +4281,7 @@ export async function startBusAgentRunner(params: {
         }
       }
 
-      await deferredSubagents.cancelAll(`parent run failed: ${msg}`).catch((err: unknown) => {
+      await liveParentSession?.cancelAll(`parent run failed: ${msg}`).catch((err: unknown) => {
         logger.warn(
           "failed to cancel deferred subagents after parent failure",
           { requestId: headers.request_id, sessionId: headers.session_id },
@@ -4467,7 +4312,18 @@ export async function startBusAgentRunner(params: {
           );
         }
       }
-      await publishLifecycle({ bus, headers, state: "failed", detail: msg });
+      await publishCurrentLifecycle({
+        state: "failed",
+        detail: msg,
+        output: `Error: ${msg}`,
+        usage: runStats.totalUsage
+          ? {
+              inputTokens: runStats.totalUsage.inputTokens ?? 0,
+              outputTokens: runStats.totalUsage.outputTokens ?? 0,
+              totalTokens: runStats.totalUsage.totalTokens ?? 0,
+            }
+          : undefined,
+      });
       await bus.publish(
         lilacEventTypes.EvtAgentOutputResponseText,
         { finalText: `Error: ${msg}` },
@@ -4486,11 +4342,20 @@ export async function startBusAgentRunner(params: {
         e,
       );
     } finally {
+      if (workflowClaimTimer) clearInterval(workflowClaimTimer);
+      if (controlCapability) params.expireControlCapability?.(next.requestId);
+      if (workflowHint && !preserveWorkflowClaim) {
+        params.durableWorkflowStore?.expireWorkflowRequest(
+          next.requestId,
+          Date.now(),
+          workflowRunnerOwnerId,
+        );
+      }
       runIdleWatchdog?.stop();
       rejectPreAgentCancellation = null;
       unsubscribe();
       unsubscribeCompaction();
-      await deferredSubagents.stop();
+      await liveParentSession?.close();
       state.agent = null;
       state.activeRequestId = null;
       state.activeRun = null;
@@ -4503,8 +4368,32 @@ export async function startBusAgentRunner(params: {
     }
   }
 
+  function getActiveLevel1Work(): readonly AgentRunnerActiveWork[] {
+    const now = Date.now();
+    const active: AgentRunnerActiveWork[] = [];
+    for (const state of bySession.values()) {
+      const run = state.activeRun;
+      if (!run) continue;
+      const tools = [...run.activeTools.entries()].map(([toolCallId, tool]) => ({
+        toolCallId,
+        toolName: tool.toolName,
+        ageMs: Math.max(0, now - tool.startedAt),
+      }));
+      active.push({
+        requestId: run.requestId,
+        requestClient: run.requestClient,
+        runProfile: run.runProfile,
+        phase: tools.length > 0 ? "tool" : run.started ? "model" : "preparing",
+        runAgeMs: Math.max(0, now - run.startedAt),
+        tools,
+      });
+    }
+    return active;
+  }
+
   return {
     beginDrain,
+    getActiveLevel1Work,
     snapshotRecoverables,
     restoreRecoverables,
     stop: async () => {
@@ -4580,21 +4469,22 @@ async function applyToRunningAgent(
   activeRun: SessionQueue["activeRun"],
 ) {
   const merged = mergeToSingleUserMessage(entry.messages);
-  const deferred = activeRun?.deferred;
+  const liveParent = activeRun?.liveParent;
+  const notifyWaiters = activeRun?.notifyWaiters;
   const queueWhileIdle = (mode: "followUp" | "steer") => {
     if (mode === "steer") {
       agent.steer(merged);
     } else {
       agent.followUp(merged);
     }
-    deferred?.notifyWaiters();
+    notifyWaiters?.();
   };
 
   const promptWhileIdle = () => {
     void agent.prompt(merged).catch(() => {
-      deferred?.notifyWaiters();
+      notifyWaiters?.();
     });
-    deferred?.notifyWaiters();
+    notifyWaiters?.();
   };
 
   const cancel = (() => {
@@ -4604,7 +4494,7 @@ async function applyToRunningAgent(
     return v === true;
   })();
 
-  const hasBufferedCompletions = deferred?.hasBufferedCompletions() ?? false;
+  const hasBufferedCompletions = liveParent?.snapshot().hasPendingCompletions ?? false;
 
   if (!agent.state.isStreaming) {
     switch (entry.queue) {
@@ -4628,9 +4518,9 @@ async function applyToRunningAgent(
       case "interrupt": {
         if (cancel) {
           cancelledByRequestId.add(entry.requestId);
-          await deferred?.cancelAll("parent request aborted");
+          await liveParent?.cancelAll("parent request aborted");
           agent.abort();
-          deferred?.notifyWaiters();
+          notifyWaiters?.();
           return;
         }
         if (hasBufferedCompletions) {
@@ -4638,7 +4528,7 @@ async function applyToRunningAgent(
           return;
         }
         await agent.interrupt(merged);
-        deferred?.notifyWaiters();
+        notifyWaiters?.();
         return;
       }
       default: {
@@ -4651,30 +4541,30 @@ async function applyToRunningAgent(
   switch (entry.queue) {
     case "steer": {
       agent.steer(merged);
-      deferred?.notifyWaiters();
+      notifyWaiters?.();
       return;
     }
     case "followUp": {
       agent.followUp(merged);
-      deferred?.notifyWaiters();
+      notifyWaiters?.();
       return;
     }
     case "interrupt": {
       if (cancel) {
         cancelledByRequestId.add(entry.requestId);
-        await deferred?.cancelAll("parent request aborted");
+        await liveParent?.cancelAll("parent request aborted");
         agent.abort();
-        deferred?.notifyWaiters();
+        notifyWaiters?.();
         return;
       }
       await agent.interrupt(merged);
-      deferred?.notifyWaiters();
+      notifyWaiters?.();
       return;
     }
     case "prompt": {
       // Cannot prompt while streaming; treat as followUp.
       agent.followUp(merged);
-      deferred?.notifyWaiters();
+      notifyWaiters?.();
       return;
     }
     default: {

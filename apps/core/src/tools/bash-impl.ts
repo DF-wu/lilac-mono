@@ -1,4 +1,10 @@
-import { createLogger, env, resolveVcsEnv, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  env,
+  resolveVcsEnv,
+  type CoreConfig,
+  type NativeSubagentProfile,
+} from "@stanley2058/lilac-utils";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
@@ -498,6 +504,9 @@ function buildBashChildEnv(params: {
     requestClient: string;
   };
   resolvedCwd: string;
+  toolCallId?: string;
+  controlCapability?: string;
+  subagentProfile?: NativeSubagentProfile;
 }): NodeJS.ProcessEnv {
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -508,6 +517,9 @@ function buildBashChildEnv(params: {
     LILAC_SESSION_ID: params.context?.sessionId,
     LILAC_REQUEST_CLIENT: params.context?.requestClient,
     LILAC_CWD: params.resolvedCwd,
+    LILAC_TOOL_CALL_ID: params.toolCallId,
+    LILAC_CONTROL_CAPABILITY: params.controlCapability,
+    LILAC_SUBAGENT_PROFILE: params.subagentProfile,
   };
 
   delete childEnv.FORCE_COLOR;
@@ -537,6 +549,8 @@ export async function executeBash(
       artifactMaxBytesPerSession: 50 * 1024 * 1024,
     },
     onActivity,
+    controlCapability,
+    subagentProfile,
   }: {
     context?: {
       requestId: string;
@@ -548,6 +562,8 @@ export async function executeBash(
     artifacts?: ToolResultArtifactStore;
     outputConfig?: CoreConfig["tools"]["output"];
     onActivity?: () => void;
+    controlCapability?: string;
+    subagentProfile?: NativeSubagentProfile;
   } = {},
 ): Promise<BashToolOutput> {
   const cwdTarget = parseSshCwdTarget(cwd);
@@ -942,6 +958,9 @@ export async function executeBash(
         vcsEnv,
         context,
         resolvedCwd,
+        toolCallId,
+        controlCapability,
+        subagentProfile,
       }),
     });
 

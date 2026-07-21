@@ -25,7 +25,6 @@ import {
 } from "../../artifacts/tool-result-artifact-store";
 import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
-import { BATCH_CHILD_CONTEXT_FLAG } from "../batch";
 import {
   remoteFuzzySearch,
   remoteGrep,
@@ -176,9 +175,16 @@ function collectPreviouslyLoadedInstructionPaths(messages: readonly unknown[]): 
   return out;
 }
 
-function buildReadFileInputZod(hashlineEnabled: boolean) {
+function buildReadFileInputZod(
+  hashlineEnabled: boolean,
+  readFileDirectAttachmentSupported = false,
+) {
   return z.object({
-    path: pathSchema,
+    path: pathSchema.describe(
+      readFileDirectAttachmentSupported
+        ? "Path to a file. Supported images and PDFs are attached to your context for native visual or document analysis. Relative paths are resolved against the tool root; absolute paths are also supported."
+        : "Path to the file. Relative paths are resolved against the tool root; absolute paths are also supported.",
+    ),
     cwd: z
       .string()
       .optional()
@@ -199,21 +205,23 @@ function buildReadFileInputZod(hashlineEnabled: boolean) {
       ])
       .optional()
       .describe(
-        "Start or continuation position for any text resource. Use {type:'offset',offset:N} for an absolute Unicode character position, or {type:'line',line:N,column?:N} for a line position. Lines are 1-based; offsets and columns are 0-based.",
+        "Text files only. Start or continuation position. Use {type:'offset',offset:N} for an absolute Unicode character position, or {type:'line',line:N,column?:N} for a line position. Lines are 1-based; offsets and columns are 0-based.",
       ),
     maxLines: z
       .number()
       .int()
       .positive()
       .optional()
-      .describe("Maximum number of lines to return. Defaults to 2000."),
+      .describe("Text files only. Maximum number of lines to return. Defaults to 2000."),
     maxCharacters: z
       .number()
       .int()
       .positive()
       .max(40 * 1024)
       .optional()
-      .describe("Maximum number of characters to return (max: 40960). Defaults to 10000."),
+      .describe(
+        "Text files only. Maximum number of characters to return (max: 40960). Defaults to 10000.",
+      ),
     format: (hashlineEnabled
       ? z.enum(["raw", "numbered", "hashline"])
       : z.enum(["raw", "numbered"])
@@ -221,8 +229,8 @@ function buildReadFileInputZod(hashlineEnabled: boolean) {
       .optional()
       .describe(
         hashlineEnabled
-          ? "Output format. Default is raw. Use 'hashline' before edit_file when you need stable edit anchors."
-          : "Output format. Default is raw (no line numbers). 'numbered' is for display only.",
+          ? "Text files only. Output format. Default is raw. Use 'hashline' before edit_file when you need stable edit anchors."
+          : "Text files only. Output format. Default is raw (no line numbers). 'numbered' is for display only.",
       ),
     dangerouslyAllow: z
       .boolean()
@@ -1042,6 +1050,9 @@ export function fsTool(
       requestId: string;
       sessionId: string;
     };
+    loadInstructions?: boolean;
+    denyPaths?: readonly string[];
+    enforceDenylist?: boolean;
   },
 ) {
   const logger = createLogger({
@@ -1053,7 +1064,7 @@ export function fsTool(
   const readFileDirectAttachmentSupported = opts?.readFileDirectAttachmentSupported === true;
   const maxOutputBytes = opts?.maxOutputBytes ?? 40 * 1024;
   const maxInlineMediaBytesPerPart = opts?.maxInlineMediaBytesPerPart ?? 10 * 1024 * 1024;
-  const readFileSchema = buildReadFileInputZod(hashlineEnabled);
+  const readFileSchema = buildReadFileInputZod(hashlineEnabled, readFileDirectAttachmentSupported);
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
   const grepInputSchema = buildGrepInputZod(hashlineEnabled);
   const grepOutputSchema = buildGrepOutputZod(hashlineEnabled);
@@ -1068,6 +1079,7 @@ export function fsTool(
       "~/.ssh",
       "~/.aws",
       "~/.gnupg",
+      ...(opts?.denyPaths ?? []),
     ],
     fsBackend,
     fffCacheDir: FFF_CACHE_DIR,
@@ -1090,14 +1102,20 @@ export function fsTool(
 
   function buildReadFileDescription(): string {
     const parts = [
-      hashlineEnabled
-        ? "Reads a file from the filesystem. Default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead."
-        : "Reads a file from the filesystem. Default format is raw (no line numbers) to preserve indentation.",
+      readFileDirectAttachmentSupported
+        ? "Reads files from the filesystem. For supported images and PDFs, calling read_file attaches the original file to your context for native visual or document analysis. Call read_file first for an image or PDF path, either directly or as an independent batch child; use shell media processing only if read_file reports that the input is unsupported or oversized."
+        : hashlineEnabled
+          ? "Reads a file from the filesystem. Default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead."
+          : "Reads a file from the filesystem. Default format is raw (no line numbers) to preserve indentation.",
     ];
 
-    if (readFileDirectAttachmentSupported) {
+    if (readFileDirectAttachmentSupported && hashlineEnabled) {
       parts.push(
-        "Use this tool to read image files and PDFs directly, prefer this over OCR or other tools.",
+        "For text files, default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.",
+      );
+    } else if (readFileDirectAttachmentSupported) {
+      parts.push(
+        "For text files, default format is raw (no line numbers) to preserve indentation.",
       );
     }
 
@@ -1251,6 +1269,7 @@ export function fsTool(
       inputSchema: readFileSchema,
       outputSchema: readFileOutputSchema,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: ReadFileInput, options) => {
+        if (opts?.enforceDenylist) dangerouslyAllow = false;
         if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
           const sessionId = opts?.requestContext?.sessionId;
           const artifact =
@@ -1312,23 +1331,6 @@ export function fsTool(
 
         const ext = path.extname(input.path).toLowerCase();
         const wantsAttachment = attachmentExts.has(ext);
-
-        if (
-          wantsAttachment &&
-          options.context &&
-          typeof options.context === "object" &&
-          BATCH_CHILD_CONTEXT_FLAG in options.context
-        ) {
-          return {
-            success: false as const,
-            resolvedPath: input.path,
-            error: {
-              code: "UNKNOWN" as const,
-              message:
-                "Media files cannot be read through batch. Call read_file directly so the attachment can be sent safely.",
-            },
-          };
-        }
 
         const res = wantsAttachment
           ? await (async () => {
@@ -1506,6 +1508,7 @@ export function fsTool(
             // Skip instruction auto-loading for remote reads for now.
             return resQualified;
           }
+          if (opts?.loadInstructions === false) return resQualified;
           const instructions = await loadInstructionsForPath({
             resolvedPath: resQualified.resolvedPath,
             opCwd,
@@ -1649,6 +1652,7 @@ export function fsTool(
       inputSchema: globInputZod,
       outputSchema: globOutputZod,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GlobInput) => {
+        if (opts?.enforceDenylist) dangerouslyAllow = false;
         const mode = input.mode ?? "default";
         const cwdTarget = parseSshCwdTarget(opCwd);
         const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
@@ -1722,6 +1726,7 @@ export function fsTool(
             inputSchema: fuzzySearchInputZod,
             outputSchema: fuzzySearchOutputZod,
             execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: FuzzySearchInput) => {
+              if (opts?.enforceDenylist) dangerouslyAllow = false;
               const cwdTarget = parseSshCwdTarget(opCwd);
 
               logger.info("fs.fuzzySearch", {
@@ -1783,6 +1788,7 @@ export function fsTool(
       inputSchema: grepInputSchema,
       outputSchema: grepOutputSchema,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GrepInput) => {
+        if (opts?.enforceDenylist) dangerouslyAllow = false;
         const mode = input.mode ?? "default";
         const cwdTarget = parseSshCwdTarget(opCwd);
         const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
@@ -1875,6 +1881,7 @@ export function fsTool(
       inputSchema: editFileSchema,
       outputSchema: editFileOutputZod,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: EditFileInput) => {
+        if (opts?.enforceDenylist) dangerouslyAllow = false;
         const cwdTarget = parseSshCwdTarget(opCwd);
         const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
         const isLegacy = isLegacyEditFileInput(input);

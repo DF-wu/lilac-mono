@@ -8,6 +8,18 @@ export type RequestContext = {
   requestClient?: string;
   cwd?: string;
   safetyMode?: "trusted" | "restricted";
+  /** Set only after matching request headers to a server-owned authenticated surface origin. */
+  serverOwnedRequest?: boolean;
+  /** Set only after authenticating the root-only container operator token. */
+  operator?: boolean;
+  authenticatedPrincipal?: { platform: "discord" | "github"; userId: string };
+  toolCallId?: string;
+  controlCapability?: string;
+  controlPolicy?: {
+    kind: "primary" | "heartbeat";
+    allowedCallables: readonly string[] | null;
+  };
+  subagentProfile?: "explore" | "general" | "self";
 };
 
 export type ServerToolPrimaryPositional = {
@@ -94,7 +106,7 @@ export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRunt
 
 export interface Level1ToolSpec<TRuntimeContext> {
   name: string;
-  /** Batch is opt-in. Omitted and false values are not batch-callable. */
+  /** Enabled tools are batch-callable by default. Set false to opt out. */
   supportsBatch?: boolean;
   createTool(buildContext: Level1ToolBuildContext<TRuntimeContext>): unknown;
   isEnabled(runContext: Level1ToolRunContext<TRuntimeContext>): boolean;
@@ -111,6 +123,13 @@ export type ToolPluginMeta = {
   name?: string;
   version?: string;
 };
+
+export type Level1ContributionInfo = {
+  pluginId: string;
+  source: PluginSource;
+};
+
+export type Level2ContributionInfo = Level1ContributionInfo;
 
 export type ToolPluginCreateContext<TRuntimeContext> = {
   runtime: TRuntimeContext;

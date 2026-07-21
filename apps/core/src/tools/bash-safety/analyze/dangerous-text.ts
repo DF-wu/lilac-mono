@@ -1,93 +1,52 @@
-export function dangerousInText(text: string): string | null {
-  const t = text.toLowerCase();
-  const stripped = t.trimStart();
-  const isEchoOrRg = stripped.startsWith("echo ") || stripped.startsWith("rg ");
+const DANGEROUS_TEXT_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
+  { pattern: /\bgit\b[^\n;|&)]*\breset\s+--hard\b/iu, reason: "git reset --hard" },
+  { pattern: /\bgit\b[^\n;|&)]*\breset\s+--merge\b/iu, reason: "git reset --merge" },
+  {
+    pattern: /\bgit\b[^\n;|&)]*\bclean\b[^\n;|&)]*(?:-[^\s]*f|--force)\b/iu,
+    reason: "git clean -f",
+  },
+  {
+    pattern: /\bgit\b[^\n;|&)]*\bbranch\b[^\n;|&)]*\s-[A-Za-z]*D[A-Za-z]*\b/u,
+    reason: "git branch -D",
+  },
+  { pattern: /\bgit\b[^\n;|&)]*\bstash\s+(?:drop|clear)\b/iu, reason: "git stash drop/clear" },
+  {
+    pattern:
+      /\bgit\b[^\n;|&)]*\bpush\b[^\n;|&)]*(?:\s-[A-Za-z]*f[A-Za-z]*\b|--force\b)(?!-with-lease)/iu,
+    reason: "git push --force",
+  },
+  {
+    pattern: /\bgit\b[^\n;|&)]*\brestore\b[^\n;|&)]*(?:--worktree|\s-W\b)/iu,
+    reason: "git restore --worktree",
+  },
+  { pattern: /\bgit\b[^\n;|&)]*\brestore\b(?![^\n;|&)]*--staged)/iu, reason: "git restore" },
+  { pattern: /\bgit\b[^\n;|&)]*\bcheckout\b[^\n;|&)]*\s--(?:\s|$)/iu, reason: "git checkout --" },
+  {
+    pattern: /\bgit\b[^\n;|&)]*\bcheckout\b[^\n;|&)]*--pathspec-from-file(?:=|\b)/iu,
+    reason: "git checkout --pathspec-from-file",
+  },
+  {
+    pattern: /\bgit\b[^\n;|&)]*\bworktree\s+remove\b[^\n;|&)]*(?:\s-f\b|--force\b)/iu,
+    reason: "git worktree remove --force",
+  },
+  { pattern: /\bfind\b[^\n;|&]*\s-delete\b/iu, reason: "find -delete" },
+];
 
-  const patterns: Array<{
-    regex: RegExp;
-    reason: string;
-    skipForEchoRg?: boolean;
-    caseSensitive?: boolean;
-  }> = [
-    {
-      regex: /\bprivate-keys-v1\.d\b/,
-      reason: "access to GPG private keys (private-keys-v1.d)",
-    },
-    {
-      regex: /\/secret\/gnupg(\/|\b)/,
-      reason: "access to agent GNUPGHOME (secret/gnupg)",
-    },
-    {
-      regex: /\/\.ssh(\/|\b)/,
-      reason: "access to ~/.ssh",
-    },
-    {
-      regex: /\/\.aws(\/|\b)/,
-      reason: "access to ~/.aws",
-    },
-    {
-      regex: /\/\.gnupg(\/|\b)/,
-      reason: "access to ~/.gnupg",
-    },
-    {
-      regex: /github-app\.private-key\.pem\b/,
-      reason: "access to GitHub App private key",
-    },
-    {
-      regex: /github-user-token\.json\b/,
-      reason: "access to GitHub user token secret",
-    },
-    {
-      regex: /\brm\s+(-[^\s]*r[^\s]*\s+-[^\s]*f|-\S*f\S*\s+-\S*r|-\S*rf|-\S*fr)\b/,
-      reason: "rm -rf",
-    },
-    {
-      regex: /\bgit\s+reset\s+--hard\b/,
-      reason: "git reset --hard",
-    },
-    {
-      regex: /\bgit\s+reset\s+--merge\b/,
-      reason: "git reset --merge",
-    },
-    {
-      regex: /\bgit\s+clean\s+(-[^\s]*f|-f)\b/,
-      reason: "git clean -f",
-    },
-    {
-      regex: /\bgit\s+push\s+[^|;]*(-f\b|--force\b)(?!-with-lease)/,
-      reason: "git push --force (use --force-with-lease instead)",
-    },
-    {
-      regex: /\bgit\s+branch\s+-D\b/,
-      reason: "git branch -D",
-      caseSensitive: true,
-    },
-    {
-      regex: /\bgit\s+stash\s+(drop|clear)\b/,
-      reason: "git stash drop/clear",
-    },
-    {
-      regex: /\bgit\s+checkout\s+--\s/,
-      reason: "git checkout --",
-    },
-    {
-      regex: /\bgit\s+restore\b(?!.*--(staged|help))/,
-      reason: "git restore (without --staged)",
-    },
-    {
-      regex: /\bfind\b[^\n;|&]*\s-delete\b/,
-      reason: "find -delete",
-      skipForEchoRg: true,
-    },
-  ];
-
-  for (const { regex, reason, skipForEchoRg, caseSensitive } of patterns) {
-    if (skipForEchoRg && isEchoOrRg) continue;
-    const target = caseSensitive ? text : t;
-    if (regex.test(target)) {
-      return reason;
-    }
+export function dangerousReasonInText(text: string): string | null {
+  for (const match of text.matchAll(/\brm\b([^\n;|&)]*)/giu)) {
+    const args = match[1] ?? "";
+    const shortOptions = Array.from(
+      args.matchAll(/(?:^|\s)-([A-Za-z]+)/gu),
+      (option) => option[1] ?? "",
+    );
+    const recursive =
+      /(?:^|\s)--recursive\b/iu.test(args) || shortOptions.some((o) => /[rR]/u.test(o));
+    const force = /(?:^|\s)--force\b/iu.test(args) || shortOptions.some((o) => o.includes("f"));
+    if (recursive && force) return "rm -rf";
   }
 
+  for (const { pattern, reason } of DANGEROUS_TEXT_PATTERNS) {
+    if (pattern.test(text)) return reason;
+  }
   return null;
 }

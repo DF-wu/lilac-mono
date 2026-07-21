@@ -177,6 +177,18 @@ If you persist `/data`, the `smart-search` config and provider credentials persi
 - [`AGENTS.md`](./AGENTS.md): repo-specific coding and validation rules
 - [`apps/acp-controller/README.md`](./apps/acp-controller/README.md): ACP controller usage details
 
+### Runtime and deployment smoke commands
+
+ - Docker/Compose (includes Redis): `docker compose up --build -d`
+ - Verify a running deployment with the operator CLI: `bun run docker:verify`
+ - Credential-free image smoke: `bun run docker:build --tag lilac:dev . && bun run docker:verify-image`
+- Docker deployment contract and diagnostics: `docs/docker-deployment.md`
+- Core runtime (needs `REDIS_URL` + Discord config): `bun apps/core/src/runtime/main.ts`
+  - Important: with default `core-config.yaml`, both Discord allowlists are empty, so the bot ignores all Discord traffic until you set at least one of `surface.discord.allowedChannelIds` or `surface.discord.allowedGuildIds`.
+ - Tool server only (dev mode): `bun apps/tool-bridge/index.ts`
+ - `tools` CLI (after building): `./apps/tool-bridge/dist/index.js --list`
+   - Target a different server with `TOOL_SERVER_BACKEND_URL=http://host:port`
+
 ## License
 
 This repository is licensed under MIT. See [`LICENSE`](./LICENSE) for details.

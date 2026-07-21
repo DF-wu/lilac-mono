@@ -1,9 +1,10 @@
+import type { CoreConfig, ResolvedNativeSubagentProfile } from "@stanley2058/lilac-utils";
 import { tool } from "ai";
 import { z } from "zod";
+
+import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { executeBash } from "./bash-impl";
 import { executeRestrictedBash } from "./restricted-bash";
-import type { CoreConfig } from "@stanley2058/lilac-utils";
-import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 
 export const bashInputSchema = z.object({
   command: z.string().describe("Bash command to execute"),
@@ -93,6 +94,8 @@ export function bashToolWithCwd(
     artifacts?: ToolResultArtifactStore;
     outputConfig?: CoreConfig["tools"]["output"];
     onActivity?: () => void;
+    controlCapability?: string;
+    nativeProfile?: ResolvedNativeSubagentProfile;
   },
 ) {
   return {
@@ -110,11 +113,17 @@ export function bashToolWithCwd(
               safetyMode?: "trusted" | "restricted";
             }
           | undefined;
-        const payload = { ...input, cwd: input.cwd ?? defaultCwd };
+        const suppliedCwd = "cwd" in input && typeof input.cwd === "string" ? input.cwd : undefined;
+        const payload = { ...input, cwd: suppliedCwd ?? defaultCwd };
         if (typedContext?.safetyMode === "restricted") {
           return executeRestrictedBash(payload, {
             workspaceRoot: defaultCwd,
-            context: typedContext,
+            context: {
+              ...typedContext,
+              controlCapability: opts?.controlCapability,
+              workspaceWritable: opts?.nativeProfile?.workspaceWrites ?? true,
+              subagentProfile: opts?.nativeProfile?.name,
+            },
             abortSignal,
             toolCallId,
             artifacts: opts?.artifacts,
@@ -128,6 +137,8 @@ export function bashToolWithCwd(
           artifacts: opts?.artifacts,
           outputConfig: opts?.outputConfig,
           onActivity: opts?.onActivity,
+          controlCapability: opts?.controlCapability,
+          subagentProfile: opts?.nativeProfile?.name,
         } as {
           context?: {
             requestId: string;
@@ -139,6 +150,8 @@ export function bashToolWithCwd(
           artifacts?: ToolResultArtifactStore;
           outputConfig?: CoreConfig["tools"]["output"];
           onActivity?: () => void;
+          controlCapability?: string;
+          subagentProfile?: ResolvedNativeSubagentProfile["name"];
         });
       },
     }),

@@ -1,18 +1,11 @@
 import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
-import {
-  lilacEventTypes,
-  outReqTopic,
-  type AdapterPlatform,
-  type LilacBus,
-} from "@stanley2058/lilac-event-bus";
+import { type AdapterPlatform, type LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   createLogger,
   MODEL_REASONING_EFFORTS,
   type ModelReasoningEffort,
 } from "@stanley2058/lilac-utils";
-import { createAgentOutputActivityPublisher } from "../shared/agent-output-activity";
-import { createIdleTimer } from "../shared/idle-timer";
 import { requireRequestContext } from "../shared/req-context";
 
 const subagentProfileSchema = z.enum(["explore", "general", "self"]);
@@ -104,6 +97,7 @@ const subagentDelegateDeferredOutputSchema = z.object({
   ok: z.literal(true),
   mode: z.literal("deferred"),
   status: z.literal("accepted"),
+  workflowRunId: z.string().min(1),
   profile: subagentProfileSchema,
   sessionName: subagentSessionNameSchema,
 });
@@ -112,6 +106,7 @@ const subagentDelegateSyncOutputSchema = z.object({
   ok: z.boolean(),
   mode: z.literal("sync"),
   status: subagentTerminalStatusSchema,
+  workflowRunId: z.string().min(1),
   profile: subagentProfileSchema,
   sessionName: subagentSessionNameSchema,
   finalText: z.string(),
@@ -214,11 +209,18 @@ function childToolIcon(state: ChildToolState): string {
 export function renderSubagentDisplay(params: {
   profile: SubagentProfile;
   children: ReadonlyMap<string, ChildToolState>;
+  model?: string;
+  reasoning?: ModelReasoningEffort;
 }): string {
   const children = Array.from(params.children.values());
   const total = children.length;
   const done = children.filter((c) => c.status === "done").length;
-  const header = `subagent (${params.profile}; ${done}/${total} done)`;
+  const model = params.model
+    ? `${params.model}${params.reasoning ? ` [${params.reasoning}]` : ""}`
+    : null;
+  const header = `subagent (${[params.profile, model, `${done}/${total} done`]
+    .filter((part): part is string => part !== null)
+    .join("; ")})`;
 
   if (children.length === 0) return header;
 
@@ -246,7 +248,8 @@ export function buildDelegatedTaskPrompt(task: string): ModelMessage {
   };
 }
 
-export type DeferredSubagentRegistration = {
+export type SubagentDelegationRegistration = {
+  mode: SubagentMode;
   profile: SubagentProfile;
   sessionName: string;
   task: string;
@@ -277,16 +280,36 @@ export type DeferredSubagentRegistration = {
   reasoningOverride?: ModelReasoningEffort;
 };
 
+export type TrustedSubagentDelegationRegistration = SubagentDelegationRegistration & {
+  projectRoot: string;
+  fallbackSurface: {
+    platform: "discord" | "github";
+    sessionId: string;
+    userId: string;
+  };
+};
+
+export type SubagentDelegationOutcome = {
+  status: SubagentTerminalStatus;
+  finalText: string;
+  detail?: string;
+};
+
+export type SubagentDelegationHandle = {
+  runId: string;
+  completion: Promise<SubagentDelegationOutcome>;
+  cancel(detail: string): Promise<void>;
+};
+
 export function subagentTools(params: {
   bus: LilacBus;
   idleTimeoutMs: number;
   maxDepth: number;
   modelPresets?: Readonly<Record<string, AgentSelectableModelPreset>>;
   delegatePromptOverlay?: string;
-  onDeferredDelegate?: (registration: DeferredSubagentRegistration) => Promise<void>;
+  onDelegate?: (registration: SubagentDelegationRegistration) => Promise<SubagentDelegationHandle>;
   onActivity?: () => void;
 }) {
-  const { bus } = params;
   const selectableModels = Object.entries(params.modelPresets ?? {}).filter(
     isSelectableModelPreset,
   );
@@ -339,8 +362,6 @@ export function subagentTools(params: {
         }
 
         const idleTimeoutMs = params.idleTimeoutMs;
-
-        const startedAt = Date.now();
         const sessionName = parsed.sessionName ?? generateSessionName(profile);
         const childRequestId = `sub:${ctx.requestId}:${crypto.randomUUID()}`;
         const childSessionId = `sub:${ctx.sessionId}:named:${sessionName}`;
@@ -360,18 +381,6 @@ export function subagentTools(params: {
           session_id: ctx.sessionId,
           request_client: toAdapterPlatform(ctx.requestClient),
         };
-        const publishParentActivity = createAgentOutputActivityPublisher({
-          bus,
-          headers: parentHeaders,
-          onError: (error) => {
-            logger.debug("subagent parent activity publish failed", {
-              requestId: ctx.requestId,
-              childRequestId,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          },
-        });
-
         logger.info("subagent delegate start", {
           requestId: ctx.requestId,
           sessionId: ctx.sessionId,
@@ -387,38 +396,38 @@ export function subagentTools(params: {
           reasoningOverride: parsed.reasoning,
         });
 
-        const subId = `${childRequestId}:${Math.random().toString(16).slice(2)}`;
+        if (!params.onDelegate) {
+          throw new Error("subagent delegation is unavailable in this runtime");
+        }
+
+        const handle = await params.onDelegate({
+          mode,
+          profile,
+          sessionName,
+          task: parsed.task,
+          idleTimeoutMs,
+          depth: depth + 1,
+          parentRequestId: ctx.requestId,
+          parentSessionId: ctx.sessionId,
+          parentRequestClient: ctx.requestClient,
+          parentToolCallId: toolCallId,
+          childRequestId,
+          childSessionId,
+          parentHeaders,
+          childHeaders,
+          initialMessages: [buildDelegatedTaskPrompt(parsed.task)],
+          modelOverride: parsed.model,
+          reasoningOverride: parsed.reasoning,
+        });
 
         if (mode === "deferred") {
-          if (!params.onDeferredDelegate) {
-            throw new Error("subagent deferred delegation is unavailable in this runtime");
-          }
-
-          await params.onDeferredDelegate({
-            profile,
-            sessionName,
-            task: parsed.task,
-            idleTimeoutMs,
-            depth: depth + 1,
-            parentRequestId: ctx.requestId,
-            parentSessionId: ctx.sessionId,
-            parentRequestClient: ctx.requestClient,
-            parentToolCallId: toolCallId,
-            childRequestId,
-            childSessionId,
-            parentHeaders,
-            childHeaders,
-            initialMessages: [buildDelegatedTaskPrompt(parsed.task)],
-            modelOverride: parsed.model,
-            reasoningOverride: parsed.reasoning,
-          });
-
           logger.info("subagent delegate accepted", {
             requestId: ctx.requestId,
             sessionId: ctx.sessionId,
             parentToolCallId: toolCallId,
             childRequestId,
             childSessionId,
+            workflowRunId: handle.runId,
             profile,
             mode: "deferred",
             idleTimeoutMs,
@@ -428,215 +437,16 @@ export function subagentTools(params: {
             ok: true,
             mode: "deferred",
             status: "accepted",
+            workflowRunId: handle.runId,
             profile,
             sessionName,
           };
         }
 
-        let lifecycleDetail: string | undefined;
-        let finalText = "";
-        const childTools = new Map<string, ChildToolState>();
-        let childUpdateSeq = 0;
-
-        const publishSubagentProgress = async () => {
-          const display = renderSubagentDisplay({
-            profile,
-            children: childTools,
-          });
-
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            {
-              toolCallId,
-              status: "update",
-              display,
-            },
-            { headers: parentHeaders },
-          );
-        };
-
-        let settleFn:
-          | ((value: { status: SubagentTerminalStatus; detail?: string }) => void)
-          | null = null;
-
-        const settled = new Promise<{
-          status: SubagentTerminalStatus;
-          detail?: string;
-        }>((resolve) => {
-          settleFn = resolve;
-        });
-
-        let isSettled = false;
-        const settle = (value: { status: SubagentTerminalStatus; detail?: string }) => {
-          if (isSettled) return;
-          isSettled = true;
-          settleFn?.(value);
-        };
-
-        const idleTimer = createIdleTimer(idleTimeoutMs, () => {
-          settle({
-            status: "timeout",
-            detail: `idle timed out after ${idleTimeoutMs}ms without child activity`,
-          });
-        });
-
-        const outSub = await bus.subscribeTopic(
-          outReqTopic(childRequestId),
-          {
-            mode: "fanout",
-            subscriptionId: `subagent:out:${subId}`,
-            consumerId: `subagent:out:${subId}`,
-            ephemeral: true,
-            offset: { type: "begin" },
-            batch: { maxWaitMs: 250 },
-          },
-          async (msg, subCtx) => {
-            if (msg.headers?.request_id !== childRequestId) {
-              await subCtx.commit();
-              return;
-            }
-
-            params.onActivity?.();
-            publishParentActivity("subagent");
-            idleTimer.reset();
-
-            if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
-              finalText += msg.data.delta;
-            }
-
-            if (msg.type === lilacEventTypes.EvtAgentOutputToolCall) {
-              const existing = childTools.get(msg.data.toolCallId);
-              const next: ChildToolState = {
-                toolCallId: msg.data.toolCallId,
-                status: msg.data.status === "end" ? "done" : "running",
-                ok: msg.data.status === "end" ? msg.data.ok === true : (existing?.ok ?? null),
-                display: msg.data.display,
-                updatedSeq: ++childUpdateSeq,
-              };
-
-              childTools.set(next.toolCallId, next);
-
-              logger.debug("subagent child tool", {
-                requestId: ctx.requestId,
-                sessionId: ctx.sessionId,
-                parentToolCallId: toolCallId,
-                childRequestId,
-                childToolCallId: msg.data.toolCallId,
-                childStatus: msg.data.status,
-                childOk: msg.data.ok,
-                display: truncateEnd(normalizeToolDisplay(msg.data.display), 160),
-              });
-
-              await publishSubagentProgress().catch((e: unknown) => {
-                logger.warn(
-                  "subagent progress publish failed",
-                  {
-                    requestId: ctx.requestId,
-                    sessionId: ctx.sessionId,
-                    parentToolCallId: toolCallId,
-                    childRequestId,
-                  },
-                  e,
-                );
-              });
-            }
-
-            if (msg.type === lilacEventTypes.EvtAgentOutputResponseText) {
-              finalText = msg.data.finalText;
-              settle({ status: "resolved" });
-            }
-
-            await subCtx.commit();
-          },
-        );
-
-        const evtSub = await bus.subscribeTopic(
-          "evt.request",
-          {
-            mode: "fanout",
-            subscriptionId: `subagent:evt:${subId}`,
-            consumerId: `subagent:evt:${subId}`,
-            ephemeral: true,
-            offset: { type: "now" },
-            batch: { maxWaitMs: 250 },
-          },
-          async (msg, subCtx) => {
-            if (msg.headers?.request_id !== childRequestId) {
-              await subCtx.commit();
-              return;
-            }
-
-            params.onActivity?.();
-            publishParentActivity("subagent");
-            idleTimer.reset();
-
-            if (msg.type === lilacEventTypes.EvtRequestLifecycleChanged) {
-              lifecycleDetail = msg.data.detail;
-              logger.debug("subagent lifecycle", {
-                requestId: ctx.requestId,
-                sessionId: ctx.sessionId,
-                parentToolCallId: toolCallId,
-                childRequestId,
-                state: msg.data.state,
-                detail: msg.data.detail,
-              });
-              if (msg.data.state === "failed") {
-                settle({ status: "failed", detail: msg.data.detail });
-              }
-              if (msg.data.state === "cancelled") {
-                settle({ status: "cancelled", detail: msg.data.detail });
-              }
-              if (msg.data.state === "resolved") {
-                settle({ status: "resolved", detail: msg.data.detail });
-              }
-            }
-
-            await subCtx.commit();
-          },
-        );
-
-        idleTimer.reset();
-
-        const stopAll = async () => {
-          idleTimer.stop();
-          await Promise.all([outSub.stop(), evtSub.stop()]);
-        };
-
-        const cancelChild = async (detail: string) => {
-          logger.warn("subagent child cancel requested", {
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            parentToolCallId: toolCallId,
-            childRequestId,
-            detail,
-          });
-
-          await bus.publish(
-            lilacEventTypes.CmdRequestMessage,
-            {
-              queue: "interrupt",
-              messages: [],
-              raw: {
-                cancel: true,
-                requiresActive: true,
-                cancelQueued: true,
-                subagent: {
-                  profile,
-                  depth: depth + 1,
-                  parentRequestId: ctx.requestId,
-                  parentToolCallId: toolCallId,
-                },
-              },
-            },
-            { headers: childHeaders },
-          );
-          settle({ status: "cancelled", detail });
-        };
-
         let abortListener: (() => void) | null = null;
         if (abortSignal) {
           const onAbort = () => {
-            void cancelChild("parent request aborted");
+            void handle.cancel("parent request aborted");
           };
           abortSignal.addEventListener("abort", onAbort, { once: true });
           abortListener = () => {
@@ -645,34 +455,7 @@ export function subagentTools(params: {
         }
 
         try {
-          await bus.publish(
-            lilacEventTypes.CmdRequestMessage,
-            {
-              queue: "prompt",
-              messages: [buildDelegatedTaskPrompt(parsed.task)],
-              ...(parsed.model ? { modelOverride: parsed.model } : {}),
-              raw: {
-                subagent: {
-                  profile,
-                  depth: depth + 1,
-                  parentRequestId: ctx.requestId,
-                  parentToolCallId: toolCallId,
-                  ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
-                },
-              },
-            },
-            { headers: childHeaders },
-          );
-
-          const outcome = await settled;
-
-          if (outcome.status === "timeout") {
-            await cancelChild(outcome.detail ?? "subagent timeout").catch(() => {
-              // Best effort: timeout result should still be returned.
-            });
-          }
-
-          const durationMs = Date.now() - startedAt;
+          const outcome = await handle.completion;
           const status = outcome.status;
           const ok = status === "resolved";
 
@@ -685,21 +468,19 @@ export function subagentTools(params: {
             profile,
             status,
             ok,
-            durationMs,
             idleTimeoutMs,
-            childToolsTotal: childTools.size,
-            childToolsDone: Array.from(childTools.values()).filter((c) => c.status === "done")
-              .length,
+            workflowRunId: handle.runId,
           });
 
           return {
             ok,
             mode: "sync",
             status,
+            workflowRunId: handle.runId,
             profile,
             sessionName,
-            finalText,
-            detail: outcome.detail ?? lifecycleDetail,
+            finalText: outcome.finalText,
+            detail: outcome.detail,
           };
         } catch (e: unknown) {
           logger.error(
@@ -718,7 +499,6 @@ export function subagentTools(params: {
           throw e;
         } finally {
           abortListener?.();
-          await stopAll();
         }
       },
     }),

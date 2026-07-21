@@ -12,18 +12,25 @@ import {
   resolveDiscoveryDbPath,
   resolveDiscordSearchDbPath,
   resolveTranscriptDbPath,
+  toDurableResolvedModelRequest,
 } from "@stanley2058/lilac-utils";
 import path from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
-import { createLilacBus, createRedisStreamsBus, type LilacBus } from "@stanley2058/lilac-event-bus";
+import {
+  createLilacBus,
+  createRedisStreamsBus,
+  lilacEventTypes,
+  type LilacBus,
+} from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { GithubAdapter } from "../surface/github/github-adapter";
+import type { SurfaceAdapter } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import { startBusRequestRouter } from "../surface/bridge/bus-request-router";
-import { startBusAgentRunner } from "../surface/bridge/bus-agent-runner";
+import { resolveAgentRunModel, startBusAgentRunner } from "../surface/bridge/bus-agent-runner";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
 import { DiscordSearchService, DiscordSearchStore } from "../surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
@@ -47,13 +54,21 @@ import { SqliteTranscriptStore } from "../transcript/transcript-store";
 import { isHeartbeatSessionId } from "../heartbeat/common";
 import { startHeartbeatService } from "../heartbeat/heartbeat-service";
 
-import { SqliteWorkflowStore } from "../workflow/workflow-store";
-import { startWorkflowService } from "../workflow/workflow-service";
-import { startWorkflowScheduler } from "../workflow/workflow-scheduler";
-import { createWorkflowStoreQueries } from "../workflow/workflow-store-queries";
-import { shouldSuppressRouterForWorkflowReply } from "../workflow/should-suppress-router-message";
+import { DurableWorkflowStore } from "../workflow/durable-workflow-store";
+import { startWorkflowActionResolver } from "../workflow/workflow-action-resolver";
+import { WorkflowProgressProjector } from "../workflow/workflow-progress-projector";
+import { WorkflowEngine } from "../workflow/workflow-engine";
+import { WorkflowWaitResolver } from "../workflow/workflow-wait-resolver";
+import { WorkflowTriggerScheduler } from "../workflow/workflow-trigger-scheduler";
+import { shouldSuppressRouterForWorkflowReply } from "../workflow/workflow-router-suppression";
+import { WorkflowLiveParentBridge } from "../workflow/workflow-live-parent-bridge";
+import { WorkflowSubagentDispatcher } from "../workflow/workflow-subagent-dispatcher";
 
 import { createToolServer } from "../tool-server/create-tool-server";
+import {
+  HEARTBEAT_LEVEL2_CALLABLES,
+  RequestControlAuthority,
+} from "../tool-server/request-control-authority";
 import type {
   ToolServerHealthCheck,
   ToolServerHealthProviderResult,
@@ -131,6 +146,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   const redis = new Redis(redisUrl);
 
   await fs.mkdir(cwd, { recursive: true });
+  const canonicalWorkspaceRoot = await fs.realpath(cwd);
 
   try {
     await redis.ping();
@@ -180,8 +196,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
   const adapter = new DiscordAdapter({ customCommands });
   const githubAdapter = new GithubAdapter();
-  const workflowStore = new SqliteWorkflowStore();
-  const workflowQueries = createWorkflowStoreQueries(workflowStore);
+  const durableWorkflowStore = new DurableWorkflowStore();
 
   let transcriptStore: SqliteTranscriptStore | null = null;
   let discordSearchStore: DiscordSearchStore | null = null;
@@ -196,8 +211,13 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   let stopAdapterToBus: { stop(): Promise<void> } | null = null;
   let stopDiscordSearchIndexer: { stop(): Promise<void> } | null = null;
   let stopRouter: { stop(): Promise<void> } | null = null;
-  let stopWorkflow: { stop(): Promise<void> } | null = null;
-  let stopWorkflowScheduler: { stop(): Promise<void> } | null = null;
+  let stopWorkflowActionResolver: { stop(): Promise<void> } | null = null;
+  let workflowProgressProjector: WorkflowProgressProjector | null = null;
+  let workflowEngine: WorkflowEngine | null = null;
+  let workflowWaitResolver: WorkflowWaitResolver | null = null;
+  let workflowTriggerScheduler: WorkflowTriggerScheduler | null = null;
+  let workflowLiveParentBridge: WorkflowLiveParentBridge | null = null;
+  let workflowSubagentDispatcher: WorkflowSubagentDispatcher | null = null;
   let stopBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopGithubBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
@@ -212,6 +232,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   let stopGithubWebhook: { stop(): Promise<void> } | null = null;
 
   let requestMessageCache: RequestMessageCache | null = null;
+  const requestControlAuthority = new RequestControlAuthority();
   let gracefulRestartStore: SqliteGracefulRestartStore | null = null;
   let pluginManager: CoreToolPluginManager | null = null;
   const toolResultArtifacts = createToolResultArtifactStore(path.join(env.dataDir, "tool-results"));
@@ -573,29 +594,97 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
       });
 
-      // Services that subscribe to evt.adapter should start before adapter.connect().
-      stopWorkflow = await startWorkflowService({
+      requestMessageCache = await createRequestMessageCache({
         bus,
-        store: workflowStore,
-        subscriptionId: subId(subscriptionPrefix, "workflow"),
-        pollTimeouts: {
-          enabled: true,
+        subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
+      });
+
+      logger.info("Request message cache started", {
+        subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
+      });
+
+      stopWorkflowActionResolver = await startWorkflowActionResolver({
+        bus,
+        store: durableWorkflowStore,
+        subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
+      });
+
+      // Subscribe durably before adapter.connect() so replies around startup replay.
+      workflowWaitResolver = new WorkflowWaitResolver({
+        bus,
+        store: durableWorkflowStore,
+        subscriptionId: subId(subscriptionPrefix, "workflow-waits"),
+        confirmLegacyGroupSingleVersionRollout:
+          process.env.LILAC_CONFIRM_SINGLE_VERSION_WORKFLOW_WAIT_RESOLVER === "1",
+      });
+      await workflowWaitResolver.start();
+
+      await adapter.connect();
+      await githubAdapter.connect();
+
+      logger.info("Surface adapter connected", {
+        platform: "discord",
+      });
+
+      const workflowAdapters = new Map<"discord" | "github", SurfaceAdapter>([
+        ["discord", adapter],
+        ["github", githubAdapter],
+      ]);
+      workflowProgressProjector = new WorkflowProgressProjector({
+        bus,
+        store: durableWorkflowStore,
+        adapters: workflowAdapters,
+        subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
+      });
+      await workflowProgressProjector.start();
+
+      workflowTriggerScheduler = new WorkflowTriggerScheduler({
+        bus,
+        store: durableWorkflowStore,
+        progressCards: workflowProgressProjector,
+        getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
+      });
+      await workflowTriggerScheduler.start();
+
+      workflowLiveParentBridge = new WorkflowLiveParentBridge({
+        bus,
+        store: durableWorkflowStore,
+        subscriptionId: subId(subscriptionPrefix, "workflow-live-parents"),
+        dataDir: env.dataDir,
+        toolResultArtifacts,
+      });
+      await workflowLiveParentBridge.start();
+
+      workflowSubagentDispatcher = await WorkflowSubagentDispatcher.create({
+        store: durableWorkflowStore,
+        dataDir: env.dataDir,
+        toolResultArtifacts,
+        getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
+        onRunCreated: async (run) => {
+          await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+            runId: run.runId,
+            revisionId: run.revisionId,
+            state: run.state,
+            ts: Date.now(),
+          });
         },
-      });
-
-      logger.info("Workflow service started", {
-        subscriptionId: subId(subscriptionPrefix, "workflow"),
-      });
-
-      stopWorkflowScheduler = await startWorkflowScheduler({
-        bus,
-        store: workflowStore,
-        queries: workflowQueries,
-        subscriptionId: subId(subscriptionPrefix, "workflow-scheduler"),
-      });
-
-      logger.info("Workflow scheduler started", {
-        subscriptionId: subId(subscriptionPrefix, "workflow-scheduler"),
+        onRunCancelled: async (run, previousState) => {
+          await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+            runId: run.runId,
+            revisionId: run.revisionId,
+            state: "cancelled",
+            previousState,
+            detail: run.terminalDetail ?? undefined,
+            ts: Date.now(),
+          });
+          await bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+            runId: run.runId,
+            revisionId: run.revisionId,
+            state: "cancelled",
+            summary: run.terminalDetail ?? undefined,
+            ts: Date.now(),
+          });
+        },
       });
 
       stopRouter = await startBusRequestRouter({
@@ -604,22 +693,12 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         subscriptionId: subId(subscriptionPrefix, "router"),
         customCommands,
         shouldSuppressAdapterEvent: async ({ evt }) =>
-          shouldSuppressRouterForWorkflowReply({ queries: workflowQueries, evt }),
+          shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
         transcriptStore: transcriptStore ?? undefined,
       });
 
       logger.info("Bus request router started", {
         subscriptionId: subId(subscriptionPrefix, "router"),
-      });
-
-      // Tool server (same process)
-      requestMessageCache = await createRequestMessageCache({
-        bus,
-        subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
-      });
-
-      logger.info("Request message cache started", {
-        subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
       });
 
       const conversationThreadToolService: ConversationThreadToolService | undefined =
@@ -644,12 +723,13 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           bus,
           adapter,
           getConfig: () => getCoreConfig(),
-          workflowStore,
           discovery: discoveryService ?? undefined,
           conversationThreads: conversationThreadToolService,
           discordSearch: discordSearchService ?? undefined,
           transcriptStore: transcriptStore ?? undefined,
           toolResultArtifacts,
+          durableWorkflowStore,
+          workflowProgressCards: workflowProgressProjector,
         },
         dataDir: env.dataDir,
       });
@@ -660,10 +740,29 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           module: "tool-server",
         }),
         healthProvider: getRuntimeHealthReport,
+        activeLevel1WorkProvider: () => stopAgentRunner?.getActiveLevel1Work() ?? [],
         onUnhealthy: opts.onUnhealthy,
         getConfig: () => getCoreConfig(),
         requestMessageCache: {
           get: requestMessageCache.get,
+          getOrigin: requestMessageCache.getOrigin,
+        },
+        canonicalWorkspaceRoot,
+        operatorTokenSha256: process.env.LILAC_OPERATOR_TOKEN_SHA256,
+        authorizeControlRequest: (input) => requestControlAuthority.authorize(input),
+        resolveServerSafetyMode: async (context) => {
+          if (context.serverOwnedRequest && context.requestClient === "github") return "trusted";
+          if (context.requestClient !== "discord" || !context.sessionId) return "restricted";
+          const config = await getCoreConfig();
+          const session = discordSurfaceStore?.getSession(context.sessionId);
+          if (!session) return "restricted";
+          return (
+            config.surface.router.sessionModes[context.sessionId]?.safetyMode ??
+            (session.parent_channel_id
+              ? config.surface.router.sessionModes[session.parent_channel_id]?.safetyMode
+              : undefined) ??
+            "trusted"
+          );
         },
       });
 
@@ -672,13 +771,6 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
       logger.info("Tool server started", {
         port: toolServerPort,
-      });
-
-      // Adapter must be connected before we start relaying streamed outputs.
-      await adapter.connect();
-
-      logger.info("Surface adapter connected", {
-        platform: "discord",
       });
 
       stopBusToAdapter = await bridgeBusToAdapter({
@@ -724,15 +816,65 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         subscriptionId: subId(subscriptionPrefix, "agent-runner"),
         pluginManager,
         customCommands,
-        cwd,
+        cwd: canonicalWorkspaceRoot,
         transcriptStore: transcriptStore ?? undefined,
         conversationThreads: conversationThreadToolService,
         toolResultArtifacts,
+        workflowLiveParentBridge,
+        workflowSubagentDispatcher,
+        durableWorkflowStore,
+        issueControlCapability: async (input) => {
+          let origin = requestMessageCache?.getOrigin(input.requestId);
+          for (let attempt = 0; !origin && attempt < 20; attempt += 1) {
+            await Bun.sleep(5);
+            origin = requestMessageCache?.getOrigin(input.requestId);
+          }
+          const originPrincipal =
+            origin?.actorUserId &&
+            origin.sessionId === input.sessionId &&
+            origin.platform === input.requestClient
+              ? { platform: origin.platform, userId: origin.actorUserId }
+              : null;
+          const policy = {
+            kind: "primary",
+            requestId: input.requestId,
+            sessionId: input.sessionId,
+            platform: input.requestClient,
+            principal: input.principal ?? originPrincipal,
+            allowedCallables: null,
+            profile: input.profile,
+            canonicalCwd: input.canonicalCwd,
+            safetyMode: input.safetyMode,
+            expiresAt: input.expiresAt,
+          } as const;
+          return {
+            capability: requestControlAuthority.issue(policy),
+            principal: policy.principal,
+          };
+        },
+        issueHeartbeatCapability: (input) =>
+          requestControlAuthority.issue({
+            kind: "heartbeat",
+            requestId: input.requestId,
+            sessionId: input.sessionId,
+            platform: input.requestClient,
+            principal: null,
+            allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
+            profile: "primary",
+            canonicalCwd: input.canonicalCwd,
+            safetyMode: "trusted",
+            expiresAt: input.expiresAt,
+          }),
+        expireControlCapability: (requestId) => requestControlAuthority.expire(requestId),
+        resolveParentChannelId: (sessionId) => {
+          const session = discordSurfaceStore?.getSession(sessionId);
+          return session ? session.parent_channel_id : undefined;
+        },
       });
 
       logger.info("Bus agent runner started", {
         subscriptionId: subId(subscriptionPrefix, "agent-runner"),
-        cwd,
+        cwd: canonicalWorkspaceRoot,
       });
 
       const restartLoad = gracefulRestartStore?.loadAndConsumeCompletedSnapshotDetailed() ?? {
@@ -763,6 +905,39 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           reason: restartLoad.reason,
         });
       }
+
+      workflowEngine = new WorkflowEngine({
+        bus,
+        store: durableWorkflowStore,
+        dataDir: env.dataDir,
+        subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
+        validateAgentSelection: async ({ profile, model, reasoning }) => {
+          const cfg = await getCoreConfig();
+          const resolved = resolveAgentRunModel({
+            cfg,
+            runProfile: profile,
+            ...(model ? { requestModelOverride: model } : {}),
+            ...(reasoning ? { reasoningOverride: reasoning } : {}),
+          });
+          return {
+            model: resolved.spec,
+            reasoning: resolved.reasoning ?? null,
+            request: toDurableResolvedModelRequest(resolved, cfg.agent.reasoningDisplay),
+          };
+        },
+      });
+      await workflowEngine.start();
+      await workflowLiveParentBridge.enableFallbacks({
+        protectedParentRequestIds:
+          restartLoad.snapshot?.agent
+            .filter((entry) => entry.kind === "active")
+            .map((entry) => entry.requestId) ?? [],
+        protectionMs: GRACEFUL_SNAPSHOT_TTL_MS,
+      });
+
+      logger.info("Unified workflow engine started", {
+        subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
+      });
 
       stopHeartbeat = await startHeartbeatService({
         bus,
@@ -822,14 +997,29 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       await safe("graceful.ingress.router.stop", () => stopRouter?.stop() ?? Promise.resolve());
       stopRouter = null;
 
-      await safe("graceful.ingress.workflow.stop", () => stopWorkflow?.stop() ?? Promise.resolve());
-      stopWorkflow = null;
+      await safe(
+        "graceful.ingress.workflowWaitResolver.stop",
+        () => workflowWaitResolver?.stop() ?? Promise.resolve(),
+      );
+      workflowWaitResolver = null;
 
       await safe(
-        "graceful.ingress.workflowScheduler.stop",
-        () => stopWorkflowScheduler?.stop() ?? Promise.resolve(),
+        "graceful.ingress.workflowTriggerScheduler.stop",
+        () => workflowTriggerScheduler?.stop() ?? Promise.resolve(),
       );
-      stopWorkflowScheduler = null;
+      workflowTriggerScheduler = null;
+
+      await safe(
+        "graceful.ingress.workflowActions.stop",
+        () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
+      );
+      stopWorkflowActionResolver = null;
+
+      await safe(
+        "graceful.ingress.workflowEngine.stop",
+        () => workflowEngine?.stop() ?? Promise.resolve(),
+      );
+      workflowEngine = null;
 
       await safe("graceful.ingress.githubWebhook.stop", () => {
         return stopGithubWebhook?.stop() ?? Promise.resolve();
@@ -878,7 +1068,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       if (agentRecoverables.length > 0 || relayRecoverables.length > 0) {
         await safe("graceful.store.saveCompletedSnapshot", async () => {
           gracefulRestartStore?.saveCompletedSnapshot({
-            version: 1,
+            version: 2,
             createdAt: Date.now(),
             deadlineMs: GRACEFUL_SNAPSHOT_TTL_MS,
             agent: agentRecoverables,
@@ -902,6 +1092,12 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     // Stop in reverse order (best-effort).
     await safe("agentRunner.stop", () => stopAgentRunner?.stop() ?? Promise.resolve());
     await safe(
+      "workflowLiveParentBridge.stop",
+      () => workflowLiveParentBridge?.stop() ?? Promise.resolve(),
+    );
+    workflowLiveParentBridge = null;
+    workflowSubagentDispatcher = null;
+    await safe(
       "conversationThreadWorker.stop",
       () => stopConversationThreadWorker?.stop() ?? Promise.resolve(),
     );
@@ -910,6 +1106,23 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       () => stopConversationThreadSummarizationWorker?.stop() ?? Promise.resolve(),
     );
     await safe("heartbeat.stop", () => stopHeartbeat?.stop() ?? Promise.resolve());
+    await safe(
+      "workflowTriggerScheduler.stop",
+      () => workflowTriggerScheduler?.stop() ?? Promise.resolve(),
+    );
+    workflowTriggerScheduler = null;
+    await safe(
+      "workflowWaitResolver.stop",
+      () => workflowWaitResolver?.stop() ?? Promise.resolve(),
+    );
+    workflowWaitResolver = null;
+    await safe("workflowEngine.stop", () => workflowEngine?.stop() ?? Promise.resolve());
+    workflowEngine = null;
+    await safe(
+      "workflowProgressProjector.stop",
+      () => workflowProgressProjector?.stop() ?? Promise.resolve(),
+    );
+    workflowProgressProjector = null;
     await safe(
       "discordSearchIndexer.stop",
       () => stopDiscordSearchIndexer?.stop() ?? Promise.resolve(),
@@ -925,12 +1138,16 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     await safe("requestMessageCache.stop", () => requestMessageCache?.stop() ?? Promise.resolve());
 
     await safe("router.stop", () => stopRouter?.stop() ?? Promise.resolve());
-    await safe("workflow.stop", () => stopWorkflow?.stop() ?? Promise.resolve());
-    await safe("workflowScheduler.stop", () => stopWorkflowScheduler?.stop() ?? Promise.resolve());
+    await safe(
+      "workflowActions.stop",
+      () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
+    );
+    stopWorkflowActionResolver = null;
     await safe("bridgeAdapterToBus.stop", () => stopAdapterToBus?.stop() ?? Promise.resolve());
 
     await safe("adapter.disconnect", () => adapter.disconnect());
     await safe("githubAdapter.disconnect", () => githubAdapter.disconnect());
+    await safe("durableWorkflowStore.close", async () => durableWorkflowStore.close());
     await safe("discoveryService.close", async () => {
       discoveryService?.close();
       discoveryService = null;

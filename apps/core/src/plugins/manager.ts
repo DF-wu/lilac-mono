@@ -5,7 +5,14 @@ import {
   type Level1RunProfile,
   type ServerTool,
 } from "@stanley2058/lilac-plugin-runtime";
-import { createLogger, getCoreConfig, resolveCoreConfigPath } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  getCoreConfig,
+  profileIncludes,
+  resolveCoreConfigPath,
+  resolveNativeSubagentProfile,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 
 import { createBuiltinCoreToolPlugins } from "./builtin";
 import {
@@ -13,6 +20,23 @@ import {
   type CoreLevel1ToolSpec,
   type CoreToolPluginRuntime,
 } from "./types";
+
+function isStructurallyAllowed(
+  spec: CoreLevel1ToolSpec,
+  contribution: import("@stanley2058/lilac-plugin-runtime").Level1ContributionInfo | undefined,
+  params: Pick<BuildLevel1ToolsetParams, "runProfile">,
+  config: CoreConfig,
+): boolean {
+  if (params.runProfile === "primary") return true;
+  if (!contribution) return false;
+  const profile = resolveNativeSubagentProfile(config, params.runProfile);
+  if (!profileIncludes(profile.level1.plugins, contribution.pluginId)) return false;
+  if (!profileIncludes(profile.level1.tools, spec.name)) return false;
+  if (spec.name === "bash" && !profile.execution) return false;
+  if (["edit_file", "apply_patch"].includes(spec.name) && !profile.workspaceWrites) return false;
+  if (spec.name === "subagent_delegate" && !profile.delegation) return false;
+  return true;
+}
 
 async function listServerToolCallableIds(tool: ServerTool): Promise<readonly string[]> {
   const entries = await tool.list();
@@ -84,15 +108,18 @@ export function createCoreToolPluginManager(params: {
     ensureFresh: () => manager.ensureFresh(),
     getStatuses: () => manager.getStatuses(),
     getLevel2Tools: () => manager.getLevel2Items(),
+    getLevel2ContributionInfo: () => manager.getLevel2ContributionInfo(),
     async buildLevel1Toolset(buildParams: BuildLevel1ToolsetParams): Promise<BuiltLevel1Toolset> {
       await manager.ensureFresh();
       const resolvedConfig = await resolveConfig();
 
       const tools: ToolSet = {} as ToolSet;
       const specs = new Map<string, CoreLevel1ToolSpec>();
+      const contributionInfo = manager.getLevel1ContributionInfo();
       const runContext = {
         runtime: {
           ...params.runtime,
+          dataDir: params.dataDir,
           config: resolvedConfig,
         },
         cwd: buildParams.cwd,
@@ -103,7 +130,13 @@ export function createCoreToolPluginManager(params: {
         requestContext: buildParams.requestContext,
       };
 
-      const enabledSpecs = manager.getLevel1Items().filter((spec) => spec.isEnabled(runContext));
+      const enabledSpecs = manager
+        .getLevel1Items()
+        .filter(
+          (spec) =>
+            spec.isEnabled(runContext) &&
+            isStructurallyAllowed(spec, contributionInfo.get(spec), buildParams, resolvedConfig),
+        );
 
       for (const spec of enabledSpecs) {
         specs.set(spec.name, spec);

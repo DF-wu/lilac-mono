@@ -1011,7 +1011,6 @@ export class Generate implements ServerTool {
     const inferredExt = inferExtensionFromMimeType(video.mediaType) || ".mp4";
     const targetWithExt =
       originalExt.length > 0 ? resolvedTarget : `${resolvedTarget}${inferredExt}`;
-
     await fs.mkdir(dirname(targetWithExt), { recursive: true });
     const outPath = await writeFileWithUniqueName(targetWithExt, video.uint8Array);
 

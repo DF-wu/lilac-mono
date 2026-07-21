@@ -3,7 +3,7 @@
 import { encode } from "@toon-format/toon";
 import { getBuildInfo, type BuildInfo } from "@stanley2058/lilac-utils";
 import { z } from "zod";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
@@ -17,10 +17,13 @@ const DEV_BUILD_ID = "dev";
 const VERSION_FETCH_TIMEOUT_MS = 1_500;
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 const MODULE_DIR = dirname(CURRENT_FILE);
+const DEFAULT_OPERATOR_TOKEN_FILE = "/run/lilac/operator-token";
 
 let buildIdPromise: Promise<string> | undefined;
 let localVersionInfoPromise: Promise<LocalVersionInfo> | undefined;
 let backendVersionInfoPromise: Promise<BackendVersionInfo | null> | undefined;
+let operatorToken: string | undefined;
+let operatorRequestId: string | undefined;
 
 async function fetchNoTimeout(input: string, init?: RequestInit): Promise<Response> {
   // Bun (and Node's undici fetch) can enforce a default request timeout (~5m)
@@ -78,6 +81,38 @@ type LocalVersionInfo = BuildInfo & {
 
 let callableIdsCache: string[] | undefined;
 
+function lilacRequestHeaders(includeJson = false): Record<string, string> {
+  const headers: Record<string, string> = includeJson ? { "Content-Type": "application/json" } : {};
+  const values = [
+    ["x-lilac-request-id", process.env.LILAC_REQUEST_ID],
+    ["x-lilac-session-id", process.env.LILAC_SESSION_ID],
+    ["x-lilac-request-client", process.env.LILAC_REQUEST_CLIENT],
+    ["x-lilac-cwd", process.env.LILAC_CWD],
+    ["x-lilac-tool-call-id", process.env.LILAC_TOOL_CALL_ID],
+    ["x-lilac-control-capability", process.env.LILAC_CONTROL_CAPABILITY],
+    ["x-lilac-subagent-profile", process.env.LILAC_SUBAGENT_PROFILE],
+  ] as const;
+  for (const [name, value] of values) {
+    if (value) headers[name] = value;
+  }
+  if (operatorToken) {
+    headers["x-lilac-operator-token"] = operatorToken;
+    headers["x-lilac-request-id"] = operatorRequestId ?? "operator";
+    headers["x-lilac-tool-call-id"] = operatorRequestId ?? "operator";
+  }
+  return headers;
+}
+
+async function enableOperatorMode(): Promise<void> {
+  const tokenPath = process.env.LILAC_OPERATOR_TOKEN_FILE || DEFAULT_OPERATOR_TOKEN_FILE;
+  const token = (await fs.readFile(tokenPath, "utf8")).trim();
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(token)) {
+    throw new Error(`Operator token file is malformed: ${tokenPath}`);
+  }
+  operatorToken = token;
+  operatorRequestId = `operator:${randomUUID()}`;
+}
+
 const objectLikeSchema = z.record(z.string(), z.unknown());
 
 const listPayloadSchema = z.object({
@@ -123,7 +158,7 @@ async function listCallableIdsBestEffort(): Promise<string[]> {
   if (callableIdsCache !== undefined) return callableIdsCache;
 
   try {
-    const res = await fetchNoTimeout(`${BACKEND_URL}/list`);
+    const res = await fetchNoTimeout(`${BACKEND_URL}/list`, { headers: lilacRequestHeaders() });
     if (!res.ok) {
       callableIdsCache = [];
       return callableIdsCache;
@@ -292,7 +327,7 @@ async function buildCallableIdErrorMessage(params: {
 }
 
 async function listTools() {
-  const res = await fetchNoTimeout(`${BACKEND_URL}/list`);
+  const res = await fetchNoTimeout(`${BACKEND_URL}/list`, { headers: lilacRequestHeaders() });
   if (!res.ok) {
     const detail = await readHttpErrorMessage(res);
     throw new Error(formatHttpFailure("fetch tools list", res, detail));
@@ -321,7 +356,9 @@ async function getBackendVersionInfoBestEffort(): Promise<BackendVersionInfo | n
 }
 
 async function toolHelp(callableId: string) {
-  const res = await fetchNoTimeout(`${BACKEND_URL}/help/${encodeURIComponent(callableId)}`);
+  const res = await fetchNoTimeout(`${BACKEND_URL}/help/${encodeURIComponent(callableId)}`, {
+    headers: lilacRequestHeaders(),
+  });
   if (!res.ok) {
     const detail = await readHttpErrorMessage(res);
     throw new Error(
@@ -338,19 +375,7 @@ async function toolHelp(callableId: string) {
 }
 
 async function callTool(callableId: string, input: Record<string, unknown>) {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-
-  const requestId = process.env.LILAC_REQUEST_ID;
-  const sessionId = process.env.LILAC_SESSION_ID;
-  const requestClient = process.env.LILAC_REQUEST_CLIENT;
-  const cwd = process.env.LILAC_CWD;
-
-  if (requestId) headers["x-lilac-request-id"] = requestId;
-  if (sessionId) headers["x-lilac-session-id"] = sessionId;
-  if (requestClient) headers["x-lilac-request-client"] = requestClient;
-  if (cwd) headers["x-lilac-cwd"] = cwd;
+  const headers = lilacRequestHeaders(true);
 
   const res = await fetchNoTimeout(`${BACKEND_URL}/call`, {
     method: "POST",
@@ -646,6 +671,7 @@ function formatToolBlock(
 type OutputMode = "compact" | "json";
 
 const commonOptions = [
+  "--operator, --op (authenticate with the root-only container operator token)",
   '--output=<"compact" | "json"> (default: "compact")',
   "--input=@file.json | --input='<json>' | --input=@-",
   "--stdin (alias for --input=@-)",
@@ -683,9 +709,18 @@ function buildUsageLinesForTool(
 }
 
 async function main() {
-  const parsed = parseArgs();
+  const globalArgs = parseGlobalArgs();
+  const parsed = parseArgs(globalArgs.args);
 
   try {
+    if (
+      globalArgs.operator &&
+      (parsed.type === "list" ||
+        parsed.type === "call" ||
+        (parsed.type === "help" && parsed.callableId !== undefined))
+    ) {
+      await enableOperatorMode();
+    }
     switch (parsed.type) {
       case "version": {
         console.log(await versionBanner());
@@ -759,6 +794,7 @@ async function main() {
                 "--list\tList all available tools",
                 "--help\tShow help (optionally for a tool)",
                 "--version\tPrint version",
+                "--operator, --op\tUse root-only container operator access",
               ]),
             ),
             "",
@@ -767,9 +803,9 @@ async function main() {
             section(
               "Examples",
               formatBullets([
-                "tools workflow.wait_for_reply.create --input=@workflow.json",
-                "cat workflow.json | tools workflow.wait_for_reply.create --stdin",
-                'cat tasks.json | tools workflow.wait_for_reply.create --summary="..." --tasks:json=@-',
+                "tools workflow.definition.validate --scope=auto --name=audit-routes",
+                "tools workflow.run.trigger --input=@workflow-run.json",
+                "cat workflow-trigger.json | tools workflow.trigger.create --stdin",
               ]),
             ),
             "",
@@ -777,6 +813,7 @@ async function main() {
               "Environment",
               formatBullets([
                 `TOOL_SERVER_BACKEND_URL (default: ${BACKEND_URL})`,
+                `LILAC_OPERATOR_TOKEN_FILE (default: ${DEFAULT_OPERATOR_TOKEN_FILE})`,
                 "NO_COLOR disables ANSI formatting",
               ]),
             ),
@@ -896,6 +933,24 @@ type ParsedArgs =
       usesStdin: boolean;
     }
   | { type: "unknown" };
+
+export function parseGlobalArgs(args = process.argv.slice(2)): {
+  args: string[];
+  operator: boolean;
+} {
+  let operator = false;
+  let optionsEnded = false;
+  const remaining = args.filter((arg) => {
+    if (arg === "--") {
+      optionsEnded = true;
+      return true;
+    }
+    if (optionsEnded || (arg !== "--operator" && arg !== "--op")) return true;
+    operator = true;
+    return false;
+  });
+  return { args: remaining, operator };
+}
 
 export function parseArgs(args = process.argv.slice(2)): ParsedArgs {
   const firstArg = args[0];

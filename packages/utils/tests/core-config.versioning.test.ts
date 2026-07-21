@@ -33,6 +33,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(false);
     expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+    expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
 
   it("parses explicit v2 configs with v2 defaults", async () => {
@@ -61,6 +62,25 @@ describe("core config versioning", () => {
     });
     expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
     expect(parsed.models.main.reasoning).toBeUndefined();
+    expect(parsed.workflows.maxActiveRuns).toBe(64);
+  });
+
+  it("parses the v2 global workflow active-run cap", async () => {
+    const parsed = await parseCoreConfig({
+      configVersion: 2,
+      workflows: { maxActiveRuns: 7 },
+    });
+
+    expect(parsed.workflows.maxActiveRuns).toBe(7);
+  });
+
+  it("keeps the workflow cap out of the frozen v1 input shape", async () => {
+    const parsed = await parseCoreConfig({
+      configVersion: 1,
+      workflows: { maxActiveRuns: 1 },
+    });
+
+    expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
 
   it("parses v2 portable model reasoning fields", async () => {
@@ -267,14 +287,14 @@ describe("core config versioning", () => {
       fallbackMode: "passthrough",
     });
     expect(parsed.agent.idleTimeoutMs).toBe(1_200_000);
-    expect(parsed.agent.subagents).toEqual({
+    expect(parsed.agent.subagents).toMatchObject({
       enabled: true,
       maxDepth: 2,
       idleTimeoutMs: 240_000,
       profiles: {
-        explore: { modelSlot: "main" },
-        general: { modelSlot: "main" },
-        self: { modelSlot: "main" },
+        explore: { modelSlot: "main", execution: false, workspaceWrites: false },
+        general: { modelSlot: "main", execution: true, workspaceWrites: true },
+        self: { modelSlot: "main", execution: true, workspaceWrites: true, delegation: true },
       },
     });
   });
