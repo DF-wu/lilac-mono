@@ -27,8 +27,9 @@ their supported ratios to concrete OpenAI `size` values.
 
 ## Configuration
 
-Image routing requires a v2 `core-config.yaml` and two existing environment
-variables.
+Image routing requires a v2 `core-config.yaml` and the endpoint environment
+variable. An API key is optional for providers that do not require bearer
+authentication.
 
 Set the provider in `$DATA_DIR/core-config.yaml`. `DATA_DIR` defaults to the
 repository's `data/` directory.
@@ -42,12 +43,12 @@ tools:
       provider: openai-compatible
 ```
 
-Set the endpoint and API key in the environment of the core runtime or
-standalone tool bridge:
+Set the endpoint, and optionally the API key, in the environment of the core
+runtime or standalone tool bridge:
 
 ```dotenv
 OPENAI_COMPATIBLE_BASE_URL=https://provider.example.com/v1
-OPENAI_COMPATIBLE_API_KEY=replace-with-your-api-key
+OPENAI_COMPATIBLE_API_KEY=replace-with-your-api-key # optional
 ```
 
 The API key is sent as an `Authorization: Bearer` header. The endpoint is an
@@ -185,8 +186,8 @@ Confirm all of the following:
 
 1. `core-config.yaml` has `configVersion: 2`.
 2. `tools.generate.image.provider` is `openai-compatible`.
-3. The runtime process received `OPENAI_COMPATIBLE_BASE_URL` and
-   `OPENAI_COMPATIBLE_API_KEY`.
+3. The runtime process received `OPENAI_COMPATIBLE_BASE_URL`; verify
+   `OPENAI_COMPATIBLE_API_KEY` too when the endpoint requires authentication.
 4. The runtime was restarted after changing its environment.
 
 ### Image generation fails but video generation still appears
