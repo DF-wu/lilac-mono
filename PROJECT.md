@@ -42,6 +42,18 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Entry/client: `apps/acp-controller/client.ts`.
   - Build script: `apps/acp-controller/build.ts` (produces `dist/index.js`).
 
+- `apps/mini-lilac-server/`
+  - Redis-free coding-agent HTTP/SSE server with durable local sessions.
+  - Entry: `apps/mini-lilac-server/src/main.ts`; API wiring: `apps/mini-lilac-server/src/server.ts`.
+
+- `apps/mini-lilac-tui/`
+  - OpenTUI client for creating, resuming, steering, and inspecting Mini Lilac sessions.
+  - Entry: `apps/mini-lilac-tui/src/main.tsx`.
+
+- `apps/mini-lilac/`
+  - Installable `mini-lilac` command that bundles and dispatches to Mini Lilac clients and server.
+  - Entry: `apps/mini-lilac/src/main.ts`; build: `apps/mini-lilac/build.ts`.
+
 - `packages/event-bus/`
   - The bus implementation and the canonical event spec.
   - Typed event contract: `packages/event-bus/lilac-spec.ts`.
@@ -60,6 +72,13 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Provider wiring: `packages/utils/model-provider.ts`.
   - Model selection for “main/fast” slots: `packages/utils/model-slot.ts`.
   - Prompt file workspace management: `packages/utils/agent-prompts.ts`.
+
+- `packages/mini-lilac-client/`
+  - Strict Mini Lilac wire protocol and reconnectable HTTP/SSE transport shared by clients and the server.
+
+- `packages/mini-lilac-runtime/`
+  - Standalone session actors, SQLite persistence, provider/model catalogs, and product-specific tools.
+  - Uses the shared agent, coding-tool, filesystem, OAuth, and skill primitives without depending on Core.
 
 - `data/`
   - “Runtime data directory” for local/dev.
@@ -267,7 +286,7 @@ There are three tool “levels”. They all serve the agent; higher levels are u
 
 1. Level 1: direct AI SDK tools (agent-local)
    - Loaded through the shared plugin runtime in `apps/core/src/plugins/manager.ts` and used inside `apps/core/src/surface/bridge/bus-agent-runner.ts` via AI SDK tool calling.
-   - Built-in implementations still live under `apps/core/src/tools/*`, but are exposed through built-in plugins in `apps/core/src/plugins/builtin/*`.
+   - Shared Level 1 names, input schemas, local adapters, patch parsing, and batch expansion/preflight live in `packages/coding-tools`. Core-specific SSH/restricted execution, artifacts, attachments, instruction loading, logging, and bus delegation adapters live under `apps/core/src/tools/*`; built-ins are exposed through `apps/core/src/plugins/builtin/*`.
    - External plugins are discovered from `DATA_DIR/plugins/*`.
    - Key ones:
       - `bash` (`apps/core/src/tools/bash.ts`), guarded by `apps/core/src/tools/bash-safety/*` unless `dangerouslyAllow=true`.
