@@ -88,10 +88,18 @@ This port starts a new persistence lineage. Databases created by the experimenta
 Build the unified executable from `apps/mini-lilac`. Run `mini-lilac server --help` for serve and
 auth usage.
 
-`agent.titleModel` optionally selects a `provider/model` for generated session titles. If omitted,
-the title is the normalized first 50 characters of the first prompt. Automatic and manual context
-compaction use `agent.compaction.model` (`inherit` or a `provider/model`) and
+`agent.titleModel` optionally selects a `provider/model` for generated session titles. The title
+request includes attachments from the first prompt, so use a model that accepts the attachment
+modalities your users submit. If generation is omitted or fails, Mini Lilac derives a title from
+the first prompt's text, filename, or attachment type. Automatic and manual context compaction use
+`agent.compaction.model` (`inherit` or a `provider/model`) and
 `agent.compaction.earlyCompactionPoint` (default `0.8`, range `0.05`-`0.95`).
+
+Each root and subagent run preloads workspace `AGENTS.md` files from its cwd upward through the Git
+root. Local `read_file` calls also load previously unseen `AGENTS.md` files between the target and
+the read cwd, so nested package rules enter context when the agent first reads inside that package.
+Instruction blocks identify their absolute source path and are not re-added after appearing in the
+system prompt or an earlier `read_file` result.
 
 Provider model metadata can override discovered models.dev or `/v1/models` values under
 `providers.<provider>.models.<model>`. Configured fields win while omitted fields keep their
