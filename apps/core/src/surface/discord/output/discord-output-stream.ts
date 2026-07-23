@@ -748,6 +748,8 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     if (!this.shouldShowProgressTitle()) return null;
 
     const nowMs = Date.now();
+    // Discord's progress title is intentionally a rotating product indicator.
+    // Provider reasoning summaries belong in the detailed block below, not here.
     const indicator = this.getWorkingIndicator(nowMs);
     return buildWorkingTitle({
       nowMs,

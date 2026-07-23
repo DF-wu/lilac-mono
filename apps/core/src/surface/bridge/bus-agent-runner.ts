@@ -43,9 +43,11 @@ import {
   type RequestRunPolicy,
 } from "@stanley2058/lilac-event-bus";
 import {
+  AgentIdleTimeoutError,
   AiSdkPiAgent,
   attachAutoCompaction,
   buildSyntheticToolCallId,
+  createAgentRunIdleWatchdog,
   type AiSdkPiAgentEvent,
   type NormalizeToolResultOutputFn,
   type TransformMessagesFn,
@@ -57,7 +59,6 @@ import path from "node:path";
 import type { CoreToolPluginManager } from "../../plugins";
 import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
 import { createAgentOutputActivityPublisher } from "../../shared/agent-output-activity";
-import { createIdleTimer } from "../../shared/idle-timer";
 import {
   createToolResultOutputNormalizer,
   normalizeSubagentFinalText,
@@ -160,6 +161,7 @@ import { resolveSessionSafetyMode, type SessionSafetyMode } from "./bus-request-
 import type { CustomCommandManager } from "../../custom-commands/manager";
 
 export { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
+export { AgentIdleTimeoutError, createAgentRunIdleWatchdog };
 export {
   shouldEnableAnthropicPromptCache,
   toOpenAIPromptCacheKey,
@@ -291,6 +293,47 @@ export function consumeAssistantTextDelta(params: {
   }
   params.state.lastTextPartId = params.partId;
   return nextDelta;
+}
+
+export type ReasoningChunkState = {
+  chunks: Map<string, string>;
+  seq: number;
+};
+
+export function consumeReasoningChunkEvent(
+  state: ReasoningChunkState,
+  event:
+    | { type: "start"; chunkId: string }
+    | { type: "delta"; chunkId: string; delta: string }
+    | { type: "end"; chunkId: string },
+): {
+  publishStart: boolean;
+  snapshot: { delta: string; seq: number } | null;
+} {
+  if (event.type === "end") {
+    state.chunks.delete(event.chunkId);
+    return { publishStart: false, snapshot: null };
+  }
+
+  if (event.type === "start") {
+    if (!state.chunks.has(event.chunkId)) {
+      state.chunks.set(event.chunkId, "");
+    }
+    return { publishStart: true, snapshot: null };
+  }
+
+  const publishStart = !state.chunks.has(event.chunkId);
+  const chunk = `${state.chunks.get(event.chunkId) ?? ""}${event.delta}`;
+  state.chunks.set(event.chunkId, chunk);
+  if (event.delta.length === 0) {
+    return { publishStart, snapshot: null };
+  }
+
+  state.seq += 1;
+  return {
+    publishStart,
+    snapshot: { delta: chunk, seq: state.seq },
+  };
 }
 
 function estimateTokensFromValue(value: unknown): number {
@@ -1209,15 +1252,6 @@ class RestartDrainingAbort extends Error {
   }
 }
 
-export class AgentIdleTimeoutError extends Error {
-  constructor(readonly idleTimeoutMs: number) {
-    super(
-      `agent idle timed out after ${idleTimeoutMs}ms without model, tool, or subagent activity`,
-    );
-    this.name = "AgentIdleTimeoutError";
-  }
-}
-
 class PreAgentRunCancelledError extends Error {
   constructor() {
     super("cancelled before agent start");
@@ -1228,51 +1262,6 @@ class PreAgentRunCancelledError extends Error {
 const AGENT_TIMEOUT_ABORT_GRACE_MS = 5_000;
 const LIVE_PARENT_RECONCILE_MS = 1_000;
 const SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS = 3;
-
-export function createAgentRunIdleWatchdog(params: {
-  idleTimeoutMs: number;
-  onTimeout: (error: AgentIdleTimeoutError) => void;
-}) {
-  let timedOut = false;
-  let monitoring = false;
-  let rejectTimeout: ((error: AgentIdleTimeoutError) => void) | null = null;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    rejectTimeout = reject;
-  });
-  void timeoutPromise.catch(() => undefined);
-
-  const timer = createIdleTimer(params.idleTimeoutMs, () => {
-    if (timedOut) return;
-    timedOut = true;
-    const error = new AgentIdleTimeoutError(params.idleTimeoutMs);
-    params.onTimeout(error);
-    rejectTimeout?.(error);
-    rejectTimeout = null;
-  });
-
-  return {
-    start() {
-      if (timedOut) return;
-      monitoring = true;
-      timer.reset();
-    },
-    reset() {
-      if (!timedOut && monitoring) timer.reset();
-    },
-    waitFor<T>(promise: Promise<T>): Promise<T> {
-      return Promise.race([promise, timeoutPromise]);
-    },
-    pause() {
-      monitoring = false;
-      timer.stop();
-    },
-    stop() {
-      monitoring = false;
-      timer.stop();
-      rejectTimeout = null;
-    },
-  };
-}
 
 function isCancelControlEntry(entry: Enqueued): boolean {
   const raw = entry.raw;
@@ -3228,7 +3217,7 @@ export async function startBusAgentRunner(params: {
             messageCountBefore,
             messageCountAfter,
             estimatedInputTokens,
-            estimatedOutputTokens,
+            estimatedInputTokensAfter,
             durationMs,
             status,
             error,
@@ -3265,7 +3254,7 @@ export async function startBusAgentRunner(params: {
               messageCountBefore,
               messageCountAfter,
               estimatedInputTokens,
-              estimatedOutputTokens,
+              estimatedInputTokensAfter,
             };
             if (status === "completed") {
               completedCompactionCount += 1;
@@ -3426,8 +3415,10 @@ export async function startBusAgentRunner(params: {
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
         next.recovery?.partialText,
       );
-      const reasoningChunkById = new Map<string, string>();
-      let reasoningChunkSeq = 0;
+      const reasoningChunkState: ReasoningChunkState = {
+        chunks: new Map<string, string>(),
+        seq: 0,
+      };
 
       const toolStartMs = new Map<string, number>();
 
@@ -3616,9 +3607,7 @@ export async function startBusAgentRunner(params: {
           event.assistantMessageEvent.type === "thinking_start"
         ) {
           const chunkId = event.assistantMessageEvent.id;
-          if (!reasoningChunkById.has(chunkId)) {
-            reasoningChunkById.set(chunkId, "");
-          }
+          consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
 
           bus
             .publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, { delta: "" }, { headers })
@@ -3641,9 +3630,12 @@ export async function startBusAgentRunner(params: {
             transientRetryOutputStarted = true;
           }
 
-          if (!reasoningChunkById.has(chunkId)) {
-            reasoningChunkById.set(chunkId, "");
-
+          const update = consumeReasoningChunkEvent(reasoningChunkState, {
+            type: "delta",
+            chunkId,
+            delta,
+          });
+          if (update.publishStart) {
             bus
               .publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, { delta: "" }, { headers })
               .catch((e: unknown) => {
@@ -3655,8 +3647,17 @@ export async function startBusAgentRunner(params: {
               });
           }
 
-          const prev = reasoningChunkById.get(chunkId) ?? "";
-          reasoningChunkById.set(chunkId, `${prev}${delta}`);
+          if (update.snapshot) {
+            bus
+              .publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, update.snapshot, { headers })
+              .catch((e: unknown) => {
+                logger.error(
+                  "failed to publish reasoning chunk",
+                  { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
+                  e,
+                );
+              });
+          }
         }
 
         if (
@@ -3664,28 +3665,7 @@ export async function startBusAgentRunner(params: {
           event.assistantMessageEvent.type === "thinking_end"
         ) {
           const chunkId = event.assistantMessageEvent.id;
-          const chunk = reasoningChunkById.get(chunkId) ?? "";
-          reasoningChunkById.delete(chunkId);
-
-          if (chunk.trim().length === 0) {
-            return;
-          }
-
-          reasoningChunkSeq += 1;
-
-          bus
-            .publish(
-              lilacEventTypes.EvtAgentOutputDeltaReasoning,
-              { delta: chunk, seq: reasoningChunkSeq },
-              { headers },
-            )
-            .catch((e: unknown) => {
-              logger.error(
-                "failed to publish reasoning chunk",
-                { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                e,
-              );
-            });
+          consumeReasoningChunkEvent(reasoningChunkState, { type: "end", chunkId });
         }
 
         if (
