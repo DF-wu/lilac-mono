@@ -1,0 +1,11 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "paths": {
+      "@stanley2058/lilac-plugin-runtime": ["../../../packages/plugin-runtime/index.ts"]
+    },
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
