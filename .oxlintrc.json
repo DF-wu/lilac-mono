@@ -7,6 +7,7 @@
     "**/dist/**",
     "apps/core/src/ssh/remote-js/remote-runner.cjs"
   ],
+  "jsPlugins": ["./scripts/oxlint-plugins/test-waits.mts"],
   "globals": {
     "Bun": "readonly"
   },
@@ -18,9 +19,14 @@
       }
     },
     {
-      "files": ["**/*.test.ts", "**/tests/**/*.ts"],
+      "files": [
+        "**/*.test.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+        "**/*.spec.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+        "**/tests/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}"
+      ],
       "rules": {
-        "@typescript-eslint/no-explicit-any": "off"
+        "@typescript-eslint/no-explicit-any": "off",
+        "lilac/no-fixed-test-wait": "error"
       }
     }
   ]

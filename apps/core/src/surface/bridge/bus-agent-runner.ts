@@ -132,11 +132,7 @@ import {
   type ParsedSubagentMeta,
 } from "./bus-agent-runner/raw";
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
-import {
-  computeTransientRetryDelayMs,
-  createTransientModelRetryController,
-  isRetryableTransientModelError,
-} from "./bus-agent-runner/transient-retry";
+import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
 import {
   buildInputCompositionLine,
   buildNoAssistantTextError,

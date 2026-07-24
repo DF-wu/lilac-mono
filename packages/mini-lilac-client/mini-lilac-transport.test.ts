@@ -371,6 +371,7 @@ describe("MiniLilacTransport", () => {
       model: "test/newer",
       reasoning: "high",
     });
+    // test-wait-justification: lets the first serialized binding request start while its response remains gated
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(calls).toHaveLength(1);
 

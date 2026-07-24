@@ -150,6 +150,17 @@ const CODEX_TRANSIENT_RETRY = {
   baseDelayMs: 2_000,
   maxDelayMs: 30_000,
 } satisfies TransientModelRetryConfig;
+const transientModelRetrySchema = z
+  .object({
+    enabled: z.boolean(),
+    maxRetries: z.number().int().nonnegative(),
+    baseDelayMs: z.number().finite().nonnegative(),
+    maxDelayMs: z.number().finite().nonnegative(),
+  })
+  .refine((retry) => retry.maxDelayMs >= retry.baseDelayMs, {
+    message: "maxDelayMs must be greater than or equal to baseDelayMs",
+    path: ["maxDelayMs"],
+  });
 
 export type ModelResolver = (modelSpecifier: string) => LanguageModel;
 export type ModelLimitsResolver = (
@@ -173,6 +184,7 @@ export type SessionServiceOptions = {
   protectedToolPaths?: readonly string[];
   toolResultArtifacts?: ToolResultArtifactStore;
   toolResultOutputConfig?: ToolResultOutputNormalizerConfig;
+  transientModelRetry?: TransientModelRetryConfig;
   shutdownGraceMs?: number;
 };
 
@@ -659,6 +671,7 @@ class SessionActor {
     private readonly protectedToolPaths: readonly string[],
     private readonly toolResultArtifacts: ToolResultArtifactStore | undefined,
     private readonly toolResultOutputConfig: ToolResultOutputNormalizerConfig,
+    private readonly transientModelRetry: TransientModelRetryConfig,
     private readonly trackExecution: (task: Promise<void>) => Promise<void>,
     private readonly acceptsAdmissions: () => boolean,
   ) {}
@@ -944,7 +957,7 @@ class SessionActor {
         : baseProviderOptions;
     const transientRetryController = usesCodexOAuth
       ? createTransientModelRetryController({
-          retry: CODEX_TRANSIENT_RETRY,
+          retry: this.transientModelRetry,
           logger,
           requestId: context.runId,
           sessionId: this.snapshot.id,
@@ -2460,7 +2473,13 @@ export class SessionService {
   private shutdownAttempt: Promise<void> | undefined;
 
   constructor(options: SessionServiceOptions) {
-    this.options = { ...options, config: parseSessionConfig(options.config) };
+    this.options = {
+      ...options,
+      config: parseSessionConfig(options.config),
+      ...(options.transientModelRetry
+        ? { transientModelRetry: transientModelRetrySchema.parse(options.transientModelRetry) }
+        : {}),
+    };
     if (!this.options.store && !this.options.databasePath) {
       throw new Error("SessionService requires store or databasePath");
     }
@@ -2567,6 +2586,12 @@ export class SessionService {
 
   getSnapshot(sessionId: string): MiniLilacSessionSnapshot {
     return this.actor(sessionId).getSnapshot();
+  }
+
+  async waitForTrackedTasks(): Promise<void> {
+    while (this.activeTasks.size > 0) {
+      await Promise.all(this.activeTasks);
+    }
   }
 
   getMessages(sessionId: string): MiniLilacUIMessage[] {
@@ -2830,6 +2855,7 @@ export class SessionService {
       this.protectedToolPaths,
       this.options.toolResultArtifacts,
       this.options.toolResultOutputConfig ?? DEFAULT_TOOL_RESULT_OUTPUT_CONFIG,
+      this.options.transientModelRetry ?? CODEX_TRANSIENT_RETRY,
       (task) => this.trackTask(task),
       () => this.acceptingAdmissions,
     );

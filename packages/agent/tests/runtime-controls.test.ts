@@ -37,6 +37,7 @@ describe("agent run idle watchdog", () => {
 
     watchdog.start();
     watchdog.pause();
+    // test-wait-justification: crosses the real idle deadline while monitoring is paused
     await Bun.sleep(20);
 
     expect(timeoutCount).toBe(0);
@@ -50,6 +51,7 @@ describe("agent run idle watchdog", () => {
     });
 
     timer.reset();
+    // test-wait-justification: verifies a very large real idle deadline is not clamped to an immediate timer
     await Bun.sleep(10);
 
     expect(timeoutCount).toBe(0);

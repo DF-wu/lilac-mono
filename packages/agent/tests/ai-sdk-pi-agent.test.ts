@@ -1966,6 +1966,7 @@ describe("AiSdkPiAgent turn boundaries", () => {
           description: "read",
           inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
           execute: async () => {
+            // test-wait-justification: keeps one tool active to verify parallel tool completion boundary accounting
             await Bun.sleep(5);
             return "read";
           },

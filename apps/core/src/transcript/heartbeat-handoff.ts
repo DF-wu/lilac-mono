@@ -1,7 +1,5 @@
 import type { ModelMessage, ToolContent } from "ai";
 
-import { isHeartbeatSessionId } from "../heartbeat/common";
-
 export { isHeartbeatSessionId } from "../heartbeat/common";
 
 export const HEARTBEAT_HANDOFF_SESSION_ID = "__heartbeat__:handoff";

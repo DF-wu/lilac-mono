@@ -284,15 +284,6 @@ function todoAndReadResult(
   };
 }
 
-async function within<T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> {
-  return Promise.race([
-    promise,
-    Bun.sleep(timeoutMs).then(() => {
-      throw new Error(`operation did not settle within ${timeoutMs}ms`);
-    }),
-  ]);
-}
-
 function userMessage(text: string): MiniLilacUIMessage {
   return { id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] };
 }
@@ -350,6 +341,13 @@ function config(): RuntimeConfig {
     },
   };
 }
+
+const IMMEDIATE_TRANSIENT_RETRY = {
+  enabled: true,
+  maxRetries: 3,
+  baseDelayMs: 0,
+  maxDelayMs: 0,
+} as const;
 
 async function temporaryRuntime(model: LanguageModel, profile = "reader") {
   const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-runtime-"));
@@ -677,7 +675,7 @@ describe("SessionService", () => {
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     const run = await service.startPrompt(session.id, userMessage("remain active"));
     const completion = collect(run.stream);
-    await within(startedRoot);
+    await startedRoot;
 
     expect(() => service.close()).toThrow("use shutdown()");
     expect(() => service.store.close()).toThrow("runtime task(s) are active");
@@ -685,8 +683,8 @@ describe("SessionService", () => {
     expect(() => service.startPrompt(session.id, userMessage("too late"))).toThrow(
       "not accepting admissions",
     );
-    await within(shutdown);
-    await within(completion);
+    await shutdown;
+    await completion;
 
     const reopened = new MiniLilacSqliteStore(databasePath);
     expect(reopened.getRun(run.runId).status).toBe("cancelled");
@@ -733,12 +731,12 @@ describe("SessionService", () => {
     });
     const root = await service.startPrompt(session.id, userMessage("launch deferred work"));
     const completion = collect(root.stream);
-    await within(startedChild);
+    await startedChild;
     const child = delegatedRuns(service, session.id)[0];
     if (child === undefined) throw new Error("deferred child did not start");
 
-    await within(service.shutdown({ graceMs: 1_000 }));
-    await within(completion);
+    await service.shutdown({ graceMs: 1_000 });
+    await completion;
 
     const reopened = new MiniLilacSqliteStore(databasePath);
     expect(reopened.getRun(root.runId).status).toBe("cancelled");
@@ -781,12 +779,13 @@ describe("SessionService", () => {
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     await collect((await service.startPrompt(session.id, userMessage("fallback title"))).stream);
-    await within(startedTitle);
+    await startedTitle;
 
     const shutdown = service.shutdown({ graceMs: 100 });
-    await within(abortedTitle);
-    await within(shutdown);
+    await abortedTitle;
+    await shutdown;
     releaseTitle();
+    // test-wait-justification: yields one event-loop turn so the deliberately cancellation-ignoring title provider can settle after shutdown.
     await Bun.sleep(0);
     const reopened = new MiniLilacSqliteStore(databasePath);
     expect(reopened.getSession(session.id).title).toBe("fallback title");
@@ -1094,13 +1093,7 @@ describe("SessionService", () => {
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     const started = await service.startPrompt(session.id, userMessage("Build compact support"));
     await collect(started.stream);
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title !== "Durable compaction controls") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     expect(service.getSnapshot(session.id).title).toBe("Durable compaction controls");
     expect(titleModel.doStreamCalls).toHaveLength(1);
@@ -1144,13 +1137,7 @@ describe("SessionService", () => {
       ],
     });
     await collect(started.stream);
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title !== "Login error screenshot") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     const titlePrompt = JSON.stringify(titleModel.doStreamCalls[0]?.prompt);
     expect(titlePrompt).toContain('"type":"file"');
@@ -1215,23 +1202,9 @@ describe("SessionService", () => {
     await collect(
       (await service.startPrompt(session.id, userMessage("Keep this useful fallback"))).stream,
     );
-    let settledTitle: string | undefined;
-    await within(
-      (async () => {
-        for (;;) {
-          settledTitle = service.getSnapshot(session.id).title;
-          try {
-            service.close();
-            return;
-          } catch (error) {
-            if (!(error instanceof Error) || !error.message.includes("runtime work is active")) {
-              throw error;
-            }
-            await Bun.sleep(1);
-          }
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
+    const settledTitle = service.getSnapshot(session.id).title;
+    service.close();
 
     expect(titleModel.doStreamCalls).toHaveLength(1);
     expect(settledTitle).toBe("Keep this useful fallback");
@@ -1255,13 +1228,7 @@ describe("SessionService", () => {
     await collect(
       (await service.startPrompt(session.id, userMessage("Generate an emoji title"))).stream,
     );
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title === "Generate an emoji title") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     expect(service.getSnapshot(session.id).title).toBe("😀".repeat(25));
     service.close();
@@ -1286,13 +1253,7 @@ describe("SessionService", () => {
     await collect(
       (await service.startPrompt(session.id, userMessage("Build title support"))).stream,
     );
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title !== "Codex-compatible title") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     expect(titleModel.doStreamCalls[0]?.maxOutputTokens).toBeUndefined();
     expect(titleModel.doStreamCalls[0]?.providerOptions).toEqual({ openai: { store: false } });
@@ -1519,6 +1480,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("active bindings"));
+    // test-wait-justification: startPrompt returns before the actor enters the gated model call; this zero-delay yield observes the active-run state.
     await Bun.sleep(0);
 
     await expect(
@@ -1759,6 +1721,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("active"), "active-prompt");
+    // test-wait-justification: startPrompt returns before the actor enters the gated model call; this zero-delay yield observes the active-run state.
     await Bun.sleep(0);
 
     await expect(
@@ -1848,6 +1811,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       providers: loadedProviders(["oauth"]),
+      transientModelRetry: IMMEDIATE_TRANSIENT_RETRY,
     });
     const session = await service.createSession({
       cwd: directory,
@@ -1883,6 +1847,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       providers: loadedProviders(["oauth"]),
+      transientModelRetry: IMMEDIATE_TRANSIENT_RETRY,
     });
     const session = await service.createSession({
       cwd: directory,
@@ -1941,6 +1906,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       providers: loadedProviders(["oauth"]),
+      transientModelRetry: IMMEDIATE_TRANSIENT_RETRY,
     });
     const session = await service.createSession({
       cwd: directory,
@@ -2181,6 +2147,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("wait"));
+    // test-wait-justification: command serialization is exercised only after the gated model call has entered its asynchronous turn.
     await Bun.sleep(0);
 
     const controls = await Promise.allSettled([
@@ -2338,6 +2305,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const first = await service.startPrompt(session.id, userMessage("first"));
+    // test-wait-justification: cancellation must run after the first gated model turn has started, and no model-start hook is exposed.
     await Bun.sleep(0);
     await service.cancel({
       sessionId: session.id,
@@ -2348,6 +2316,7 @@ describe("SessionService", () => {
     await collect(first.stream);
 
     const second = await service.startPrompt(session.id, userMessage("second"));
+    // test-wait-justification: cancellation must run after the second gated model turn has started, and no model-start hook is exposed.
     await Bun.sleep(0);
     await expect(
       service.cancel({
@@ -2388,6 +2357,7 @@ describe("SessionService", () => {
     const first = await service.startPrompt(session.id, userMessage("first"));
     await collect(first.stream);
     const second = await service.startPrompt(session.id, userMessage("second"));
+    // test-wait-justification: the stale-control assertion requires the newer gated run to have entered its asynchronous model turn.
     await Bun.sleep(0);
 
     await expect(
@@ -2470,6 +2440,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("wait"));
+    // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
     const saveCommandResult = service.store.saveCommandResult.bind(service.store);
     service.store.saveCommandResult = () => {
@@ -2511,6 +2482,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("wait"));
+    // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
     const markCommandSideEffectStarted = service.store.markCommandSideEffectStarted.bind(
       service.store,
@@ -2649,7 +2621,7 @@ describe("SessionService", () => {
           clientCommandId: `${mode}-interrupt`,
         }),
       ).toMatchObject({ status: "interrupted" });
-      await within(completion);
+      await completion;
 
       expect(service.store.getRun(started.runId).status).toBe("completed");
       expect(delegatedRuns(service, session.id)[0]?.status).toBe("cancelled");
@@ -2771,15 +2743,15 @@ describe("SessionService", () => {
     });
     const first = await service.startPrompt(firstSession.id, userMessage("first root"));
     const firstCompletion = collect(first.stream);
-    await within(childStart);
+    await childStart;
 
     const second = await service.startPrompt(secondSession.id, userMessage("second root"));
-    await within(collect(second.stream));
+    await collect(second.stream);
     expect(delegatedRuns(service, secondSession.id)).toEqual([]);
     expect(JSON.stringify(model.doStreamCalls)).toContain("maximum concurrent subagents reached");
 
     releaseChild();
-    await within(firstCompletion);
+    await firstCompletion;
     expect(delegatedRuns(service, firstSession.id)[0]?.status).toBe("completed");
     service.close();
   });
@@ -2809,7 +2781,7 @@ describe("SessionService", () => {
     });
 
     const started = await service.startPrompt(session.id, userMessage("run a silent tool"));
-    const chunks = await within(collect(started.stream));
+    const chunks = await collect(started.stream);
 
     expect(model.doStreamCalls).toHaveLength(1);
     expect(JSON.stringify(chunks)).toContain(
@@ -2828,7 +2800,7 @@ describe("SessionService", () => {
     ).toBe(true);
 
     const followUp = await service.startPrompt(session.id, userMessage("continue after timeout"));
-    await within(collect(followUp.stream));
+    await collect(followUp.stream);
     expect(model.doStreamCalls).toHaveLength(2);
     expect(service.getSnapshot(session.id).status).toBe("idle");
     expect(JSON.stringify(service.getMessages(session.id))).toContain("follow-up works");
@@ -2987,7 +2959,7 @@ describe("SessionService", () => {
         profile: "delegate",
       });
       const started = await service.startPrompt(session.id, userMessage("delegate idle child"));
-      await within(collect(started.stream));
+      await collect(started.stream);
 
       expect(delegatedRuns(service, session.id)[0]?.status).toBe("error");
       expect(service.store.getRun(started.runId).status).toBe("completed");
@@ -3037,7 +3009,7 @@ describe("SessionService", () => {
       profile: "delegate",
     });
     const started = await service.startPrompt(session.id, userMessage("delegate active child"));
-    await within(collect(started.stream));
+    await collect(started.stream);
 
     expect(delegatedRuns(service, session.id)[0]?.status).toBe("completed");
     service.close();
@@ -3082,7 +3054,7 @@ describe("SessionService", () => {
     };
 
     const started = await service.startPrompt(session.id, userMessage("trigger failure"));
-    await within(collect(started.stream));
+    await collect(started.stream);
 
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
@@ -3278,10 +3250,10 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("launch children"));
     const completion = collect(started.stream);
 
-    await within(parentProgress);
+    await parentProgress;
     expect(service.store.getRun(started.runId).status).toBe("active");
     releaseSecondChild();
-    await within(completion);
+    await completion;
 
     expect(delegatedRuns(service, session.id).map((run) => run.status)).toEqual([
       "completed",
@@ -3310,6 +3282,7 @@ describe("SessionService", () => {
     const { directory, service, session } = await temporaryRuntime(model);
     await Bun.write(path.join(directory, "visible.txt"), "visible tool output");
     const started = await service.startPrompt(session.id, userMessage("start"));
+    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
     await Bun.sleep(0);
     const firstSteer = {
       id: "steer-one-message",
@@ -3435,6 +3408,7 @@ describe("SessionService", () => {
     const secondSteer = steeringMessage("second separate steer");
     const started = await service.startPrompt(session.id, rootUser);
     const completion = collect(started.stream);
+    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
     await Bun.sleep(0);
 
     await service.steer({
@@ -3462,14 +3436,11 @@ describe("SessionService", () => {
       data: firstSteer,
     });
     releaseFirst();
-    await within(secondStart);
-    await within(
-      (async () => {
-        while (!service.getMessages(session.id).some((message) => message.id === firstSteer.id)) {
-          await Bun.sleep(0);
-        }
-      })(),
-    );
+    await secondStart;
+    while (!service.getMessages(session.id).some((message) => message.id === firstSteer.id)) {
+      // test-wait-justification: canonical message publication has no callback; zero-delay yields observe the already-started persistence transition.
+      await Bun.sleep(0);
+    }
     const activeCanonicalUi = service.getMessages(session.id);
     expect(activeCanonicalUi).toEqual([rootUser, firstSteer]);
     expect(JSON.stringify(activeCanonicalUi)).not.toContain("before first steer");
@@ -3510,7 +3481,7 @@ describe("SessionService", () => {
       message: secondSteer,
     });
     releaseSecond();
-    await within(completion);
+    await completion;
 
     expect(model.doStreamCalls).toHaveLength(3);
     const canonicalUi = service.getMessages(session.id);
@@ -3586,6 +3557,7 @@ describe("SessionService", () => {
       profile: "reader",
     });
     const started = await service.startPrompt(session.id, userMessage("root"));
+    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
     await Bun.sleep(0);
     const firstSteer = steeringMessage("first merged steer");
     const secondSteer = steeringMessage("second merged steer");

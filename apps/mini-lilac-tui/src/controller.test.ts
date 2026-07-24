@@ -29,6 +29,7 @@ const SESSION_PRESENTATION = {
 } as const;
 
 function flush(): Promise<void> {
+  // test-wait-justification: drains controller work queued onto the next timer turn by fake transport actions
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 

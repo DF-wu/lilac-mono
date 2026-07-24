@@ -69,6 +69,7 @@ function callExtractPageContentWithProvider(
 describe("web tool fetch", () => {
   it("propagates abort signals through fetch mode", async () => {
     const server = startServer(async () => {
+      // test-wait-justification: keeps the real local HTTP response pending so abort propagation wins the race
       await Bun.sleep(200);
       return new Response("hello", {
         headers: {
@@ -634,6 +635,7 @@ describe("web tool fetch", () => {
       webSearchProviders: [{ id: "exa", isConfigured: () => true, search: async () => [] }],
       getExaClient: () => ({
         getContents: async () => {
+          // test-wait-justification: keeps the fake Exa request pending beyond the configured extract timeout
           await Bun.sleep(50);
           return {
             results: [
@@ -797,6 +799,7 @@ describe("web tool fetch", () => {
       getExaClient: () => ({
         getContents: async () => {
           calls.push("exa");
+          // test-wait-justification: makes the first extract provider exceed its timeout so fallback is exercised
           await Bun.sleep(50);
           return { results: [] };
         },

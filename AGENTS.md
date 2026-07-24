@@ -40,6 +40,15 @@ Tests use Bun’s built-in runner + `bun:test`.
 - Run a single test by name (regex):
   - `cd apps/core && bun test --test-name-pattern "<pattern>"`
 
+### Test timing
+
+- Do not use fixed-time sleeps or waits to synchronize tests. Await the observable operation, resolve a deferred from the callback/event under test, or use an injected/fake clock.
+- Real-time waits are allowed only when elapsed time is itself the behavior under test and a fake clock cannot cover it safely.
+- Every allowed real-time wait must have an immediately preceding, specific justification:
+  - `// test-wait-justification: verifies the real idle deadline while monitoring is paused`
+- Rejection-only timeout guards are allowed because they do not delay the successful path.
+- `lilac/no-fixed-test-wait` enforces this policy through Oxlint for test files. Run its focused tests with `bun run test:lint-rules`.
+
 ### Typechecking
 
 - Treat running `tsc` as essential (same tier as running tests).
@@ -48,10 +57,10 @@ Tests use Bun’s built-in runner + `bun:test`.
 
 ### Lint / Format
 
-This repo uses Oxc tooling at the root:
+This repo uses Oxc tooling and local Oxlint rules at the root:
 
-- Lint: `bun run lint` (`oxlint`)
-- Lint fix: `bun run lint:fix` (`oxlint --fix`)
+- Lint: `bun run lint` (`oxlint`, including local rules)
+- Lint fix: `bun run lint:fix` (`oxlint --fix`, including local rules)
 - Format check: `bun run fmt:check` (`oxfmt --check`)
 - Format write: `bun run fmt` (`oxfmt --write`)
 

@@ -531,11 +531,14 @@ describe("agent run activity", () => {
     });
 
     watchdog.start();
+    // test-wait-justification: advances part of the real idle deadline before resetting the watchdog
     await Bun.sleep(30);
     watchdog.reset();
 
+    // test-wait-justification: keeps the watched operation active across the reset idle window
     await expect(watchdog.waitFor(Bun.sleep(30).then(() => "resolved"))).resolves.toBe("resolved");
     watchdog.stop();
+    // test-wait-justification: verifies no stale watchdog deadline fires after the watched operation completes
     await Bun.sleep(20);
     expect(timeoutCount).toBe(0);
   });
@@ -551,6 +554,7 @@ describe("agent run activity", () => {
 
     watchdog.start();
     watchdog.pause();
+    // test-wait-justification: crosses the real idle deadline while watchdog timing is paused
     await Bun.sleep(30);
 
     expect(timeoutCount).toBe(0);
@@ -564,6 +568,7 @@ describe("agent run activity", () => {
     });
 
     timer.reset();
+    // test-wait-justification: verifies a very large real idle deadline is not clamped to an immediate timer
     await Bun.sleep(10);
 
     expect(timeoutCount).toBe(0);
@@ -592,8 +597,10 @@ describe("agent run activity", () => {
 
     publishActivity("model");
     publishActivity("tool");
+    // test-wait-justification: crosses the activity publisher's real throttle interval before the next publish
     await Bun.sleep(30);
     publishActivity("subagent");
+    // test-wait-justification: drains the throttled activity publication through the in-memory bus subscriber
     await Bun.sleep(0);
 
     expect(sources).toEqual(["model", "subagent"]);

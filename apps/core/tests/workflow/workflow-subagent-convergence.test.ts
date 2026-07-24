@@ -120,8 +120,8 @@ class FallbackTrackingWorkflowStore extends DurableWorkflowStore {
     if (run?.progressTarget === null && this.nullTargetProjectionResolve) {
       const resolve = this.nullTargetProjectionResolve;
       this.nullTargetProjectionResolve = null;
-      // The no-target path has no awaits; the timer runs after its projection promise settles.
-      setTimeout(resolve, 0);
+      // The no-target path has no awaits; its projection promise settles before this microtask runs.
+      queueMicrotask(resolve);
     }
     return run;
   }
@@ -281,6 +281,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 3_000;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("timed out waiting for workflow state");
+    // test-wait-justification: polls for convergence work performed by independently scheduled workflow consumers
     await Bun.sleep(5);
   }
 }
@@ -1256,6 +1257,7 @@ describe("workflow subagent convergence", () => {
     publishControl.failProgressRequested = false;
     await projector.reconcile();
     await waitFor(() => Boolean(store.getSurfaceBinding(run.runId)?.messageRef));
+    // test-wait-justification: crosses the projector retry interval to detect duplicate fallback card sends
     await Bun.sleep(30);
     expect(adapter.sends).toBe(1);
     expect(adapter.messages.size).toBe(1);
@@ -1364,6 +1366,7 @@ describe("workflow subagent convergence", () => {
     expect(store.getRun(run.runId)?.progressTarget).toBeNull();
 
     const parent = bridge.registerParent({ parentRequestId: "parent:restored" });
+    // test-wait-justification: crosses the restored-parent protection window to verify fallback remains suppressed
     await Bun.sleep(30);
     expect(store.getRun(run.runId)?.progressTarget).toBeNull();
     expect(parent.listPending()).toHaveLength(1);

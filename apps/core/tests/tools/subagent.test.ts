@@ -701,6 +701,7 @@ describe("subagent_delegate tool", () => {
       onDelegate: async () => ({
         runId: "run:sync-activity",
         completion: (async () => {
+          // test-wait-justification: keeps completion beyond the 40 ms idle deadline while staged child activity repeatedly extends it
           await sleep(100);
           return { status: "resolved" as const, finalText: "finished" };
         })(),
@@ -735,24 +736,28 @@ describe("subagent_delegate tool", () => {
         }
 
         const headers = msg.headers;
+        // test-wait-justification: approaches the initial 40 ms idle deadline before reasoning activity resets it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputDeltaReasoning,
           { delta: "still thinking" },
           { headers },
         );
+        // test-wait-justification: places tool activity beyond the original idle deadline to prove the reasoning reset extended it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputToolCall,
           { toolCallId: "child-tool", status: "start", display: "working" },
           { headers },
         );
+        // test-wait-justification: places lifecycle activity beyond the prior idle deadline to prove the tool reset extended it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtRequestLifecycleChanged,
           { state: "running" },
           { headers },
         );
+        // test-wait-justification: places the final response beyond the prior idle deadline to prove the lifecycle reset extended it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputResponseText,

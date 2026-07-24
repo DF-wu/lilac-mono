@@ -224,7 +224,10 @@ describe("compact subagent progress", () => {
   });
 });
 
-function createFakeDiscordClient(opts?: { failEditWithFiles?: boolean }): {
+function createFakeDiscordClient(opts?: {
+  failEditWithFiles?: boolean;
+  onEdit?: (options: unknown) => void;
+}): {
   client: Client;
   createdMessageIds: string[];
   deletedMessageIds: string[];
@@ -321,6 +324,7 @@ function createFakeDiscordClient(opts?: { failEditWithFiles?: boolean }): {
       attachments,
       edit: async (options) => {
         operations.push({ kind: "edit", messageId: id, options });
+        opts?.onEdit?.(options);
         if (opts?.failEditWithFiles && fileCountFromOptions(options) > 0) {
           throw new Error("edit failed");
         }
@@ -460,7 +464,17 @@ function makeAttachment(index: number): SurfaceAttachment {
 
 describe("Discord compact progress integration", () => {
   it("keeps agents in the Working field and removes progress on completion", async () => {
-    const { client, operations } = createFakeDiscordClient();
+    let resolveStreamingEdit: (options: unknown) => void = () => {};
+    const streamingEdit = new Promise<unknown>((resolve) => {
+      resolveStreamingEdit = resolve;
+    });
+    const { client, operations } = createFakeDiscordClient({
+      onEdit: (options) => {
+        if (embedFieldValuesFromOptions(options).some((value) => value.includes("bash bun test"))) {
+          resolveStreamingEdit(options);
+        }
+      },
+    });
     const out = new DiscordOutputStream({
       client,
       sessionRef: { platform: "discord", channelId: "chan" },
@@ -493,9 +507,8 @@ describe("Discord compact progress integration", () => {
       },
     });
 
-    await Bun.sleep(300);
-    const streamingEdit = operations.filter((operation) => operation.kind === "edit").at(-1);
-    const streamingValues = embedFieldValuesFromOptions(streamingEdit?.options).map((value) =>
+    const streamingEditOptions = await streamingEdit;
+    const streamingValues = embedFieldValuesFromOptions(streamingEditOptions).map((value) =>
       value.replaceAll("\\", ""),
     );
     expect(streamingValues).toHaveLength(1);

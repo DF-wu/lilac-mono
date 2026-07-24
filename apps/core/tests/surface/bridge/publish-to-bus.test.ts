@@ -211,6 +211,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       messageRef: { platform: "discord", channelId: "chan", messageId: "m1" },
       session: { platform: "discord", channelId: "chan" },
     });
+    // test-wait-justification: drains the adapter event listener and transcript unlink callback triggered above
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(unlinked).toEqual([{ platform: "discord", channelId: "chan", messageId: "m1" }]);
@@ -252,6 +253,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       messageRef: { platform: "discord", channelId: "chan", messageId: "m1" },
       session: { platform: "discord", channelId: "chan" },
     });
+    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(publishedTypes).toContain(lilacEventTypes.EvtAdapterMessageDeleted);
@@ -338,6 +340,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userName: "bob",
     });
 
+    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.map((m) => m.type)).toEqual([
@@ -400,6 +403,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       cancelScope: "active_only",
     });
 
+    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.length).toBe(1);
@@ -452,6 +456,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       messageId: "m2",
     });
 
+    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.length).toBe(1);
@@ -510,6 +515,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       sessionConfigId: "chan",
     });
 
+    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.length).toBe(1);

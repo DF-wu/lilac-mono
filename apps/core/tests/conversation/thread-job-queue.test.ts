@@ -13,6 +13,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 50; i++) {
     if (predicate()) return;
+    // test-wait-justification: polls until the serial queue's asynchronously scheduled job transition runs
     await Bun.sleep(1);
   }
   throw new Error("condition not met");

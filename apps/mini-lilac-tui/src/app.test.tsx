@@ -3,6 +3,7 @@ import type { UIMessageChunk } from "ai";
 
 import {
   BoxRenderable,
+  CliRenderEvents,
   CodeRenderable,
   RGBA,
   type CapturedSpan,
@@ -78,6 +79,23 @@ async function clickRenderedText(
   const { x, y } = renderedTextPosition(app, text);
   await app.mockMouse.click(x, y);
   await app.flush();
+}
+
+function waitForReactiveFrame(
+  app: Awaited<ReturnType<typeof renderApp>>,
+  predicate: (frame: string) => boolean,
+): Promise<string> {
+  const initialFrame = app.captureCharFrame();
+  if (predicate(initialFrame)) return Promise.resolve(initialFrame);
+
+  const completion = Promise.withResolvers<string>();
+  const checkFrame = () => {
+    const frame = app.captureCharFrame();
+    if (predicate(frame)) completion.resolve(frame);
+    else app.renderer.once(CliRenderEvents.FRAME, checkFrame);
+  };
+  app.renderer.once(CliRenderEvents.FRAME, checkFrame);
+  return completion.promise;
 }
 
 function renderedTextPosition(
@@ -234,9 +252,7 @@ describe("MiniLilacApp tool interactions", () => {
     const app = await renderApp(messages, transport);
     try {
       await clickRenderedText(app, "✓ Explore Task");
-      await Bun.sleep(100);
-      await app.flush();
-      await app.waitForFrame((frame) => frame.includes("Read-only child result"));
+      await waitForReactiveFrame(app, (frame) => frame.includes("Read-only child result"));
       const childFrame = app.captureCharFrame();
       expect(childFrame).toContain("explore subagent");
       expect(childFrame).toContain("2 reads");
@@ -245,8 +261,7 @@ describe("MiniLilacApp tool interactions", () => {
       expect(childFrame).not.toContain("Ask anything...");
 
       app.mockInput.pressEscape();
-      await Bun.sleep(20);
-      await app.flush();
+      await waitForReactiveFrame(app, (frame) => frame.includes("Ask anything..."));
       const parentFrame = app.captureCharFrame();
       expect(parentFrame).toContain("✓ Explore Task");
       expect(parentFrame).toContain("Ask anything...");
@@ -341,8 +356,12 @@ describe("MiniLilacApp tool interactions", () => {
       expect(parentScrollTop).toBeGreaterThan(0);
 
       await clickRenderedText(app, "Explore Task");
-      await Bun.sleep(30);
-      await app.flush();
+      await waitForReactiveFrame(
+        app,
+        (frame) =>
+          frame.includes("CHILD TAIL") &&
+          transcript.scrollHeight - transcript.height - transcript.scrollTop <= 1,
+      );
       expect(app.captureCharFrame()).toContain("CHILD TAIL");
       expect(transcript.scrollTop).toBeGreaterThan(0);
       expect(
@@ -350,8 +369,10 @@ describe("MiniLilacApp tool interactions", () => {
       ).toBeLessThanOrEqual(1);
 
       app.mockInput.pressEscape();
-      await Bun.sleep(20);
-      await app.flush();
+      await waitForReactiveFrame(
+        app,
+        (frame) => frame.includes("Parent history") && transcript.scrollTop === parentScrollTop,
+      );
       expect(transcript.scrollTop).toBe(parentScrollTop);
     } finally {
       app.renderer.destroy();

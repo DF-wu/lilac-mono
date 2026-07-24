@@ -383,6 +383,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -534,6 +535,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -627,6 +629,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -723,6 +726,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(0);
@@ -813,6 +817,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(0);
@@ -905,6 +910,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1001,6 +1007,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1098,6 +1105,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(called).toBe(1);
@@ -1198,6 +1206,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1304,6 +1313,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1404,6 +1414,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(0);
@@ -1504,6 +1515,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1595,6 +1607,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1694,6 +1707,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(1);
@@ -1800,6 +1814,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(0);
@@ -1906,6 +1921,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(gateCalled).toBe(0);
@@ -2014,6 +2030,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(gateCalled).toBe(0);
@@ -2127,6 +2144,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(gateCalled).toBe(1);
@@ -2220,6 +2238,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -2342,6 +2361,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(received).toHaveLength(1);
@@ -2377,6 +2397,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 30));
 
     expect(received.length).toBe(2);
@@ -2503,6 +2524,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(0);
@@ -2612,6 +2634,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -2722,6 +2745,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -2889,6 +2913,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(3);
@@ -3043,6 +3068,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
@@ -3213,6 +3239,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
@@ -3399,6 +3426,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
@@ -3536,6 +3564,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -3693,6 +3722,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -3859,6 +3889,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -4002,6 +4033,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -4139,6 +4171,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(0);
 
@@ -4154,6 +4187,7 @@ describe("startBusRequestRouter", () => {
       },
     );
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -4321,6 +4355,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(0);
 
@@ -4336,6 +4371,7 @@ describe("startBusRequestRouter", () => {
       },
     );
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -4553,6 +4589,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(3);
@@ -4586,6 +4623,7 @@ describe("startBusRequestRouter", () => {
       },
     );
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(3);
 
@@ -4766,6 +4804,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
@@ -4794,6 +4833,7 @@ describe("startBusRequestRouter", () => {
       },
     );
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(2);
 
@@ -4886,6 +4926,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -4981,6 +5022,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -5080,6 +5122,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -5181,6 +5224,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -5279,6 +5323,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
@@ -5460,6 +5505,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(4);
@@ -5582,6 +5628,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(received.length).toBe(1);
@@ -5706,6 +5753,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(received.length).toBe(1);
@@ -5820,6 +5868,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 10));
 
     expect(received.length).toBe(1);
@@ -5914,6 +5963,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
+    // test-wait-justification: exercises the router's real debounce or gate deadline before observing delivery
     await new Promise((r) => setTimeout(r, 20));
 
     expect(received.length).toBe(0);
