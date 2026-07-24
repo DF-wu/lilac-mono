@@ -37,6 +37,7 @@ describe("agent run idle watchdog", () => {
 
     watchdog.start();
     watchdog.pause();
+    // test-wait-justification: crosses the real idle deadline while monitoring is paused
     await Bun.sleep(20);
 
     expect(timeoutCount).toBe(0);
@@ -50,6 +51,7 @@ describe("agent run idle watchdog", () => {
     });
 
     timer.reset();
+    // test-wait-justification: verifies a very large real idle deadline is not clamped to an immediate timer
     await Bun.sleep(10);
 
     expect(timeoutCount).toBe(0);
@@ -87,14 +89,30 @@ describe("transient model retry", () => {
       requestId: "request-1",
       sessionId: "session-1",
       modelSpec: "codex/test",
-      hasStartedOutput: () => false,
     });
     const error = { statusCode: 503, message: "Service unavailable" };
+    const context = { retrySafety: { canRetry: true } as const };
 
-    await expect(controller.handler(error, {})).resolves.toBe("retry");
-    await expect(controller.handler(error, {})).resolves.toBe("retry");
-    await expect(controller.handler(error, {})).resolves.toBe("fail");
+    await expect(controller.handler(error, context)).resolves.toBe("retry");
+    await expect(controller.handler(error, context)).resolves.toBe("retry");
+    await expect(controller.handler(error, context)).resolves.toBe("fail");
     controller.reset();
-    await expect(controller.handler(error, {})).resolves.toBe("retry");
+    await expect(controller.handler(error, context)).resolves.toBe("retry");
+  });
+
+  it("does not retry an unsafe transcript boundary", async () => {
+    const controller = createTransientModelRetryController({
+      retry: { enabled: true, maxRetries: 2, baseDelayMs: 0, maxDelayMs: 0 },
+      logger: createLogger({ module: "agent-runtime-controls-test" }),
+      requestId: "request-1",
+      sessionId: "session-1",
+      modelSpec: "codex/test",
+    });
+
+    await expect(
+      controller.handler(new Error("WebSocket closed before a terminal response event"), {
+        retrySafety: { canRetry: false, reason: "provider-executed-tool" },
+      }),
+    ).resolves.toBe("fail");
   });
 });

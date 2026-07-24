@@ -51,6 +51,7 @@ export const miniLilacProfileSummarySchema = z.object({
   description: z.string().optional(),
   isDefault: z.boolean().optional(),
   subagentOnly: z.boolean(),
+  workspaceWrites: z.boolean(),
 });
 export type MiniLilacProfileSummary = z.infer<typeof miniLilacProfileSummarySchema>;
 
@@ -657,6 +658,13 @@ export const miniLilacSteeringChunkSchema = z.strictObject({
   data: miniLilacUserUIMessageSchema,
 });
 export type MiniLilacSteeringChunk = z.infer<typeof miniLilacSteeringChunkSchema>;
+
+export const miniLilacSteeringCommittedChunkSchema = z.strictObject({
+  type: z.literal("data-steeringCommitted"),
+  id: identifierSchema.optional(),
+  data: miniLilacUserUIMessageSchema,
+});
+export type MiniLilacSteeringCommittedChunk = z.infer<typeof miniLilacSteeringCommittedChunkSchema>;
 
 export const miniLilacUndoResultSchema = z.discriminatedUnion("status", [
   z.strictObject({

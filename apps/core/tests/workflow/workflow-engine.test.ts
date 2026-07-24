@@ -206,6 +206,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 3_000;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for workflow state");
+    // test-wait-justification: polls workflow state produced by the engine's independently scheduled worker loop
     await Bun.sleep(10);
   }
 }
@@ -298,6 +299,7 @@ describe("WorkflowEngine", () => {
             }),
           ]);
         } else {
+          // test-wait-justification: keeps shared read operations active while writer overlap is measured
           await Bun.sleep(30);
         }
         if (policy.profile !== "explore") activeEditors -= 1;
@@ -697,6 +699,7 @@ describe("WorkflowEngine", () => {
     });
     try {
       await engine.start();
+      // test-wait-justification: crosses several engine poll intervals to prove manual blocks are not reclaimed
       await Bun.sleep(25);
       expect(store.getRun("run-1")).toMatchObject({
         state: "blocked",
@@ -1288,6 +1291,7 @@ describe("WorkflowEngine", () => {
         requestId: cancelledCapture.requestId,
         error: WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
       });
+      // test-wait-justification: crosses several engine poll intervals to prove terminal receipts prevent redispatch
       await Bun.sleep(25);
       expect(dispatches).toBe(2);
     } finally {
@@ -1336,6 +1340,7 @@ describe("WorkflowEngine", () => {
       ).toBe("successor");
       now = 101;
       await waitFor(() => store.getRun("run-1")?.claimedBy === "successor");
+      // test-wait-justification: crosses several engine poll intervals to detect an incorrect successor interrupt
       await Bun.sleep(25);
       expect(
         raw.messages.some(
@@ -1751,6 +1756,7 @@ describe("WorkflowEngine", () => {
             if (this.interruptAttempts === 1) throw new Error("transient cancel publish failure");
             this.cancelledRequestId = requestId;
             this.stateBeforeReceipt = store.getOperationByRequestId(requestId)?.state ?? null;
+            // test-wait-justification: holds terminal receipt recording open to exercise idle-cancellation ordering
             await Bun.sleep(50);
             const operation = store.getOperationByRequestId(requestId);
             if (!operation) throw new Error("Missing idle operation");

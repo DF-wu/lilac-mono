@@ -42,6 +42,7 @@ export interface TranscriptEntry {
   readonly text: string;
   readonly singleLine?: boolean;
   readonly streaming?: boolean;
+  readonly running?: boolean;
   readonly shell?: ShellTranscript;
   readonly exploration?: ExplorationTranscript;
   readonly edit?: EditTranscript;
@@ -66,6 +67,11 @@ export interface SubagentTranscript {
 export interface ShellTranscript {
   readonly command: string;
   readonly cwd?: string;
+  readonly output?: string;
+}
+
+export interface ShellTranscriptPreview {
+  readonly command: string;
   readonly output?: string;
 }
 
@@ -379,7 +385,8 @@ export function explorationTranscriptText(
   ].join("\n");
 }
 
-function explorationEntry(state: ExplorationState, latest = true): Omit<TranscriptEntry, "id"> {
+function explorationEntry(state: ExplorationState): Omit<TranscriptEntry, "id"> {
+  const running = state.pending.size > 0;
   const exploration = {
     reads: state.reads,
     searches: state.searches,
@@ -388,8 +395,9 @@ function explorationEntry(state: ExplorationState, latest = true): Omit<Transcri
   } satisfies ExplorationTranscript;
   return {
     kind: "exploration",
-    tone: state.failures > 0 ? "warning" : latest ? "accent" : "normal",
-    text: explorationTranscriptText(exploration, latest),
+    tone: state.failures > 0 ? "warning" : running ? "accent" : "normal",
+    text: explorationTranscriptText(exploration, running),
+    ...(running ? { running: true } : {}),
     exploration,
   };
 }
@@ -538,6 +546,7 @@ export function groupNearbyEdits(entries: readonly TranscriptEntry[]): Transcrip
           : previous.tone === "warning" || entry.tone === "warning"
             ? "warning"
             : "normal",
+      running: previous.running === true || entry.running === true ? true : undefined,
       text: editTranscriptText(edit),
       edit,
     };
@@ -666,45 +675,65 @@ function sameCwd(commandCwd: string, clientCwd: string | undefined): boolean {
 export function shellTranscriptText(
   shell: ShellTranscript,
   expanded = false,
-  outputLineLimit = DEFAULT_SHELL_OUTPUT_LINES,
-  outputCharacterLimit = DEFAULT_SHELL_OUTPUT_CHARACTERS,
+  lineLimit = DEFAULT_SHELL_OUTPUT_LINES,
+  characterLimit = DEFAULT_SHELL_OUTPUT_CHARACTERS,
 ): string {
-  const outputLines = shell.output?.split("\n") ?? [];
-  const outputCharacters = Array.from(shell.output ?? "");
-  const collapsible =
-    outputLines.length > outputLineLimit || outputCharacters.length > outputCharacterLimit;
-  const lineLimitedOutput = outputLines.slice(0, outputLineLimit).join("\n");
-  const lineLimitedCharacters = Array.from(lineLimitedOutput);
-  const characterLimitedOutput =
-    lineLimitedCharacters.length <= outputCharacterLimit
-      ? lineLimitedOutput
-      : `${lineLimitedCharacters.slice(0, Math.max(0, outputCharacterLimit - 3)).join("")}...`;
-  const visibleOutput =
-    expanded || !collapsible
-      ? outputLines
-      : characterLimitedOutput.length === 0
-        ? []
-        : characterLimitedOutput.split("\n");
+  const collapsible = isShellTranscriptCollapsible(shell, lineLimit, characterLimit);
+  const preview = shellTranscriptPreview(shell, expanded, lineLimit, characterLimit);
   const lines = [
     shell.cwd === undefined ? undefined : `# Running in ${shell.cwd}`,
     shell.cwd === undefined ? undefined : "",
-    `$ ${shell.command}`,
-    visibleOutput.length === 0 ? undefined : "",
-    ...visibleOutput,
+    `$ ${preview.command}`,
+    preview.output === undefined ? undefined : "",
+    preview.output,
     collapsible ? "" : undefined,
     collapsible ? (expanded ? "Click to collapse" : "Click to expand") : undefined,
   ].filter((value) => value !== undefined);
   return lines.join("\n");
 }
 
+function truncateShellTranscript(value: string, lineLimit: number, characterLimit: number): string {
+  const lineLimitedValue = value.split("\n").slice(0, lineLimit).join("\n");
+  const characters = Array.from(lineLimitedValue);
+  if (characters.length <= characterLimit) return lineLimitedValue;
+  return `${characters.slice(0, Math.max(0, characterLimit - 3)).join("")}...`;
+}
+
+function shellTranscriptContent(shell: ShellTranscript): string {
+  return shell.output === undefined || shell.output.length === 0
+    ? shell.command
+    : `${shell.command}\n${shell.output}`;
+}
+
+export function shellTranscriptPreview(
+  shell: ShellTranscript,
+  expanded = false,
+  lineLimit = DEFAULT_SHELL_OUTPUT_LINES,
+  characterLimit = DEFAULT_SHELL_OUTPUT_CHARACTERS,
+): ShellTranscriptPreview {
+  const output = shell.output === undefined || shell.output.length === 0 ? undefined : shell.output;
+  if (expanded || !isShellTranscriptCollapsible(shell, lineLimit, characterLimit)) {
+    return { command: shell.command, ...(output === undefined ? {} : { output }) };
+  }
+
+  const visible = truncateShellTranscript(shellTranscriptContent(shell), lineLimit, characterLimit);
+  const outputPrefix = `${shell.command}\n`;
+  if (!visible.startsWith(outputPrefix)) return { command: visible };
+  const visibleOutput = visible.slice(outputPrefix.length);
+  return {
+    command: shell.command,
+    ...(visibleOutput.length === 0 ? {} : { output: visibleOutput }),
+  };
+}
+
 export function isShellTranscriptCollapsible(
   shell: ShellTranscript,
-  outputLineLimit = DEFAULT_SHELL_OUTPUT_LINES,
-  outputCharacterLimit = DEFAULT_SHELL_OUTPUT_CHARACTERS,
+  lineLimit = DEFAULT_SHELL_OUTPUT_LINES,
+  characterLimit = DEFAULT_SHELL_OUTPUT_CHARACTERS,
 ): boolean {
+  const transcript = shellTranscriptContent(shell);
   return (
-    (shell.output?.split("\n").length ?? 0) > outputLineLimit ||
-    Array.from(shell.output ?? "").length > outputCharacterLimit
+    transcript.split("\n").length > lineLimit || Array.from(transcript).length > characterLimit
   );
 }
 
@@ -746,6 +775,7 @@ function toolEntry(
               ? "warning"
               : "normal",
         text: shellTranscriptText(shell),
+        ...(state.status === "active" ? { running: true } : {}),
         shell,
       };
     }
@@ -757,6 +787,7 @@ function toolEntry(
         kind: "tool",
         tone: state.status === "success" ? "success" : "accent",
         text: `${state.status === "success" ? "Loaded" : "Loading"} skill ${parsed.data.name}`,
+        ...(state.status === "active" ? { running: true } : {}),
       };
     }
   }
@@ -787,6 +818,7 @@ function toolEntry(
       tone,
       text: editTranscriptText(edit),
       singleLine: true,
+      ...(state.status === "active" ? { running: true } : {}),
       edit,
     };
   }
@@ -821,6 +853,7 @@ function toolEntry(
     tone: state.status === "success" ? "success" : "accent",
     text: summary,
     ...(singleLine ? { singleLine: true } : {}),
+    ...(state.status === "active" ? { running: true } : {}),
   };
 }
 
@@ -1082,15 +1115,7 @@ export function renderInitialMessages(
     });
     return entries;
   });
-  return rendered.map((entry, index) => {
-    if (entry.exploration === undefined) return entry;
-    const latest = index === rendered.length - 1;
-    return {
-      ...entry,
-      tone: entry.exploration.failures > 0 ? "warning" : latest ? "accent" : "normal",
-      text: explorationTranscriptText(entry.exploration, latest),
-    };
-  });
+  return rendered;
 }
 
 /** Maps AI SDK chunks to plain semantic transcript entries for a UI adapter. */
@@ -1316,6 +1341,7 @@ export class ChunkRenderer {
             kind: "tool",
             tone: "accent",
             text: summary,
+            running: true,
           },
         );
       }
@@ -1325,6 +1351,7 @@ export class ChunkRenderer {
       kind: "tool" as const,
       tone: "accent" as const,
       text: summary,
+      running: true,
     };
     const id = this.append(entry);
     this.toolEntryIds.set(toolCallId, id);
@@ -1364,7 +1391,12 @@ export class ChunkRenderer {
           this.toolInputs.get(toolCallId),
           { status: "active", output: { stdout: partial } },
           this.options,
-        ) ?? { kind: "tool", tone: "accent", text: this.toolSummaries.get(toolCallId) ?? "Bash" },
+        ) ?? {
+          kind: "tool",
+          tone: "accent",
+          text: this.toolSummaries.get(toolCallId) ?? "Bash",
+          running: true,
+        },
       );
       return;
     }
@@ -1484,7 +1516,7 @@ export class ChunkRenderer {
 
   private append(entry: Omit<TranscriptEntry, "id">): string {
     if (entry.kind !== "exploration" && this.exploration !== undefined) {
-      this.output.update(this.exploration.id, explorationEntry(this.exploration, false));
+      this.output.update(this.exploration.id, explorationEntry(this.exploration));
       this.exploration = undefined;
     }
     return this.output.append(entry);
@@ -1495,7 +1527,7 @@ export class ChunkRenderer {
     if (state === undefined) return;
     state.pending.delete(toolCallId);
     if (failed) state.failures += 1;
-    this.output.update(state.id, explorationEntry(state, state === this.exploration));
+    this.output.update(state.id, explorationEntry(state));
   }
 
   private startReasoning(chunkId: string): void {

@@ -62,6 +62,7 @@ describe("createProcessHandlers", () => {
     });
 
     handlers.handleUncaughtException(new Error("fatal"));
+    // test-wait-justification: yields until the fatal handler's asynchronous stop and exit sequence completes
     await Bun.sleep(0);
 
     expect(stopCalls).toBe(1);
@@ -90,11 +91,13 @@ describe("createProcessHandlers", () => {
 
     void handlers.handleSignal("SIGTERM");
     handlers.handleUncaughtException(new Error("fatal during shutdown"));
+    // test-wait-justification: yields until the concurrently started signal shutdown enters its pending stop
     await Bun.sleep(0);
 
     expect(exitCalls).toEqual([1]);
 
     resolveStop();
+    // test-wait-justification: drains the released asynchronous shutdown before the test returns
     await Bun.sleep(0);
   });
 });

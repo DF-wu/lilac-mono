@@ -294,6 +294,7 @@ describe("workflow sandbox cancellation", () => {
       signal: controller.signal,
       onCall: async () => null,
     });
+    // test-wait-justification: lets the real child process enter CPU-bound work before sending its abort signal
     await Bun.sleep(50);
     controller.abort();
 
@@ -316,6 +317,7 @@ export default defineWorkflow({
       source: compileWorkflowSource(workflowSource, sha256(workflowSource)),
       args: {},
       onCall: async () => {
+        // test-wait-justification: keeps the first host call active so concurrent call-site reuse is observable
         await Bun.sleep(20);
         return "completed";
       },

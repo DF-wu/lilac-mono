@@ -1,8 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import type { UIMessageChunk } from "ai";
 
 import {
+  BoxRenderable,
+  CliRenderEvents,
+  CodeRenderable,
   RGBA,
   type CapturedSpan,
+  type Renderable,
   type ScrollBoxRenderable,
   type TextareaRenderable,
 } from "@opentui/core";
@@ -15,7 +20,7 @@ import {
   type MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
 
-import { MiniLilacApp } from "./app";
+import { MiniLilacApp, formatRunDuration } from "./app";
 import type { SessionBindings } from "./controller";
 import { COLORS } from "./theme";
 
@@ -40,6 +45,8 @@ async function renderApp(
   cwd = "/workspace",
   onNewSession: (bindings: SessionBindings) => Promise<void> = async () => {},
   initialTodos: MiniLilacTodoState = { revision: 0, todos: [] },
+  initialSnapshot: MiniLilacSessionSnapshot = { ...snapshot, cwd },
+  height = 30,
 ) {
   return testRender(
     () => (
@@ -51,8 +58,8 @@ async function renderApp(
         profile="coding"
         reasoning="low"
         models={[]}
-        profiles={[{ id: "coding", label: "Coding", subagentOnly: false }]}
-        initialSnapshot={{ ...snapshot, cwd }}
+        profiles={[{ id: "coding", label: "Coding", subagentOnly: false, workspaceWrites: true }]}
+        initialSnapshot={initialSnapshot}
         initialMessages={messages}
         initialTodos={initialTodos}
         onNewSession={onNewSession}
@@ -60,7 +67,7 @@ async function renderApp(
         onExit={() => {}}
       />
     ),
-    { width, height: 30 },
+    { width, height },
   );
 }
 
@@ -72,6 +79,23 @@ async function clickRenderedText(
   const { x, y } = renderedTextPosition(app, text);
   await app.mockMouse.click(x, y);
   await app.flush();
+}
+
+function waitForReactiveFrame(
+  app: Awaited<ReturnType<typeof renderApp>>,
+  predicate: (frame: string) => boolean,
+): Promise<string> {
+  const initialFrame = app.captureCharFrame();
+  if (predicate(initialFrame)) return Promise.resolve(initialFrame);
+
+  const completion = Promise.withResolvers<string>();
+  const checkFrame = () => {
+    const frame = app.captureCharFrame();
+    if (predicate(frame)) completion.resolve(frame);
+    else app.renderer.once(CliRenderEvents.FRAME, checkFrame);
+  };
+  app.renderer.once(CliRenderEvents.FRAME, checkFrame);
+  return completion.promise;
 }
 
 function renderedTextPosition(
@@ -93,6 +117,30 @@ function renderedSpan(app: Awaited<ReturnType<typeof renderApp>>, text: string):
     .find((candidate) => candidate.text.includes(text));
   if (span === undefined) throw new Error(`Could not find rendered span containing ${text}`);
   return span;
+}
+
+function renderedBackgroundAt(
+  app: Awaited<ReturnType<typeof renderApp>>,
+  x: number,
+  y: number,
+): RGBA {
+  const line = app.captureSpans().lines[y];
+  if (line === undefined) throw new Error(`Rendered line ${y} missing`);
+  let column = 0;
+  for (const span of line.spans) {
+    column += span.width;
+    if (x < column) return span.bg;
+  }
+  throw new Error(`Rendered column ${x} missing from line ${y}`);
+}
+
+function codeBlockContaining(renderable: Renderable, text: string): CodeRenderable | undefined {
+  if (renderable instanceof CodeRenderable && renderable.content.includes(text)) return renderable;
+  for (const child of renderable.getChildren()) {
+    const match = codeBlockContaining(child, text);
+    if (match !== undefined) return match;
+  }
+  return undefined;
 }
 
 function subagentMessagesResponse(): Response {
@@ -132,6 +180,11 @@ function subagentMessagesResponse(): Response {
 }
 
 describe("MiniLilacApp tool interactions", () => {
+  it("formats completed run durations", () => {
+    expect(formatRunDuration(12 * 60_000 + 32_000)).toBe("12m 32s");
+    expect(formatRunDuration(3_500)).toBe("3s");
+  });
+
   it("opens a subagent block as a read-only transcript and returns with escape", async () => {
     const fetchMock = Object.assign(
       async (input: string | URL | Request) => {
@@ -199,9 +252,7 @@ describe("MiniLilacApp tool interactions", () => {
     const app = await renderApp(messages, transport);
     try {
       await clickRenderedText(app, "✓ Explore Task");
-      await Bun.sleep(100);
-      await app.flush();
-      await app.waitForFrame((frame) => frame.includes("Read-only child result"));
+      await waitForReactiveFrame(app, (frame) => frame.includes("Read-only child result"));
       const childFrame = app.captureCharFrame();
       expect(childFrame).toContain("explore subagent");
       expect(childFrame).toContain("2 reads");
@@ -210,8 +261,7 @@ describe("MiniLilacApp tool interactions", () => {
       expect(childFrame).not.toContain("Ask anything...");
 
       app.mockInput.pressEscape();
-      await Bun.sleep(20);
-      await app.flush();
+      await waitForReactiveFrame(app, (frame) => frame.includes("Ask anything..."));
       const parentFrame = app.captureCharFrame();
       expect(parentFrame).toContain("✓ Explore Task");
       expect(parentFrame).toContain("Ask anything...");
@@ -306,8 +356,12 @@ describe("MiniLilacApp tool interactions", () => {
       expect(parentScrollTop).toBeGreaterThan(0);
 
       await clickRenderedText(app, "Explore Task");
-      await Bun.sleep(30);
-      await app.flush();
+      await waitForReactiveFrame(
+        app,
+        (frame) =>
+          frame.includes("CHILD TAIL") &&
+          transcript.scrollHeight - transcript.height - transcript.scrollTop <= 1,
+      );
       expect(app.captureCharFrame()).toContain("CHILD TAIL");
       expect(transcript.scrollTop).toBeGreaterThan(0);
       expect(
@@ -315,8 +369,10 @@ describe("MiniLilacApp tool interactions", () => {
       ).toBeLessThanOrEqual(1);
 
       app.mockInput.pressEscape();
-      await Bun.sleep(20);
-      await app.flush();
+      await waitForReactiveFrame(
+        app,
+        (frame) => frame.includes("Parent history") && transcript.scrollTop === parentScrollTop,
+      );
       expect(transcript.scrollTop).toBe(parentScrollTop);
     } finally {
       app.renderer.destroy();
@@ -608,6 +664,57 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
+  it("keeps the profile hint stable while cycling profiles", async () => {
+    const update = Promise.withResolvers<Response>();
+    const fetch = Object.assign(async () => await update.promise, {
+      preconnect() {},
+    });
+    const app = await testRender(
+      () => (
+        <MiniLilacApp
+          transport={new MiniLilacTransport({ cwd: "/workspace", baseUrl: "/mini", fetch })}
+          cwd="/workspace"
+          sessionId="session-1"
+          model="test/model"
+          profile="coding"
+          reasoning="low"
+          models={[]}
+          profiles={[
+            { id: "coding", label: "Coding", subagentOnly: false, workspaceWrites: true },
+            { id: "review", label: "Review", subagentOnly: false, workspaceWrites: false },
+          ]}
+          initialSnapshot={snapshot}
+          initialMessages={[]}
+          initialTodos={{ revision: 0, todos: [] }}
+          onNewSession={async () => {}}
+          onSessionSelect={async () => {}}
+          onExit={() => {}}
+        />
+      ),
+      { width: 90, height: 30 },
+    );
+    try {
+      await app.flush();
+      const composerFrame = app.renderer.root.findDescendantById("composer-frame") as BoxRenderable;
+      expect(app.captureCharFrame()).toContain("tab profile");
+      expect(composerFrame.borderColor.equals(RGBA.fromHex(COLORS.success))).toBe(true);
+
+      app.mockInput.pressKey("TAB");
+      await app.flush();
+
+      const frame = app.captureCharFrame();
+      expect(frame).toContain("tab profile");
+      expect(frame).not.toContain("submitting");
+      expect(renderedSpan(app, "tab profile").fg.equals(RGBA.fromHex(COLORS.muted))).toBe(true);
+
+      update.resolve(Response.json({ ...snapshot, profile: "review" }));
+      await app.waitForFrame((nextFrame) => nextFrame.includes("review |"));
+      expect(composerFrame.borderColor.equals(RGBA.fromHex(COLORS.model))).toBe(true);
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
   it("focuses the new session composer after /new", async () => {
     const transport = new MiniLilacTransport({ cwd: "/workspace" });
     const app = await testRender(
@@ -624,7 +731,9 @@ describe("MiniLilacApp tool interactions", () => {
                 profile="coding"
                 reasoning="low"
                 models={[]}
-                profiles={[{ id: "coding", label: "Coding", subagentOnly: false }]}
+                profiles={[
+                  { id: "coding", label: "Coding", subagentOnly: false, workspaceWrites: true },
+                ]}
                 initialSnapshot={id === "session-1" ? snapshot : undefined}
                 initialMessages={[]}
                 initialTodos={{ revision: 0, todos: [] }}
@@ -699,6 +808,62 @@ describe("MiniLilacApp tool interactions", () => {
       expect(frame).toContain("│Interaction");
       expect(frame).toContain("├");
       expect(frame).toContain("┘");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("renders fenced code on a full-width panel without changing prose", async () => {
+    const app = await renderApp([
+      {
+        id: "assistant-code-background",
+        role: "assistant",
+        parts: [
+          {
+            type: "text",
+            text: "Ordinary prose\n\n```unsupported-language\nUNHIGHLIGHTED_CODE\n\nSECOND_CODE_LINE\n```\n\nAfter prose",
+          },
+        ],
+      },
+    ]);
+    try {
+      await app.flush();
+      const prose = codeBlockContaining(app.renderer.root, "Ordinary prose");
+      const code = codeBlockContaining(app.renderer.root, "UNHIGHLIGHTED_CODE");
+      const after = codeBlockContaining(app.renderer.root, "After prose");
+      if (prose === undefined) throw new Error("Prose block missing");
+      if (code === undefined) throw new Error("Code block missing");
+      if (after === undefined) throw new Error("Trailing prose block missing");
+      if (!(code.parent instanceof BoxRenderable)) {
+        throw new Error(`Code block container missing: ${code.parent?.constructor.name ?? "none"}`);
+      }
+      const container = code.parent;
+      await Promise.all([prose.highlightingDone, code.highlightingDone, after.highlightingDone]);
+      await app.flush();
+
+      expect(prose.bg.equals(RGBA.fromHex(COLORS.background))).toBe(true);
+      expect(code.bg.equals(RGBA.fromHex(COLORS.panel))).toBe(true);
+      expect(code.width).toBe(prose.width);
+      expect(container.backgroundColor.equals(RGBA.fromHex(COLORS.panel))).toBe(true);
+      expect(container.screenY).toBe(prose.screenY + prose.height);
+      expect(code.screenY).toBe(container.screenY + 1);
+      expect(container.height).toBe(code.height + 2);
+      expect(after.screenY).toBe(container.screenY + container.height);
+      const label = renderedSpan(app, "unsupported-language");
+      expect(label.bg.equals(RGBA.fromHex(COLORS.raised))).toBe(true);
+      expect(label.fg.equals(RGBA.fromHex(COLORS.syntaxType))).toBe(true);
+      const rightEdge = container.screenX + container.width - 1;
+      expect(
+        renderedBackgroundAt(app, rightEdge, code.screenY).equals(RGBA.fromHex(COLORS.panel)),
+      ).toBe(true);
+      expect(
+        renderedBackgroundAt(app, rightEdge, code.screenY + 1).equals(RGBA.fromHex(COLORS.panel)),
+      ).toBe(true);
+      expect(
+        renderedBackgroundAt(app, rightEdge, container.screenY + container.height - 1).equals(
+          RGBA.fromHex(COLORS.panel),
+        ),
+      ).toBe(true);
     } finally {
       app.renderer.destroy();
     }
@@ -805,6 +970,10 @@ describe("MiniLilacApp tool interactions", () => {
       expect(renderedTextPosition(app, "coding").y).toBe(
         renderedTextPosition(app, "Click test").y + 1,
       );
+      expect(renderedTextPosition(app, "coding").x).toBeGreaterThan(
+        renderedTextPosition(app, "▣ Ready").x,
+      );
+      expect(renderedTextPosition(app, "coding").y).toBe(renderedTextPosition(app, "▣ Ready").y);
       expect(renderedSpan(app, "coding").fg.equals(RGBA.fromHex(COLORS.accent))).toBe(true);
       expect(renderedSpan(app, "test/model").fg.equals(RGBA.fromHex(COLORS.model))).toBe(true);
       expect(renderedSpan(app, "low").fg.equals(RGBA.fromHex(COLORS.warning))).toBe(true);
@@ -886,6 +1055,310 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
+  it("shows eight logical shell transcript lines with deliberate spacing", async () => {
+    const output = [
+      `line 1 ${"detail ".repeat(16)}`,
+      ...Array.from({ length: 13 }, (_, index) => `line ${index + 2}`),
+    ].join("\n");
+    const app = await renderApp([
+      {
+        id: "assistant-shell-height",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "bash",
+            toolCallId: "bash-height-1",
+            state: "output-available",
+            input: { command: "docker system df -v", cwd: "/workspace/apps/api" },
+            output: { stdout: output, stderr: "", exitCode: 0 },
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "deploy_preview",
+            toolCallId: "after-shell-height",
+            state: "output-available",
+            input: {},
+            output: {},
+          },
+        ],
+      },
+    ]);
+    try {
+      await app.flush();
+      const cwdY = renderedTextPosition(app, "# Running in /workspace/apps/api").y;
+      const initialCommandY = renderedTextPosition(app, "$ docker system df -v").y;
+      const firstOutputY = renderedTextPosition(app, "line 1").y;
+      const lastOutputY = renderedTextPosition(app, "line 7").y;
+      const expandY = renderedTextPosition(app, "Click to expand").y;
+      const initialNextY = renderedTextPosition(app, "Deploy Preview").y;
+      expect(app.captureCharFrame()).not.toContain("line 8");
+      expect(initialCommandY).toBe(cwdY + 2);
+      expect(firstOutputY).toBe(initialCommandY + 1);
+      expect(expandY).toBe(lastOutputY + 2);
+      expect(initialNextY).toBe(expandY + 3);
+
+      await clickRenderedText(app, "$ docker system df -v");
+      expect(app.captureCharFrame()).toContain("line 14");
+      await clickRenderedText(app, "Click to collapse");
+      expect(renderedTextPosition(app, "Deploy Preview").y).toBe(initialNextY);
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("marks running and completed shell commands independently of color", async () => {
+    const app = await renderApp([
+      {
+        id: "assistant-shell-states",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "bash",
+            toolCallId: "bash-complete",
+            state: "output-available",
+            input: { command: "df -h" },
+            output: { stdout: "done", stderr: "", exitCode: 0 },
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "bash",
+            toolCallId: "bash-running",
+            state: "input-available",
+            input: { command: "du -x -h /" },
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "deploy_preview",
+            toolCallId: "tool-running",
+            state: "input-available",
+            input: {},
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "skill",
+            toolCallId: "tool-complete",
+            state: "output-available",
+            input: { name: "frontend-design" },
+            output: {},
+          },
+        ],
+      },
+    ]);
+    try {
+      await app.flush();
+      const frame = app.captureCharFrame();
+      expect(frame).toContain("✓ $ df -h");
+      expect(frame).toContain("● $ du -x -h /");
+      expect(frame).toContain("● Deploy Preview");
+      expect(frame).toContain("✓ Loaded skill frontend-design");
+      expect(renderedSpan(app, "✓ ").fg.equals(RGBA.fromHex(COLORS.success))).toBe(true);
+      expect(renderedSpan(app, "● ").fg.equals(RGBA.fromHex(COLORS.accent))).toBe(true);
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("keeps a stationary session status row across idle and active states", async () => {
+    const idleApp = await renderApp([]);
+    let idleComposerY: number;
+    try {
+      await idleApp.flush();
+      expect(idleApp.captureCharFrame()).toContain("▣ Ready");
+      idleComposerY = renderedTextPosition(idleApp, "Ask anything...").y;
+      expect(renderedTextPosition(idleApp, "▣ Ready").y).toBeGreaterThan(idleComposerY);
+    } finally {
+      idleApp.renderer.destroy();
+    }
+
+    const fetch = Object.assign(async () => await new Promise<Response>(() => {}), {
+      preconnect() {},
+    });
+    const activeSnapshot = {
+      ...snapshot,
+      activeRunId: "run-active",
+      status: "streaming" as const,
+      queuedSteeringCount: 2,
+    };
+    const app = await renderApp(
+      [],
+      new MiniLilacTransport({ cwd: "/workspace", baseUrl: "/mini", fetch }),
+      90,
+      "/workspace",
+      async () => {},
+      { revision: 0, todos: [] },
+      activeSnapshot,
+    );
+    try {
+      await app.flush();
+      const frame = app.captureCharFrame();
+      expect(frame).toMatch(/[·▪■▣] \S+\.\.\. 0s/u);
+      expect(frame).toContain("2 queued / esc interrupt");
+      expect(renderedTextPosition(app, "2 queued / esc interrupt").y).toBe(
+        renderedTextPosition(app, "Steer the active run...").y,
+      );
+      expect(renderedTextPosition(app, "2 queued / esc interrupt").x).toBeGreaterThan(
+        renderedTextPosition(app, "Steer the active run...").x,
+      );
+      expect(renderedTextPosition(app, "Steer the active run...").y).toBe(idleComposerY);
+      expect(frame).not.toContain("working / esc interrupt");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("pins a capped steering queue above the composer until messages commit", async () => {
+    const steering = ["first queued", "second queued", "third queued", "fourth queued"].map(
+      (text, index) => ({
+        id: `steering-${index + 1}`,
+        role: "user" as const,
+        parts: [{ type: "text" as const, text }],
+      }),
+    );
+    class QueuedSteeringTransport extends MiniLilacTransport {
+      streamController: ReadableStreamDefaultController<UIMessageChunk> | undefined;
+
+      override async reconnectToStream() {
+        return new ReadableStream<UIMessageChunk>({
+          start: (controller) => {
+            this.streamController = controller;
+            steering.forEach((message) => {
+              controller.enqueue({ type: "data-steering", id: message.id, data: message });
+            });
+          },
+        });
+      }
+    }
+
+    const activeSnapshot = {
+      ...snapshot,
+      activeRunId: "run-steering",
+      status: "streaming" as const,
+      queuedSteeringCount: steering.length,
+    };
+    const transport = new QueuedSteeringTransport({ cwd: "/workspace" });
+    const app = await renderApp(
+      [{ id: "root", role: "user", parts: [{ type: "text", text: "root prompt" }] }],
+      transport,
+      90,
+      "/workspace",
+      async () => {},
+      { revision: 0, todos: [] },
+      activeSnapshot,
+    );
+    try {
+      await app.waitForFrame((frame) => frame.includes("+1 more queued"));
+      const queuedFrame = app.captureCharFrame();
+      expect(queuedFrame).toContain("queued 4 messages · send in order");
+      expect(queuedFrame).toContain("first queued");
+      expect(queuedFrame).toContain("third queued");
+      expect(queuedFrame).not.toContain("fourth queued");
+      expect(renderedTextPosition(app, "4 messages · send in order").y).toBeGreaterThan(
+        renderedTextPosition(app, "root prompt").y,
+      );
+      expect(renderedTextPosition(app, "4 messages · send in order").y).toBeLessThan(
+        renderedTextPosition(app, "Steer the active run...").y,
+      );
+
+      const committed = steering[0];
+      if (committed === undefined) throw new Error("expected steering fixture");
+      transport.streamController?.enqueue({
+        type: "data-steeringCommitted",
+        id: committed.id,
+        data: committed,
+      });
+      await app.waitForFrame((frame) => !frame.includes("+1 more queued"));
+      expect(renderedTextPosition(app, "first queued").y).toBeLessThan(
+        renderedTextPosition(app, "3 messages · send in order").y,
+      );
+
+      for (const committedMessage of steering.slice(1, 3)) {
+        transport.streamController?.enqueue({
+          type: "data-steeringCommitted",
+          id: committedMessage.id,
+          data: committedMessage,
+        });
+      }
+      await app.waitForFrame((frame) => frame.includes("fourth queued"));
+      expect(app.captureCharFrame()).not.toContain("sends after current step");
+    } finally {
+      app.renderer.destroy();
+    }
+
+    const narrowApp = await renderApp(
+      [],
+      new QueuedSteeringTransport({ cwd: "/workspace" }),
+      50,
+      "/workspace",
+      async () => {},
+      { revision: 0, todos: [] },
+      activeSnapshot,
+    );
+    try {
+      await narrowApp.waitForFrame((frame) => frame.includes("first queued"));
+      const narrowFrame = narrowApp.captureCharFrame();
+      expect(narrowFrame).toContain("first queued");
+      expect(narrowFrame).not.toContain("second queued");
+      expect(narrowFrame).not.toContain("more queued");
+    } finally {
+      narrowApp.renderer.destroy();
+    }
+
+    const shortApp = await renderApp(
+      [],
+      new QueuedSteeringTransport({ cwd: "/workspace" }),
+      90,
+      "/workspace",
+      async () => {},
+      { revision: 0, todos: [] },
+      activeSnapshot,
+      12,
+    );
+    try {
+      await shortApp.waitForFrame((frame) => frame.includes("first queued"));
+      const shortFrame = shortApp.captureCharFrame();
+      expect(shortFrame).toContain("first queued");
+      expect(shortFrame).toContain("Steer the active run...");
+      expect(shortFrame).not.toContain("second queued");
+    } finally {
+      shortApp.renderer.destroy();
+    }
+  });
+
+  it("keeps the completed run duration in the ready status", async () => {
+    class FinishedRunTransport extends MiniLilacTransport {
+      override async reconnectToStream() {
+        return null;
+      }
+
+      override async getMessages() {
+        return [];
+      }
+    }
+
+    const activeSnapshot = {
+      ...snapshot,
+      activeRunId: "run-finished",
+      status: "streaming" as const,
+    };
+    const app = await renderApp(
+      [],
+      new FinishedRunTransport({ cwd: "/workspace" }),
+      90,
+      "/workspace",
+      async () => {},
+      { revision: 0, todos: [] },
+      activeSnapshot,
+    );
+    try {
+      await app.waitForFrame((frame) => frame.includes("▣ Ready · Ran for 0s"));
+      expect(app.captureCharFrame()).toContain("▣ Ready · Ran for 0s");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
   it("expands exploration when its rendered text is clicked", async () => {
     const app = await renderApp([
       {
@@ -906,7 +1379,7 @@ describe("MiniLilacApp tool interactions", () => {
     try {
       await app.flush();
       expect(app.captureCharFrame()).not.toContain("src/app.ts · 12 lines");
-      await clickRenderedText(app, "Exploring");
+      await clickRenderedText(app, "Explored");
       expect(app.captureCharFrame()).toContain("src/app.ts · 12 lines");
     } finally {
       app.renderer.destroy();

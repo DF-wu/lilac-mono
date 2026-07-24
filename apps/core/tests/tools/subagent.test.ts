@@ -183,6 +183,7 @@ describe("subagent_delegate tool", () => {
     const schema = asSchema(delegate.inputSchema as never).jsonSchema as unknown as {
       properties?: {
         model?: { enum?: string[]; description?: string };
+        mode?: { description?: string };
         reasoning?: { enum?: string[] };
       };
     };
@@ -204,6 +205,18 @@ describe("subagent_delegate tool", () => {
     expect(schema.properties?.model?.enum).not.toContain("invalid/alias");
     expect(schema.properties?.model?.enum).not.toContain("invalidTarget");
     expect(schema.properties?.reasoning?.enum).toContain("xhigh");
+    expect(schema.properties?.mode?.description).toContain(
+      "acceptance confirms that the child started, not that it finished",
+    );
+    expect(schema.properties?.mode?.description).toContain(
+      "give the final answer after every deferred subagent has returned a terminal subagent_result",
+    );
+    expect(delegate.description).toContain(
+      "send a brief progress update saying that you are waiting for subagent results",
+    );
+    expect(delegate.description).toContain(
+      "Give the final answer only after every launched deferred subagent has returned a terminal subagent_result",
+    );
     expect(delegate.description).toContain("Escalate critical reviews to a stronger model.");
     expect(JSON.stringify(asSchema(delegate.outputSchema as never).jsonSchema)).toContain(
       "workflowRunId",
@@ -688,6 +701,7 @@ describe("subagent_delegate tool", () => {
       onDelegate: async () => ({
         runId: "run:sync-activity",
         completion: (async () => {
+          // test-wait-justification: keeps completion beyond the 40 ms idle deadline while staged child activity repeatedly extends it
           await sleep(100);
           return { status: "resolved" as const, finalText: "finished" };
         })(),
@@ -722,24 +736,28 @@ describe("subagent_delegate tool", () => {
         }
 
         const headers = msg.headers;
+        // test-wait-justification: approaches the initial 40 ms idle deadline before reasoning activity resets it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputDeltaReasoning,
           { delta: "still thinking" },
           { headers },
         );
+        // test-wait-justification: places tool activity beyond the original idle deadline to prove the reasoning reset extended it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputToolCall,
           { toolCallId: "child-tool", status: "start", display: "working" },
           { headers },
         );
+        // test-wait-justification: places lifecycle activity beyond the prior idle deadline to prove the tool reset extended it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtRequestLifecycleChanged,
           { state: "running" },
           { headers },
         );
+        // test-wait-justification: places the final response beyond the prior idle deadline to prove the lifecycle reset extended it
         await sleep(25);
         await bus.publish(
           lilacEventTypes.EvtAgentOutputResponseText,

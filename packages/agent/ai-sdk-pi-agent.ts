@@ -171,6 +171,12 @@ export type AiSdkPiAgentEvent<TOOLS extends ToolSet> =
       /** Token usage summed across steps for this turn. */
       totalUsage: LanguageModelUsage;
     }
+  /** A failed model request will be replayed from the unchanged canonical transcript. */
+  | {
+      type: "turn_retry";
+      hadPartialOutput: boolean;
+      abandonedToolCallIds: string[];
+    }
   /** Provider warnings emitted for the active model turn. */
   | {
       type: "turn_warnings";
@@ -305,10 +311,18 @@ export type TransformMessagesFn = (
 
 export type TurnErrorHandlerDecision = "retry" | "fail";
 
+export type TurnRetrySafety =
+  | { canRetry: true }
+  | {
+      canRetry: false;
+      reason: "invalid-transcript-boundary" | "post-model-phase" | "provider-executed-tool";
+    };
+
 export type TurnErrorHandler = (
   error: unknown,
   context: {
     abortSignal?: AbortSignal;
+    retrySafety: TurnRetrySafety;
   },
 ) => TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
 
@@ -1051,6 +1065,44 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.emit({ type: "message_end", message: cloneMessage(normalizedMessage) });
   }
 
+  private async normalizeToolOutput(
+    output: ToolResultOutput,
+    context: Parameters<NormalizeToolResultOutputFn>[1],
+  ): Promise<ToolResultOutput> {
+    if (!this.normalizeToolResultOutput) return output;
+
+    try {
+      return await this.normalizeToolResultOutput(output, context);
+    } catch (error) {
+      logger.warn("tool result normalization failed", {
+        toolCallId: context.toolCallId,
+        toolName: context.toolName,
+        error: errorMessage(error),
+      });
+      return { type: "error-text", value: UNSERIALIZABLE_TOOL_RESULT };
+    }
+  }
+
+  private async normalizeNewToolMessage(message: ToolModelMessage): Promise<ToolModelMessage> {
+    if (!this.normalizeToolResultOutput) return message;
+
+    const content: ToolModelMessage["content"] = [];
+    for (const part of message.content) {
+      if (part.type !== "tool-result") {
+        content.push(part);
+        continue;
+      }
+      content.push({
+        ...part,
+        output: await this.normalizeToolOutput(part.output, {
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+        }),
+      });
+    }
+    return { ...message, content };
+  }
+
   private resetMessagesAfterAbort(reason: "cancel" | "interrupt") {
     const truncated = truncateToLastValidBoundary(this.state.messages);
     this.state.messages = truncated.messages;
@@ -1129,8 +1181,20 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             break;
           }
 
+          let modelTurnCompleted = false;
+          let providerExecutedToolObserved = false;
+          const localToolDraftIds = new Set<string>();
+
           try {
-            const turn = await this.runTurn();
+            const turn = await this.runTurn({
+              onProviderExecutedTool: () => {
+                providerExecutedToolObserved = true;
+              },
+              onLocalToolDraft: (toolCallId) => {
+                localToolDraftIds.add(toolCallId);
+              },
+            });
+            modelTurnCompleted = true;
             if (this.cancelResetPending) {
               throw new TurnAbortedError({ reason: "cancel", phase: "model" });
             }
@@ -1266,13 +1330,28 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             }
 
             if (this.turnErrorHandler) {
+              const lastMessage = this.state.messages.at(-1);
+              const retrySafety: TurnRetrySafety = modelTurnCompleted
+                ? { canRetry: false, reason: "post-model-phase" }
+                : providerExecutedToolObserved
+                  ? { canRetry: false, reason: "provider-executed-tool" }
+                  : lastMessage?.role === "assistant" || this.state.pendingToolCalls.size > 0
+                    ? { canRetry: false, reason: "invalid-transcript-boundary" }
+                    : { canRetry: true };
               let decision: TurnErrorHandlerDecision | undefined;
               try {
                 decision = await this.turnErrorHandler(err, {
                   abortSignal: this.abortController?.signal,
+                  retrySafety,
                 });
               } catch (handlerError) {
-                if (!this.cancelResetPending) throw handlerError;
+                if (
+                  !this.cancelResetPending &&
+                  !this.pendingInterrupt &&
+                  !this.abortController?.signal.aborted
+                ) {
+                  throw handlerError;
+                }
               }
               if (this.cancelResetPending) {
                 this.emit({
@@ -1283,7 +1362,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                 this.finishCancellation();
                 break;
               }
-              if (decision === "retry") {
+              if (this.pendingInterrupt || this.abortController?.signal.aborted) {
+                continue;
+              }
+              if (decision === "retry" && retrySafety.canRetry) {
+                const hadPartialOutput = this.state.streamMessage !== null;
+                this.state.streamMessage = null;
+                this.emit({
+                  type: "turn_retry",
+                  hadPartialOutput,
+                  abandonedToolCallIds: [...localToolDraftIds],
+                });
                 continue;
               }
             }
@@ -1323,7 +1412,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     await this.running;
   }
 
-  private async runTurn(): Promise<{
+  private async runTurn(params: {
+    onProviderExecutedTool: () => void;
+    onLocalToolDraft: (toolCallId: string) => void;
+  }): Promise<{
     finishReason: FinishReason;
     newMessages: ModelMessage[];
     toolCalls: Array<{
@@ -1528,6 +1620,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-input-start": {
+          if (part.providerExecuted === true) {
+            params.onProviderExecutedTool();
+          } else {
+            params.onLocalToolDraft(part.id);
+          }
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -1599,6 +1696,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         }
         case "tool-call": {
           const { toolCallId, toolName, input } = part;
+          if (part.providerExecuted === true) {
+            params.onProviderExecutedTool();
+          } else {
+            params.onLocalToolDraft(toolCallId);
+          }
           partialAssistant.content.push({
             type: "tool-call",
             toolCallId,
@@ -1607,6 +1709,21 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             providerExecuted: part.providerExecuted,
           });
           this.state.streamMessage = partialAssistant;
+          break;
+        }
+        case "tool-result":
+        case "tool-error":
+        case "tool-output-denied":
+        case "tool-approval-response": {
+          if (part.providerExecuted === true) {
+            params.onProviderExecutedTool();
+          }
+          break;
+        }
+        case "tool-approval-request": {
+          if (part.toolCall.providerExecuted === true) {
+            params.onProviderExecutedTool();
+          }
           break;
         }
         case "error": {
@@ -1668,7 +1785,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       });
     }
 
-    const newMessages: ModelMessage[] = normalizeReplayMessages(response.messages);
+    const newMessages: ModelMessage[] = [];
+    for (const message of normalizeReplayMessages(response.messages)) {
+      newMessages.push(
+        message.role === "tool" ? await this.normalizeNewToolMessage(message) : message,
+      );
+    }
     const toolCalls = extractToolCallsFromMessages(newMessages);
 
     // Emit message_end for assistant message (first assistant in response.messages)
@@ -1730,7 +1852,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     });
     assertNotAborted();
 
-    const appended = decision.append ?? [];
+    const appended: ModelMessage[] = [];
+    for (const message of decision.append ?? []) {
+      appended.push(
+        message.role === "tool" ? await this.normalizeNewToolMessage(message) : message,
+      );
+    }
+    assertNotAborted();
     for (const message of appended) this.appendMessage(message);
     return {
       requiresNextTurn: appended.length > 0 || decision.forceNextTurn === true,
@@ -1910,31 +2038,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       }
 
       assertNotAborted();
-      if (this.normalizeToolResultOutput) {
-        try {
-          toolOutput = await this.normalizeToolResultOutput(toolOutput, {
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(
-              call.toolName,
-            ),
-          });
-          assertNotAborted();
-        } catch (error) {
-          if (error instanceof TurnAbortedError) throw error;
-          assertNotAborted();
-          logger.warn("tool result normalization failed", {
-            toolCallId: call.toolCallId,
-            toolName: call.toolName,
-            error: errorMessage(error),
-          });
-          if (toolOutput.type === "json") {
-            toolOutput = { type: "text", value: UNSERIALIZABLE_TOOL_RESULT };
-          } else if (toolOutput.type === "error-json") {
-            toolOutput = { type: "error-text", value: UNSERIALIZABLE_TOOL_RESULT };
-          }
-        }
-      }
+      toolOutput = await this.normalizeToolOutput(toolOutput, {
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
+      });
+      assertNotAborted();
 
       this.state.pendingToolCalls.delete(call.toolCallId);
       this.emit({

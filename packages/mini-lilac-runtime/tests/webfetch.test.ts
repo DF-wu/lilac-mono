@@ -201,6 +201,7 @@ describe("Mini Lilac webfetch", () => {
       },
     );
     await started;
+    // test-wait-justification: lets response-body consumption attach before aborting the in-flight fetch
     await Bun.sleep(0);
     abortController.abort(new Error("cancelled by test"));
     await expect(pending).rejects.toThrow("cancelled by test");

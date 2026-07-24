@@ -707,6 +707,7 @@ describe("createMiniLilacServer", () => {
     const chat = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
     );
+    // test-wait-justification: lets chat enter its gated active run before attempting the conflicting binding update
     await Bun.sleep(0);
     const bindings = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/bindings`, {
@@ -1280,6 +1281,7 @@ describe("createMiniLilacServer", () => {
         }),
       ),
     );
+    // test-wait-justification: lets the second chat register its active run before capturing its run identifier
     await Bun.sleep(0);
     const secondRunId = service.getSnapshot("session-1").activeRunId;
     if (!secondRunId) throw new Error("Expected a second active run");
@@ -1343,6 +1345,7 @@ describe("createMiniLilacServer", () => {
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
     );
     expect(initial.status).toBe(200);
+    // test-wait-justification: lets the chat stream enter its active run before simulating client disconnect
     await Bun.sleep(0);
     await initial.body?.cancel("client disconnected");
     expect(service.getSnapshot("session-1").status).toBe("streaming");
@@ -1492,12 +1495,14 @@ describe("createMiniLilacServer", () => {
         description: "Coding profile",
         isDefault: true,
         subagentOnly: false,
+        workspaceWrites: false,
       },
       {
         id: "investigator",
         label: "investigator",
         description: "Subagent profile",
         subagentOnly: true,
+        workspaceWrites: false,
       },
     ]);
     service.close();

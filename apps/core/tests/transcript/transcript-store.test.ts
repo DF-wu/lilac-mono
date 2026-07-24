@@ -197,6 +197,7 @@ describe("SqliteTranscriptStore", () => {
       modelLabel: "test-model",
     });
 
+    // test-wait-justification: gives the second transcript a later wall-clock timestamp for latest ordering
     await new Promise((resolve) => setTimeout(resolve, 2));
 
     store.saveRequestTranscript({

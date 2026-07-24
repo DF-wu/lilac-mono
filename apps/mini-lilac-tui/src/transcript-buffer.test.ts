@@ -29,12 +29,15 @@ describe("createBufferedChunkOutput", () => {
 
   it("publishes an active transcript after the frame delay", async () => {
     const publications: string[] = [];
+    const publication = Promise.withResolvers<void>();
     const buffer = createBufferedChunkOutput("child", [], (entries) => {
       publications.push(entries[0]?.text ?? "");
+      publication.resolve();
     });
 
     buffer.output.append({ kind: "assistant", tone: "normal", text: "working" });
-    await Bun.sleep(30);
+    expect(publications).toEqual([]);
+    await publication.promise;
 
     expect(publications).toEqual(["working"]);
     buffer.dispose();

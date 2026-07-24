@@ -225,6 +225,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for resolver");
+    // test-wait-justification: polls for resolver work performed by its independently scheduled bus consumer
     await Bun.sleep(5);
   }
 }
@@ -365,6 +366,7 @@ describe("WorkflowWaitResolver", () => {
     try {
       await crashed.start();
       const takeover = replacement.start();
+      // test-wait-justification: leaves replacement lease acquisition pending until the simulated lease becomes stale
       await Bun.sleep(15);
       now = 121;
       await takeover;

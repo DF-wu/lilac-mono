@@ -136,6 +136,7 @@ async function withCapturedStderr<T>(fn: (chunks: string[]) => Promise<T>): Prom
 
 async function waitForAsyncLogging(): Promise<void> {
   await Promise.resolve();
+  // test-wait-justification: drains the logger's timer-queued transport writes before assertions restore globals
   await new Promise((resolve) => setTimeout(resolve, 0));
   await Promise.resolve();
 }

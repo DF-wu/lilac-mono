@@ -343,6 +343,7 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
       })(),
     );
 
+    // test-wait-justification: lets stream consumption create the fake websocket before injecting its error event
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const socket = FakeWebSocket.instances[0];
@@ -1424,6 +1425,7 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     const text = await textPromise;
     expect(text).toContain("[DONE]");
 
+    // test-wait-justification: crosses the reusable websocket's real ten-millisecond idle-close deadline
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(socket?.readyState).toBe(FakeWebSocket.CLOSED);
     wsFetch.close();

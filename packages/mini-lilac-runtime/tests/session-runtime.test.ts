@@ -9,6 +9,7 @@ import type {
   MiniLilacTodoState,
   MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
+import { createToolResultArtifactStore } from "@stanley2058/lilac-tool-results";
 import { readUIMessageStream, type LanguageModel, type UIMessageChunk } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { getCodexAuthStoragePath } from "@stanley2058/lilac-utils";
@@ -180,6 +181,26 @@ function bashToolResult(command: string) {
   };
 }
 
+function grepToolResult(pattern: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        {
+          type: "tool-call" as const,
+          toolCallId: "oversized-grep",
+          toolName: "grep",
+          input: JSON.stringify({ pattern }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 const bashOutputDeltaTestSchema = z.object({
   type: z.literal("output-delta"),
   delta: z.string(),
@@ -263,15 +284,6 @@ function todoAndReadResult(
   };
 }
 
-async function within<T>(promise: Promise<T>, timeoutMs = 2_000): Promise<T> {
-  return Promise.race([
-    promise,
-    Bun.sleep(timeoutMs).then(() => {
-      throw new Error(`operation did not settle within ${timeoutMs}ms`);
-    }),
-  ]);
-}
-
 function userMessage(text: string): MiniLilacUIMessage {
   return { id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] };
 }
@@ -329,6 +341,13 @@ function config(): RuntimeConfig {
     },
   };
 }
+
+const IMMEDIATE_TRANSIENT_RETRY = {
+  enabled: true,
+  maxRetries: 3,
+  baseDelayMs: 0,
+  maxDelayMs: 0,
+} as const;
 
 async function temporaryRuntime(model: LanguageModel, profile = "reader") {
   const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-runtime-"));
@@ -510,6 +529,111 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("stores oversized grep output out of line before the next model turn and UI persistence", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-tool-overflow-"));
+    temporaryDirectories.push(directory);
+    const longLine = `needle:${"x".repeat(8_000)}\n`;
+    await writeFile(path.join(directory, "large.txt"), longLine);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["grep", "read_file"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    const model = new MockLanguageModelV4({
+      doStream: [grepToolResult("needle"), textResult("answer", "inspected")],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+      toolResultOutputConfig: {
+        maxInlineBytes: 512,
+        artifactTtlMs: 60_000,
+        maxArtifactBytesPerScope: 1024 * 1024,
+        maxArtifactBytes: 1024 * 1024,
+      },
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("find it"))).stream,
+    );
+
+    const secondPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(secondPrompt).toContain("[tool result overflow]");
+    expect(secondPrompt).toContain("tool-result://");
+    expect(secondPrompt).not.toContain("x".repeat(1_000));
+    expect(JSON.stringify(chunks)).not.toContain("x".repeat(1_000));
+    expect(chunks).toContainEqual(
+      expect.objectContaining({
+        type: "tool-output-error",
+        toolCallId: "oversized-grep",
+      }),
+    );
+
+    const transcript = service.store.getModelMessages(session.id);
+    const serializedTranscript = JSON.stringify(transcript);
+    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(serializedTranscript)?.[0];
+    if (uri === undefined) throw new Error("overflow artifact URI was not persisted");
+    expect(serializedTranscript).not.toContain("x".repeat(1_000));
+    const artifact = await artifacts.read(uri, session.id);
+    expect(artifact.ok).toBe(true);
+    if (artifact.ok) expect(artifact.content).toContain(longLine.trim());
+    service.close();
+  });
+
+  it("shares artifact authority between a root session and delegated children", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-artifacts-"));
+    temporaryDirectories.push(directory);
+    await writeFile(path.join(directory, "large.txt"), `needle:${"y".repeat(8_000)}\n`);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.child!.tools = ["grep"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    const model = new MockLanguageModelV4({
+      doStream: async (options) => {
+        const prompt = JSON.stringify(options.prompt);
+        const latestUser = JSON.stringify(
+          options.prompt.filter((message) => message.role === "user").at(-1),
+        );
+        if (prompt.includes("child complete")) return textResult("root", "root complete");
+        if (latestUser.includes("investigate") && prompt.includes("tool result overflow")) {
+          return textResult("child", "child complete");
+        }
+        if (latestUser.includes("investigate")) return grepToolResult("needle");
+        return delegateResult("sync", "investigate");
+      },
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+      toolResultOutputConfig: {
+        maxInlineBytes: 512,
+        artifactTtlMs: 60_000,
+        maxArtifactBytesPerScope: 1024 * 1024,
+        maxArtifactBytes: 1024 * 1024,
+      },
+    });
+    const root = await service.createSession({
+      cwd: directory,
+      model: "test/mock",
+      profile: "delegate",
+    });
+    await collect((await service.startPrompt(root.id, userMessage("delegate overflow"))).stream);
+
+    const child = service.store
+      .listSessions()
+      .find((session) => session.id.startsWith(`sub:${root.id}:named:`));
+    if (child === undefined) throw new Error("delegated child was not created");
+    const childTranscript = JSON.stringify(service.store.getModelMessages(child.id));
+    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(childTranscript)?.[0];
+    if (uri === undefined) throw new Error("child overflow artifact URI was not persisted");
+    expect((await artifacts.read(uri, root.id)).ok).toBe(true);
+    expect((await artifacts.read(uri, child.id)).ok).toBe(false);
+    service.close();
+  });
+
   it("accepts a loaded runtime config with its resolved configFile metadata", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-loaded-config-"));
     temporaryDirectories.push(directory);
@@ -551,7 +675,7 @@ describe("SessionService", () => {
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     const run = await service.startPrompt(session.id, userMessage("remain active"));
     const completion = collect(run.stream);
-    await within(startedRoot);
+    await startedRoot;
 
     expect(() => service.close()).toThrow("use shutdown()");
     expect(() => service.store.close()).toThrow("runtime task(s) are active");
@@ -559,8 +683,8 @@ describe("SessionService", () => {
     expect(() => service.startPrompt(session.id, userMessage("too late"))).toThrow(
       "not accepting admissions",
     );
-    await within(shutdown);
-    await within(completion);
+    await shutdown;
+    await completion;
 
     const reopened = new MiniLilacSqliteStore(databasePath);
     expect(reopened.getRun(run.runId).status).toBe("cancelled");
@@ -607,12 +731,12 @@ describe("SessionService", () => {
     });
     const root = await service.startPrompt(session.id, userMessage("launch deferred work"));
     const completion = collect(root.stream);
-    await within(startedChild);
+    await startedChild;
     const child = delegatedRuns(service, session.id)[0];
     if (child === undefined) throw new Error("deferred child did not start");
 
-    await within(service.shutdown({ graceMs: 1_000 }));
-    await within(completion);
+    await service.shutdown({ graceMs: 1_000 });
+    await completion;
 
     const reopened = new MiniLilacSqliteStore(databasePath);
     expect(reopened.getRun(root.runId).status).toBe("cancelled");
@@ -655,12 +779,13 @@ describe("SessionService", () => {
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     await collect((await service.startPrompt(session.id, userMessage("fallback title"))).stream);
-    await within(startedTitle);
+    await startedTitle;
 
     const shutdown = service.shutdown({ graceMs: 100 });
-    await within(abortedTitle);
-    await within(shutdown);
+    await abortedTitle;
+    await shutdown;
     releaseTitle();
+    // test-wait-justification: yields one event-loop turn so the deliberately cancellation-ignoring title provider can settle after shutdown.
     await Bun.sleep(0);
     const reopened = new MiniLilacSqliteStore(databasePath);
     expect(reopened.getSession(session.id).title).toBe("fallback title");
@@ -968,13 +1093,7 @@ describe("SessionService", () => {
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     const started = await service.startPrompt(session.id, userMessage("Build compact support"));
     await collect(started.stream);
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title !== "Durable compaction controls") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     expect(service.getSnapshot(session.id).title).toBe("Durable compaction controls");
     expect(titleModel.doStreamCalls).toHaveLength(1);
@@ -1018,13 +1137,7 @@ describe("SessionService", () => {
       ],
     });
     await collect(started.stream);
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title !== "Login error screenshot") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     const titlePrompt = JSON.stringify(titleModel.doStreamCalls[0]?.prompt);
     expect(titlePrompt).toContain('"type":"file"');
@@ -1089,23 +1202,9 @@ describe("SessionService", () => {
     await collect(
       (await service.startPrompt(session.id, userMessage("Keep this useful fallback"))).stream,
     );
-    let settledTitle: string | undefined;
-    await within(
-      (async () => {
-        for (;;) {
-          settledTitle = service.getSnapshot(session.id).title;
-          try {
-            service.close();
-            return;
-          } catch (error) {
-            if (!(error instanceof Error) || !error.message.includes("runtime work is active")) {
-              throw error;
-            }
-            await Bun.sleep(1);
-          }
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
+    const settledTitle = service.getSnapshot(session.id).title;
+    service.close();
 
     expect(titleModel.doStreamCalls).toHaveLength(1);
     expect(settledTitle).toBe("Keep this useful fallback");
@@ -1129,13 +1228,7 @@ describe("SessionService", () => {
     await collect(
       (await service.startPrompt(session.id, userMessage("Generate an emoji title"))).stream,
     );
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title === "Generate an emoji title") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     expect(service.getSnapshot(session.id).title).toBe("😀".repeat(25));
     service.close();
@@ -1160,13 +1253,7 @@ describe("SessionService", () => {
     await collect(
       (await service.startPrompt(session.id, userMessage("Build title support"))).stream,
     );
-    await within(
-      (async () => {
-        while (service.getSnapshot(session.id).title !== "Codex-compatible title") {
-          await Bun.sleep(1);
-        }
-      })(),
-    );
+    await service.waitForTrackedTasks();
 
     expect(titleModel.doStreamCalls[0]?.maxOutputTokens).toBeUndefined();
     expect(titleModel.doStreamCalls[0]?.providerOptions).toEqual({ openai: { store: false } });
@@ -1393,6 +1480,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("active bindings"));
+    // test-wait-justification: startPrompt returns before the actor enters the gated model call; this zero-delay yield observes the active-run state.
     await Bun.sleep(0);
 
     await expect(
@@ -1633,6 +1721,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("active"), "active-prompt");
+    // test-wait-justification: startPrompt returns before the actor enters the gated model call; this zero-delay yield observes the active-run state.
     await Bun.sleep(0);
 
     await expect(
@@ -1722,6 +1811,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       providers: loadedProviders(["oauth"]),
+      transientModelRetry: IMMEDIATE_TRANSIENT_RETRY,
     });
     const session = await service.createSession({
       cwd: directory,
@@ -1740,12 +1830,14 @@ describe("SessionService", () => {
     service.close();
   }, 10_000);
 
-  it("does not retry a Codex stream failure after output starts", async () => {
+  it("retries a Codex stream failure after partial output", async () => {
     let callCount = 0;
     const model = new MockLanguageModelV4({
       doStream: async () => {
         callCount += 1;
-        return streamErrorResult({ code: "server_is_overloaded" }, "partial answer");
+        return callCount === 1
+          ? streamErrorResult({ code: "server_is_overloaded" }, "partial answer")
+          : textResult("recovered", "recovered answer");
       },
     });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-codex-partial-error-"));
@@ -1755,6 +1847,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       providers: loadedProviders(["oauth"]),
+      transientModelRetry: IMMEDIATE_TRANSIENT_RETRY,
     });
     const session = await service.createSession({
       cwd: directory,
@@ -1764,12 +1857,72 @@ describe("SessionService", () => {
     });
 
     const chunks = await collect(
-      (await service.startPrompt(session.id, userMessage("do not duplicate output"))).stream,
+      (await service.startPrompt(session.id, userMessage("recover partial output"))).stream,
     );
 
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
     expect(JSON.stringify(chunks)).toContain("partial answer");
-    expect(service.getSnapshot(session.id).status).toBe("error");
+    expect(JSON.stringify(chunks)).toContain("recovered answer");
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).not.toContain(
+      "partial answer",
+    );
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).toContain(
+      "recovered answer",
+    );
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+    service.close();
+  });
+
+  it("marks an abandoned streamed tool draft failed before retrying", async () => {
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        if (callCount > 1) return textResult("recovered", "recovered answer");
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-input-start" as const,
+                id: "draft-read",
+                toolName: "read_file",
+                providerExecuted: false,
+              },
+              {
+                type: "tool-input-delta" as const,
+                id: "draft-read",
+                delta: '{"path":"unfinished',
+              },
+              { type: "error" as const, error: { code: "server_is_overloaded" } },
+            ],
+          }),
+        };
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-codex-tool-draft-retry-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      providers: loadedProviders(["oauth"]),
+      transientModelRetry: IMMEDIATE_TRANSIENT_RETRY,
+    });
+    const session = await service.createSession({
+      cwd: directory,
+      model: "oauth/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("recover tool draft"))).stream,
+    );
+
+    expect(callCount).toBe(2);
+    expect(JSON.stringify(chunks)).toContain("Model turn interrupted; tool was not executed");
+    expect(JSON.stringify(chunks)).toContain("recovered answer");
+    expect(service.getSnapshot(session.id).status).toBe("idle");
     service.close();
   });
 
@@ -1994,6 +2147,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("wait"));
+    // test-wait-justification: command serialization is exercised only after the gated model call has entered its asynchronous turn.
     await Bun.sleep(0);
 
     const controls = await Promise.allSettled([
@@ -2151,6 +2305,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const first = await service.startPrompt(session.id, userMessage("first"));
+    // test-wait-justification: cancellation must run after the first gated model turn has started, and no model-start hook is exposed.
     await Bun.sleep(0);
     await service.cancel({
       sessionId: session.id,
@@ -2161,6 +2316,7 @@ describe("SessionService", () => {
     await collect(first.stream);
 
     const second = await service.startPrompt(session.id, userMessage("second"));
+    // test-wait-justification: cancellation must run after the second gated model turn has started, and no model-start hook is exposed.
     await Bun.sleep(0);
     await expect(
       service.cancel({
@@ -2201,6 +2357,7 @@ describe("SessionService", () => {
     const first = await service.startPrompt(session.id, userMessage("first"));
     await collect(first.stream);
     const second = await service.startPrompt(session.id, userMessage("second"));
+    // test-wait-justification: the stale-control assertion requires the newer gated run to have entered its asynchronous model turn.
     await Bun.sleep(0);
 
     await expect(
@@ -2283,6 +2440,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("wait"));
+    // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
     const saveCommandResult = service.store.saveCommandResult.bind(service.store);
     service.store.saveCommandResult = () => {
@@ -2324,6 +2482,7 @@ describe("SessionService", () => {
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("wait"));
+    // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
     const markCommandSideEffectStarted = service.store.markCommandSideEffectStarted.bind(
       service.store,
@@ -2462,7 +2621,7 @@ describe("SessionService", () => {
           clientCommandId: `${mode}-interrupt`,
         }),
       ).toMatchObject({ status: "interrupted" });
-      await within(completion);
+      await completion;
 
       expect(service.store.getRun(started.runId).status).toBe("completed");
       expect(delegatedRuns(service, session.id)[0]?.status).toBe("cancelled");
@@ -2584,15 +2743,15 @@ describe("SessionService", () => {
     });
     const first = await service.startPrompt(firstSession.id, userMessage("first root"));
     const firstCompletion = collect(first.stream);
-    await within(childStart);
+    await childStart;
 
     const second = await service.startPrompt(secondSession.id, userMessage("second root"));
-    await within(collect(second.stream));
+    await collect(second.stream);
     expect(delegatedRuns(service, secondSession.id)).toEqual([]);
     expect(JSON.stringify(model.doStreamCalls)).toContain("maximum concurrent subagents reached");
 
     releaseChild();
-    await within(firstCompletion);
+    await firstCompletion;
     expect(delegatedRuns(service, firstSession.id)[0]?.status).toBe("completed");
     service.close();
   });
@@ -2622,7 +2781,7 @@ describe("SessionService", () => {
     });
 
     const started = await service.startPrompt(session.id, userMessage("run a silent tool"));
-    const chunks = await within(collect(started.stream));
+    const chunks = await collect(started.stream);
 
     expect(model.doStreamCalls).toHaveLength(1);
     expect(JSON.stringify(chunks)).toContain(
@@ -2641,7 +2800,7 @@ describe("SessionService", () => {
     ).toBe(true);
 
     const followUp = await service.startPrompt(session.id, userMessage("continue after timeout"));
-    await within(collect(followUp.stream));
+    await collect(followUp.stream);
     expect(model.doStreamCalls).toHaveLength(2);
     expect(service.getSnapshot(session.id).status).toBe("idle");
     expect(JSON.stringify(service.getMessages(session.id))).toContain("follow-up works");
@@ -2713,6 +2872,51 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("keeps bounded Bash output inline and retains the complete output as an artifact", async () => {
+    const runtimeConfig = config();
+    const readerProfile = runtimeConfig.agent.profiles.reader;
+    if (!readerProfile) throw new Error("reader profile missing");
+    readerProfile.tools = ["bash", "read_file"];
+    readerProfile.execution = true;
+    readerProfile.workspaceWrites = true;
+    const model = new MockLanguageModelV4({
+      doStream: [
+        bashToolResult("printf 'start-'; printf 'z%.0s' {1..50000}; printf -- '-end'"),
+        textResult("answer", "done"),
+      ],
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-bash-artifact-"));
+    temporaryDirectories.push(directory);
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+    });
+    const session = await service.createSession({
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+    });
+    await collect((await service.startPrompt(session.id, userMessage("run large command"))).stream);
+
+    const secondPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(secondPrompt)?.[0];
+    if (uri === undefined) throw new Error("Bash artifact URI was not sent to the model");
+    expect(secondPrompt).toContain("middle output omitted");
+    expect(secondPrompt).toContain('"completeOutputRetained":true');
+    const artifact = await artifacts.read(uri, session.id);
+    expect(artifact.ok).toBe(true);
+    if (artifact.ok) {
+      expect(artifact.content).toContain("start-");
+      expect(artifact.content).toContain("-end");
+      expect(artifact.content).toContain("z".repeat(40_000));
+    }
+    service.close();
+  });
+
   for (const mode of ["sync", "deferred"] as const) {
     it(`cancels an inactive ${mode} child after the configured idle timeout`, async () => {
       const runtimeConfig = config();
@@ -2755,7 +2959,7 @@ describe("SessionService", () => {
         profile: "delegate",
       });
       const started = await service.startPrompt(session.id, userMessage("delegate idle child"));
-      await within(collect(started.stream));
+      await collect(started.stream);
 
       expect(delegatedRuns(service, session.id)[0]?.status).toBe("error");
       expect(service.store.getRun(started.runId).status).toBe("completed");
@@ -2805,7 +3009,7 @@ describe("SessionService", () => {
       profile: "delegate",
     });
     const started = await service.startPrompt(session.id, userMessage("delegate active child"));
-    await within(collect(started.stream));
+    await collect(started.stream);
 
     expect(delegatedRuns(service, session.id)[0]?.status).toBe("completed");
     service.close();
@@ -2850,7 +3054,7 @@ describe("SessionService", () => {
     };
 
     const started = await service.startPrompt(session.id, userMessage("trigger failure"));
-    await within(collect(started.stream));
+    await collect(started.stream);
 
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
@@ -3046,10 +3250,10 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("launch children"));
     const completion = collect(started.stream);
 
-    await within(parentProgress);
+    await parentProgress;
     expect(service.store.getRun(started.runId).status).toBe("active");
     releaseSecondChild();
-    await within(completion);
+    await completion;
 
     expect(delegatedRuns(service, session.id).map((run) => run.status)).toEqual([
       "completed",
@@ -3078,6 +3282,7 @@ describe("SessionService", () => {
     const { directory, service, session } = await temporaryRuntime(model);
     await Bun.write(path.join(directory, "visible.txt"), "visible tool output");
     const started = await service.startPrompt(session.id, userMessage("start"));
+    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
     await Bun.sleep(0);
     const firstSteer = {
       id: "steer-one-message",
@@ -3109,9 +3314,20 @@ describe("SessionService", () => {
     expect(service.getSnapshot(session.id).queuedSteeringCount).toBe(2);
 
     release();
-    await collect(started.stream);
+    const chunks = await collect(started.stream);
 
     expect(model.doStreamCalls).toHaveLength(2);
+    expect(
+      chunks.filter((chunk) => chunk.type === "data-steeringCommitted").map((chunk) => chunk.data),
+    ).toEqual([firstSteer, secondSteer]);
+    const finalCommitIndex = chunks.findLastIndex(
+      (chunk) => chunk.type === "data-steeringCommitted",
+    );
+    expect(
+      chunks
+        .slice(finalCommitIndex + 1)
+        .some((chunk) => chunk.type === "data-session" && chunk.data.queuedSteeringCount === 0),
+    ).toBe(true);
     const secondPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
     expect(secondPrompt).toContain("first steering");
     expect(secondPrompt).toContain("second steering");
@@ -3192,6 +3408,7 @@ describe("SessionService", () => {
     const secondSteer = steeringMessage("second separate steer");
     const started = await service.startPrompt(session.id, rootUser);
     const completion = collect(started.stream);
+    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
     await Bun.sleep(0);
 
     await service.steer({
@@ -3219,14 +3436,11 @@ describe("SessionService", () => {
       data: firstSteer,
     });
     releaseFirst();
-    await within(secondStart);
-    await within(
-      (async () => {
-        while (!service.getMessages(session.id).some((message) => message.id === firstSteer.id)) {
-          await Bun.sleep(0);
-        }
-      })(),
-    );
+    await secondStart;
+    while (!service.getMessages(session.id).some((message) => message.id === firstSteer.id)) {
+      // test-wait-justification: canonical message publication has no callback; zero-delay yields observe the already-started persistence transition.
+      await Bun.sleep(0);
+    }
     const activeCanonicalUi = service.getMessages(session.id);
     expect(activeCanonicalUi).toEqual([rootUser, firstSteer]);
     expect(JSON.stringify(activeCanonicalUi)).not.toContain("before first steer");
@@ -3267,7 +3481,7 @@ describe("SessionService", () => {
       message: secondSteer,
     });
     releaseSecond();
-    await within(completion);
+    await completion;
 
     expect(model.doStreamCalls).toHaveLength(3);
     const canonicalUi = service.getMessages(session.id);
@@ -3343,6 +3557,7 @@ describe("SessionService", () => {
       profile: "reader",
     });
     const started = await service.startPrompt(session.id, userMessage("root"));
+    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
     await Bun.sleep(0);
     const firstSteer = steeringMessage("first merged steer");
     const secondSteer = steeringMessage("second merged steer");
@@ -4192,11 +4407,12 @@ describe("SessionService", () => {
       chunks.push(next.value);
     }
 
+    const replacement = steeringMessage("replace direction");
     await service.steer({
       sessionId: session.id,
       runId: started.runId,
       clientCommandId: "replacement-steer",
-      message: steeringMessage("replace direction"),
+      message: replacement,
     });
     const interrupted = await service.interruptQueuedSteering({
       sessionId: session.id,
@@ -4215,6 +4431,14 @@ describe("SessionService", () => {
         (chunk) => chunk.type === "data-transcriptReset" && chunk.data.reason === "interrupt",
       ),
     ).toBe(true);
+    const resetIndex = chunks.findIndex((chunk) => chunk.type === "data-transcriptReset");
+    const commitIndex = chunks.findIndex((chunk) => chunk.type === "data-steeringCommitted");
+    expect(commitIndex).toBeGreaterThan(resetIndex);
+    expect(chunks[commitIndex]).toEqual({
+      type: "data-steeringCommitted",
+      id: replacement.id,
+      data: replacement,
+    });
     const persisted = JSON.stringify(service.getMessages(session.id));
     expect(persisted).toContain("canonical final");
     expect(persisted).not.toContain("aborted partial");

@@ -311,6 +311,49 @@ describe("AiSdkPiAgent model spec tracking", () => {
     expect(part.input).toEqual({ path: "note.txt" });
   });
 
+  it("does not normalize constructor history or replacement input", () => {
+    const constructorToolMessage: ToolModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "constructor-call",
+          toolName: "history_tool",
+          output: { type: "text", value: "constructor output" },
+        },
+      ],
+    };
+    const replacementToolMessage: ToolModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "replacement-call",
+          toolName: "history_tool",
+          output: { type: "text", value: "replacement output" },
+        },
+      ],
+    };
+    let normalizations = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      messages: [constructorToolMessage],
+      normalizeToolResultOutput: () => {
+        normalizations += 1;
+        return { type: "text", value: "normalized" };
+      },
+    });
+
+    expect(agent.state.messages).toEqual([constructorToolMessage]);
+    expect(normalizations).toBe(0);
+
+    agent.replaceMessages([replacementToolMessage]);
+
+    expect(agent.state.messages).toEqual([replacementToolMessage]);
+    expect(normalizations).toBe(0);
+  });
+
   it("continues after the SDK produces a tool result for invalid input", async () => {
     const model = new MockLanguageModelV4({
       doStream: [
@@ -476,7 +519,7 @@ describe("AiSdkPiAgent model spec tracking", () => {
     const output =
       toolMessage?.content[0]?.type === "tool-result" ? toolMessage.content[0].output : undefined;
 
-    expect(output).toEqual({ type: "text", value: "[tool result is not JSON-serializable]" });
+    expect(output).toEqual({ type: "error-text", value: "[tool result is not JSON-serializable]" });
   });
 
   it("executes parsed tool calls when the provider reports finish reason other", async () => {
@@ -699,6 +742,121 @@ describe("AiSdkPiAgent provider stream parts", () => {
       ["reasoning_file", "reasoning-file"],
     ]);
     expect(updates.every((update) => update.providerMetadata === providerMetadata)).toBe(true);
+  });
+
+  it("normalizes response tool messages before events and the next model call", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "provider-1",
+                toolName: "provider_one",
+                input: "{}",
+              },
+              {
+                type: "tool-call",
+                toolCallId: "provider-2",
+                toolName: "provider_two",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const normalizationContexts: Array<{
+      toolCallId: string;
+      toolName: string;
+      bypassGenericOutputNormalizer?: boolean;
+    }> = [];
+    const toolEvents: ToolModelMessage[] = [];
+    let executions = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        provider_one: tool({
+          inputSchema: jsonSchema(
+            { type: "object", additionalProperties: false },
+            {
+              validate: () => ({ success: false, error: new Error("raw provider one") }),
+            },
+          ),
+          execute: () => {
+            executions += 1;
+            return "must not execute";
+          },
+        }),
+        provider_two: tool({
+          inputSchema: jsonSchema(
+            { type: "object", additionalProperties: false },
+            {
+              validate: () => ({ success: false, error: new Error("raw provider two") }),
+            },
+          ),
+          execute: () => {
+            executions += 1;
+            return "must not execute";
+          },
+        }),
+      },
+      genericOutputNormalizerBypassTools: new Set(["provider_one", "provider_two"]),
+      normalizeToolResultOutput: (_output, context) => {
+        normalizationContexts.push(context);
+        return { type: "text", value: `normalized:${context.toolCallId}` };
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "tool") {
+        toolEvents.push(event.message);
+      }
+    });
+
+    await agent.prompt("use provider outputs");
+
+    expect(executions).toBe(0);
+    expect(normalizationContexts).toEqual([
+      { toolCallId: "provider-1", toolName: "provider_one" },
+      { toolCallId: "provider-2", toolName: "provider_two" },
+    ]);
+    expect(toolEvents).toHaveLength(1);
+    expect(
+      toolEvents[0]?.content.map((part) => (part.type === "tool-result" ? part.output : part)),
+    ).toEqual([
+      { type: "text", value: "normalized:provider-1" },
+      { type: "text", value: "normalized:provider-2" },
+    ]);
+    expect(
+      agent.state.messages.find(
+        (message) =>
+          message.role === "tool" &&
+          message.content.some(
+            (part) => part.type === "tool-result" && part.toolCallId === "provider-1",
+          ),
+      ),
+    ).toEqual(toolEvents[0]);
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("normalized:provider-1");
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("normalized:provider-2");
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain("raw provider one");
   });
 });
 
@@ -1000,6 +1158,45 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     }
   });
 
+  it("preserves a manual abort when the awaited turn error handler rejects", async () => {
+    const handlerEntered = deferred();
+    const handlerAborted = deferred();
+    const terminalEvents: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      transformMessages: () => {
+        throw new Error("transient model error");
+      },
+      turnErrorHandler: async (_error, context) => {
+        handlerEntered.resolve();
+        if (context.abortSignal?.aborted) return "fail" as const;
+        await new Promise<void>((resolve) => {
+          context.abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        handlerAborted.resolve();
+        throw new Error("handler aborted");
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "turn_abort") {
+        terminalEvents.push(`${event.type}:${event.reason}`);
+      } else if (event.type === "agent_end") {
+        terminalEvents.push(event.type);
+      }
+    });
+
+    const run = agent.prompt("abort during backoff");
+    await handlerEntered.promise;
+    agent.abort();
+    await handlerAborted.promise;
+    await run;
+
+    expect(terminalEvents).toEqual(["turn_abort:manual", "agent_end"]);
+    expect(agent.state.error).toBeUndefined();
+    expect(agent.state.messages).toEqual([{ role: "user", content: "abort during backoff" }]);
+  });
+
   it("lets cancellation win when the awaited turn error handler rejects", async () => {
     const handlerEntered = deferred();
     const releaseHandler = deferred();
@@ -1052,6 +1249,248 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
 
     await expect(agent.prompt("fail normally")).rejects.toBe(handlerError);
     expect(agent.state.error).toBe(handlerError.message);
+  });
+
+  it("replays a failed model turn after partial output without committing the failed draft", async () => {
+    const streamError = new Error("WebSocket closed before a terminal response event");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "partial" },
+              { type: "text-delta", id: "partial", delta: "partial answer" },
+              { type: "error", error: streamError },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "recovered" },
+              { type: "text-delta", id: "recovered", delta: "recovered answer" },
+              { type: "text-end", id: "recovered" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const retries: boolean[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      turnErrorHandler: (_error, context) => (context.retrySafety.canRetry ? "retry" : "fail"),
+    });
+    agent.subscribe((event) => {
+      if (event.type === "turn_retry") retries.push(event.hadPartialOutput);
+    });
+
+    await agent.prompt("answer once");
+
+    expect(model.doStreamCalls).toHaveLength(2);
+    expect(model.doStreamCalls[1]?.prompt).toEqual(model.doStreamCalls[0]?.prompt);
+    expect(retries).toEqual([true]);
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "answer once" },
+      { role: "assistant", content: [{ type: "text", text: "recovered answer" }] },
+    ]);
+  });
+
+  it("does not replay after provider-executed tool activity", async () => {
+    const streamError = new Error("WebSocket closed before a terminal response event");
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "provider-call",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            { type: "error", error: streamError },
+          ],
+        }),
+      },
+    });
+    const retryReasons: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      turnErrorHandler: async (_error, context) => {
+        if (!context.retrySafety.canRetry) retryReasons.push(context.retrySafety.reason);
+        return "retry" as const;
+      },
+    });
+
+    await expect(agent.prompt("search")).rejects.toBe(streamError);
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(retryReasons).toEqual(["provider-executed-tool"]);
+    expect(agent.state.messages).toEqual([{ role: "user", content: "search" }]);
+  });
+
+  it("does not replay after a provider-executed tool result", async () => {
+    const streamError = new Error("WebSocket closed before a terminal response event");
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-result",
+              toolCallId: "provider-call",
+              toolName: "provider_search",
+              input: {},
+              result: "result",
+              providerExecuted: true as const,
+            },
+            { type: "error", error: streamError },
+          ],
+        }),
+      },
+    });
+    const retryReasons: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      turnErrorHandler: async (_error, context) => {
+        if (!context.retrySafety.canRetry) retryReasons.push(context.retrySafety.reason);
+        return "retry" as const;
+      },
+    });
+
+    await expect(agent.prompt("search")).rejects.toBe(streamError);
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(retryReasons).toEqual(["provider-executed-tool"]);
+  });
+
+  it("replays a local tool draft and executes only the completed retry", async () => {
+    const streamError = new Error("WebSocket closed before a terminal response event");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "draft-call",
+                toolName: "lookup",
+                input: "{}",
+              },
+              { type: "error", error: streamError },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "completed-call",
+                toolName: "lookup",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "answer" },
+              { type: "text-delta", id: "answer", delta: "done" },
+              { type: "text-end", id: "answer" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    let executions = 0;
+    const abandonedToolCalls: string[][] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => {
+            executions += 1;
+            return "result";
+          },
+        }),
+      },
+      turnErrorHandler: (_error, context) => (context.retrySafety.canRetry ? "retry" : "fail"),
+    });
+    agent.subscribe((event) => {
+      if (event.type === "turn_retry") {
+        abandonedToolCalls.push(event.abandonedToolCallIds);
+      }
+    });
+
+    await agent.prompt("look it up");
+
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(executions).toBe(1);
+    expect(abandonedToolCalls).toEqual([["draft-call"]]);
+    expect(JSON.stringify(agent.state.messages)).not.toContain("draft-call");
+    expect(JSON.stringify(agent.state.messages)).toContain("completed-call");
+  });
+
+  it("does not replay errors after the model turn commits", async () => {
+    const boundaryError = new Error("boundary network timeout");
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "answer" },
+            { type: "text-delta", id: "answer", delta: "committed" },
+            { type: "text-end", id: "answer" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const retryReasons: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      turnBoundaryHandler: () => {
+        throw boundaryError;
+      },
+      turnErrorHandler: async (_error, context) => {
+        if (!context.retrySafety.canRetry) retryReasons.push(context.retrySafety.reason);
+        return "retry" as const;
+      },
+    });
+
+    await expect(agent.prompt("finish")).rejects.toBe(boundaryError);
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(retryReasons).toEqual(["post-model-phase"]);
+    expect(agent.state.messages.at(-1)).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "committed" }],
+    });
   });
 
   it("stops before approval when cancellation is requested by a tool start subscriber", async () => {
@@ -1331,6 +1770,184 @@ describe("AiSdkPiAgent turn boundaries", () => {
     ).toBe(true);
   });
 
+  it("normalizes boundary tool messages before insertion, events, and the next model call", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const historyToolMessage: ToolModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "history-call",
+          toolName: "history_tool",
+          output: { type: "text", value: "existing history" },
+        },
+      ],
+    };
+    const boundaryToolMessage: ToolModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "boundary-1",
+          toolName: "boundary_one",
+          output: { type: "text", value: "raw boundary one" },
+        },
+        {
+          type: "tool-approval-response",
+          approvalId: "boundary-approval",
+          approved: true,
+          providerExecuted: true,
+        },
+        {
+          type: "tool-result",
+          toolCallId: "boundary-2",
+          toolName: "boundary_two",
+          output: { type: "text", value: "raw boundary two" },
+        },
+      ],
+    };
+    const normalizationContexts: Array<{
+      toolCallId: string;
+      toolName: string;
+      bypassGenericOutputNormalizer?: boolean;
+    }> = [];
+    const toolEvents: ToolModelMessage[] = [];
+    let boundaries = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "history-call",
+              toolName: "history_tool",
+              input: {},
+            },
+          ],
+        },
+        historyToolMessage,
+      ],
+      genericOutputNormalizerBypassTools: new Set(["history_tool", "boundary_one", "boundary_two"]),
+      normalizeToolResultOutput: (_output, context) => {
+        normalizationContexts.push(context);
+        return { type: "text", value: `normalized:${context.toolCallId}` };
+      },
+      turnBoundaryHandler: () => {
+        boundaries += 1;
+        if (boundaries !== 1) return {};
+        return {
+          append: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool-call",
+                  toolCallId: "boundary-1",
+                  toolName: "boundary_one",
+                  input: {},
+                  providerExecuted: true,
+                },
+                {
+                  type: "tool-approval-request",
+                  approvalId: "boundary-approval",
+                  toolCallId: "boundary-1",
+                },
+                {
+                  type: "tool-call",
+                  toolCallId: "boundary-2",
+                  toolName: "boundary_two",
+                  input: {},
+                  providerExecuted: true,
+                },
+              ],
+            },
+            boundaryToolMessage,
+          ],
+        };
+      },
+    });
+    agent.subscribe((event) => {
+      if (
+        event.type === "message_end" &&
+        event.message.role === "tool" &&
+        event.message.content.some(
+          (part) => part.type === "tool-result" && part.toolCallId === "boundary-1",
+        )
+      ) {
+        toolEvents.push(event.message);
+      }
+    });
+
+    await agent.prompt("use boundary outputs");
+
+    expect(normalizationContexts).toEqual([
+      { toolCallId: "boundary-1", toolName: "boundary_one" },
+      { toolCallId: "boundary-2", toolName: "boundary_two" },
+    ]);
+    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents[0]?.content).toEqual([
+      {
+        type: "tool-result",
+        toolCallId: "boundary-1",
+        toolName: "boundary_one",
+        output: { type: "text", value: "normalized:boundary-1" },
+      },
+      {
+        type: "tool-approval-response",
+        approvalId: "boundary-approval",
+        approved: true,
+        providerExecuted: true,
+      },
+      {
+        type: "tool-result",
+        toolCallId: "boundary-2",
+        toolName: "boundary_two",
+        output: { type: "text", value: "normalized:boundary-2" },
+      },
+    ]);
+    expect(agent.state.messages[1]).toEqual(historyToolMessage);
+    expect(
+      agent.state.messages.find(
+        (message) =>
+          message.role === "tool" &&
+          message.content.some(
+            (part) => part.type === "tool-result" && part.toolCallId === "boundary-1",
+          ),
+      ),
+    ).toEqual(toolEvents[0]);
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("normalized:boundary-1");
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("normalized:boundary-2");
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain("raw boundary one");
+  });
+
   it("forces another model turn when a stop boundary injects a result", async () => {
     const model = new MockLanguageModelV4({
       doStream: [
@@ -1421,6 +2038,7 @@ describe("AiSdkPiAgent turn boundaries", () => {
           description: "read",
           inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
           execute: async () => {
+            // test-wait-justification: keeps one tool active to verify parallel tool completion boundary accounting
             await Bun.sleep(5);
             return "read";
           },

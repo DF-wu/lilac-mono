@@ -531,11 +531,14 @@ describe("agent run activity", () => {
     });
 
     watchdog.start();
+    // test-wait-justification: advances part of the real idle deadline before resetting the watchdog
     await Bun.sleep(30);
     watchdog.reset();
 
+    // test-wait-justification: keeps the watched operation active across the reset idle window
     await expect(watchdog.waitFor(Bun.sleep(30).then(() => "resolved"))).resolves.toBe("resolved");
     watchdog.stop();
+    // test-wait-justification: verifies no stale watchdog deadline fires after the watched operation completes
     await Bun.sleep(20);
     expect(timeoutCount).toBe(0);
   });
@@ -551,6 +554,7 @@ describe("agent run activity", () => {
 
     watchdog.start();
     watchdog.pause();
+    // test-wait-justification: crosses the real idle deadline while watchdog timing is paused
     await Bun.sleep(30);
 
     expect(timeoutCount).toBe(0);
@@ -564,6 +568,7 @@ describe("agent run activity", () => {
     });
 
     timer.reset();
+    // test-wait-justification: verifies a very large real idle deadline is not clamped to an immediate timer
     await Bun.sleep(10);
 
     expect(timeoutCount).toBe(0);
@@ -592,8 +597,10 @@ describe("agent run activity", () => {
 
     publishActivity("model");
     publishActivity("tool");
+    // test-wait-justification: crosses the activity publisher's real throttle interval before the next publish
     await Bun.sleep(30);
     publishActivity("subagent");
+    // test-wait-justification: drains the throttled activity publication through the in-memory bus subscriber
     await Bun.sleep(0);
 
     expect(sources).toEqual(["model", "subagent"]);
@@ -2169,6 +2176,11 @@ describe("transient model retry", () => {
       }),
     ).toBe(true);
     expect(isRetryableTransientModelError({ code: "ECONNRESET" })).toBe(true);
+    expect(
+      isRetryableTransientModelError(
+        new Error("WebSocket closed before a terminal response event"),
+      ),
+    ).toBe(true);
   });
 
   it("does not classify context overflow or exhausted AI SDK retries", () => {
@@ -2202,18 +2214,18 @@ describe("transient model retry", () => {
       requestId: "request-1",
       sessionId: "session-1",
       modelSpec: "codex/gpt-5.5",
-      hasStartedOutput: () => false,
     });
+    const context = { retrySafety: { canRetry: true } as const };
 
-    await expect(controller.handler(error, {})).resolves.toBe("retry");
-    await expect(controller.handler(error, {})).resolves.toBe("retry");
-    await expect(controller.handler(error, {})).resolves.toBe("fail");
+    await expect(controller.handler(error, context)).resolves.toBe("retry");
+    await expect(controller.handler(error, context)).resolves.toBe("retry");
+    await expect(controller.handler(error, context)).resolves.toBe("fail");
 
     controller.reset();
-    await expect(controller.handler(error, {})).resolves.toBe("retry");
+    await expect(controller.handler(error, context)).resolves.toBe("retry");
   });
 
-  it("does not retry after assistant output has started", async () => {
+  it("does not retry when the transcript boundary is unsafe", async () => {
     const logger = createLogger({ module: "bus-agent-runner-test" });
     const controller = createTransientModelRetryController({
       retry,
@@ -2221,11 +2233,13 @@ describe("transient model retry", () => {
       requestId: "request-1",
       sessionId: "session-1",
       modelSpec: "codex/gpt-5.5",
-      hasStartedOutput: () => true,
     });
 
     await expect(
-      controller.handler({ statusCode: 503, message: "Service unavailable" }, {}),
+      controller.handler(
+        { statusCode: 503, message: "Service unavailable" },
+        { retrySafety: { canRetry: false, reason: "post-model-phase" } },
+      ),
     ).resolves.toBe("fail");
   });
 });
