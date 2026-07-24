@@ -64,10 +64,12 @@ superseded and always requires its configured key. Do not put real credentials i
 Each provider in `providers.yaml` uses `type` as its provider discriminator; API-key entries use the
 exact shape `{ "type": "api-key", "key": "..." }`.
 
-`workspaceWrites: false` also disables Bash because Bash is trusted, unrestricted process
-execution and can write outside filesystem-tool guardrails. This runtime does not provide a
-sandbox. Filesystem tools deny the configured provider/auth files and common credential paths;
-Bash receives an environment with the HTTP auth-token variable removed.
+`workspaceWrites: false` also disables Bash because allowed commands have unrestricted process
+authority and can write outside filesystem-tool guardrails. Bash safety blocks known destructive
+operations, expansion-sensitive recursive deletion, and protected paths by default, but it is not
+a sandbox. Set `dangerouslyAllow: true` only to intentionally bypass every Bash guardrail for one
+call, including credential and state-path protections. Bash receives an environment with the HTTP
+auth-token variable removed.
 
 Model-facing tool results are limited to 40 KiB. When a non-Bash tool completes with a larger
 materialized result, Mini Lilac stores the complete sanitized result under the transient,

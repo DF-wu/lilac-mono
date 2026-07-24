@@ -1,0 +1,24 @@
+{
+  "name": "@stanley2058/lilac-bash-safety",
+  "version": "0.0.0",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "just-bash": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

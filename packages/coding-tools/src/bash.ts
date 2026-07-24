@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
+import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { tool, type ToolSet } from "ai";
 
@@ -27,7 +28,7 @@ const DEFAULT_OUTPUT_CAP_BYTES = 40 * 1024;
 const HARD_KILL_DELAY_MS = 500;
 
 export type BashExecutionError =
-  | { type: "blocked"; reason: string }
+  | { type: "blocked"; reason: string; segment?: string }
   | { type: "aborted"; signal: "SIGTERM" }
   | { type: "timeout"; timeoutMs: number; signal: "SIGTERM" }
   | { type: "exception"; message: string };
@@ -378,6 +379,7 @@ export async function executeLocalBash(
     1,
     Math.floor(options.maxOutputBytes ?? DEFAULT_OUTPUT_CAP_BYTES),
   );
+  const analysis = input.dangerouslyAllow ? null : analyzeBashCommand(input.command, { cwd });
   const blockedPath = input.dangerouslyAllow
     ? undefined
     : protectedPathInCommand(input.command, options.denyPaths);
@@ -390,15 +392,20 @@ export async function executeLocalBash(
     }
   }
 
-  if (blockedPath || cwdBlockReason) {
-    const reason = cwdBlockReason ?? `Access denied: '${blockedPath}' is protected`;
+  if (analysis || blockedPath || cwdBlockReason) {
+    const reason =
+      analysis?.reason ?? cwdBlockReason ?? `Access denied: '${blockedPath}' is protected`;
     return {
       stdout: "",
       stderr: reason,
       exitCode: -1,
       stdoutTruncated: false,
       stderrTruncated: false,
-      executionError: { type: "blocked", reason },
+      executionError: {
+        type: "blocked",
+        reason,
+        ...(analysis ? { segment: analysis.segment } : {}),
+      },
     };
   }
 
@@ -688,7 +695,7 @@ export function createBashTool(params: {
   return {
     bash: tool({
       description:
-        "Execute a command in local bash from the caller-supplied cwd. Output is capped with a head/tail preview and interactive stdin is disabled. When complete truncated output is retained, truncation.artifactUri can be paged with read_file using the returned nextStart. Path guardrails are best-effort and do not sandbox command contents.",
+        "Execute a command in local bash from the caller-supplied cwd. Output is capped with a head/tail preview and interactive stdin is disabled. When complete truncated output is retained, truncation.artifactUri can be paged with read_file using the returned nextStart. Bash safety blocks known destructive operations and protected paths but is not a sandbox. Set dangerouslyAllow=true only to intentionally bypass every Bash guardrail for one call.",
       inputSchema: bashInputSchema,
       execute: (input, { abortSignal, toolCallId }) => {
         const options = {

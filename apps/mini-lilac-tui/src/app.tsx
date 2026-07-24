@@ -180,13 +180,6 @@ function truncateStart(value: string, width: number): string {
 
 function entryPrefix(entry: TranscriptEntry): string {
   if (entry.kind === "compaction") return "COMPACTION / ";
-  if (entry.kind === "shell" || entry.kind === "exploration" || entry.kind === "edit") return "";
-  if (entry.kind === "tool") {
-    if (entry.running === true) return "● ";
-    if (entry.tone === "warning") return "! ";
-    if (entry.tone === "danger") return "× ";
-    return "✓ ";
-  }
   if (entry.kind === "reasoning") return "* ";
   if (entry.kind === "error") return "! ";
   if (entry.kind === "status") return "- ";
@@ -196,6 +189,28 @@ function entryPrefix(entry: TranscriptEntry): string {
 
 function shellPreviewRows(narrow: boolean): number {
   return narrow ? 4 : 8;
+}
+
+function isToolTranscriptEntry(entry: TranscriptEntry): boolean {
+  return (
+    entry.kind === "tool" ||
+    entry.kind === "shell" ||
+    entry.kind === "exploration" ||
+    entry.kind === "edit" ||
+    entry.kind === "subagent"
+  );
+}
+
+function ToolDisclosure(props: {
+  readonly expanded: boolean;
+  readonly narrow: boolean;
+  readonly colors: ThemeColors;
+}) {
+  return (
+    <text flexShrink={0} paddingLeft={1} fg={props.colors.muted} selectable={false}>
+      {props.narrow ? (props.expanded ? "−" : "+") : props.expanded ? "hide" : "details"}
+    </text>
+  );
 }
 
 export function formatRunDuration(durationMs: number): string {
@@ -210,8 +225,6 @@ export function formatRunDuration(durationMs: number): string {
 
 function ShellView(props: {
   readonly shell: ShellTranscript;
-  readonly running: boolean;
-  readonly tone: TranscriptTone;
   readonly expanded: boolean;
   readonly narrow: boolean;
   readonly width: number;
@@ -225,18 +238,6 @@ function ShellView(props: {
   const preview = createMemo(() =>
     shellTranscriptPreview(props.shell, props.expanded, previewRows(), characterLimit()),
   );
-  const statusColor = createMemo(() => {
-    if (props.running) return props.colors.accent;
-    if (props.tone === "danger") return props.colors.danger;
-    if (props.tone === "warning") return props.colors.warning;
-    return props.colors.success;
-  });
-  const statusGlyph = createMemo(() => {
-    if (props.running) return "●";
-    if (props.tone === "danger") return "×";
-    if (props.tone === "warning") return "!";
-    return "✓";
-  });
 
   return (
     <box width="100%">
@@ -246,7 +247,6 @@ function ShellView(props: {
         </text>
       </Show>
       <box width="100%" flexDirection="row" paddingTop={props.shell.cwd === undefined ? 0 : 1}>
-        <text flexShrink={0} fg={statusColor()}>{`${statusGlyph()} `}</text>
         <text flexGrow={1} minWidth={0} wrapMode="word" fg={props.colors.text} selectable={true}>
           {`$ ${preview().command}`}
         </text>
@@ -288,9 +288,6 @@ function ExplorationView(props: {
   return (
     <box width="100%">
       <box width="100%" flexDirection="row">
-        <text flexShrink={0} fg={props.running ? props.colors.accent : props.colors.muted}>
-          {props.running ? "◆ " : "◇ "}
-        </text>
         <text flexShrink={0} fg={props.colors.text}>
           {props.running ? "Exploring" : "Explored"}
         </text>
@@ -300,10 +297,13 @@ function ExplorationView(props: {
             {` · ${props.exploration.failures} failed`}
           </text>
         </Show>
+        <Show when={(props.exploration.cancellations ?? 0) > 0}>
+          <text flexShrink={0} fg={props.colors.muted}>
+            {` · ${props.exploration.cancellations ?? 0} cancelled`}
+          </text>
+        </Show>
         <box flexGrow={1} />
-        <text flexShrink={0} paddingLeft={1} fg={props.colors.muted}>
-          {props.narrow ? (props.expanded ? "−" : "+") : props.expanded ? "hide" : "details"}
-        </text>
+        <ToolDisclosure expanded={props.expanded} narrow={props.narrow} colors={props.colors} />
       </box>
       <Show when={props.expanded}>
         <box width="100%">
@@ -358,6 +358,7 @@ function EditOperationView(props: {
 function EditView(props: {
   readonly edit: EditTranscript;
   readonly expanded: boolean;
+  readonly narrow: boolean;
   readonly width: number;
   readonly toneColors: Record<TranscriptTone, string>;
   readonly colors: ThemeColors;
@@ -377,30 +378,33 @@ function EditView(props: {
             >{` ${props.edit.operations.length} files`}</span>
           </text>
           <box flexGrow={1} />
-          <text flexShrink={0} paddingLeft={1} fg={props.colors.muted}>
-            expand
-          </text>
+          <ToolDisclosure expanded={props.expanded} narrow={props.narrow} colors={props.colors} />
         </box>
       }
     >
       <box width="100%">
         <For each={props.edit.operations}>
           {(operation, index) => {
-            const label = collapsible && index() === 0 ? "collapse" : "";
+            const showsDisclosure = collapsible && index() === 0;
             return (
               <box width="100%" flexDirection="row">
                 <box flexGrow={1} minWidth={0}>
                   <EditOperationView
                     operation={operation}
-                    width={Math.max(1, props.width - (label.length > 0 ? label.length + 1 : 0))}
+                    width={Math.max(
+                      1,
+                      props.width - (showsDisclosure ? (props.narrow ? 2 : 5) : 0),
+                    )}
                     toneColors={props.toneColors}
                     colors={props.colors}
                   />
                 </box>
-                <Show when={label.length > 0}>
-                  <text flexShrink={0} paddingLeft={1} fg={props.colors.muted}>
-                    {label}
-                  </text>
+                <Show when={showsDisclosure}>
+                  <ToolDisclosure
+                    expanded={props.expanded}
+                    narrow={props.narrow}
+                    colors={props.colors}
+                  />
                 </Show>
               </box>
             );
@@ -427,7 +431,6 @@ function TodoOverlay(props: {
   readonly onToggle: (event: MouseEvent) => void;
   readonly onViewport: (viewport: ScrollBoxRenderable) => void;
 }) {
-  const countText = `(${props.summary.completed} completed; ${props.summary.coming} coming)`;
   return (
     <box
       position="absolute"
@@ -453,7 +456,7 @@ function TodoOverlay(props: {
               {props.summary.todo.content}
             </text>
             <text flexShrink={0} paddingLeft={1} wrapMode="none" fg={props.colors.muted}>
-              {countText}
+              {`(${props.summary.completed} completed; ${props.summary.coming} coming)`}
             </text>
           </box>
         }
@@ -836,6 +839,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     if (entry.running === true) return colors.accent;
     if (entry.tone === "danger") return colors.danger;
     if (entry.tone === "warning") return colors.warning;
+    if (entry.tone === "muted") return colors.muted;
     return colors.success;
   }
 
@@ -1570,62 +1574,34 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
                     backgroundColor={
                       entry().kind === "shell"
                         ? colors.raised
-                        : entry().kind === "tool"
-                          ? colors.toolBackground
-                          : entry().kind === "subagent"
-                            ? colors.raised
-                            : (entry().kind === "exploration" || entry().kind === "edit") &&
-                                expandedEntries().has(entry().id)
-                              ? colors.panel
-                              : entry().kind === "user"
-                                ? colors.panel
-                                : undefined
+                        : entry().kind === "user"
+                          ? colors.panel
+                          : undefined
                     }
                     border={
                       entry().kind === "compaction"
                         ? ["top"]
-                        : entry().kind === "user" ||
-                            entry().kind === "tool" ||
-                            entry().kind === "subagent" ||
-                            entry().kind === "shell" ||
-                            entry().kind === "exploration"
+                        : entry().kind === "user" || isToolTranscriptEntry(entry())
                           ? ["left"]
                           : undefined
                     }
                     borderColor={
                       entry().kind === "compaction"
                         ? colors.warning
-                        : entry().kind === "shell"
+                        : isToolTranscriptEntry(entry())
                           ? toolStateColor(entry())
-                          : entry().kind === "tool"
-                            ? toolStateColor(entry())
-                            : entry().kind === "subagent"
-                              ? transcriptEntryColor(entry())
-                              : entry().kind === "exploration"
-                                ? toneColors[entry().tone]
-                                : entry().kind === "user"
-                                  ? colors.accent
-                                  : undefined
+                          : entry().kind === "user"
+                            ? colors.accent
+                            : undefined
                     }
                     paddingLeft={
                       entry().kind === "user" ||
-                      entry().kind === "tool" ||
-                      entry().kind === "subagent" ||
                       entry().kind === "compaction" ||
-                      entry().kind === "shell" ||
-                      entry().kind === "exploration"
+                      isToolTranscriptEntry(entry())
                         ? 1
                         : 0
                     }
-                    paddingRight={
-                      entry().kind === "user" ||
-                      entry().kind === "tool" ||
-                      entry().kind === "subagent" ||
-                      entry().kind === "shell" ||
-                      entry().kind === "exploration"
-                        ? 1
-                        : 0
-                    }
+                    paddingRight={entry().kind === "user" || isToolTranscriptEntry(entry()) ? 1 : 0}
                     paddingTop={entry().kind === "user" || entry().kind === "shell" ? 1 : 0}
                     paddingBottom={entry().kind === "user" || entry().kind === "shell" ? 1 : 0}
                     onMouseUp={(event: MouseEvent) => toggleTranscriptEntry(event, entry())}
@@ -1655,7 +1631,8 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
                                 <EditView
                                   edit={edit()}
                                   expanded={expandedEntries().has(entry().id)}
-                                  width={Math.max(1, dimensions().width - (narrow() ? 1 : 6))}
+                                  narrow={narrow()}
+                                  width={Math.max(1, dimensions().width - (narrow() ? 4 : 9))}
                                   toneColors={toneColors}
                                   colors={colors}
                                 />
@@ -1678,8 +1655,6 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
                       {(shell) => (
                         <ShellView
                           shell={shell()}
-                          running={entry().running === true}
-                          tone={entry().tone}
                           expanded={expandedEntries().has(entry().id)}
                           narrow={narrow()}
                           width={Math.max(1, dimensions().width - (narrow() ? 4 : 10))}

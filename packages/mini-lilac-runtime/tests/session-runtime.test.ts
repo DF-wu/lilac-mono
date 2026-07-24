@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -161,15 +161,15 @@ function delegateResult(
   };
 }
 
-function bashToolResult(command: string) {
+function bashToolResult(command: string, dangerouslyAllow?: boolean) {
   return {
     stream: simulateReadableStream({
       chunks: [
         {
           type: "tool-call" as const,
-          toolCallId: "silent-bash",
+          toolCallId: dangerouslyAllow ? "silent-bash-bypass" : "silent-bash",
           toolName: "bash",
-          input: JSON.stringify({ command }),
+          input: JSON.stringify({ command, dangerouslyAllow }),
         },
         {
           type: "finish" as const,
@@ -2872,6 +2872,45 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("blocks dangerous Bash expansion and permits an explicit dangerouslyAllow retry", async () => {
+    const runtimeConfig = config();
+    const readerProfile = runtimeConfig.agent.profiles.reader;
+    if (!readerProfile) throw new Error("reader profile missing");
+    readerProfile.tools = ["bash"];
+    readerProfile.execution = true;
+    readerProfile.workspaceWrites = true;
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-bash-safety-"));
+    temporaryDirectories.push(directory);
+    const target = path.join(directory, "expanded-target");
+    await mkdir(target);
+    await writeFile(path.join(target, "marker.txt"), "keep");
+    const command = `target=${JSON.stringify(target)}; rm -rf "$target"`;
+    const model = new MockLanguageModelV4({
+      doStream: [
+        bashToolResult(command),
+        bashToolResult(command, true),
+        textResult("answer", "done"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+    });
+
+    await collect((await service.startPrompt(session.id, userMessage("clean target"))).stream);
+
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("dynamic target");
+    expect(await readdir(directory)).not.toContain("expanded-target");
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+    service.close();
+  });
+
   it("keeps bounded Bash output inline and retains the complete output as an artifact", async () => {
     const runtimeConfig = config();
     const readerProfile = runtimeConfig.agent.profiles.reader;
@@ -4197,6 +4236,12 @@ describe("SessionService", () => {
                 toolName: "read_file",
                 input: JSON.stringify({ path: protectedPath }),
               })),
+              ...protectedPaths.map((protectedPath, index) => ({
+                type: "tool-call" as const,
+                toolCallId: `read-protected-bypass-${index}`,
+                toolName: "read_file",
+                input: JSON.stringify({ path: protectedPath, dangerouslyAllow: true }),
+              })),
               {
                 type: "finish",
                 finishReason: { unified: "tool-calls", raw: "tool-calls" },
@@ -4225,6 +4270,7 @@ describe("SessionService", () => {
     expect(continuation).not.toContain("must-not-read");
     expect(continuation).not.toContain("provider-marker-must-not-read");
     expect(continuation).not.toContain("mini-lilac-token-must-not-read");
+    expect(continuation).toContain("dangerouslyAllow is disabled");
     service.close();
   });
 

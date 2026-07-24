@@ -572,7 +572,7 @@ function enabledProfileTools(profile: AgentProfile, availableTools: readonly str
         ),
       ];
   return requested.filter((name) => {
-    // Bash is trusted, unrestricted execution rather than a filesystem sandbox.
+    // Bash retains unrestricted process authority after its preflight guardrails.
     if (name === "bash" && (!profile.execution || !profile.workspaceWrites)) return false;
     if ((name === "edit_file" || name === "apply_patch") && !profile.workspaceWrites) {
       return false;
@@ -1183,7 +1183,7 @@ class SessionActor {
       batchExcludedTools: ["todowrite", "websearch"],
       bashStreamOutput: true,
       bashMergeOutput: true,
-      allowGuardrailBypass: false,
+      allowBashGuardrailBypass: true,
       denyPaths: this.protectedToolPaths,
       preloadedInstructionPaths,
       ...(this.toolResultArtifacts

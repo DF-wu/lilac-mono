@@ -146,6 +146,70 @@ describe("coding tools", () => {
     expect(eofStdin).toMatchObject({ stdout: "stdin_read_ok\n", exitCode: 0 });
   });
 
+  it("blocks expansion-sensitive deletion unless dangerouslyAllow is explicit", async () => {
+    const target = path.join(cwd, "expanded-target");
+    await mkdir(target);
+    await writeFile(path.join(target, "marker.txt"), "keep");
+    const command = `target=${JSON.stringify(target)}; rm -rf "$target"`;
+    const tools = createCodingToolset({ cwd, allowBashGuardrailBypass: true });
+    const bash = executable(tools, "bash");
+
+    const blocked = await bash.execute({ command }, options("bash-safety-block"));
+    expect(blocked).toMatchObject({
+      exitCode: -1,
+      executionError: {
+        type: "blocked",
+        reason: expect.stringContaining("dynamic target"),
+        segment: expect.stringContaining("rm -rf"),
+      },
+    });
+    expect(await readFile(path.join(target, "marker.txt"), "utf8")).toBe("keep");
+
+    const allowed = await bash.execute(
+      { command, dangerouslyAllow: true },
+      options("bash-safety-bypass"),
+    );
+    expect(allowed).toMatchObject({ exitCode: 0 });
+    expect(await readdir(cwd)).not.toContain("expanded-target");
+    await expect(
+      Promise.resolve().then(() =>
+        executable(tools, "read_file").execute(
+          { path: "marker.txt", dangerouslyAllow: true },
+          options("filesystem-bypass-disabled"),
+        ),
+      ),
+    ).rejects.toThrow("dangerouslyAllow is disabled");
+    await expect(
+      Promise.resolve().then(() =>
+        executable(tools, "edit_file").execute(
+          {
+            path: "marker.txt",
+            oldText: "before",
+            newText: "after",
+            dangerouslyAllow: true,
+          },
+          options("edit-bypass-disabled"),
+        ),
+      ),
+    ).rejects.toThrow("dangerouslyAllow is disabled");
+    await expect(
+      Promise.resolve().then(() =>
+        executable(tools, "apply_patch").execute(
+          {
+            patchText: [
+              "*** Begin Patch",
+              "*** Add File: bypass.txt",
+              "+blocked",
+              "*** End Patch",
+            ].join("\n"),
+            dangerouslyAllow: true,
+          },
+          options("patch-bypass-disabled"),
+        ),
+      ),
+    ).rejects.toThrow("dangerouslyAllow is disabled");
+  });
+
   it("optionally streams bounded Bash stdout and stderr before the final result", async () => {
     const bash = executable(
       createCodingToolset({

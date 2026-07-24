@@ -5,12 +5,12 @@ import {
   type CoreConfig,
   type NativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
+import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { analyzeBashCommand } from "./bash-safety";
 import { formatBlockedMessage, redactSecrets } from "./bash-safety/format";
 import { expandTilde } from "@stanley2058/lilac-fs";
 

@@ -29,7 +29,10 @@ export const bashInputSchema = z.object({
     .describe(
       "stdin handling mode: 'error' (default, recommended) makes inherited stdin reads fail immediately (EBADF); use 'eof' only as a fallback if the command fails specifically due to this strict stdin mode.",
     ),
-  dangerouslyAllow: z.boolean().optional().describe("Bypass safety guardrails for this call"),
+  dangerouslyAllow: z
+    .boolean()
+    .optional()
+    .describe("Bypass every Bash safety and protected-path guardrail for this call"),
 });
 
 export type BashInput = z.infer<typeof bashInputSchema>;

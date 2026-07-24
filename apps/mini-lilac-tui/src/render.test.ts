@@ -209,7 +209,7 @@ describe("renderInitialMessages", () => {
     expect(entries()[0]).toMatchObject({
       kind: "subagent",
       tone: "success",
-      text: "✓ Explore Task - Trace the request flow\n  ↳ 3 tool calls",
+      text: "Explore Task - Trace the request flow\n  ↳ 3 tool calls",
       subagent: { runId: "child-1", state: "completed", toolCount: 3 },
     });
   });
@@ -256,6 +256,65 @@ describe("renderInitialMessages", () => {
       kind: "subagent",
       tone: "success",
       subagent: { runId: "child-1", toolCallId: "delegate-1", toolCount: 4 },
+    });
+  });
+
+  it("preserves subagent running, error, and denied states", () => {
+    const canonical = renderInitialMessages([
+      {
+        id: "assistant-subagent-states",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "subagent_delegate",
+            toolCallId: "delegate-error",
+            state: "output-error",
+            input: { profile: "explore", prompt: "Inspect failures" },
+            errorText: "child failed",
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "subagent_delegate",
+            toolCallId: "delegate-denied",
+            state: "output-denied",
+            input: { profile: "explore", prompt: "Inspect secrets" },
+            approval: { id: "approval-subagent", approved: false },
+          },
+        ],
+      },
+    ]);
+
+    expect(canonical).toMatchObject([
+      {
+        kind: "subagent",
+        tone: "danger",
+        text: "Explore Task - Inspect failures\n  ↳ child failed",
+        subagent: { state: "error" },
+      },
+      {
+        kind: "subagent",
+        tone: "warning",
+        text: "Explore Task - Inspect secrets\n  ↳ Denied",
+        subagent: { state: "denied" },
+      },
+    ]);
+
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "delegate-live",
+      toolName: "subagent_delegate",
+      input: { profile: "explore", prompt: "Inspect runtime" },
+      dynamic: true,
+    });
+    expect(entries()[0]).toMatchObject({ kind: "subagent", tone: "accent", running: true });
+    renderer.handle({ type: "tool-output-denied", toolCallId: "delegate-live" });
+    expect(entries()[0]).toMatchObject({
+      kind: "subagent",
+      tone: "warning",
+      text: "Explore Task - Inspect runtime\n  ↳ Denied",
+      subagent: { state: "denied" },
     });
   });
 
@@ -678,7 +737,7 @@ describe("renderInitialMessages", () => {
         singleLine: true,
       },
       {
-        kind: "error",
+        kind: "tool",
         tone: "danger",
         text: 'Search "latest runtime release": search unavailable',
         singleLine: true,
@@ -716,7 +775,7 @@ describe("renderInitialMessages", () => {
       input: {},
       dynamic: true,
     });
-    expect(entries()[0]?.text).toBe("Websearch");
+    expect(entries()[0]?.text).toBe("Websearch · running");
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "native-search-1",
@@ -808,6 +867,70 @@ describe("renderInitialMessages", () => {
         },
       ]).map((entry) => ({ kind: entry.kind, tone: entry.tone, text: entry.text })),
     ).toEqual([{ kind: "exploration", tone: "normal", text: "Explored · 1 read, 1 search" }]);
+  });
+
+  it("distinguishes failed and denied exploration states", () => {
+    const canonical = renderInitialMessages([
+      {
+        id: "assistant-exploration-error",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "read_file",
+            toolCallId: "read-error",
+            state: "output-error",
+            input: { path: "missing.ts" },
+            errorText: "file missing",
+          },
+        ],
+      },
+      {
+        id: "assistant-exploration-denied",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "grep",
+            toolCallId: "grep-denied",
+            state: "output-denied",
+            input: { pattern: "secret" },
+            approval: { id: "approval-exploration", approved: false },
+          },
+        ],
+      },
+    ]);
+    expect(canonical).toMatchObject([
+      { kind: "exploration", tone: "danger", text: "Explored · 1 read · 1 failure" },
+      { kind: "exploration", tone: "warning", text: "Explored · 1 search · 1 failure" },
+    ]);
+
+    const failed = createRendererHarness();
+    failed.renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "read-error",
+      toolName: "read_file",
+      input: { path: "missing.ts" },
+      dynamic: true,
+    });
+    failed.renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "read-error",
+      errorText: "file missing",
+      dynamic: true,
+    });
+    expect(failed.entries()[0]).toMatchObject({ kind: "exploration", tone: "danger" });
+
+    const denied = createRendererHarness();
+    denied.renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "grep-denied",
+      toolName: "grep",
+      input: { pattern: "secret" },
+      dynamic: true,
+    });
+    denied.renderer.handle({ type: "tool-output-denied", toolCallId: "grep-denied" });
+    expect(denied.entries()[0]).toMatchObject({ kind: "exploration", tone: "warning" });
   });
 
   it("segments exploration around commentary and expands operation details", () => {
@@ -1193,7 +1316,7 @@ describe("renderInitialMessages", () => {
       inputTextDelta: '"pwd"}',
     });
     expect(entries).toHaveLength(1);
-    expect(entries[0]?.text).toBe("Bash");
+    expect(entries[0]?.text).toBe("Bash · running");
     renderer.handle({
       type: "tool-input-available",
       toolCallId: "reused",
@@ -1313,6 +1436,29 @@ describe("renderInitialMessages", () => {
     renderer.startRun();
     renderer.handle({
       type: "tool-input-available",
+      toolCallId: "bash-aborted",
+      toolName: "bash",
+      input: { command: "cancelled-command" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "bash-aborted",
+      output: {
+        stdout: "",
+        stderr: "",
+        executionError: { type: "aborted", signal: "SIGTERM" },
+      },
+      dynamic: true,
+    });
+    expect(entries().at(-1)).toMatchObject({
+      tone: "muted",
+      text: "$ cancelled-command\n\nCommand aborted",
+    });
+
+    renderer.startRun();
+    renderer.handle({
+      type: "tool-input-available",
       toolCallId: "bash-malformed",
       toolName: "bash",
       input: { command: "odd-command" },
@@ -1332,6 +1478,139 @@ describe("renderInitialMessages", () => {
       dynamic: true,
     });
     expect(entries().at(-1)?.text).toBe("$ odd-command\n\nretain me");
+  });
+
+  it("settles every active tool row when the stream aborts", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "bash-active",
+      toolName: "bash",
+      input: { command: "bun test" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "bash-active",
+      output: { type: "output-delta", delta: "partial output\n" },
+      dynamic: true,
+      preliminary: true,
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "generic-active",
+      toolName: "deploy_preview",
+      input: {},
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "read-active",
+      toolName: "read_file",
+      input: { path: "src/app.ts" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "edit-active",
+      toolName: "apply_patch",
+      input: {
+        patchText: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n-old\n+new\n*** End Patch",
+      },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "edit-active-2",
+      toolName: "apply_patch",
+      input: {
+        patchText:
+          "*** Begin Patch\n*** Update File: src/other.ts\n@@\n-before\n+after\n*** End Patch",
+      },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "subagent-active",
+      toolName: "subagent_delegate",
+      input: { profile: "explore", prompt: "Inspect aborts" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "subagent-active",
+      output: {
+        status: "accepted",
+        childRunId: "child-active",
+        profile: "explore",
+      },
+      dynamic: true,
+    });
+
+    renderer.handle({ type: "abort", reason: "user requested" });
+
+    expect(entries()).toMatchObject([
+      {
+        kind: "shell",
+        tone: "muted",
+        text: "$ bun test\n\npartial output\nCancelled: user requested",
+      },
+      {
+        kind: "tool",
+        tone: "muted",
+        text: "Deploy Preview: cancelled (user requested)",
+      },
+      {
+        kind: "exploration",
+        tone: "muted",
+        text: "Explored · 1 read · 1 cancelled",
+      },
+      {
+        kind: "edit",
+        tone: "muted",
+        text: "Patch src/app.ts +1 -1: cancelled (user requested)",
+      },
+      {
+        kind: "edit",
+        tone: "muted",
+        text: "Patch src/other.ts +1 -1: cancelled (user requested)",
+      },
+      {
+        kind: "subagent",
+        tone: "muted",
+        text: "Explore Task - Inspect aborts\n  ↳ Cancelled: user requested",
+        subagent: { state: "cancelled" },
+      },
+      { kind: "status", tone: "muted", text: "aborted: user requested" },
+    ]);
+    for (const entry of entries().slice(0, -1)) expect(entry).not.toHaveProperty("running");
+    expect(groupNearbyEdits(entries()).find((entry) => entry.edit !== undefined)).toMatchObject({
+      tone: "muted",
+      edit: { operations: [{ path: "src/app.ts" }, { path: "src/other.ts" }] },
+    });
+
+    const statusOnly = createRendererHarness();
+    statusOnly.renderer.handle({
+      type: "data-subagentStatus",
+      id: "status-only",
+      data: {
+        toolCallId: "status-only",
+        runId: "child-status-only",
+        profile: "explore",
+        prompt: "Inspect reconnects",
+        mode: "sync",
+        state: "running",
+        toolCount: 1,
+        activity: "grep",
+      },
+    });
+    statusOnly.renderer.handle({ type: "abort", reason: "connection closed" });
+    expect(statusOnly.entries()[0]).toMatchObject({
+      kind: "subagent",
+      tone: "muted",
+      text: "Explore Task - Inspect reconnects\n  ↳ Cancelled: connection closed",
+      subagent: { state: "cancelled", runId: "child-status-only" },
+    });
   });
 
   it("appends one entry per reasoning chunk and finalizes on reasoning-end", () => {
