@@ -36,7 +36,10 @@ export type CodingToolsetOptions = {
   bashEnv?: Readonly<Record<string, string | undefined>>;
   enabledTools?: readonly string[];
   batchExcludedTools?: readonly string[];
+  /** Authorize dangerouslyAllow for every guardrailed coding tool. */
   allowGuardrailBypass?: boolean;
+  /** Authorize dangerouslyAllow for Bash without authorizing filesystem or patch bypasses. */
+  allowBashGuardrailBypass?: boolean;
   loadInstructions?: boolean;
   preloadedInstructionPaths?: readonly string[];
   /** Fixed artifact authority for recoverable Bash output and tool-result:// reads. */
@@ -64,6 +67,7 @@ export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
   const allToolsEnabled = enabledTools === undefined || enabledTools.includes("*");
   const isEnabled = (name: string) => allToolsEnabled || enabledTools?.includes(name) === true;
   const allowGuardrailBypass = options.allowGuardrailBypass ?? false;
+  const allowBashGuardrailBypass = options.allowBashGuardrailBypass ?? allowGuardrailBypass;
   const artifactIntegration = options.artifactIntegration
     ? { ...options.artifactIntegration }
     : undefined;
@@ -81,7 +85,7 @@ export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
       streamOutput: options.bashStreamOutput,
       mergeOutput: options.bashMergeOutput,
       env: options.bashEnv,
-      allowGuardrailBypass,
+      allowGuardrailBypass: allowBashGuardrailBypass,
       artifactIntegration,
     }),
     ...createFilesystemTools({

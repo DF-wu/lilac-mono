@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import {
   env,
   isRecord,
@@ -11,7 +12,6 @@ import path from "node:path";
 import { executeBash, withLimitedBashOutput } from "../../src/tools/bash-impl";
 import { bashToolWithCwd } from "../../src/tools/bash";
 import { executeRestrictedBash } from "../../src/tools/restricted-bash";
-import { analyzeBashCommand } from "../../src/tools/bash-safety";
 import { resolveRestrictedSessionTmpDir } from "../../src/shared/attachment-utils";
 import {
   createToolResultArtifactStore,
