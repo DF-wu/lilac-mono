@@ -119,6 +119,25 @@ function renderedSpan(app: Awaited<ReturnType<typeof renderApp>>, text: string):
   return span;
 }
 
+function renderedSpanOnLine(
+  app: Awaited<ReturnType<typeof renderApp>>,
+  lineText: string,
+  spanText: string,
+): CapturedSpan {
+  const line = app.captureSpans().lines.find((candidate) =>
+    candidate.spans
+      .map((span) => span.text)
+      .join("")
+      .includes(lineText),
+  );
+  if (line === undefined) throw new Error(`Could not find rendered line containing ${lineText}`);
+  const span = line.spans.find((candidate) => candidate.text.includes(spanText));
+  if (span === undefined) {
+    throw new Error(`Could not find rendered span containing ${spanText} on line ${lineText}`);
+  }
+  return span;
+}
+
 function renderedBackgroundAt(
   app: Awaited<ReturnType<typeof renderApp>>,
   x: number,
@@ -251,7 +270,7 @@ describe("MiniLilacApp tool interactions", () => {
     ];
     const app = await renderApp(messages, transport);
     try {
-      await clickRenderedText(app, "✓ Explore Task");
+      await clickRenderedText(app, "Explore Task");
       await waitForReactiveFrame(app, (frame) => frame.includes("Read-only child result"));
       const childFrame = app.captureCharFrame();
       expect(childFrame).toContain("explore subagent");
@@ -263,7 +282,7 @@ describe("MiniLilacApp tool interactions", () => {
       app.mockInput.pressEscape();
       await waitForReactiveFrame(app, (frame) => frame.includes("Ask anything..."));
       const parentFrame = app.captureCharFrame();
-      expect(parentFrame).toContain("✓ Explore Task");
+      expect(parentFrame).toContain("Explore Task");
       expect(parentFrame).toContain("Ask anything...");
     } finally {
       app.renderer.destroy();
@@ -652,7 +671,7 @@ describe("MiniLilacApp tool interactions", () => {
     try {
       await app.flush();
       expect(app.captureCharFrame()).toContain("Patch 2 files");
-      expect(app.captureCharFrame()).toContain("expand");
+      expect(app.captureCharFrame()).toContain("details");
       expect(app.captureCharFrame()).not.toContain("src/first.ts");
       expect(renderedSpan(app, "Patch").fg.equals(RGBA.fromHex(COLORS.tool))).toBe(true);
       expect(renderedSpan(app, "2 files").fg.equals(RGBA.fromHex(COLORS.muted))).toBe(true);
@@ -660,7 +679,7 @@ describe("MiniLilacApp tool interactions", () => {
       await clickRenderedText(app, "Patch 2 files");
       expect(app.captureCharFrame()).toContain("Patch src/first.ts +2 -1");
       expect(app.captureCharFrame()).toContain("Patch src/second.ts +1");
-      expect(app.captureCharFrame()).toContain("collapse");
+      expect(app.captureCharFrame()).toContain("hide");
       expect(renderedSpan(app, "+2").fg.equals(RGBA.fromHex(COLORS.success))).toBe(true);
       expect(renderedSpan(app, "-1").fg.equals(RGBA.fromHex(COLORS.danger))).toBe(true);
 
@@ -975,7 +994,7 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
-  it("separates shell and generic tool surfaces and moves metadata below the composer", async () => {
+  it("keeps the status rule while giving shell a raised surface", async () => {
     const app = await renderApp([
       {
         id: "assistant-surfaces",
@@ -1005,6 +1024,38 @@ describe("MiniLilacApp tool interactions", () => {
             input: {},
             output: {},
           },
+          {
+            type: "dynamic-tool",
+            toolName: "read_file",
+            toolCallId: "read-surfaces-1",
+            state: "output-available",
+            input: { path: "/workspace/src/app.ts" },
+            output: {},
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "apply_patch",
+            toolCallId: "patch-surfaces-1",
+            state: "output-available",
+            input: {
+              patchText:
+                "*** Begin Patch\n*** Update File: /workspace/src/app.ts\n@@\n-old\n+new\n*** End Patch",
+            },
+            output: "Success",
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "subagent_delegate",
+            toolCallId: "delegate-surfaces-1",
+            state: "output-available",
+            input: { profile: "explore", prompt: "Inspect status", mode: "sync" },
+            output: {
+              status: "completed",
+              childRunId: "child-surfaces-1",
+              profile: "explore",
+              text: "Done",
+            },
+          },
         ],
       },
     ]);
@@ -1014,10 +1065,28 @@ describe("MiniLilacApp tool interactions", () => {
       expect(renderedSpan(app, "$ bun test").bg.equals(RGBA.fromHex(COLORS.raised))).toBe(true);
       const tool = renderedSpan(app, "Fetch https://example.test");
       expect(tool.fg.equals(RGBA.fromHex(COLORS.tool))).toBe(true);
-      expect(tool.bg.equals(RGBA.fromHex(COLORS.toolBackground))).toBe(true);
+      expect(tool.bg.equals(RGBA.fromHex(COLORS.background))).toBe(true);
       const genericTool = renderedSpan(app, "Deploy Preview");
       expect(genericTool.fg.equals(RGBA.fromHex(COLORS.tool))).toBe(true);
-      expect(genericTool.bg.equals(RGBA.fromHex(COLORS.toolBackground))).toBe(true);
+      expect(genericTool.bg.equals(RGBA.fromHex(COLORS.background))).toBe(true);
+      expect(
+        renderedSpanOnLine(app, "$ bun test", "│").fg.equals(RGBA.fromHex(COLORS.success)),
+      ).toBe(true);
+      expect(
+        renderedSpanOnLine(app, "Fetch https://example.test", "│").fg.equals(
+          RGBA.fromHex(COLORS.success),
+        ),
+      ).toBe(true);
+      for (const [lineText, spanText] of [
+        ["Explored", "Explored"],
+        ["Patch src/app.ts", "Patch "],
+        ["Explore Task", "Explore Task"],
+      ] as const) {
+        expect(renderedSpan(app, spanText).bg.equals(RGBA.fromHex(COLORS.background))).toBe(true);
+        expect(renderedSpanOnLine(app, lineText, "│").fg.equals(RGBA.fromHex(COLORS.success))).toBe(
+          true,
+        );
+      }
       expect(app.captureCharFrame()).toContain("coding | test/model | low | 23.7K (6%)");
       expect(renderedTextPosition(app, "Click test").y).toBeGreaterThan(
         renderedTextPosition(app, "Ask anything...").y,
@@ -1162,7 +1231,7 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
-  it("marks running and completed shell commands independently of color", async () => {
+  it("uses left-rule color and text instead of tool status glyphs", async () => {
     const app = await renderApp([
       {
         id: "assistant-shell-states",
@@ -1198,18 +1267,157 @@ describe("MiniLilacApp tool interactions", () => {
             input: { name: "frontend-design" },
             output: {},
           },
+          {
+            type: "dynamic-tool",
+            toolName: "webfetch",
+            toolCallId: "tool-failed",
+            state: "output-error",
+            input: { url: "https://example.test/failure" },
+            errorText: "request failed",
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "write",
+            toolCallId: "tool-denied",
+            state: "output-denied",
+            input: { path: "/etc/hosts" },
+            approval: { id: "approval-1", approved: false },
+          },
         ],
       },
     ]);
     try {
       await app.flush();
       const frame = app.captureCharFrame();
-      expect(frame).toContain("✓ $ df -h");
-      expect(frame).toContain("● $ du -x -h /");
-      expect(frame).toContain("● Deploy Preview");
-      expect(frame).toContain("✓ Loaded skill frontend-design");
-      expect(renderedSpan(app, "✓ ").fg.equals(RGBA.fromHex(COLORS.success))).toBe(true);
-      expect(renderedSpan(app, "● ").fg.equals(RGBA.fromHex(COLORS.accent))).toBe(true);
+      expect(frame).toContain("$ df -h");
+      expect(frame).toContain("$ du -x -h /");
+      expect(frame).toContain("Deploy Preview · running");
+      expect(frame).toContain("Loaded skill frontend-design");
+      expect(frame).toContain("Fetch https://example.test/failure: request failed");
+      expect(frame).toContain("Write: denied");
+      expect(frame).not.toContain("✓ $ df -h");
+      expect(frame).not.toContain("● $ du -x -h /");
+      expect(renderedSpanOnLine(app, "$ df -h", "│").fg.equals(RGBA.fromHex(COLORS.success))).toBe(
+        true,
+      );
+      expect(
+        renderedSpanOnLine(app, "$ du -x -h /", "│").fg.equals(RGBA.fromHex(COLORS.accent)),
+      ).toBe(true);
+      expect(
+        renderedSpanOnLine(app, "request failed", "│").fg.equals(RGBA.fromHex(COLORS.danger)),
+      ).toBe(true);
+      expect(
+        renderedSpanOnLine(app, "Write: denied", "│").fg.equals(RGBA.fromHex(COLORS.warning)),
+      ).toBe(true);
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("colors running and cancelled subagent rules without status glyphs", async () => {
+    const app = await renderApp([
+      {
+        id: "assistant-subagent-rule-states",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "subagent_delegate",
+            toolCallId: "subagent-running",
+            state: "input-available",
+            input: { profile: "explore", prompt: "Inspect active work" },
+          },
+          {
+            type: "dynamic-tool",
+            toolName: "subagent_delegate",
+            toolCallId: "subagent-cancelled",
+            state: "output-available",
+            input: { profile: "general", prompt: "Inspect cancelled work" },
+            output: {
+              status: "cancelled",
+              childRunId: "child-cancelled",
+              profile: "general",
+              reason: "Run cancelled",
+            },
+          },
+        ],
+      },
+    ]);
+    try {
+      await app.flush();
+      expect(
+        renderedSpanOnLine(app, "Inspect active work", "│").fg.equals(RGBA.fromHex(COLORS.accent)),
+      ).toBe(true);
+      expect(
+        renderedSpanOnLine(app, "Inspect cancelled work", "│").fg.equals(
+          RGBA.fromHex(COLORS.muted),
+        ),
+      ).toBe(true);
+      expect(app.captureCharFrame()).not.toContain("● Explore Task");
+      expect(app.captureCharFrame()).not.toContain("× General Task");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("keeps shell disclosure below the block while compact rows use narrow marks", async () => {
+    const output = Array.from({ length: 6 }, (_, index) => `line ${index + 1}`).join("\n");
+    const app = await renderApp(
+      [
+        {
+          id: "assistant-narrow-disclosures",
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolName: "bash",
+              toolCallId: "bash-narrow",
+              state: "output-available",
+              input: { command: "bun test" },
+              output: { stdout: output, stderr: "", exitCode: 0 },
+            },
+            {
+              type: "dynamic-tool",
+              toolName: "read_file",
+              toolCallId: "read-narrow",
+              state: "output-available",
+              input: { path: "src/app.ts" },
+              output: {},
+            },
+            {
+              type: "dynamic-tool",
+              toolName: "apply_patch",
+              toolCallId: "patch-narrow",
+              state: "output-available",
+              input: {
+                patchText:
+                  "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-a\n+b\n*** Update File: src/b.ts\n@@\n-c\n+d\n*** End Patch",
+              },
+              output: "Success",
+            },
+          ],
+        },
+      ],
+      new MiniLilacTransport({ cwd: "/workspace" }),
+      40,
+    );
+    const row = (text: string) =>
+      app
+        .captureCharFrame()
+        .split("\n")
+        .find((line) => line.includes(text)) ?? "";
+    try {
+      await app.flush();
+      expect(app.captureCharFrame()).toContain("Click to expand");
+      expect(row("Explored")).toContain("+");
+      expect(row("Patch 2 files")).toContain("+");
+
+      await clickRenderedText(app, "Explored");
+      expect(row("Explored")).toContain("−");
+      await clickRenderedText(app, "Patch 2 files");
+      expect(row("Patch src/a.ts")).toContain("−");
+      await clickRenderedText(app, "$ bun test");
+      expect(app.captureCharFrame()).toContain("Click to collapse");
     } finally {
       app.renderer.destroy();
     }

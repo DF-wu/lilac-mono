@@ -57,7 +57,14 @@ export interface SubagentTranscript {
   readonly profile: string;
   readonly prompt: string;
   readonly mode: "sync" | "deferred";
-  readonly state: "pending" | "running" | "completed" | "cancelled" | "error" | "rejected";
+  readonly state:
+    | "pending"
+    | "running"
+    | "completed"
+    | "cancelled"
+    | "denied"
+    | "error"
+    | "rejected";
   readonly toolCount: number;
   readonly activity?: string;
   readonly text?: string;
@@ -84,6 +91,7 @@ export interface ExplorationTranscript {
   readonly reads: number;
   readonly searches: number;
   readonly failures: number;
+  readonly cancellations?: number;
   readonly operations: readonly ExplorationOperation[];
 }
 
@@ -149,21 +157,18 @@ function controlSummary(result: MiniLilacControlResult): string {
 
 function subagentEntry(subagent: SubagentTranscript): Omit<TranscriptEntry, "id"> {
   const running = subagent.state === "pending" || subagent.state === "running";
-  const icon = running ? "│" : subagent.state === "completed" ? "✓" : "×";
   const profile = humanizeToolName(subagent.profile);
   const background = subagent.mode === "deferred" ? " (background)" : "";
   const session = subagent.sessionName === undefined ? "" : ` [${subagent.sessionName}]`;
-  const lines = [
-    `${icon} ${profile} Task${session}${background} - ${previewText(subagent.prompt, 160)}`,
-  ];
+  const lines = [`${profile} Task${session}${background} - ${previewText(subagent.prompt, 160)}`];
   if (running && subagent.activity !== undefined) {
     lines.push(
       `  ↳ ${humanizeToolName(subagent.activity)}${subagent.toolCount > 1 ? ` · ${subagent.toolCount} tool calls` : ""}`,
     );
-  } else if (subagent.toolCount > 0) {
-    lines.push(`  ↳ ${subagent.toolCount} tool call${subagent.toolCount === 1 ? "" : "s"}`);
   } else if (subagent.error !== undefined) {
     lines.push(`  ↳ ${previewText(subagent.error, 180)}`);
+  } else if (subagent.toolCount > 0) {
+    lines.push(`  ↳ ${subagent.toolCount} tool call${subagent.toolCount === 1 ? "" : "s"}`);
   }
   if (subagent.sessionId !== undefined && lines.length === 1)
     lines.push("  ↳ Click to view transcript");
@@ -175,8 +180,11 @@ function subagentEntry(subagent: SubagentTranscript): Omit<TranscriptEntry, "id"
         ? "success"
         : subagent.state === "cancelled"
           ? "muted"
-          : "danger",
+          : subagent.state === "denied"
+            ? "warning"
+            : "danger",
     text: lines.join("\n"),
+    ...(running ? { running: true } : {}),
     subagent,
   };
 }
@@ -345,13 +353,16 @@ type ToolRenderState =
   | { readonly status: "active"; readonly output?: unknown }
   | { readonly status: "success"; readonly output: unknown }
   | { readonly status: "error"; readonly errorText: string }
-  | { readonly status: "denied" };
+  | { readonly status: "denied" }
+  | { readonly status: "cancelled"; readonly reason?: string; readonly output?: unknown };
 
 type ExplorationState = {
   id: string;
   reads: number;
   searches: number;
   failures: number;
+  errors: number;
+  cancellations: number;
   operations: ExplorationOperation[];
   pending: Set<string>;
 };
@@ -375,7 +386,7 @@ export function explorationTranscriptText(
     exploration.reads > 0 ? plural(exploration.reads, "read") : undefined,
     exploration.searches > 0 ? plural(exploration.searches, "search") : undefined,
   ].filter((value) => value !== undefined);
-  const header = `${latest ? "Exploring" : "Explored"} · ${counts.join(", ")}${exploration.failures > 0 ? ` · ${plural(exploration.failures, "failure")}` : ""}`;
+  const header = `${latest ? "Exploring" : "Explored"} · ${counts.join(", ")}${exploration.failures > 0 ? ` · ${plural(exploration.failures, "failure")}` : ""}${exploration.cancellations ? ` · ${exploration.cancellations} cancelled` : ""}`;
   if (!expanded) return header;
   return [
     header,
@@ -391,11 +402,21 @@ function explorationEntry(state: ExplorationState): Omit<TranscriptEntry, "id"> 
     reads: state.reads,
     searches: state.searches,
     failures: state.failures,
+    ...(state.cancellations > 0 ? { cancellations: state.cancellations } : {}),
     operations: [...state.operations],
   } satisfies ExplorationTranscript;
   return {
     kind: "exploration",
-    tone: state.failures > 0 ? "warning" : running ? "accent" : "normal",
+    tone:
+      state.errors > 0
+        ? "danger"
+        : state.failures > 0
+          ? "warning"
+          : state.cancellations > 0
+            ? "muted"
+            : running
+              ? "accent"
+              : "normal",
     text: explorationTranscriptText(exploration, running),
     ...(running ? { running: true } : {}),
     exploration,
@@ -545,7 +566,9 @@ export function groupNearbyEdits(entries: readonly TranscriptEntry[]): Transcrip
           ? "danger"
           : previous.tone === "warning" || entry.tone === "warning"
             ? "warning"
-            : "normal",
+            : previous.tone === "muted" || entry.tone === "muted"
+              ? "muted"
+              : "normal",
       running: previous.running === true || entry.running === true ? true : undefined,
       text: editTranscriptText(edit),
       edit,
@@ -661,9 +684,10 @@ function shellOutput(output: unknown): string | undefined {
   return chunks.join("\n") || undefined;
 }
 
-function shellOutputFailed(output: unknown): boolean {
+function shellOutputTone(output: unknown): "normal" | "muted" | "danger" {
   const parsed = bashOutputSchema.safeParse(output);
-  return parsed.success && parsed.data.executionError !== undefined;
+  if (!parsed.success || parsed.data.executionError === undefined) return "normal";
+  return parsed.data.executionError.type === "aborted" ? "muted" : "danger";
 }
 
 function sameCwd(commandCwd: string, clientCwd: string | undefined): boolean {
@@ -748,6 +772,16 @@ function toolEntry(
   if (name === "bash") {
     const parsed = bashInputSchema.safeParse(input);
     if (parsed.success) {
+      const cancellation =
+        state.status === "cancelled"
+          ? `Cancelled${state.reason === undefined ? "" : `: ${previewText(state.reason, 180)}`}`
+          : undefined;
+      const cancelledOutput =
+        state.status === "cancelled"
+          ? [shellOutput(state.output), cancellation]
+              .filter((value) => value !== undefined)
+              .join("\n")
+          : undefined;
       const output =
         state.status === "success" || (state.status === "active" && state.output !== undefined)
           ? shellOutput(state.output)
@@ -757,7 +791,7 @@ function toolEntry(
               : state.errorText
             : state.status === "denied"
               ? "Denied"
-              : undefined;
+              : cancelledOutput;
       const shell = {
         command: parsed.data.command,
         ...(parsed.data.cwd === undefined || sameCwd(parsed.data.cwd, options.cwd)
@@ -768,12 +802,15 @@ function toolEntry(
       return {
         kind: "shell",
         tone:
-          state.status === "error" ||
-          (state.status === "success" && shellOutputFailed(state.output))
+          state.status === "error"
             ? "danger"
             : state.status === "denied"
               ? "warning"
-              : "normal",
+              : state.status === "cancelled"
+                ? "muted"
+                : state.status === "success"
+                  ? shellOutputTone(state.output)
+                  : "normal",
         text: shellTranscriptText(shell),
         ...(state.status === "active" ? { running: true } : {}),
         shell,
@@ -782,7 +819,7 @@ function toolEntry(
   }
   if (name === "skill") {
     const parsed = skillInputSchema.safeParse(input);
-    if (parsed.success && state.status !== "error" && state.status !== "denied") {
+    if (parsed.success && (state.status === "active" || state.status === "success")) {
       return {
         kind: "tool",
         tone: state.status === "success" ? "success" : "accent",
@@ -803,9 +840,17 @@ function toolEntry(
         ? `: ${previewText(state.errorText, 180)}`
         : state.status === "denied"
           ? ": denied"
-          : undefined;
+          : state.status === "cancelled"
+            ? `: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`
+            : undefined;
     const tone =
-      state.status === "error" ? "danger" : state.status === "denied" ? "warning" : "normal";
+      state.status === "error"
+        ? "danger"
+        : state.status === "denied"
+          ? "warning"
+          : state.status === "cancelled"
+            ? "muted"
+            : "normal";
     const edit = {
       operations: edits.map((operation, index) => ({
         ...operation,
@@ -834,7 +879,7 @@ function toolEntry(
     name === "webfetch" || name === "websearch" || name === "apply_patch" || name === "edit_file";
   if (state.status === "error") {
     return {
-      kind: "error",
+      kind: "tool",
       tone: "danger",
       text: toolErrorSummary(summary, state.errorText),
       ...(singleLine ? { singleLine: true } : {}),
@@ -848,10 +893,18 @@ function toolEntry(
       ...(singleLine ? { singleLine: true } : {}),
     };
   }
+  if (state.status === "cancelled") {
+    return {
+      kind: "tool",
+      tone: "muted",
+      text: `${summary}: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`,
+      ...(singleLine ? { singleLine: true } : {}),
+    };
+  }
   return {
     kind: "tool",
     tone: state.status === "success" ? "success" : "accent",
-    text: summary,
+    text: state.status === "active" ? `${summary} · running` : summary,
     ...(singleLine ? { singleLine: true } : {}),
     ...(state.status === "active" ? { running: true } : {}),
   };
@@ -1036,11 +1089,16 @@ export function renderInitialMessages(
           part.state === "output-error" && "rawInput" in part ? part.rawInput : part.input;
         const category = explorationCategory(name);
         if (name === "subagent_delegate") {
-          const subagent = subagentFromTool(
+          let subagent = subagentFromTool(
             part.toolCallId,
             input,
             part.state === "output-available" ? part.output : undefined,
           );
+          if (part.state === "output-error") {
+            subagent = { ...subagent, state: "error", error: part.errorText };
+          } else if (part.state === "output-denied") {
+            subagent = { ...subagent, state: "denied", error: "Denied" };
+          }
           append({ id, ...subagentEntry(subagent) });
           subagentIndexes.set(part.toolCallId, entries.length - 1);
           return;
@@ -1052,6 +1110,8 @@ export function renderInitialMessages(
               reads: 0,
               searches: 0,
               failures: 0,
+              errors: 0,
+              cancellations: 0,
               operations: [],
               pending: new Set(),
             };
@@ -1063,6 +1123,7 @@ export function renderInitialMessages(
           if (part.state !== "output-available") {
             if (part.state === "output-error" || part.state === "output-denied") {
               exploration.failures += 1;
+              if (part.state === "output-error") exploration.errors += 1;
             } else {
               exploration.pending.add(id);
             }
@@ -1126,6 +1187,7 @@ export class ChunkRenderer {
   private readonly toolInputs = new Map<string, unknown>();
   private readonly bashOutputByToolId = new Map<string, string>();
   private readonly flattenedBatchToolIds = new Set<string>();
+  private readonly activeToolIds = new Set<string>();
   private readonly explorationByToolId = new Map<string, ExplorationState>();
   private readonly subagents = new Map<string, SubagentTranscript>();
   private exploration: ExplorationState | undefined;
@@ -1210,6 +1272,7 @@ export class ChunkRenderer {
       case "abort":
         this.finishOpenText();
         this.finalizeReasoning();
+        this.cancelActiveTools(chunk.reason);
         this.append({
           kind: "status",
           tone: "muted",
@@ -1262,6 +1325,7 @@ export class ChunkRenderer {
 
   private renderSubagentStatus(status: MiniLilacSubagentStatus): void {
     const subagent = subagentFromStatus(status);
+    this.toolNames.set(status.toolCallId, "subagent_delegate");
     this.subagents.set(status.toolCallId, subagent);
     let id = this.toolEntryIds.get(status.toolCallId);
     if (id === undefined) {
@@ -1271,6 +1335,8 @@ export class ChunkRenderer {
     } else {
       this.output.update(id, subagentEntry(subagent));
     }
+    if (status.state === "running") this.activeToolIds.add(status.toolCallId);
+    else this.activeToolIds.delete(status.toolCallId);
   }
 
   private renderToolStart(
@@ -1280,6 +1346,7 @@ export class ChunkRenderer {
     inputAvailable = false,
   ): void {
     this.toolNames.set(toolCallId, toolName);
+    this.activeToolIds.add(toolCallId);
     if (inputAvailable) this.toolInputs.set(toolCallId, input);
     this.finalizeReasoning();
     if (toolName === "subagent_result") return;
@@ -1291,6 +1358,9 @@ export class ChunkRenderer {
           ? parsed
           : { ...existing, profile: parsed.profile, prompt: parsed.prompt, mode: parsed.mode };
       this.subagents.set(toolCallId, subagent);
+      if (subagent.state !== "pending" && subagent.state !== "running") {
+        this.activeToolIds.delete(toolCallId);
+      }
       const existingId = this.toolEntryIds.get(toolCallId);
       if (existingId === undefined) {
         this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
@@ -1312,6 +1382,8 @@ export class ChunkRenderer {
           reads: category === "read" ? 1 : 0,
           searches: category === "search" ? 1 : 0,
           failures: 0,
+          errors: 0,
+          cancellations: 0,
           operations: [explorationOperation(toolName, input, this.options)],
           pending: new Set([toolCallId]),
         };
@@ -1359,14 +1431,25 @@ export class ChunkRenderer {
 
   private renderToolOutput(toolCallId: string, output: unknown, preliminary: boolean): void {
     const name = this.toolNames.get(toolCallId) ?? "tool";
-    if (name === "subagent_result") return;
+    if (name === "subagent_result") {
+      if (!preliminary) this.activeToolIds.delete(toolCallId);
+      return;
+    }
     if (name === "subagent_delegate") {
       if (preliminary) return;
       const existing = this.subagents.get(toolCallId);
-      if (existing?.state === "completed" || existing?.state === "cancelled") return;
+      if (existing?.state === "completed" || existing?.state === "cancelled") {
+        this.activeToolIds.delete(toolCallId);
+        return;
+      }
       const subagent = subagentFromTool(toolCallId, this.toolInputs.get(toolCallId), output);
       const merged = { ...subagent, toolCount: existing?.toolCount ?? subagent.toolCount };
       this.subagents.set(toolCallId, merged);
+      if (merged.state === "pending" || merged.state === "running") {
+        this.activeToolIds.add(toolCallId);
+      } else {
+        this.activeToolIds.delete(toolCallId);
+      }
       const id = this.toolEntryIds.get(toolCallId);
       if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(subagentEntry(merged)));
       else this.output.update(id, subagentEntry(merged));
@@ -1400,11 +1483,12 @@ export class ChunkRenderer {
       );
       return;
     }
+    this.activeToolIds.delete(toolCallId);
     const partial = this.bashOutputByToolId.get(toolCallId);
     this.bashOutputByToolId.delete(toolCallId);
     if (this.flattenedBatchToolIds.has(toolCallId)) return;
     if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId, false);
+      this.settleExploration(toolCallId);
       return;
     }
     const id = this.toolEntryIds.get(toolCallId);
@@ -1434,6 +1518,7 @@ export class ChunkRenderer {
   }
 
   private renderToolError(toolCallId: string, errorText: string): void {
+    this.activeToolIds.delete(toolCallId);
     this.bashOutputByToolId.delete(toolCallId);
     const name = this.toolNames.get(toolCallId) ?? "tool";
     if (name === "subagent_result") return;
@@ -1451,7 +1536,7 @@ export class ChunkRenderer {
       return;
     }
     if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId, true);
+      this.settleExploration(toolCallId, "error");
       return;
     }
     if (this.flattenedBatchToolIds.has(toolCallId)) {
@@ -1462,7 +1547,7 @@ export class ChunkRenderer {
           { status: "error", errorText },
           this.options,
         ) ?? {
-          kind: "error",
+          kind: "tool",
           tone: "danger",
           text: toolErrorSummary("Parallel tools", errorText),
         },
@@ -1479,7 +1564,7 @@ export class ChunkRenderer {
       },
       this.options,
     ) ?? {
-      kind: "error" as const,
+      kind: "tool" as const,
       tone: "danger" as const,
       text: toolErrorSummary(
         this.toolSummaries.get(toolCallId) ?? toolSummary(name, undefined),
@@ -1491,11 +1576,25 @@ export class ChunkRenderer {
   }
 
   private renderToolDenied(toolCallId: string): void {
+    this.activeToolIds.delete(toolCallId);
     this.bashOutputByToolId.delete(toolCallId);
     const name = this.toolNames.get(toolCallId) ?? "tool";
     if (name === "subagent_result") return;
+    if (name === "subagent_delegate") {
+      const existing = this.subagents.get(toolCallId);
+      const subagent: SubagentTranscript = {
+        ...(existing ?? subagentFromTool(toolCallId, this.toolInputs.get(toolCallId))),
+        state: "denied",
+        error: "Denied",
+      };
+      this.subagents.set(toolCallId, subagent);
+      const id = this.toolEntryIds.get(toolCallId);
+      if (id === undefined) this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
+      else this.output.update(id, subagentEntry(subagent));
+      return;
+    }
     if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId, true);
+      this.settleExploration(toolCallId, "denied");
       return;
     }
     if (this.flattenedBatchToolIds.has(toolCallId)) return;
@@ -1522,12 +1621,60 @@ export class ChunkRenderer {
     return this.output.append(entry);
   }
 
-  private settleExploration(toolCallId: string, failed: boolean): void {
+  private settleExploration(toolCallId: string, failure?: "error" | "denied" | "cancelled"): void {
     const state = this.explorationByToolId.get(toolCallId);
     if (state === undefined) return;
     state.pending.delete(toolCallId);
-    if (failed) state.failures += 1;
+    if (failure === "error" || failure === "denied") state.failures += 1;
+    if (failure === "error") state.errors += 1;
+    if (failure === "cancelled") state.cancellations += 1;
     this.output.update(state.id, explorationEntry(state));
+  }
+
+  private cancelActiveTools(reason: string | undefined): void {
+    for (const toolCallId of this.activeToolIds) {
+      const name = this.toolNames.get(toolCallId) ?? "tool";
+      if (name === "subagent_result" || this.flattenedBatchToolIds.has(toolCallId)) continue;
+      if (name === "subagent_delegate") {
+        const existing = this.subagents.get(toolCallId);
+        const subagent: SubagentTranscript = {
+          ...(existing ?? subagentFromTool(toolCallId, this.toolInputs.get(toolCallId))),
+          state: "cancelled",
+          error: `Cancelled${reason === undefined ? "" : `: ${reason}`}`,
+        };
+        this.subagents.set(toolCallId, subagent);
+        const id = this.toolEntryIds.get(toolCallId);
+        if (id === undefined)
+          this.toolEntryIds.set(toolCallId, this.append(subagentEntry(subagent)));
+        else this.output.update(id, subagentEntry(subagent));
+        continue;
+      }
+      if (this.explorationByToolId.has(toolCallId)) {
+        this.settleExploration(toolCallId, "cancelled");
+        continue;
+      }
+      const id = this.toolEntryIds.get(toolCallId);
+      if (id === undefined) continue;
+      const partial = this.bashOutputByToolId.get(toolCallId);
+      this.output.update(
+        id,
+        toolEntry(
+          name,
+          this.toolInputs.get(toolCallId),
+          {
+            status: "cancelled",
+            ...(reason === undefined ? {} : { reason }),
+            ...(name === "bash" && partial !== undefined ? { output: { stdout: partial } } : {}),
+          },
+          this.options,
+        ) ?? {
+          kind: "tool",
+          tone: "muted",
+          text: `${this.toolSummaries.get(toolCallId) ?? toolSummary(name, undefined)}: cancelled`,
+        },
+      );
+    }
+    this.activeToolIds.clear();
   }
 
   private startReasoning(chunkId: string): void {
@@ -1592,6 +1739,7 @@ export class ChunkRenderer {
     this.toolInputs.clear();
     this.bashOutputByToolId.clear();
     this.flattenedBatchToolIds.clear();
+    this.activeToolIds.clear();
     this.explorationByToolId.clear();
     this.subagents.clear();
     this.exploration = undefined;
