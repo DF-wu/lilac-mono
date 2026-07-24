@@ -427,7 +427,6 @@ function TodoOverlay(props: {
   readonly onToggle: (event: MouseEvent) => void;
   readonly onViewport: (viewport: ScrollBoxRenderable) => void;
 }) {
-  const countText = `(${props.summary.completed} completed; ${props.summary.coming} coming)`;
   return (
     <box
       position="absolute"
@@ -453,7 +452,7 @@ function TodoOverlay(props: {
               {props.summary.todo.content}
             </text>
             <text flexShrink={0} paddingLeft={1} wrapMode="none" fg={props.colors.muted}>
-              {countText}
+              {`(${props.summary.completed} completed; ${props.summary.coming} coming)`}
             </text>
           </box>
         }

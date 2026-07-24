@@ -442,6 +442,61 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
+  it("updates floating todo counts when later revisions complete items", async () => {
+    class TodoUpdateTransport extends MiniLilacTransport {
+      streamController: ReadableStreamDefaultController<UIMessageChunk> | undefined;
+
+      override async reconnectToStream() {
+        return new ReadableStream<UIMessageChunk>({
+          start: (controller) => {
+            this.streamController = controller;
+          },
+        });
+      }
+    }
+
+    const transport = new TodoUpdateTransport({ cwd: "/workspace" });
+    const app = await renderApp(
+      [],
+      transport,
+      130,
+      "/workspace",
+      async () => {},
+      {
+        revision: 1,
+        todos: [
+          { content: "Inspect", status: "in_progress", priority: "high" },
+          { content: "Design", status: "pending", priority: "high" },
+          { content: "Implement", status: "pending", priority: "high" },
+          { content: "Verify", status: "pending", priority: "high" },
+        ],
+      },
+      { ...snapshot, activeRunId: "run-todos", status: "streaming" },
+    );
+    try {
+      await app.waitForFrame((frame) => frame.includes("(0 completed; 3 coming)"));
+      transport.streamController?.enqueue({
+        type: "data-todos",
+        transient: true,
+        data: {
+          revision: 2,
+          todos: [
+            { content: "Inspect", status: "completed", priority: "high" },
+            { content: "Design", status: "completed", priority: "high" },
+            { content: "Implement", status: "completed", priority: "high" },
+            { content: "Verify", status: "in_progress", priority: "high" },
+          ],
+        },
+      });
+
+      const frame = await app.waitForFrame((next) => next.includes("[•] Verify"));
+      expect(frame).toContain("(3 completed; 0 coming)");
+      expect(frame).not.toContain("(0 completed; 3 coming)");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
   it("keeps counts visible while truncating the floating todo on narrow terminals", async () => {
     const initialTodos: MiniLilacTodoState = {
       revision: 3,
