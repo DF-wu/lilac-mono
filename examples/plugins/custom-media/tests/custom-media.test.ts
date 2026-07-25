@@ -292,4 +292,27 @@ describe("custom-media.video", () => {
     ).rejects.toThrow("DOWNLOAD_TOO_LARGE");
     expect(await fs.readdir(output)).toEqual([]);
   });
+
+  it("redacts credentials echoed by terminal task errors", async () => {
+    const output = await tempDirectory("custom-media-video-error-");
+    startServer(() =>
+      Response.json({
+        id: "video_failed",
+        status: "failed",
+        error: { message: `bad Authorization: Bearer ${API_KEY}` },
+      }),
+    );
+
+    try {
+      await createCustomMediaServerTool(config).call(
+        "custom-media.video",
+        { prompt: "fail", path: "failed.mp4" },
+        { context: { cwd: output } },
+      );
+      throw new Error("expected video call to fail");
+    } catch (error) {
+      expect(String(error)).not.toContain(API_KEY);
+      expect(String(error)).toContain("REDACTED");
+    }
+  });
 });

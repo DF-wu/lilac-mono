@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { CustomMediaConfig } from "./config";
 import { resolveCredentials } from "./config";
 import type { ToolCallOptions } from "./contracts";
-import { asCustomMediaError, CustomMediaError, parseWithSchema } from "./errors";
+import { asCustomMediaError, CustomMediaError, parseWithSchema, redactDiagnostic } from "./errors";
 import {
   assertSuccessfulResponse,
   authorizationHeaders,
@@ -36,10 +36,14 @@ const videoTaskSchema = z
 const SUCCEEDED_STATUSES = new Set(["succeeded", "completed"]);
 const FAILED_STATUSES = new Set(["failed", "cancelled", "canceled", "expired"]);
 
-function taskErrorMessage(task: z.infer<typeof videoTaskSchema>): string {
-  if (typeof task.error === "string") return task.error;
-  if (task.error && typeof task.error.message === "string") return task.error.message;
-  return `Video task ended with status '${task.status}'.`;
+function taskErrorMessage(task: z.infer<typeof videoTaskSchema>, apiKey: string): string {
+  const message =
+    typeof task.error === "string"
+      ? task.error
+      : task.error && typeof task.error.message === "string"
+        ? task.error.message
+        : `Video task ended with status '${task.status}'.`;
+  return redactDiagnostic(message, [apiKey]);
 }
 
 async function createVideoTask(params: {
@@ -89,7 +93,7 @@ async function waitForVideoTask(params: {
     const status = task.status.toLowerCase();
     if (SUCCEEDED_STATUSES.has(status)) return task;
     if (FAILED_STATUSES.has(status)) {
-      throw new CustomMediaError("VIDEO_FAILED", taskErrorMessage(task));
+      throw new CustomMediaError("VIDEO_FAILED", taskErrorMessage(task, params.apiKey));
     }
     await abortableSleep(params.pollIntervalMs, params.signal);
     const response = await fetch(

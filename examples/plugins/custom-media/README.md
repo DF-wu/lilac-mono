@@ -115,9 +115,9 @@ Generate a video, optionally from a local image:
 tools custom-media.video prompt="A slow cinematic camera move" model=grok-imagine-video inputImage=./frame.png path=./media/clip.mp4 seconds=5 size=1280x720
 ```
 
-`custom-media.video` defaults to a 10-minute operation timeout and a 256 MiB download bound. Both
-can be lowered per call with `timeoutMs` and `maxDownloadBytes`; the hard schema maxima are 30
-minutes and 512 MiB.
+`custom-media.video` defaults to a four-minute operation timeout and a 256 MiB download bound. Both
+can be lowered per call with `timeoutMs` and `maxDownloadBytes`; the hard schema maxima are 290
+seconds and 512 MiB. The timeout stays below Lilac core's five-minute Level 2 call deadline.
 
 ## File Safety
 
@@ -125,11 +125,15 @@ Local inputs are checked by file signature and bounded to 20 MiB per image. Outp
 and exclusive creation; an existing filename produces `name (1).ext` instead of being overwritten.
 Partial video downloads are removed on cancellation, provider failure, or size-limit failure.
 
-In restricted public-session mode, virtual `/tmp` paths map exactly like core:
+The plugin's path resolver maps restricted virtual `/tmp` paths exactly like core:
 
 ```text
 /tmp/lilac-restricted/<sha256(sessionId).slice(0, 32)>
 ```
 
 The tool returns virtual `/tmp/...` paths to the caller. Paths outside `/tmp`, missing session ids,
-and restricted symlinks escaping the session directory are rejected.
+and restricted symlinks escaping the session directory are rejected. Current Lilac core releases
+do not include external callable ids in `RESTRICTED_LEVEL2_ALLOWED`, so restricted callers cannot
+invoke this plugin until core gains plugin-owned safety declarations or the operator explicitly
+allowlists these callables. The mapping is retained so the plugin is ready for that policy change;
+trusted callers are unaffected.

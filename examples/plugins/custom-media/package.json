@@ -8,7 +8,7 @@
     "plugin": "./dist/index.js"
   },
   "scripts": {
-    "build": "rm -rf dist && bun build ./src/index.ts --target=bun --format=esm --packages=bundle --minify --outfile=./dist/index.js && bun -e 'const p=\"dist/index.js\"; await Bun.write(p, (await Bun.file(p).text()).replace(/[ \\t]+$/gm, \"\"))'",
+    "build": "mkdir -p dist && bun build ./src/index.ts --target=bun --format=esm --packages=bundle --minify --outfile=./dist/index.js && bun -e 'const p=\"dist/index.js\"; await Bun.write(p, (await Bun.file(p).text()).replace(/[ \\t]+$/gm, \"\"))'",
     "typecheck": "bunx tsc -p tsconfig.json --noEmit",
     "test": "bun test",
     "fmt": "bunx oxfmt --write \"src/**/*.ts\" \"tests/**/*.ts\" \"*.json\"",

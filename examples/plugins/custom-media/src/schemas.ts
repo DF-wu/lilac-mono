@@ -6,12 +6,7 @@ const optionalPathListSchema = z
   .optional()
   .transform((value) => (typeof value === "string" ? [value] : value));
 
-const timeoutSchema = z.coerce
-  .number()
-  .int()
-  .min(100)
-  .max(30 * 60_000)
-  .default(10 * 60_000);
+const timeoutSchema = z.coerce.number().int().min(100).max(290_000).default(240_000);
 
 export const imageInputSchema = z
   .object({
