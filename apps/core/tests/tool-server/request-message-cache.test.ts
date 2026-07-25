@@ -147,6 +147,7 @@ describe("request-message-cache", () => {
 
     expect(cache.get(requestId)?.length).toBe(1);
 
+    // test-wait-justification: crosses the cache's real five-millisecond TTL before asserting eviction
     await new Promise((r) => setTimeout(r, 10));
     expect(cache.get(requestId)).toBeUndefined();
 

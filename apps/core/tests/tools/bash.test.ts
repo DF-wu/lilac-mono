@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import {
   env,
   isRecord,
@@ -11,7 +12,6 @@ import path from "node:path";
 import { executeBash, withLimitedBashOutput } from "../../src/tools/bash-impl";
 import { bashToolWithCwd } from "../../src/tools/bash";
 import { executeRestrictedBash } from "../../src/tools/restricted-bash";
-import { analyzeBashCommand } from "../../src/tools/bash-safety";
 import { resolveRestrictedSessionTmpDir } from "../../src/shared/attachment-utils";
 import {
   createToolResultArtifactStore,
@@ -245,8 +245,10 @@ rmdir "$media_dir"`,
     );
     const artifacts = createToolResultArtifactStore(path.join(artifactDir, "tool-results"));
     await artifacts.init();
-    const requestId = "bash-trunc-test-request";
-    const toolCallId = "bash-trunc-test-tool";
+    const testId = crypto.randomUUID();
+    const requestId = `bash-trunc-test-request-${testId}`;
+    const toolCallId = `bash-trunc-test-tool-${testId}`;
+    const sessionId = `bash-trunc-test-session-${testId}`;
     let persistenceTempEntries: string[] = [];
     const observedArtifacts: ToolResultArtifactStore = {
       ...artifacts,
@@ -267,7 +269,7 @@ rmdir "$media_dir"`,
         {
           context: {
             requestId,
-            sessionId: "bash-trunc-test-session",
+            sessionId,
             requestClient: "test",
           },
           toolCallId,
@@ -294,7 +296,7 @@ rmdir "$media_dir"`,
       expect(persistenceTempEntries.some((entry) => entry.endsWith(".sanitized"))).toBe(false);
       const uri = res.truncation?.artifactUri;
       if (!uri) throw new Error("expected truncated output artifact URI");
-      const artifact = await artifacts.read(uri, "bash-trunc-test-session");
+      const artifact = await artifacts.read(uri, sessionId);
       expect(artifact.ok).toBe(true);
       if (artifact.ok) {
         expect(artifact.content).toContain("<bash_tool_full_output>");
@@ -449,7 +451,8 @@ describe("executeRestrictedBash", () => {
     const workspace = await fs.mkdtemp(
       path.join(await fs.realpath("/tmp"), "lilac-restricted-workspace-"),
     );
-    const sessionId = "restricted-bash-test-session";
+    const testId = crypto.randomUUID();
+    const sessionId = `restricted-bash-test-session-${testId}`;
     const sessionTmp = resolveRestrictedSessionTmpDir(sessionId);
 
     try {
@@ -466,7 +469,7 @@ describe("executeRestrictedBash", () => {
         {
           workspaceRoot: workspace,
           context: {
-            requestId: "restricted-bash-test-req-1",
+            requestId: `restricted-bash-test-req-1-${testId}`,
             sessionId,
             requestClient: "discord",
           },
@@ -486,7 +489,7 @@ describe("executeRestrictedBash", () => {
         {
           workspaceRoot: workspace,
           context: {
-            requestId: "restricted-bash-test-req-2",
+            requestId: `restricted-bash-test-req-2-${testId}`,
             sessionId,
             requestClient: "discord",
           },
@@ -507,9 +510,10 @@ describe("executeRestrictedBash", () => {
     const workspace = await fs.mkdtemp(
       path.join(await fs.realpath("/tmp"), "lilac-restricted-isolation-workspace-"),
     );
-    const requestId = "restricted-shared-request";
-    const firstSession = "restricted-isolation-a";
-    const secondSession = "restricted-isolation-b";
+    const testId = crypto.randomUUID();
+    const requestId = `restricted-shared-request-${testId}`;
+    const firstSession = `restricted-isolation-a-${testId}`;
+    const secondSession = `restricted-isolation-b-${testId}`;
 
     try {
       const first = await executeRestrictedBash(

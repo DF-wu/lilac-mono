@@ -141,6 +141,7 @@ describe("plugin runtime manager", () => {
       "demo.call",
     ]);
 
+    // test-wait-justification: advances filesystem mtime so plugin freshness detects the rewritten entry module
     await Bun.sleep(5);
     await writePlugin({
       dataDir,
@@ -214,6 +215,7 @@ export const value = 1;
     await manager.init();
     expect(manager.getLevel1Items().map((spec) => spec.name)).toEqual(["demo_tool"]);
 
+    // test-wait-justification: advances filesystem mtime so plugin freshness detects the rewritten dependency
     await Bun.sleep(5);
     await fs.writeFile(
       path.join(pluginDir, "dist", "dep.js"),

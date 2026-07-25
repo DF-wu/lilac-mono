@@ -10,17 +10,6 @@ function randomId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-async function waitFor(
-  predicate: () => boolean | Promise<boolean>,
-  timeoutMs = 2000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!(await predicate())) {
-    if (Date.now() >= deadline) throw new Error("timed out waiting for condition");
-    await Bun.sleep(20);
-  }
-}
-
 describe("RedisStreamsBus", () => {
   it("returns the latest durable topic watermark", async () => {
     const redis = new Redis(TEST_REDIS_URL);
@@ -65,7 +54,7 @@ describe("RedisStreamsBus", () => {
       async () => {},
     );
 
-    // Give the subscription loop a moment to enter XREAD BLOCK.
+    // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK.
     await new Promise((r) => setTimeout(r, 50));
 
     const startedAt = Date.now();
@@ -100,6 +89,7 @@ describe("RedisStreamsBus", () => {
       async () => {},
     );
 
+    // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK before stop() is timed.
     await new Promise((r) => setTimeout(r, 50));
 
     const startedAt = Date.now();
@@ -120,16 +110,16 @@ describe("RedisStreamsBus", () => {
     const topic = outReqTopic(requestId);
 
     const received: string[] = [];
+    const delivered = Promise.withResolvers<void>();
 
-    let sub: { stop(): Promise<void> } | undefined;
-    sub = await bus.subscribeTopic(
+    const sub = await bus.subscribeTopic(
       topic,
       { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
       async (msg) => {
         if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           received.push(msg.data.delta);
+          delivered.resolve();
         }
-        await sub?.stop();
       },
     );
 
@@ -142,10 +132,10 @@ describe("RedisStreamsBus", () => {
       { headers: { request_id: requestId } },
     );
 
-    // Wait a tick for the subscriber to receive.
-    await new Promise((r) => setTimeout(r, 50));
+    await delivered.promise;
 
     expect(received).toEqual(["hello"]);
+    await sub.stop();
     await bus.close();
   });
 
@@ -180,6 +170,8 @@ describe("RedisStreamsBus", () => {
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const commitsA: Array<() => Promise<void>> = [];
     const commitsB: Array<() => Promise<void>> = [];
+    const commitsAReady = Promise.withResolvers<void>();
+    const commitsBReady = Promise.withResolvers<void>();
 
     const subA = await raw.subscribe(
       "topic",
@@ -192,6 +184,7 @@ describe("RedisStreamsBus", () => {
       },
       async (_msg, ctx) => {
         commitsA.push(ctx.commit);
+        if (commitsA.length === 2) commitsAReady.resolve();
       },
     );
     const subB = await raw.subscribe(
@@ -205,21 +198,23 @@ describe("RedisStreamsBus", () => {
       },
       async (_msg, ctx) => {
         commitsB.push(ctx.commit);
+        if (commitsB.length === 2) commitsBReady.resolve();
       },
     );
 
     await raw.publish({ topic: "topic", type: "test", data: 1 }, { topic: "topic", type: "test" });
     await raw.publish({ topic: "topic", type: "test", data: 2 }, { topic: "topic", type: "test" });
-    await waitFor(() => commitsA.length === 2 && commitsB.length === 2);
+    await Promise.all([commitsAReady.promise, commitsBReady.promise]);
 
     await commitsA[0]!();
     await commitsA[1]!();
     await commitsB[1]!();
-    await Bun.sleep(200);
+    await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(2);
 
     await commitsB[0]!();
-    await waitFor(async () => (await redis.xlen(streamKey)) === 1);
+    await raw.flushPendingTrims();
+    expect(await redis.xlen(streamKey)).toBe(1);
 
     await subA.stop();
     await subB.stop();
@@ -234,6 +229,7 @@ describe("RedisStreamsBus", () => {
     const streamKey = `${keyPrefix}:evt.request`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const commits: Array<() => Promise<void>> = [];
+    const commitsReady = Promise.withResolvers<void>();
     const sub = await raw.subscribe(
       "evt.request",
       {
@@ -245,6 +241,7 @@ describe("RedisStreamsBus", () => {
       },
       async (_msg, ctx) => {
         commits.push(ctx.commit);
+        if (commits.length === 2) commitsReady.resolve();
       },
     );
 
@@ -256,10 +253,10 @@ describe("RedisStreamsBus", () => {
       { topic: "evt.request", type: "test", data: 2 },
       { topic: "evt.request", type: "test" },
     );
-    await waitFor(() => commits.length === 2);
+    await commitsReady.promise;
     await commits[0]!();
     await commits[1]!();
-    await Bun.sleep(200);
+    await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(2);
 
     await sub.stop();
@@ -394,6 +391,7 @@ describe("RedisStreamsBus", () => {
     const streamKey = `${keyPrefix}:evt.adapter`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const commits: Array<() => Promise<void>> = [];
+    const commitsReady = Promise.withResolvers<void>();
     const sub = await raw.subscribe(
       "evt.adapter",
       {
@@ -405,6 +403,7 @@ describe("RedisStreamsBus", () => {
       },
       async (_msg, ctx) => {
         commits.push(ctx.commit);
+        if (commits.length === 2) commitsReady.resolve();
       },
     );
 
@@ -416,10 +415,10 @@ describe("RedisStreamsBus", () => {
       { topic: "evt.adapter", type: "test.barrier", data: 2 },
       { topic: "evt.adapter", type: "test.barrier", retention: { maxLenApprox: 1 } },
     );
-    await waitFor(() => commits.length === 2);
+    await commitsReady.promise;
     await commits[1]!();
     await commits[0]!();
-    await Bun.sleep(200);
+    await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(2);
 
     await sub.stop();
@@ -508,9 +507,9 @@ describe("RedisStreamsBus", () => {
       status: string;
       display: string;
     }> = [];
+    const delivered = Promise.withResolvers<void>();
 
-    let sub: { stop(): Promise<void> } | undefined;
-    sub = await bus.subscribeTopic(
+    const sub = await bus.subscribeTopic(
       topic,
       { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
       async (msg) => {
@@ -519,7 +518,7 @@ describe("RedisStreamsBus", () => {
             status: msg.data.status,
             display: msg.data.display,
           });
-          if (received.length >= 2) await sub?.stop();
+          if (received.length >= 2) delivered.resolve();
         }
       },
     );
@@ -545,13 +544,14 @@ describe("RedisStreamsBus", () => {
       { headers: { request_id: requestId } },
     );
 
-    await new Promise((r) => setTimeout(r, 50));
+    await delivered.promise;
 
     expect(received).toEqual([
       { status: "start", display: "[bash] ls -al" },
       { status: "end", display: "[bash] ls -al" },
     ]);
 
+    await sub.stop();
     await bus.close();
   });
 
@@ -565,6 +565,8 @@ describe("RedisStreamsBus", () => {
 
     let aCount = 0;
     let bCount = 0;
+    const aDelivered = Promise.withResolvers<void>();
+    const bDelivered = Promise.withResolvers<void>();
 
     const subA = await bus.subscribeTopic(
       "evt.request",
@@ -580,6 +582,7 @@ describe("RedisStreamsBus", () => {
           aCount++;
         }
         await ctx.commit();
+        aDelivered.resolve();
       },
     );
 
@@ -597,6 +600,7 @@ describe("RedisStreamsBus", () => {
           bCount++;
         }
         await ctx.commit();
+        bDelivered.resolve();
       },
     );
 
@@ -608,7 +612,7 @@ describe("RedisStreamsBus", () => {
       },
     );
 
-    await new Promise((r) => setTimeout(r, 50));
+    await Promise.all([aDelivered.promise, bDelivered.promise]);
 
     expect(aCount).toBe(1);
     expect(bCount).toBe(1);
@@ -653,9 +657,9 @@ describe("RedisStreamsBus", () => {
     const cursor = first.messages[0]!.cursor;
 
     const received: string[] = [];
+    const delivered = Promise.withResolvers<void>();
 
-    let sub: { stop(): Promise<void> } | undefined;
-    sub = await bus.subscribeTopic(
+    const sub = await bus.subscribeTopic(
       topic,
       {
         mode: "tail",
@@ -665,14 +669,15 @@ describe("RedisStreamsBus", () => {
       async (msg) => {
         if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           received.push(msg.data.delta);
+          delivered.resolve();
         }
-        await sub?.stop();
       },
     );
 
-    await new Promise((r) => setTimeout(r, 50));
+    await delivered.promise;
     expect(received).toEqual(["b"]);
 
+    await sub.stop();
     await bus.close();
   });
 
@@ -685,9 +690,9 @@ describe("RedisStreamsBus", () => {
     const requestId = randomId("req");
 
     let received = 0;
+    const delivered = Promise.withResolvers<void>();
 
-    let sub: { stop(): Promise<void> } | undefined;
-    sub = await bus.subscribeTopic(
+    const sub = await bus.subscribeTopic(
       "cmd.request",
       {
         mode: "work",
@@ -701,7 +706,7 @@ describe("RedisStreamsBus", () => {
           received++;
         }
         await ctx.commit();
-        await sub?.stop();
+        delivered.resolve();
       },
     );
 
@@ -720,9 +725,10 @@ describe("RedisStreamsBus", () => {
       },
     );
 
-    await new Promise((r) => setTimeout(r, 50));
+    await delivered.promise;
     expect(received).toBe(1);
 
+    await sub.stop();
     await bus.close();
   });
 
@@ -763,9 +769,9 @@ describe("RedisStreamsBus", () => {
     };
 
     let received: unknown;
+    const delivered = Promise.withResolvers<void>();
 
-    let sub: { stop(): Promise<void> } | undefined;
-    sub = await bus.subscribeTopic(
+    const sub = await bus.subscribeTopic(
       "cmd.request",
       {
         mode: "work",
@@ -779,7 +785,7 @@ describe("RedisStreamsBus", () => {
           received = msg.data;
         }
         await ctx.commit();
-        await sub?.stop();
+        delivered.resolve();
       },
     );
 
@@ -787,9 +793,10 @@ describe("RedisStreamsBus", () => {
       headers: { request_id: requestId },
     });
 
-    await new Promise((r) => setTimeout(r, 50));
+    await delivered.promise;
 
     expect(received).toEqual(complexData);
+    await sub.stop();
     await bus.close();
   });
 
@@ -801,6 +808,7 @@ describe("RedisStreamsBus", () => {
 
     let calls = 0;
     let deliveredAfterError = false;
+    const delivered = Promise.withResolvers<void>();
 
     const sub = await bus.subscribeTopic(
       "cmd.request",
@@ -821,6 +829,7 @@ describe("RedisStreamsBus", () => {
 
         deliveredAfterError = true;
         await ctx.commit();
+        delivered.resolve();
       },
     );
 
@@ -854,7 +863,7 @@ describe("RedisStreamsBus", () => {
       },
     );
 
-    await new Promise((r) => setTimeout(r, 120));
+    await delivered.promise;
 
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(deliveredAfterError).toBe(true);

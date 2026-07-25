@@ -382,6 +382,7 @@ describe("bridgeBusToAdapter", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
     const requestId = "discord:chan:msg_activity";
+    const scheduled: Array<{ active: boolean; callback: () => void }> = [];
 
     const bridge = await bridgeBusToAdapter({
       adapter,
@@ -389,6 +390,13 @@ describe("bridgeBusToAdapter", () => {
       platform: "discord",
       subscriptionId: "discord-adapter",
       idleTimeoutMs: 60,
+      scheduleIdleTimeout: (callback) => {
+        const timeout = { active: true, callback };
+        scheduled.push(timeout);
+        return () => {
+          timeout.active = false;
+        };
+      },
     });
 
     await bus.publish(
@@ -403,19 +411,22 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
-    await Bun.sleep(40);
     await bus.publish(
       lilacEventTypes.EvtAgentOutputActivity,
       { source: "model" },
       { headers: { request_id: requestId } },
     );
-    await Bun.sleep(40);
+    const originalTimeout = scheduled.shift();
+    if (!originalTimeout) throw new Error("relay did not schedule its initial idle timeout");
+    if (originalTimeout.active) originalTimeout.callback();
 
     expect(adapter.stream?.aborted).toBeUndefined();
     expect(adapter.stream?.parts).toEqual([]);
     expect(bridge.snapshotRelays()).toHaveLength(1);
 
-    await Bun.sleep(30);
+    const refreshedTimeout = scheduled.shift();
+    if (!refreshedTimeout) throw new Error("activity did not refresh the relay idle timeout");
+    if (refreshedTimeout.active) refreshedTimeout.callback();
     expect(adapter.stream?.aborted).toBe("timeout");
     expect(bridge.snapshotRelays()).toHaveLength(0);
 
@@ -473,6 +484,7 @@ describe("bridgeBusToAdapter", () => {
     );
 
     // Relay is async; wait one tick.
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.lastStart?.sessionRef).toEqual({ platform: "discord", channelId: "chan" });
@@ -645,6 +657,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts).toEqual([
@@ -701,6 +714,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const reasoningUpdates =
@@ -759,6 +773,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const reasoningUpdates =
@@ -820,6 +835,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const reasoningUpdates =
@@ -877,6 +893,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.lastStart).not.toBeNull();
@@ -945,6 +962,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.starts.length).toBe(2);
@@ -1011,6 +1029,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams.length).toBe(2);
@@ -1095,6 +1114,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams).toHaveLength(3);
@@ -1151,6 +1171,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams).toHaveLength(1);
@@ -1234,6 +1255,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams).toHaveLength(3);
@@ -1302,6 +1324,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams).toHaveLength(2);
@@ -1378,6 +1401,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams).toHaveLength(2);
@@ -1455,6 +1479,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams).toHaveLength(2);
@@ -1511,6 +1536,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.aborted).toBe("cancel");
@@ -1560,6 +1586,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.typingStops).toBe(1);
@@ -1571,6 +1598,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts).toEqual([{ type: "text.set", text: "Error: boom" }]);
@@ -1620,6 +1648,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.aborted).toBe("skip");
@@ -1677,6 +1706,7 @@ describe("bridgeBusToAdapter", () => {
       { finalText: "NO_REPLY" },
       { headers: { request_id: requestId } },
     );
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(adapter.stream?.aborted).toBe("skip");
@@ -1731,6 +1761,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.aborted).toBe("skip");
@@ -1785,6 +1816,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.aborted).toBe("skip");
@@ -1839,6 +1871,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts).toEqual([
@@ -1893,6 +1926,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const snapshots = bridge.snapshotRelays();
@@ -1963,6 +1997,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const snapshot = bridge.snapshotRelays()[0]!;
@@ -2062,6 +2097,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const snapshot = bridgeA.snapshotRelays()[0]!;
@@ -2093,6 +2129,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapterB.stream?.parts[0]).toEqual({ type: "text.set", text: "a" });
@@ -2160,6 +2197,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts[0]).toEqual({ type: "text.set", text: "a" });
@@ -2211,6 +2249,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "abcdef!" });
@@ -2258,6 +2297,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "abcdefXYZ" });
@@ -2300,6 +2340,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "defg" });
@@ -2344,6 +2385,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "g!" });
@@ -2384,6 +2426,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const snapshot = bridgeA.snapshotRelays()[0]!;
@@ -2407,6 +2450,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     const replayedA =
@@ -2462,6 +2506,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.stream?.aborted).toBe("skip");
@@ -2511,6 +2556,7 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
 
+    // test-wait-justification: bounds the final publish while the test deliberately blocks relay shutdown
     const settled = await Promise.race([
       publishFinal.then(() => "resolved" as const),
       new Promise<"timeout">((resolve) => {
@@ -2593,6 +2639,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.starts).toHaveLength(2);
@@ -2633,6 +2680,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
     expect(adapter.stream).not.toBeNull();
 
@@ -2666,6 +2714,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams[0]?.aborted).toBeUndefined();
@@ -2703,6 +2752,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     await bus.publish(
@@ -2717,6 +2767,7 @@ describe("bridgeBusToAdapter", () => {
       },
     );
 
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((r) => setTimeout(r, 0));
 
     expect(adapter.streams[0]?.aborted).toBe("superseded");

@@ -1998,6 +1998,7 @@ describe("tool-server surface", () => {
         last: { platform: "discord", channelId: "c1", messageId: "m1" },
       });
 
+      // test-wait-justification: gives the hidden transcript a later wall-clock timestamp for recent-write ordering
       await new Promise((resolve) => setTimeout(resolve, 5));
 
       transcriptStore.saveRequestTranscript({
@@ -2094,6 +2095,7 @@ describe("tool-server surface", () => {
         last: { platform: "discord", channelId: "c1", messageId: "m-visible" },
       });
 
+      // test-wait-justification: gives the hidden transcript a later wall-clock timestamp before limit filtering
       await new Promise((resolve) => setTimeout(resolve, 5));
 
       transcriptStore.saveRequestTranscript({

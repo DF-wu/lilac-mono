@@ -83,6 +83,7 @@ describe("tool server health state", () => {
 
     await server.init();
     await server.start(0);
+    // test-wait-justification: allows real event-loop and watchdog samples to produce readiness degradation
     await Bun.sleep(25);
 
     const healthResponse = await server.app.handle(new Request("http://localhost/healthz"));
@@ -226,6 +227,7 @@ describe("tool server health state", () => {
   it("marks unavailable event-loop utilization instead of reporting misleading zeros", async () => {
     const sampler = createRuntimeDiagnosticSampler();
     sampler.start();
+    // test-wait-justification: allows the runtime sampler to collect a real event-loop delay and utilization interval
     await Bun.sleep(25);
     const sample = sampler.sample();
     sampler.stop();

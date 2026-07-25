@@ -11,7 +11,8 @@ async function runBunTest(cwd: string): Promise<{
   const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-workspace-test-data-"));
 
   try {
-    const proc = Bun.spawn(["bun", "test", "--pass-with-no-tests"], {
+    const parallelArgs = cwd === "apps/core" ? ["--parallel=4"] : [];
+    const proc = Bun.spawn(["bun", "test", ...parallelArgs, "--pass-with-no-tests"], {
       cwd,
       env: { ...process.env, DATA_DIR: dataDir },
       stdout: "pipe",
@@ -33,10 +34,23 @@ async function runBunTest(cwd: string): Promise<{
 
 describe("workspace tests", () => {
   it("runs bun tests in each workspace", async () => {
-    const roots = ["apps/core", "apps/acp-controller", "packages/utils", "packages/event-bus"];
+    const roots = [
+      "apps/core",
+      "apps/acp-controller",
+      "apps/mini-lilac",
+      "apps/mini-lilac-server",
+      "apps/mini-lilac-tui",
+      "packages/utils",
+      "packages/event-bus",
+      "packages/mini-lilac-client",
+      "packages/mini-lilac-runtime",
+    ];
 
-    for (const dir of roots) {
-      const res = await runBunTest(dir);
+    const results = await Promise.all(
+      roots.map(async (dir) => ({ dir, res: await runBunTest(dir) })),
+    );
+
+    for (const { dir, res } of results) {
       if (res.exitCode !== 0) {
         throw new Error(
           [
@@ -51,5 +65,5 @@ describe("workspace tests", () => {
     }
 
     expect(true).toBe(true);
-  }, 60_000);
+  }, 120_000);
 });

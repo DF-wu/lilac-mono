@@ -179,6 +179,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for workflow integration");
+    // test-wait-justification: polls integration state produced by independently scheduled workflow and bus workers
     await Bun.sleep(10);
   }
 }

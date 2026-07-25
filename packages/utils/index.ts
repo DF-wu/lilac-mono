@@ -1,5 +1,6 @@
 export * from "./model-capability";
 export * from "./model-provider";
+export * from "./model-message-provider-options";
 export * from "./model-slot";
 export * from "./codex-oauth";
 export * from "./codex-instructions";
@@ -18,3 +19,5 @@ export * from "./runtime-utils";
 export * from "./friendly-units";
 export * from "./ai-error";
 export * from "./subagent-profile";
+export * from "./reasoning-summary";
+export * from "./working-indicators";

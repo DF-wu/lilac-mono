@@ -1135,6 +1135,7 @@ describe("createToolServer", () => {
     );
     expect(await firstCall.json()).toEqual({ isError: false, output: { value: "one" } });
 
+    // test-wait-justification: advances filesystem mtime so explicit reload observes the rewritten plugin bundle
     await Bun.sleep(5);
     await writePluginServerTool({
       dataDir,
@@ -1208,6 +1209,7 @@ describe("createToolServer", () => {
     const server = createToolServer({ pluginManager });
     await server.init();
 
+    // test-wait-justification: advances filesystem mtime so automatic freshness observes the rewritten plugin bundle
     await Bun.sleep(5);
     await writePluginServerTool({
       dataDir,
@@ -1329,6 +1331,7 @@ describe("createToolServer", () => {
 
     await server.init();
     await server.start(0);
+    // test-wait-justification: allows the server health sampler to establish a baseline before rejection injection
     await Bun.sleep(5);
     server.recordUnhandledRejection(new Error("timer exploded"));
 
@@ -1488,6 +1491,7 @@ describe("createToolServer", () => {
       output: "Tool call timed out after 20ms",
     });
 
+    // test-wait-justification: crosses the overdue grace period after the real tool-call timeout fires
     await Bun.sleep(20);
 
     const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
@@ -1553,6 +1557,7 @@ describe("createToolServer", () => {
       output: "sync boom",
     });
 
+    // test-wait-justification: crosses the timeout and overdue grace window to detect leaked synchronous failures
     await Bun.sleep(40);
 
     const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
@@ -1711,6 +1716,7 @@ describe("createToolServer", () => {
     await server.init();
     await server.start(0);
 
+    // test-wait-justification: allows two real watchdog intervals to trigger the configured unhealthy callback
     await Bun.sleep(40);
 
     expect(unhealthySnapshots).toHaveLength(1);

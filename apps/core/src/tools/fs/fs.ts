@@ -14,8 +14,22 @@ import {
   type ReadFileStart,
 } from "@stanley2058/lilac-fs";
 import { createLogger, env } from "@stanley2058/lilac-utils";
+import {
+  createReadFileInstructionClaims,
+  loadReadFileInstructions,
+  READ_FILE_INSTRUCTION_HINT,
+} from "@stanley2058/lilac-coding-tools/instructions";
+import {
+  createEditFileInputSchema,
+  createGrepInputSchema,
+  createReadFileInputSchema,
+  editFileInputSchema as sharedEditFileInputSchema,
+  fuzzySearchInputSchema as sharedFuzzySearchInputSchema,
+  globInputSchema as sharedGlobInputSchema,
+  grepInputSchema as sharedGrepInputSchema,
+  readFileInputSchema as sharedReadFileInputSchema,
+} from "@stanley2058/lilac-coding-tools/schemas";
 import { fileTypeFromBuffer } from "file-type";
-import fsp from "node:fs/promises";
 import path from "node:path";
 
 import {
@@ -35,16 +49,8 @@ import {
   toRemoteDebugPath,
 } from "./remote-fs";
 
-const pathSchema = z
-  .string()
-  .describe(
-    "Path to the file. Relative paths are resolved against the tool root; absolute paths are also supported.",
-  );
-
 const readErrorCodeSchema = z.enum(READ_ERROR_CODES);
 const editErrorCodeSchema = z.enum(EDIT_ERROR_CODES);
-const searchModeSchema = z.enum(["default", "detailed"]);
-const grepModeSchema = z.enum(["default", "detailed", "hashline"]);
 const warningZod = z.object({
   code: z.literal("LINE_TOO_LONG_FOR_HASHLINE"),
   message: z.string(),
@@ -53,9 +59,6 @@ const warningZod = z.object({
   actualLength: z.number(),
 });
 
-const INSTRUCTION_FILENAMES = ["AGENTS.md"] as const;
-const MAX_INSTRUCTION_CHARS = 20_000;
-
 const REMOTE_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
 const FFF_CACHE_DIR = path.join(env.dataDir, ".cache", "fff");
 
@@ -63,183 +66,7 @@ function resolveRemoteDenyPaths(dangerouslyAllow?: boolean): readonly string[] {
   return dangerouslyAllow === true ? [] : REMOTE_DENY_PATHS;
 }
 
-function isPathWithin(candidatePath: string, parentDir: string): boolean {
-  const rel = path.relative(parentDir, candidatePath);
-  if (rel === "") return true;
-  if (rel === "..") return false;
-  if (rel.startsWith(`..${path.sep}`)) return false;
-  return !path.isAbsolute(rel);
-}
-
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fsp.stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readTextFileBestEffort(filePath: string): Promise<string | null> {
-  try {
-    const raw = await fsp.readFile(filePath, "utf8");
-    const trimmed = raw.trim();
-    if (!trimmed) return null;
-    if (trimmed.length <= MAX_INSTRUCTION_CHARS) return trimmed;
-    return trimmed.slice(0, MAX_INSTRUCTION_CHARS) + "\n... (truncated)";
-  } catch {
-    return null;
-  }
-}
-
-async function findGitRoot(startDir: string): Promise<string | null> {
-  let current = path.resolve(startDir);
-  while (true) {
-    if (await pathExists(path.join(current, ".git"))) return current;
-    const parent = path.dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
-}
-
-function parseInstructionPathsFromText(text: string): string[] {
-  const out: string[] = [];
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("Instructions from:")) continue;
-    const p = trimmed.slice("Instructions from:".length).trim();
-    if (p.length > 0) out.push(p);
-  }
-  return out;
-}
-
-function collectPreviouslyLoadedInstructionPaths(messages: readonly unknown[]): Set<string> {
-  const out = new Set<string>();
-
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object" || Array.isArray(msg)) continue;
-    const msgRecord = msg as Record<string, unknown>;
-    if (msgRecord["role"] !== "tool") continue;
-
-    const content = msgRecord["content"];
-    if (!Array.isArray(content)) continue;
-
-    for (const part of content) {
-      if (!part || typeof part !== "object" || Array.isArray(part)) continue;
-      const partRecord = part as Record<string, unknown>;
-      if (partRecord["type"] !== "tool-result") continue;
-      if (partRecord["toolName"] !== "read_file") continue;
-
-      const output = partRecord["output"];
-      if (!output || typeof output !== "object" || Array.isArray(output)) continue;
-      const outputRecord = output as Record<string, unknown>;
-
-      if (outputRecord["type"] === "json") {
-        const value = outputRecord["value"];
-        if (value && typeof value === "object" && !Array.isArray(value)) {
-          const valueRecord = value as Record<string, unknown>;
-          const loaded = valueRecord["loadedInstructions"];
-          if (Array.isArray(loaded)) {
-            for (const p of loaded) {
-              if (typeof p === "string" && p.length > 0) out.add(p);
-            }
-          }
-
-          const instructionsText = valueRecord["instructionsText"];
-          if (typeof instructionsText === "string") {
-            for (const p of parseInstructionPathsFromText(instructionsText)) {
-              out.add(p);
-            }
-          }
-        }
-        continue;
-      }
-
-      if (outputRecord["type"] === "content") {
-        const value = outputRecord["value"];
-        if (!Array.isArray(value)) continue;
-        for (const p of value) {
-          if (!p || typeof p !== "object" || Array.isArray(p)) continue;
-          const pRecord = p as Record<string, unknown>;
-          if (pRecord["type"] !== "text") continue;
-          const t = pRecord["text"];
-          if (typeof t !== "string") continue;
-          for (const loadedPath of parseInstructionPathsFromText(t)) {
-            out.add(loadedPath);
-          }
-        }
-      }
-    }
-  }
-
-  return out;
-}
-
-function buildReadFileInputZod(
-  hashlineEnabled: boolean,
-  readFileDirectAttachmentSupported = false,
-) {
-  return z.object({
-    path: pathSchema.describe(
-      readFileDirectAttachmentSupported
-        ? "Path to a file. Supported images and PDFs are attached to your context for native visual or document analysis. Relative paths are resolved against the tool root; absolute paths are also supported."
-        : "Path to the file. Relative paths are resolved against the tool root; absolute paths are also supported.",
-    ),
-    cwd: z
-      .string()
-      .optional()
-      .describe(
-        "Optional working directory to resolve relative paths against (supports ~). Also supports ssh-style '<host>:<path>' to run on a configured SSH host alias. Defaults to the tool root.",
-      ),
-    start: z
-      .discriminatedUnion("type", [
-        z.object({
-          type: z.literal("offset"),
-          offset: z.number().int().nonnegative(),
-        }),
-        z.object({
-          type: z.literal("line"),
-          line: z.number().int().positive(),
-          column: z.number().int().nonnegative().optional(),
-        }),
-      ])
-      .optional()
-      .describe(
-        "Text files only. Start or continuation position. Use {type:'offset',offset:N} for an absolute Unicode character position, or {type:'line',line:N,column?:N} for a line position. Lines are 1-based; offsets and columns are 0-based.",
-      ),
-    maxLines: z
-      .number()
-      .int()
-      .positive()
-      .optional()
-      .describe("Text files only. Maximum number of lines to return. Defaults to 2000."),
-    maxCharacters: z
-      .number()
-      .int()
-      .positive()
-      .max(40 * 1024)
-      .optional()
-      .describe(
-        "Text files only. Maximum number of characters to return (max: 40960). Defaults to 10000.",
-      ),
-    format: (hashlineEnabled
-      ? z.enum(["raw", "numbered", "hashline"])
-      : z.enum(["raw", "numbered"])
-    )
-      .optional()
-      .describe(
-        hashlineEnabled
-          ? "Text files only. Output format. Default is raw. Use 'hashline' before edit_file when you need stable edit anchors."
-          : "Text files only. Output format. Default is raw (no line numbers). 'numbered' is for display only.",
-      ),
-    dangerouslyAllow: z
-      .boolean()
-      .optional()
-      .describe("Bypass filesystem denylist guardrails for this call."),
-  });
-}
-
-export const readFileInputZod = buildReadFileInputZod(false);
+export const readFileInputZod = sharedReadFileInputSchema;
 
 type ReadFileInput = {
   path: string;
@@ -262,35 +89,7 @@ const globEntryTypeSchema = z.enum([
   "unknown",
 ]);
 
-export const globInputZod = z.object({
-  patterns: z
-    .array(z.string().min(1))
-    .min(1)
-    .max(100)
-    .describe("Glob patterns (supports include + negate patterns)"),
-  cwd: z
-    .string()
-    .optional()
-    .describe(
-      "Optional base directory to search from (supports ~). Also supports ssh-style '<host>:<path>' to run on a configured SSH host alias. Defaults to the tool root.",
-    ),
-  maxEntries: z
-    .number()
-    .int()
-    .positive()
-    .max(10_000)
-    .optional()
-    .describe("Maximum number of matched paths to return (default: 100)."),
-  mode: searchModeSchema
-    .optional()
-    .describe(
-      "Output mode. Recommended: 'default'. Use 'detailed' only when you need file type/size metadata.",
-    ),
-  dangerouslyAllow: z
-    .boolean()
-    .optional()
-    .describe("Bypass filesystem denylist guardrails for this call."),
-});
+export const globInputZod = sharedGlobInputSchema;
 
 type GlobInput = z.infer<typeof globInputZod>;
 
@@ -319,23 +118,7 @@ const globOutputZod = z.discriminatedUnion("mode", [
 
 type GlobOutput = z.infer<typeof globOutputZod>;
 
-export const fuzzySearchInputZod = z.object({
-  query: z
-    .string()
-    .min(1)
-    .describe(
-      "Approximate filename/path query. Use this for fuzzy path discovery, not file content search.",
-    ),
-  cwd: z.string().optional().describe("Optional base directory to search from (supports ~)."),
-  maxResults: z
-    .number()
-    .int()
-    .positive()
-    .max(10_000)
-    .optional()
-    .describe("Maximum number of ranked files to return (default: 50)."),
-  dangerouslyAllow: z.boolean().optional().describe("Bypass filesystem denylist guardrails."),
-});
+export const fuzzySearchInputZod = sharedFuzzySearchInputSchema;
 
 type FuzzySearchInput = z.infer<typeof fuzzySearchInputZod>;
 
@@ -359,53 +142,7 @@ const fuzzySearchOutputZod = z.object({
 
 type FuzzySearchOutput = z.infer<typeof fuzzySearchOutputZod>;
 
-function buildGrepInputZod(hashlineEnabled: boolean) {
-  return z.object({
-    pattern: z.string().min(1).describe("Search pattern. Literal by default unless regex=true."),
-    cwd: z
-      .string()
-      .optional()
-      .describe(
-        "Optional base directory to search from (supports ~). Also supports ssh-style '<host>:<path>' to run on a configured SSH host alias. Defaults to the tool root.",
-      ),
-    regex: z
-      .boolean()
-      .optional()
-      .describe("Treat pattern as regex when true. Default is false (literal)."),
-    maxResults: z
-      .number()
-      .int()
-      .positive()
-      .max(10_000)
-      .optional()
-      .describe("Maximum number of matches to return (default: 100)."),
-    fileExtensions: z
-      .array(z.string().min(1))
-      .max(100)
-      .optional()
-      .describe('Optional file extension filters (e.g. ["ts", "tsx"]).'),
-    includeContextLines: z
-      .number()
-      .int()
-      .nonnegative()
-      .max(100)
-      .optional()
-      .describe("Include N context lines around each match."),
-    mode: (hashlineEnabled ? grepModeSchema : searchModeSchema)
-      .optional()
-      .describe(
-        hashlineEnabled
-          ? "Output mode. Recommended: 'default'. Use 'hashline' when you want grep output that can be turned into edit anchors. Use 'detailed' only when you need column/submatches metadata."
-          : "Output mode. Recommended: 'default'. Use 'detailed' only when you need column/submatches metadata.",
-      ),
-    dangerouslyAllow: z
-      .boolean()
-      .optional()
-      .describe("Bypass filesystem denylist guardrails for this call."),
-  });
-}
-
-export const grepInputZod = buildGrepInputZod(false);
+export const grepInputZod = sharedGrepInputSchema;
 
 type GrepInput = {
   pattern: string;
@@ -530,102 +267,7 @@ type GrepOutput =
       truncationHint?: string;
     };
 
-const expectedMatchesSchema = z.union([z.literal("any"), z.number().int().positive()]);
-const hashlineEditSchema = z.discriminatedUnion("op", [
-  z.object({
-    op: z.literal("replace"),
-    pos: z
-      .string()
-      .min(1)
-      .describe("Starting hashline anchor from read_file/grep hashline output."),
-    end: z
-      .string()
-      .min(1)
-      .optional()
-      .describe("Optional ending hashline anchor for multi-line replace."),
-    lines: z
-      .union([z.string(), z.array(z.string()), z.null()])
-      .optional()
-      .describe("Replacement lines. Prefer an array of lines; null or [] deletes the range."),
-  }),
-  z.object({
-    op: z.literal("append"),
-    pos: z.string().min(1).describe("Hashline anchor after which to insert."),
-    lines: z
-      .union([z.string(), z.array(z.string()), z.null()])
-      .optional()
-      .describe("Lines to insert after the anchor."),
-  }),
-  z.object({
-    op: z.literal("prepend"),
-    pos: z.string().min(1).describe("Hashline anchor before which to insert."),
-    lines: z
-      .union([z.string(), z.array(z.string()), z.null()])
-      .optional()
-      .describe("Lines to insert before the anchor."),
-  }),
-]);
-
-function buildEditFileInputZod(hashlineEnabled: boolean) {
-  if (hashlineEnabled) {
-    return z.object({
-      path: pathSchema,
-      cwd: z
-        .string()
-        .optional()
-        .describe(
-          "Optional working directory (supports ~). Also supports ssh-style '<host>:<path>' to run on a configured SSH host alias.",
-        ),
-      edits: z
-        .array(hashlineEditSchema)
-        .min(1)
-        .describe("Batch all hashline edits for the file into one call."),
-      expectedHash: z
-        .string()
-        .optional()
-        .describe(
-          "Optional optimistic concurrency hash from read_file. If omitted, edit_file requires a prior read in the same tool session.",
-        ),
-      dangerouslyAllow: z
-        .boolean()
-        .optional()
-        .describe("Bypass filesystem denylist guardrails for this call."),
-    });
-  }
-
-  return z.object({
-    path: pathSchema,
-    cwd: z
-      .string()
-      .optional()
-      .describe(
-        "Optional working directory (supports ~). Also supports ssh-style '<host>:<path>' to run on a configured SSH host alias.",
-      ),
-    oldText: z
-      .string()
-      .min(1)
-      .describe("Exact text to find and replace. Must uniquely match by default."),
-    newText: z.string().describe("Replacement text."),
-    matching: z.enum(["exact", "regex"]).optional().describe("Matching mode. Default: exact."),
-    replaceAll: z
-      .boolean()
-      .optional()
-      .describe("Replace all matches when true. Default: false (single replacement)."),
-    expectedMatches: expectedMatchesSchema
-      .optional()
-      .describe("Expected number of matches. Default: 1 when replaceAll=false, otherwise 'any'."),
-    expectedHash: z
-      .string()
-      .optional()
-      .describe("Optional optimistic concurrency hash from read_file."),
-    dangerouslyAllow: z
-      .boolean()
-      .optional()
-      .describe("Bypass filesystem denylist guardrails for this call."),
-  });
-}
-
-export const editFileInputZod = buildEditFileInputZod(false);
+export const editFileInputZod = sharedEditFileInputSchema;
 
 type LegacyEditFileInput = {
   path: string;
@@ -1064,23 +706,27 @@ export function fsTool(
   const readFileDirectAttachmentSupported = opts?.readFileDirectAttachmentSupported === true;
   const maxOutputBytes = opts?.maxOutputBytes ?? 40 * 1024;
   const maxInlineMediaBytesPerPart = opts?.maxInlineMediaBytesPerPart ?? 10 * 1024 * 1024;
-  const readFileSchema = buildReadFileInputZod(hashlineEnabled, readFileDirectAttachmentSupported);
+  const readFileSchema = createReadFileInputSchema({
+    hashlineEnabled,
+    directAttachmentSupported: readFileDirectAttachmentSupported,
+  });
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
-  const grepInputSchema = buildGrepInputZod(hashlineEnabled);
+  const grepInputSchema = createGrepInputSchema(hashlineEnabled);
   const grepOutputSchema = buildGrepOutputZod(hashlineEnabled);
-  const editFileSchema = buildEditFileInputZod(hashlineEnabled);
+  const editFileSchema = createEditFileInputSchema(hashlineEnabled);
 
   const toolRootAbs = path.resolve(expandTilde(cwd));
 
+  const denyPaths = [
+    path.join(env.dataDir, "secret"),
+    path.join(env.dataDir, "tool-results"),
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    ...(opts?.denyPaths ?? []),
+  ];
   const fileSystem = new FileSystem(cwd, {
-    denyPaths: [
-      path.join(env.dataDir, "secret"),
-      path.join(env.dataDir, "tool-results"),
-      "~/.ssh",
-      "~/.aws",
-      "~/.gnupg",
-      ...(opts?.denyPaths ?? []),
-    ],
+    denyPaths,
     fsBackend,
     fffCacheDir: FFF_CACHE_DIR,
   });
@@ -1099,6 +745,7 @@ export function fsTool(
       fileHash: string;
     }
   >();
+  const instructionClaims = createReadFileInstructionClaims();
 
   function buildReadFileDescription(): string {
     const parts = [
@@ -1122,6 +769,7 @@ export function fsTool(
     parts.push(
       "Use maxCharacters with either absolute offset or line/column start positions to page through text resources. Absolute offsets count Unicode characters including newlines. Reuse nextStart unchanged to continue.",
     );
+    parts.push(READ_FILE_INSTRUCTION_HINT);
     parts.push("Denylisted paths require dangerouslyAllow=true.");
     return parts.join(" ");
   }
@@ -1204,63 +852,6 @@ export function fsTool(
       (o["format"] === "raw" || o["format"] === "numbered" || o["format"] === "hashline") &&
       typeof o["resolvedPath"] === "string"
     );
-  }
-
-  async function loadInstructionsForPath(params: {
-    resolvedPath: string;
-    opCwd?: string;
-    messages: readonly unknown[];
-  }): Promise<{ loaded: string[]; text?: string } | null> {
-    const targetAbs = path.resolve(params.resolvedPath);
-
-    const targetBase = path.basename(targetAbs);
-    if ((INSTRUCTION_FILENAMES as readonly string[]).includes(targetBase)) {
-      return null;
-    }
-
-    const opCwdAbs = params.opCwd ? path.resolve(expandTilde(params.opCwd)) : toolRootAbs;
-
-    const boundaryCwd = isPathWithin(targetAbs, opCwdAbs) ? opCwdAbs : null;
-    const gitRoot = boundaryCwd ? null : await findGitRoot(opCwdAbs);
-    const boundaryAbs = boundaryCwd ?? gitRoot;
-
-    if (!boundaryAbs) return null;
-    if (!isPathWithin(targetAbs, boundaryAbs)) return null;
-
-    const already = collectPreviouslyLoadedInstructionPaths(params.messages);
-    const loaded: string[] = [];
-    const snippets: string[] = [];
-
-    let current = path.dirname(targetAbs);
-    while (true) {
-      for (const name of INSTRUCTION_FILENAMES) {
-        const candidate = path.join(current, name);
-        if (candidate === targetAbs) continue;
-        if (already.has(candidate)) continue;
-        if (!(await pathExists(candidate))) continue;
-
-        const content = await readTextFileBestEffort(candidate);
-        if (!content) continue;
-
-        loaded.push(candidate);
-        already.add(candidate);
-        snippets.push(`Instructions from: ${candidate}\n${content}`);
-      }
-
-      if (current === boundaryAbs) break;
-      const parent = path.dirname(current);
-      if (parent === current) break;
-      current = parent;
-
-      if (!isPathWithin(current, boundaryAbs)) break;
-    }
-
-    if (loaded.length === 0) return null;
-
-    return {
-      loaded,
-      text: ["<system-reminder>", snippets.join("\n\n"), "</system-reminder>"].join("\n"),
-    };
   }
 
   const baseTools = {
@@ -1439,10 +1030,13 @@ export function fsTool(
                 fileHash: bytesRes.fileHash,
               });
 
-              const instructions = await loadInstructionsForPath({
+              const instructions = await loadReadFileInstructions({
                 resolvedPath,
-                opCwd,
+                requestedPath: input.path,
+                cwd: opCwd ?? toolRootAbs,
                 messages: options.messages,
+                denyPaths,
+                claimedInstructionPaths: instructionClaims.forMessages(options.messages),
               });
 
               return {
@@ -1509,10 +1103,13 @@ export function fsTool(
             return resQualified;
           }
           if (opts?.loadInstructions === false) return resQualified;
-          const instructions = await loadInstructionsForPath({
+          const instructions = await loadReadFileInstructions({
             resolvedPath: resQualified.resolvedPath,
-            opCwd,
+            requestedPath: input.path,
+            cwd: opCwd ?? toolRootAbs,
             messages: options.messages,
+            denyPaths,
+            claimedInstructionPaths: instructionClaims.forMessages(options.messages),
           });
           if (!instructions) return resQualified;
           return {

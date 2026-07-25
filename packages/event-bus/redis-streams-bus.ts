@@ -358,14 +358,27 @@ export class RedisStreamsBus implements RawBus {
 
     const timer = setTimeout(() => {
       this.trimTimers.delete(streamKey);
-      const activeTrim = this.trimAcknowledgedPrefix(topic, streamKey).catch((e: unknown) => {
-        this.logger.error("event_bus.trim_failed", { topic }, e);
-      });
-      this.activeTrims.add(activeTrim);
-      void activeTrim.finally(() => this.activeTrims.delete(activeTrim));
+      this.startAcknowledgedTrim(topic, streamKey);
     }, TRIM_DEBOUNCE_MS);
     timer.unref?.();
     this.trimTimers.set(streamKey, timer);
+  }
+
+  private startAcknowledgedTrim(topic: Topic, streamKey: string): void {
+    const activeTrim = this.trimAcknowledgedPrefix(topic, streamKey).catch((e: unknown) => {
+      this.logger.error("event_bus.trim_failed", { topic }, e);
+    });
+    this.activeTrims.add(activeTrim);
+    void activeTrim.finally(() => this.activeTrims.delete(activeTrim));
+  }
+
+  async flushPendingTrims(): Promise<void> {
+    for (const [streamKey, timer] of this.trimTimers) {
+      clearTimeout(timer);
+      this.trimTimers.delete(streamKey);
+      this.startAcknowledgedTrim(streamKey.slice(this.keyPrefix.length + 1), streamKey);
+    }
+    await Promise.allSettled(this.activeTrims);
   }
 
   private async trimAcknowledgedPrefix(topic: Topic, streamKey: string): Promise<void> {

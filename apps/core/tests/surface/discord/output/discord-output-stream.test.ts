@@ -40,17 +40,20 @@ describe("compact subagent progress", () => {
     return lines.map((line) => line.replaceAll("\\", ""));
   }
 
-  it("keeps detailed reasoning and progress within the shared five-line body", () => {
+  it("keeps detailed reasoning visible alongside all five action rows", () => {
     const value = buildProgressFieldValue({
-      reasoningValue: "> reason one\n> reason two\n> reason three",
-      actionsValue: "action one\naction two\nagent one",
+      reasoningValue: "> **Inspecting**\n> reasoning detail",
+      actionsValue: "action one\naction two\naction three\naction four\nagent one",
     });
 
     expect(value.split("\n")).toEqual([
-      "> reason one",
+      "> **Inspecting**",
+      "> reasoning detail",
       "",
       "action one",
       "action two",
+      "action three",
+      "action four",
       "agent one",
     ]);
   });
@@ -221,7 +224,10 @@ describe("compact subagent progress", () => {
   });
 });
 
-function createFakeDiscordClient(opts?: { failEditWithFiles?: boolean }): {
+function createFakeDiscordClient(opts?: {
+  failEditWithFiles?: boolean;
+  onEdit?: (options: unknown) => void;
+}): {
   client: Client;
   createdMessageIds: string[];
   deletedMessageIds: string[];
@@ -318,6 +324,7 @@ function createFakeDiscordClient(opts?: { failEditWithFiles?: boolean }): {
       attachments,
       edit: async (options) => {
         operations.push({ kind: "edit", messageId: id, options });
+        opts?.onEdit?.(options);
         if (opts?.failEditWithFiles && fileCountFromOptions(options) > 0) {
           throw new Error("edit failed");
         }
@@ -457,7 +464,17 @@ function makeAttachment(index: number): SurfaceAttachment {
 
 describe("Discord compact progress integration", () => {
   it("keeps agents in the Working field and removes progress on completion", async () => {
-    const { client, operations } = createFakeDiscordClient();
+    let resolveStreamingEdit: (options: unknown) => void = () => {};
+    const streamingEdit = new Promise<unknown>((resolve) => {
+      resolveStreamingEdit = resolve;
+    });
+    const { client, operations } = createFakeDiscordClient({
+      onEdit: (options) => {
+        if (embedFieldValuesFromOptions(options).some((value) => value.includes("bash bun test"))) {
+          resolveStreamingEdit(options);
+        }
+      },
+    });
     const out = new DiscordOutputStream({
       client,
       sessionRef: { platform: "discord", channelId: "chan" },
@@ -490,9 +507,8 @@ describe("Discord compact progress integration", () => {
       },
     });
 
-    await Bun.sleep(300);
-    const streamingEdit = operations.filter((operation) => operation.kind === "edit").at(-1);
-    const streamingValues = embedFieldValuesFromOptions(streamingEdit?.options).map((value) =>
+    const streamingEditOptions = await streamingEdit;
+    const streamingValues = embedFieldValuesFromOptions(streamingEditOptions).map((value) =>
       value.replaceAll("\\", ""),
     );
     expect(streamingValues).toHaveLength(1);
@@ -954,6 +970,57 @@ describe("experimental markdown table rendering", () => {
 });
 
 describe("reasoning display helpers", () => {
+  function getReasoningPresentation(
+    mode: "simple" | "detailed",
+    detailText: string,
+  ): { title: string; detail: string | null } {
+    const { client } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: mode,
+      workingIndicators: ["Working"],
+    });
+    Reflect.set(out as object, "hasReasoningStatus", true);
+    Reflect.set(out as object, "reasoningDetailText", detailText);
+
+    const getProgressTitle = Reflect.get(out as object, "getProgressTitle");
+    const getReasoningValue = Reflect.get(out as object, "getReasoningValue");
+    if (typeof getProgressTitle !== "function" || typeof getReasoningValue !== "function") {
+      throw new Error("reasoning presentation methods are unavailable");
+    }
+    return {
+      title: getProgressTitle.call(out) as string,
+      detail: getReasoningValue.call(out) as string | null,
+    };
+  }
+
+  it("keeps the working indicator and shows a detailed title-only summary", () => {
+    const presentation = getReasoningPresentation("detailed", "**Inspecting the stream**");
+
+    expect(presentation.title).toContain("Working");
+    expect(presentation.detail).toBe("> **Inspecting the stream**");
+  });
+
+  it("keeps the working indicator and blockquotes the full detailed summary", () => {
+    const presentation = getReasoningPresentation(
+      "detailed",
+      "**Inspecting the stream**\n\nChecking event ordering.",
+    );
+
+    expect(presentation.title).toContain("Working");
+    expect(presentation.detail).toBe("> **Inspecting the stream**\n> \n> Checking event ordering.");
+  });
+
+  it("keeps the working indicator and hides the detail body in simple mode", () => {
+    const presentation = getReasoningPresentation("simple", "**Inspecting the stream**");
+
+    expect(presentation.title).toContain("Working");
+    expect(presentation.detail).toBeNull();
+  });
+
   it("clamps long reasoning output and preserves leading content", () => {
     expect(clampReasoningDetail("0123456789", 4)).toBe("012…");
   });

@@ -1350,13 +1350,19 @@ describe("conversation thread store", () => {
 
     let active = 0;
     let maxActive = 0;
+    const pendingSummaries: Array<() => void> = [];
     const service = new ConversationThreadService({
       store: threadStore,
       getConfig: async () => testConfigWithThreadConcurrency(2),
       summarizer: async ({ threadId }) => {
         active += 1;
         maxActive = Math.max(maxActive, active);
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        const gate = Promise.withResolvers<void>();
+        pendingSummaries.push(gate.resolve);
+        if (pendingSummaries.length === 2) {
+          for (const resolve of pendingSummaries.splice(0)) resolve();
+        }
+        await gate.promise;
         active -= 1;
         return {
           title: threadId,
@@ -1398,12 +1404,19 @@ describe("conversation thread store", () => {
       ]).flat(),
     );
 
+    const pendingSummaries: Array<{ index: number; resolve: () => void }> = [];
     const service = new ConversationThreadService({
       store: threadStore,
       getConfig: async () => testConfigWithThreadConcurrency(16),
       summarizer: async ({ threadId }) => {
         const index = Number(threadId.match(/scheduled-(\d+)-1$/u)?.[1] ?? "0");
-        await Bun.sleep(threadCount - index);
+        const gate = Promise.withResolvers<void>();
+        pendingSummaries.push({ index, resolve: gate.resolve });
+        if (pendingSummaries.length === threadCount) {
+          pendingSummaries.sort((left, right) => right.index - left.index);
+          for (const pending of pendingSummaries) pending.resolve();
+        }
+        await gate.promise;
         return {
           title: `Summary for ${threadId}`,
           brief: `Summary for ${threadId}`,

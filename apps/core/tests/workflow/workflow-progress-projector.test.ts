@@ -279,6 +279,7 @@ describe("WorkflowProgressProjector", () => {
     try {
       createInvocation(store, false);
       projector.requestProjection("run-1");
+      // test-wait-justification: allows an asynchronously requested null-target projection to be ignored
       await Bun.sleep(20);
       expect(store.getSurfaceBinding("run-1")).toBeNull();
       expect(adapter.sends).toBe(0);
@@ -363,6 +364,7 @@ describe("WorkflowProgressProjector", () => {
       );
       projector.requestProjection("run-1");
       projector.requestProjection("run-1");
+      // test-wait-justification: crosses the real coalescing window before asserting one projected edit
       await Bun.sleep(30);
       expect(adapter.edits).toBe(1);
       expect(adapter.contents.at(-1)?.text).toContain("**Running**");
@@ -467,6 +469,7 @@ describe("WorkflowProgressProjector", () => {
         attempt < 100 && store.getSurfaceBinding("run-1")?.lastError !== null;
         attempt += 1
       ) {
+        // test-wait-justification: polls for the projector's independently scheduled persisted retry
         await Bun.sleep(5);
       }
       expect(adapter.reads).toBe(2);
@@ -514,6 +517,7 @@ describe("WorkflowProgressProjector", () => {
       await projector.start();
       now = 1_100;
       for (let attempt = 0; attempt < 100 && adapter.sends === 0; attempt += 1) {
+        // test-wait-justification: polls for the projector's independently scheduled initial-card retry
         await Bun.sleep(5);
       }
       expect(adapter.sends).toBe(1);
@@ -689,6 +693,7 @@ describe("WorkflowProgressProjector", () => {
       const stopping = projector.stop().then(() => {
         stopped = true;
       });
+      // test-wait-justification: verifies shutdown remains pending while a real in-flight projection is blocked
       await Bun.sleep(10);
       expect(stopped).toBe(false);
       adapter.release();

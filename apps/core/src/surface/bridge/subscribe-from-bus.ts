@@ -32,6 +32,11 @@ function getConsumerId(prefix: string): string {
   return `${prefix}:${process.pid}:${Math.random().toString(16).slice(2)}`;
 }
 
+function scheduleTimeout(callback: () => void, delayMs: number): () => void {
+  const timeout = setTimeout(callback, delayMs);
+  return () => clearTimeout(timeout);
+}
+
 function isTypingIndicatorProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & TypingIndicatorProvider {
@@ -229,13 +234,21 @@ export async function bridgeBusToAdapter(params: {
   platform: "discord" | "github";
   subscriptionId: string;
   idleTimeoutMs?: number;
+  scheduleIdleTimeout?: (callback: () => void, delayMs: number) => () => void;
   transcriptStore?: TranscriptStore;
 }) {
   const logger = createLogger({
     module: "bridge:bus-to-adapter",
   });
 
-  const { adapter, bus, platform, subscriptionId, idleTimeoutMs = 60 * 60 * 1000 } = params;
+  const {
+    adapter,
+    bus,
+    platform,
+    subscriptionId,
+    idleTimeoutMs = 60 * 60 * 1000,
+    scheduleIdleTimeout = scheduleTimeout,
+  } = params;
 
   const activeRelays = new Map<string, ActiveRelay>();
   const terminalLifecycleByRequestId = new Map<string, number>();
@@ -755,10 +768,10 @@ export async function bridgeBusToAdapter(params: {
       }
     };
 
-    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let cancelTimeout: (() => void) | null = null;
     const bumpTimeout = () => {
-      if (timeout) clearTimeout(timeout);
-      timeout = setTimeout(() => {
+      cancelTimeout?.();
+      cancelTimeout = scheduleIdleTimeout(() => {
         logger.warn("reply relay idle timeout", {
           requestId,
           sessionId,
@@ -828,10 +841,8 @@ export async function bridgeBusToAdapter(params: {
       activeRelays.delete(requestId);
       terminalLifecycleByRequestId.delete(requestId);
 
-      if (timeout) {
-        clearTimeout(timeout);
-        timeout = null;
-      }
+      cancelTimeout?.();
+      cancelTimeout = null;
       await stopTyping();
 
       const subToStop = outputSub;
