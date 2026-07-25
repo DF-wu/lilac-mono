@@ -1,4 +1,5 @@
 import type { AtomicToolExecutionOutcome } from "@stanley2058/lilac-agent";
+import { claudeCodeExecutableSettings } from "@stanley2058/lilac-utils";
 import type { LanguageModel, ToolSet } from "ai";
 import {
   createClaudeCode,
@@ -9,6 +10,8 @@ import {
 
 import {
   createClaudeCodeToolBridge,
+  validateClaudeCodeBuiltInTools,
+  type ClaudeCodeBuiltInTool,
   type ClaudeCodeToolExecutionRequest,
 } from "./claude-code-tools";
 
@@ -32,11 +35,21 @@ export async function materializeClaudeCodeRun(options: {
   cwd: string;
   tools: ToolSet;
   execute(request: ClaudeCodeToolExecutionRequest): Promise<AtomicToolExecutionOutcome>;
+  /**
+   * Claude built-in tools this run may call. Applied to the agent model only;
+   * the utility model is always tool-free so a summarization prompt cannot
+   * reach the network.
+   */
+  builtInTools?: readonly ClaudeCodeBuiltInTool[];
   createModel?: CreateClaudeCodeModel;
 }): Promise<MaterializedClaudeCodeRun> {
+  // Validated here as well as in the bridge, because this array also reaches
+  // the Agent SDK's own built-in allowlist.
+  const builtInTools = validateClaudeCodeBuiltInTools(options.builtInTools);
   const bridge = await createClaudeCodeToolBridge({
     tools: options.tools,
     execute: options.execute,
+    builtInTools,
   });
   const createModel =
     options.createModel ??
@@ -47,6 +60,7 @@ export async function materializeClaudeCodeRun(options: {
         persistSession: false,
       },
     });
+  const executable = claudeCodeExecutableSettings();
   let injector: MessageInjector | null = null;
   let controller: ClaudeCodeQueryController | null = null;
   let disposed = false;
@@ -78,8 +92,9 @@ export async function materializeClaudeCodeRun(options: {
 
   try {
     const agentModel = createModel(options.modelId, {
+      ...executable,
       cwd: options.cwd,
-      tools: [],
+      tools: builtInTools,
       settingSources: [],
       persistSession: false,
       mcpServers: bridge.mcpServers,
@@ -97,6 +112,7 @@ export async function materializeClaudeCodeRun(options: {
       },
     });
     const utilityModel = createModel(options.modelId, {
+      ...executable,
       cwd: options.cwd,
       tools: [],
       settingSources: [],

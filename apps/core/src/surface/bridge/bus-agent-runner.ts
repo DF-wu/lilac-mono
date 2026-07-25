@@ -46,6 +46,7 @@ import {
   AgentIdleTimeoutError,
   AiSdkPiAgent,
   attachAutoCompaction,
+  buildSafeRecoveryCheckpoint,
   buildSyntheticToolCallId,
   createAgentRunIdleWatchdog,
   type AiSdkPiAgentEvent,
@@ -91,7 +92,6 @@ import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
-import { buildSafeRecoveryCheckpoint } from "./recovery-checkpoint";
 import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
@@ -137,7 +137,7 @@ import {
   materializeClaudeCodeRun,
   type ClaudeCodeRunControl,
   type MaterializedClaudeCodeRun,
-} from "./bus-agent-runner/claude-code-run";
+} from "@stanley2058/lilac-claude-code-bridge";
 import {
   buildInputCompositionLine,
   buildNoAssistantTextError,
@@ -3044,6 +3044,8 @@ export async function startBusAgentRunner(params: {
             modelId: resolved.modelId,
             cwd: executionCwd,
             tools,
+            // Core admits no Claude built-ins; Lilac remains the only tool source.
+            builtInTools: [],
             execute: async (request) => {
               if (!activeAgent) {
                 throw new Error("Claude Code tool execution started before the agent was ready");

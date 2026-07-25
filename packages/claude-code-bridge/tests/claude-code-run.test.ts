@@ -1,9 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import { claudeCodeExecutableSettings } from "@stanley2058/lilac-utils";
 import { tool } from "ai";
 import { createClaudeCode, type ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
 import { z } from "zod";
 
-import { materializeClaudeCodeRun } from "../../../src/surface/bridge/bus-agent-runner/claude-code-run";
+import { materializeClaudeCodeRun } from "../claude-code-run";
 
 describe("materializeClaudeCodeRun", () => {
   it("isolates the tool-enabled agent model from the no-tools utility model", async () => {
@@ -48,11 +49,16 @@ describe("materializeClaudeCodeRun", () => {
     expect(settings[0]?.onStreamStart).toBeFunction();
     expect(settings[0]?.onQueryControllerCreated).toBeFunction();
     expect(settings[1]).toEqual({
+      ...claudeCodeExecutableSettings(),
       cwd,
       tools: [],
       settingSources: [],
       persistSession: false,
     });
+    // Both models must target the same Claude installation.
+    expect(settings[0]?.pathToClaudeCodeExecutable).toBe(
+      settings[1]?.pathToClaudeCodeExecutable as string | undefined,
+    );
 
     const injected: string[] = [];
     let closed = false;
@@ -77,6 +83,29 @@ describe("materializeClaudeCodeRun", () => {
     await run.dispose();
     expect(closed).toBe(true);
     expect(run.control.inject("too late")).toBe(false);
+    await run.dispose();
+  });
+
+  it("applies the built-in allowlist to the agent model only", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const provider = createClaudeCode();
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd: process.cwd(),
+      tools: { read: tool({ inputSchema: z.object({}), execute: () => "value" }) },
+      builtInTools: ["WebSearch"],
+      execute: () => {
+        throw new Error("not called");
+      },
+      createModel: (modelId, modelSettings) => {
+        settings.push(modelSettings);
+        return provider(modelId, modelSettings);
+      },
+    });
+
+    expect(settings[0]?.tools).toEqual(["WebSearch"]);
+    expect(settings[1]?.tools).toEqual([]);
+
     await run.dispose();
   });
 });

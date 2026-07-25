@@ -2,13 +2,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { tool } from "ai";
+import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
-import {
-  createClaudeCodeToolBridge,
-  displayClaudeCodeToolName,
-} from "../../../src/surface/bridge/bus-agent-runner/claude-code-tools";
+import { createClaudeCodeToolBridge, displayClaudeCodeToolName } from "../claude-code-tools";
 
 const closeCallbacks: Array<() => Promise<void>> = [];
 
@@ -133,6 +130,87 @@ describe("Claude Code tool bridge", () => {
       { type: "text", text: "toolu_a" },
       { type: "text", text: "toolu_b" },
     ]);
+  });
+
+  it("skips provider-executed tools the model runs itself", async () => {
+    const bridge = await createClaudeCodeToolBridge({
+      tools: {
+        local: tool({ inputSchema: z.object({}), execute: () => "ran" }),
+        // A native web search: the provider runs it, so there is nothing for
+        // the bridge to expose.
+        websearch: {
+          ...tool({ inputSchema: z.object({}) }),
+          isProviderExecuted: true,
+        } as unknown as ToolSet[string],
+      },
+      execute: async () => {
+        throw new Error("unreachable");
+      },
+    });
+    const client = await connectBridge(bridge);
+
+    expect(bridge.exposedToolNames).toEqual(["local"]);
+    expect((await client.listTools()).tools.map((entry) => entry.name)).toEqual(["local"]);
+    expect(
+      await bridge.canUseTool("mcp__lilac__websearch", {}, permissionOptions("toolu_skip")),
+    ).toMatchObject({ behavior: "deny" });
+  });
+
+  it("names the tool when a Lilac tool cannot be executed at all", async () => {
+    // Not provider-executed, just broken: that is a toolset bug and must not
+    // silently remove the tool from the model's reach.
+    await expect(
+      createClaudeCodeToolBridge({
+        tools: { broken: tool({ inputSchema: z.object({}) }) },
+        execute: async () => {
+          throw new Error("unreachable");
+        },
+      }),
+    ).rejects.toThrow("Cannot expose Claude MCP tool 'broken': execute is missing");
+  });
+
+  it("rejects built-ins outside the vetted set even when typechecking is bypassed", async () => {
+    await expect(
+      createClaudeCodeToolBridge({
+        tools: { local: tool({ inputSchema: z.object({}), execute: () => "ran" }) },
+        execute: async () => {
+          throw new Error("unreachable");
+        },
+        builtInTools: ["Bash"] as unknown as ["WebSearch"],
+      }),
+    ).rejects.toThrow("Claude built-in tool 'Bash' is not supported");
+  });
+
+  it("allows only exactly allowlisted built-ins and denies every other Claude tool", async () => {
+    const bridge = await createClaudeCodeToolBridge({
+      tools: { local: tool({ inputSchema: z.object({}), execute: () => "ran" }) },
+      execute: async () => {
+        throw new Error("unreachable");
+      },
+      builtInTools: ["WebSearch"],
+    });
+
+    expect(
+      await bridge.canUseTool("WebSearch", { query: "lilac" }, permissionOptions("toolu_search")),
+    ).toEqual({ behavior: "allow", updatedInput: { query: "lilac" } });
+    for (const denied of ["Bash", "WebFetch", "WebSearchExtra", "websearch"]) {
+      expect(
+        await bridge.canUseTool(denied, {}, permissionOptions(`toolu_${denied}`)),
+      ).toMatchObject({ behavior: "deny" });
+    }
+  });
+
+  it("denies built-ins when no allowlist is supplied", async () => {
+    const bridge = await createClaudeCodeToolBridge({
+      tools: { local: tool({ inputSchema: z.object({}), execute: () => "ran" }) },
+      execute: async () => {
+        throw new Error("unreachable");
+      },
+    });
+
+    expect(await bridge.canUseTool("WebSearch", {}, permissionOptions("toolu_x"))).toMatchObject({
+      behavior: "deny",
+    });
   });
 
   it("formats only the Lilac MCP namespace for display", () => {

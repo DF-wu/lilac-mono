@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { ModelMessage } from "ai";
 
-import { buildSafeRecoveryCheckpoint } from "../../../src/surface/bridge/recovery-checkpoint";
+import { buildSafeRecoveryCheckpoint } from "../recovery-checkpoint";
 
 describe("buildSafeRecoveryCheckpoint", () => {
   it("keeps complete transcripts unchanged", () => {

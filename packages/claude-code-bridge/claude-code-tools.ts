@@ -42,6 +42,30 @@ export type ClaudeCodeToolBridge = {
   close(): Promise<void>;
 };
 
+/**
+ * Claude built-in tools a surface may re-enable. Anything else is rejected
+ * before it can reach the Agent SDK's own allowlist, so a caller cannot widen
+ * the model's reach with a name that merely typechecks.
+ */
+export const CLAUDE_CODE_BUILT_IN_TOOLS = ["WebSearch"] as const;
+export type ClaudeCodeBuiltInTool = (typeof CLAUDE_CODE_BUILT_IN_TOOLS)[number];
+
+const SUPPORTED_BUILT_IN_TOOLS: ReadonlySet<string> = new Set(CLAUDE_CODE_BUILT_IN_TOOLS);
+
+/** Fail closed on any built-in Lilac has not vetted, however it was supplied. */
+export function validateClaudeCodeBuiltInTools(
+  names: readonly string[] = [],
+): ClaudeCodeBuiltInTool[] {
+  for (const name of names) {
+    if (!SUPPORTED_BUILT_IN_TOOLS.has(name)) {
+      throw new Error(
+        `Claude built-in tool '${name}' is not supported; allowed: ${CLAUDE_CODE_BUILT_IN_TOOLS.join(", ")}`,
+      );
+    }
+  }
+  return [...names] as ClaudeCodeBuiltInTool[];
+}
+
 function toolError(message: string): CallToolResult {
   return { isError: true, content: [{ type: "text", text: message }] };
 }
@@ -231,10 +255,23 @@ function pruneCorrelations(pending: Map<string, PendingCorrelation>, now: number
 export async function createClaudeCodeToolBridge(options: {
   tools: ToolSet;
   execute(request: ClaudeCodeToolExecutionRequest): Promise<AtomicToolExecutionOutcome>;
+  /**
+   * Claude built-in tools this run may call directly. They bypass the MCP
+   * bridge entirely, so they get no Lilac approval, execution events, output
+   * normalization, or artifact capture.
+   */
+  builtInTools?: readonly ClaudeCodeBuiltInTool[];
   now?: () => number;
 }): Promise<ClaudeCodeToolBridge> {
-  const exposedEntries = Object.entries(options.tools).filter(([name]) => name !== "batch");
+  // Provider-executed tools are run by the model, not Lilac, so there is
+  // nothing to expose through MCP. A tool that is merely missing `execute`
+  // still fails loudly below, because that is a toolset bug rather than a
+  // deliberate handover.
+  const exposedEntries = Object.entries(options.tools).filter(
+    ([name, definition]) => name !== "batch" && definition.isProviderExecuted !== true,
+  );
   const exposedNames = new Set(exposedEntries.map(([name]) => name));
+  const allowedBuiltIns = new Set<string>(validateClaudeCodeBuiltInTools(options.builtInTools));
   const validators = new Map<string, NonNullable<ReturnType<typeof asSchema>["validate"]>>();
   const declarations: McpTool[] = [];
 
@@ -318,6 +355,9 @@ export async function createClaudeCodeToolBridge(options: {
 
   const canUseTool: CanUseTool = async (toolName, input, callbackOptions) => {
     if (!toolName.startsWith(NAMESPACED_PREFIX)) {
+      // Exact membership only: no prefix or pattern matching, so an unexpected
+      // built-in can never be admitted by resembling an allowlisted one.
+      if (allowedBuiltIns.has(toolName)) return { behavior: "allow", updatedInput: input };
       return { behavior: "deny", message: `Claude built-in tool '${toolName}' is disabled` };
     }
     const localName = toolName.slice(NAMESPACED_PREFIX.length);
