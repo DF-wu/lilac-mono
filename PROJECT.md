@@ -42,6 +42,11 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Entry/client: `apps/acp-controller/client.ts`.
   - Build script: `apps/acp-controller/build.ts` (produces `dist/index.js`).
 
+- `apps/architecture-atlas/`
+  - Standalone Vite/React architecture explorer generated from a pinned source-evidence snapshot.
+  - It is documentation, not live telemetry: Core does not import, start, or serve it, and it does not connect to Redis or the event bus.
+  - It joins workspace tests, lint, typecheck, formatting, and lockfile maintenance; source citations and refresh instructions live in `apps/architecture-atlas/README.md`.
+
 - `apps/mini-lilac-server/`
   - Redis-free coding-agent HTTP/SSE server with durable local sessions.
   - Entry: `apps/mini-lilac-server/src/main.ts`; API wiring: `apps/mini-lilac-server/src/server.ts`.
@@ -479,6 +484,11 @@ Shutdown happens in reverse (best-effort).
 
 - Build `lilac-acp` CLI:
   - `cd apps/acp-controller && bun run build`
+
+- Open or build the static Architecture Atlas:
+  - `bun run atlas:open` (starts the standalone Vite app on port 4173 and opens it when possible)
+  - `bun run atlas:build`
+  - This does not start Core, Redis, or any Lilac runtime service.
 
 - Run tests:
   - Root harness: `bun test`

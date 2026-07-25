@@ -1,6 +1,6 @@
 # Lilac System Atlas
 
-這是一個獨立的、以原始碼證據為核心的 Lilac Mono architecture explorer。它不會被 core runtime 啟動，也不會連 Redis；所有圖、事件、payload、狀態與 source link 都是對固定 commit 的靜態研究快照。
+這是一個獨立的、以原始碼證據為核心的 Lilac Mono architecture explorer。它不會被 core runtime import、build、啟動或提供服務，也不會連 Redis；所有圖、事件、payload、狀態與 source link 都是對固定 commit 的靜態研究快照。它會加入 Bun workspace 與 root validation，但不在產品 runtime execution path 上。
 
 ## 啟動
 
@@ -67,5 +67,7 @@ bun --cwd=apps/architecture-atlas run preview -- --port 4173
 bun --cwd=apps/architecture-atlas run typecheck
 bun --cwd=apps/architecture-atlas run build
 ```
+
+資料完整性測試會直接從 Git 物件 `f31f4f4e11867575c8ae3d6d754cae428f0d9ede` 讀取 source evidence，而不是拿目前 worktree 驗證歷史行號。執行測試的 checkout 必須包含該 commit；若使用 shallow clone，需先取得完整歷史。
 
 Root-level validation 仍應依 repository `AGENTS.md` 執行 `bun run lint:fix`、`bun run fmt`、workspace typecheck 與測試。瀏覽器驗收至少檢查 1440px、900px 與 375px；圖形互動另有文字 catalog/table fallback。
