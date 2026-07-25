@@ -828,6 +828,51 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     ]);
   });
 
+  it("keeps delivered steering but drops queued steering when a run is cancelled", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        await gate;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "text-1" },
+              { type: "text-delta" as const, id: "text-1", delta: "done" },
+              { type: "text-end" as const, id: "text-1" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    agent.setSteeringMode("all");
+    const running = agent.prompt("start");
+    while (!agent.state.isStreaming) await Promise.resolve();
+
+    const delivered = agent.steer("use typescript");
+    agent.steer("never sent");
+    // Only the first message reached the model, so only it belongs in the
+    // transcript once the run is cancelled.
+    expect(agent.acknowledgeSteeringDelivery(delivered)).toBe(true);
+    agent.cancel();
+    release?.();
+    await running;
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "user", content: "use typescript" },
+    ]);
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+  });
+
   it("returns stable steering IDs and interrupts with every queued message exactly once", async () => {
     const model = new MockLanguageModelV4({
       doStream: {

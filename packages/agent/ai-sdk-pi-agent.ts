@@ -989,8 +989,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * boundary. A `messages_reset` event with reason `cancel` is authoritative.
    */
   cancel() {
+    // Queued (undelivered) work is discarded, but messages the model already
+    // received are committed by `finishCancellation`.
     this.steeringQueue.length = 0;
-    this.deliveredSteeringMessages.length = 0;
     this.followUpQueue.length = 0;
     this.pendingInterrupt = null;
 
@@ -1122,9 +1123,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     return { ...message, content };
   }
 
-  private resetMessagesAfterAbort(reason: "cancel" | "interrupt") {
+  private resetMessagesAfterAbort(
+    reason: "cancel" | "interrupt",
+    appendAfterBoundary: ModelMessage[] = [],
+  ) {
     const truncated = truncateToLastValidBoundary(this.state.messages);
-    this.state.messages = truncated.messages;
+    this.state.messages = [...truncated.messages, ...appendAfterBoundary];
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
 
@@ -1137,7 +1141,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   private finishCancellation() {
-    this.resetMessagesAfterAbort("cancel");
+    // Steering the model already received stays in the transcript even though
+    // the run was cancelled. Provider-executed work it caused is preserved by
+    // recovery, so dropping the message would leave an answer to a question no
+    // user turn ever asked. Undelivered steering is still discarded.
+    this.resetMessagesAfterAbort("cancel", takeAll(this.deliveredSteeringMessages));
     this.steeringQueue.length = 0;
     this.followUpQueue.length = 0;
     this.pendingInterrupt = null;
