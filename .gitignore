@@ -5,6 +5,7 @@ node_modules
 out
 *.tgz
 packages/remote-fs-runner/dist/cli.js
+apps/architecture-atlas/dist/
 
 # code coverage
 coverage
