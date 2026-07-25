@@ -8,6 +8,7 @@ import {
   loadProviderAuth,
   loadProviderConfig,
   loadProviderRegistry,
+  providerConfigSchema,
   reasoningProviderOptions,
   writeProviderAuth,
   type ProviderAuth,
@@ -339,6 +340,60 @@ describe("provider configuration", () => {
     };
     await expect(loadTestRegistry(v1Config, {}, oauthTokens)).rejects.toThrow(
       "must set catalog: models-dev",
+    );
+  });
+});
+
+describe("credentialless claude-code provider", () => {
+  const claudeConfig: ProviderConfig = {
+    configVersion: 1,
+    providers: { "claude-code": { type: "claude-code", catalog: "models-dev" } },
+  };
+
+  it("builds a registry without any stored credential", async () => {
+    const loaded = await loadTestRegistry(claudeConfig, {}, null);
+    expect(loaded.supersededProviderIds).toEqual([]);
+    expect(loaded.registry.languageModel("claude-code/claude-sonnet-4-6")).toBeDefined();
+  });
+
+  it("rejects credentials supplied for a locally authenticated provider", async () => {
+    await expect(
+      loadTestRegistry(claudeConfig, { "claude-code": { type: "api-key", key: "nope" } }, null),
+    ).rejects.toThrow("must not have credentials in the auth file");
+  });
+
+  it("rejects a v1 catalog and a custom base URL", () => {
+    expect(() =>
+      providerConfigSchema.parse({
+        configVersion: 1,
+        providers: { claude: { type: "claude-code", catalog: "v1" } },
+      }),
+    ).toThrow("must set catalog: models-dev");
+
+    expect(() =>
+      providerConfigSchema.parse({
+        configVersion: 1,
+        providers: {
+          claude: {
+            type: "claude-code",
+            catalog: "models-dev",
+            baseUrl: "https://example.test/v1",
+          },
+        },
+      }),
+    ).toThrow("cannot set baseUrl");
+  });
+
+  it("keeps requiring credentials for ordinary providers alongside it", async () => {
+    const mixed: ProviderConfig = {
+      configVersion: 1,
+      providers: {
+        "claude-code": { type: "claude-code", catalog: "models-dev" },
+        anthropic: { type: "anthropic", catalog: "models-dev" },
+      },
+    };
+    await expect(loadTestRegistry(mixed, {}, null)).rejects.toThrow(
+      "Missing credentials for configured provider 'anthropic'",
     );
   });
 });

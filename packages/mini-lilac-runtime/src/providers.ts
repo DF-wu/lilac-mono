@@ -5,12 +5,14 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createXai } from "@ai-sdk/xai";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createGateway, createProviderRegistry, type JSONValue } from "ai";
+import { createClaudeCode } from "ai-sdk-provider-claude-code";
 import { chmod, open, readFile, rename, stat, unlink, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import { z } from "zod";
 
 import {
+  claudeCodeExecutableSettings,
   createCodexOAuthProvider,
   readCodexTokens,
   type CodexOAuthTokens,
@@ -22,11 +24,18 @@ export const providerTypeSchema = z.enum([
   "openai",
   "openai-compatible",
   "anthropic",
+  "claude-code",
   "xai",
   "openrouter",
   "groq",
   "vercel",
 ]);
+
+/**
+ * Provider types that authenticate through local tooling instead of a Lilac-held
+ * key. Lilac never reads, stores, or refreshes their credentials.
+ */
+const CREDENTIALLESS_PROVIDER_TYPES = new Set<ProviderType>(["claude-code"]);
 
 const modelModalitySchema = z.enum(["text", "image", "audio", "video", "pdf"]);
 const providerModelOverrideSchema = z
@@ -71,6 +80,23 @@ export const providerDefinitionSchema = z
         path: ["baseUrl"],
         message: "openai-compatible providers require baseUrl",
       });
+    }
+    if (provider.type === "claude-code") {
+      if (provider.baseUrl) {
+        context.addIssue({
+          code: "custom",
+          path: ["baseUrl"],
+          message:
+            "claude-code providers cannot set baseUrl; the local Claude installation owns the endpoint",
+        });
+      }
+      if (provider.catalog === "v1") {
+        context.addIssue({
+          code: "custom",
+          path: ["catalog"],
+          message: "claude-code providers must set catalog: models-dev; there is no /v1/models",
+        });
+      }
     }
   });
 
@@ -189,12 +215,24 @@ export async function writeProviderAuth(file: string, auth: unknown): Promise<vo
   }
 }
 
+function isCredentialless(definition: ProviderDefinition | undefined): boolean {
+  return definition !== undefined && CREDENTIALLESS_PROVIDER_TYPES.has(definition.type);
+}
+
 function validateProviderAuth(
   config: ProviderConfig,
   auth: ProviderAuth,
   supersededProviderIds: ReadonlySet<string>,
 ): void {
-  for (const providerId of Object.keys(config.providers)) {
+  for (const [providerId, definition] of Object.entries(config.providers)) {
+    if (isCredentialless(definition)) {
+      if (auth[providerId]) {
+        throw new Error(
+          `Provider '${providerId}' uses local ${definition.type} authentication and must not have credentials in the auth file`,
+        );
+      }
+      continue;
+    }
     if (!auth[providerId] && !supersededProviderIds.has(providerId)) {
       throw new Error(`Missing credentials for configured provider '${providerId}'`);
     }
@@ -225,6 +263,23 @@ export function createAiProviderRegistry(
           throw new Error(`Provider '${providerId}' cannot be superseded by Codex OAuth`);
         }
         return [providerId, options.codexOAuthProvider ?? createCodexOAuthProvider()] as const;
+      }
+      if (definition.type === "claude-code") {
+        // Credentialless: the official Claude tooling resolves its own local
+        // authentication. This base instance carries no tools and no MCP
+        // server, so it is safe for title generation and other utility calls;
+        // per-run agent models are materialized separately.
+        return [
+          providerId,
+          createClaudeCode({
+            defaultSettings: {
+              ...claudeCodeExecutableSettings(),
+              tools: [],
+              settingSources: [],
+              persistSession: false,
+            },
+          }),
+        ] as const;
       }
       const apiKey = auth[providerId]?.key;
       if (!apiKey) throw new Error(`Missing credentials for configured provider '${providerId}'`);

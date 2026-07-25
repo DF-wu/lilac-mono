@@ -595,3 +595,67 @@ describe("model catalog", () => {
     expect(() => parseModelRef("alias")).toThrow("provider/model");
   });
 });
+
+describe("claude-code catalog", () => {
+  const anthropicRegistry = {
+    anthropic: {
+      id: "anthropic",
+      models: {
+        "claude-sonnet-4-6": {
+          id: "claude-sonnet-4-6",
+          name: "Claude Sonnet 4.6",
+          reasoning: true,
+          tool_call: true,
+          limit: { context: 200_000, output: 64_000 },
+        },
+        "claude-opus-4-1": { id: "claude-opus-4-1", name: "Claude Opus 4.1" },
+        // Anthropic publishes non-Claude entries the CLI cannot launch.
+        "legacy-instant": { id: "legacy-instant", name: "Legacy Instant" },
+      },
+    },
+  };
+
+  it("resolves an operator-named provider against the anthropic registry", async () => {
+    const catalog = new ModelCatalog(
+      {
+        configVersion: 1,
+        // Deliberately not named "claude-code": the registry key comes from the
+        // provider type, not the operator's chosen id.
+        providers: { claude: { type: "claude-code", catalog: "models-dev" } },
+      },
+      {},
+      { fetch: async () => Response.json(anthropicRegistry) },
+    );
+
+    const snapshot = await catalog.get();
+    expect(snapshot.warnings).toEqual([]);
+    expect(snapshot.models.map((model) => model.ref.value)).toEqual([
+      "claude/claude-opus-4-1",
+      "claude/claude-sonnet-4-6",
+    ]);
+    const sonnet = snapshot.models.find((model) => model.ref.modelId === "claude-sonnet-4-6");
+    expect(sonnet?.provider).toEqual({ id: "claude", type: "claude-code" });
+    expect(sonnet?.limits).toEqual({ context: 200_000, output: 64_000 });
+  });
+
+  it("applies configured model overrides to filtered entries", async () => {
+    const catalog = new ModelCatalog(
+      {
+        configVersion: 1,
+        providers: {
+          "claude-code": {
+            type: "claude-code",
+            catalog: "models-dev",
+            models: { "claude-opus-4-1": { limit: { context: 500_000 } } },
+          },
+        },
+      },
+      {},
+      { fetch: async () => Response.json(anthropicRegistry) },
+    );
+
+    const snapshot = await catalog.get();
+    const opus = snapshot.models.find((model) => model.ref.modelId === "claude-opus-4-1");
+    expect(opus?.limits?.context).toBe(500_000);
+  });
+});

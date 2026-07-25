@@ -4,6 +4,7 @@ import {
   AgentIdleTimeoutError,
   AiSdkPiAgent,
   attachAutoCompaction,
+  buildSafeRecoveryCheckpoint,
   compactMessages,
   createAgentRunIdleWatchdog,
   createTransientModelRetryController,
@@ -12,6 +13,12 @@ import {
   type TransientModelRetryConfig,
   type TurnBoundaryDecision,
 } from "@stanley2058/lilac-agent";
+import {
+  displayClaudeCodeToolName,
+  materializeClaudeCodeRun,
+  type ClaudeCodeBuiltInTool,
+  type MaterializedClaudeCodeRun,
+} from "@stanley2058/lilac-claude-code-bridge";
 import {
   createCodingToolset,
   DEFAULT_DENY_PATHS,
@@ -74,6 +81,7 @@ import {
   type LanguageModel,
   type LanguageModelUsage,
   type ModelMessage,
+  type ToolContent,
   type ToolSet,
   type UIMessageChunk,
 } from "ai";
@@ -179,6 +187,8 @@ export type SessionServiceOptions = {
     agent: AiSdkPiAgent<ToolSet>,
     options: AutoCompactionOptions,
   ) => Promise<() => void>;
+  /** Test seam for run-scoped Claude materialization. */
+  materializeClaudeCodeRun?: typeof materializeClaudeCodeRun;
   skillCatalog?: MiniLilacSkillCatalog;
   webSearchProviderResolver?: WebSearchProviderResolver;
   protectedToolPaths?: readonly string[];
@@ -257,9 +267,16 @@ type RunContext = {
   reportActivity?: () => void;
 };
 
+type CreatedAgent = {
+  agent: AiSdkPiAgent<ToolSet>;
+  /** Run-scoped Claude resources; null for ordinary API-key providers. */
+  claudeCodeRun: MaterializedClaudeCodeRun | null;
+};
+
 type RunProjection = {
   runId: string;
   agent: AiSdkPiAgent<ToolSet>;
+  claudeCodeRun: MaterializedClaudeCodeRun | null;
   eventQueue: Promise<void>;
   lastFinishReason?: "stop" | "length" | "content-filter" | "tool-calls" | "error" | "other";
   stepOpen: boolean;
@@ -555,6 +572,22 @@ function systemPrompt(
     .join("\n\n");
 }
 
+/**
+ * Text of a steering message when it can be injected into a live Claude query.
+ * Multipart or media steering has no injector representation and stays
+ * boundary-based.
+ */
+function plainTextSteering(message: ModelMessage): string | undefined {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return undefined;
+  const texts: string[] = [];
+  for (const part of message.content) {
+    if (part.type !== "text") return undefined;
+    texts.push(part.text);
+  }
+  return texts.length > 0 ? texts.join("\n") : undefined;
+}
+
 function profileRequestsTool(profile: AgentProfile, name: string): boolean {
   return profile.tools.includes("*") || profile.tools.includes(name);
 }
@@ -674,6 +707,7 @@ class SessionActor {
     private readonly transientModelRetry: TransientModelRetryConfig,
     private readonly trackExecution: (task: Promise<void>) => Promise<void>,
     private readonly acceptsAdmissions: () => boolean,
+    private readonly materializeClaudeCode: typeof materializeClaudeCodeRun = materializeClaudeCodeRun,
   ) {}
 
   private withLock<T>(operation: () => Promise<T> | T): Promise<T> {
@@ -734,6 +768,7 @@ class SessionActor {
           active.runId,
         );
       }
+      this.requestClaudeCodeInterrupt(active.claudeCodeRun);
       active.agent.cancel();
       for (const cancel of this.delegatedCancels.values()) cancel();
     });
@@ -817,13 +852,19 @@ class SessionActor {
       };
       this.store.reserveCommand(this.snapshot.id, clientCommandId, command);
       let admitted = false;
+      // Claude resources outlive this scope only once the run is executing;
+      // until then this method owns disposing them.
+      let pendingClaudeCodeRun: MaterializedClaudeCodeRun | null = null;
+      let started = false;
       try {
-        const agent = await this.createAgent(
+        const created = await this.createAgent(
           profileId,
           context,
           priorModelMessages,
           options.overrides,
         );
+        const { agent, claudeCodeRun } = created;
+        pendingClaudeCodeRun = claudeCodeRun;
         this.snapshot = this.store.beginRootRun({
           run: {
             id: runId,
@@ -841,6 +882,7 @@ class SessionActor {
         this.active = {
           runId,
           agent,
+          claudeCodeRun,
           context,
           eventQueue: Promise.resolve(),
           cancelRequested: false,
@@ -881,6 +923,7 @@ class SessionActor {
         );
         const trackedExecution = this.trackExecution(execution);
         void trackedExecution.finally(() => this.closeSubscribers(runId));
+        started = true;
         return { runId, stream: this.streamRun(runId) };
       } catch (error) {
         if (!admitted) {
@@ -888,6 +931,7 @@ class SessionActor {
           this.closeSubscribers(runId);
           this.store.releaseCommand(this.snapshot.id, clientCommandId, command);
         }
+        if (!started) await this.disposeClaudeCodeRun(pendingClaudeCodeRun, runId);
         throw error;
       }
     });
@@ -904,9 +948,45 @@ class SessionActor {
         0,
         active.runId,
       );
+      this.requestClaudeCodeInterrupt(active.claudeCodeRun);
       active.agent.cancel();
       for (const cancel of this.delegatedCancels.values()) cancel();
     });
+  }
+
+  /**
+   * Ask a live Claude query to stop so completed MCP calls can finish their
+   * provider bookkeeping.
+   *
+   * Never awaited: this is best effort, Lilac's own cancellation is
+   * authoritative, and a wedged Claude control channel must not hold the actor
+   * lock or delay the abort signal that actually ends the run.
+   */
+  private requestClaudeCodeInterrupt(claudeCodeRun: MaterializedClaudeCodeRun | null): void {
+    if (!claudeCodeRun) return;
+    void claudeCodeRun.control.interrupt().catch(() => {
+      // Lilac's cancellation path still runs.
+    });
+  }
+
+  /**
+   * Release a run's Claude subprocess and bridge state. Failure-isolated: a
+   * hung Claude query must not block run finalization or transcript writes.
+   */
+  private async disposeClaudeCodeRun(
+    claudeCodeRun: MaterializedClaudeCodeRun | null,
+    runId: string,
+  ): Promise<void> {
+    if (!claudeCodeRun) return;
+    try {
+      await claudeCodeRun.dispose();
+    } catch (error) {
+      logger.warn("failed to dispose Claude Code run resources", {
+        requestId: runId,
+        sessionId: this.snapshot.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async createAgent(
@@ -914,7 +994,7 @@ class SessionActor {
     context: RunContext,
     messages: ModelMessage[],
     overrides: SubagentOverrides = {},
-  ): Promise<AiSdkPiAgent<ToolSet>> {
+  ): Promise<CreatedAgent> {
     const profile = this.config.agent.profiles[profileId];
     if (!profile) throw new Error(`Unknown profile '${profileId}'`);
     const modelSpecifier = overrides.model ?? this.snapshot.model;
@@ -972,6 +1052,98 @@ class SessionActor {
       },
       getOutputConfig: () => this.toolResultOutputConfig,
     });
+    // Claude's built-in search stands in for Lilac's `websearch` tool, which
+    // needs a provider API key this session does not have.
+    const claudeBuiltInTools: ClaudeCodeBuiltInTool[] =
+      providerType === "claude-code" && profileRequestsTool(profile, "websearch")
+        ? ["WebSearch"]
+        : [];
+    // Claude-backed runs execute Lilac tools through an in-process MCP server,
+    // so the model can only be built once the run-scoped toolset exists. The
+    // bridge reads the agent lazily because the model is an input to it.
+    let materializedAgent: AiSdkPiAgent<ToolSet> | undefined;
+    const claudeCodeRun =
+      providerType === "claude-code"
+        ? await this.materializeClaudeCode({
+            modelId: parseModelRef(modelSpecifier).modelId,
+            cwd: this.snapshot.cwd,
+            tools,
+            builtInTools: claudeBuiltInTools,
+            execute: async (request) => {
+              if (!materializedAgent) {
+                throw new Error("Claude Code tool execution started before the agent was ready");
+              }
+              return await materializedAgent.executeExternalToolCall(request);
+            },
+          })
+        : null;
+    try {
+      return await this.buildAgent({
+        profile,
+        context,
+        messages,
+        modelSpecifier,
+        reasoning,
+        tools,
+        skills,
+        skillContextWindow,
+        workspaceInstructions,
+        providerOptions,
+        transientRetryController,
+        normalizeOverflow,
+        usesCodexOAuth,
+        claudeBuiltInTools,
+        claudeCodeRun,
+        onAgentReady: (ready) => {
+          materializedAgent = ready;
+        },
+      });
+    } catch (error) {
+      // Nothing else can reach this run yet, so this method still owns it.
+      await this.disposeClaudeCodeRun(claudeCodeRun, context.runId);
+      throw error;
+    }
+  }
+
+  /**
+   * Second half of {@link createAgent}, split out so a failure after Claude
+   * materialization still releases the subprocess and MCP bridge.
+   */
+  private async buildAgent(input: {
+    profile: AgentProfile;
+    context: RunContext;
+    messages: ModelMessage[];
+    modelSpecifier: string;
+    reasoning: MiniLilacReasoning;
+    tools: ToolSet;
+    skills: MiniLilacSkillCatalogSnapshot | undefined;
+    skillContextWindow: number | undefined;
+    workspaceInstructions: Awaited<ReturnType<typeof loadWorkspaceInstructions>>;
+    providerOptions: ReturnType<typeof reasoningProviderOptions>;
+    transientRetryController: ReturnType<typeof createTransientModelRetryController> | undefined;
+    normalizeOverflow: ReturnType<typeof createOverflowReferenceNormalizer>;
+    usesCodexOAuth: boolean;
+    claudeBuiltInTools: readonly ClaudeCodeBuiltInTool[];
+    claudeCodeRun: MaterializedClaudeCodeRun | null;
+    onAgentReady: (agent: AiSdkPiAgent<ToolSet>) => void;
+  }): Promise<CreatedAgent> {
+    const {
+      profile,
+      context,
+      messages,
+      modelSpecifier,
+      reasoning,
+      tools,
+      skills,
+      skillContextWindow,
+      workspaceInstructions,
+      providerOptions,
+      transientRetryController,
+      normalizeOverflow,
+      usesCodexOAuth,
+      claudeBuiltInTools,
+      claudeCodeRun,
+    } = input;
     const agent = new AiSdkPiAgent<ToolSet>({
       system: systemPrompt(
         this.config,
@@ -979,12 +1151,17 @@ class SessionActor {
         this.snapshot.cwd,
         workspaceInstructions?.text,
         tools.skill === undefined ? undefined : skills?.promptSection(skillContextWindow),
-        tools.websearch !== undefined,
+        // Claude's built-in search needs the same untrusted-content warning as
+        // Lilac's own websearch tool.
+        tools.websearch !== undefined || claudeBuiltInTools.includes("WebSearch"),
       ),
-      model: this.resolveModel(modelSpecifier),
+      model: claudeCodeRun?.agentModel ?? this.resolveModel(modelSpecifier),
       modelSpecifier,
       reasoning,
       tools,
+      // Claude ignores AI SDK tool declarations and warns about them; the same
+      // toolset still drives execution, display, and metadata through MCP.
+      sendToolsToModel: claudeCodeRun === null,
       exclusiveToolNames: tools.skill === undefined ? undefined : new Set(["skill"]),
       messages,
       normalizeToolResultOutput: (output, normalizationContext) =>
@@ -996,6 +1173,7 @@ class SessionActor {
       turnErrorHandler: transientRetryController?.handler,
       turnBoundaryHandler: () => this.finishDeferredChildren(context),
     });
+    input.onAgentReady(agent);
     if (transientRetryController) {
       agent.subscribe((event) => {
         if (event.type === "turn_end") {
@@ -1012,7 +1190,9 @@ class SessionActor {
       modelCapability: this.modelCapability,
       summaryModel:
         configuredSummaryModel === "inherit"
-          ? "current"
+          ? // Never summarize with the tool-enabled model: its embedded MCP
+            // settings would let a summarization prompt call workspace tools.
+            (claudeCodeRun?.utilityModel ?? "current")
           : this.resolveModel(configuredSummaryModel),
       thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
       resolveCurrentModelSpecifier: () => agent.state.modelSpecifier,
@@ -1045,7 +1225,7 @@ class SessionActor {
       });
     }
     if (usesCodexOAuth) agent.appendTransformMessages(withoutOpenAIItemIds);
-    return agent;
+    return { agent, claudeCodeRun };
   }
 
   private async generateSessionTitle(
@@ -1490,6 +1670,10 @@ class SessionActor {
           sessionId: this.snapshot.id,
           idleTimeoutMs: context.idleTimeoutMs ?? this.config.agent.idleTimeoutMs,
         });
+        // Stop the Claude subprocess too, so it cannot outlive the run.
+        if (active?.runId === context.runId) {
+          this.requestClaudeCodeInterrupt(active.claudeCodeRun);
+        }
         agent.cancel();
       },
     });
@@ -1558,14 +1742,22 @@ class SessionActor {
       const uiMessages = [...active.chronologicalUiPrefix];
       if (assistantMessage && assistantMessage.parts.length > 0) uiMessages.push(assistantMessage);
       const runStatus = cancelled ? "cancelled" : error ? "error" : "completed";
+      // A run interrupted between a provider-executed tool call and its inline
+      // result would otherwise persist an unpaired call that poisons the next
+      // prompt. The delegated result must read the same messages that were
+      // persisted, or a subagent reports an answer its transcript contradicts.
+      const finalMessages = buildSafeRecoveryCheckpoint(
+        agent.getRecoverableMessages(),
+        "run ended",
+      );
       this.snapshot = this.store.finalizeRootRun({
         runId: context.runId,
         sessionId: this.snapshot.id,
         runStatus,
         sessionStatus: error && !cancelled ? "error" : "idle",
         error,
-        terminalResult: { text: terminalText(agent.state.messages) },
-        modelMessages: agent.state.messages,
+        terminalResult: { text: terminalText(finalMessages) },
+        modelMessages: finalMessages,
         uiMessages,
       });
     } catch (finalizationError) {
@@ -1587,6 +1779,7 @@ class SessionActor {
         // Cleanup must still run if the persistence layer remains unavailable.
       }
     } finally {
+      await this.disposeClaudeCodeRun(active.claudeCodeRun, context.runId);
       this.active = undefined;
       this.interruptedSteerCommandIds.clear();
     }
@@ -1764,43 +1957,7 @@ class SessionActor {
         } else if (event.message.role === "tool") {
           for (const part of event.message.content) {
             if (part.type !== "tool-result") continue;
-            if (projection.toolOutputsAvailable.has(part.toolCallId)) continue;
-            projection.toolOutputsAvailable.add(part.toolCallId);
-            const output = part.output;
-            if (output.type === "execution-denied") {
-              await this.appendChunk(runId, {
-                type: "tool-output-denied",
-                toolCallId: part.toolCallId,
-              });
-            } else if (output.type === "error-text" || output.type === "error-json") {
-              const errorText = toolOutputErrorText(output, "Tool returned a structured error");
-              const toolInput = projection.toolInputsAvailable.get(part.toolCallId);
-              await this.appendChunk(
-                runId,
-                errorText.includes("AI_InvalidToolInputError")
-                  ? {
-                      type: "tool-input-error",
-                      toolCallId: part.toolCallId,
-                      toolName: part.toolName,
-                      input: toolInput?.input,
-                      errorText,
-                      dynamic: true,
-                    }
-                  : {
-                      type: "tool-output-error",
-                      toolCallId: part.toolCallId,
-                      errorText,
-                      dynamic: true,
-                    },
-              );
-            } else {
-              await this.appendChunk(runId, {
-                type: "tool-output-available",
-                toolCallId: part.toolCallId,
-                output: toolOutputDisplayValue(output),
-                dynamic: true,
-              });
-            }
+            await this.appendToolResultChunk(runId, projection, part);
           }
         }
         return;
@@ -2008,17 +2165,25 @@ class SessionActor {
         return;
       case "message_end":
         if (event.message.role === "assistant" && typeof event.message.content !== "string") {
+          // Provider-executed tools (Claude built-ins, and calls denied before
+          // Lilac ran them) appear only here, as an inline call/result pair
+          // with no execution events. Calls Lilac ran are already registered.
           for (const part of event.message.content) {
+            if (part.type === "tool-result") {
+              await this.appendToolResultChunk(runId, projection, part);
+              continue;
+            }
             if (part.type !== "tool-call") continue;
             if (projection.toolInputsAvailable.has(part.toolCallId)) continue;
+            const toolName = displayClaudeCodeToolName(part.toolName);
             projection.toolInputsAvailable.set(part.toolCallId, {
-              toolName: part.toolName,
+              toolName,
               input: part.input,
             });
             await this.appendChunk(runId, {
               type: "tool-input-available",
               toolCallId: part.toolCallId,
-              toolName: part.toolName,
+              toolName,
               input: part.input,
               dynamic: true,
             });
@@ -2028,6 +2193,58 @@ class SessionActor {
       case "turn_warnings":
         return;
     }
+  }
+
+  /**
+   * Emit the terminal display chunk for one tool result, whether it arrived as
+   * an ordinary tool message or inline in an assistant message (Claude's
+   * provider-executed tools). Deduped by tool call id, so a result Lilac
+   * already reported through `tool_execution_end` is skipped.
+   */
+  private async appendToolResultChunk(
+    runId: string,
+    projection: RunProjection,
+    part: Extract<ToolContent[number], { type: "tool-result" }>,
+  ): Promise<void> {
+    if (projection.toolOutputsAvailable.has(part.toolCallId)) return;
+    projection.toolOutputsAvailable.add(part.toolCallId);
+    const output = part.output;
+    if (output.type === "execution-denied") {
+      await this.appendChunk(runId, {
+        type: "tool-output-denied",
+        toolCallId: part.toolCallId,
+      });
+      return;
+    }
+    if (output.type === "error-text" || output.type === "error-json") {
+      const errorText = toolOutputErrorText(output, "Tool returned a structured error");
+      const toolInput = projection.toolInputsAvailable.get(part.toolCallId);
+      await this.appendChunk(
+        runId,
+        errorText.includes("AI_InvalidToolInputError")
+          ? {
+              type: "tool-input-error",
+              toolCallId: part.toolCallId,
+              toolName: displayClaudeCodeToolName(part.toolName),
+              input: toolInput?.input,
+              errorText,
+              dynamic: true,
+            }
+          : {
+              type: "tool-output-error",
+              toolCallId: part.toolCallId,
+              errorText,
+              dynamic: true,
+            },
+      );
+      return;
+    }
+    await this.appendChunk(runId, {
+      type: "tool-output-available",
+      toolCallId: part.toolCallId,
+      output: toolOutputDisplayValue(output),
+      dynamic: true,
+    });
   }
 
   private async appendChunk(runId: string, chunk: StoredUIMessageChunk): Promise<void> {
@@ -2186,6 +2403,15 @@ class SessionActor {
         modelMessage: userModelMessage,
         state: "queued",
       });
+      // One Claude-backed streamText() call spans many internal model and tool
+      // turns, so turn-boundary steering alone is not responsive enough. The
+      // queued entry stays as the fallback until delivery is confirmed.
+      const steeringText = plainTextSteering(userModelMessage);
+      if (active.claudeCodeRun && steeringText !== undefined) {
+        active.claudeCodeRun.control.inject(steeringText, (delivered) => {
+          if (delivered) this.acknowledgeClaudeCodeSteering(active, steeringId);
+        });
+      }
       await this.queueSteeringChunk(active.runId, request.message);
       this.snapshot = this.store.updateSessionState(
         this.snapshot.id,
@@ -2231,6 +2457,10 @@ class SessionActor {
       );
       const interrupted = active.agent.interruptQueuedSteering();
       if (interrupted.status === "interrupted") {
+        // Steering only stays queued on a Claude run when the live query could
+        // not take it (multipart content, or an injector not yet installed), so
+        // the query has to be stopped for the next turn to pick it up.
+        this.requestClaudeCodeInterrupt(active.claudeCodeRun);
         for (const cancel of this.delegatedCancels.values()) cancel();
         const consumed = new Set(interrupted.steeringIds);
         this.steeringEntries.forEach((entry) => {
@@ -2283,6 +2513,7 @@ class SessionActor {
         0,
         active.runId,
       );
+      this.requestClaudeCodeInterrupt(active.claudeCodeRun);
       active.agent.cancel();
       for (const cancel of this.delegatedCancels.values()) cancel();
       this.store.saveCommandResult(this.snapshot.id, id, command, result);
@@ -2446,6 +2677,26 @@ class SessionActor {
 
   private queuedSteeringCount(): number {
     return this.steeringEntries.filter((entry) => entry.state === "queued").length;
+  }
+
+  /**
+   * Commit a steering message the live Claude query accepted. Runs through the
+   * actor lock because delivery is confirmed asynchronously, and consumes the
+   * queue entry exactly once so the queued count cannot drift.
+   */
+  private acknowledgeClaudeCodeSteering(active: ActiveRootRun, steeringId: string): void {
+    void this.withLock(async () => {
+      if (this.active !== active || active.phase !== "accepting-controls") return;
+      if (!active.agent.acknowledgeSteeringDelivery(steeringId)) return;
+      const entry = this.steeringEntries.find((candidate) => candidate.id === steeringId);
+      if (entry?.state === "queued") entry.state = "consumed";
+      this.snapshot = this.store.updateSessionState(
+        this.snapshot.id,
+        this.snapshot.status,
+        this.queuedSteeringCount(),
+      );
+      await this.appendChunk(active.runId, { type: "data-session", data: this.snapshot });
+    });
   }
 }
 
@@ -2858,6 +3109,7 @@ export class SessionService {
       this.options.transientModelRetry ?? CODEX_TRANSIENT_RETRY,
       (task) => this.trackTask(task),
       () => this.acceptingAdmissions,
+      this.options.materializeClaudeCodeRun ?? materializeClaudeCodeRun,
     );
   }
 
