@@ -14,30 +14,33 @@ import {
   type AssistantContent,
   type AssistantModelMessage,
   type FinishReason,
-  InvalidToolInputError,
   type LanguageModel,
   type LanguageModelUsage,
   type ModelMessage,
   type SystemModelMessage,
   type TextStreamPart,
-  type Tool,
   type ToolModelMessage,
   type ToolSet,
 } from "ai";
 import {
-  createLogger,
-  errorMessage,
+  isRecord,
   type ModelReasoningEffort,
   normalizeReplayMessages,
   normalizeAssistantToolCallInputMessage,
   normalizeToolCallInputValue,
 } from "@stanley2058/lilac-utils";
 
+import {
+  executeAtomicToolCall,
+  normalizeToolResultOutput,
+  type AtomicToolExecutionOutcome,
+  type NormalizeToolResultOutputFn,
+  type ToolResultOutput,
+} from "./atomic-tool-execution";
 import { normalizeModelMessagesToolCallIds } from "./tool-call-id-normalization";
-import { isToolExpansion, type ExpandedToolCall, type ToolExpansion } from "./tool-call-expansion";
+import type { ExpandedToolCall } from "./tool-call-expansion";
 
-const logger = createLogger({ module: "ai-sdk-pi-agent" });
-const UNSERIALIZABLE_TOOL_RESULT = "[tool result is not JSON-serializable]";
+export type { NormalizeToolResultOutputFn, ToolResultOutput } from "./atomic-tool-execution";
 
 export type SystemPrompt = string | SystemModelMessage | SystemModelMessage[];
 
@@ -345,20 +348,6 @@ export type TurnBoundaryHandler = (
   context: TurnBoundaryContext,
 ) => TurnBoundaryDecision | Promise<TurnBoundaryDecision>;
 
-export type ToolResultOutput = Extract<
-  ToolModelMessage["content"][number],
-  { type: "tool-result" }
->["output"];
-
-export type NormalizeToolResultOutputFn = (
-  output: ToolResultOutput,
-  context: {
-    toolCallId: string;
-    toolName: string;
-    bypassGenericOutputNormalizer?: boolean;
-  },
-) => ToolResultOutput | Promise<ToolResultOutput>;
-
 export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   /** System prompt for the model. */
   system: SystemPrompt;
@@ -368,6 +357,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   modelSpecifier?: string;
   /** Optional toolset (defaults to empty). */
   tools?: TOOLS;
+  /** Keep tools executable locally without sending their declarations to the model. */
+  sendToolsToModel?: boolean;
   /** Optional initial transcript (defaults to empty). */
   messages?: ModelMessage[];
   /**
@@ -403,22 +394,6 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
     captureModelViewMessages?: boolean;
   };
 };
-
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    Symbol.asyncIterator in value &&
-    typeof value[Symbol.asyncIterator] === "function"
-  );
-}
-
-function isInvalidToolInputError(error: unknown): boolean {
-  if (InvalidToolInputError.isInstance(error)) return true;
-  if (!(error instanceof Error)) return false;
-  if (error.name === "ZodError") return true;
-  return isInvalidToolInputError(error.cause);
-}
 
 function cloneMessage(message: ModelMessage): ModelMessage {
   if (message.role === "assistant") {
@@ -555,54 +530,6 @@ function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet 
 }
 
 type AssistantContentParts = Extract<AssistantContent, unknown[]>;
-type JsonToolOutputValue = Extract<ToolResultOutput, { type: "json" }>["value"];
-
-function isJsonToolOutputValue(value: unknown): value is JsonToolOutputValue {
-  return isJsonToolOutputValueInner(value, new WeakSet<object>());
-}
-
-function isJsonToolOutputValueInner(
-  value: unknown,
-  activeObjects: WeakSet<object>,
-): value is JsonToolOutputValue {
-  if (value === null) return true;
-
-  switch (typeof value) {
-    case "string":
-    case "boolean":
-      return true;
-    case "number":
-      return Number.isFinite(value);
-    case "object":
-      if (activeObjects.has(value)) return false;
-      activeObjects.add(value);
-      try {
-        const values = Array.isArray(value) ? value : Object.values(value);
-        return values.every((item) => isJsonToolOutputValueInner(item, activeObjects));
-      } catch {
-        return false;
-      } finally {
-        activeObjects.delete(value);
-      }
-    default:
-      return false;
-  }
-}
-
-function toJsonToolOutputValue(value: unknown): JsonToolOutputValue {
-  if (typeof value === "undefined") return null;
-  if (isJsonToolOutputValue(value)) return value;
-
-  try {
-    const parsed: unknown = JSON.parse(JSON.stringify(value));
-    if (isJsonToolOutputValue(parsed)) return parsed;
-  } catch {
-    // Fall through to the stable string representation.
-  }
-
-  return String(value);
-}
-
 function upsertTextPart(
   content: AssistantContentParts,
   partType: "text" | "reasoning",
@@ -634,37 +561,59 @@ class TurnAbortedError extends Error {
   }
 }
 
-function getAssistantToolCallIds(message: ModelMessage): string[] {
-  if (message.role !== "assistant") return [];
+function getToolResultToolCallIds(message: ModelMessage): string[] {
+  if (message.role !== "tool" && message.role !== "assistant") return [];
   if (!Array.isArray(message.content)) return [];
 
   const ids: string[] = [];
   for (const part of message.content) {
-    const candidate = part as unknown as {
-      type?: unknown;
-      toolCallId?: unknown;
-    };
-    if (candidate.type === "tool-call" && typeof candidate.toolCallId === "string") {
-      ids.push(candidate.toolCallId);
+    if (part.type === "tool-result") {
+      ids.push(part.toolCallId);
     }
   }
   return ids;
 }
 
-function getToolResultToolCallIds(message: ModelMessage): string[] {
-  if (message.role !== "tool") return [];
+function getUnresolvedAssistantToolCallIds(message: ModelMessage): string[] {
+  if (message.role !== "assistant" || !Array.isArray(message.content)) return [];
 
-  const ids: string[] = [];
+  const open = new Set<string>();
   for (const part of message.content) {
-    const candidate = part as unknown as {
-      type?: unknown;
-      toolCallId?: unknown;
-    };
-    if (candidate.type === "tool-result" && typeof candidate.toolCallId === "string") {
-      ids.push(candidate.toolCallId);
+    if (part.type === "tool-call") open.add(part.toolCallId);
+    if (part.type === "tool-result") open.delete(part.toolCallId);
+  }
+  return [...open];
+}
+
+function hasInlineToolResult(message: ModelMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    Array.isArray(message.content) &&
+    message.content.some((part) => part.type === "tool-result")
+  );
+}
+
+function recoveryToolOutput(value: unknown): ToolResultOutput {
+  if (typeof value === "string") return { type: "text", value };
+  if (isRecord(value)) {
+    if (value.type === "text" && typeof value.value === "string") {
+      return { type: "text", value: value.value };
+    }
+    if (value.type === "error-text" && typeof value.value === "string") {
+      return { type: "error-text", value: value.value };
+    }
+    if (value.type === "execution-denied") {
+      return {
+        type: "execution-denied",
+        reason: typeof value.reason === "string" ? value.reason : undefined,
+      };
     }
   }
-  return ids;
+  try {
+    return { type: "text", value: JSON.stringify(value) ?? String(value) };
+  } catch {
+    return { type: "text", value: String(value) };
+  }
 }
 
 function truncateToLastValidBoundary(messages: ModelMessage[]): {
@@ -698,7 +647,7 @@ function truncateToLastValidBoundary(messages: ModelMessage[]): {
       break;
     }
 
-    const toolCallIds = getAssistantToolCallIds(message);
+    const toolCallIds = getUnresolvedAssistantToolCallIds(message);
     if (toolCallIds.length > 0) {
       openToolCallIds = new Set(toolCallIds);
       continue;
@@ -730,12 +679,15 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   private turnCounter = 0;
   private readonly captureModelViewMessages: boolean;
+  private readonly sendToolsToModel: boolean;
 
   private steeringMode: SteeringMode = "one-at-a-time";
   private followUpMode: FollowUpMode = "one-at-a-time";
   private nextSteeringId = 1;
   private steeringQueue: Array<{ id: SteeringQueueId; message: ModelMessage }> = [];
+  private deliveredSteeringMessages: ModelMessage[] = [];
   private followUpQueue: ModelMessage[] = [];
+  private recoveryDraft: AssistantModelMessage | null = null;
 
   private pendingInterrupt: ModelMessage[] | null = null;
   private cancelResetPending = false;
@@ -764,6 +716,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.genericOutputNormalizerBypassTools =
       options.genericOutputNormalizerBypassTools ?? new Set<string>();
     this.exclusiveToolNames = options.exclusiveToolNames ?? new Set<string>();
+    this.sendToolsToModel = options.sendToolsToModel !== false;
 
     this.captureModelViewMessages = options.debug?.captureModelViewMessages === true;
 
@@ -823,6 +776,49 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.context = context;
   }
 
+  /** Snapshot the last replay-safe boundary, including completed provider-executed tool activity. */
+  getRecoverableMessages(): ModelMessage[] {
+    return this.recoveryDraft
+      ? [...this.state.messages, cloneMessage(this.recoveryDraft)]
+      : [...this.state.messages];
+  }
+
+  /** Execute a provider-originated tool call through the same atomic path as local calls. */
+  executeExternalToolCall(input: {
+    toolCallId: string;
+    toolName: string;
+    input: unknown;
+    abortSignal?: AbortSignal;
+    inputValidation?: "validate" | "prevalidated";
+  }): Promise<AtomicToolExecutionOutcome> {
+    const signals = [input.abortSignal, this.abortController?.signal].filter(
+      (signal): signal is AbortSignal => signal !== undefined,
+    );
+    const abortSignal =
+      signals.length > 1 ? AbortSignal.any(signals) : signals.length === 1 ? signals[0] : undefined;
+
+    return executeAtomicToolCall({
+      call: {
+        toolCallId: input.toolCallId,
+        toolName: input.toolName,
+        input: input.input,
+      },
+      tools: this.state.tools,
+      messages: this.state.messages,
+      context: this.context,
+      abortSignal,
+      pendingToolCalls: this.state.pendingToolCalls,
+      inputValidation: { type: input.inputValidation ?? "validate" },
+      expansionHandling: {
+        type: "reject",
+        message: "Tool-call expansions are not available through external tool transports.",
+      },
+      normalizeToolResultOutput: this.normalizeToolResultOutput,
+      bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(input.toolName),
+      onEvent: (event) => this.emit(event),
+    });
+  }
+
   /** Replace the outbound message transform hook. */
   setTransformMessages(transformMessages: TransformMessagesFn | undefined) {
     this.transformMessages = transformMessages;
@@ -858,6 +854,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.state.messages = normalizeReplayMessages(messages);
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
+    this.recoveryDraft = null;
 
     this.emit({
       type: "messages_reset",
@@ -910,6 +907,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   /** Snapshot entries that have not yet been drained at a steering boundary. */
   getQueuedSteeringIds(): SteeringQueueId[] {
     return this.steeringQueue.map((entry) => entry.id);
+  }
+
+  /** Mark provider-injected steering as delivered and retain it in the canonical transcript. */
+  acknowledgeSteeringDelivery(id: SteeringQueueId): boolean {
+    const index = this.steeringQueue.findIndex((entry) => entry.id === id);
+    if (index < 0) return false;
+    const [entry] = this.steeringQueue.splice(index, 1);
+    if (!entry) return false;
+    this.deliveredSteeringMessages.push(entry.message);
+    return true;
   }
 
   /**
@@ -983,6 +990,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    */
   cancel() {
     this.steeringQueue.length = 0;
+    this.deliveredSteeringMessages.length = 0;
     this.followUpQueue.length = 0;
     this.pendingInterrupt = null;
 
@@ -1069,24 +1077,35 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     output: ToolResultOutput,
     context: Parameters<NormalizeToolResultOutputFn>[1],
   ): Promise<ToolResultOutput> {
-    if (!this.normalizeToolResultOutput) return output;
-
-    try {
-      return await this.normalizeToolResultOutput(output, context);
-    } catch (error) {
-      logger.warn("tool result normalization failed", {
-        toolCallId: context.toolCallId,
-        toolName: context.toolName,
-        error: errorMessage(error),
-      });
-      return { type: "error-text", value: UNSERIALIZABLE_TOOL_RESULT };
-    }
+    return normalizeToolResultOutput(output, context, this.normalizeToolResultOutput);
   }
 
   private async normalizeNewToolMessage(message: ToolModelMessage): Promise<ToolModelMessage> {
     if (!this.normalizeToolResultOutput) return message;
 
     const content: ToolModelMessage["content"] = [];
+    for (const part of message.content) {
+      if (part.type !== "tool-result") {
+        content.push(part);
+        continue;
+      }
+      content.push({
+        ...part,
+        output: await this.normalizeToolOutput(part.output, {
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+        }),
+      });
+    }
+    return { ...message, content };
+  }
+
+  private async normalizeNewAssistantMessage(
+    message: AssistantModelMessage,
+  ): Promise<AssistantModelMessage> {
+    if (!this.normalizeToolResultOutput || !Array.isArray(message.content)) return message;
+
+    const content: AssistantContentParts = [];
     for (const part of message.content) {
       if (part.type !== "tool-result") {
         content.push(part);
@@ -1129,6 +1148,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.state.isStreaming = true;
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
+    this.recoveryDraft = null;
     this.state.error = undefined;
 
     this.abortController = new AbortController();
@@ -1199,9 +1219,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               throw new TurnAbortedError({ reason: "cancel", phase: "model" });
             }
 
+            for (const delivered of takeAll(this.deliveredSteeringMessages)) {
+              this.appendMessage(delivered);
+            }
             for (const added of turn.newMessages) {
               this.state.messages.push(added);
             }
+            this.recoveryDraft = null;
 
             runTotalUsage = sumLanguageModelUsage(runTotalUsage, turn.totalUsage);
 
@@ -1222,7 +1246,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             // AI SDK materializes rejected tool inputs as completed tool results.
             // Continue so the model can inspect the validation error and retry.
             const hasCompletedToolExchange =
-              turn.finishReason === "tool-calls" && turn.newMessages.at(-1)?.role === "tool";
+              turn.finishReason === "tool-calls" &&
+              turn.newMessages.some(
+                (message) => message.role === "tool" || hasInlineToolResult(message),
+              );
             const executedToolCallCount = hasLocalToolCalls
               ? await this.executeToolCalls(turn.toolCalls)
               : 0;
@@ -1328,6 +1355,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               break;
             }
 
+            for (const delivered of takeAll(this.deliveredSteeringMessages)) {
+              this.appendMessage(delivered);
+            }
+
             if (this.turnErrorHandler) {
               const lastMessage = this.state.messages.at(-1);
               const retrySafety: TurnRetrySafety = modelTurnCompleted
@@ -1389,7 +1420,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         this.state.error = err instanceof Error ? err.message : String(err);
         this.emit({
           type: "agent_end",
-          messages: this.state.messages.map(cloneMessage),
+          messages: this.getRecoverableMessages().map(cloneMessage),
           totalUsage: runTotalUsage,
         });
         throw err;
@@ -1402,6 +1433,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         this.pendingInterrupt = null;
         if (this.cancelResetPending) {
           this.steeringQueue.length = 0;
+          this.deliveredSteeringMessages.length = 0;
           this.followUpQueue.length = 0;
         }
         this.cancelResetPending = false;
@@ -1482,12 +1514,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       );
     }
 
-    const toolsForModel = stripToolExecuteForModel(this.state.tools);
     const result = streamText({
       model: this.state.model,
       instructions: this.state.system,
       messages: messagesForModel,
-      tools: toolsForModel,
+      ...(this.sendToolsToModel ? { tools: stripToolExecuteForModel(this.state.tools) } : {}),
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
@@ -1621,6 +1652,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         case "tool-input-start": {
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
+            this.recoveryDraft = partialAssistant;
           } else {
             params.onLocalToolDraft(part.id);
           }
@@ -1710,9 +1742,48 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           this.state.streamMessage = partialAssistant;
           break;
         }
-        case "tool-result":
-        case "tool-error":
-        case "tool-output-denied":
+        case "tool-result": {
+          if (part.providerExecuted === true) {
+            params.onProviderExecutedTool();
+            partialAssistant.content.push({
+              type: "tool-result",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              output: recoveryToolOutput(part.output),
+            });
+            this.state.streamMessage = partialAssistant;
+            this.recoveryDraft = partialAssistant;
+          }
+          break;
+        }
+        case "tool-error": {
+          if (part.providerExecuted === true) {
+            params.onProviderExecutedTool();
+            partialAssistant.content.push({
+              type: "tool-result",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              output: { type: "error-text", value: String(part.error) },
+            });
+            this.state.streamMessage = partialAssistant;
+            this.recoveryDraft = partialAssistant;
+          }
+          break;
+        }
+        case "tool-output-denied": {
+          if (part.providerExecuted === true) {
+            params.onProviderExecutedTool();
+            partialAssistant.content.push({
+              type: "tool-result",
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              output: { type: "execution-denied", reason: "Tool output was denied." },
+            });
+            this.state.streamMessage = partialAssistant;
+            this.recoveryDraft = partialAssistant;
+          }
+          break;
+        }
         case "tool-approval-response": {
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
@@ -1786,9 +1857,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     const newMessages: ModelMessage[] = [];
     for (const message of normalizeReplayMessages(response.messages)) {
-      newMessages.push(
-        message.role === "tool" ? await this.normalizeNewToolMessage(message) : message,
-      );
+      if (message.role === "tool") {
+        newMessages.push(await this.normalizeNewToolMessage(message));
+      } else if (message.role === "assistant") {
+        newMessages.push(await this.normalizeNewAssistantMessage(message));
+      } else {
+        newMessages.push(message);
+      }
     }
     const toolCalls = extractToolCallsFromMessages(newMessages);
 
@@ -1868,15 +1943,6 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     toolCalls: ExpandedToolCall[],
     expansionDepth = 0,
   ): Promise<number> {
-    type ToolCall = (typeof toolCalls)[number];
-    type ToolExecutionOutcome = {
-      result: unknown;
-      isError: boolean;
-      toolOutput: ToolResultOutput;
-      outcome: "success" | "invalid-input" | "denied" | "error";
-      expansion?: ToolExpansion;
-    };
-
     const MAX_PARALLEL_TOOLS = 8;
     const hasExclusiveTool = toolCalls.some((call) => this.exclusiveToolNames.has(call.toolName));
 
@@ -1890,182 +1956,35 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       }
     };
 
-    const executeOne = async (call: ToolCall): Promise<ToolExecutionOutcome> => {
-      const tool = this.state.tools[call.toolName] as Tool | undefined;
-
-      this.state.pendingToolCalls.add(call.toolCallId);
-      this.emit({
-        type: "tool_execution_start",
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
-        args: call.input,
-      });
-      assertNotAborted();
-
-      let result: unknown;
-      let isError = false;
-      let toolOutput: ToolResultOutput;
-      let expansion: ToolExpansion | undefined;
-      let outcome: ToolExecutionOutcome["outcome"] = "success";
-
-      try {
-        if (hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)) {
-          isError = true;
-          outcome = "error";
-          const message = `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`;
-          result = message;
-          toolOutput = { type: "error-text", value: message };
-        } else if (call.invalid) {
-          isError = true;
-          outcome = "invalid-input";
-          const msg =
-            call.error instanceof Error
-              ? call.error.message
-              : typeof call.error === "string"
-                ? call.error
-                : call.error
-                  ? (() => {
-                      try {
-                        const s = JSON.stringify(call.error);
-                        return s ?? String(call.error);
-                      } catch {
-                        return String(call.error);
-                      }
-                    })()
-                  : "Invalid tool input.";
-          result = msg;
-          toolOutput = { type: "error-text", value: msg };
-        } else if (!tool) {
-          throw new Error(`Tool not found: ${call.toolName}`);
-        } else {
-          assertNotAborted();
-          const needsApproval =
-            typeof tool.needsApproval === "function"
-              ? await tool.needsApproval(call.input, {
-                  toolCallId: call.toolCallId,
-                  messages: this.state.messages,
-                  context: this.context,
-                })
-              : Boolean(tool.needsApproval);
-          assertNotAborted();
-
-          if (needsApproval) {
-            isError = true;
-            outcome = "denied";
-            result = { denied: true };
-            toolOutput = {
-              type: "execution-denied",
-              reason: "Tool requires approval.",
-            };
-          } else if (!tool.execute) {
-            throw new Error(`Tool has no execute(): ${call.toolName}`);
-          } else {
-            assertNotAborted();
-            const raw = tool.execute(call.input, {
-              toolCallId: call.toolCallId,
-              messages: this.state.messages,
-              abortSignal: this.abortController?.signal,
-              context: this.context,
-            });
-
-            let rawResult: unknown;
-            if (isAsyncIterable(raw)) {
-              let last: unknown = undefined;
-              const iterator = raw[Symbol.asyncIterator]();
-              let completed = false;
-              try {
-                while (true) {
-                  const next = await iterator.next();
-                  if (next.done) {
-                    completed = true;
-                    rawResult = next.value === undefined ? last : next.value;
-                    break;
-                  }
-                  assertNotAborted();
-                  last = next.value;
-                  this.emit({
-                    type: "tool_execution_update",
-                    toolCallId: call.toolCallId,
-                    toolName: call.toolName,
-                    args: call.input,
-                    partialResult: next.value,
-                  });
-                  assertNotAborted();
-                }
-              } finally {
-                if (!completed) await iterator.return?.();
+    const executeOne = (call: ExpandedToolCall): Promise<AtomicToolExecutionOutcome> =>
+      executeAtomicToolCall({
+        call,
+        tools: this.state.tools,
+        messages: this.state.messages,
+        context: this.context,
+        abortSignal: this.abortController?.signal,
+        pendingToolCalls: this.state.pendingToolCalls,
+        inputValidation: call.invalid
+          ? { type: "invalid", error: call.error }
+          : { type: "prevalidated" },
+        expansionHandling:
+          expansionDepth > 0
+            ? {
+                type: "reject",
+                message: "Nested tool-call expansions are not supported.",
               }
-            } else {
-              rawResult = await raw;
-            }
-            assertNotAborted();
-
-            if (isToolExpansion(rawResult)) {
-              if (expansionDepth > 0) {
-                throw new Error("Nested tool-call expansions are not supported.");
-              }
-              expansion = rawResult;
-              result = rawResult.result;
-              toolOutput = { type: "json", value: toJsonToolOutputValue(result) };
-            } else {
-              result = rawResult;
-              toolOutput = tool.toModelOutput
-                ? await tool.toModelOutput({
-                    toolCallId: call.toolCallId,
-                    input: call.input,
-                    output: result,
-                  })
-                : { type: "json", value: toJsonToolOutputValue(result) };
-              assertNotAborted();
-            }
-          }
-        }
-      } catch (e) {
-        if (e instanceof TurnAbortedError) throw e;
-        assertNotAborted();
-        isError = true;
-        const message = errorMessage(e);
-        outcome =
-          isInvalidToolInputError(e) || message.includes("AI_InvalidToolInputError")
-            ? "invalid-input"
-            : "error";
-        result = message;
-        toolOutput = {
-          type: "error-text",
-          value: message,
-        };
-      }
-
-      assertNotAborted();
-      toolOutput = await this.normalizeToolOutput(toolOutput, {
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
+            : { type: "capture" },
+        normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
-      });
-      assertNotAborted();
-
-      this.state.pendingToolCalls.delete(call.toolCallId);
-      this.emit({
-        type: "tool_execution_end",
-        toolCallId: call.toolCallId,
-        toolName: call.toolName,
-        args: call.input,
-        result,
-        isError,
-        output: toolOutput,
-        outcome,
+        executionRejection:
+          hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
+            ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
+            : undefined,
+        assertNotAborted,
+        onEvent: (event) => this.emit(event),
       });
 
-      return {
-        result,
-        isError,
-        toolOutput,
-        outcome,
-        ...(expansion ? { expansion } : {}),
-      };
-    };
-
-    const outcomes: Array<ToolExecutionOutcome | undefined> = Array.from({
+    const outcomes: Array<AtomicToolExecutionOutcome | undefined> = Array.from({
       length: toolCalls.length,
     });
     let nextAppendIndex = 0;

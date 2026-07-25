@@ -125,14 +125,14 @@ function rewriteAssistantToolCallIds(params: {
 
   for (let i = 0; i < params.message.content.length; i += 1) {
     const part = params.message.content[i];
-    if (part?.type !== "tool-call") continue;
+    if (part?.type !== "tool-call" && part?.type !== "tool-result") continue;
 
     const nextId = params.resolve(part.toolCallId);
     if (nextId === part.toolCallId) continue;
 
     nextContent ??= params.message.content.map((contentPart) => ({ ...contentPart }));
     const nextPart = nextContent[i];
-    if (nextPart?.type !== "tool-call") continue;
+    if (nextPart?.type !== "tool-call" && nextPart?.type !== "tool-result") continue;
     nextPart.toolCallId = nextId;
   }
 

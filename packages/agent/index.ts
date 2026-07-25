@@ -1,5 +1,6 @@
 export * from "./agent-run-idle-watchdog";
 export * from "./ai-sdk-pi-agent";
+export * from "./atomic-tool-execution";
 export * from "./auto-compaction";
 export * from "./context-overflow";
 export * from "./tool-call-expansion";

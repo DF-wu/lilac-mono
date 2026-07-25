@@ -789,6 +789,45 @@ describe("AiSdkPiAgent provider stream parts", () => {
 });
 
 describe("AiSdkPiAgent queued steering and cancellation", () => {
+  it("records provider-delivered steering once without replaying it at a boundary", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "text-1" },
+            { type: "text-delta", id: "text-1", delta: "done" },
+            { type: "text-end", id: "text-1" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    let steeringId = "";
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      transformMessages: (messages) => {
+        expect(agent.acknowledgeSteeringDelivery(steeringId)).toBe(true);
+        return [...messages];
+      },
+    });
+    steeringId = agent.steer("change direction");
+
+    await agent.prompt("start");
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "user", content: "change direction" },
+      { role: "assistant", content: [{ type: "text", text: "done" }] },
+    ]);
+  });
+
   it("returns stable steering IDs and interrupts with every queued message exactly once", async () => {
     const model = new MockLanguageModelV4({
       doStream: {
@@ -1271,6 +1310,13 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
         stream: simulateReadableStream({
           chunks: [
             {
+              type: "tool-call",
+              toolCallId: "provider-call",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
               type: "tool-result",
               toolCallId: "provider-call",
               toolName: "provider_search",
@@ -1297,6 +1343,104 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
 
     expect(model.doStreamCalls).toHaveLength(1);
     expect(retryReasons).toEqual(["provider-executed-tool"]);
+    expect(agent.getRecoverableMessages()).toEqual([
+      { role: "user", content: "search" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "provider-call",
+            toolName: "provider_search",
+            input: {},
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "provider-call",
+            toolName: "provider_search",
+            output: { type: "text", value: "result" },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("normalizes an inline provider tool result and continues the completed exchange", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "provider-call",
+                toolName: "mcp__lilac__read",
+                input: '{"path":"README.md"}',
+                providerExecuted: true,
+              },
+              {
+                type: "tool-result",
+                toolCallId: "provider-call",
+                toolName: "mcp__lilac__read",
+                input: { path: "README.md" },
+                result: "raw result",
+                providerExecuted: true,
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "answer" },
+              { type: "text-delta", id: "answer", delta: "done" },
+              { type: "text-end", id: "answer" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const normalized: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      sendToolsToModel: false,
+      normalizeToolResultOutput: (_output, context) => {
+        normalized.push(context.toolName);
+        return { type: "text", value: "normalized result" };
+      },
+    });
+
+    await agent.prompt("read");
+
+    expect(model.doStreamCalls).toHaveLength(2);
+    expect(normalized).toEqual(["mcp__lilac__read", "mcp__lilac__read"]);
+    expect(agent.state.messages[1]).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "provider-call", providerExecuted: true },
+        {
+          type: "tool-result",
+          toolCallId: "provider-call",
+          output: { type: "text", value: "normalized result" },
+        },
+      ],
+    });
+    expect(agent.state.messages.at(-1)).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+    });
   });
 
   it("replays a local tool draft and executes only the completed retry", async () => {

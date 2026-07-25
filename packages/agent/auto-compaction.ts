@@ -68,13 +68,7 @@ function getAssistantToolCallIds(message: ModelMessage): string[] {
 
   const ids: string[] = [];
   for (const part of message.content) {
-    const candidate = part as {
-      type?: unknown;
-      toolCallId?: unknown;
-    };
-    if (candidate.type === "tool-call" && typeof candidate.toolCallId === "string") {
-      ids.push(candidate.toolCallId);
-    }
+    if (part.type === "tool-call") ids.push(part.toolCallId);
   }
   return ids;
 }
@@ -89,13 +83,7 @@ function getToolResultToolCallIds(message: ModelMessage): string[] {
 
   const ids: string[] = [];
   for (const part of message.content) {
-    const candidate = part as {
-      type?: unknown;
-      toolCallId?: unknown;
-    };
-    if (candidate.type === "tool-result" && typeof candidate.toolCallId === "string") {
-      ids.push(candidate.toolCallId);
-    }
+    if (part.type === "tool-result") ids.push(part.toolCallId);
   }
   return ids;
 }
@@ -112,7 +100,19 @@ function isValidSuffix(messages: readonly ModelMessage[], startIndex: number): b
       const toolCallIds = getAssistantToolCallIds(message);
       if (getAssistantToolCallPartCount(message) !== toolCallIds.length) return false;
       if (new Set(toolCallIds).size !== toolCallIds.length) return false;
-      if (toolCallIds.length > 0) openToolCallIds = new Set(toolCallIds);
+      const unresolved = new Set(toolCallIds);
+      if (Array.isArray(message.content)) {
+        const seenCalls = new Set<string>();
+        for (const part of message.content) {
+          if (part.type === "tool-call") {
+            seenCalls.add(part.toolCallId);
+            continue;
+          }
+          if (part.type !== "tool-result") continue;
+          if (!seenCalls.has(part.toolCallId) || !unresolved.delete(part.toolCallId)) return false;
+        }
+      }
+      if (unresolved.size > 0) openToolCallIds = unresolved;
       continue;
     }
 
@@ -254,6 +254,14 @@ function repairTranscriptForCompaction(messages: readonly ModelMessage[]): Repai
 
       const uniqueToolCallIds = new Set(toolCallIds);
       const matchedToolCallIds = new Set<string>();
+      const seenInlineCallIds = new Set<string>();
+      for (const part of message.content) {
+        if (part.type === "tool-call") {
+          seenInlineCallIds.add(part.toolCallId);
+        } else if (part.type === "tool-result" && seenInlineCallIds.has(part.toolCallId)) {
+          matchedToolCallIds.add(part.toolCallId);
+        }
+      }
       for (let toolIndex = messageIndex + 1; toolIndex < toolBlockEnd; toolIndex++) {
         const toolMessage = messages[toolIndex]!;
         for (const resultId of getToolResultToolCallIds(toolMessage)) {
@@ -262,18 +270,25 @@ function repairTranscriptForCompaction(messages: readonly ModelMessage[]): Repai
       }
 
       const retainedToolCallIds = new Set<string>();
+      const retainedResultIds = new Set<string>();
       const assistantContent = message.content.filter((part) => {
-        const candidate = part as { type?: unknown; toolCallId?: unknown };
-        if (candidate.type !== "tool-call") return true;
-        if (
-          typeof candidate.toolCallId === "string" &&
-          matchedToolCallIds.has(candidate.toolCallId) &&
-          !retainedToolCallIds.has(candidate.toolCallId)
-        ) {
-          retainedToolCallIds.add(candidate.toolCallId);
+        if (part.type === "tool-call") {
+          if (
+            matchedToolCallIds.has(part.toolCallId) &&
+            !retainedToolCallIds.has(part.toolCallId)
+          ) {
+            retainedToolCallIds.add(part.toolCallId);
+            return true;
+          }
+          droppedDanglingToolCallParts += 1;
+          return false;
+        }
+        if (part.type !== "tool-result") return true;
+        if (retainedToolCallIds.has(part.toolCallId) && !retainedResultIds.has(part.toolCallId)) {
+          retainedResultIds.add(part.toolCallId);
           return true;
         }
-        droppedDanglingToolCallParts += 1;
+        droppedOrphanToolResultParts += 1;
         return false;
       });
 
@@ -283,7 +298,6 @@ function repairTranscriptForCompaction(messages: readonly ModelMessage[]): Repai
         droppedEmptyAssistantMessages += 1;
       }
 
-      const retainedResultIds = new Set<string>();
       for (let toolIndex = messageIndex + 1; toolIndex < toolBlockEnd; toolIndex++) {
         const toolMessage = messages[toolIndex]!;
         if (toolMessage.role !== "tool") continue;

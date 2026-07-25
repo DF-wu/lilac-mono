@@ -158,6 +158,45 @@ describe("tool call ID normalization", () => {
     expect(part.toolCallId).toBe("subagent_result:sub:discord:1");
   });
 
+  it("rewrites an inline provider call and result to the same ID", () => {
+    const originalId = "provider:call/with invalid characters and a very long identifier";
+    const normalized = normalizeModelMessagesToolCallIds({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: originalId,
+              toolName: "mcp__lilac__read",
+              input: { path: "README.md" },
+              providerExecuted: true,
+            },
+            {
+              type: "tool-result",
+              toolCallId: originalId,
+              toolName: "mcp__lilac__read",
+              output: { type: "text", value: "contents" },
+            },
+          ],
+        },
+      ],
+      modelSpecifier: "claude-code/claude-sonnet-4-6",
+    });
+
+    const message = normalized[0];
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+      throw new Error("expected assistant message");
+    }
+    const call = message.content[0];
+    const result = message.content[1];
+    if (call?.type !== "tool-call" || result?.type !== "tool-result") {
+      throw new Error("expected inline tool exchange");
+    }
+    expect(call.toolCallId).not.toBe(originalId);
+    expect(result.toolCallId).toBe(call.toolCallId);
+  });
+
   it("builds stable synthetic tool call IDs with safe characters", () => {
     const one = buildSyntheticToolCallId({
       prefix: "subagent_result",

@@ -558,6 +558,40 @@ describe("auto-compaction internals", () => {
     expect(__autoCompactionInternals.isValidSuffix(repaired.messages, 0)).toBe(true);
   });
 
+  it("preserves a complete inline provider tool exchange", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "read" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "inline-call",
+            toolName: "mcp__lilac__read",
+            input: { path: "README.md" },
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "inline-call",
+            toolName: "mcp__lilac__read",
+            output: { type: "text", value: "contents" },
+          },
+          { type: "text", text: "done" },
+        ],
+      },
+    ];
+
+    expect(__autoCompactionInternals.isValidSuffix(messages, 0)).toBe(true);
+    expect(__autoCompactionInternals.repairTranscriptForCompaction(messages)).toEqual({
+      messages,
+      droppedDanglingToolCallParts: 0,
+      droppedOrphanToolResultParts: 0,
+      droppedEmptyAssistantMessages: 0,
+      droppedEmptyToolMessages: 0,
+    });
+  });
+
   it("removes a dangling assistant tool call", () => {
     const messages: ModelMessage[] = [
       {
