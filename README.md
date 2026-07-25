@@ -54,6 +54,25 @@ Most commands below are long-running.
 - `tools` CLI (after building): `./apps/tool-bridge/dist/index.js --list`
   - Target a different server with `TOOL_SERVER_BACKEND_URL=http://host:port`
 
+### Local Claude Subscription
+
+Core can use an authenticated local Claude Code installation without an Anthropic API key. Install
+the official Claude tooling, run `claude auth login`, and select the credentialless provider in
+`core-config.yaml`:
+
+```yaml
+models:
+  main:
+    model: claude-code/claude-sonnet-4-6
+```
+
+Lilac does not read, store, or refresh the Claude credential. The provider delegates authentication
+to the official local tooling. Claude filesystem settings, built-in tools, and Claude transcript
+persistence are disabled; run-scoped Lilac tools are exposed through an in-process MCP server.
+`batch` is intentionally omitted because Claude can issue independent MCP calls in parallel. This
+provider is distinct from the API-key-backed `anthropic` provider and is currently supported by Core,
+not Mini Lilac.
+
 ## License
 
 This repository is licensed under MIT. See `LICENSE` for details.
