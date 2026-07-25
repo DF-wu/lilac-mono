@@ -146,4 +146,69 @@ describe("buildSafeRecoveryCheckpoint", () => {
     const checkpoint = buildSafeRecoveryCheckpoint(messages, "server restarted");
     expect(checkpoint).toEqual([{ role: "user", content: "hi" }]);
   });
+
+  it("keeps a complete inline provider tool exchange unchanged", () => {
+    const messages = [
+      { role: "user", content: "read" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "inline",
+            toolName: "mcp__lilac__read",
+            input: { path: "README.md" },
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "inline",
+            toolName: "mcp__lilac__read",
+            output: { type: "text", value: "contents" },
+          },
+          { type: "text", text: "done" },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(buildSafeRecoveryCheckpoint(messages)).toEqual(messages);
+  });
+
+  it("synthesizes failure only for a dangling call in a mixed inline exchange", () => {
+    const messages = [
+      { role: "user", content: "run both" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "complete",
+            toolName: "mcp__lilac__read",
+            input: {},
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "complete",
+            toolName: "mcp__lilac__read",
+            output: { type: "text", value: "ok" },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "dangling",
+            toolName: "mcp__lilac__bash",
+            input: {},
+            providerExecuted: true,
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    const checkpoint = buildSafeRecoveryCheckpoint(messages);
+    expect(checkpoint.slice(0, 2)).toEqual(messages);
+    expect(checkpoint[2]).toMatchObject({
+      role: "tool",
+      content: [{ toolCallId: "dangling", output: { type: "error-text" } }],
+    });
+  });
 });

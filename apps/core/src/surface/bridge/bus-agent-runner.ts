@@ -134,6 +134,11 @@ import {
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
 import {
+  materializeClaudeCodeRun,
+  type ClaudeCodeRunControl,
+  type MaterializedClaudeCodeRun,
+} from "./bus-agent-runner/claude-code-run";
+import {
   buildInputCompositionLine,
   buildNoAssistantTextError,
   buildStatsLine,
@@ -1467,6 +1472,7 @@ type SessionQueue = {
     raw?: unknown;
     partialText: string;
     liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
+    claudeCodeControl: ClaudeCodeRunControl | null;
     notifyWaiters: () => void;
     cancel: () => void;
     started: boolean;
@@ -2042,7 +2048,7 @@ export async function startBusAgentRunner(params: {
     }
 
     const checkpointMessages = buildSafeRecoveryCheckpoint(
-      state.agent.state.messages,
+      state.agent.getRecoverableMessages(),
       "server restarted",
     );
 
@@ -2208,6 +2214,7 @@ export async function startBusAgentRunner(params: {
     const routerSessionMode = parseRouterSessionModeFromRaw(next.raw);
 
     let activeAgent: AiSdkPiAgent<ToolSet> | null = null;
+    let claudeCodeRun: MaterializedClaudeCodeRun | null = null;
     let activeRunOperation: Promise<unknown> | null = null;
     let customCommandAbortController: AbortController | null = null;
     let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
@@ -2376,6 +2383,7 @@ export async function startBusAgentRunner(params: {
       raw: next.raw,
       partialText: next.recovery?.partialText ?? "",
       liveParent: liveParentSession,
+      claudeCodeControl: null,
       notifyWaiters: notifyContinuationWaiters,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
@@ -3030,10 +3038,26 @@ export async function startBusAgentRunner(params: {
         sessionId: headers.session_id,
         modelSpec: resolved.spec,
       });
+      if (resolved.provider === "claude-code") {
+        claudeCodeRun = await waitForPreAgent(
+          materializeClaudeCodeRun({
+            modelId: resolved.modelId,
+            cwd: executionCwd,
+            tools,
+            execute: async (request) => {
+              if (!activeAgent) {
+                throw new Error("Claude Code tool execution started before the agent was ready");
+              }
+              return await activeAgent.executeExternalToolCall(request);
+            },
+          }),
+        );
+        if (state.activeRun) state.activeRun.claudeCodeControl = claudeCodeRun.control;
+      }
 
       const agent = new AiSdkPiAgent<ToolSet>({
         system: agentSystem,
-        model: resolved.model,
+        model: claudeCodeRun?.agentModel ?? resolved.model,
         modelSpecifier: resolved.spec,
         messages: next.recovery?.checkpointMessages ?? seededSessionMessages,
         tools,
@@ -3043,6 +3067,7 @@ export async function startBusAgentRunner(params: {
         normalizeToolResultOutput,
         genericOutputNormalizerBypassTools,
         experimentalDownload: experimentalDownloadForAgent,
+        sendToolsToModel: claudeCodeRun === null,
         debug: {
           captureModelViewMessages: env.debug.contextDump.enabled,
         },
@@ -3136,6 +3161,7 @@ export async function startBusAgentRunner(params: {
       unsubscribeCompaction = await waitForPreAgent(
         attachAutoCompaction(agent, {
           model: resolved.spec,
+          summaryModel: claudeCodeRun?.utilityModel ?? "current",
           modelCapability,
           resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
           baseTransformMessages: toolPruneTransform,
@@ -4248,14 +4274,18 @@ export async function startBusAgentRunner(params: {
       if (params.transcriptStore) {
         try {
           const finalMessagesForPersistence =
-            runStats.finalMessages ?? activeAgent?.state.messages ?? [];
-          const responseMessages = finalMessagesForPersistence.slice(responseStartIndex);
+            runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
+          const safeFinalMessages = buildSafeRecoveryCheckpoint(
+            finalMessagesForPersistence,
+            "agent run failed",
+          );
+          const responseMessages = safeFinalMessages.slice(responseStartIndex);
           const persistedMessages = (() => {
             if (isHeartbeatSessionId(headers.session_id)) {
               return buildPersistedHeartbeatMessages(`Error: ${msg}`);
             }
 
-            return runProfile === "primary" ? responseMessages : finalMessagesForPersistence;
+            return runProfile === "primary" ? responseMessages : safeFinalMessages;
           })();
 
           params.transcriptStore.saveRequestTranscript({
@@ -4286,8 +4316,11 @@ export async function startBusAgentRunner(params: {
       if (params.transcriptStore && isHeartbeatSessionId(headers.session_id)) {
         try {
           const finalMessagesForPersistence =
-            runStats.finalMessages ?? activeAgent?.state.messages ?? [];
-          const responseMessages = finalMessagesForPersistence.slice(responseStartIndex);
+            runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
+          const responseMessages = buildSafeRecoveryCheckpoint(
+            finalMessagesForPersistence,
+            "agent run failed",
+          ).slice(responseStartIndex);
 
           persistHeartbeatSurfaceHandoffs({
             logger,
@@ -4349,6 +4382,13 @@ export async function startBusAgentRunner(params: {
       rejectPreAgentCancellation = null;
       unsubscribe();
       unsubscribeCompaction();
+      await claudeCodeRun?.dispose().catch((e: unknown) => {
+        logger.warn(
+          "failed to dispose Claude Code run resources",
+          { requestId: headers.request_id, sessionId: headers.session_id },
+          e,
+        );
+      });
       await liveParentSession?.close();
       state.agent = null;
       state.activeRequestId = null;
@@ -4464,6 +4504,7 @@ async function applyToRunningAgent(
 ) {
   const merged = mergeToSingleUserMessage(entry.messages);
   const liveParent = activeRun?.liveParent;
+  const claudeCodeControl = activeRun?.claudeCodeControl;
   const notifyWaiters = activeRun?.notifyWaiters;
   const queueWhileIdle = (mode: "followUp" | "steer") => {
     if (mode === "steer") {
@@ -4513,7 +4554,7 @@ async function applyToRunningAgent(
         if (cancel) {
           cancelledByRequestId.add(entry.requestId);
           await liveParent?.cancelAll("parent request aborted");
-          agent.abort();
+          agent.cancel();
           notifyWaiters?.();
           return;
         }
@@ -4534,7 +4575,12 @@ async function applyToRunningAgent(
 
   switch (entry.queue) {
     case "steer": {
-      agent.steer(merged);
+      const steeringId = agent.steer(merged);
+      if (merged.role === "user" && typeof merged.content === "string") {
+        claudeCodeControl?.inject(merged.content, (delivered) => {
+          if (delivered) agent.acknowledgeSteeringDelivery(steeringId);
+        });
+      }
       notifyWaiters?.();
       return;
     }
@@ -4547,11 +4593,14 @@ async function applyToRunningAgent(
       if (cancel) {
         cancelledByRequestId.add(entry.requestId);
         await liveParent?.cancelAll("parent request aborted");
-        agent.abort();
+        await claudeCodeControl?.interrupt();
+        agent.cancel();
         notifyWaiters?.();
         return;
       }
-      await agent.interrupt(merged);
+      agent.steer(merged);
+      const interruptedNatively = (await claudeCodeControl?.interrupt()) ?? false;
+      if (!interruptedNatively) agent.interruptQueuedSteering();
       notifyWaiters?.();
       return;
     }

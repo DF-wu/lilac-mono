@@ -1,4 +1,4 @@
-import type { ModelMessage, ToolContent } from "ai";
+import type { AssistantContent, ModelMessage, ToolContent } from "ai";
 
 export { isHeartbeatSessionId } from "../heartbeat/common";
 
@@ -11,6 +11,7 @@ const HEARTBEAT_HANDOFF_TOOL_OUTPUT = {
 } satisfies Extract<ToolContent[number], { type: "tool-result" }>["output"];
 
 const SURFACE_SEND_PATTERN = /\bsurface\.messages\.send\b/u;
+const LILAC_MCP_PREFIX = "mcp__lilac__";
 const SURFACE_SEND_TEXT_PATTERN =
   /surface\.messages\.send\b[\s\S]*?(?:--text(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(\S+)))/gu;
 
@@ -37,20 +38,35 @@ export function extractHeartbeatSurfaceSendHandoffs(
   const pendingTexts = new Map<string, string[]>();
   const out: HeartbeatHandoffTranscript[] = [];
 
+  const consumeResult = (toolCallId: string, messageIndex: number) => {
+    const sendTexts = pendingTexts.get(toolCallId) ?? [];
+    if (sendTexts.length === 0) return;
+
+    for (const sendText of sendTexts) {
+      const handoff = buildHeartbeatHandoffTranscriptWithSendText(
+        messages.slice(0, messageIndex + 1),
+        sendText,
+      );
+      if (handoff) out.push(handoff);
+    }
+    pendingTexts.delete(toolCallId);
+  };
+
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
     const message = messages[messageIndex]!;
 
     if (message.role === "assistant" && Array.isArray(message.content)) {
       for (const part of message.content) {
-        if (part?.type !== "tool-call") continue;
-
-        const toolCallId = part.toolCallId;
-        if (!toolCallId) continue;
-
-        const sendTexts = extractSurfaceSendTexts(part.toolName, part.input);
-        if (sendTexts.length === 0) continue;
-
-        pendingTexts.set(toolCallId, [...(pendingTexts.get(toolCallId) ?? []), ...sendTexts]);
+        if (part.type === "tool-call") {
+          const sendTexts = extractSurfaceSendTexts(part.toolName, part.input);
+          if (sendTexts.length === 0) continue;
+          pendingTexts.set(part.toolCallId, [
+            ...(pendingTexts.get(part.toolCallId) ?? []),
+            ...sendTexts,
+          ]);
+        } else if (part.type === "tool-result") {
+          consumeResult(part.toolCallId, messageIndex);
+        }
       }
     }
 
@@ -64,18 +80,7 @@ export function extractHeartbeatSurfaceSendHandoffs(
       const toolCallId = part.toolCallId;
       if (!toolCallId) continue;
 
-      const sendTexts = pendingTexts.get(toolCallId) ?? [];
-      if (sendTexts.length === 0) continue;
-
-      for (const sendText of sendTexts) {
-        const handoff = buildHeartbeatHandoffTranscriptWithSendText(
-          messages.slice(0, messageIndex + 1),
-          sendText,
-        );
-        if (handoff) out.push(handoff);
-      }
-
-      pendingTexts.delete(toolCallId);
+      consumeResult(toolCallId, messageIndex);
     }
   }
 
@@ -99,28 +104,30 @@ function buildHeartbeatHandoffTranscriptWithSendText(
 
 function compactHeartbeatHandoffMessages(messages: readonly ModelMessage[]): ModelMessage[] {
   return messages.map((message) => {
-    if (message.role !== "tool" || !Array.isArray(message.content)) {
-      return message;
+    if (message.role === "tool") {
+      const content: ToolContent = message.content.map((part) =>
+        part.type === "tool-result"
+          ? { ...part, output: HEARTBEAT_HANDOFF_TOOL_OUTPUT }
+          : { ...part },
+      );
+      return { ...message, content };
     }
+    if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
 
-    return {
-      ...message,
-      content: message.content.map((part) => {
-        if (part?.type !== "tool-result") {
-          return { ...part };
-        }
-
-        return {
-          ...part,
-          output: HEARTBEAT_HANDOFF_TOOL_OUTPUT,
-        };
-      }),
-    } satisfies ModelMessage;
+    const content: AssistantContent = message.content.map((part) =>
+      part.type === "tool-result"
+        ? { ...part, output: HEARTBEAT_HANDOFF_TOOL_OUTPUT }
+        : { ...part },
+    );
+    return { ...message, content };
   });
 }
 
 function extractSurfaceSendTexts(toolName: string | undefined, input: unknown): string[] {
-  if (toolName === "surface.messages.send") {
+  const localToolName = toolName?.startsWith(LILAC_MCP_PREFIX)
+    ? toolName.slice(LILAC_MCP_PREFIX.length)
+    : toolName;
+  if (localToolName === "surface.messages.send") {
     const direct = extractDirectSurfaceSendText(input);
     return direct ? [direct] : [safeStringify(input)];
   }

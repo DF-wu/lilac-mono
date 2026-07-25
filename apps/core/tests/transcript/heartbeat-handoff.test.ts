@@ -159,6 +159,42 @@ describe("heartbeat handoff transcripts", () => {
     expect(handoffs[0]?.finalText).toBe("batched update");
   });
 
+  it("extracts and compacts a namespaced inline provider send", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "send-1",
+            toolName: "mcp__lilac__surface.messages.send",
+            input: { text: "inline update" },
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "send-1",
+            toolName: "mcp__lilac__surface.messages.send",
+            output: { type: "text", value: '{"ok":true}' },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    const handoffs = extractHeartbeatSurfaceSendHandoffs(messages);
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]?.finalText).toBe("inline update");
+    const assistant = handoffs[0]?.messages[0];
+    if (assistant?.role !== "assistant" || !Array.isArray(assistant.content)) {
+      throw new Error("expected inline assistant exchange");
+    }
+    const result = assistant.content.find((part) => part.type === "tool-result");
+    expect(result).toMatchObject({
+      toolCallId: "send-1",
+      output: { type: "text", value: HEARTBEAT_HANDOFF_TOOL_RESULT_PLACEHOLDER },
+    });
+  });
+
   it("builds a fallback compacted transcript", () => {
     const transcript = buildHeartbeatHandoffTranscript([
       { role: "assistant", content: "Intro" },
