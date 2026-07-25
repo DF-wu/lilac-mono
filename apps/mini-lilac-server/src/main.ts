@@ -234,6 +234,9 @@ Commands:
   auth codex --status  Show Codex OAuth status without printing tokens
   auth codex --logout  Clear stored Lilac Codex OAuth tokens
 
+Providers of type 'claude-code' need no Lilac auth command and no auth.json
+entry; authenticate with the official Claude CLI (claude auth login).
+
 Options:
   --config <file>    Server config (default: $XDG_STATE_HOME/mini-lilac/config.yaml)
   --database <file>  SQLite database (default: $XDG_STATE_HOME/mini-lilac/mini-lilac.sqlite)

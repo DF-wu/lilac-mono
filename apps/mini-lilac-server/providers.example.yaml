@@ -1,6 +1,14 @@
 configVersion: 1
 
 providers:
+  # Uses a locally authenticated Claude installation (`claude auth login`).
+  # Credentialless: this provider must have no entry in auth.json, and Lilac
+  # never reads or stores the Claude credential. Models come from Anthropic's
+  # models.dev metadata; `catalog: v1` and `baseUrl` are rejected.
+  # claude-code:
+  #   type: claude-code
+  #   catalog: models-dev
+
   openai:
     type: openai
     # Uses Lilac Codex OAuth when available, otherwise the key in auth.json.

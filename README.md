@@ -70,8 +70,31 @@ Lilac does not read, store, or refresh the Claude credential. The provider deleg
 to the official local tooling. Claude filesystem settings, built-in tools, and Claude transcript
 persistence are disabled; run-scoped Lilac tools are exposed through an in-process MCP server.
 `batch` is intentionally omitted because Claude can issue independent MCP calls in parallel. This
-provider is distinct from the API-key-backed `anthropic` provider and is currently supported by Core,
-not Mini Lilac.
+provider is distinct from the API-key-backed `anthropic` provider.
+
+Mini Lilac supports the same provider, declared in `providers.yaml`:
+
+```yaml
+providers:
+  claude-code:
+    type: claude-code
+    catalog: models-dev
+```
+
+It takes no `auth.json` entry (supplying one is a configuration error), no `baseUrl`, and requires
+`catalog: models-dev`. Models are resolved from Anthropic's models.dev metadata and filtered to the
+Claude families the CLI can launch. Two behaviors differ from other Mini Lilac providers:
+
+- Profiles that request `websearch` get Claude's built-in `WebSearch` instead of the API-key-backed
+  provider tool. Claude executes it, so it does not pass through Lilac approval, artifact capture, or
+  output normalization. It is the only Claude built-in that is enabled, and only for profiles that
+  already ask for web search. Core enables none.
+- Steering is injected into the live Claude query rather than waiting for a turn boundary. Messages
+  the query cannot take — attachments, or a steer sent before the query opened — stay queued and
+  behave as they do on any other provider.
+
+Because it needs the local Claude CLI and its credential, this provider is for local runs; it does
+not work inside the Docker image.
 
 ## License
 
