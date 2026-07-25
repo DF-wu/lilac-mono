@@ -6,6 +6,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGroq } from "@ai-sdk/groq";
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
 import { createGateway } from "ai";
+import { createClaudeCode } from "ai-sdk-provider-claude-code";
 
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
 import { env } from "./env";
@@ -30,6 +31,7 @@ export type Providers =
   | "xai"
   | "openrouter"
   | "anthropic"
+  | "claude-code"
   | "groq"
   | "vercel"
   | (string & {});
@@ -396,6 +398,13 @@ export function getModelProviders() {
           apiKey: env.providers.anthropic.apiKey,
         })
       : null,
+    "claude-code": createClaudeCode({
+      defaultSettings: {
+        tools: [],
+        settingSources: [],
+        persistSession: false,
+      },
+    }),
     openrouter: env.providers.openrouter
       ? createOpenRouter({
           baseURL: env.providers.openrouter.baseUrl,

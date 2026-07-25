@@ -4,10 +4,21 @@ import { CODEX_BASE_INSTRUCTIONS } from "../codex-instructions";
 import type { CodexOAuthTokens } from "../codex-oauth";
 import {
   createCodexResponsesEventNormalizer,
+  getModelProviders,
   normalizeCodexResponsesRequestRecord,
   refreshCodexOAuthTokens,
   shouldRefreshCodexOAuthTokens,
 } from "../model-provider";
+
+describe("claude-code provider", () => {
+  it("is available without API credentials and uses isolated utility defaults", () => {
+    const provider = getModelProviders()["claude-code"];
+    const model = provider("sonnet");
+
+    expect(model.provider).toBe("claude-code");
+    expect(model.modelId).toBe("sonnet");
+  });
+});
 
 function jwt(claims: Record<string, unknown>): string {
   return `header.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.signature`;
