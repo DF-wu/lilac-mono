@@ -234,11 +234,45 @@ render the equivalent UI.
 
 ## 8. Verification record
 
-_(populated during Phase 8/9)_
+### Automated
 
 | Check | Command | Result |
 |-------|---------|--------|
-| | | |
+| Telegram suite | `bun test tests/surface/telegram/` (in `apps/core`) | **207 pass, 0 fail** across 9 files |
+| Telegram suite, isolated container | `docker/verify-telegram.sh` | **pass** — read-only repo mount, `--network none`, tmpfs scratch |
+| Config suite | `bun test` (in `packages/utils`) | **283 pass, 0 fail** |
+| Full core suite | `bun test` (in `apps/core`) | **1492 pass, 1 fail** — the one failure is the pre-existing wall-clock-dependent heartbeat test ([#41](https://github.com/DF-wu/lilac-mono/issues/41)) |
+| Workspace typecheck | `tsc --noEmit` per package | **clean**, except the pre-existing `packages/mini-lilac-runtime` error ([#41](https://github.com/DF-wu/lilac-mono/issues/41)) |
+| Lint | `bun run lint` | **clean** |
+| Format | `bun run fmt:check` | **clean** for all source; flags only `.omo/run-continuation/*.json`, an untracked scratch file written live by the local agent harness |
+
+Test count moved from **1302 → 1493** in `apps/core`, and no Discord or GitHub test
+required modification — the router generalization is behaviour-preserving.
+
+### Adversarial check of the HTML renderer
+
+The renderer is the one security-sensitive component (it turns model output into
+markup sent to a third party), so its claims were probed directly rather than
+taken on trust:
+
+| Input | Output | Verdict |
+|-------|--------|---------|
+| `<img src=x onerror=alert(1)>` | `&lt;img src=x onerror=alert(1)&gt;` | fully escaped |
+| `[x](https://a.com" onmouseover="alert(1))` | `<a href="https://a.com&quot; onmouseover=&quot;alert(1)">x</a>` | quote escaped; stays one attribute |
+| `[click](javascript:alert(1))` | `click` | link dropped, label kept |
+| ` ```ts\n</code></pre>...\n``` ` | escaped inside the fence | no code-block breakout |
+| unterminated fence | closed anyway | never unbalanced |
+
+### Manual smoke test (owner)
+
+_Pending._ Steps are in `docs/telegram-surface.md` §7.
+
+| Step | Result |
+|------|--------|
+| DM reply with streamed edits | |
+| Long answer splits cleanly across messages | |
+| Cancel button stops a running request | |
+| Group behaviour under privacy mode | |
 
 ---
 
