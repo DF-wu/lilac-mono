@@ -115,14 +115,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier"): Promise<void> {
     if (scope === "verifier") return;
-    await this.updateCredential((credential) => {
-      const { clientInformation, tokens, ...retained } = credential;
-      if (scope === "tokens") {
-        return clientInformation ? { ...retained, clientInformation } : retained;
-      }
-      if (scope === "client") return tokens ? { ...retained, tokens } : retained;
-      return retained;
-    });
+    await this.updateCredential((credential) => this.invalidateCredential(credential, scope));
   }
 
   redirectToAuthorization(_authorizationUrl: URL): void {
@@ -177,10 +170,6 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return { client_id: clientId.value, client_secret: clientSecret.value };
   }
 
-  private async persistClientInformation(clientInformation: OAuthClientInformation): Promise<void> {
-    await this.updateCredential((credential) => ({ ...credential, clientInformation }));
-  }
-
   async authorizationServerInformation(): Promise<OAuthAuthorizationServerInformation | undefined> {
     return (await this.readCredential())?.authorizationServerInformation;
   }
@@ -209,6 +198,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
   hasPendingState(state: string): boolean {
     this.pruneExpiredPending();
     return this.pending.has(state);
+  }
+
+  discardPendingAuthorizations(): void {
+    this.pending.clear();
   }
 
   async startAuthorization(): Promise<McpOAuthStartResult> {
@@ -294,10 +287,18 @@ export class McpOAuthProvider implements OAuthClientProvider {
       tokens: () => this.tokens(),
       saveTokens: async (tokens: OAuthTokens) => {
         this.assertActive(pending, "complete");
-        await this.saveTokens(tokens);
+        await this.updateCredentialForAttempt(pending, "complete", (credential) => ({
+          ...credential,
+          tokens,
+        }));
       },
-      invalidateCredentials: (scope: "all" | "client" | "tokens" | "verifier") =>
-        this.invalidateCredentials(scope),
+      invalidateCredentials: async (scope: "all" | "client" | "tokens" | "verifier") => {
+        this.assertActive(pending, "complete");
+        if (scope === "verifier") return;
+        await this.updateCredentialForAttempt(pending, "complete", (credential) =>
+          this.invalidateCredential(credential, scope),
+        );
+      },
       redirectToAuthorization: (authorizationUrl: URL) => {
         this.assertActive(pending, "start");
         if (
@@ -320,12 +321,23 @@ export class McpOAuthProvider implements OAuthClientProvider {
         return pending.codeVerifier;
       },
       clientInformation: () => this.clientInformationForAuthorization(),
-      saveClientInformation: (clientInformation: OAuthClientInformation) =>
-        this.persistClientInformation(clientInformation),
+      saveClientInformation: async (clientInformation: OAuthClientInformation) => {
+        this.assertActive(pending, "start");
+        await this.updateCredentialForAttempt(pending, "start", (credential) => ({
+          ...credential,
+          clientInformation,
+        }));
+      },
       authorizationServerInformation: () => this.authorizationServerInformation(),
-      saveAuthorizationServerInformation: (
+      saveAuthorizationServerInformation: async (
         authorizationServerInformation: OAuthAuthorizationServerInformation,
-      ) => this.saveAuthorizationServerInformation(authorizationServerInformation),
+      ) => {
+        this.assertActive(pending, "start");
+        await this.updateCredentialForAttempt(pending, "start", (credential) => ({
+          ...credential,
+          authorizationServerInformation,
+        }));
+      },
       state: () => pending.state,
       saveState: (state: string) => {
         this.assertActive(pending, "start");
@@ -339,7 +351,10 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   private isActive(pending: PendingAuthorization): boolean {
-    return this.pending.get(pending.state) === pending;
+    if (this.pending.get(pending.state) !== pending) return false;
+    if (pending.createdAt + PENDING_AUTHORIZATION_TTL_MS > this.now()) return true;
+    this.pending.delete(pending.state);
+    return false;
   }
 
   private assertActive(pending: PendingAuthorization, operation: "start" | "complete"): void {
@@ -379,6 +394,34 @@ export class McpOAuthProvider implements OAuthClientProvider {
       update,
     });
   }
+
+  private async updateCredentialForAttempt(
+    pending: PendingAuthorization,
+    operation: "start" | "complete",
+    update: (credential: McpOAuthCredential) => McpOAuthCredential,
+  ): Promise<void> {
+    await updateMcpOAuthCredentialFile({
+      dataDir: this.dataDir,
+      serverId: this.serverId,
+      serverUrl: this.serverUrl,
+      update: (credential) => {
+        this.assertActive(pending, operation);
+        return update(credential);
+      },
+    });
+  }
+
+  private invalidateCredential(
+    credential: McpOAuthCredential,
+    scope: "all" | "client" | "tokens",
+  ): McpOAuthCredential {
+    const { clientInformation, tokens, ...retained } = credential;
+    if (scope === "tokens") {
+      return clientInformation ? { ...retained, clientInformation } : retained;
+    }
+    if (scope === "client") return tokens ? { ...retained, tokens } : retained;
+    return retained;
+  }
 }
 
 type ProviderEntry = {
@@ -416,7 +459,9 @@ export class McpOAuthProviderService {
       if (!oauth) continue;
       configured.add(definition.id);
       const fingerprint = JSON.stringify([oauth.serverUrl, oauth.authConfig]);
-      if (this.providers.get(definition.id)?.fingerprint === fingerprint) continue;
+      const existing = this.providers.get(definition.id);
+      if (existing?.fingerprint === fingerprint) continue;
+      existing?.provider.discardPendingAuthorizations();
 
       this.providers.set(definition.id, {
         fingerprint,
@@ -433,7 +478,9 @@ export class McpOAuthProviderService {
     }
 
     for (const serverId of this.providers.keys()) {
-      if (!configured.has(serverId)) this.providers.delete(serverId);
+      if (configured.has(serverId)) continue;
+      this.providers.get(serverId)?.provider.discardPendingAuthorizations();
+      this.providers.delete(serverId);
     }
   }
 

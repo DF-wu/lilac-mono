@@ -649,6 +649,62 @@ describe("McpRegistry reload and terminal failures", () => {
     await registry.shutdown();
   });
 
+  it("replaces a healthy client when a resolved transport value changes", async () => {
+    const first = new FakeMcpClient({ first: { tools: [mcpToolDefinition("before")] } });
+    const second = new FakeMcpClient({ first: { tools: [mcpToolDefinition("after")] } });
+    const clients = [first, second];
+    const transportInputs: McpRegistryTransportInput[] = [];
+    let secret = "first-secret";
+    const definition = {
+      id: "resolved",
+      transportConfig: {
+        transport: "stdio" as const,
+        command: "bun",
+        args: ["server.ts"],
+        env: { TOKEN: { file: "secret.txt" } },
+      },
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      readTextFile: async () => secret,
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([definition])),
+        createTransport: (input) => {
+          transportInputs.push(input);
+          return { type: "http", url: "https://unused.invalid" };
+        },
+        createClient: async () => {
+          const client = clients.shift();
+          if (!client) throw new Error("Unexpected extra MCP client");
+          return client;
+        },
+      },
+    });
+    await registry.init();
+
+    secret = "second-secret";
+    expect(await registry.reload("resolved")).toEqual([
+      { serverId: "resolved", reconciliation: "changed", result: "available" },
+    ]);
+    expect(transportInputs).toEqual([
+      {
+        transport: "stdio",
+        command: "bun",
+        args: ["server.ts"],
+        env: { TOKEN: "first-secret" },
+      },
+      {
+        transport: "stdio",
+        command: "bun",
+        args: ["server.ts"],
+        env: { TOKEN: "second-secret" },
+      },
+    ]);
+    expect(registry.getTools().map((tool) => tool.rawName)).toEqual(["after"]);
+    expect(first.closeCount).toBe(1);
+    await registry.shutdown();
+  });
+
   it("reports unavailable when terminal failure interrupts unchanged refresh", async () => {
     let clientConfig: MCPClientConfig | undefined;
     const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("before")] } });

@@ -779,10 +779,12 @@ export function createToolServer(options: ToolServerOptions) {
         return {
           isError: true,
           output:
-            e instanceof ToolInputValidationError
-              ? e.message
-              : body.callableId === "mcp.add"
-                ? "mcp.add failed without exposing sensitive configuration"
+            body.callableId === "mcp.add"
+              ? e instanceof ToolInputValidationError
+                ? "mcp.add input validation failed"
+                : "mcp.add failed without exposing sensitive configuration"
+              : e instanceof ToolInputValidationError
+                ? e.message
                 : e instanceof Error
                   ? e.message
                   : String(e),

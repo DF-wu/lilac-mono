@@ -1716,7 +1716,11 @@ describe("createToolServer", () => {
           }),
         }),
       );
-      expect(await response.json()).toMatchObject({ isError: true });
+      const validationResult = await response.json();
+      expect(validationResult).toEqual({
+        isError: true,
+        output: "mcp.add input validation failed",
+      });
 
       const runtimeResponse = await server.app.handle(
         new Request("http://localhost/call", {
@@ -1750,7 +1754,7 @@ describe("createToolServer", () => {
       expect(logged).not.toContain("MCP runtime failed");
       expect(logged).not.toContain("mcp.add has invalid input");
       expect(logged).not.toContain("?code=");
-      const observableOutput = `${logged}\n${JSON.stringify(runtimeResult)}`;
+      const observableOutput = `${logged}\n${JSON.stringify({ validationResult, runtimeResult })}`;
       for (const secret of Object.values(secrets)) expect(observableOutput).not.toContain(secret);
     } finally {
       await server.stop();

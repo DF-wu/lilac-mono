@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import {
@@ -38,6 +39,7 @@ const mcpApplicationErrorSchema = z.object({
 type RegistryEntry = {
   readonly definition: McpServerDefinition;
   readonly fingerprint: string;
+  readonly transportFingerprint?: string;
   readonly client?: McpRegistryClient;
   readonly sensitiveValues: readonly string[];
   readonly status: McpServerStatus;
@@ -47,7 +49,13 @@ type RegistryEntry = {
 type InitializedCandidate = {
   readonly client: McpRegistryClient;
   readonly sensitiveValues: readonly string[];
+  readonly transportFingerprint: string;
   readonly tools: readonly McpCatalogTool[];
+};
+
+type ResolvedTransport = {
+  readonly input: McpRegistryTransportInput;
+  readonly sensitiveValues: readonly string[];
 };
 
 type CandidateResult =
@@ -105,6 +113,19 @@ function defaultCreateTransport(input: McpRegistryTransportInput): MCPClientConf
 
 function definitionFingerprint(definition: McpServerDefinition): string {
   return JSON.stringify(definition.transportConfig);
+}
+
+function transportFingerprint(input: McpRegistryTransportInput): string {
+  const normalized =
+    input.transport === "stdio"
+      ? input
+      : {
+          transport: input.transport,
+          url: input.url,
+          headers: input.headers,
+          hasAuthProvider: input.authProvider !== undefined,
+        };
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
 function freezeOutcome(outcome: McpReloadOutcome): McpReloadOutcome {
@@ -356,7 +377,23 @@ export class McpRegistry implements McpRegistryApi {
       });
     }
 
-    const reconciliation = this.classifyReconciliation(current, definition);
+    let reconciliation = this.classifyReconciliation(current, definition);
+    let resolvedTransport: ResolvedTransport | undefined;
+    if (reconciliation === "unchanged" && current) {
+      try {
+        resolvedTransport = await this.resolveTransport(definition);
+      } catch (error) {
+        return freezeOutcome({
+          serverId,
+          reconciliation,
+          result: "retained",
+          error: safeErrorText(error, current.sensitiveValues),
+        });
+      }
+      if (current.transportFingerprint !== transportFingerprint(resolvedTransport.input)) {
+        reconciliation = "changed";
+      }
+    }
     if (reconciliation === "unchanged" && current) {
       if (!current.client) {
         throw new Error(`Available MCP server ${JSON.stringify(serverId)} has no client`);
@@ -418,7 +455,7 @@ export class McpRegistry implements McpRegistryApi {
       this.entries.set(serverId, { ...current, client: undefined });
     }
 
-    const result = await this.initializeCandidate(definition);
+    const result = await this.initializeCandidate(definition, resolvedTransport);
     if (!result.ok) {
       if (reconciliation === "changed" && current?.status.status === "available") {
         return freezeOutcome({
@@ -465,14 +502,17 @@ export class McpRegistry implements McpRegistryApi {
     return current.fingerprint === definitionFingerprint(definition) ? "unchanged" : "changed";
   }
 
-  private async initializeCandidate(definition: McpServerDefinition): Promise<CandidateResult> {
+  private async initializeCandidate(
+    definition: McpServerDefinition,
+    prefetchedTransport?: ResolvedTransport,
+  ): Promise<CandidateResult> {
     let phase: McpRegistryPhase = "configuration";
     let sensitiveValues: readonly string[] = [];
     let client: McpRegistryClient | undefined;
     const holder: { client?: McpRegistryClient; terminalError?: unknown } = {};
 
     try {
-      const resolved = await this.resolveTransport(definition);
+      const resolved = prefetchedTransport ?? (await this.resolveTransport(definition));
       sensitiveValues = resolved.sensitiveValues;
       const transport = this.createTransport(resolved.input);
       phase = "connection";
@@ -501,6 +541,7 @@ export class McpRegistry implements McpRegistryApi {
           return {
             client: createdClient,
             sensitiveValues: Object.freeze([...sensitiveValues]),
+            transportFingerprint: transportFingerprint(resolved.input),
             tools,
           } satisfies InitializedCandidate;
         },
@@ -523,10 +564,7 @@ export class McpRegistry implements McpRegistryApi {
     }
   }
 
-  private async resolveTransport(definition: McpServerDefinition): Promise<{
-    readonly input: McpRegistryTransportInput;
-    readonly sensitiveValues: readonly string[];
-  }> {
+  private async resolveTransport(definition: McpServerDefinition): Promise<ResolvedTransport> {
     const config = definition.transportConfig;
     if (config.transport === "stdio") {
       const resolved = await resolveMcpValueSourceMap(config.env, this.valueContext);
@@ -737,6 +775,7 @@ export class McpRegistry implements McpRegistryApi {
     return {
       definition,
       fingerprint: definitionFingerprint(definition),
+      transportFingerprint: result.candidate.transportFingerprint,
       client: result.candidate.client,
       sensitiveValues: result.candidate.sensitiveValues,
       status: Object.freeze({
