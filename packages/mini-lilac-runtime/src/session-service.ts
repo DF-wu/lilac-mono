@@ -109,6 +109,7 @@ import {
 import { MiniLilacSkillCatalog, type MiniLilacSkillCatalogSnapshot } from "./skills";
 import {
   MiniLilacSqliteStore,
+  parseStoredUIMessageChunk,
   type StoredCommandRequest,
   type StoredRunChunk,
   type StoredSessionResume,
@@ -246,7 +247,7 @@ function enqueueStoredChunk(
   entry: StoredRunChunk,
 ): void {
   controller.enqueue(streamCursor(runId, entry.seq));
-  controller.enqueue(entry.chunk);
+  controller.enqueue(structuredClone(entry.chunk));
 }
 
 type DeferredChild = {
@@ -296,6 +297,17 @@ type ActiveRootRun = RunProjection & {
   phase: "accepting-controls" | "finalizing";
   uiChunkCursor: number;
   chronologicalUiPrefix: MiniLilacUIMessage[];
+  liveLog: StoredRunChunk[];
+  nextSeq: number;
+  inputTokens: number | null;
+};
+
+type TerminalReplayProjection = {
+  runId: string;
+  snapshot: MiniLilacSessionSnapshot;
+  uiChunkCursor: number;
+  chronologicalUiPrefix: MiniLilacUIMessage[];
+  liveLog: StoredRunChunk[];
 };
 
 type SubagentCapacity = {
@@ -669,6 +681,7 @@ async function assistantMessageFromChunks(
 
 class SessionActor {
   private active: ActiveRootRun | undefined;
+  private terminalReplay: TerminalReplayProjection | undefined;
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly delegatedCancels = new Map<string, () => void>();
   private readonly titleControllers = new Map<string, AbortController>();
@@ -728,8 +741,31 @@ class SessionActor {
     }
   }
 
+  private reconcileTerminalReplay(
+    durableSnapshot: MiniLilacSessionSnapshot,
+  ): TerminalReplayProjection | undefined {
+    const terminal = this.terminalReplay;
+    if (terminal === undefined) return undefined;
+    const run = this.store.getRun(terminal.runId);
+    if (
+      durableSnapshot.activeRunId !== terminal.runId ||
+      run.sessionId !== durableSnapshot.id ||
+      run.status !== "active"
+    ) {
+      this.terminalReplay = undefined;
+      return undefined;
+    }
+    return terminal;
+  }
+
   getSnapshot(): MiniLilacSessionSnapshot {
     this.snapshot = this.store.getSession(this.snapshot.id);
+    const terminal = this.reconcileTerminalReplay(this.snapshot);
+    if (this.active !== undefined) {
+      this.snapshot = { ...this.snapshot, inputTokens: this.active.inputTokens };
+    } else if (terminal !== undefined) {
+      this.snapshot = terminal.snapshot;
+    }
     return this.snapshot;
   }
 
@@ -740,9 +776,42 @@ class SessionActor {
   getSessionResume(): Promise<SessionResumeProjection> {
     return this.withLock(async () => {
       const active = this.active;
-      if (active !== undefined) await active.eventQueue;
-      return this.store.getSessionResume(this.snapshot.id);
+      if (active === undefined) {
+        const durableSnapshot = this.store.getSession(this.snapshot.id);
+        this.snapshot = durableSnapshot;
+        const terminal = this.reconcileTerminalReplay(durableSnapshot);
+        if (terminal === undefined) return this.store.getSessionResume(this.snapshot.id);
+        return {
+          snapshot: terminal.snapshot,
+          messages: [...terminal.chronologicalUiPrefix],
+          replayCursor: { runId: terminal.runId, afterSeq: terminal.uiChunkCursor },
+        };
+      }
+      await active.eventQueue;
+      this.snapshot = {
+        ...this.store.getSession(this.snapshot.id),
+        inputTokens: active.inputTokens,
+      };
+      return {
+        snapshot: this.snapshot,
+        messages: [...active.chronologicalUiPrefix],
+        replayCursor: { runId: active.runId, afterSeq: active.uiChunkCursor },
+      };
     });
+  }
+
+  getRunChunks(runId: string, afterSeq = 0): StoredRunChunk[] {
+    if (this.active === undefined) {
+      this.snapshot = this.store.getSession(this.snapshot.id);
+      this.reconcileTerminalReplay(this.snapshot);
+    }
+    const projection =
+      this.active?.runId === runId
+        ? this.active
+        : this.terminalReplay?.runId === runId
+          ? this.terminalReplay
+          : undefined;
+    return projection?.liveLog.filter((entry) => entry.seq > afterSeq) ?? [];
   }
 
   isQuiescent(): boolean {
@@ -778,10 +847,15 @@ class SessionActor {
     let subscriber: Subscriber | undefined;
     return new ReadableStream<MiniLilacRuntimeChunk>({
       start: (controller) => {
-        for (const entry of this.store.getChunks(runId, afterSeq)) {
+        for (const entry of this.getRunChunks(runId, afterSeq)) {
           enqueueStoredChunk(controller, runId, entry);
         }
-        if (this.projection(runId) === undefined || this.store.getRun(runId).status !== "active") {
+        const projection = this.projection(runId);
+        if (
+          projection === undefined ||
+          projection.streamFinished ||
+          this.store.getRun(runId).status !== "active"
+        ) {
           controller.close();
           return;
         }
@@ -808,6 +882,8 @@ class SessionActor {
       if (!this.acceptsAdmissions()) {
         throw new Error("SessionService is shutting down and is not accepting admissions");
       }
+      this.snapshot = this.store.getSession(this.snapshot.id);
+      this.reconcileTerminalReplay(this.snapshot);
       const parsedMessage = miniLilacUIMessageSchema.parse(userMessageValue);
       if (parsedMessage.role !== "user") throw new Error("startPrompt requires a user UI message");
       const userMessage = miniLilacUserUIMessageSchema.parse(parsedMessage);
@@ -878,6 +954,7 @@ class SessionActor {
           uiMessages: [...priorUiMessages, userMessage],
           title: initialTitle,
         });
+        this.terminalReplay = undefined;
         admitted = true;
         this.active = {
           runId,
@@ -892,6 +969,9 @@ class SessionActor {
           streamFinished: false,
           uiChunkCursor: 0,
           chronologicalUiPrefix: [...priorUiMessages, userMessage],
+          liveLog: [],
+          nextSeq: 1,
+          inputTokens: this.snapshot.inputTokens ?? null,
           toolInputsAvailable: new Map(),
           streamedToolInputIds: new Set(),
           toolOutputsAvailable: new Set(),
@@ -1435,13 +1515,18 @@ class SessionActor {
         ) {
           throw new Error(`Run '${context.runId}' stopped accepting todo updates`);
         }
+        const priorRevision = this.store.getTodos(this.snapshot.id).revision;
         const result = await this.store.replaceTodosForRun({
           sessionId: this.snapshot.id,
           runId: context.runId,
           todos,
         });
-        if (result.storedChunk !== undefined) {
-          this.publishStoredChunk(context.runId, result.storedChunk);
+        if (result.state.revision !== priorRevision) {
+          await this.appendChunk(context.runId, {
+            type: "data-todos",
+            data: result.state,
+            transient: true,
+          });
         }
         return result.state;
       });
@@ -1734,7 +1819,7 @@ class SessionActor {
         await this.appendChunk(context.runId, { type: "error", errorText: error });
         await this.appendChunk(context.runId, { type: "finish", finishReason: "error" });
       }
-      const runChunks = this.store.getChunks(context.runId);
+      const runChunks = active.liveLog;
       const { message: assistantMessage } = await assistantMessageFromChunks(
         runChunks,
         active.uiChunkCursor,
@@ -1759,7 +1844,9 @@ class SessionActor {
         terminalResult: { text: terminalText(finalMessages) },
         modelMessages: finalMessages,
         uiMessages,
+        inputTokens: active.inputTokens,
       });
+      this.terminalReplay = undefined;
     } catch (finalizationError) {
       const message =
         finalizationError instanceof Error ? finalizationError.message : String(finalizationError);
@@ -1774,9 +1861,26 @@ class SessionActor {
           terminalResult: { text: terminalText(agent.state.messages) },
           modelMessages: this.store.getModelMessages(this.snapshot.id),
           uiMessages: this.store.getUiMessages(this.snapshot.id),
+          inputTokens: active.inputTokens,
         });
+        this.terminalReplay = undefined;
       } catch {
-        // Cleanup must still run if the persistence layer remains unavailable.
+        // Keep the only replayable response alive even though durable state
+        // remains active for startup recovery to terminalize.
+        this.terminalReplay = {
+          runId: active.runId,
+          snapshot: {
+            ...this.snapshot,
+            activeRunId: null,
+            status: "error",
+            queuedSteeringCount: 0,
+            inputTokens: active.inputTokens,
+            updatedAt: new Date().toISOString(),
+          },
+          uiChunkCursor: active.uiChunkCursor,
+          chronologicalUiPrefix: [...active.chronologicalUiPrefix],
+          liveLog: active.liveLog,
+        };
       }
     } finally {
       await this.disposeClaudeCodeRun(active.claudeCodeRun, context.runId);
@@ -1889,8 +1993,17 @@ class SessionActor {
         return;
       case "turn_end":
         projection.lastFinishReason = event.finishReason;
-        if (active !== undefined && event.usage.inputTokens !== undefined) {
-          this.snapshot = this.store.updateSessionUsage(this.snapshot.id, event.usage.inputTokens);
+        if (
+          active !== undefined &&
+          event.usage.inputTokens !== undefined &&
+          active.inputTokens !== event.usage.inputTokens
+        ) {
+          active.inputTokens = event.usage.inputTokens;
+          this.snapshot = this.store.updateActiveRunInputTokens(
+            this.snapshot.id,
+            runId,
+            active.inputTokens,
+          );
           await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
         }
         return;
@@ -1923,7 +2036,7 @@ class SessionActor {
       case "message_start":
         if (event.message.role === "user") {
           if (active === undefined || consumedSteeringCheckpoints.length === 0) return;
-          const runChunks = this.store.getChunks(runId);
+          const runChunks = active.liveLog;
           const segment = await assistantMessageFromChunks(runChunks, active.uiChunkCursor);
           const chronologicalUiPrefix = [...active.chronologicalUiPrefix];
           if (segment.message && segment.message.parts.length > 0) {
@@ -2250,8 +2363,15 @@ class SessionActor {
   private async appendChunk(runId: string, chunk: StoredUIMessageChunk): Promise<void> {
     const projection = this.projection(runId);
     if (projection === undefined || projection.streamFinished) return;
-    const seq = this.store.appendChunk(runId, chunk);
-    this.publishStoredChunk(runId, { seq, chunk });
+    const active = this.active;
+    if (active?.runId !== runId) return;
+    const entry = {
+      seq: active.nextSeq,
+      chunk: structuredClone(parseStoredUIMessageChunk(chunk)),
+    } satisfies StoredRunChunk;
+    active.nextSeq += 1;
+    active.liveLog.push(entry);
+    this.publishStoredChunk(runId, entry);
   }
 
   private publishStoredChunk(runId: string, entry: StoredRunChunk): void {
@@ -2858,7 +2978,8 @@ export class SessionService {
   }
 
   getRunChunks(runId: string, afterSeq = 0): StoredRunChunk[] {
-    return this.store.getChunks(runId, afterSeq);
+    const run = this.store.getRun(runId);
+    return this.actors.get(run.sessionId)?.getRunChunks(runId, afterSeq) ?? [];
   }
 
   async listSkills(cwdValue: string, profileId?: string): Promise<MiniLilacSkillSummary[]> {
@@ -3003,10 +3124,11 @@ export class SessionService {
     options: { afterSeq?: number; tail?: boolean } = {},
   ): ReadableStream<MiniLilacRuntimeChunk> {
     const run = this.store.getRun(runId);
-    if (options.tail !== false && run.status === "active") {
-      return this.actor(run.sessionId).streamRun(runId, options.afterSeq);
+    const actor = this.actors.get(run.sessionId);
+    if (options.tail !== false && run.status === "active" && actor !== undefined) {
+      return actor.streamRun(runId, options.afterSeq);
     }
-    const chunks = this.store.getChunks(runId, options.afterSeq);
+    const chunks = actor?.getRunChunks(runId, options.afterSeq) ?? [];
     return new ReadableStream<MiniLilacRuntimeChunk>({
       start(controller) {
         chunks.forEach((entry) => enqueueStoredChunk(controller, runId, entry));

@@ -60,6 +60,26 @@ function textResult(id: string, text: string) {
   };
 }
 
+function textResultWithInputTokens(id: string, text: string, inputTokens: number) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id },
+        { type: "text-delta" as const, id, delta: text },
+        { type: "text-end" as const, id },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            ...zeroUsage(),
+            inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: 0, cacheWrite: 0 },
+          },
+        },
+      ],
+    }),
+  };
+}
+
 function textResultWithOpenAIItemId(id: string, text: string, itemId: string) {
   const providerMetadata = { openai: { itemId, phase: "final_answer" } };
   return {
@@ -445,7 +465,11 @@ describe("MiniLilacSqliteStore", () => {
     const recovered = new MiniLilacSqliteStore(databasePath);
     expect(recovered.getRun("run-1").status).toBe("error");
     expect(recovered.getRun("child-1").status).toBe("error");
-    expect(recovered.getChunks("run-1")).toEqual([]);
+    expect(
+      recovered.database
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
+        .get(),
+    ).toBeNull();
     expect(recovered.getSession("session-1")).toMatchObject({
       status: "error",
       queuedSteeringCount: 0,
@@ -453,7 +477,7 @@ describe("MiniLilacSqliteStore", () => {
     recovered.close();
   });
 
-  it("preserves interrupted-run chunks for crash diagnostics", async () => {
+  it("does not preserve interrupted-run chunks after a process restart", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finished-recovery-"));
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, "runtime.sqlite");
@@ -467,13 +491,55 @@ describe("MiniLilacSqliteStore", () => {
     });
     first.createRun({ id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 });
     first.updateSessionState("session-1", "streaming", 0, "run-1");
-    first.appendChunk("run-1", { type: "finish", finishReason: "stop" });
     first.close();
 
     const recovered = new MiniLilacSqliteStore(databasePath);
-    expect(recovered.getChunks("run-1").map((entry) => entry.chunk)).toEqual([
-      { type: "finish", finishReason: "stop" },
-    ]);
+    expect(recovered.getRun("run-1").status).toBe("error");
+    expect(
+      recovered.database
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
+        .get(),
+    ).toBeNull();
+    recovered.close();
+  });
+
+  it("retains turn-boundary input usage when startup recovers an interrupted run", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-usage-recovery-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const first = new MiniLilacSqliteStore(databasePath);
+    first.createSession({
+      id: "session-1",
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+    const message = userMessage("persist usage before the next turn");
+    const command = { kind: "prompt", runId: null, payload: { message } };
+    first.reserveCommand("session-1", "prompt-1", command);
+    first.beginRootRun({
+      run: { id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 },
+      commandId: "prompt-1",
+      commandPayload: command.payload,
+      modelMessages: [{ role: "user", content: "persist usage before the next turn" }],
+      uiMessages: [message],
+    });
+
+    first.updateActiveRunInputTokens("session-1", "run-1", 37);
+    const changesAfterUsage = first.database.query("SELECT total_changes() AS changes").get();
+    first.updateActiveRunInputTokens("session-1", "run-1", 37);
+    expect(first.database.query("SELECT total_changes() AS changes").get()).toEqual(
+      changesAfterUsage,
+    );
+    first.close();
+
+    const recovered = new MiniLilacSqliteStore(databasePath);
+    expect(recovered.getSession("session-1")).toMatchObject({
+      status: "error",
+      activeRunId: null,
+      inputTokens: 37,
+    });
     expect(recovered.getRun("run-1").status).toBe("error");
     recovered.close();
   });
@@ -861,6 +927,239 @@ describe("SessionService", () => {
       "assistant",
     ]);
     reopened.close();
+  });
+
+  it("replays and tails the process-local live log without a chunk table", async () => {
+    let releaseSecondDelta = () => {};
+    const secondDeltaGate = new Promise<void>((resolve) => {
+      releaseSecondDelta = resolve;
+    });
+    let releaseProvider = () => {};
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const model = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "text-start", id: "live-answer" });
+            controller.enqueue({
+              type: "text-delta",
+              id: "live-answer",
+              delta: "live prefix",
+            });
+            void secondDeltaGate.then(async () => {
+              controller.enqueue({
+                type: "text-delta",
+                id: "live-answer",
+                delta: " live suffix",
+              });
+              await providerGate;
+              controller.enqueue({ type: "text-end", id: "live-answer" });
+              controller.enqueue({
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              });
+              controller.close();
+            });
+          },
+        }),
+      }),
+    });
+    const { service, session } = await temporaryRuntime(model);
+    const started = await service.startPrompt(session.id, userMessage("keep the live log"));
+    const reader = started.stream.getReader();
+    const initial: MiniLilacRuntimeChunk[] = [];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) throw new Error("Run finished before the live prefix was observed");
+      initial.push(next.value);
+      if (next.value.type === "text-delta") break;
+    }
+    const changesBeforeSecondDelta = service.store.database
+      .query("SELECT total_changes() AS changes")
+      .get();
+    releaseSecondDelta();
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) throw new Error("Run finished before the second live delta was observed");
+      initial.push(next.value);
+      if (next.value.type === "text-delta") break;
+    }
+    expect(service.store.database.query("SELECT total_changes() AS changes").get()).toEqual(
+      changesBeforeSecondDelta,
+    );
+    const lastCursor = initial.findLast((chunk) => chunk.type === "data-streamCursor");
+    if (lastCursor?.type !== "data-streamCursor") throw new Error("Live prefix had no cursor");
+    await reader.cancel("test disconnect");
+
+    expect(service.getRunChunks(started.runId).at(-1)?.chunk).toMatchObject({
+      type: "text-delta",
+      delta: " live suffix",
+    });
+    expect(
+      service.store.database
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
+        .get(),
+    ).toBeNull();
+    const resume = await service.getSessionResume(session.id);
+    expect(resume.messages).toEqual([expect.objectContaining({ role: "user" })]);
+    expect(resume.replayCursor).toEqual({ runId: started.runId, afterSeq: 0 });
+
+    const reconnected = collect(
+      service.replayRun(started.runId, { afterSeq: lastCursor.data.seq, tail: true }),
+    );
+    releaseProvider();
+    const tail = await reconnected;
+    const tailCursors = tail.filter((chunk) => chunk.type === "data-streamCursor");
+    expect(tailCursors.every((chunk) => chunk.data.seq > lastCursor.data.seq)).toBe(true);
+    expect(tail.some((chunk) => chunk.type === "finish")).toBe(true);
+    expect(service.getRunChunks(started.runId)).toEqual([]);
+    expect(JSON.stringify(service.getMessages(session.id))).toContain("live prefix live suffix");
+    service.close();
+  });
+
+  it("does not allocate an actor when replaying a finished run", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finished-replay-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const store = new MiniLilacSqliteStore(databasePath);
+    store.createSession({
+      id: "finished-session",
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+    store.createRun({
+      id: "finished-run",
+      sessionId: "finished-session",
+      profile: "reader",
+      depth: 0,
+    });
+    store.finishRun("finished-run", "completed");
+    store.close();
+
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    service.store.getSession = () => {
+      throw new Error("finished replay allocated an actor");
+    };
+
+    expect(service.getRunChunks("finished-run")).toEqual([]);
+    expect(await collect(service.replayRun("finished-run", { tail: false }))).toEqual([]);
+    service.close();
+  });
+
+  it("retains a terminal replay projection when both finalization writes fail", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: textResultWithInputTokens("answer", "still replayable", 41),
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finalization-fault-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    let finalizationAttempts = 0;
+    service.store.finalizeRootRun = () => {
+      finalizationAttempts += 1;
+      throw new Error("injected finalization failure");
+    };
+
+    const started = await service.startPrompt(session.id, userMessage("preserve the only replay"));
+    const streamed = await collect(started.stream);
+
+    expect(finalizationAttempts).toBe(2);
+    expect(service.store.getRun(started.runId).status).toBe("active");
+    expect(service.store.getSession(session.id)).toMatchObject({
+      status: "streaming",
+      activeRunId: started.runId,
+      inputTokens: 41,
+    });
+    const replayed = await collect(service.replayRun(started.runId, { tail: false }));
+    expect(replayed.filter((chunk) => chunk.type !== "data-streamCursor")).toEqual(
+      streamed.filter((chunk) => chunk.type !== "data-streamCursor"),
+    );
+    const resume = await service.getSessionResume(session.id);
+    expect(resume).toMatchObject({
+      snapshot: { status: "error", activeRunId: null },
+      messages: [{ role: "user" }],
+      replayCursor: { runId: started.runId, afterSeq: 0 },
+    });
+
+    await service.shutdown({ graceMs: 1_000 });
+    const recovered = new MiniLilacSqliteStore(databasePath);
+    expect(recovered.getRun(started.runId).status).toBe("error");
+    expect(recovered.getSession(session.id)).toMatchObject({
+      status: "error",
+      activeRunId: null,
+      inputTokens: 41,
+    });
+    recovered.close();
+  });
+
+  it("drops terminal replay after durable repair and completes a later run", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        textResultWithInputTokens("failed-finalization", "only live", 41),
+        textResult("durable-success", "later durable"),
+      ],
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finalization-repair-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const finalizeRootRun = service.store.finalizeRootRun.bind(service.store);
+    service.store.finalizeRootRun = () => {
+      throw new Error("injected finalization failure");
+    };
+    const failed = await service.startPrompt(session.id, userMessage("first prompt"));
+    await collect(failed.stream);
+    expect((await service.getSessionResume(session.id)).replayCursor).toEqual({
+      runId: failed.runId,
+      afterSeq: 0,
+    });
+
+    service.store.finalizeRootRun = finalizeRootRun;
+    const durableSnapshot = finalizeRootRun({
+      runId: failed.runId,
+      sessionId: session.id,
+      runStatus: "error",
+      sessionStatus: "error",
+      error: "repaired finalization",
+      terminalResult: { text: "" },
+      modelMessages: service.store.getModelMessages(session.id),
+      uiMessages: service.store.getUiMessages(session.id),
+      inputTokens: 41,
+    });
+
+    expect(service.getSnapshot(session.id)).toEqual(durableSnapshot);
+    expect(await service.getSessionResume(session.id)).toEqual({
+      snapshot: durableSnapshot,
+      messages: service.store.getUiMessages(session.id),
+      replayCursor: null,
+    });
+    expect(service.getRunChunks(failed.runId)).toEqual([]);
+
+    const succeeded = await service.startPrompt(session.id, userMessage("second prompt"));
+    await collect(succeeded.stream);
+    expect(service.store.getRun(succeeded.runId).status).toBe("completed");
+    expect(service.getSnapshot(session.id)).toMatchObject({ status: "idle", activeRunId: null });
+    expect(JSON.stringify(service.getMessages(session.id))).toContain("later durable");
+    expect(service.getRunChunks(failed.runId)).toEqual([]);
+    service.close();
   });
 
   it("preloads workspace AGENTS.md and injects nested instructions with read_file", async () => {
@@ -3079,30 +3378,6 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("finalizes an error and closes the stream after event persistence fails", async () => {
-    const model = new MockLanguageModelV4({ doStream: textResult("answer", "ignored") });
-    const { service, session } = await temporaryRuntime(model);
-    const originalAppendChunk = service.store.appendChunk.bind(service.store);
-    let failOnce = true;
-    service.store.appendChunk = (runId, chunk) => {
-      if (failOnce) {
-        failOnce = false;
-        throw new Error("chunk persistence failed");
-      }
-      return originalAppendChunk(runId, chunk);
-    };
-
-    const started = await service.startPrompt(session.id, userMessage("trigger failure"));
-    await collect(started.stream);
-
-    expect(service.store.getRun(started.runId)).toMatchObject({
-      status: "error",
-      error: "chunk persistence failed",
-    });
-    expect(service.getSnapshot(session.id).status).toBe("error");
-    service.close();
-  });
-
   it("persists a final response after a dynamic tool error", async () => {
     const runtimeConfig = config();
     const reader = runtimeConfig.agent.profiles.reader;
@@ -4644,7 +4919,7 @@ describe("SessionService", () => {
       const child = service.store.getLatestRun(childSessionId);
       expect(child).toMatchObject({ profile: "child", depth: 1, status: "completed" });
       expect(child?.terminalResult).toMatchObject({ text: "child result" });
-      expect(service.store.getChunks(child?.id ?? "")).toEqual([]);
+      expect(service.getRunChunks(child?.id ?? "")).toEqual([]);
       expect(service.getMessages(childSessionId).map((message) => message.role)).toEqual([
         "user",
         "assistant",
@@ -4724,9 +4999,7 @@ describe("SessionService", () => {
     expect(continuedPrompt).toContain("first investigation");
     expect(continuedPrompt).toContain("first finding");
     expect(continuedPrompt).toContain("continue investigation");
-    expect(resumed.store.getChunks(resumed.store.getLatestRun(childSessionId)?.id ?? "")).toEqual(
-      [],
-    );
+    expect(resumed.getRunChunks(resumed.store.getLatestRun(childSessionId)?.id ?? "")).toEqual([]);
     resumed.close();
   });
 

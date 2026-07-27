@@ -1026,7 +1026,7 @@ describe("createMiniLilacServer", () => {
     );
     expect(completedFull.status).toBe(204);
     const fullChunks = [...prefix.chunks, ...activeTail];
-    expect(service.store.getChunks(runId)).toEqual([]);
+    expect(service.getRunChunks(runId)).toEqual([]);
 
     const cursorChunks = fullChunks
       .map((chunk) => miniLilacStreamCursorChunkSchema.safeParse(chunk))
@@ -1215,20 +1215,13 @@ describe("createMiniLilacServer", () => {
       profile: "coding",
       reasoning: "provider-default",
     });
-    for (const [runId, text] of [
-      ["older-run", "older"],
-      ["newer-run", "newer"],
-    ] as const) {
+    for (const runId of ["older-run", "newer-run"] as const) {
       service.store.createRun({
         id: runId,
         sessionId: "session-1",
         profile: "coding",
         depth: 0,
       });
-      service.store.appendChunk(runId, { type: "text-start", id: runId });
-      service.store.appendChunk(runId, { type: "text-delta", id: runId, delta: text });
-      service.store.appendChunk(runId, { type: "text-end", id: runId });
-      service.store.appendChunk(runId, { type: "finish", finishReason: "stop" });
       service.store.finishRun(runId, "completed");
     }
     service.store.database

@@ -43,7 +43,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Build script: `apps/acp-controller/build.ts` (produces `dist/index.js`).
 
 - `apps/mini-lilac-server/`
-  - Redis-free coding-agent HTTP/SSE server with durable local sessions.
+  - Redis-free coding-agent HTTP/SSE server with durable local sessions and process-local active-run replay.
   - Entry: `apps/mini-lilac-server/src/main.ts`; API wiring: `apps/mini-lilac-server/src/server.ts`.
 
 - `apps/mini-lilac-tui/`
@@ -77,7 +77,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Strict Mini Lilac wire protocol and reconnectable HTTP/SSE transport shared by clients and the server.
 
 - `packages/mini-lilac-runtime/`
-  - Standalone session actors, SQLite persistence, provider/model catalogs, and product-specific tools.
+  - Standalone session actors, immutable SQLite transcript chains, live active-run logs, provider/model catalogs, and product-specific tools.
   - Uses the shared agent, coding-tool, filesystem, OAuth, and skill primitives without depending on Core.
 
 - `data/`

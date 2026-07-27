@@ -80,6 +80,21 @@ Default changes from v1:
 - `agent.reasoningDisplay: detailed`
 - `agent.subagents.idleTimeoutMs: 360000`; explicit v1 `defaultTimeoutMs` values are preserved, while omitted values use the new universal default.
 
+## Mini Lilac Database Schema 3
+
+Mini Lilac migrates schema 2 databases to schema 3 transactionally at startup. Schema 3 preserves
+sessions, runs, commands, and todos, and replaces mutable full transcript rows and full-prefix undo
+checkpoint blobs with immutable, hash-chained model/UI nodes. Session heads and undo checkpoints
+reference those chains, so common prefixes are shared while legacy divergent checkpoint branches
+remain usable. The migration drops `run_chunks`, `model_transcript`, and `ui_messages`, and sets
+`user_version` to 3 only after all data and tables have migrated successfully. It does not run
+`VACUUM`. Database versions other than 0, 2, and 3 are rejected.
+
+Stream chunks are no longer durable SQLite state. An active session actor keeps a monotonic live log
+for replay, tail reconnect, resume projection, and final UI reconstruction. The log is discarded at
+run finalization. A process crash therefore retains no partial chunks and startup marks interrupted
+runs as errors; finalized canonical transcripts remain durable.
+
 ## Historical Workflow Schema 18
 
 Workflow capability review now stores a normalized maximum envelope with per-operation narrowing, exact Level-1 tools, concrete Level-2 callable IDs, destination-scoped origin surface operations, allowed roots, bounded reasoning, and explicit trusted executable authority.

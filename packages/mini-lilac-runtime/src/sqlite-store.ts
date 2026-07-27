@@ -27,7 +27,6 @@ import {
   miniLilacTodoStateSchema,
   miniLilacTodosSchema,
   miniLilacTranscriptResetSchema,
-  miniLilacUIMessageSchema,
   miniLilacUIMessageMetadataSchema,
   miniLilacUndoResultSchema,
   miniLilacUserUIMessageSchema,
@@ -38,7 +37,7 @@ import { z } from "zod";
 
 const sessionStatusSchema = z.enum(["idle", "streaming", "cancelling", "error"]);
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
-export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 2;
+export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 3;
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -81,17 +80,38 @@ const runRowSchema = z.object({
   finished_at: z.string().nullable(),
 });
 
-const chunkRowSchema = z.object({ seq: z.number().int().positive(), chunk_json: z.string() });
 const jsonRowSchema = z.object({ value_json: z.string() });
 const todosRowSchema = z.object({
   revision: z.number().int().nonnegative(),
   todos_json: z.string(),
 });
-const positionedJsonRowSchema = z.object({
+const checkpointRowSchema = z.object({
+  ui_position: z.number().int().nonnegative(),
+  user_message_json: z.string(),
+  model_head_id: z.number().int().positive().nullable(),
+  ui_head_id: z.number().int().positive().nullable(),
+  root_run_id: z.string(),
+  replay_after_seq: z.number().int().nonnegative(),
+});
+const transcriptNodeRowSchema = z.object({
+  id: z.number().int().positive(),
+  parent_id: z.number().int().positive().nullable(),
+  depth: z.number().int().positive(),
+  value_json: z.string(),
+  hash: z.string(),
+});
+const transcriptHeadRowSchema = z.object({
+  model_head_id: z.number().int().positive().nullable(),
+  ui_head_id: z.number().int().positive().nullable(),
+});
+const legacyPositionedJsonRowSchema = z.object({
+  session_id: z.string(),
   position: z.number().int().nonnegative(),
   value_json: z.string(),
 });
-const checkpointRowSchema = z.object({
+const legacyCheckpointRowSchema = z.object({
+  session_id: z.string(),
+  ui_position: z.number().int().nonnegative(),
   user_message_json: z.string(),
   model_prefix_json: z.string(),
   ui_prefix_json: z.string(),
@@ -263,7 +283,9 @@ const standardChunkSchema = z.discriminatedUnion("type", [
 export type StoredUIMessageChunk = z.infer<typeof standardChunkSchema>;
 export type StoredRunChunk = { seq: number; chunk: StoredUIMessageChunk };
 
-const uiMessageChunkSchema = standardChunkSchema;
+export function parseStoredUIMessageChunk(value: unknown): StoredUIMessageChunk {
+  return standardChunkSchema.parse(value);
+}
 
 const modelMessagesSchema = z.custom<ModelMessage[]>(
   (value) =>
@@ -339,6 +361,7 @@ export type FinalizeStoredRootRun = {
   terminalResult?: unknown;
   modelMessages: readonly ModelMessage[];
   uiMessages: readonly MiniLilacUIMessage[];
+  inputTokens?: number | null;
 };
 
 export type StoredUserCheckpoint = {
@@ -362,7 +385,6 @@ export type ReplaceTodosForRun = {
 
 export type ReplaceTodosForRunResult = {
   state: MiniLilacTodoState;
-  storedChunk?: StoredRunChunk;
 };
 
 function serialize(value: unknown): string {
@@ -471,12 +493,22 @@ export class MiniLilacSqliteStore {
       .object({ user_version: z.number().int() })
       .parse(this.database.query("PRAGMA user_version").get()).user_version;
     if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return;
-    if (version !== 0) {
+    if (version !== 0 && version !== 2) {
       throw new MiniLilacDatabaseVersionError(version);
     }
 
     this.database.transaction(() => {
-      this.database.exec(`
+      if (version === 0) {
+        this.createSchemaV3();
+      } else {
+        this.migrateSchemaV2ToV3();
+      }
+      this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
+    })();
+  }
+
+  private createSchemaV3(): void {
+    this.database.exec(`
         CREATE TABLE sessions (
           id TEXT PRIMARY KEY,
           active_run_id TEXT,
@@ -519,33 +551,46 @@ export class MiniLilacSqliteStore {
           created_at TEXT NOT NULL,
           PRIMARY KEY(session_id, command_id)
         );
-        CREATE TABLE model_transcript (
+        CREATE TABLE transcript_nodes (
+          id INTEGER PRIMARY KEY,
           session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-          position INTEGER NOT NULL,
+          lane TEXT NOT NULL CHECK(lane IN ('model', 'ui')),
+          parent_id INTEGER,
+          depth INTEGER NOT NULL CHECK(depth > 0),
           value_json TEXT NOT NULL,
-          PRIMARY KEY(session_id, position)
+          hash TEXT NOT NULL,
+          UNIQUE(session_id, lane, hash),
+          UNIQUE(id, session_id, lane),
+          FOREIGN KEY(parent_id, session_id, lane)
+            REFERENCES transcript_nodes(id, session_id, lane)
         );
-        CREATE TABLE ui_messages (
-          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-          position INTEGER NOT NULL,
-          value_json TEXT NOT NULL,
-          PRIMARY KEY(session_id, position)
-        );
-        CREATE TABLE run_chunks (
-          run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-          seq INTEGER NOT NULL,
-          chunk_json TEXT NOT NULL,
-          PRIMARY KEY(run_id, seq)
+        CREATE INDEX transcript_nodes_parent ON transcript_nodes(parent_id);
+        CREATE TABLE session_transcript_heads (
+          session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          model_head_id INTEGER,
+          model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+          ui_head_id INTEGER,
+          ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+          FOREIGN KEY(model_head_id, session_id, model_lane)
+            REFERENCES transcript_nodes(id, session_id, lane),
+          FOREIGN KEY(ui_head_id, session_id, ui_lane)
+            REFERENCES transcript_nodes(id, session_id, lane)
         );
         CREATE TABLE user_checkpoints (
           session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
           ui_position INTEGER NOT NULL,
           user_message_json TEXT NOT NULL,
-          model_prefix_json TEXT NOT NULL,
-          ui_prefix_json TEXT NOT NULL,
+          model_head_id INTEGER,
+          model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+          ui_head_id INTEGER,
+          ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
           root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
           replay_after_seq INTEGER NOT NULL CHECK(replay_after_seq >= 0),
-          PRIMARY KEY(session_id, ui_position)
+          PRIMARY KEY(session_id, ui_position),
+          FOREIGN KEY(model_head_id, session_id, model_lane)
+            REFERENCES transcript_nodes(id, session_id, lane),
+          FOREIGN KEY(ui_head_id, session_id, ui_lane)
+            REFERENCES transcript_nodes(id, session_id, lane)
         );
         CREATE TABLE session_todos (
           session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
@@ -553,9 +598,114 @@ export class MiniLilacSqliteStore {
           todos_json TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
-        PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};
       `);
-    })();
+  }
+
+  private migrateSchemaV2ToV3(): void {
+    this.database.exec(`
+      CREATE TABLE transcript_nodes (
+        id INTEGER PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        lane TEXT NOT NULL CHECK(lane IN ('model', 'ui')),
+        parent_id INTEGER,
+        depth INTEGER NOT NULL CHECK(depth > 0),
+        value_json TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        UNIQUE(session_id, lane, hash),
+        UNIQUE(id, session_id, lane),
+        FOREIGN KEY(parent_id, session_id, lane)
+          REFERENCES transcript_nodes(id, session_id, lane)
+      );
+      CREATE INDEX transcript_nodes_parent ON transcript_nodes(parent_id);
+      CREATE TABLE session_transcript_heads (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        model_head_id INTEGER,
+        model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+        ui_head_id INTEGER,
+        ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+        FOREIGN KEY(model_head_id, session_id, model_lane)
+          REFERENCES transcript_nodes(id, session_id, lane),
+        FOREIGN KEY(ui_head_id, session_id, ui_lane)
+          REFERENCES transcript_nodes(id, session_id, lane)
+      );
+      CREATE TABLE user_checkpoints_v3 (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        ui_position INTEGER NOT NULL,
+        user_message_json TEXT NOT NULL,
+        model_head_id INTEGER,
+        model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+        ui_head_id INTEGER,
+        ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+        root_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        replay_after_seq INTEGER NOT NULL CHECK(replay_after_seq >= 0),
+        PRIMARY KEY(session_id, ui_position),
+        FOREIGN KEY(model_head_id, session_id, model_lane)
+          REFERENCES transcript_nodes(id, session_id, lane),
+        FOREIGN KEY(ui_head_id, session_id, ui_lane)
+          REFERENCES transcript_nodes(id, session_id, lane)
+      );
+    `);
+
+    const sessionIds = z
+      .array(z.object({ id: z.string() }))
+      .parse(this.database.query("SELECT id FROM sessions ORDER BY rowid").all());
+    for (const { id: sessionId } of sessionIds) {
+      const modelValues = this.database
+        .query(
+          "SELECT session_id, position, value_json FROM model_transcript WHERE session_id = ? ORDER BY position",
+        )
+        .all(sessionId)
+        .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
+      const uiValues = this.database
+        .query(
+          "SELECT session_id, position, value_json FROM ui_messages WHERE session_id = ? ORDER BY position",
+        )
+        .all(sessionId)
+        .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
+      modelMessagesSchema.parse(modelValues.map(deserialize));
+      miniLilacMessagesSchema.parse(uiValues.map(deserialize));
+      const modelHeadId = this.internSerializedChain(sessionId, "model", modelValues);
+      const uiHeadId = this.internSerializedChain(sessionId, "ui", uiValues);
+      this.setTranscriptHeads(sessionId, modelHeadId, uiHeadId);
+    }
+
+    const checkpoints = this.database
+      .query(
+        `SELECT session_id, ui_position, user_message_json, model_prefix_json,
+                ui_prefix_json, root_run_id, replay_after_seq
+         FROM user_checkpoints ORDER BY session_id, ui_position`,
+      )
+      .all()
+      .map((value) => legacyCheckpointRowSchema.parse(value));
+    const insertCheckpoint = this.database.query(
+      `INSERT INTO user_checkpoints_v3
+        (session_id, ui_position, user_message_json, model_head_id, ui_head_id, root_run_id, replay_after_seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const checkpoint of checkpoints) {
+      const message = miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json));
+      const modelPrefix = modelMessagesSchema.parse(deserialize(checkpoint.model_prefix_json));
+      const uiPrefix = miniLilacMessagesSchema.parse(deserialize(checkpoint.ui_prefix_json));
+      const modelHeadId = this.internChain(checkpoint.session_id, "model", modelPrefix);
+      const uiHeadId = this.internChain(checkpoint.session_id, "ui", uiPrefix);
+      insertCheckpoint.run(
+        checkpoint.session_id,
+        checkpoint.ui_position,
+        serialize(message),
+        modelHeadId,
+        uiHeadId,
+        checkpoint.root_run_id,
+        checkpoint.replay_after_seq,
+      );
+    }
+
+    this.database.exec(`
+      DROP TABLE run_chunks;
+      DROP TABLE user_checkpoints;
+      DROP TABLE model_transcript;
+      DROP TABLE ui_messages;
+      ALTER TABLE user_checkpoints_v3 RENAME TO user_checkpoints;
+    `);
   }
 
   private recoverInterruptedRuns(): void {
@@ -647,6 +797,25 @@ export class MiniLilacSqliteStore {
     return this.getSession(sessionId);
   }
 
+  updateActiveRunInputTokens(
+    sessionId: string,
+    runId: string,
+    inputTokens: number,
+  ): MiniLilacSessionSnapshot {
+    z.number().int().nonnegative().parse(inputTokens);
+    const updated = this.database
+      .query(
+        `UPDATE sessions SET input_tokens = ?, updated_at = ?
+         WHERE id = ? AND active_run_id = ? AND input_tokens IS NOT ?`,
+      )
+      .run(inputTokens, new Date().toISOString(), sessionId, runId, inputTokens);
+    const snapshot = this.getSession(sessionId);
+    if (updated.changes === 0 && snapshot.activeRunId !== runId) {
+      throw new Error(`Run '${runId}' is not active for session '${sessionId}'`);
+    }
+    return snapshot;
+  }
+
   updateSessionTitle(
     sessionId: string,
     expectedTitle: string,
@@ -655,13 +824,6 @@ export class MiniLilacSqliteStore {
     this.database
       .query("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND title = ?")
       .run(title, new Date().toISOString(), sessionId, expectedTitle);
-    return this.getSession(sessionId);
-  }
-
-  updateSessionUsage(sessionId: string, inputTokens: number): MiniLilacSessionSnapshot {
-    this.database
-      .query("UPDATE sessions SET input_tokens = ?, updated_at = ? WHERE id = ?")
-      .run(inputTokens, new Date().toISOString(), sessionId);
     return this.getSession(sessionId);
   }
 
@@ -820,20 +982,17 @@ export class MiniLilacSqliteStore {
     status: Exclude<MiniLilacRunStatus, "active">,
     options: { error?: string; terminalResult?: unknown } = {},
   ): void {
-    this.database.transaction(() => {
-      this.database
-        .query(
-          "UPDATE runs SET status = ?, error = ?, terminal_result_json = ?, finished_at = ? WHERE id = ?",
-        )
-        .run(
-          status,
-          options.error ?? null,
-          options.terminalResult === undefined ? null : serialize(options.terminalResult),
-          new Date().toISOString(),
-          runId,
-        );
-      this.database.query("DELETE FROM run_chunks WHERE run_id = ?").run(runId);
-    })();
+    this.database
+      .query(
+        "UPDATE runs SET status = ?, error = ?, terminal_result_json = ?, finished_at = ? WHERE id = ?",
+      )
+      .run(
+        status,
+        options.error ?? null,
+        options.terminalResult === undefined ? null : serialize(options.terminalResult),
+        new Date().toISOString(),
+        runId,
+      );
   }
 
   finalizeRootRun(input: FinalizeStoredRootRun): MiniLilacSessionSnapshot {
@@ -860,46 +1019,16 @@ export class MiniLilacSqliteStore {
       const updated = this.database
         .query(
           `UPDATE sessions
-           SET status = ?, active_run_id = NULL, queued_steering_count = 0, updated_at = ?
+           SET status = ?, active_run_id = NULL, queued_steering_count = 0,
+               input_tokens = ?, updated_at = ?
            WHERE id = ? AND active_run_id = ?`,
         )
-        .run(input.sessionStatus, now, input.sessionId, input.runId);
+        .run(input.sessionStatus, input.inputTokens ?? null, now, input.sessionId, input.runId);
       if (updated.changes !== 1) {
         throw new Error(`Run '${input.runId}' is not active for session '${input.sessionId}'`);
       }
-      this.database.query("DELETE FROM run_chunks WHERE run_id = ?").run(input.runId);
     })();
     return this.getSession(input.sessionId);
-  }
-
-  appendChunk(runId: string, chunk: StoredUIMessageChunk): number {
-    const parsed = uiMessageChunkSchema.parse(chunk);
-    const next = z
-      .object({ seq: z.number().int() })
-      .parse(
-        this.database
-          .query("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_chunks WHERE run_id = ?")
-          .get(runId),
-      ).seq;
-    this.database
-      .query("INSERT INTO run_chunks (run_id, seq, chunk_json) VALUES (?, ?, ?)")
-      .run(runId, next, serialize(parsed));
-    return next;
-  }
-
-  getChunks(runId: string, afterSeq = 0): StoredRunChunk[] {
-    return this.database
-      .query(
-        `SELECT seq, chunk_json FROM run_chunks
-         WHERE run_id = ? AND seq > ?
-           AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND undone_at IS NULL)
-         ORDER BY seq`,
-      )
-      .all(runId, afterSeq, runId)
-      .map((value) => {
-        const row = chunkRowSchema.parse(value);
-        return { seq: row.seq, chunk: uiMessageChunkSchema.parse(deserialize(row.chunk_json)) };
-      });
   }
 
   getTodos(sessionId: string): MiniLilacTodoState {
@@ -961,25 +1090,10 @@ export class MiniLilacSqliteStore {
         revision: updated.revision,
         todos: JSON.parse(updated.todos_json),
       });
-      const chunk = miniLilacTodoChunkSchema.parse({
-        type: "data-todos",
-        data: state,
-        transient: true,
-      });
-      const seq = z
-        .object({ seq: z.number().int().positive() })
-        .parse(
-          this.database
-            .query("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM run_chunks WHERE run_id = ?")
-            .get(input.runId),
-        ).seq;
       this.database
         .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
         .run(now, input.sessionId);
-      this.database
-        .query("INSERT INTO run_chunks (run_id, seq, chunk_json) VALUES (?, ?, ?)")
-        .run(input.runId, seq, serialize(chunk));
-      return { state, storedChunk: { seq, chunk } };
+      return { state };
     })();
   }
 
@@ -1136,22 +1250,14 @@ export class MiniLilacSqliteStore {
         throw new Error(`Session '${sessionId}' must be quiescent to undo`);
       }
 
-      const uiRows = this.database
-        .query(
-          "SELECT position, value_json FROM ui_messages WHERE session_id = ? ORDER BY position",
-        )
-        .all(sessionId)
-        .map((value) => positionedJsonRowSchema.parse(value));
-      const latestUser = uiRows.findLast(
-        (row) => miniLilacUIMessageSchema.parse(deserialize(row.value_json)).role === "user",
-      );
-      const latestManualCompaction = uiRows.findLast((row) => {
-        const message = miniLilacUIMessageSchema.parse(deserialize(row.value_json));
+      const uiMessages = this.getUiMessages(sessionId);
+      const latestUserPosition = uiMessages.findLastIndex((message) => message.role === "user");
+      const latestManualCompactionPosition = uiMessages.findLastIndex((message) => {
         return message.parts.some(
           (part) => part.type === "data-compaction" && part.data.source === "manual",
         );
       });
-      if (!latestUser || (latestManualCompaction?.position ?? -1) > latestUser.position) {
+      if (latestUserPosition < 0 || latestManualCompactionPosition > latestUserPosition) {
         const result = miniLilacUndoResultSchema.parse({
           status: "empty",
           clientCommandId: commandId,
@@ -1173,28 +1279,29 @@ export class MiniLilacSqliteStore {
           );
         return result;
       }
+      const latestUser = miniLilacUserUIMessageSchema.parse(uiMessages[latestUserPosition]);
       const checkpointValue = this.database
         .query(
-          `SELECT user_message_json, model_prefix_json, ui_prefix_json, root_run_id, replay_after_seq
+          `SELECT ui_position, user_message_json, model_head_id, ui_head_id, root_run_id, replay_after_seq
            FROM user_checkpoints
-           WHERE session_id = ? AND user_message_json = ?
+           WHERE session_id = ?
            ORDER BY ui_position DESC LIMIT 1`,
         )
-        .get(sessionId, latestUser.value_json);
+        .get(sessionId);
       if (!checkpointValue) {
         throw new Error(
           `Session '${sessionId}' has no durable checkpoint for its latest user message`,
         );
       }
       const checkpoint = checkpointRowSchema.parse(checkpointValue);
-      if (checkpoint.user_message_json !== latestUser.value_json) {
+      const message = miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json));
+      const latestUserJson = JSON.stringify(canonicalJsonValue(latestUser));
+      const checkpointMessageJson = JSON.stringify(canonicalJsonValue(message));
+      if (checkpointMessageJson !== latestUserJson) {
         throw new Error(
           `Session '${sessionId}' has an invalid checkpoint for its latest user message`,
         );
       }
-      const message = miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json));
-      const modelPrefix = modelMessagesSchema.parse(deserialize(checkpoint.model_prefix_json));
-      const uiPrefix = miniLilacMessagesSchema.parse(deserialize(checkpoint.ui_prefix_json));
       const result = miniLilacUndoResultSchema.parse({
         status: "undone",
         clientCommandId: commandId,
@@ -1204,19 +1311,13 @@ export class MiniLilacSqliteStore {
       this.database
         .query(
           `DELETE FROM user_checkpoints
-           WHERE session_id = ? AND ui_position >= (
-             SELECT ui_position FROM user_checkpoints
-             WHERE session_id = ? AND user_message_json = ?
-             ORDER BY ui_position DESC LIMIT 1
-           )`,
+           WHERE session_id = ? AND ui_position >= ?`,
         )
-        .run(sessionId, sessionId, latestUser.value_json);
-      this.insertModelMessages(sessionId, modelPrefix);
-      this.insertUiMessages(sessionId, uiPrefix);
+        .run(sessionId, checkpoint.ui_position);
+      this.setTranscriptHeads(sessionId, checkpoint.model_head_id, checkpoint.ui_head_id);
       this.database
         .query("UPDATE runs SET undone_at = ? WHERE id = ? AND session_id = ?")
         .run(new Date().toISOString(), checkpoint.root_run_id, sessionId);
-      this.database.query("DELETE FROM run_chunks WHERE run_id = ?").run(checkpoint.root_run_id);
       this.database
         .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
         .run(new Date().toISOString(), sessionId);
@@ -1249,23 +1350,15 @@ export class MiniLilacSqliteStore {
   }
 
   private insertUiMessages(sessionId: string, uiMessages: readonly MiniLilacUIMessage[]): void {
-    this.database.query("DELETE FROM ui_messages WHERE session_id = ?").run(sessionId);
-    const insertUi = this.database.query(
-      "INSERT INTO ui_messages (session_id, position, value_json) VALUES (?, ?, ?)",
-    );
-    uiMessages.forEach((message, position) =>
-      insertUi.run(sessionId, position, serialize(message)),
-    );
+    const headId = this.internChain(sessionId, "ui", uiMessages);
+    const heads = this.getTranscriptHeads(sessionId);
+    this.setTranscriptHeads(sessionId, heads.model_head_id, headId);
   }
 
   private insertModelMessages(sessionId: string, modelMessages: readonly ModelMessage[]): void {
-    this.database.query("DELETE FROM model_transcript WHERE session_id = ?").run(sessionId);
-    const insertModel = this.database.query(
-      "INSERT INTO model_transcript (session_id, position, value_json) VALUES (?, ?, ?)",
-    );
-    modelMessages.forEach((message, position) =>
-      insertModel.run(sessionId, position, serialize(message)),
-    );
+    const headId = this.internChain(sessionId, "model", modelMessages);
+    const heads = this.getTranscriptHeads(sessionId);
+    this.setTranscriptHeads(sessionId, headId, heads.ui_head_id);
   }
 
   private insertUserCheckpoint(
@@ -1277,68 +1370,153 @@ export class MiniLilacSqliteStore {
     rootRunId: string,
     replayAfterSeq: number,
   ): void {
+    const modelHeadId = this.internChain(sessionId, "model", modelPrefix);
+    const uiHeadId = this.internChain(sessionId, "ui", uiPrefix);
     this.database
       .query(
         `INSERT INTO user_checkpoints
-          (session_id, ui_position, user_message_json, model_prefix_json, ui_prefix_json, root_run_id, replay_after_seq)
+          (session_id, ui_position, user_message_json, model_head_id, ui_head_id, root_run_id, replay_after_seq)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         sessionId,
         uiPosition,
         serialize(message),
-        serialize(modelPrefix),
-        serialize(uiPrefix),
+        modelHeadId,
+        uiHeadId,
         rootRunId,
         replayAfterSeq,
       );
   }
 
   getModelMessages(sessionId: string): ModelMessage[] {
-    const values = this.database
-      .query("SELECT value_json FROM model_transcript WHERE session_id = ? ORDER BY position")
-      .all(sessionId)
-      .map((value) => deserialize(jsonRowSchema.parse(value).value_json));
+    const values = this.readSerializedChain(
+      sessionId,
+      "model",
+      this.getTranscriptHeads(sessionId).model_head_id,
+    ).map(deserialize);
     return modelMessagesSchema.parse(values);
   }
 
   getUiMessages(sessionId: string): MiniLilacUIMessage[] {
-    const values = this.database
-      .query("SELECT value_json FROM ui_messages WHERE session_id = ? ORDER BY position")
-      .all(sessionId)
-      .map((value) => deserialize(jsonRowSchema.parse(value).value_json));
+    const values = this.readSerializedChain(
+      sessionId,
+      "ui",
+      this.getTranscriptHeads(sessionId).ui_head_id,
+    ).map(deserialize);
     return miniLilacMessagesSchema.parse(values);
   }
 
   getSessionResume(sessionId: string): StoredSessionResume {
-    return this.database.transaction(() => {
-      const snapshot = this.getSession(sessionId);
-      if (snapshot.activeRunId === null) {
-        return { snapshot, messages: this.getUiMessages(sessionId), replayCursor: null };
-      }
-      const value = this.database
+    return {
+      snapshot: this.getSession(sessionId),
+      messages: this.getUiMessages(sessionId),
+      replayCursor: null,
+    };
+  }
+
+  private internChain(
+    sessionId: string,
+    lane: "model" | "ui",
+    values: readonly unknown[],
+  ): number | null {
+    return this.internSerializedChain(sessionId, lane, values.map(serialize));
+  }
+
+  private internSerializedChain(
+    sessionId: string,
+    lane: "model" | "ui",
+    values: readonly string[],
+  ): number | null {
+    let parent: z.infer<typeof transcriptNodeRowSchema> | null = null;
+    for (const valueJson of values) {
+      const hash: string = new Bun.CryptoHasher("sha256")
+        .update(parent?.hash ?? "root")
+        .update("\0")
+        .update(valueJson)
+        .digest("hex");
+      const existingValue = this.database
         .query(
-          `SELECT user_message_json, model_prefix_json, ui_prefix_json, root_run_id, replay_after_seq
-           FROM user_checkpoints
-           WHERE session_id = ? AND root_run_id = ?
-           ORDER BY ui_position DESC LIMIT 1`,
+          `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
+           WHERE session_id = ? AND lane = ? AND hash = ?`,
         )
-        .get(sessionId, snapshot.activeRunId);
-      if (!value) {
-        throw new Error(`Active run '${snapshot.activeRunId}' has no durable resume checkpoint`);
+        .get(sessionId, lane, hash);
+      if (existingValue) {
+        const existing = transcriptNodeRowSchema.parse(existingValue);
+        if (
+          existing.parent_id !== (parent?.id ?? null) ||
+          existing.depth !== (parent?.depth ?? 0) + 1 ||
+          existing.value_json !== valueJson
+        ) {
+          throw new Error(`Transcript hash collision for session '${sessionId}' lane '${lane}'`);
+        }
+        parent = existing;
+        continue;
       }
-      const checkpoint = checkpointRowSchema.parse(value);
-      const message = miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json));
-      const uiPrefix = miniLilacMessagesSchema.parse(deserialize(checkpoint.ui_prefix_json));
-      return {
-        snapshot,
-        messages: [...uiPrefix, message],
-        replayCursor: {
-          runId: checkpoint.root_run_id,
-          afterSeq: checkpoint.replay_after_seq,
-        },
+      const inserted = transcriptNodeRowSchema.pick({ id: true }).parse(
+        this.database
+          .query(
+            `INSERT INTO transcript_nodes
+              (session_id, lane, parent_id, depth, value_json, hash)
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
+          )
+          .get(sessionId, lane, parent?.id ?? null, (parent?.depth ?? 0) + 1, valueJson, hash),
+      );
+      parent = {
+        id: inserted.id,
+        parent_id: parent?.id ?? null,
+        depth: (parent?.depth ?? 0) + 1,
+        value_json: valueJson,
+        hash,
       };
-    })();
+    }
+    return parent?.id ?? null;
+  }
+
+  private getTranscriptHeads(sessionId: string): z.infer<typeof transcriptHeadRowSchema> {
+    const value = this.database
+      .query("SELECT model_head_id, ui_head_id FROM session_transcript_heads WHERE session_id = ?")
+      .get(sessionId);
+    return value ? transcriptHeadRowSchema.parse(value) : { model_head_id: null, ui_head_id: null };
+  }
+
+  private setTranscriptHeads(
+    sessionId: string,
+    modelHeadId: number | null,
+    uiHeadId: number | null,
+  ): void {
+    this.database
+      .query(
+        `INSERT INTO session_transcript_heads (session_id, model_head_id, ui_head_id)
+         VALUES (?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           model_head_id = excluded.model_head_id,
+           ui_head_id = excluded.ui_head_id`,
+      )
+      .run(sessionId, modelHeadId, uiHeadId);
+  }
+
+  private readSerializedChain(
+    sessionId: string,
+    lane: "model" | "ui",
+    headId: number | null,
+  ): string[] {
+    if (headId === null) return [];
+    return this.database
+      .query(
+        `WITH RECURSIVE chain(id, parent_id, depth, value_json) AS (
+           SELECT id, parent_id, depth, value_json FROM transcript_nodes
+           WHERE id = ? AND session_id = ? AND lane = ?
+           UNION ALL
+           SELECT parent.id, parent.parent_id, parent.depth, parent.value_json
+           FROM transcript_nodes AS parent
+           JOIN chain AS child ON child.parent_id = parent.id
+           WHERE parent.session_id = ? AND parent.lane = ?
+         )
+         SELECT value_json FROM chain ORDER BY depth`,
+      )
+      .all(headId, sessionId, lane, sessionId, lane)
+      .map((value) => jsonRowSchema.parse(value).value_json);
   }
 
   getCommandResult(
