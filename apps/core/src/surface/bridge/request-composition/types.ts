@@ -1,3 +1,4 @@
+import type { RoutedSurfacePlatform } from "../../types";
 import type { ModelMessage } from "ai";
 
 import type { MsgRef } from "../../types";
@@ -11,7 +12,7 @@ export type RequestCompositionResult = {
 };
 
 export type ComposeRecentChannelMessagesOpts = {
-  platform: "discord";
+  platform: RoutedSurfacePlatform;
   sessionId: string;
   botUserId: string;
   botName: string;
@@ -29,7 +30,7 @@ export type ComposeRecentChannelMessagesOpts = {
 };
 
 export type ComposeSingleMessageOpts = {
-  platform: "discord";
+  platform: RoutedSurfacePlatform;
   botUserId: string;
   botName: string;
   msgRef: MsgRef;
@@ -38,7 +39,7 @@ export type ComposeSingleMessageOpts = {
 };
 
 export type ComposeRequestOpts = {
-  platform: "discord";
+  platform: RoutedSurfacePlatform;
   botUserId: string;
   botName: string;
   transcriptStore?: TranscriptStore;

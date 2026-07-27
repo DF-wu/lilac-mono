@@ -2,6 +2,15 @@ import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
 export type SurfacePlatform = Exclude<AdapterPlatform, "unknown"> | "unknown";
 
+/**
+ * Surfaces whose inbound messages flow through the shared request router and
+ * its message-composition pipeline.
+ *
+ * GitHub is deliberately absent: its webhook handlers publish
+ * `cmd.request.message` directly and never emit adapter message events.
+ */
+export type RoutedSurfacePlatform = "discord" | "telegram";
+
 export type DiscordSessionRef = {
   platform: "discord";
   channelId: string;

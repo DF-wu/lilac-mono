@@ -1,10 +1,11 @@
 import type { ModelMessage, UserContent } from "ai";
 import type { SurfaceAdapter } from "../adapter";
-import type { MsgRef, SurfaceMessage } from "../types";
+import type { MsgRef, RoutedSurfacePlatform, SessionRef, SurfaceMessage } from "../types";
 
 import {
   parseLeadingContinueDirective,
   stripLeadingContinueDirective,
+  isRoutedSurfacePlatform,
 } from "./bus-request-router/common";
 import {
   isDiscordSessionDividerSurfaceMessageAnyAuthor,
@@ -20,7 +21,7 @@ import {
 import { selectNewestReachableCheckpoint } from "./request-composition/checkpoint-selection";
 import {
   buildAssistantOnlyMessageFromTranscript,
-  formatDiscordAttributionHeader,
+  formatSurfaceAttributionHeader,
   normalizeAssistantContextText,
   normalizeText,
 } from "./request-composition/normalization";
@@ -54,7 +55,7 @@ const DISCORD_REFERENCE_TYPE_FORWARD = 1;
 
 function resolveTranscriptSnapshot(input: {
   messageId: string;
-  platform: "discord";
+  platform: RoutedSurfacePlatform;
   channelId: string;
   transcriptStore: TranscriptStore;
   resolvedSnapshotsBySurfaceMessageId: ReadonlyMap<string, TranscriptSnapshot | null>;
@@ -235,10 +236,9 @@ async function listRecentMessagesEndingAt(params: {
     fetchedPreviousMessages: number;
   }) => boolean;
 }): Promise<SurfaceMessage[]> {
-  const sessionRef = {
-    platform: "discord",
-    channelId: params.sessionId,
-  } as const;
+  // The anchor already carries the session it belongs to; rebuilding a ref
+  // here would hardcode a platform.
+  const sessionRef = params.anchor.session;
 
   const previousMessageTargets = (() => {
     const requested = params.previousMessageTargets ?? [params.maxPreviousMessages];
@@ -553,15 +553,16 @@ function applyDiscordSessionDividerCutoffToReplyChain(params: {
 
 async function findLastDiscordSessionDividerBefore(params: {
   adapter: SurfaceAdapter;
+  platform: RoutedSurfacePlatform;
   channelId: string;
   botUserId: string;
   beforeMessageId: string;
   /** Optional: stop scanning once we see this message id. */
   stopAtMessageId?: string;
 }): Promise<{ ts: number; messageId: string } | null> {
-  const { adapter, channelId, botUserId, beforeMessageId, stopAtMessageId } = params;
+  const { adapter, platform, channelId, botUserId, beforeMessageId, stopAtMessageId } = params;
 
-  const sessionRef = { platform: "discord", channelId } as const;
+  const sessionRef: SessionRef = { platform, channelId };
 
   let cursor: string | undefined = beforeMessageId;
   let scanned = 0;
@@ -680,7 +681,7 @@ export async function composeRequestMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRequestOpts,
 ): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(opts.platform)) {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
 
@@ -813,7 +814,8 @@ export async function composeRequestMessages(
 
     const reactions = reactionsByMessageId.get(messageId) ?? [];
 
-    const header = formatDiscordAttributionHeader({
+    const header = formatSurfaceAttributionHeader({
+      platform: opts.platform,
       authorId: chunk.authorId,
       authorName: chunk.authorName,
       userAlias: opts.discordUserAliasById?.get(chunk.authorId),
@@ -852,7 +854,7 @@ export async function composeRecentChannelMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRecentChannelMessagesOpts,
 ): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(opts.platform)) {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
 
@@ -883,6 +885,7 @@ export async function composeRecentChannelMessages(
         const divider = oldestAnchoredMessageId
           ? await findLastDiscordSessionDividerBefore({
               adapter,
+              platform: opts.platform,
               channelId: opts.sessionId,
               botUserId: opts.botUserId,
               beforeMessageId: triggerMsg.ref.messageId,
@@ -989,7 +992,8 @@ export async function composeRecentChannelMessages(
 
           const reactions = reactionsByMessageId.get(messageId) ?? [];
 
-          const header = formatDiscordAttributionHeader({
+          const header = formatSurfaceAttributionHeader({
+            platform: opts.platform,
             authorId: chunk.authorId,
             authorName: chunk.authorName,
             userAlias: opts.discordUserAliasById?.get(chunk.authorId),
@@ -1025,10 +1029,10 @@ export async function composeRecentChannelMessages(
     }
   }
 
-  const sessionRef = {
-    platform: "discord",
+  const sessionRef: SessionRef = {
+    platform: opts.platform,
     channelId: opts.sessionId,
-  } as const;
+  };
   const continueDirectiveBotNames = opts.botMentionNames ?? [opts.botName];
 
   // Active-burst rules are intended for "latest view" prompts, including
@@ -1242,7 +1246,8 @@ export async function composeRecentChannelMessages(
 
     const reactions = reactionsByMessageId.get(messageId) ?? [];
 
-    const header = formatDiscordAttributionHeader({
+    const header = formatSurfaceAttributionHeader({
+      platform: opts.platform,
       authorId: chunk.authorId,
       authorName: chunk.authorName,
       userAlias: opts.discordUserAliasById?.get(chunk.authorId),
@@ -1280,7 +1285,7 @@ export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
 ): Promise<ModelMessage | null> {
-  if (opts.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(opts.platform)) {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
 
@@ -1306,7 +1311,8 @@ export async function composeSingleMessage(
     } satisfies ModelMessage;
   }
 
-  const header = formatDiscordAttributionHeader({
+  const header = formatSurfaceAttributionHeader({
+    platform: opts.platform,
     authorId: m.userId,
     authorName: m.userName ?? `user_${m.userId}`,
     userAlias: opts.discordUserAliasById?.get(m.userId),

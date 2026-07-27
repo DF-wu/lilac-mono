@@ -1,3 +1,4 @@
+import type { RoutedSurfacePlatform } from "../../types";
 import type { MsgRef, SurfaceMessage } from "../../types";
 
 import { hasReplyChainPlannerProvider, type SurfaceAdapter } from "../../adapter";
@@ -238,7 +239,7 @@ export function findEarliestReplyAnchor(block: readonly SurfaceMessage[]): Surfa
 export async function fetchReplyChainFrom(
   adapter: SurfaceAdapter,
   opts: {
-    platform: "discord";
+    platform: RoutedSurfacePlatform;
     botUserId: string;
     botName: string;
     trigger: { type: "mention" | "reply"; msgRef: MsgRef };
@@ -352,7 +353,7 @@ export async function fetchReplyChainFrom(
 export async function fetchMentionThreadContext(
   adapter: SurfaceAdapter,
   params: {
-    platform: "discord";
+    platform: RoutedSurfacePlatform;
     botUserId: string;
     botName: string;
     triggerMsg: SurfaceMessage;
