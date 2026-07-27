@@ -155,6 +155,9 @@ const DEFAULT_BASE_URLS: Record<ProviderType, string> = {
   openai: "https://api.openai.com/v1",
   "openai-compatible": "",
   anthropic: "https://api.anthropic.com/v1",
+  // The local Claude installation owns the endpoint, and `catalog: v1` is
+  // rejected for this type, so no model listing URL is ever built.
+  "claude-code": "",
   xai: "https://api.x.ai/v1",
   openrouter: "https://openrouter.ai/api/v1",
   groq: "https://api.groq.com/openai/v1",
@@ -289,6 +292,28 @@ function isCodexOAuthModel(model: ModelsDevModel): boolean {
   );
 }
 
+// The Claude CLI runs Claude models only, so the Anthropic catalog is filtered
+// to the Claude families it can actually launch. Deliberately permissive:
+// `providers.<id>.models` overrides cover anything this misses.
+function isClaudeCodeModel(model: ModelsDevModel): boolean {
+  return model.id.startsWith("claude-");
+}
+
+/**
+ * models.dev entry for a configured provider. Ordinary providers may be named
+ * after their models.dev id, so that name wins; `claude-code` always reads
+ * Anthropic's metadata, because a provider id that happens to collide with an
+ * unrelated models.dev key would otherwise yield an empty Claude catalog.
+ */
+function modelsDevProvider(
+  registry: ModelsDevRegistry,
+  providerId: string,
+  definition: ProviderDefinition,
+): unknown {
+  if (definition.type === "claude-code") return registry.anthropic;
+  return registry[providerId] ?? registry[definition.type];
+}
+
 export class ModelCatalog {
   private readonly fetchFn: CatalogFetch;
   private readonly modelsDevUrl: string;
@@ -415,12 +440,13 @@ export class ModelCatalog {
     const errors: ModelsDevProviderError[] = [];
 
     for (const [providerId, definition] of this.modelsDevProviders()) {
-      const sourceProviderValue = registry[providerId] ?? registry[definition.type];
+      const sourceProviderValue = modelsDevProvider(registry, providerId, definition);
       if (!sourceProviderValue) {
+        const expected = definition.type === "claude-code" ? "anthropic" : definition.type;
         errors.push({
           code: "provider-not-found",
           providerId,
-          message: `models.dev has no provider matching '${providerId}' or type '${definition.type}'`,
+          message: `models.dev has no provider matching '${providerId}' or type '${expected}'`,
         });
         continue;
       }
@@ -434,7 +460,9 @@ export class ModelCatalog {
         continue;
       }
       const entries = Object.values(sourceProvider.data.models).filter(
-        (entry) => !this.codexOAuthProviderIds.has(providerId) || isCodexOAuthModel(entry),
+        (entry) =>
+          (!this.codexOAuthProviderIds.has(providerId) || isCodexOAuthModel(entry)) &&
+          (definition.type !== "claude-code" || isClaudeCodeModel(entry)),
       );
       for (const entry of entries) {
         models.push(

@@ -46,6 +46,7 @@ import {
   AgentIdleTimeoutError,
   AiSdkPiAgent,
   attachAutoCompaction,
+  buildSafeRecoveryCheckpoint,
   buildSyntheticToolCallId,
   createAgentRunIdleWatchdog,
   type AiSdkPiAgentEvent,
@@ -56,7 +57,7 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { CoreToolPluginManager } from "../../plugins";
+import type { BuiltLevel1Toolset, CoreToolPluginManager } from "../../plugins";
 import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
 import { createAgentOutputActivityPublisher } from "../../shared/agent-output-activity";
 import {
@@ -91,7 +92,6 @@ import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
-import { buildSafeRecoveryCheckpoint } from "./recovery-checkpoint";
 import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
@@ -133,6 +133,11 @@ import {
 } from "./bus-agent-runner/raw";
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
+import {
+  materializeClaudeCodeRun,
+  type ClaudeCodeRunControl,
+  type MaterializedClaudeCodeRun,
+} from "@stanley2058/lilac-claude-code-bridge";
 import {
   buildInputCompositionLine,
   buildNoAssistantTextError,
@@ -1449,6 +1454,52 @@ export function assertWorkflowDispatchPolicy(
   }
 }
 
+type Level1ToolAuthorityTarget = Pick<AiSdkPiAgent<ToolSet>, "setTools" | "setActiveTools">;
+
+export function selectedLevel1ToolNames(
+  toolset: BuiltLevel1Toolset,
+  selectedCatalogIds: readonly string[],
+): ReadonlySet<string> {
+  const selected = new Set(selectedCatalogIds);
+  const active = new Set(toolset.directToolNames);
+  for (const entry of toolset.catalog) {
+    if (selected.has(entry.stableId)) active.add(entry.modelName);
+  }
+  return active;
+}
+
+export async function refreshSelectedLevel1Tools(params: {
+  target: Pick<Level1ToolAuthorityTarget, "setActiveTools">;
+  toolset: BuiltLevel1Toolset;
+  listSelectedCatalogIds: () => readonly string[];
+}): Promise<BuiltLevel1Toolset> {
+  const toolset = params.toolset;
+  const activeToolNames = selectedLevel1ToolNames(toolset, params.listSelectedCatalogIds());
+  toolset.updateActiveBatchTools(activeToolNames);
+  params.target.setActiveTools(activeToolNames);
+  return toolset;
+}
+
+export function applyCompleteLevel1Tools(
+  target: Level1ToolAuthorityTarget,
+  toolset: BuiltLevel1Toolset,
+): void {
+  toolset.updateActiveBatchTools(new Set(Object.keys(toolset.tools)));
+  target.setTools(toolset.tools);
+  target.setActiveTools(new Set(Object.keys(toolset.tools)));
+}
+
+export function completeLevel1ToolMapping(toolset: BuiltLevel1Toolset): {
+  tools: ToolSet;
+  catalogMetadata: BuiltLevel1Toolset["catalogMetadata"];
+} {
+  toolset.updateActiveBatchTools(new Set(Object.keys(toolset.tools)));
+  return {
+    tools: toolset.tools,
+    catalogMetadata: toolset.catalogMetadata,
+  };
+}
+
 type SessionQueue = {
   running: boolean;
   agent: AiSdkPiAgent<ToolSet> | null;
@@ -1467,6 +1518,7 @@ type SessionQueue = {
     raw?: unknown;
     partialText: string;
     liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
+    claudeCodeControl: ClaudeCodeRunControl | null;
     notifyWaiters: () => void;
     cancel: () => void;
     started: boolean;
@@ -2042,7 +2094,7 @@ export async function startBusAgentRunner(params: {
     }
 
     const checkpointMessages = buildSafeRecoveryCheckpoint(
-      state.agent.state.messages,
+      state.agent.getRecoverableMessages(),
       "server restarted",
     );
 
@@ -2208,6 +2260,7 @@ export async function startBusAgentRunner(params: {
     const routerSessionMode = parseRouterSessionModeFromRaw(next.raw);
 
     let activeAgent: AiSdkPiAgent<ToolSet> | null = null;
+    let claudeCodeRun: MaterializedClaudeCodeRun | null = null;
     let activeRunOperation: Promise<unknown> | null = null;
     let customCommandAbortController: AbortController | null = null;
     let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
@@ -2376,6 +2429,7 @@ export async function startBusAgentRunner(params: {
       raw: next.raw,
       partialText: next.recovery?.partialText ?? "",
       liveParent: liveParentSession,
+      claudeCodeControl: null,
       notifyWaiters: notifyContinuationWaiters,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
@@ -2959,11 +3013,7 @@ export async function startBusAgentRunner(params: {
 
       const fallbackSurfaceForDelegation = trustedFallbackSurface;
       const executionCwd = workflowPolicy?.cwd ?? cwd;
-      const {
-        tools,
-        specs: level1ToolSpecs,
-        genericOutputNormalizerBypassTools,
-      } = await waitForPreAgent(
+      const initialLevel1Toolset = await waitForPreAgent(
         params.pluginManager.buildLevel1Toolset({
           cwd: executionCwd,
           runProfile,
@@ -3016,6 +3066,11 @@ export async function startBusAgentRunner(params: {
           },
         }),
       );
+      const {
+        tools,
+        specs: level1ToolSpecs,
+        genericOutputNormalizerBypassTools,
+      } = initialLevel1Toolset;
       const agentSystem = anthropicPromptCachingEnabled
         ? {
             role: "system" as const,
@@ -3030,23 +3085,61 @@ export async function startBusAgentRunner(params: {
         sessionId: headers.session_id,
         modelSpec: resolved.spec,
       });
+      if (resolved.provider === "claude-code") {
+        const claudeCodeToolMapping = completeLevel1ToolMapping(initialLevel1Toolset);
+        claudeCodeRun = await waitForPreAgent(
+          materializeClaudeCodeRun({
+            modelId: resolved.modelId,
+            cwd: executionCwd,
+            tools: claudeCodeToolMapping.tools,
+            catalogMetadata: claudeCodeToolMapping.catalogMetadata,
+            // Core admits no Claude built-ins; Lilac remains the only tool source.
+            builtInTools: [],
+            execute: async (request) => {
+              if (!activeAgent) {
+                throw new Error("Claude Code tool execution started before the agent was ready");
+              }
+              return await activeAgent.executeExternalToolCall(request);
+            },
+          }),
+        );
+        if (state.activeRun) state.activeRun.claudeCodeControl = claudeCodeRun.control;
+      }
 
-      const agent = new AiSdkPiAgent<ToolSet>({
+      let agent: AiSdkPiAgent<ToolSet> | null = null;
+      agent = new AiSdkPiAgent<ToolSet>({
         system: agentSystem,
-        model: resolved.model,
+        model: claudeCodeRun?.agentModel ?? resolved.model,
         modelSpecifier: resolved.spec,
         messages: next.recovery?.checkpointMessages ?? seededSessionMessages,
         tools,
         providerOptions: providerOptionsForAgent,
         reasoning: resolved.reasoning,
         turnErrorHandler: transientRetryController.handler,
+        beforeStep:
+          claudeCodeRun === null
+            ? async () => {
+                if (!agent) throw new Error("Tool refresh started before the agent was ready");
+                await refreshSelectedLevel1Tools({
+                  target: agent,
+                  toolset: initialLevel1Toolset,
+                  listSelectedCatalogIds: () =>
+                    params.transcriptStore?.listSessionToolIds?.({
+                      requestClient: next.requestClient,
+                      sessionId: next.sessionId,
+                    }) ?? [],
+                });
+              }
+            : undefined,
         normalizeToolResultOutput,
         genericOutputNormalizerBypassTools,
         experimentalDownload: experimentalDownloadForAgent,
+        sendToolsToModel: claudeCodeRun === null,
         debug: {
           captureModelViewMessages: env.debug.contextDump.enabled,
         },
       });
+      if (claudeCodeRun !== null) applyCompleteLevel1Tools(agent, initialLevel1Toolset);
       activeAgent = agent;
 
       agent.setContext({
@@ -3136,6 +3229,7 @@ export async function startBusAgentRunner(params: {
       unsubscribeCompaction = await waitForPreAgent(
         attachAutoCompaction(agent, {
           model: resolved.spec,
+          summaryModel: claudeCodeRun?.utilityModel ?? "current",
           modelCapability,
           resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
           baseTransformMessages: toolPruneTransform,
@@ -4248,14 +4342,18 @@ export async function startBusAgentRunner(params: {
       if (params.transcriptStore) {
         try {
           const finalMessagesForPersistence =
-            runStats.finalMessages ?? activeAgent?.state.messages ?? [];
-          const responseMessages = finalMessagesForPersistence.slice(responseStartIndex);
+            runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
+          const safeFinalMessages = buildSafeRecoveryCheckpoint(
+            finalMessagesForPersistence,
+            "agent run failed",
+          );
+          const responseMessages = safeFinalMessages.slice(responseStartIndex);
           const persistedMessages = (() => {
             if (isHeartbeatSessionId(headers.session_id)) {
               return buildPersistedHeartbeatMessages(`Error: ${msg}`);
             }
 
-            return runProfile === "primary" ? responseMessages : finalMessagesForPersistence;
+            return runProfile === "primary" ? responseMessages : safeFinalMessages;
           })();
 
           params.transcriptStore.saveRequestTranscript({
@@ -4286,8 +4384,11 @@ export async function startBusAgentRunner(params: {
       if (params.transcriptStore && isHeartbeatSessionId(headers.session_id)) {
         try {
           const finalMessagesForPersistence =
-            runStats.finalMessages ?? activeAgent?.state.messages ?? [];
-          const responseMessages = finalMessagesForPersistence.slice(responseStartIndex);
+            runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
+          const responseMessages = buildSafeRecoveryCheckpoint(
+            finalMessagesForPersistence,
+            "agent run failed",
+          ).slice(responseStartIndex);
 
           persistHeartbeatSurfaceHandoffs({
             logger,
@@ -4349,6 +4450,13 @@ export async function startBusAgentRunner(params: {
       rejectPreAgentCancellation = null;
       unsubscribe();
       unsubscribeCompaction();
+      await claudeCodeRun?.dispose().catch((e: unknown) => {
+        logger.warn(
+          "failed to dispose Claude Code run resources",
+          { requestId: headers.request_id, sessionId: headers.session_id },
+          e,
+        );
+      });
       await liveParentSession?.close();
       state.agent = null;
       state.activeRequestId = null;
@@ -4464,6 +4572,7 @@ async function applyToRunningAgent(
 ) {
   const merged = mergeToSingleUserMessage(entry.messages);
   const liveParent = activeRun?.liveParent;
+  const claudeCodeControl = activeRun?.claudeCodeControl;
   const notifyWaiters = activeRun?.notifyWaiters;
   const queueWhileIdle = (mode: "followUp" | "steer") => {
     if (mode === "steer") {
@@ -4513,7 +4622,7 @@ async function applyToRunningAgent(
         if (cancel) {
           cancelledByRequestId.add(entry.requestId);
           await liveParent?.cancelAll("parent request aborted");
-          agent.abort();
+          agent.cancel();
           notifyWaiters?.();
           return;
         }
@@ -4534,7 +4643,12 @@ async function applyToRunningAgent(
 
   switch (entry.queue) {
     case "steer": {
-      agent.steer(merged);
+      const steeringId = agent.steer(merged);
+      if (merged.role === "user" && typeof merged.content === "string") {
+        claudeCodeControl?.inject(merged.content, (delivered) => {
+          if (delivered) agent.acknowledgeSteeringDelivery(steeringId);
+        });
+      }
       notifyWaiters?.();
       return;
     }
@@ -4547,11 +4661,14 @@ async function applyToRunningAgent(
       if (cancel) {
         cancelledByRequestId.add(entry.requestId);
         await liveParent?.cancelAll("parent request aborted");
-        agent.abort();
+        await claudeCodeControl?.interrupt();
+        agent.cancel();
         notifyWaiters?.();
         return;
       }
-      await agent.interrupt(merged);
+      agent.steer(merged);
+      const interruptedNatively = (await claudeCodeControl?.interrupt()) ?? false;
+      if (!interruptedNatively) agent.interruptQueuedSteering();
       notifyWaiters?.();
       return;
     }

@@ -89,6 +89,8 @@ export type ModelCapabilityOptions = {
 const DEFAULT_PROVIDER_ALIASES = {
   // Our internal provider id for OpenAI Codex OAuth; models.dev uses "openai".
   codex: "openai",
+  // Claude Agent SDK models use Anthropic's model catalog and limits.
+  "claude-code": "anthropic",
 } as const satisfies Record<string, string>;
 
 type ModelsDevRegistry = Record<string, ModelsDevProvider>;

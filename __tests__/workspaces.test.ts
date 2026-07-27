@@ -41,6 +41,8 @@ describe("workspace tests", () => {
       "apps/mini-lilac-server",
       "apps/mini-lilac-tui",
       "packages/utils",
+      "packages/agent",
+      "packages/claude-code-bridge",
       "packages/event-bus",
       "packages/mini-lilac-client",
       "packages/mini-lilac-runtime",

@@ -8,6 +8,7 @@ import type {
   ToolPluginCreateContext,
   ToolPluginStatus,
   Level1ContributionInfo,
+  Level1RegistrationContext,
   Level2ContributionInfo,
 } from "./types";
 
@@ -66,6 +67,7 @@ export type ToolPluginManagerOptions<TRuntimeContext, TLevel1, TLevel2> = {
   builtinPlugins?: readonly LilacToolPlugin<TRuntimeContext, TLevel1, TLevel2>[];
   getDisabledPluginIds?: () => Promise<readonly string[]> | readonly string[];
   getPluginConfig?: (pluginId: string) => Promise<unknown> | unknown;
+  getLevel1RegistrationKey?: (spec: TLevel1, context: Level1RegistrationContext) => string;
   getLevel1Name?: (spec: TLevel1) => string;
   getLevel2CallableIds?: (tool: TLevel2) => Promise<readonly string[]> | readonly string[];
   initLevel2Item?: (tool: TLevel2) => Promise<void> | void;
@@ -467,13 +469,21 @@ export class ToolPluginManager<TRuntimeContext, TLevel1, TLevel2> {
     seenLevel1Names: Map<string, string>;
     seenLevel2Ids: Map<string, string>;
   }): Promise<string[]> {
-    const level1Names = params.loadedPlugin.level1.map((item) => this.getLevel1Name(item));
-    for (const name of level1Names) {
-      const prior = params.seenLevel1Names.get(name);
+    const registrationContext = {
+      pluginId: params.loadedPlugin.meta.id,
+      source: params.loadedPlugin.source,
+    } satisfies Level1RegistrationContext;
+    const level1Keys = params.loadedPlugin.level1.map((item) =>
+      this.getLevel1RegistrationKey(item, registrationContext),
+    );
+    for (const key of level1Keys) {
+      const prior = params.seenLevel1Names.get(key);
       if (prior) {
-        throw new Error(`duplicate Level 1 tool name '${name}' (already provided by '${prior}')`);
+        throw new Error(
+          `duplicate Level 1 registration key '${key}' (already provided by '${prior}')`,
+        );
       }
-      params.seenLevel1Names.set(name, params.loadedPlugin.meta.id);
+      params.seenLevel1Names.set(key, params.loadedPlugin.meta.id);
     }
 
     const callableIds: string[] = [];
@@ -519,6 +529,10 @@ export class ToolPluginManager<TRuntimeContext, TLevel1, TLevel2> {
     }
 
     throw new Error("getLevel1Name is required when Level 1 specs do not expose a string name");
+  }
+
+  private getLevel1RegistrationKey(item: TLevel1, context: Level1RegistrationContext): string {
+    return this.options.getLevel1RegistrationKey?.(item, context) ?? this.getLevel1Name(item);
   }
 
   private async getLevel2CallableIds(item: TLevel2): Promise<readonly string[]> {

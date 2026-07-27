@@ -1,0 +1,31 @@
+configVersion: 1
+
+servers: {}
+
+# Replace `servers: {}` with entries such as:
+# servers:
+#   docs:
+#     transport: http
+#     url: https://mcp.example.com/mcp
+#     headers:
+#       Authorization:
+#         env: DOCS_MCP_AUTHORIZATION
+#
+#   linear:
+#     transport: http
+#     url: https://mcp.example.com/mcp
+#     auth:
+#       type: oauth
+#       grant: authorization_code
+#       scopes: [read, write]
+#       client:
+#         type: dynamic
+#
+#   local-docs:
+#     transport: stdio
+#     command: bun
+#     args: [run, /opt/lilac/mcp/docs-server.ts]
+#     cwd: /opt/lilac
+#     env:
+#       DOCS_TOKEN:
+#         env: DOCS_TOKEN

@@ -351,4 +351,33 @@ describe("bundled skill templates", () => {
     expect(skill.body).toContain("Use `git` when applicable");
     expect(skill.body).toContain("Use `gh` when configured and the project is linked to GitHub");
   });
+
+  it("documents Core MCP management separately from direct mcporter usage", async () => {
+    const managementRaw = await Bun.file(
+      path.join(import.meta.dir, "..", "skill-templates", "mcp-management", "SKILL.md"),
+    ).text();
+    const mcporterRaw = await Bun.file(
+      path.join(import.meta.dir, "..", "skill-templates", "mcporter", "SKILL.md"),
+    ).text();
+
+    const management = parseSkillMarkdown(managementRaw);
+    const mcporter = parseSkillMarkdown(mcporterRaw);
+
+    expect(management.name).toBe("mcp-management");
+    expect(management.body).toContain("tools mcp.add");
+    expect(management.body).toContain("curl '<complete-callback-url>'");
+    expect(management.body).toContain("deliberately retains its credential file");
+    expect(management.body).toContain("not isolation");
+    expect(mcporter.description).toContain("does not manage Core's configured MCP registry");
+    expect(mcporter.body).toContain("Load `mcp-management` instead");
+  });
+
+  it("discloses MCP management exactly once in TOOLS.md", async () => {
+    const tools = await Bun.file(
+      path.join(import.meta.dir, "..", "prompt-templates", "TOOLS.md"),
+    ).text();
+
+    expect(tools.match(/`mcp\.\*`/gu)).toHaveLength(1);
+    expect(tools).toContain("Load the `mcp-management` skill");
+  });
 });

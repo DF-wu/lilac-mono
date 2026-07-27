@@ -5,30 +5,17 @@ type ToolCallRef = {
   toolName: string;
 };
 
-function getAssistantToolCalls(message: ModelMessage): ToolCallRef[] {
+function getUnresolvedAssistantToolCalls(message: ModelMessage): ToolCallRef[] {
   if (message.role !== "assistant") return [];
   if (!Array.isArray(message.content)) return [];
 
-  const calls: ToolCallRef[] = [];
+  const calls = new Map<string, string>();
   for (const part of message.content) {
-    const candidate = part as unknown as {
-      type?: unknown;
-      toolCallId?: unknown;
-      toolName?: unknown;
-    };
-    if (
-      candidate.type === "tool-call" &&
-      typeof candidate.toolCallId === "string" &&
-      typeof candidate.toolName === "string"
-    ) {
-      calls.push({
-        toolCallId: candidate.toolCallId,
-        toolName: candidate.toolName,
-      });
-    }
+    if (part.type === "tool-call") calls.set(part.toolCallId, part.toolName);
+    if (part.type === "tool-result") calls.delete(part.toolCallId);
   }
 
-  return calls;
+  return [...calls].map(([toolCallId, toolName]) => ({ toolCallId, toolName }));
 }
 
 function getToolResultToolCallIds(message: ModelMessage): string[] {
@@ -36,13 +23,7 @@ function getToolResultToolCallIds(message: ModelMessage): string[] {
 
   const ids: string[] = [];
   for (const part of message.content) {
-    const candidate = part as unknown as {
-      type?: unknown;
-      toolCallId?: unknown;
-    };
-    if (candidate.type === "tool-result" && typeof candidate.toolCallId === "string") {
-      ids.push(candidate.toolCallId);
-    }
+    if (part.type === "tool-result") ids.push(part.toolCallId);
   }
 
   return ids;
@@ -81,7 +62,7 @@ export function buildSafeRecoveryCheckpoint(
       break;
     }
 
-    const toolCalls = getAssistantToolCalls(message);
+    const toolCalls = getUnresolvedAssistantToolCalls(message);
     if (toolCalls.length > 0) {
       openToolCalls = new Map(toolCalls.map((call) => [call.toolCallId, call.toolName]));
       openSegmentLastIndex = i;

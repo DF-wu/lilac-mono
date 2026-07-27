@@ -67,6 +67,35 @@ describe("ModelCapability", () => {
     expect(info.limit.context).toBe(128_000);
   });
 
+  it("maps claude-code/* provider to anthropic/* for models.dev lookup", async () => {
+    const registry = {
+      anthropic: {
+        id: "anthropic",
+        npm: "@ai-sdk/anthropic",
+        name: "Anthropic",
+        models: {
+          "claude-sonnet-4-6": {
+            id: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6",
+            family: "claude-sonnet",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 200_000, output: 64_000 },
+          },
+        },
+      },
+    };
+
+    const mc = new ModelCapability({
+      apiUrl: "https://example.invalid/models.dev/api.json",
+      fetch: createRegistryFetch(registry),
+    });
+
+    const info = await mc.resolve("claude-code/claude-sonnet-4-6");
+    expect(info.provider).toBe("claude-code");
+    expect(info.model).toBe("claude-sonnet-4-6");
+    expect(info.limit.context).toBe(200_000);
+  });
+
   it("falls back openrouter/provider/model to provider/model in models.dev", async () => {
     const registry = {
       openrouter: {

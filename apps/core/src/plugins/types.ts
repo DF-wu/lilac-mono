@@ -14,6 +14,9 @@ import type { TranscriptStore } from "../transcript/transcript-store";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import type { DurableWorkflowStore } from "../workflow/durable-workflow-store";
 import type { WorkflowProgressCardService } from "../workflow/workflow-progress-projector";
+import type { McpRegistryApi } from "../mcp/registry-types";
+import type { McpOAuthProviderService } from "../mcp/oauth-provider";
+import type { McpOAuthCallbackControl } from "../mcp/oauth-callback";
 
 export type CoreToolPluginRuntime = {
   dataDir?: string;
@@ -25,6 +28,10 @@ export type CoreToolPluginRuntime = {
   conversationThreads?: ConversationThreadToolService;
   discordSearch?: DiscordSearchService;
   transcriptStore?: TranscriptStore;
+  mcpRegistry?: McpRegistryApi;
+  mcpOAuthProviders?: McpOAuthProviderService;
+  mcpOAuthCallback?: McpOAuthCallbackControl;
+  mcpConfigPath?: string;
   toolResultArtifacts?: ToolResultArtifactStore;
   durableWorkflowStore?: DurableWorkflowStore;
   workflowProgressCards?: WorkflowProgressCardService;

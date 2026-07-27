@@ -96,6 +96,14 @@ export type TranscriptStore = {
 
   listDiscoveryRecords?(): TranscriptDiscoveryRecord[];
 
+  selectSessionToolIds?(input: {
+    requestClient: AdapterPlatform;
+    sessionId: string;
+    catalogIds: readonly string[];
+  }): void;
+
+  listSessionToolIds?(input: { requestClient: AdapterPlatform; sessionId: string }): string[];
+
   close(): void;
 };
 
@@ -141,6 +149,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
     `);
 
     this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_request_transcripts_client_session
+      ON request_transcripts(request_client, session_id);
+    `);
+
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS surface_message_to_request (
         platform TEXT NOT NULL,
         channel_id TEXT NOT NULL,
@@ -155,6 +168,62 @@ export class SqliteTranscriptStore implements TranscriptStore {
       CREATE INDEX IF NOT EXISTS idx_surface_message_to_request_request
       ON surface_message_to_request(request_id);
     `);
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS session_loaded_tools (
+        request_client TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        catalog_id TEXT NOT NULL,
+        selected_ts INTEGER NOT NULL,
+        PRIMARY KEY (request_client, session_id, catalog_id)
+      );
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_session_loaded_tools_session
+      ON session_loaded_tools(request_client, session_id);
+    `);
+  }
+
+  selectSessionToolIds(input: {
+    requestClient: AdapterPlatform;
+    sessionId: string;
+    catalogIds: readonly string[];
+  }): void {
+    if (input.catalogIds.length === 0) return;
+
+    const selectedTs = Date.now();
+    const select = this.db.transaction(() => {
+      for (const catalogId of input.catalogIds) {
+        this.db.run(
+          `
+          INSERT INTO session_loaded_tools (
+            request_client, session_id, catalog_id, selected_ts
+          ) VALUES (?, ?, ?, ?)
+          ON CONFLICT(request_client, session_id, catalog_id) DO UPDATE SET
+            selected_ts=excluded.selected_ts;
+          `,
+          [input.requestClient, input.sessionId, catalogId, selectedTs],
+        );
+      }
+    });
+
+    select();
+  }
+
+  listSessionToolIds(input: { requestClient: AdapterPlatform; sessionId: string }): string[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT catalog_id
+        FROM session_loaded_tools
+        WHERE request_client = ? AND session_id = ?
+        ORDER BY catalog_id ASC
+        `,
+      )
+      .all(input.requestClient, input.sessionId) as Array<{ catalog_id: string }>;
+
+    return rows.map((row) => row.catalog_id);
   }
 
   saveRequestTranscript(input: {
@@ -587,18 +656,31 @@ export class SqliteTranscriptStore implements TranscriptStore {
       c: number;
     };
     const count = typeof countRow?.c === "number" ? countRow.c : 0;
-    if (count <= MAX_REQUESTS) return;
+    if (count > MAX_REQUESTS) {
+      const toDelete = count - MAX_REQUESTS;
+      const victims = this.db
+        .query("SELECT request_id FROM request_transcripts ORDER BY updated_ts ASC LIMIT ?")
+        .all(toDelete) as Array<{ request_id: string }>;
 
-    const toDelete = count - MAX_REQUESTS;
-    const victims = this.db
-      .query("SELECT request_id FROM request_transcripts ORDER BY updated_ts ASC LIMIT ?")
-      .all(toDelete) as Array<{ request_id: string }>;
-    if (victims.length === 0) return;
-
-    for (const v of victims) {
-      this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
-      this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [v.request_id]);
+      for (const v of victims) {
+        this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
+        this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [v.request_id]);
+      }
     }
+
+    this.db.run(
+      `
+      DELETE FROM session_loaded_tools
+      WHERE selected_ts < ?
+        AND NOT EXISTS (
+        SELECT 1
+        FROM request_transcripts
+        WHERE request_transcripts.request_client = session_loaded_tools.request_client
+          AND request_transcripts.session_id = session_loaded_tools.session_id
+      )
+    `,
+      [cutoff],
+    );
   }
 }
 

@@ -2,14 +2,24 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asSchema } from "ai";
+import { asSchema, jsonSchema, tool } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 
 import { createCoreToolPluginManager } from "../../src/plugins";
+import { McpRegistry } from "../../src/mcp";
+import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
+import {
+  configSnapshot,
+  FakeClientFactory,
+  FakeMcpClient,
+  mcpConfig,
+  mcpToolDefinition,
+  stdioDefinition,
+} from "../mcp/fixtures/registry-fixture";
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -209,6 +219,16 @@ describe("core tool plugin manager", () => {
     expect([...applyPatchTools.genericOutputNormalizerBypassTools].sort()).toEqual(
       [...applyPatchTools.specs.keys()].sort(),
     );
+    expect([...applyPatchTools.directToolNames].sort()).toEqual([
+      "apply_patch",
+      "bash",
+      "batch",
+      "glob",
+      "grep",
+      "read_file",
+      "subagent_delegate",
+    ]);
+    expect(applyPatchTools.tools).not.toHaveProperty("tool_search");
 
     const editFileTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -600,17 +620,17 @@ describe("core tool plugin manager", () => {
     await writeExternalPlugin({
       dataDir,
       pluginId: "fixture-plugin",
-      entryBody: `export default {
+      entryBody: `import { markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
+export default {
   meta: { id: "fixture-plugin" },
   create() {
     return {
-      level1: [{
+      level1: [markBoundedBuiltinOutput({
         name: "fixture_level1",
-        bypassGenericOutputNormalizer: true,
-        createTool() { return { execute() { return { ok: true }; } }; },
+        createTool() { return { title: "Fixture Level 1", description: "Complete external fixture description", execute() { return { ok: true }; } }; },
         isEnabled() { return true; },
         formatArgs() { return " fixture"; },
-      }],
+      })],
       level2: [{
         id: "fixture",
         async init() {},
@@ -642,9 +662,31 @@ describe("core tool plugin manager", () => {
       subagentDepth: 0,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect(level1.specs.has("fixture_level1")).toBe(true);
+    expect(level1.specs.has("plugin_fixture_plugin_fixture_level1")).toBe(true);
+    expect(level1.specs.has("fixture_level1")).toBe(false);
+    expect(level1.tools).toHaveProperty("plugin_fixture_plugin_fixture_level1");
+    expect(level1.tools).not.toHaveProperty("fixture_level1");
+    expect(level1.catalog).toEqual([
+      expect.objectContaining({
+        source: "plugin",
+        sourceId: "fixture-plugin",
+        rawName: "fixture_level1",
+        modelName: "plugin_fixture_plugin_fixture_level1",
+        title: "Fixture Level 1",
+        description: "Complete external fixture description",
+      }),
+    ]);
+    expect(level1.catalogMetadata.plugin_fixture_plugin_fixture_level1).toEqual({
+      sourceId: "fixture-plugin",
+      rawName: "fixture_level1",
+      title: "Fixture Level 1",
+      description: "Complete external fixture description",
+    });
+    expect(level1.genericOutputNormalizerBypassTools).toContain(
+      "plugin_fixture_plugin_fixture_level1",
+    );
     expect(level1.genericOutputNormalizerBypassTools.has("fixture_level1")).toBe(false);
-    expect(getBatchToolNames(level1.tools)).toContain("fixture_level1");
+    expect(getBatchToolNames(level1.tools)).not.toContain("plugin_fixture_plugin_fixture_level1");
     expect(getBatchToolNames(level1.tools)).not.toContain("batch");
 
     const callableIds = (
@@ -655,6 +697,291 @@ describe("core tool plugin manager", () => {
       )
     ).flat();
     expect(callableIds).toContain("fixture.echo");
+  });
+
+  it("qualifies external registration keys by plugin while preserving raw status names", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const pluginBody = (pluginId: string, names: readonly string[]) => `export default {
+  meta: { id: ${JSON.stringify(pluginId)} },
+  create() { return { level1: [${names
+    .map(
+      (name) =>
+        `{ name: ${JSON.stringify(name)}, createTool() { return { execute() { return ${JSON.stringify(pluginId)}; } }; }, isEnabled() { return true; } }`,
+    )
+    .join(",")} ] }; },
+};`;
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "same-a",
+      entryBody: pluginBody("same-a", ["shared_raw"]),
+    });
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "same-b",
+      entryBody: pluginBody("same-b", ["shared_raw"]),
+    });
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "builtin-name",
+      entryBody: pluginBody("builtin-name", ["read_file"]),
+    });
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "duplicate-own",
+      entryBody: pluginBody("duplicate-own", ["own_raw", "own_raw"]),
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+
+    await manager.init();
+
+    expect(manager.getStatuses()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          pluginId: "same-a",
+          state: "loaded",
+          level1Names: ["shared_raw"],
+        }),
+        expect.objectContaining({
+          pluginId: "same-b",
+          state: "loaded",
+          level1Names: ["shared_raw"],
+        }),
+        expect.objectContaining({
+          pluginId: "builtin-name",
+          state: "loaded",
+          level1Names: ["read_file"],
+        }),
+        expect.objectContaining({ pluginId: "duplicate-own", state: "failed" }),
+      ]),
+    );
+    const toolset = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents,
+    });
+    expect(
+      toolset.catalog
+        .filter((entry) => entry.rawName === "shared_raw")
+        .map((entry) => entry.sourceId)
+        .sort(),
+    ).toEqual(["same-a", "same-b"]);
+    expect(
+      toolset.catalog.some(
+        (entry) => entry.sourceId === "builtin-name" && entry.rawName === "read_file",
+      ),
+    ).toBe(true);
+  });
+
+  it("applies native profile plugin and tool gates to the MCP catalog", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const base = testConfig({});
+    const cfg: CoreConfig = {
+      ...base,
+      agent: {
+        ...base.agent,
+        subagents: {
+          ...base.agent.subagents,
+          profiles: {
+            ...base.agent.subagents.profiles,
+            general: {
+              ...base.agent.subagents.profiles.general,
+              level1: {
+                plugins: ["mcp:allowed"],
+                tools: ["raw_allowed", "mcp_allowed_model_raw"],
+              },
+            },
+          },
+        },
+      },
+    };
+    const mcpEntry = (serverId: string, rawName: string) => {
+      const identity = { source: "mcp", sourceId: serverId, rawToolName: rawName } as const;
+      return {
+        serverId,
+        rawName,
+        identity,
+        stableId: catalogToolStableId(identity),
+        tool: tool({
+          inputSchema: jsonSchema<unknown>({ type: "object", properties: {} }),
+          execute: () => `${serverId}:${rawName}`,
+        }),
+      };
+    };
+    const entries = [
+      mcpEntry("allowed", "raw_allowed"),
+      mcpEntry("allowed", "model_raw"),
+      mcpEntry("allowed", "denied_raw"),
+      mcpEntry("blocked", "raw_allowed"),
+    ];
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        config: cfg,
+        mcpRegistry: {
+          async init() {},
+          async reload() {
+            return [];
+          },
+          getConfigStatus: () => ({ status: "valid" }),
+          list: () => [],
+          getTools: () => entries,
+          async shutdown() {},
+        },
+      },
+      dataDir,
+    });
+    await manager.init();
+    const build = (runProfile: "primary" | "general") =>
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile,
+        editingToolMode: "none",
+        subagentDepth: runProfile === "primary" ? 0 : 1,
+        subagentConfig: cfg.agent.subagents,
+      });
+
+    const primary = await build("primary");
+    expect(primary.catalog.filter((entry) => entry.source === "mcp")).toHaveLength(4);
+
+    const general = await build("general");
+    expect(
+      general.catalog
+        .filter((entry) => entry.source === "mcp")
+        .map((entry) => `${entry.sourceId}:${entry.rawName}`),
+    ).toEqual(["allowed:model_raw", "allowed:raw_allowed"]);
+    expect(Object.keys(general.catalogMetadata).sort()).toEqual([
+      "mcp_allowed_model_raw",
+      "mcp_allowed_raw_allowed",
+    ]);
+    expect(general.directToolNames.has("tool_search")).toBe(true);
+  });
+
+  it("reuses one registry client and its tool wrappers across concurrent Level 1 sessions", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    const client = new FakeMcpClient({
+      first: { tools: [mcpToolDefinition("shared-wrapper")] },
+    });
+    const factory = new FakeClientFactory();
+    factory.enqueue("shared", client);
+    const registry = new McpRegistry({
+      configPath: path.join(dataDir, "mcp-config.yaml"),
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("shared")])),
+        createClient: factory.create,
+      },
+    });
+    await registry.init();
+    const manager = createCoreToolPluginManager({
+      runtime: { config: cfg, mcpRegistry: registry },
+      dataDir,
+    });
+    await manager.init();
+    const buildSession = (sessionId: string) =>
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+        requestContext: {
+          requestId: `request:${sessionId}`,
+          sessionId,
+          requestClient: "discord",
+          subagentDepth: 0,
+          subagentProfile: "primary",
+        },
+      });
+
+    const [first, second] = await Promise.all([buildSession("first"), buildSession("second")]);
+    const registryTool = registry.getTools()[0];
+    const firstEntry = first.catalog.find((entry) => entry.stableId === registryTool?.stableId);
+    const secondEntry = second.catalog.find((entry) => entry.stableId === registryTool?.stableId);
+    if (!registryTool || !firstEntry || !secondEntry) throw new Error("missing shared MCP tool");
+
+    expect(factory.configs).toHaveLength(1);
+    expect(factory.created).toEqual([client]);
+    expect(firstEntry.tool).toBe(registryTool.tool);
+    expect(secondEntry.tool).toBe(registryTool.tool);
+    expect(Object.is(first.tools[firstEntry.modelName], registryTool.tool)).toBe(true);
+    expect(Object.is(second.tools[secondEntry.modelName], first.tools[firstEntry.modelName])).toBe(
+      true,
+    );
+
+    await manager.destroy();
+    await registry.shutdown();
+    expect(client.closeCount).toBe(1);
+  });
+
+  it("updates batch membership for selected external tools while excluding opt-outs and MCP", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "batch-fixture",
+      entryBody: `export default {
+  meta: { id: "batch-fixture" },
+  create() { return { level1: [
+    { name: "allowed", createTool() { return { inputSchema: { type: "object" }, execute() { return "allowed"; } }; }, isEnabled() { return true; } },
+    { name: "blocked", supportsBatch: false, createTool() { return { inputSchema: { type: "object" }, execute() { return "blocked"; } }; }, isEnabled() { return true; } },
+  ] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const identity = { source: "mcp", sourceId: "server", rawToolName: "remote" } as const;
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        config: cfg,
+        mcpRegistry: {
+          async init() {},
+          async reload() {
+            return [];
+          },
+          getConfigStatus: () => ({ status: "valid" }),
+          list: () => [],
+          getTools: () => [
+            {
+              serverId: "server",
+              rawName: "remote",
+              identity,
+              stableId: catalogToolStableId(identity),
+              tool: tool({
+                inputSchema: jsonSchema<unknown>({
+                  type: "object",
+                  properties: {},
+                }),
+                execute: () => "remote",
+              }),
+            },
+          ],
+          async shutdown() {},
+        },
+      },
+      dataDir,
+    });
+    await manager.init();
+    const toolset = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents,
+    });
+    const allowed = toolset.catalog.find((entry) => entry.rawName === "allowed")?.modelName;
+    const blocked = toolset.catalog.find((entry) => entry.rawName === "blocked")?.modelName;
+    const remote = toolset.catalog.find((entry) => entry.source === "mcp")?.modelName;
+    if (!allowed || !blocked || !remote) throw new Error("missing deferred test tools");
+
+    toolset.updateActiveBatchTools(new Set([...toolset.directToolNames, allowed, blocked, remote]));
+
+    expect(getBatchToolNames(toolset.tools)).toContain(allowed);
+    expect(getBatchToolNames(toolset.tools)).not.toContain(blocked);
+    expect(getBatchToolNames(toolset.tools)).not.toContain(remote);
   });
 
   it("uses the same native profile plugin gates with and without a request context", async () => {
@@ -726,7 +1053,7 @@ describe("core tool plugin manager", () => {
           subagentConfig: base.agent.subagents!,
           requestContext,
         })
-      ).specs.has("fixture_write"),
+      ).specs.has("plugin_profile_fixture_fixture_write"),
     ).toBe(false);
     await denied.destroy();
 
@@ -742,7 +1069,7 @@ describe("core tool plugin manager", () => {
           subagentConfig: base.agent.subagents!,
           requestContext,
         })
-      ).specs.has("fixture_write"),
+      ).specs.has("plugin_profile_fixture_fixture_write"),
     ).toBe(true);
     const direct = await enabled.buildLevel1Toolset({
       cwd: dataDir,
@@ -751,7 +1078,7 @@ describe("core tool plugin manager", () => {
       subagentDepth: 1,
       subagentConfig: base.agent.subagents,
     });
-    expect(direct.specs.has("fixture_write")).toBe(true);
+    expect(direct.specs.has("plugin_profile_fixture_fixture_write")).toBe(true);
     await enabled.destroy();
   });
 });
