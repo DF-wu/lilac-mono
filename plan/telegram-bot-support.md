@@ -1,6 +1,6 @@
 # Telegram Bot Surface Support
 
-Status: **in progress**
+Status: **implementation complete — pending the owner's real-Telegram smoke test**
 Branch: `feat/telegram-bot-support`
 Tracking: GitHub issues on `DF-wu/lilac-mono` (see [Issue Map](#issue-map))
 
