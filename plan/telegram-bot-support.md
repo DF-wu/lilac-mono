@@ -118,8 +118,8 @@ webhook handler. We deliberately do **not** copy that shortcut (per D1).
 | 5 | Platform-aware request router | [#36](https://github.com/DF-wu/lilac-mono/issues/36) | done |
 | 6 | Attachments, cancel buttons, reactions, command menu | [#37](https://github.com/DF-wu/lilac-mono/issues/37) | done (inbound attachments deferred to [#42](https://github.com/DF-wu/lilac-mono/issues/42)) |
 | 7 | Runtime wiring in `create-core-runtime.ts` | [#38](https://github.com/DF-wu/lilac-mono/issues/38) | done |
-| 8 | Tests: unit + fake Bot API integration in container | [#39](https://github.com/DF-wu/lilac-mono/issues/39) | in progress |
-| 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | in progress |
+| 8 | Tests: unit + fake Bot API integration in container | [#39](https://github.com/DF-wu/lilac-mono/issues/39) | done |
+| 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | done, pending owner smoke test |
 
 ---
 
@@ -238,16 +238,30 @@ render the equivalent UI.
 
 | Check | Command | Result |
 |-------|---------|--------|
-| Telegram suite | `bun test tests/surface/telegram/` (in `apps/core`) | **207 pass, 0 fail** across 9 files |
+| Telegram suite | `bun test tests/surface/telegram/` (in `apps/core`) | **234 pass, 0 fail** across 11 files |
 | Telegram suite, isolated container | `docker/verify-telegram.sh` | **pass** — read-only repo mount, `--network none`, tmpfs scratch |
 | Config suite | `bun test` (in `packages/utils`) | **283 pass, 0 fail** |
-| Full core suite | `bun test` (in `apps/core`) | **1492 pass, 1 fail** — the one failure is the pre-existing wall-clock-dependent heartbeat test ([#41](https://github.com/DF-wu/lilac-mono/issues/41)) |
+| Full core suite | `bun test` (in `apps/core`) | **1535 pass, 1 fail** — the one failure is the pre-existing wall-clock-dependent heartbeat test ([#41](https://github.com/DF-wu/lilac-mono/issues/41)) |
 | Workspace typecheck | `tsc --noEmit` per package | **clean**, except the pre-existing `packages/mini-lilac-runtime` error ([#41](https://github.com/DF-wu/lilac-mono/issues/41)) |
 | Lint | `bun run lint` | **clean** |
 | Format | `bun run fmt:check` | **clean** for all source; flags only `.omo/run-continuation/*.json`, an untracked scratch file written live by the local agent harness |
 
-Test count moved from **1302 → 1493** in `apps/core`, and no Discord or GitHub test
+Test count moved from **1302 → 1536** in `apps/core`, and no Discord or GitHub test
 required modification — the router generalization is behaviour-preserving.
+
+### Integration coverage
+
+A Telegram bot cannot message itself, so an automated end-to-end test against
+the real API is impossible without driving a user account over MTProto. The real
+`TelegramAdapter` is instead pointed at a local fake Bot API server
+(`apps/core/tests/surface/telegram/fake-bot-api-server.ts`), which serves long
+polls, records every call, and can be programmed to fail. 15 scenarios cover:
+
+connect/identity · `allowed_updates` includes `message_reaction` · command menu
+registration and opt-out · chat allowlisting · self-message loop guard · forum
+topic session ids · streamed reply · chunk overflow · cancel button reaching
+`adapter.request.cancel` · reaction mapping both directions · history served from
+the local index · message CRUD · idempotent disconnect.
 
 ### Adversarial check of the HTML renderer
 
