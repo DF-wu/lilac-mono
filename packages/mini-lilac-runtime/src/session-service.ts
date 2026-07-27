@@ -1278,6 +1278,10 @@ class SessionActor {
       resolveCurrentModelSpecifier: () => agent.state.modelSpecifier,
       resolveContextLimit: async ({ defaultModel, currentModelSpecifier }) =>
         (await this.resolveModelLimits(currentModelSpecifier ?? defaultModel)) ?? 0,
+      resolveSummaryContextLimit:
+        configuredSummaryModel === "inherit"
+          ? undefined
+          : async () => (await this.resolveModelLimits(configuredSummaryModel))?.context,
       baseTurnErrorHandler: transientRetryController?.handler,
       onCompactionEnd: (event) => this.queueAutomaticCompaction(event),
     });
@@ -2700,11 +2704,16 @@ class SessionActor {
         const configuredSummaryModel = this.config.agent.compaction.model;
         const summaryModelSpecifier =
           configuredSummaryModel === "inherit" ? modelSpecifier : configuredSummaryModel;
+        const summaryLimits =
+          summaryModelSpecifier === modelSpecifier
+            ? limits
+            : await this.resolveModelLimits(summaryModelSpecifier);
         const compacted = await compactMessages({
           messages,
           currentModel: this.resolveModel(modelSpecifier),
           contextLimit: limits.context,
           outputLimit: limits.output,
+          summaryContextLimit: summaryLimits?.context,
           thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
           summaryModel:
             configuredSummaryModel === "inherit"

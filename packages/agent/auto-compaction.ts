@@ -559,17 +559,11 @@ function renderMessageForSummary(message: ModelMessage): string {
   return `${String((message as { role?: unknown }).role ?? "UNKNOWN").toUpperCase()}:\n${stringifyUnknown(message)}`;
 }
 
-function renderMessagesForSummary(
-  messages: readonly ModelMessage[],
-  _options: {
-    maxCharsPerMessage: number;
-    maxCharsTotal: number;
-  },
-): string {
-  const separator = "\n\n---\n\n";
-  return messages.map((message) => renderMessageForSummary(message)).join(separator);
-}
+const SUMMARY_OVERFLOW_RETRY_SCALE = 0.5;
 
+const SUMMARY_SEGMENT_SEPARATOR = "\n\n---\n\n";
+
+/** Pack rendered messages into bounded segments, splitting only oversized messages. */
 function renderMessagesForSummarySegments(
   messages: readonly ModelMessage[],
   options: {
@@ -581,20 +575,42 @@ function renderMessagesForSummarySegments(
   const payloadLimit = Math.max(1, segmentLimit - 80);
   const segments: string[] = [];
 
+  let buffered: string[] = [];
+  let bufferedLength = 0;
+
+  const flush = () => {
+    if (buffered.length === 0) return;
+    segments.push(buffered.join(SUMMARY_SEGMENT_SEPARATOR));
+    buffered = [];
+    bufferedLength = 0;
+  };
+
   for (const message of messages) {
     const rendered = renderMessageForSummary(message);
-    if (rendered.length <= segmentLimit) {
-      segments.push(rendered);
+
+    if (rendered.length > segmentLimit) {
+      flush();
+      const segmentCount = Math.ceil(rendered.length / payloadLimit);
+      for (let index = 0; index < segmentCount; index++) {
+        const payload = rendered.slice(index * payloadLimit, (index + 1) * payloadLimit);
+        segments.push(`[message continuation ${index + 1}/${segmentCount}]\n${payload}`);
+      }
       continue;
     }
 
-    const segmentCount = Math.ceil(rendered.length / payloadLimit);
-    for (let index = 0; index < segmentCount; index++) {
-      const payload = rendered.slice(index * payloadLimit, (index + 1) * payloadLimit);
-      segments.push(`[message continuation ${index + 1}/${segmentCount}]\n${payload}`);
+    const separatorLength = buffered.length === 0 ? 0 : SUMMARY_SEGMENT_SEPARATOR.length;
+    if (bufferedLength + separatorLength + rendered.length > segmentLimit) {
+      flush();
+      buffered.push(rendered);
+      bufferedLength = rendered.length;
+      continue;
     }
+
+    buffered.push(rendered);
+    bufferedLength += separatorLength + rendered.length;
   }
 
+  flush();
   return segments;
 }
 
@@ -683,9 +699,13 @@ async function summarizeMessagesHierarchical(options: {
       if (!isLikelyContextOverflowError(error)) {
         throw error;
       }
-      budget = Math.max(1, Math.floor(budget * 0.6));
-      maxCharsPerMessage = Math.max(200, Math.floor(maxCharsPerMessage * 0.7));
-      maxCharsTotal = Math.max(500, Math.floor(maxCharsTotal * 0.7));
+      // Keep token and character budgets in lockstep.
+      budget = Math.max(1, Math.floor(budget * SUMMARY_OVERFLOW_RETRY_SCALE));
+      maxCharsPerMessage = Math.max(
+        200,
+        Math.floor(maxCharsPerMessage * SUMMARY_OVERFLOW_RETRY_SCALE),
+      );
+      maxCharsTotal = Math.max(500, Math.floor(maxCharsTotal * SUMMARY_OVERFLOW_RETRY_SCALE));
     }
   }
 
@@ -697,13 +717,18 @@ async function summarizeMessagesHierarchical(options: {
 const DEFAULT_THRESHOLD_FRACTION = 0.8;
 const DEFAULT_KEEP_LAST_MESSAGES = 30;
 const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
-const DEFAULT_SUMMARY_CHUNK_FRACTION = 0.35;
+// Try one summary request first; overflow retries split it as needed.
+const DEFAULT_SUMMARY_CHUNK_FRACTION = 1;
 const DEFAULT_SUMMARY_REDUCTION_PASSES = 6;
 const DEFAULT_OVERFLOW_RECOVERY_MAX_ATTEMPTS = 2;
 const DEFAULT_RESERVED_OUTPUT_FRACTION = 0.2;
 const DEFAULT_RESERVED_OUTPUT_MIN_TOKENS = 1_024;
 const DEFAULT_COMPACTION_MAX_PASSES = 4;
 const DEFAULT_SUMMARY_MAX_CHARS_FLOOR = 2_000;
+
+// Leave room for prompt framing and summary output.
+const DEFAULT_SUMMARY_PROMPT_RESERVE_TOKENS = 8_192;
+const DEFAULT_SUMMARY_PROMPT_RESERVE_FRACTION = 0.15;
 
 export type CompactionBudget = {
   inputBudget: number;
@@ -1007,6 +1032,11 @@ export type AutoCompactionOptions = {
   /** Builds split-turn prompt from split-turn prefix transcript. */
   buildSplitTurnSummaryPrompt?: (splitTurnPrefix: string) => string;
 
+  /** Resolves the configured summary model's context window. */
+  resolveSummaryContextLimit?: (params: {
+    abortSignal?: AbortSignal;
+  }) => Promise<number | undefined> | number | undefined;
+
   /** Optional explicit current-model spec resolver (for mid-run model switches). */
   resolveCurrentModelSpecifier?: () =>
     | ModelSpecifier
@@ -1072,6 +1102,9 @@ export type ManualCompactionOptions = {
 
   /** Current model context-window limit. */
   contextLimit: number;
+
+  /** Context window of `summaryModel`; defaults to `contextLimit`. */
+  summaryContextLimit?: number;
 
   /** Current model output limit, used to reserve response capacity. */
   outputLimit?: number;
@@ -1174,9 +1207,17 @@ async function compactRepairedMessages(
     }
 
     const passScale = Math.pow(0.7, pass);
+    const summaryPromptReserve = Math.min(
+      DEFAULT_SUMMARY_PROMPT_RESERVE_TOKENS,
+      Math.floor(options.summaryContextLimit * DEFAULT_SUMMARY_PROMPT_RESERVE_FRACTION),
+    );
     const chunkTokenBudget = Math.max(
       1,
-      Math.floor(options.summaryContextLimit * DEFAULT_SUMMARY_CHUNK_FRACTION * passScale),
+      Math.floor(
+        (options.summaryContextLimit - summaryPromptReserve) *
+          DEFAULT_SUMMARY_CHUNK_FRACTION *
+          passScale,
+      ),
     );
     const summaryMaxChars = Math.max(
       DEFAULT_SUMMARY_MAX_CHARS_FLOOR,
@@ -1277,6 +1318,17 @@ async function compactRepairedMessages(
   });
 }
 
+function pickSummaryContextLimit(params: {
+  summaryContextLimit: number | undefined;
+  fallbackContextLimit: number;
+}): number {
+  const summaryLimit = params.summaryContextLimit;
+  if (typeof summaryLimit === "number" && Number.isFinite(summaryLimit) && summaryLimit > 0) {
+    return Math.max(1, Math.floor(summaryLimit));
+  }
+  return Math.max(1, Math.floor(params.fallbackContextLimit));
+}
+
 /**
  * Compact an idle persisted transcript without constructing an `AiSdkPiAgent`.
  * The input messages are never mutated; callers should persist `result.messages`.
@@ -1314,7 +1366,10 @@ export async function compactMessages(
   const compacted = await compactRepairedMessages({
     messages: compactableMessages,
     budget,
-    summaryContextLimit: Math.max(1, options.contextLimit),
+    summaryContextLimit: pickSummaryContextLimit({
+      summaryContextLimit: options.summaryContextLimit,
+      fallbackContextLimit: options.contextLimit,
+    }),
     model: summaryModel === "current" ? options.currentModel : summaryModel,
     providerOptions: options.providerOptions,
     keepLastMessages: options.keepLastMessages ?? DEFAULT_KEEP_LAST_MESSAGES,
@@ -1679,9 +1734,14 @@ export async function attachAutoCompaction(
       options.onCompactionStart?.(compactionEventBase);
       queuedAutoContinue = false;
 
-      const summaryContextLimit = latestCapability.known
-        ? Math.max(1, latestCapability.contextLimit)
-        : Math.max(2_048, Math.floor(activeBudget.inputBudget * 1.5));
+      const summaryContextLimit = pickSummaryContextLimit({
+        summaryContextLimit: await options.resolveSummaryContextLimit?.({
+          abortSignal: context.abortSignal,
+        }),
+        fallbackContextLimit: latestCapability.known
+          ? latestCapability.contextLimit
+          : Math.max(2_048, Math.floor(activeBudget.inputBudget * 1.5)),
+      });
       const compacted = await compactRepairedMessages({
         messages: compactableMessages,
         budget: activeBudget,
@@ -1759,7 +1819,7 @@ export const __autoCompactionInternals = {
   isValidSuffix,
   normalizeThresholdFraction,
   repairTranscriptForCompaction,
-  renderMessagesForSummary,
+  renderMessagesForSummarySegments,
   resolveContextLimit,
   resolveCompactionBoundary,
   shrinkCompactedMessagesToBudget,

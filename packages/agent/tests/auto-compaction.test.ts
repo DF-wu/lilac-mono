@@ -133,6 +133,116 @@ describe("auto-compaction internals", () => {
     expect(boundary.splitTurnStart).toBe(2);
   });
 
+  it("packs under-budget messages into a single summarization call", async () => {
+    const messages: ModelMessage[] = Array.from({ length: 40 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `message ${index} ${"x".repeat(200)}`,
+    }));
+
+    let calls = 0;
+    await __autoCompactionInternals.summarizeMessagesHierarchical({
+      messages,
+      initialChunkTokenBudget: 129_000,
+      maxReductionPasses: 6,
+      initialMaxCharsPerMessage: 516_000,
+      initialMaxCharsTotal: 774_000,
+      summarizeChunk: async () => {
+        calls += 1;
+        return "summary";
+      },
+    });
+
+    expect(calls).toBe(1);
+  });
+
+  it("summarizes a below-threshold transcript in one call without pre-splitting", async () => {
+    // Exceeds the old 35% split while remaining below the context limit.
+    const messages: ModelMessage[] = Array.from({ length: 300 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `msg ${index} ${"x".repeat(2_930)}`,
+    }));
+    const contextLimit = 369_000;
+    const estimated = __autoCompactionInternals.estimateMessagesTokens(messages);
+    expect(estimated).toBeGreaterThan(contextLimit * 0.35);
+    expect(estimated).toBeLessThan(contextLimit);
+
+    let calls = 0;
+    await __autoCompactionInternals.summarizeMessagesHierarchical({
+      messages,
+      initialChunkTokenBudget: contextLimit,
+      maxReductionPasses: 6,
+      initialMaxCharsPerMessage: contextLimit * 4,
+      initialMaxCharsTotal: contextLimit * 6,
+      summarizeChunk: async () => {
+        calls += 1;
+        return "summary";
+      },
+    });
+
+    expect(calls).toBe(1);
+  });
+
+  it("preserves message order and content when packing a segment", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "FIRST" },
+      { role: "assistant", content: "SECOND" },
+      { role: "user", content: "THIRD" },
+    ];
+
+    const segments = __autoCompactionInternals.renderMessagesForSummarySegments(messages, {
+      maxCharsPerMessage: 10_000,
+      maxCharsTotal: 10_000,
+    });
+
+    expect(segments).toHaveLength(1);
+    const segment = segments[0] ?? "";
+    expect(segment.indexOf("FIRST")).toBeLessThan(segment.indexOf("SECOND"));
+    expect(segment.indexOf("SECOND")).toBeLessThan(segment.indexOf("THIRD"));
+  });
+
+  it("starts a new segment once the char limit is reached, losing no messages", () => {
+    const markers = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"];
+    const messages: ModelMessage[] = markers.map((marker) => ({
+      role: "user" as const,
+      content: `${marker}${"y".repeat(100)}`,
+    }));
+
+    const segments = __autoCompactionInternals.renderMessagesForSummarySegments(messages, {
+      maxCharsPerMessage: 250,
+      maxCharsTotal: 250,
+    });
+
+    expect(segments.length).toBeGreaterThan(1);
+    for (const segment of segments) {
+      expect(segment.length).toBeLessThanOrEqual(250);
+    }
+
+    const joined = segments.join("\n");
+    for (const marker of markers) {
+      expect(joined.split(marker)).toHaveLength(2);
+    }
+    const positions = markers.map((marker) => joined.indexOf(marker));
+    expect(positions).toEqual([...positions].sort((a, b) => a - b));
+  });
+
+  it("flushes buffered messages before splitting an oversized message", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "SMALL" },
+      { role: "assistant", content: "z".repeat(600) },
+    ];
+
+    const segments = __autoCompactionInternals.renderMessagesForSummarySegments(messages, {
+      maxCharsPerMessage: 200,
+      maxCharsTotal: 200,
+    });
+
+    expect(segments[0]).toContain("SMALL");
+    expect(segments.slice(1).every((segment) => segment.startsWith("[message continuation"))).toBe(
+      true,
+    );
+    expect(segments.slice(1).length).toBeGreaterThan(1);
+  });
+
   it("retries hierarchical summary with smaller budgets after overflow", async () => {
     const messages: ModelMessage[] = [
       { role: "user", content: "a".repeat(3500) },
@@ -313,6 +423,95 @@ describe("auto-compaction internals", () => {
     });
     expect(result.messages[1]).toEqual(messages[2]);
     expect(messages).toHaveLength(3);
+  });
+
+  it("issues a single summarization request for a below-threshold transcript", async () => {
+    const summaryResponse = () => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start" as const, id: "summary" },
+          { type: "text-delta" as const, id: "summary", delta: "Condensed prior work." },
+          { type: "text-end" as const, id: "summary" },
+          {
+            type: "finish" as const,
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage: zeroUsage(),
+          },
+        ],
+      }),
+    });
+
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        return summaryResponse();
+      },
+    });
+
+    // Exceeds the old 35% split while remaining below the compaction threshold.
+    const messages: ModelMessage[] = Array.from({ length: 300 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `msg ${index} ${"x".repeat(2_930)}`,
+    }));
+
+    const result = await compactMessages({
+      messages,
+      currentModel: model,
+      contextLimit: 369_000,
+      outputLimit: 128_000,
+    });
+
+    expect(result.status).toBe("compacted");
+    expect(result.estimatedTokensBefore).toBeLessThan(result.budget.inputBudget);
+    expect(result.estimatedTokensBefore).toBeGreaterThan(369_000 * 0.35);
+    expect(calls).toBe(1);
+  });
+
+  it("sizes chunk budgets against a smaller summary model's own context window", async () => {
+    const summaryModelContextLimit = 128_000;
+    const summaryResponse = () => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start" as const, id: "summary" },
+          { type: "text-delta" as const, id: "summary", delta: "Condensed prior work." },
+          { type: "text-end" as const, id: "summary" },
+          {
+            type: "finish" as const,
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage: zeroUsage(),
+          },
+        ],
+      }),
+    });
+
+    const requestedTranscriptChars: number[] = [];
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        requestedTranscriptChars.push(JSON.stringify(prompt).length);
+        return summaryResponse();
+      },
+    });
+
+    const messages: ModelMessage[] = Array.from({ length: 400 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `msg ${index} ${"x".repeat(6_000)}`,
+    }));
+
+    const result = await compactMessages({
+      messages,
+      currentModel: fakeModel(),
+      contextLimit: 2_000_000,
+      outputLimit: 128_000,
+      summaryModel,
+      summaryContextLimit: summaryModelContextLimit,
+    });
+
+    expect(result.status).toBe("compacted");
+    expect(requestedTranscriptChars.length).toBeGreaterThan(1);
+    for (const chars of requestedTranscriptChars) {
+      expect(chars).toBeLessThanOrEqual(summaryModelContextLimit * 4);
+    }
   });
 
   it("returns typed noop metrics for an empty persisted transcript", async () => {
