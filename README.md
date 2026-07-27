@@ -1,7 +1,7 @@
 # Lilac Monorepo
 
 <p align="center">
-  <strong>Bun monorepo for a Redis-backed AI agent runtime with Discord ingress, optional GitHub ingress, layered tools, and durable workflow resume.</strong>
+  <strong>Bun monorepo for a Redis-backed AI agent runtime with Discord ingress, optional Telegram and GitHub ingress, layered tools, and durable workflow resume.</strong>
 </p>
 
 <p align="center">
@@ -36,10 +36,10 @@ The fork-specific code is intentionally small and easy to audit. Useful entry po
 
 ## What This Repo Does
 
-- Receives work from **Discord** and optional **GitHub issue/PR webhook** flows.
+- Receives work from **Discord**, optional **Telegram**, and optional **GitHub issue/PR webhook** flows.
 - Routes requests through a **typed Redis Streams event bus**.
 - Runs agent turns with **local tools**, **HTTP tool-server callables**, and **on-disk skills**.
-- Sends results back to Discord and GitHub surfaces.
+- Sends results back to Discord, Telegram, and GitHub surfaces.
 - Supports **pause/resume**, scheduled wakeups, and long-lived workflows.
 - Ships operator-facing tooling through the **`tools` bridge** and **`lilac-acp` controller**.
 
@@ -168,6 +168,7 @@ If you persist `/data`, the `smart-search` config and provider credentials persi
 
 - The runtime expects **Redis** and reads seeded runtime config from `data/core-config.yaml`.
 - Discord uses `DISCORD_TOKEN` by default unless `surface.discord.tokenEnv` is changed in `core-config.yaml`.
+- Telegram is off by default. Set `surface.telegram.enabled: true` (requires `configVersion: 2`) and `TELEGRAM_BOT_TOKEN`; see `docs/telegram-surface.md`.
 - GitHub webhook ingress requires `GITHUB_WEBHOOK_SECRET`.
 - GitHub auth can be configured through user or app credentials, depending on the workflow.
 

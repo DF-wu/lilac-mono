@@ -1,6 +1,6 @@
 # Lilac Monorepo: Structure, Terminology, And Working Mental Model
 
-This repo is an event-driven “agent runtime” built around a typed event bus (Redis Streams), surface adapters (Discord with optional GitHub ingress), and **layered tools** that are **progressively disclosed** to the agent:
+This repo is an event-driven “agent runtime” built around a typed event bus (Redis Streams), surface adapters (Discord, optional Telegram, and optional GitHub ingress), and **layered tools** that are **progressively disclosed** to the agent:
 
 - Level 1 (direct AI SDK tools): low-level local tools the LLM can call during generation (`bash`, `read_file`, `glob`, `grep`, `apply_patch`, `batch`, and `subagent_delegate` when enabled).
 - Level 2 (tool server + `tools` CLI): a stable HTTP tool API (Elysia) exposed via the `tools` CLI (and usable by the agent through `bash`).
@@ -10,12 +10,12 @@ All three are “for the agent”; the layering is mostly about keeping the defa
 
 The main loop is:
 
-1. Surface ingress receives platform events (Discord adapter events and optional GitHub webhook triggers).
-2. Discord adapter events are published onto the bus (`evt.adapter`).
-3. A router turns Discord adapter events into request messages (`cmd.request.message`) based on per-session routing mode.
+1. Surface ingress receives platform events (Discord and Telegram adapter events, and optional GitHub webhook triggers).
+2. Adapter events are published onto the bus (`evt.adapter`).
+3. A router turns adapter events into request messages (`cmd.request.message`) based on per-session routing mode. One router instance runs per adapter; GitHub bypasses it and publishes directly.
 4. GitHub webhook handlers can publish `cmd.request.message` directly for GitHub-triggered runs.
 5. An agent runner consumes request messages, runs an LLM (AI SDK) with local tools, and publishes streamed output to request-scoped topics (`out.req.<request_id>`).
-6. A relay subscribes to `out.req.<request_id>` and streams output back to surface adapters (Discord and GitHub).
+6. A relay subscribes to `out.req.<request_id>` and streams output back to surface adapters (Discord, Telegram, and GitHub).
 7. The unified workflow engine executes trusted immutable programs through the same request bus and projects durable progress independently of request output relays.
 
 This document explains where things live, the words used in code, and the project’s “shape” so you don’t have to re-derive it each time.
@@ -143,6 +143,7 @@ Many flows treat missing `request_id` as an error (especially request lifecycle 
   - `SessionRef` / `MsgRef` are small structs that identify sessions/messages across platforms.
 
 The Discord adapter also maintains a local SQLite cache (`discord-surface.db`) for read-history operations.
+The Telegram adapter maintains an equivalent index (`telegram-surface.db`); for Telegram it is not a cache but the only source of history, because the Bot API has no endpoint for fetching past messages. See `docs/telegram-surface.md`.
 
 ### Router
 

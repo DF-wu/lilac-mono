@@ -1,6 +1,7 @@
 import { Bot, GrammyError, HttpError } from "grammy";
 import type {
   InlineKeyboardMarkup,
+  MaybeInaccessibleMessage,
   Message,
   ReactionTypeEmoji,
   Update,
@@ -62,8 +63,13 @@ import {
 } from "./telegram-raw";
 import { TelegramSurfaceStore } from "./store/telegram-surface-store";
 import {
+  createGrammyAttachmentApi,
+  TelegramOutputStreamWithAttachments,
+} from "./output/telegram-attachment-delivery";
+import {
   TelegramOutputStream,
   type TelegramOutputApi,
+  parseTelegramCancelCallbackData,
   type TelegramReplyMarkup,
 } from "./output/telegram-output-stream";
 
@@ -279,7 +285,9 @@ export class TelegramAdapter implements SurfaceAdapter {
     const cfg = this.cfg ?? (await this.resolveCoreConfig());
     const telegram = cfg.surface.telegram;
 
-    return new TelegramOutputStream({
+    const silent = opts?.silent === true || !telegram.outputNotification;
+
+    const stream = new TelegramOutputStream({
       api: createGrammyOutputApi(bot),
       sessionRef,
       ...(opts ? { opts } : {}),
@@ -291,11 +299,20 @@ export class TelegramAdapter implements SurfaceAdapter {
       streamEditIntervalMs: telegram.streamEditIntervalMs,
       parseMode: telegram.parseMode,
       outputMode: telegram.outputMode,
-      outputNotification: opts?.silent === true ? false : telegram.outputNotification,
+      outputNotification: !silent,
       workingIndicators: telegram.workingIndicators,
       ...(telegram.markdownTableRender.enabled
         ? { markdownTableRender: telegram.markdownTableRender }
         : {}),
+    });
+
+    return new TelegramOutputStreamWithAttachments(stream, {
+      api: createGrammyAttachmentApi(bot),
+      sessionRef,
+      silent,
+      onError: (error: unknown) => {
+        this.logger.warn("failed to deliver telegram attachments", {}, error);
+      },
     });
   }
 
@@ -584,8 +601,31 @@ export class TelegramAdapter implements SurfaceAdapter {
       if (!message) return;
       if (!this.isAllowed({ chatId: message.chat.id, userId: query.from.id })) return;
 
-      // Always answer, otherwise the client shows a spinner until it times out.
-      await ctx.answerCallbackQuery().catch(() => undefined);
+      const cancelRequestId = parseTelegramCancelCallbackData(query.data);
+
+      // Always answer, otherwise the client spins until the query times out.
+      await ctx
+        .answerCallbackQuery(cancelRequestId ? { text: "Cancelling\u2026" } : {})
+        .catch(() => undefined);
+
+      const threadId = topicIdOfCallbackMessage(message);
+
+      // The cancel button rides the same callback_query channel as ordinary
+      // actions, but the runtime cancels through a distinct event.
+      if (cancelRequestId) {
+        await this.emit({
+          type: "adapter.request.cancel",
+          platform: "telegram",
+          ts: Date.now(),
+          requestId: cancelRequestId,
+          sessionId: formatTelegramSessionId({ chatId: message.chat.id, threadId }),
+          cancelScope: "active_or_queued",
+          source: "button",
+          userId: String(query.from.id),
+          messageId: String(message.message_id),
+        });
+        return;
+      }
 
       await this.emit({
         type: "adapter.action.invoked",
@@ -595,7 +635,7 @@ export class TelegramAdapter implements SurfaceAdapter {
         userId: String(query.from.id),
         messageRef: telegramMsgRef({
           chatId: message.chat.id,
-          threadId: telegramTopicIdOf(message as Message),
+          threadId,
           messageId: message.message_id,
         }),
       });
@@ -789,6 +829,15 @@ function toGrammyKeyboard(markup: TelegramReplyMarkup): InlineKeyboardMarkup {
       row.map((button) => ({ text: button.text, callback_data: button.callback_data })),
     ),
   };
+}
+
+/**
+ * A callback query's message may be "inaccessible" (Telegram omits everything
+ * but the id and chat), so the topic id can only be read when the full message
+ * is present.
+ */
+function topicIdOfCallbackMessage(message: MaybeInaccessibleMessage): number | undefined {
+  return "date" in message && message.date !== 0 ? telegramTopicIdOf(message) : undefined;
 }
 
 function chatTitleOf(message: Message): string | undefined {
