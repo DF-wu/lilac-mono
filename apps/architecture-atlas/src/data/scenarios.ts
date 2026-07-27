@@ -33,14 +33,14 @@ export const RUNTIME_SCENARIOS = [
         title: "平台事件進站",
         transport: "call",
         description:
-          "Gateway message create 經 allowlist、raw normalization 與 session metadata 轉成 SurfaceEvent。",
+          "Gateway message create 經 allowlist、raw normalization 與 session metadata 轉成 SurfaceEvent。",
         payload: [
           "channelId / messageId / userId",
           "text / mentions / reply target",
           "platform=discord",
         ],
         invariant:
-          "allowlist 先於 routing；空 channel + guild allowlist 代表忽略全部 Discord traffic。",
+          "allowlist 先於 routing；空 channel + guild allowlist 代表忽⁠略⁠全⁠部 Discord traffic。",
         failure:
           "partial/deleted event 缺關鍵資料時 adapter 會忽略或使用 cache 補齊，不應進入 request loop。",
         sources: [

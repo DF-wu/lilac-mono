@@ -178,7 +178,7 @@ export const MAP_NODES = [
       eyebrow: "SURFACE / ADAPTER",
       kind: "surface",
       status: "implemented",
-      summary: "封裝 Discord connect、事件、歷史查詢、訊息輸出與本地 surface cache。",
+      summary: "封裝 Discord connect、事件、歷史查詢、訊息輸出與本地 surface cache。",
       responsibilities: [
         "平台 allowlist / normalization",
         "輸出 DiscordOutputStream",
@@ -257,7 +257,7 @@ export const MAP_NODES = [
       kind: "orchestrator",
       status: "implemented",
       summary:
-        "從 Discord adapter events 判斷 ignore、debounce、gate、prompt、steer、followUp 或 interrupt。",
+        "從 Discord adapter events 判斷 ignore、debounce、gate、prompt、steer、followUp 或 interrupt。",
       responsibilities: [
         "mention / active mode",
         "direct reply gate",
