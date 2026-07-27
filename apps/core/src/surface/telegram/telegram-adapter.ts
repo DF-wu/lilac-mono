@@ -147,6 +147,7 @@ export class TelegramAdapter implements SurfaceAdapter {
   private self: SurfaceSelf | null = null;
   private readonly handlers = new Set<AdapterEventHandler>();
   private pollingStopped: Promise<void> | null = null;
+  private ready: { promise: Promise<void>; resolve: () => void } | null = null;
 
   private readonly logger = createLogger({ module: "surface:telegram" });
 
@@ -161,6 +162,7 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (this.bot) return;
 
     this.healthState = { connectionState: "connecting", isReady: false };
+    this.ready = createDeferred();
 
     const cfg = await this.resolveCoreConfig();
     this.cfg = cfg;
@@ -219,6 +221,7 @@ export class TelegramAdapter implements SurfaceAdapter {
           botUsername: info.username,
         };
         this.logger.info("telegram surface ready", { botUsername: info.username });
+        this.ready?.resolve();
       },
     });
   }
@@ -228,11 +231,14 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (!bot) return;
 
     this.bot = null;
-    await bot.stop();
+    // Stopping aborts the in-flight getUpdates, which surfaces as a transport
+    // error. That is the expected shape of a clean shutdown, not a failure.
+    await bot.stop().catch(() => undefined);
     // Let the polling loop unwind before tearing down the store it may touch.
     await this.pollingStopped?.catch(() => undefined);
     this.pollingStopped = null;
 
+    this.ready = null;
     this.store?.close();
     this.store = null;
     this.healthState = {
@@ -240,6 +246,17 @@ export class TelegramAdapter implements SurfaceAdapter {
       connectionState: "disconnected",
       isReady: false,
     };
+  }
+
+  /**
+   * Resolves once long polling is actually running.
+   *
+   * `connect()` deliberately returns before this, because grammY's `start()`
+   * only settles when polling stops. Callers that need the distinction — the
+   * startup log line, and tests — await this instead of guessing.
+   */
+  async whenReady(): Promise<void> {
+    await this.ready?.promise;
   }
 
   getHealthSnapshot(): TelegramAdapterHealthSnapshot {
@@ -877,6 +894,14 @@ function toGrammyKeyboard(markup: TelegramReplyMarkup): InlineKeyboardMarkup {
  */
 function topicIdOfCallbackMessage(message: MaybeInaccessibleMessage): number | undefined {
   return "date" in message && message.date !== 0 ? telegramTopicIdOf(message) : undefined;
+}
+
+function createDeferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 function chatTitleOf(message: Message): string | undefined {

@@ -1,0 +1,366 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import type { Message, Update } from "grammy/types";
+
+import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
+import type { CoreConfig } from "@stanley2058/lilac-utils";
+
+import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
+import { buildTelegramCancelCallbackData } from "../../../src/surface/telegram/output/telegram-output-stream";
+import type { AdapterEvent } from "../../../src/surface/events";
+import { FakeBotApiServer } from "./fake-bot-api-server";
+import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
+
+const ALLOWED_CHAT = 1001;
+const TOKEN_ENV = "TELEGRAM_BOT_TOKEN";
+
+let server: FakeBotApiServer;
+let adapter: TelegramAdapter | null = null;
+let scratchDir = "";
+let previousToken: string | undefined;
+
+/**
+ * Collects adapter events and lets a test await a specific one, so nothing has
+ * to guess how long an update takes to travel through long polling.
+ */
+class EventSink {
+  readonly events: AdapterEvent[] = [];
+  private waiters: { match: (e: AdapterEvent) => boolean; resolve: (e: AdapterEvent) => void }[] =
+    [];
+
+  handle = (evt: AdapterEvent): void => {
+    this.events.push(evt);
+    this.waiters = this.waiters.filter((waiter) => {
+      if (!waiter.match(evt)) return true;
+      waiter.resolve(evt);
+      return false;
+    });
+  };
+
+  waitFor(match: (e: AdapterEvent) => boolean, label: string): Promise<AdapterEvent> {
+    const existing = this.events.find(match);
+    if (existing) return Promise.resolve(existing);
+
+    return new Promise<AdapterEvent>((resolve, reject) => {
+      this.waiters.push({ match, resolve });
+      // Rejection-only guard: it never delays the successful path.
+      const timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 10_000);
+      void Promise.resolve().then(() => timer.unref?.());
+    });
+  }
+
+  ofType(type: AdapterEvent["type"]): AdapterEvent[] {
+    return this.events.filter((e) => e.type === type);
+  }
+}
+
+function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
+  const cfg = parseCoreConfigV2ToUniversal({
+    configVersion: 2,
+    surface: {
+      telegram: {
+        enabled: true,
+        botName: "lilac",
+        allowedChatIds: [String(ALLOWED_CHAT)],
+        streamEditIntervalMs: 500,
+        ...telegram,
+      },
+    },
+  });
+  return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
+async function connectAdapter(input: {
+  cfg?: CoreConfig;
+  sink?: EventSink;
+}): Promise<{ adapter: TelegramAdapter; sink: EventSink }> {
+  const cfg = input.cfg ?? testConfig();
+  const sink = input.sink ?? new EventSink();
+
+  const created = new TelegramAdapter({
+    apiRoot: server.url,
+    getConfig: async () => ({
+      ...cfg,
+      surface: {
+        ...cfg.surface,
+        telegram: { ...cfg.surface.telegram, dbPath: path.join(scratchDir, "telegram.db") },
+      },
+    }),
+  });
+
+  await created.subscribe(sink.handle);
+  await created.connect();
+  // connect() returns before polling actually starts, so wait for the first
+  // successful getUpdates rather than racing it.
+  await created.whenReady();
+  adapter = created;
+
+  return { adapter: created, sink };
+}
+
+/** A message from the allowlisted chat, authored by a human. */
+function inboundMessage(overrides: Partial<Message> = {}): NonNullable<Update["message"]> {
+  const message = makeMessage({
+    chat: { id: ALLOWED_CHAT, type: "private", first_name: "Ada" },
+    ...overrides,
+  });
+  return message as NonNullable<Update["message"]>;
+}
+
+beforeEach(async () => {
+  previousToken = process.env[TOKEN_ENV];
+  process.env[TOKEN_ENV] = "000000:fake-token";
+  scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-it-"));
+  server = new FakeBotApiServer(BOT_USER_ID, BOT_USERNAME);
+});
+
+afterEach(async () => {
+  await adapter?.disconnect();
+  adapter = null;
+  await server.close();
+  await rm(scratchDir, { recursive: true, force: true });
+
+  if (previousToken === undefined) delete process.env[TOKEN_ENV];
+  else process.env[TOKEN_ENV] = previousToken;
+});
+
+describe("telegram adapter against a fake Bot API", () => {
+  it("connects, identifies itself, and reports ready", async () => {
+    const { adapter: a } = await connectAdapter({});
+
+    expect(server.callsOf("getMe")).toHaveLength(1);
+    expect(await a.getSelf()).toEqual({
+      platform: "telegram",
+      userId: String(BOT_USER_ID),
+      userName: BOT_USERNAME,
+    });
+    expect(a.getHealthSnapshot().isReady).toBe(true);
+  });
+
+  it("requests message_reaction updates, which are outside the API default set", async () => {
+    await connectAdapter({});
+    const poll = await server.waitForCall("getUpdates");
+
+    expect(poll.params.allowed_updates).toEqual([
+      "message",
+      "edited_message",
+      "callback_query",
+      "message_reaction",
+    ]);
+  });
+
+  it("registers the command menu, and skips it when disabled", async () => {
+    await connectAdapter({});
+    expect(server.callsOf("setMyCommands")).toHaveLength(1);
+
+    await adapter?.disconnect();
+    adapter = null;
+    await connectAdapter({ cfg: testConfig({ commandMenu: false }) });
+
+    expect(server.callsOf("setMyCommands")).toHaveLength(1);
+  });
+
+  it("routes a message from an allowlisted chat", async () => {
+    const { sink } = await connectAdapter({});
+
+    server.enqueueMessage(inboundMessage({ text: "hello there" }));
+    const evt = await sink.waitFor((e) => e.type === "adapter.message.created", "message.created");
+
+    expect(evt.type === "adapter.message.created" && evt.message.text).toBe("hello there");
+    expect(evt.type === "adapter.message.created" && evt.message.session.channelId).toBe(
+      String(ALLOWED_CHAT),
+    );
+  });
+
+  it("ignores a chat that is not allowlisted", async () => {
+    const { sink } = await connectAdapter({});
+
+    // Enqueue the rejected message first, then an allowed one. When the second
+    // arrives the first has demonstrably been processed and discarded.
+    server.enqueueMessage(
+      makeMessage({ chat: { id: 9999, type: "private", first_name: "Mal" } }) as NonNullable<
+        Update["message"]
+      >,
+    );
+    server.enqueueMessage(inboundMessage({ message_id: 77, text: "allowed" }));
+
+    await sink.waitFor((e) => e.type === "adapter.message.created", "message.created");
+
+    expect(sink.ofType("adapter.message.created")).toHaveLength(1);
+  });
+
+  it("ignores its own messages so replies cannot loop", async () => {
+    const { sink } = await connectAdapter({});
+
+    server.enqueueMessage(
+      inboundMessage({
+        message_id: 50,
+        from: { id: BOT_USER_ID, is_bot: true, first_name: "Catalina" },
+        text: "my own output",
+      }),
+    );
+    server.enqueueMessage(inboundMessage({ message_id: 51, text: "from a human" }));
+
+    await sink.waitFor((e) => e.type === "adapter.message.created", "message.created");
+
+    const created = sink.ofType("adapter.message.created");
+    expect(created).toHaveLength(1);
+    expect(created[0]?.type === "adapter.message.created" && created[0].message.text).toBe(
+      "from a human",
+    );
+  });
+
+  it("gives a forum topic its own session id", async () => {
+    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
+    const { sink } = await connectAdapter({ cfg });
+
+    server.enqueueMessage(
+      makeMessage({
+        chat: makeSupergroupChat(),
+        is_topic_message: true,
+        message_thread_id: 7,
+        text: "in a topic",
+      }) as NonNullable<Update["message"]>,
+    );
+
+    const evt = await sink.waitFor((e) => e.type === "adapter.message.created", "topic message");
+
+    expect(evt.type === "adapter.message.created" && evt.message.session.channelId).toBe(
+      "-1001234567890:7",
+    );
+  });
+
+  it("streams a reply as a send followed by edits", async () => {
+    const { adapter: a } = await connectAdapter({});
+
+    const stream = await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) });
+    await stream.push({ type: "text.set", text: "the complete answer" });
+    const result = await stream.finish();
+
+    expect(server.callsOf("sendMessage").length).toBeGreaterThanOrEqual(1);
+    expect(result.last.platform).toBe("telegram");
+
+    const messageId = Number(result.last.messageId);
+    expect(server.textOf(messageId)).toContain("the complete answer");
+  });
+
+  it("splits an over-long answer across several messages", async () => {
+    const { adapter: a } = await connectAdapter({});
+
+    const stream = await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) });
+    await stream.push({ type: "text.set", text: "lorem ipsum ".repeat(900) });
+    const result = await stream.finish();
+
+    expect(result.created.length).toBeGreaterThan(1);
+    for (const call of server.callsOf("sendMessage")) {
+      expect(String(call.params.text ?? "").length).toBeLessThanOrEqual(4096);
+    }
+  });
+
+  it("turns the cancel button into a cancellation, not a workflow action", async () => {
+    const { sink } = await connectAdapter({});
+
+    const requestId = `telegram:${ALLOWED_CHAT}:42`;
+    const callbackData = buildTelegramCancelCallbackData(requestId);
+    expect(callbackData).not.toBeNull();
+
+    server.enqueueUpdate({
+      callback_query: {
+        id: "cb-1",
+        from: { id: 7, is_bot: false, first_name: "Ada" },
+        chat_instance: "ci",
+        data: callbackData ?? "",
+        message: {
+          message_id: 500,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: ALLOWED_CHAT, type: "private", first_name: "Ada" },
+        },
+      },
+    });
+
+    const evt = await sink.waitFor((e) => e.type === "adapter.request.cancel", "request.cancel");
+
+    expect(evt.type === "adapter.request.cancel" && evt.requestId).toBe(requestId);
+    expect(evt.type === "adapter.request.cancel" && evt.sessionId).toBe(String(ALLOWED_CHAT));
+    expect(sink.ofType("adapter.action.invoked")).toHaveLength(0);
+    expect(server.callsOf("answerCallbackQuery")).toHaveLength(1);
+  });
+
+  it("maps a reaction update onto add and remove events", async () => {
+    const { sink } = await connectAdapter({});
+
+    server.enqueueUpdate({
+      message_reaction: {
+        chat: { id: ALLOWED_CHAT, type: "private", first_name: "Ada" },
+        message_id: 60,
+        user: { id: 7, is_bot: false, first_name: "Ada" },
+        date: Math.floor(Date.now() / 1000),
+        old_reaction: [{ type: "emoji", emoji: "👀" }],
+        new_reaction: [{ type: "emoji", emoji: "🔥" }],
+      },
+    });
+
+    await sink.waitFor((e) => e.type === "adapter.reaction.added", "reaction.added");
+    await sink.waitFor((e) => e.type === "adapter.reaction.removed", "reaction.removed");
+
+    const added = sink.ofType("adapter.reaction.added")[0];
+    const removed = sink.ofType("adapter.reaction.removed")[0];
+    expect(added?.type === "adapter.reaction.added" && added.reaction).toBe("🔥");
+    expect(removed?.type === "adapter.reaction.removed" && removed.reaction).toBe("👀");
+  });
+
+  it("sends a reaction through setMessageReaction", async () => {
+    const { adapter: a } = await connectAdapter({});
+
+    await a.addReaction(
+      { platform: "telegram", channelId: String(ALLOWED_CHAT), messageId: "60" },
+      "👍",
+    );
+
+    expect(server.callsOf("setMessageReaction")).toHaveLength(1);
+  });
+
+  it("serves history from the local index, since the Bot API has none", async () => {
+    const { adapter: a, sink } = await connectAdapter({});
+    const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
+
+    server.enqueueMessage(inboundMessage({ message_id: 10, text: "first", date: 1_700_000_000 }));
+    server.enqueueMessage(inboundMessage({ message_id: 11, text: "second", date: 1_700_000_060 }));
+
+    await sink.waitFor(
+      (e) => e.type === "adapter.message.created" && e.message.text === "second",
+      "second message",
+    );
+
+    const history = await a.listMsg(sessionRef);
+    expect(history.map((m) => m.text)).toEqual(["second", "first"]);
+
+    const read = await a.readMsg({ ...sessionRef, messageId: "10" });
+    expect(read?.text).toBe("first");
+  });
+
+  it("sends, edits and deletes a message", async () => {
+    const { adapter: a } = await connectAdapter({});
+    const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
+
+    const ref = await a.sendMsg(sessionRef, { text: "hello" });
+    await a.editMsg(ref, { text: "hello again" });
+    await a.deleteMsg(ref);
+
+    expect(server.textOf(Number(ref.messageId))).toBe("hello again");
+    expect(server.callsOf("deleteMessage")).toHaveLength(1);
+  });
+
+  it("disconnects cleanly and tolerates a second disconnect", async () => {
+    const { adapter: a } = await connectAdapter({});
+
+    await a.disconnect();
+    await a.disconnect();
+    adapter = null;
+
+    expect(a.getHealthSnapshot().isReady).toBe(false);
+  });
+});
