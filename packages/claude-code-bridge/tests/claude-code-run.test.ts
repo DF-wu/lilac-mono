@@ -39,7 +39,8 @@ describe("materializeClaudeCodeRun", () => {
     expect(settings).toHaveLength(2);
     expect(settings[0]).toMatchObject({
       cwd,
-      tools: [],
+      env: { ENABLE_TOOL_SEARCH: "true" },
+      tools: ["ToolSearch"],
       settingSources: [],
       persistSession: false,
       streamingInput: "always",
@@ -86,14 +87,14 @@ describe("materializeClaudeCodeRun", () => {
     await run.dispose();
   });
 
-  it("applies the built-in allowlist to the agent model only", async () => {
+  it("preserves caller built-ins, appends ToolSearch once, and keeps utility tools empty", async () => {
     const settings: ClaudeCodeSettings[] = [];
     const provider = createClaudeCode();
     const run = await materializeClaudeCodeRun({
       modelId: "sonnet",
       cwd: process.cwd(),
       tools: { read: tool({ inputSchema: z.object({}), execute: () => "value" }) },
-      builtInTools: ["WebSearch"],
+      builtInTools: ["WebSearch", "ToolSearch"],
       execute: () => {
         throw new Error("not called");
       },
@@ -103,8 +104,10 @@ describe("materializeClaudeCodeRun", () => {
       },
     });
 
-    expect(settings[0]?.tools).toEqual(["WebSearch"]);
+    expect(settings[0]?.tools).toEqual(["WebSearch", "ToolSearch"]);
+    expect(settings[0]?.env).toEqual({ ENABLE_TOOL_SEARCH: "true" });
     expect(settings[1]?.tools).toEqual([]);
+    expect(settings[1]?.env).toBeUndefined();
 
     await run.dispose();
   });

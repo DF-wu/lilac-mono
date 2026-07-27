@@ -42,12 +42,23 @@ export type ClaudeCodeToolBridge = {
   close(): Promise<void>;
 };
 
+export type ClaudeCodeToolCatalogMetadata = {
+  readonly sourceId: string;
+  readonly rawName: string;
+  readonly title?: string;
+  readonly description?: string;
+};
+
+export type ClaudeCodeToolCatalogMetadataMap = Readonly<
+  Record<string, ClaudeCodeToolCatalogMetadata>
+>;
+
 /**
  * Claude built-in tools a surface may re-enable. Anything else is rejected
  * before it can reach the Agent SDK's own allowlist, so a caller cannot widen
  * the model's reach with a name that merely typechecks.
  */
-export const CLAUDE_CODE_BUILT_IN_TOOLS = ["WebSearch"] as const;
+export const CLAUDE_CODE_BUILT_IN_TOOLS = ["WebSearch", "ToolSearch"] as const;
 export type ClaudeCodeBuiltInTool = (typeof CLAUDE_CODE_BUILT_IN_TOOLS)[number];
 
 const SUPPORTED_BUILT_IN_TOOLS: ReadonlySet<string> = new Set(CLAUDE_CODE_BUILT_IN_TOOLS);
@@ -252,8 +263,22 @@ function pruneCorrelations(pending: Map<string, PendingCorrelation>, now: number
   }
 }
 
+function catalogSearchHint(metadata: ClaudeCodeToolCatalogMetadata): string {
+  return [
+    `Source ID: ${metadata.sourceId}`,
+    `Raw tool name: ${metadata.rawName}`,
+    ...(metadata.title ? [`Title: ${metadata.title}`] : []),
+    ...(metadata.description ? [`Description: ${metadata.description}`] : []),
+  ].join("\n");
+}
+
 export async function createClaudeCodeToolBridge(options: {
   tools: ToolSet;
+  /**
+   * Deferred catalog tools keyed by model-facing name. Exposed tools absent
+   * from this map are Lilac builtins and are marked always-load.
+   */
+  catalogMetadata?: ClaudeCodeToolCatalogMetadataMap;
   execute(request: ClaudeCodeToolExecutionRequest): Promise<AtomicToolExecutionOutcome>;
   /**
    * Claude built-in tools this run may call directly. They bypass the MCP
@@ -268,7 +293,8 @@ export async function createClaudeCodeToolBridge(options: {
   // still fails loudly below, because that is a toolset bug rather than a
   // deliberate handover.
   const exposedEntries = Object.entries(options.tools).filter(
-    ([name, definition]) => name !== "batch" && definition.isProviderExecuted !== true,
+    ([name, definition]) =>
+      name !== "batch" && name !== "tool_search" && definition.isProviderExecuted !== true,
   );
   const exposedNames = new Set(exposedEntries.map(([name]) => name));
   const allowedBuiltIns = new Set<string>(validateClaudeCodeBuiltInTools(options.builtInTools));
@@ -284,6 +310,7 @@ export async function createClaudeCodeToolBridge(options: {
       throw new Error(`Cannot expose Claude MCP tool '${toolName}': input validation is missing`);
     }
     validators.set(toolName, schema.validate);
+    const catalogMetadata = options.catalogMetadata?.[toolName];
     try {
       declarations.push(
         ToolSchema.parse({
@@ -292,6 +319,9 @@ export async function createClaudeCodeToolBridge(options: {
             ? { description: definition.description }
             : {}),
           inputSchema: await schema.jsonSchema,
+          _meta: catalogMetadata
+            ? { "anthropic/searchHint": catalogSearchHint(catalogMetadata) }
+            : { "anthropic/alwaysLoad": true },
         }),
       );
     } catch (error) {
