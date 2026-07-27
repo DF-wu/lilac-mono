@@ -1,6 +1,12 @@
 import { describe, expect, it } from "bun:test";
 
-import type { MCPClientConfig, MCPTransport, OAuthClientProvider, OAuthTokens } from "@ai-sdk/mcp";
+import {
+  UnauthorizedError,
+  type MCPClientConfig,
+  type MCPTransport,
+  type OAuthClientProvider,
+  type OAuthTokens,
+} from "@ai-sdk/mcp";
 import { Experimental_StdioMCPTransport } from "@ai-sdk/mcp/mcp-stdio";
 
 import {
@@ -678,6 +684,64 @@ describe("McpRegistry reload and terminal failures", () => {
     });
     expect(registry.getTools()).toEqual([]);
     expect(client.closeCount).toBe(1);
+    await registry.shutdown();
+  });
+
+  it("reports authentication required when runtime OAuth refresh cannot authorize", async () => {
+    let clientConfig: MCPClientConfig | undefined;
+    const client = new FakeMcpClient();
+    const authServer = {
+      id: "auth",
+      transportConfig: {
+        transport: "http" as const,
+        url: "https://example.invalid/mcp",
+        headers: {},
+        auth: {
+          type: "oauth" as const,
+          grant: "authorization_code" as const,
+          client: { type: "dynamic" as const },
+        },
+      },
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([authServer])),
+        createAuthProvider: async () =>
+          fakeAuthProvider({
+            access_token: "expired-access-token",
+            token_type: "Bearer",
+            refresh_token: "rejected-refresh-token",
+          }),
+        createTransport: () => ({ type: "http", url: "https://unused.invalid" }),
+        createClient: async (config) => {
+          clientConfig = config;
+          return client;
+        },
+      },
+    });
+    await registry.init();
+    client.listTools = async () => {
+      const error = new UnauthorizedError();
+      clientConfig?.onUncaughtError?.(error);
+      throw error;
+    };
+
+    expect(await registry.reload("auth")).toEqual([
+      {
+        serverId: "auth",
+        reconciliation: "unchanged",
+        result: "authentication_required",
+        error: "Unauthorized",
+      },
+    ]);
+
+    expect(registry.list()[0]).toMatchObject({
+      serverId: "auth",
+      status: "authentication_required",
+      phase: "runtime",
+    });
+    expect(registry.getTools()).toEqual([]);
     await registry.shutdown();
   });
 

@@ -149,6 +149,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
     `);
 
     this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_request_transcripts_client_session
+      ON request_transcripts(request_client, session_id);
+    `);
+
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS surface_message_to_request (
         platform TEXT NOT NULL,
         channel_id TEXT NOT NULL,
@@ -651,18 +656,31 @@ export class SqliteTranscriptStore implements TranscriptStore {
       c: number;
     };
     const count = typeof countRow?.c === "number" ? countRow.c : 0;
-    if (count <= MAX_REQUESTS) return;
+    if (count > MAX_REQUESTS) {
+      const toDelete = count - MAX_REQUESTS;
+      const victims = this.db
+        .query("SELECT request_id FROM request_transcripts ORDER BY updated_ts ASC LIMIT ?")
+        .all(toDelete) as Array<{ request_id: string }>;
 
-    const toDelete = count - MAX_REQUESTS;
-    const victims = this.db
-      .query("SELECT request_id FROM request_transcripts ORDER BY updated_ts ASC LIMIT ?")
-      .all(toDelete) as Array<{ request_id: string }>;
-    if (victims.length === 0) return;
-
-    for (const v of victims) {
-      this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
-      this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [v.request_id]);
+      for (const v of victims) {
+        this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
+        this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [v.request_id]);
+      }
     }
+
+    this.db.run(
+      `
+      DELETE FROM session_loaded_tools
+      WHERE selected_ts < ?
+        AND NOT EXISTS (
+        SELECT 1
+        FROM request_transcripts
+        WHERE request_transcripts.request_client = session_loaded_tools.request_client
+          AND request_transcripts.session_id = session_loaded_tools.session_id
+      )
+    `,
+      [cutoff],
+    );
   }
 }
 

@@ -3,12 +3,15 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { UnauthorizedError } from "@ai-sdk/mcp";
+
 import {
   MCP_OAUTH_CALLBACK_URL,
   McpOAuthCallbackService,
   McpOAuthProviderService,
   readMcpOAuthCredentialFile,
   resolveMcpOAuthCredentialPath,
+  writeMcpOAuthCredentialFileAtomic,
   type UniversalMcpConfig,
 } from "../../src/mcp";
 
@@ -45,7 +48,7 @@ function oauthConfig(): UniversalMcpConfig {
   };
 }
 
-function oauthFetch(options: { tokenRequests: URLSearchParams[] }) {
+function oauthFetch(options: { tokenRequests: URLSearchParams[]; rejectRefresh?: () => boolean }) {
   return Object.assign(
     async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = new URL(input instanceof Request ? input.url : String(input));
@@ -82,6 +85,9 @@ function oauthFetch(options: { tokenRequests: URLSearchParams[] }) {
             ? init.body
             : new URLSearchParams(typeof init?.body === "string" ? init.body : "");
         options.tokenRequests.push(body);
+        if (body.get("grant_type") === "refresh_token" && options.rejectRefresh?.()) {
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        }
         return Response.json({
           access_token: "saved-access-token",
           refresh_token: "saved-refresh-token",
@@ -219,6 +225,119 @@ describe("Core-owned MCP OAuth", () => {
     expect(tokenRequests[0]?.get("code_verifier")).toBeTruthy();
     expect(tokenRequests[1]?.get("code_verifier")).toBeTruthy();
     expect(tokenRequests[0]?.get("code_verifier")).not.toBe(tokenRequests[1]?.get("code_verifier"));
+  });
+
+  it("keeps runtime OAuth limited to token refresh and explicit mcp.auth", async () => {
+    const dataDir = await createDataDir();
+    const providers = new McpOAuthProviderService({
+      dataDir,
+      fetchFn: oauthFetch({ tokenRequests: [] }),
+    });
+    providers.reconcile(oauthConfig());
+    const provider = providers.getProvider("docs");
+    if (!provider) throw new Error("Expected OAuth provider");
+
+    await expect(provider.clientInformation()).rejects.toBeInstanceOf(UnauthorizedError);
+    await expect(
+      provider.saveClientInformation?.({ client_id: "implicit-registration" }),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+    expect(() => provider.state?.()).toThrow(UnauthorizedError);
+    expect(() => provider.saveCodeVerifier("implicit-verifier")).toThrow(UnauthorizedError);
+    expect(provider.storedState?.()).toBeUndefined();
+
+    const explicit = await providers.startAuthorization("docs");
+    expect(explicit.status).toBe("authorization_required");
+  });
+
+  it("treats a zero dynamic client secret expiration as non-expiring", async () => {
+    const dataDir = await createDataDir();
+    const providers = new McpOAuthProviderService({ dataDir });
+    providers.reconcile(oauthConfig());
+    const provider = providers.getProvider("docs");
+    if (!provider) throw new Error("Expected OAuth provider");
+
+    await writeMcpOAuthCredentialFileAtomic({
+      dataDir,
+      serverId: "docs",
+      credential: {
+        version: 1,
+        serverUrl: SERVER_URL,
+        clientInformation: {
+          client_id: "registered-client",
+          client_secret: "registered-secret",
+          client_secret_expires_at: 0,
+        },
+      },
+    });
+
+    expect(await provider.clientInformation()).toMatchObject({
+      client_id: "registered-client",
+      client_secret_expires_at: 0,
+    });
+  });
+
+  it("expires abandoned authorization states without affecting new explicit flows", async () => {
+    const dataDir = await createDataDir();
+    let now = 0;
+    const providers = new McpOAuthProviderService({
+      dataDir,
+      fetchFn: oauthFetch({ tokenRequests: [] }),
+      now: () => now,
+    });
+    providers.reconcile(oauthConfig());
+
+    const first = await providers.startAuthorization("docs");
+    const second = await providers.startAuthorization("docs");
+    if (first.status !== "authorization_required" || second.status !== "authorization_required") {
+      throw new Error("Expected OAuth redirects");
+    }
+    const firstState = new URL(first.authorizationUrl).searchParams.get("state");
+    const secondState = new URL(second.authorizationUrl).searchParams.get("state");
+    if (!firstState || !secondState) throw new Error("Expected OAuth states");
+
+    now = Number.MAX_SAFE_INTEGER;
+    const current = await providers.startAuthorization("docs");
+    if (current.status !== "authorization_required") throw new Error("Expected OAuth redirect");
+    const currentState = new URL(current.authorizationUrl).searchParams.get("state");
+    if (!currentState) throw new Error("Expected OAuth state");
+
+    expect(providers.getProviderForState(firstState)).toBeUndefined();
+    expect(providers.getProviderForState(secondState)).toBeUndefined();
+    expect(providers.getProviderForState(currentState)).toBeDefined();
+  });
+
+  it("clears a rejected refresh token when explicit mcp.auth restarts authorization", async () => {
+    const dataDir = await createDataDir();
+    const tokenRequests: URLSearchParams[] = [];
+    let rejectRefresh = false;
+    const providers = new McpOAuthProviderService({
+      dataDir,
+      fetchFn: oauthFetch({ tokenRequests, rejectRefresh: () => rejectRefresh }),
+    });
+    providers.reconcile(oauthConfig());
+    const callbacks = new McpOAuthCallbackService({ providers });
+    callbackServices.push(callbacks);
+
+    const initial = await providers.startAuthorization("docs");
+    if (initial.status !== "authorization_required") throw new Error("Expected OAuth redirect");
+    const initialState = new URL(initial.authorizationUrl).searchParams.get("state");
+    if (!initialState) throw new Error("Expected OAuth state");
+    expect(
+      await callbacks.handleRequest(
+        new Request(`${MCP_OAUTH_CALLBACK_URL}?code=initial-code&state=${initialState}`),
+      ),
+    ).toMatchObject({ status: 200 });
+
+    rejectRefresh = true;
+    const restarted = await providers.startAuthorization("docs");
+    expect(restarted.status).toBe("authorization_required");
+    expect(tokenRequests.map((request) => request.get("grant_type"))).toEqual([
+      "authorization_code",
+      "refresh_token",
+    ]);
+    expect(
+      (await readMcpOAuthCredentialFile({ dataDir, serverId: "docs" }))?.tokens,
+    ).toBeUndefined();
   });
 
   it("bounds retained pending attempts", async () => {

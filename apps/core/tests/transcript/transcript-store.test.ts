@@ -637,6 +637,52 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("prunes tool selections after their session transcripts expire", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+
+    store.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "abandoned-session",
+      catalogIds: ["mcp_abandoned_tool"],
+    });
+    store.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "active-session",
+      catalogIds: ["mcp_active_tool"],
+    });
+    store.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "in-flight-session",
+      catalogIds: ["mcp_in_flight_tool"],
+    });
+    const rawDb = new Database(dbPath);
+    rawDb.run("UPDATE session_loaded_tools SET selected_ts = 0 WHERE session_id = ?", [
+      "abandoned-session",
+    ]);
+    rawDb.close();
+    store.saveRequestTranscript({
+      requestId: "active-request",
+      sessionId: "active-session",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "keep this session" }],
+    });
+
+    expect(
+      store.listSessionToolIds({ requestClient: "discord", sessionId: "abandoned-session" }),
+    ).toEqual([]);
+    expect(
+      store.listSessionToolIds({ requestClient: "discord", sessionId: "active-session" }),
+    ).toEqual(["mcp_active_tool"]);
+    expect(
+      store.listSessionToolIds({ requestClient: "discord", sessionId: "in-flight-session" }),
+    ).toEqual(["mcp_in_flight_tool"]);
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("creates the generic selection table without migrating attempt-1 state", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");

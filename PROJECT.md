@@ -318,8 +318,8 @@ There are three tool “levels”. They all serve the agent; higher levels are u
    - Built-in Level 2 plugins live in `apps/core/src/plugins/builtin/*`; external plugins are discovered from `DATA_DIR/plugins/*`.
    - The tool server uses request context headers (`x-lilac-request-id`, etc.) and generic server-issued request capabilities for request-scoped behavior. Capabilities bind cwd and native profile identity; profile headers are context only and cannot expand Level-2 access.
    - `apps/tool-bridge/client.ts` provides a human-friendly `tools` CLI that calls the tool server; the agent can also invoke it through Level-1 `bash`.
-    - Capability-bound plugins skip cleanly in dev mode when required services are absent.
-    - Configured MCP servers are Core-owned, process-wide clients managed through ordinary `mcp.list`, `mcp.add`, `mcp.remove`, `mcp.status`, `mcp.auth`, and `mcp.reload` callable IDs. Every accepted server is attempted at startup; unavailable servers wait for explicit reload rather than retrying on requests or in the background. Load the `mcp-management` skill for operational syntax and OAuth flow.
+   - Capability-bound plugins skip cleanly in dev mode when required services are absent.
+   - Configured MCP servers are Core-owned, process-wide clients managed through ordinary `mcp.list`, `mcp.add`, `mcp.remove`, `mcp.status`, `mcp.auth`, and `mcp.reload` callable IDs. Every accepted server is attempted at startup; unavailable servers wait for explicit reload rather than retrying on requests or in the background. Load the `mcp-management` skill for operational syntax and OAuth flow.
    - Health distinguishes fatal liveness failures from readiness degradation. Sustained event-loop
      lag is readiness-only: it is retained as a diagnostic incident and can make `/readyz` return
      503, but lag alone never invokes the process watchdog. Incident diagnostics contain process

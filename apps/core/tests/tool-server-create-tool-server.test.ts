@@ -1690,6 +1690,8 @@ describe("createToolServer", () => {
       clientSecret: "client-secret-value",
       authorization: "Bearer header-secret-value",
       envToken: "env-secret-value",
+      commandToken: "command-token-value",
+      argumentToken: "argument-token-value",
       code: "query-code-value",
       state: "query-state-value",
     };
@@ -1724,6 +1726,8 @@ describe("createToolServer", () => {
             callableId: "mcp.add",
             input: {
               transport: "stdio",
+              command: `bun --token=${secrets.commandToken}`,
+              args: [`--api-key=${secrets.argumentToken}`],
               url: `https://mcp.example/callback?code=${secrets.code}&state=${secrets.state}`,
               auth: {
                 client: { clientSecret: secrets.clientSecret },
@@ -1734,16 +1738,20 @@ describe("createToolServer", () => {
           }),
         }),
       );
-      expect(await runtimeResponse.json()).toMatchObject({ isError: true });
+      const runtimeResult = await runtimeResponse.json();
+      expect(runtimeResult).toEqual({
+        isError: true,
+        output: "mcp.add failed without exposing sensitive configuration",
+      });
 
       const logged = chunks.join("");
       expect(logged).toContain("<redacted mcp.add input>");
-      expect(logged).toContain("McpRuntimeError:<redacted>");
-      expect(logged).toContain("MCP runtime failed");
-      expect(logged).toContain("https://mcp.example/callback");
+      expect(logged).toContain("McpAddError");
+      expect(logged).not.toContain("MCP runtime failed");
       expect(logged).not.toContain("mcp.add has invalid input");
       expect(logged).not.toContain("?code=");
-      for (const secret of Object.values(secrets)) expect(logged).not.toContain(secret);
+      const observableOutput = `${logged}\n${JSON.stringify(runtimeResult)}`;
+      for (const secret of Object.values(secrets)) expect(observableOutput).not.toContain(secret);
     } finally {
       await server.stop();
     }

@@ -39,6 +39,7 @@ describe("local apply_patch MCP credential guards", () => {
     await fs.writeFile(path.join(secretDir, "delete.txt"), "keep\n", "utf8");
     await fs.writeFile(path.join(workspace, "move-source.txt"), "public\n", "utf8");
     await fs.symlink(secretDir, path.join(workspace, "secret-alias"));
+    await fs.symlink("missing/../cyclic-alias", path.join(workspace, "cyclic-alias"));
   });
 
   afterEach(async () => {
@@ -142,13 +143,25 @@ describe("local apply_patch MCP credential guards", () => {
             "*** End Patch",
           ].join("\n"),
         },
+        {
+          label: "cyclic symlink alias",
+          cwd: workspace,
+          patchText: [
+            "*** Begin Patch",
+            "*** Add File: cyclic-alias/file.txt",
+            "+blocked",
+            "*** End Patch",
+          ].join("\n"),
+        },
       ];
 
       for (const input of patches) {
         const result = await resolveExecuteResult(executePatch(input));
         expect(result, input.label).toMatchObject({ status: "failed" });
         if (!result || typeof result !== "object") throw new Error("expected apply_patch result");
-        expect(Reflect.get(result, "output"), input.label).toContain("Access denied");
+        expect(Reflect.get(result, "output"), input.label).toContain(
+          input.label === "cyclic symlink alias" ? "Too many symbolic links" : "Access denied",
+        );
       }
 
       expect(await fs.readFile(path.join(secretDir, "update.txt"), "utf8")).toBe("old\n");

@@ -95,76 +95,6 @@ function safeToolInputPreview(callableId: string, input: unknown): string {
   return safeJsonPreview(input);
 }
 
-function redactUrlQuery(raw: string): string {
-  try {
-    const url = new URL(raw);
-    if (url.username) url.username = "<redacted>";
-    if (url.password) url.password = "<redacted>";
-    url.search = "";
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return "<redacted-url>";
-  }
-}
-
-function collectMcpAddSensitiveValues(input: unknown): string[] {
-  const values = new Set<string>();
-
-  const collectStrings = (value: unknown): void => {
-    if (typeof value === "string") {
-      if (value.length > 0) values.add(value);
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value) collectStrings(item);
-      return;
-    }
-    if (!isRecord(value)) return;
-    for (const nested of Object.values(value)) collectStrings(nested);
-  };
-
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
-      return;
-    }
-    if (!isRecord(value)) return;
-
-    for (const [key, nested] of Object.entries(value)) {
-      const normalizedKey = key.toLowerCase().replaceAll("_", "");
-      if (
-        normalizedKey === "headers" ||
-        normalizedKey === "env" ||
-        normalizedKey === "clientsecret"
-      ) {
-        collectStrings(nested);
-      }
-      visit(nested);
-    }
-  };
-
-  visit(input);
-  return [...values].sort((left, right) => right.length - left.length);
-}
-
-function safeMcpAddError(error: unknown, input: unknown): { name: string; message: string } {
-  let name = error instanceof Error ? error.name : "unknown";
-  let message = error instanceof Error ? error.message : String(error);
-
-  name = name.replace(/https?:\/\/[^\s"'<>]+/giu, redactUrlQuery);
-  message = message.replace(/https?:\/\/[^\s"'<>]+/giu, redactUrlQuery);
-  for (const value of collectMcpAddSensitiveValues(input)) {
-    const escapedValue = JSON.stringify(value).slice(1, -1);
-    for (const candidate of new Set([value, escapedValue])) {
-      name = name.replaceAll(candidate, "<redacted>");
-      message = message.replaceAll(candidate, "<redacted>");
-    }
-  }
-
-  return { name, message };
-}
-
 function headerStr(h: unknown): string | undefined {
   return typeof h === "string" && h.length > 0 ? h : undefined;
 }
@@ -829,13 +759,11 @@ export function createToolServer(options: ToolServerOptions) {
           cancelled: combinedSignal.aborted,
         };
         if (body.callableId === "mcp.add") {
-          // ToolInputValidationError retains its raw input, so never pass this error to the logger.
-          const safeError =
-            e instanceof ToolInputValidationError ? undefined : safeMcpAddError(e, body.input);
+          // mcp.add accepts arbitrary credential-bearing strings. Do not inspect or serialize
+          // unexpected failures because providers may echo partial command-line values.
           logger.error("tool.call.result", {
             ...errorLogDetails,
-            errorClass: safeError?.name ?? "ToolInputValidationError",
-            ...(safeError ? { error: safeError } : {}),
+            errorClass: e instanceof ToolInputValidationError ? e.name : "McpAddError",
           });
         } else {
           logger.error(
@@ -853,9 +781,11 @@ export function createToolServer(options: ToolServerOptions) {
           output:
             e instanceof ToolInputValidationError
               ? e.message
-              : e instanceof Error
-                ? e.message
-                : String(e),
+              : body.callableId === "mcp.add"
+                ? "mcp.add failed without exposing sensitive configuration"
+                : e instanceof Error
+                  ? e.message
+                  : String(e),
         };
       }
     },

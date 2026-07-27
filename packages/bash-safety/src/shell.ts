@@ -298,6 +298,14 @@ function stripEnvWithInfo(tokens: string[]): EnvStrippingResult & {
       continue;
     }
 
+    if (token.startsWith("-C") && token.length > 2) {
+      const value = token.slice(2);
+      if (hasDynamicExpansion(value)) childCwdUnknown = true;
+      else childCwd = value;
+      i++;
+      continue;
+    }
+
     if (token.startsWith("-P")) {
       i++;
       continue;

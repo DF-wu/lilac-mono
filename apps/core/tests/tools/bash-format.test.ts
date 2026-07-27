@@ -20,6 +20,9 @@ describe("bash output redaction", () => {
       "curl http://localhost/callback?code=plain-code&state=plain-state&other=visible",
       `curl 'https://example.test/callback?token=quoted-token&key=quoted-key'`,
       `curl "https://example.test/callback?secret=quoted-secret#done"`,
+      "curl https://example.test/callback?access_token=access-value&refresh_token=refresh-value",
+      "curl https://example.test/callback?client-secret=client-value&api_key=key-value",
+      "curl https://example.test/callback?code_verifier=verifier-value&other=visible",
     ].join("\n");
 
     const redacted = redactSecrets(input);
@@ -34,6 +37,16 @@ describe("bash output redaction", () => {
     expect(redacted).not.toContain("quoted-token");
     expect(redacted).not.toContain("quoted-key");
     expect(redacted).not.toContain("quoted-secret");
+    for (const secret of [
+      "access-value",
+      "refresh-value",
+      "client-value",
+      "key-value",
+      "verifier-value",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("other=visible");
   });
 
   it("redacts callback query secrets from blocked command and segment text", () => {

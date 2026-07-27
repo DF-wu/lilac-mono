@@ -78,6 +78,8 @@ function isPathWithin(candidate: string, root: string): boolean {
 async function canonicalizeAsFarAsExists(inputPath: string): Promise<string> {
   let current = path.resolve(inputPath);
   const missingSegments: string[] = [];
+  const followedSymlinks = new Set<string>();
+  let symlinkHops = 0;
 
   while (true) {
     try {
@@ -91,6 +93,10 @@ async function canonicalizeAsFarAsExists(inputPath: string): Promise<string> {
 
       const stats = await fs.lstat(current).catch(() => undefined);
       if (stats?.isSymbolicLink()) {
+        if (followedSymlinks.has(current) || ++symlinkHops > 40) {
+          throw new Error(`Too many symbolic links resolving '${inputPath}'`);
+        }
+        followedSymlinks.add(current);
         const target = await fs.readlink(current);
         current = path.isAbsolute(target)
           ? path.resolve(target)

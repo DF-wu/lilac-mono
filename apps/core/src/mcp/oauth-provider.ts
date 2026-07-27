@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import {
   auth,
+  UnauthorizedError,
   type OAuthAuthorizationServerInformation,
   type OAuthClientInformation,
   type OAuthClientMetadata,
@@ -23,11 +24,13 @@ import { resolveMcpValueSource, type McpValueResolutionContext } from "./value-s
 
 export const MCP_OAUTH_CALLBACK_URL = "http://localhost:1456/mcp/oauth/callback";
 const MAX_PENDING_AUTHORIZATIONS = 32;
+const PENDING_AUTHORIZATION_TTL_MS = 15 * 60 * 1000;
 
 type OAuthFetchFunction = NonNullable<Parameters<typeof auth>[1]["fetchFn"]>;
 
 type PendingAuthorization = {
   readonly state: string;
+  readonly createdAt: number;
   status: "starting" | "pending" | "completing";
   codeVerifier?: string;
   authorizationUrl?: string;
@@ -66,8 +69,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
   private readonly dataDir: string;
   private readonly valueContext: McpValueResolutionContext;
   private readonly fetchFn?: OAuthFetchFunction;
+  private readonly now: () => number;
   private readonly pending = new Map<string, PendingAuthorization>();
-  private implicitPending?: PendingAuthorization;
 
   constructor(options: {
     readonly serverId: string;
@@ -76,6 +79,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     readonly dataDir: string;
     readonly valueContext: McpValueResolutionContext;
     readonly fetchFn?: OAuthFetchFunction;
+    readonly now?: () => number;
   }) {
     this.serverId = options.serverId;
     this.serverUrl = options.serverUrl;
@@ -83,6 +87,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.dataDir = options.dataDir;
     this.valueContext = options.valueContext;
     this.fetchFn = options.fetchFn;
+    this.now = options.now ?? Date.now;
     this.redirectUrl = MCP_OAUTH_CALLBACK_URL;
   }
 
@@ -108,35 +113,49 @@ export class McpOAuthProvider implements OAuthClientProvider {
     await this.updateCredential((credential) => ({ ...credential, tokens }));
   }
 
-  redirectToAuthorization(authorizationUrl: URL): void {
-    const state = authorizationUrl.searchParams.get("state");
-    const pending = state ? this.pending.get(state) : undefined;
-    if (!pending || pending.authorizationUrl !== undefined) {
-      throw new McpOAuthProviderError(this.serverId, "start");
-    }
-    pending.authorizationUrl = authorizationUrl.href;
+  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier"): Promise<void> {
+    if (scope === "verifier") return;
+    await this.updateCredential((credential) => {
+      const { clientInformation, tokens, ...retained } = credential;
+      if (scope === "tokens") {
+        return clientInformation ? { ...retained, clientInformation } : retained;
+      }
+      if (scope === "client") return tokens ? { ...retained, tokens } : retained;
+      return retained;
+    });
   }
 
-  saveCodeVerifier(codeVerifier: string): void {
-    if (!this.implicitPending || !this.isActive(this.implicitPending)) {
-      throw new McpOAuthProviderError(this.serverId, "start");
-    }
-    this.implicitPending.codeVerifier = codeVerifier;
+  redirectToAuthorization(_authorizationUrl: URL): void {
+    this.rejectImplicitAuthorization();
+  }
+
+  saveCodeVerifier(_codeVerifier: string): void {
+    this.rejectImplicitAuthorization();
   }
 
   codeVerifier(): string {
-    if (!this.implicitPending?.codeVerifier || !this.isActive(this.implicitPending)) {
-      throw new McpOAuthProviderError(this.serverId, "complete");
-    }
-    return this.implicitPending.codeVerifier;
+    return this.rejectImplicitAuthorization();
   }
 
   async clientInformation(): Promise<OAuthClientInformation | undefined> {
+    const information = await this.clientInformationForAuthorization();
+    if (this.authConfig.client.type === "dynamic" && information === undefined) {
+      throw new UnauthorizedError("Interactive MCP authorization requires explicit mcp.auth");
+    }
+    return information;
+  }
+
+  async saveClientInformation(_clientInformation: OAuthClientInformation): Promise<void> {
+    this.rejectImplicitAuthorization();
+  }
+
+  private async clientInformationForAuthorization(): Promise<OAuthClientInformation | undefined> {
     if (this.authConfig.client.type === "dynamic") {
       const information = (await this.readCredential())?.clientInformation;
       if (
         information?.client_secret_expires_at !== undefined &&
-        information.client_secret_expires_at <= Date.now() / 1000
+        information.client_secret_expires_at !== 0 &&
+        information.client_secret_expires_at <= this.now() / 1000
       ) {
         return undefined;
       }
@@ -158,7 +177,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     return { client_id: clientId.value, client_secret: clientSecret.value };
   }
 
-  async saveClientInformation(clientInformation: OAuthClientInformation): Promise<void> {
+  private async persistClientInformation(clientInformation: OAuthClientInformation): Promise<void> {
     await this.updateCredential((credential) => ({ ...credential, clientInformation }));
   }
 
@@ -176,26 +195,19 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   state(): string {
-    const pending = this.createPendingAuthorization();
-    this.implicitPending = pending;
-    return pending.state;
+    return this.rejectImplicitAuthorization();
   }
 
-  saveState(state: string): void {
-    const pending = this.pending.get(state);
-    if (!pending) {
-      throw new McpOAuthProviderError(this.serverId, "start");
-    }
-    this.implicitPending = pending;
+  saveState(_state: string): void {
+    this.rejectImplicitAuthorization();
   }
 
   storedState(): string | undefined {
-    return this.implicitPending && this.isActive(this.implicitPending)
-      ? this.implicitPending.state
-      : undefined;
+    return undefined;
   }
 
   hasPendingState(state: string): boolean {
+    this.pruneExpiredPending();
     return this.pending.has(state);
   }
 
@@ -230,6 +242,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   async completeAuthorization(authorizationCode: string, callbackState: string): Promise<void> {
+    this.pruneExpiredPending();
     const pending = this.pending.get(callbackState);
     if (!pending || pending.status !== "pending" || authorizationCode.length === 0) {
       throw new McpOAuthProviderError(this.serverId, "complete");
@@ -253,11 +266,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   private createPendingAuthorization(): PendingAuthorization {
+    this.pruneExpiredPending();
     if (this.pending.size >= MAX_PENDING_AUTHORIZATIONS) {
       for (const [state, pending] of this.pending) {
         if (pending.status !== "pending") continue;
         this.pending.delete(state);
-        if (this.implicitPending === pending) this.implicitPending = undefined;
         break;
       }
     }
@@ -269,7 +282,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     do {
       state = randomBytes(32).toString("hex");
     } while (this.pending.has(state));
-    const pending: PendingAuthorization = { state, status: "starting" };
+    const pending: PendingAuthorization = { state, createdAt: this.now(), status: "starting" };
     this.pending.set(state, pending);
     return pending;
   }
@@ -283,6 +296,8 @@ export class McpOAuthProvider implements OAuthClientProvider {
         this.assertActive(pending, "complete");
         await this.saveTokens(tokens);
       },
+      invalidateCredentials: (scope: "all" | "client" | "tokens" | "verifier") =>
+        this.invalidateCredentials(scope),
       redirectToAuthorization: (authorizationUrl: URL) => {
         this.assertActive(pending, "start");
         if (
@@ -304,9 +319,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
         }
         return pending.codeVerifier;
       },
-      clientInformation: () => this.clientInformation(),
+      clientInformation: () => this.clientInformationForAuthorization(),
       saveClientInformation: (clientInformation: OAuthClientInformation) =>
-        this.saveClientInformation(clientInformation),
+        this.persistClientInformation(clientInformation),
       authorizationServerInformation: () => this.authorizationServerInformation(),
       saveAuthorizationServerInformation: (
         authorizationServerInformation: OAuthAuthorizationServerInformation,
@@ -333,7 +348,17 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
   private deletePending(pending: PendingAuthorization): void {
     if (this.isActive(pending)) this.pending.delete(pending.state);
-    if (this.implicitPending === pending) this.implicitPending = undefined;
+  }
+
+  private pruneExpiredPending(): void {
+    const now = this.now();
+    for (const [state, pending] of this.pending) {
+      if (pending.createdAt + PENDING_AUTHORIZATION_TTL_MS <= now) this.pending.delete(state);
+    }
+  }
+
+  private rejectImplicitAuthorization(): never {
+    throw new UnauthorizedError("Interactive MCP authorization requires explicit mcp.auth");
   }
 
   private async readCredential(): Promise<McpOAuthCredential | undefined> {
@@ -365,6 +390,7 @@ export class McpOAuthProviderService {
   private readonly dataDir: string;
   private readonly valueContext: McpValueResolutionContext;
   private readonly fetchFn?: OAuthFetchFunction;
+  private readonly now: () => number;
   private readonly providers = new Map<string, ProviderEntry>();
 
   constructor(options: {
@@ -372,6 +398,7 @@ export class McpOAuthProviderService {
     readonly configBaseDir?: string;
     readonly env?: Readonly<Record<string, string | undefined>>;
     readonly fetchFn?: OAuthFetchFunction;
+    readonly now?: () => number;
   }) {
     this.dataDir = options.dataDir;
     this.valueContext = {
@@ -379,6 +406,7 @@ export class McpOAuthProviderService {
       env: options.env ?? process.env,
     };
     this.fetchFn = options.fetchFn;
+    this.now = options.now ?? Date.now;
   }
 
   reconcile(config: UniversalMcpConfig): void {
@@ -399,6 +427,7 @@ export class McpOAuthProviderService {
           dataDir: this.dataDir,
           valueContext: this.valueContext,
           ...(this.fetchFn ? { fetchFn: this.fetchFn } : {}),
+          now: this.now,
         }),
       });
     }

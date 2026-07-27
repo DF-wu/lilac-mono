@@ -39,6 +39,18 @@ describe("analyzeBashCommand", () => {
     expect(
       analyzeBashCommand("printf nope > /data/secret/mcp-oauth/docs.json", options),
     ).not.toBeNull();
+    expect(
+      analyzeBashCommand("tar -C/data/secret -cf /tmp/credentials.tar .", options),
+    ).not.toBeNull();
+    expect(
+      analyzeBashCommand("tar -C=/data/secret -cf /tmp/credentials.tar .", options),
+    ).not.toBeNull();
+    expect(
+      analyzeBashCommand("env -C/data/secret cat mcp-oauth/docs.json", options),
+    ).not.toBeNull();
+    expect(
+      analyzeBashCommand("env -C/data/secret bash -c 'cat mcp-oauth/docs.json'", options),
+    ).not.toBeNull();
     expect(analyzeBashCommand('cat "$credential_path"', options)).toBeNull();
   });
 

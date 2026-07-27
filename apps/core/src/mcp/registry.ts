@@ -392,7 +392,10 @@ export class McpRegistry implements McpRegistryApi {
           return freezeOutcome({
             serverId,
             reconciliation,
-            result: "unavailable",
+            result:
+              latest?.status.status === "authentication_required"
+                ? "authentication_required"
+                : "unavailable",
             error:
               latest?.status.status === "unavailable" ||
               latest?.status.status === "authentication_required"
@@ -767,12 +770,13 @@ export class McpRegistry implements McpRegistryApi {
     if (!current || current.client !== client || current.status.status !== "available") return;
 
     const message = safeErrorText(error, current.sensitiveValues);
+    const status = this.failureStatus(current.definition, error);
     this.entries.set(serverId, {
       ...current,
       status: Object.freeze({
         serverId,
         transport: current.definition.transportConfig.transport,
-        status: "unavailable",
+        status,
         phase: "runtime",
         error: message,
       }),

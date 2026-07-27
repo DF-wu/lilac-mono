@@ -222,6 +222,7 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
       cwd: options.cwd,
       effectiveCwd: commandEffectiveCwd,
       protectedPaths: options.protectedPaths,
+      inspectAttachedDirectoryOption: normalizedHead === "tar",
     });
     if (protectedPathReason) return protectedPathReason;
   }
@@ -794,7 +795,9 @@ export function analyzeSensitiveTokens(tokens: readonly string[]): string | null
 
 export function analyzeProtectedPathTokens(
   tokens: readonly string[],
-  options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd" | "protectedPaths">,
+  options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd" | "protectedPaths"> & {
+    readonly inspectAttachedDirectoryOption?: boolean;
+  },
 ): string | null {
   if (!options.protectedPaths || options.protectedPaths.length === 0) return null;
 
@@ -807,8 +810,16 @@ export function analyzeProtectedPathTokens(
 
     const staticToken = stripExpansionMarkers(token);
     const equalsIndex = staticToken.indexOf("=");
+    const attachedDirectory =
+      options.inspectAttachedDirectoryOption && staticToken.startsWith("-C")
+        ? staticToken.slice(2).replace(/^=/u, "")
+        : undefined;
     const candidates =
-      equalsIndex > 0 ? [staticToken, staticToken.slice(equalsIndex + 1)] : [staticToken];
+      equalsIndex > 0
+        ? [staticToken, staticToken.slice(equalsIndex + 1)]
+        : attachedDirectory
+          ? [attachedDirectory]
+          : [staticToken];
 
     for (const candidate of candidates) {
       if (!candidate || candidate === "-" || candidate.startsWith("-")) continue;
