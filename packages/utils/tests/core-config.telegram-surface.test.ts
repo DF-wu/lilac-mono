@@ -1,6 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
-import { parseCoreConfig } from "../core-config";
+import { isTelegramSurfaceUsable, parseCoreConfig, resolveTelegramToken } from "../core-config";
 
 describe("core config surface.telegram", () => {
   it("is disabled by default on v2 so existing deployments are unaffected", async () => {
@@ -101,6 +101,11 @@ describe("core config surface.telegram", () => {
     expect(seen).toContain("surface.telegram");
   });
 
+  it("keeps a disabled surface usable only when explicitly enabled", async () => {
+    const cfg = await parseCoreConfig({ configVersion: 2 });
+    expect(isTelegramSurfaceUsable(cfg)).toBe(false);
+  });
+
   it("returns independent default objects per parse", async () => {
     const a = await parseCoreConfig({ configVersion: 2 });
     const b = await parseCoreConfig({ configVersion: 2 });
@@ -108,5 +113,72 @@ describe("core config surface.telegram", () => {
     a.surface.telegram.allowedChatIds.push("mutated");
 
     expect(b.surface.telegram.allowedChatIds).toEqual([]);
+  });
+});
+
+describe("telegram surface gating", () => {
+  const ENV_KEY = "TELEGRAM_BOT_TOKEN";
+  let previous: string | undefined;
+
+  beforeEach(() => {
+    previous = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+  });
+
+  afterEach(() => {
+    if (previous === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = previous;
+  });
+
+  it("is unusable while disabled, even with a token present", async () => {
+    process.env[ENV_KEY] = "123:abc";
+    const cfg = await parseCoreConfig({ configVersion: 2 });
+
+    expect(isTelegramSurfaceUsable(cfg)).toBe(false);
+  });
+
+  it("is unusable when enabled without a token", async () => {
+    // Enabling the surface must not break startup for a deployment that has
+    // no credentials configured; the runtime warns and continues instead.
+    const cfg = await parseCoreConfig({
+      configVersion: 2,
+      surface: { telegram: { enabled: true } },
+    });
+
+    expect(isTelegramSurfaceUsable(cfg)).toBe(false);
+  });
+
+  it("is usable once enabled and a token is present", async () => {
+    process.env[ENV_KEY] = "123:abc";
+    const cfg = await parseCoreConfig({
+      configVersion: 2,
+      surface: { telegram: { enabled: true } },
+    });
+
+    expect(isTelegramSurfaceUsable(cfg)).toBe(true);
+  });
+
+  it("honours a custom tokenEnv", async () => {
+    process.env.MY_TELEGRAM_TOKEN = "123:abc";
+    try {
+      const cfg = await parseCoreConfig({
+        configVersion: 2,
+        surface: { telegram: { enabled: true, tokenEnv: "MY_TELEGRAM_TOKEN" } },
+      });
+
+      expect(isTelegramSurfaceUsable(cfg)).toBe(true);
+      expect(resolveTelegramToken(cfg)).toBe("123:abc");
+    } finally {
+      delete process.env.MY_TELEGRAM_TOKEN;
+    }
+  });
+
+  it("names the missing env var when resolving a token that is not set", async () => {
+    const cfg = await parseCoreConfig({
+      configVersion: 2,
+      surface: { telegram: { enabled: true, tokenEnv: "ABSENT_TELEGRAM_TOKEN" } },
+    });
+
+    expect(() => resolveTelegramToken(cfg)).toThrow("ABSENT_TELEGRAM_TOKEN");
   });
 });
