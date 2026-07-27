@@ -7,6 +7,19 @@ the architecture on `expr/mcp-attempt-1`; that branch remains useful as a source
 of config, OAuth, transport, and test cases, but its runtime and lifecycle should
 not be merged wholesale.
 
+### Implementation Progress
+
+- [x] Map active architecture and identify narrowly reusable attempt-1 code.
+- [x] Add strict versioned MCP config parsing and value-source resolution.
+- [x] Add the process-wide MCP registry, complete pagination, and explicit reload.
+- [x] Add source-neutral catalog naming, search, and durable session selection.
+- [x] Freeze tool declaration and execution authority per model step.
+- [x] Enable Claude Code native `ToolSearch` over the complete deferred catalog.
+- [x] Add generic `tools mcp.*` management and persistent loopback OAuth.
+- [x] Add secret-path guards, management skill, templates, and documentation.
+- [x] Remove stale attempt-1 workspace directories.
+- [x] Pass focused tests, package typechecks, lint, format, and full test suite.
+
 The design keeps the first attempt's broad product goal while changing the
 implementation around six decisions:
 
