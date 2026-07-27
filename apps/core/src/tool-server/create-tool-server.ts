@@ -89,6 +89,82 @@ function safeJsonPreview(value: unknown, maxChars = 2000): string {
   return raw.length > maxChars ? `${raw.slice(0, maxChars)}...` : raw;
 }
 
+function safeToolInputPreview(callableId: string, input: unknown): string {
+  if (callableId === "mcp.add") return "<redacted mcp.add input>";
+  if (callableId.startsWith("workflow.")) return "<redacted workflow input>";
+  return safeJsonPreview(input);
+}
+
+function redactUrlQuery(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.username) url.username = "<redacted>";
+    if (url.password) url.password = "<redacted>";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "<redacted-url>";
+  }
+}
+
+function collectMcpAddSensitiveValues(input: unknown): string[] {
+  const values = new Set<string>();
+
+  const collectStrings = (value: unknown): void => {
+    if (typeof value === "string") {
+      if (value.length > 0) values.add(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collectStrings(item);
+      return;
+    }
+    if (!isRecord(value)) return;
+    for (const nested of Object.values(value)) collectStrings(nested);
+  };
+
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    if (!isRecord(value)) return;
+
+    for (const [key, nested] of Object.entries(value)) {
+      const normalizedKey = key.toLowerCase().replaceAll("_", "");
+      if (
+        normalizedKey === "headers" ||
+        normalizedKey === "env" ||
+        normalizedKey === "clientsecret"
+      ) {
+        collectStrings(nested);
+      }
+      visit(nested);
+    }
+  };
+
+  visit(input);
+  return [...values].sort((left, right) => right.length - left.length);
+}
+
+function safeMcpAddError(error: unknown, input: unknown): { name: string; message: string } {
+  let name = error instanceof Error ? error.name : "unknown";
+  let message = error instanceof Error ? error.message : String(error);
+
+  name = name.replace(/https?:\/\/[^\s"'<>]+/giu, redactUrlQuery);
+  message = message.replace(/https?:\/\/[^\s"'<>]+/giu, redactUrlQuery);
+  for (const value of collectMcpAddSensitiveValues(input)) {
+    const escapedValue = JSON.stringify(value).slice(1, -1);
+    for (const candidate of new Set([value, escapedValue])) {
+      name = name.replaceAll(candidate, "<redacted>");
+      message = message.replaceAll(candidate, "<redacted>");
+    }
+  }
+
+  return { name, message };
+}
+
 function headerStr(h: unknown): string | undefined {
   return typeof h === "string" && h.length > 0 ? h : undefined;
 }
@@ -638,9 +714,7 @@ export function createToolServer(options: ToolServerOptions) {
 
       logger.debug("tool call input", {
         callableId: body.callableId,
-        input: safeJsonPreview(
-          body.callableId.startsWith("workflow.") ? "<redacted workflow input>" : body.input,
-        ),
+        input: safeToolInputPreview(body.callableId, body.input),
       });
 
       try {
@@ -742,23 +816,37 @@ export function createToolServer(options: ToolServerOptions) {
             cancelled: combinedSignal.aborted,
           });
         }
-        logger.error(
-          "tool.call.result",
-          {
-            callableId: body.callableId,
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            requestClient: ctx.requestClient,
-            inputBytes,
-            durationMs: Date.now() - startedAt,
-            timeoutMs,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-            cancelled: combinedSignal.aborted,
-            ...extractAiErrorLogDetails(e),
-          },
-          e,
-        );
+        const errorLogDetails = {
+          callableId: body.callableId,
+          requestId: ctx.requestId,
+          sessionId: ctx.sessionId,
+          requestClient: ctx.requestClient,
+          inputBytes,
+          durationMs: Date.now() - startedAt,
+          timeoutMs,
+          ok: false,
+          errorClass: e instanceof Error ? e.name : "unknown",
+          cancelled: combinedSignal.aborted,
+        };
+        if (body.callableId === "mcp.add") {
+          // ToolInputValidationError retains its raw input, so never pass this error to the logger.
+          const safeError =
+            e instanceof ToolInputValidationError ? undefined : safeMcpAddError(e, body.input);
+          logger.error("tool.call.result", {
+            ...errorLogDetails,
+            errorClass: safeError?.name ?? "ToolInputValidationError",
+            ...(safeError ? { error: safeError } : {}),
+          });
+        } else {
+          logger.error(
+            "tool.call.result",
+            {
+              ...errorLogDetails,
+              ...extractAiErrorLogDetails(e),
+            },
+            e,
+          );
+        }
 
         return {
           isError: true,

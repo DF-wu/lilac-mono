@@ -314,6 +314,137 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
+  it("treats mcp.add as an opaque callable ID and flattens positional and flag input", async () => {
+    const requests: Array<{ pathname: string; body?: unknown }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const pathname = new URL(req.url).pathname;
+        if (pathname === "/help/mcp.add") {
+          requests.push({ pathname });
+          return Response.json({ primaryPositional: { field: "serverId" } });
+        }
+
+        requests.push({ pathname, body: (await req.json()) as unknown });
+        return Response.json({ isError: false, output: { ok: true } });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: [
+          "mcp.add",
+          "demo",
+          "--transport=http",
+          "--url=https://mcp.example.test/service",
+          "--output=json",
+        ],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(requests).toEqual([
+        { pathname: "/help/mcp.add" },
+        {
+          pathname: "/call",
+          body: {
+            callableId: "mcp.add",
+            input: {
+              serverId: "demo",
+              transport: "http",
+              url: "https://mcp.example.test/service",
+            },
+          },
+        },
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("calls mcp.reload with and without its serverId positional", async () => {
+    const requests: Array<{ pathname: string; body?: unknown }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const pathname = new URL(req.url).pathname;
+        if (pathname === "/help/mcp.reload") {
+          requests.push({ pathname });
+          return Response.json({ primaryPositional: { field: "serverId" } });
+        }
+
+        requests.push({ pathname, body: (await req.json()) as unknown });
+        return Response.json({ isError: false, output: { ok: true } });
+      },
+    });
+
+    try {
+      const withServerId = await runToolBridgeCli({
+        args: ["mcp.reload", "demo", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+      const withoutServerId = await runToolBridgeCli({
+        args: ["mcp.reload", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(withServerId.exitCode).toBe(0);
+      expect(withServerId.stderr).toBe("");
+      expect(withoutServerId.exitCode).toBe(0);
+      expect(withoutServerId.stderr).toBe("");
+      expect(requests).toEqual([
+        { pathname: "/help/mcp.reload" },
+        {
+          pathname: "/call",
+          body: { callableId: "mcp.reload", input: { serverId: "demo" } },
+        },
+        {
+          pathname: "/call",
+          body: { callableId: "mcp.reload", input: {} },
+        },
+      ]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("forwards structured mcp.add stdin JSON unchanged", async () => {
+    const bodies: unknown[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        bodies.push((await req.json()) as unknown);
+        return Response.json({ isError: false, output: { ok: true } });
+      },
+    });
+    const input = {
+      serverId: "local-docs",
+      transport: "stdio",
+      command: "bun",
+      args: ["run", "server.ts"],
+      cwd: "/workspace",
+      env: { DOCS_TOKEN: { env: "DOCS_TOKEN" } },
+    };
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["mcp.add", "--stdin", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+        stdin: JSON.stringify(input),
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(bodies).toEqual([{ callableId: "mcp.add", input }]);
+    } finally {
+      server.stop(true);
+    }
+  });
+
   it("exits nonzero and writes stderr when the backend returns a tool error", async () => {
     const server = Bun.serve({
       port: 0,
