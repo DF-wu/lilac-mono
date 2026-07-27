@@ -4,7 +4,7 @@ import {
   PARANOID_INTERPRETERS_SUFFIX,
   SHELL_WRAPPERS,
 } from "../types";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { analyzeGit } from "../rules-git";
 import { analyzeRm } from "../rules-rm";
@@ -217,6 +217,22 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
   if (SENSITIVE_PATH_CONSUMERS.has(normalizedHead)) {
     const sensitiveReason = analyzeSensitiveTokens(staticTokens);
     if (sensitiveReason) return sensitiveReason;
+
+    const protectedPathReason = analyzeProtectedPathTokens(stripped, {
+      cwd: options.cwd,
+      effectiveCwd: commandEffectiveCwd,
+      protectedPaths: options.protectedPaths,
+    });
+    if (protectedPathReason) return protectedPathReason;
+  }
+
+  if (normalizedHead === "cd") {
+    const protectedPathReason = analyzeProtectedPathTokens(stripped, {
+      cwd: options.cwd,
+      effectiveCwd: commandEffectiveCwd,
+      protectedPaths: options.protectedPaths,
+    });
+    if (protectedPathReason) return protectedPathReason;
   }
 
   const { cwdForRm, originalCwd } = deriveCwdContext({
@@ -773,5 +789,48 @@ export function analyzeSensitiveTokens(tokens: readonly string[]): string | null
       if (re.test(token)) return reason;
     }
   }
+  return null;
+}
+
+export function analyzeProtectedPathTokens(
+  tokens: readonly string[],
+  options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd" | "protectedPaths">,
+): string | null {
+  if (!options.protectedPaths || options.protectedPaths.length === 0) return null;
+
+  const effectiveCwd =
+    options.effectiveCwd === null ? undefined : (options.effectiveCwd ?? options.cwd);
+  const protectedPaths = options.protectedPaths.map((protectedPath) => resolve(protectedPath));
+
+  for (const token of tokens) {
+    if (!token || hasDynamicExpansion(token.replaceAll(GLOB_EXPANSION_MARKER, ""))) continue;
+
+    const staticToken = stripExpansionMarkers(token);
+    const equalsIndex = staticToken.indexOf("=");
+    const candidates =
+      equalsIndex > 0 ? [staticToken, staticToken.slice(equalsIndex + 1)] : [staticToken];
+
+    for (const candidate of candidates) {
+      if (!candidate || candidate === "-" || candidate.startsWith("-")) continue;
+      if (!isAbsolute(candidate) && !effectiveCwd) continue;
+
+      let resolvedCandidate: string;
+      if (isAbsolute(candidate)) {
+        resolvedCandidate = resolve(candidate);
+      } else {
+        if (!effectiveCwd) continue;
+        resolvedCandidate = resolve(effectiveCwd, candidate);
+      }
+      for (const protectedPath of protectedPaths) {
+        if (
+          resolvedCandidate === protectedPath ||
+          relative(protectedPath, resolvedCandidate).split(sep)[0] !== ".."
+        ) {
+          return "access to a configured protected path";
+        }
+      }
+    }
+  }
+
   return null;
 }

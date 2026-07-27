@@ -1,8 +1,13 @@
 import type { ServerTool } from "@stanley2058/lilac-plugin-runtime";
-import { LEVEL1_TOOL_NAMES } from "@stanley2058/lilac-coding-tools/schemas";
+import { LEVEL1_TOOL_NAMES, type ApplyPatchInput } from "@stanley2058/lilac-coding-tools/schemas";
+import { expandTilde } from "@stanley2058/lilac-fs";
 import { resolveNativeSubagentProfile } from "@stanley2058/lilac-utils";
+import fs from "node:fs/promises";
+import path from "node:path";
 
+import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import { applyPatchTool } from "../../tools/apply-patch";
+import { parsePatch } from "../../tools/apply-patch/local-apply-patch-tool";
 import {
   batchTool,
   collectApplyPatchTouchedPaths,
@@ -64,6 +69,109 @@ function getFsReadOnlyTool(
 
 function getEditFileTool(context: CoreToolBuildContext): unknown {
   return (getFsTools(context) as Record<string, unknown>)["edit_file"];
+}
+
+function isPathWithin(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+async function canonicalizeAsFarAsExists(inputPath: string): Promise<string> {
+  let current = path.resolve(inputPath);
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      return path.resolve(await fs.realpath(current), ...missingSegments);
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error
+          ? Reflect.get(error, "code")
+          : undefined;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+
+      const stats = await fs.lstat(current).catch(() => undefined);
+      if (stats?.isSymbolicLink()) {
+        const target = await fs.readlink(current);
+        current = path.isAbsolute(target)
+          ? path.resolve(target)
+          : path.resolve(path.dirname(current), target);
+        continue;
+      }
+
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(current, ...missingSegments);
+      missingSegments.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+async function assertLocalApplyPatchPathsAllowed(params: {
+  input: ApplyPatchInput;
+  defaultCwd: string;
+  denyPath: string;
+}): Promise<void> {
+  const cwdTarget = parseSshCwdTarget(params.input.cwd ?? params.defaultCwd);
+  if (cwdTarget.kind !== "local") return;
+
+  const baseDir = path.resolve(expandTilde(cwdTarget.cwd || params.defaultCwd));
+  const denyResolved = path.resolve(expandTilde(params.denyPath));
+  const denyCanonical = await fs.realpath(denyResolved).catch(() => denyResolved);
+  const hunks = parsePatch(params.input.patchText);
+  const targets = hunks.flatMap((hunk) => [
+    hunk.path,
+    ...(hunk.type === "update" && hunk.movePath ? [hunk.movePath] : []),
+  ]);
+
+  // This closes ordinary lexical and symlink aliases, but remains a best-effort guardrail rather
+  // than filesystem isolation: another process can still race path resolution and patch writes.
+  for (const target of targets) {
+    const resolved = path.isAbsolute(target) ? path.resolve(target) : path.resolve(baseDir, target);
+    const canonical = await canonicalizeAsFarAsExists(resolved);
+    if (
+      isPathWithin(resolved, denyResolved) ||
+      isPathWithin(resolved, denyCanonical) ||
+      isPathWithin(canonical, denyResolved) ||
+      isPathWithin(canonical, denyCanonical)
+    ) {
+      throw new Error(`Access denied: '${resolved}' is blocked for apply_patch`);
+    }
+  }
+}
+
+function getApplyPatchTool(context: CoreToolBuildContext) {
+  const denyPath = context.runtime.dataDir
+    ? path.join(context.runtime.dataDir, "secret")
+    : undefined;
+  const guarded = applyPatchTool({
+    cwd: context.cwd,
+    denyPaths: denyPath ? [denyPath] : undefined,
+  }).apply_patch;
+  if (!denyPath) return guarded;
+
+  const unrestricted = applyPatchTool({ cwd: context.cwd }).apply_patch;
+  const guardedExecute = guarded.execute;
+  const unrestrictedExecute = unrestricted.execute;
+  if (!guardedExecute || !unrestrictedExecute) return guarded;
+
+  return {
+    ...guarded,
+    description: `${guarded.description} Local denylist checks are best-effort guardrails, not filesystem isolation.`,
+    execute: async (...args: Parameters<typeof guardedExecute>) => {
+      const [input] = args;
+      if (input.dangerouslyAllow === true) return unrestrictedExecute(...args);
+
+      try {
+        await assertLocalApplyPatchPathsAllowed({ input, defaultCwd: context.cwd, denyPath });
+      } catch (error) {
+        return {
+          status: "failed" as const,
+          output: error instanceof Error ? error.message : String(error),
+        };
+      }
+      return guardedExecute(...args);
+    },
+  };
 }
 
 function withBuiltinMetadata(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
@@ -166,10 +274,7 @@ export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
       isEnabled: (context) =>
         context.editingToolMode === "apply_patch" &&
         context.requestContext?.safetyMode !== "restricted",
-      createTool: (context) =>
-        applyPatchTool({
-          cwd: context.cwd,
-        }).apply_patch,
+      createTool: (context) => getApplyPatchTool(context),
       editTargets: (args, context) => {
         const record = args as Record<string, unknown>;
         if (typeof record.patchText !== "string") {

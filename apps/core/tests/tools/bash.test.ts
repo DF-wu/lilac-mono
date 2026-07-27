@@ -71,6 +71,51 @@ describe("executeBash", () => {
     expect(res.stdout).toContain("hello");
   });
 
+  it("executes the original callback URL while redacting only displayed command text", async () => {
+    const callbackUrl =
+      "http://localhost/callback?code=execution-code&state=execution-state&other=visible";
+    const res = await executeBash({
+      command: `value=${JSON.stringify(callbackUrl)}; test "$value" = ${JSON.stringify(callbackUrl)} && printf original-preserved`,
+    });
+
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe("original-preserved");
+  });
+
+  it("blocks direct static access to MCP credentials in DATA_DIR/secret", async () => {
+    const credentialPath = path.join(env.dataDir, "secret", "mcp-oauth", "docs.json");
+    const commands = [
+      `cat ${JSON.stringify(credentialPath)}`,
+      `printf nope > ${JSON.stringify(credentialPath)}`,
+    ];
+
+    for (const command of commands) {
+      const result = await executeBash({ command });
+      expect(result.executionError, command).toMatchObject({
+        type: "blocked",
+        reason: "access to a configured protected path",
+      });
+      expect(result.exitCode).toBe(-1);
+    }
+  });
+
+  it("resolves static protected paths relative to trusted Bash cwd", async () => {
+    const workspace = path.join(env.dataDir, "workspace");
+    const relativeCredentialPath = path.relative(
+      workspace,
+      path.join(env.dataDir, "secret", "mcp-oauth", "docs.json"),
+    );
+    const result = await executeBash({
+      command: `cat ${JSON.stringify(relativeCredentialPath)}`,
+      cwd: workspace,
+    });
+
+    expect(result.executionError).toMatchObject({
+      type: "blocked",
+      reason: "access to a configured protected path",
+    });
+  });
+
   it("executes the smoke loop with Bash parameter expansion", async () => {
     const res = await executeBash({
       command: `for spec in "fetch tools one" "read tools two"; do

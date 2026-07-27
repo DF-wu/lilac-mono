@@ -17,6 +17,7 @@ import {
 } from "../shell";
 
 import {
+  analyzeProtectedPathTokens,
   analyzeSegment,
   analyzeSensitiveTokens,
   COMMAND_EXECUTION_WRAPPERS,
@@ -788,7 +789,13 @@ function analyzeRedirections(
     if (analyzed.blocked) return analyzed.blocked;
 
     if (redirection.operator !== "<<<") {
-      const reason = analyzeSensitiveTokens([analyzed.value.text]);
+      const reason =
+        analyzeSensitiveTokens([analyzed.value.text]) ??
+        analyzeProtectedPathTokens([analyzed.value.text], {
+          cwd: context.originalCwd,
+          effectiveCwd: state.cwd,
+          protectedPaths: context.options.protectedPaths,
+        });
       if (reason) return { reason, segment };
     }
   }
@@ -924,7 +931,14 @@ function analyzeConditionalExpression(
       if (left.blocked) return left.blocked;
       const right = analyzeWord(expression.right, context, state, segment, stdinSource);
       if (right.blocked) return right.blocked;
-      const reason = analyzeSensitiveTokens([left.value.text, right.value.text]);
+      const tokens = [left.value.text, right.value.text];
+      const reason =
+        analyzeSensitiveTokens(tokens) ??
+        analyzeProtectedPathTokens(tokens, {
+          cwd: context.originalCwd,
+          effectiveCwd: state.cwd,
+          protectedPaths: context.options.protectedPaths,
+        });
       return reason ? { reason, segment } : null;
     }
     case "CondUnary":
@@ -937,7 +951,13 @@ function analyzeConditionalExpression(
         stdinSource,
       );
       if (word.blocked) return word.blocked;
-      const reason = analyzeSensitiveTokens([word.value.text]);
+      const reason =
+        analyzeSensitiveTokens([word.value.text]) ??
+        analyzeProtectedPathTokens([word.value.text], {
+          cwd: context.originalCwd,
+          effectiveCwd: state.cwd,
+          protectedPaths: context.options.protectedPaths,
+        });
       return reason ? { reason, segment } : null;
     }
     case "CondNot":

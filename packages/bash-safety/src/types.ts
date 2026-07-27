@@ -5,6 +5,8 @@ export interface AnalyzeResult {
 
 export interface AnalyzeOptions {
   cwd?: string;
+  /** Absolute paths whose direct static access should be blocked. */
+  protectedPaths?: readonly string[];
   /** Block non-temp rm -rf even within cwd */
   paranoidRm?: boolean;
   /** Block interpreter one-liners (python -c, node -e, etc.) */

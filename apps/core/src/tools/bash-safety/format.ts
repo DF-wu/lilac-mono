@@ -42,7 +42,7 @@ export function redactSecrets(text: string, literalSecrets: readonly string[] = 
   let result = redactLiteralSecrets(text, literalSecrets);
 
   result = result.replace(
-    /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|KEY|CREDENTIALS)[A-Z0-9_]*)=([^\s]+)/gi,
+    /(?<![?&])\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|KEY|CREDENTIALS)[A-Z0-9_]*)=([^\s]+)/gi,
     "$1=<redacted>",
   );
 
@@ -50,6 +50,8 @@ export function redactSecrets(text: string, literalSecrets: readonly string[] = 
   result = result.replace(/(authorization\s*:\s*)([^\s"']+)(\s+[^\s"']+)?/gi, "$1<redacted>");
 
   result = result.replace(/(https?:\/\/)([^\s/:@]+):([^\s@]+)@/gi, "$1<redacted>:<redacted>@");
+
+  result = result.replace(/([?&](?:code|state|token|key|secret)=)([^&#\s"']*)/gi, "$1<redacted>");
 
   result = result.replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "<redacted>");
   result = result.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "<redacted>");
