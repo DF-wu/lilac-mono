@@ -231,6 +231,16 @@ adapter against a **fake Bot API server** (`apps/core/tests/surface/telegram/fak
 cd apps/core && bun test tests/surface/telegram/
 ```
 
+To run the same suite in an isolated container — read-only repo mount,
+`--network none`, scratch state in tmpfs, nothing written to the host:
+
+```bash
+docker/verify-telegram.sh
+```
+
+`--network none` is deliberate: it proves the suite has no hidden dependency on
+the real Bot API.
+
 For a real smoke test:
 
 1. Configure your DM chat id and start the runtime.

@@ -111,15 +111,15 @@ webhook handler. We deliberately do **not** copy that shortcut (per D1).
 | Phase | Scope | Issue | Status |
 |-------|-------|-------|--------|
 | 0 | Branch, plan doc, tracking issues | [#31](https://github.com/DF-wu/lilac-mono/issues/31) | done |
-| 1 | Generalize surface types + relay to 3 platforms | [#32](https://github.com/DF-wu/lilac-mono/issues/32) | pending |
-| 2 | `core-config` `surface.telegram` schema (v2 + v1 fallback) | [#33](https://github.com/DF-wu/lilac-mono/issues/33) | pending |
-| 3 | `TelegramAdapter` (grammY, long polling) | [#34](https://github.com/DF-wu/lilac-mono/issues/34) | pending |
-| 4 | `TelegramOutputStream` (throttled streaming, chunking, HTML) | [#35](https://github.com/DF-wu/lilac-mono/issues/35) | pending |
-| 5 | Platform-aware request router | [#36](https://github.com/DF-wu/lilac-mono/issues/36) | pending |
-| 6 | Attachments, cancel buttons, reactions, command menu | [#37](https://github.com/DF-wu/lilac-mono/issues/37) | pending |
-| 7 | Runtime wiring in `create-core-runtime.ts` | [#38](https://github.com/DF-wu/lilac-mono/issues/38) | pending |
-| 8 | Tests: unit + fake Bot API integration in container | [#39](https://github.com/DF-wu/lilac-mono/issues/39) | pending |
-| 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | pending |
+| 1 | Generalize surface types + relay to 3 platforms | [#32](https://github.com/DF-wu/lilac-mono/issues/32) | done |
+| 2 | `core-config` `surface.telegram` schema (v2 + v1 fallback) | [#33](https://github.com/DF-wu/lilac-mono/issues/33) | done |
+| 3 | `TelegramAdapter` (grammY, long polling) | [#34](https://github.com/DF-wu/lilac-mono/issues/34) | done |
+| 4 | `TelegramOutputStream` (throttled streaming, chunking, HTML) | [#35](https://github.com/DF-wu/lilac-mono/issues/35) | done |
+| 5 | Platform-aware request router | [#36](https://github.com/DF-wu/lilac-mono/issues/36) | done |
+| 6 | Attachments, cancel buttons, reactions, command menu | [#37](https://github.com/DF-wu/lilac-mono/issues/37) | done (inbound attachments deferred to [#42](https://github.com/DF-wu/lilac-mono/issues/42)) |
+| 7 | Runtime wiring in `create-core-runtime.ts` | [#38](https://github.com/DF-wu/lilac-mono/issues/38) | done |
+| 8 | Tests: unit + fake Bot API integration in container | [#39](https://github.com/DF-wu/lilac-mono/issues/39) | in progress |
+| 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | in progress |
 
 ---
 
@@ -188,6 +188,47 @@ render the equivalent UI.
 - Validated the development bot token via `getMe`: `@Catalina_agentbot`, privacy mode ON.
 - Recorded decisions D1–D10 above.
 - Wrote this plan.
+- **Phase 1** (`de33ed8`): added Telegram session/message refs, widened the shared
+  `SessionRef`/`MsgRef` unions, and generalized the output relay. Replaced the
+  scattered `platform === "discord"` gates with two named capability predicates
+  (`supportsStreamingProgressUi`, `supportsCreatedOutputCleanup`) and made
+  `replyTo` resolution an exhaustive switch so a missing platform branch is a
+  compile error. Telegram request ids parse from the last colon, since forum
+  session ids embed one.
+- **Phase 2** (`f7d71df`): added `surface.telegram` to `UniversalCoreConfig` and
+  the v2 schema, with a synthesised disabled fallback for frozen v1 configs.
+  A new test caught a real defect while writing it: Zod evaluates a literal
+  `.default()` once at module load and hands it out by reference, so every
+  parsed config shared the same nested arrays. Switched the v2 surface default
+  to a lazy factory.
+- **Phase 3** (`a610260`): `TelegramAdapter` over grammY long polling. Added a
+  local SQLite index because the Bot API has no history endpoint — for Telegram
+  this is not a cache but the only source of past messages.
+- **Phase 4** (`2a88faf`): throttled output stream with edit dedupe, 4096-char
+  tag-aware chunking, a markdown→HTML renderer that only emits tags it generated
+  itself, 429 `retry_after` handling, and a plain-text fallback on entity errors.
+- **Phase 5** (`62f4cf8`): made the request router platform-aware. Key
+  simplification: one router instance runs per adapter, so the platform is a
+  closure-level constant rather than something derived per message.
+  `getDiscordFlags` became `getSurfaceFlags(raw, platform)`, reading the
+  `raw.<platform>` envelope both adapters publish in the same shape.
+- **Phase 7** (`be56ab1`): runtime wiring, gated on `enabled` + token presence,
+  plus a `telegram.ready` health check and graceful-restart participation.
+- **Phase 6 / docs** (`11cacec`): outbound attachment delivery, cancel button
+  routed to `adapter.request.cancel` (it was reaching the workflow action
+  resolver instead), and `docs/telegram-surface.md`.
+
+#### Deviations from the original plan
+
+- **Inbound attachments deferred** to [#42](https://github.com/DF-wu/lilac-mono/issues/42).
+  Discord attachments ride on stable CDN URLs and `request-composition/attachments.ts`
+  is built around that. Telegram needs `getFile` + an authenticated, expiring
+  download, which calls for a platform-neutral resolution seam rather than a
+  second URL scheme bolted onto the Discord path. Captions still reach the agent.
+- **Two pre-existing failures on `main`** were found while establishing a baseline
+  and filed as [#41](https://github.com/DF-wu/lilac-mono/issues/41): a typecheck
+  error in `packages/mini-lilac-runtime` and a wall-clock-dependent heartbeat
+  test. Neither is caused by this branch.
 
 ---
 
