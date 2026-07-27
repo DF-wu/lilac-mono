@@ -2,7 +2,6 @@ import { useMemo, useState } from "react";
 import {
   Background,
   BackgroundVariant,
-  Controls,
   MarkerType,
   MiniMap,
   ReactFlow,
@@ -30,6 +29,7 @@ import {
   type ArchitectureFlowNode,
   type StageFlowNode,
 } from "./architecture-node";
+import { MapControls } from "./map-controls";
 import { SourceLinks } from "./source-links";
 
 const NODE_TYPES = {
@@ -214,7 +214,7 @@ function CatalogView({
   onSelect: (node: SystemNodeData) => void;
 }) {
   return (
-    <div className="map-catalog" aria-label="架構元件文字清單">
+    <section className="map-catalog" aria-label="架構元件文字清單">
       {nodes.map((node) => (
         <button
           className="catalog-row"
@@ -233,7 +233,7 @@ function CatalogView({
           <ArrowRight aria-hidden="true" size={16} />
         </button>
       ))}
-    </div>
+    </section>
   );
 }
 
@@ -276,7 +276,8 @@ export function SystemMapView() {
           <p className="view-kicker">VERSION 01 / STATIC + BOUNDARIES</p>
           <h1 id="map-title">Lilac 全系統地圖</h1>
           <p>
-            先沿箭頭讀主路徑，再點任一元件檢查責任、風險與原始碼。固定布局保留跨視圖的空間記憶。
+            先沿箭頭讀主路徑，再點任一元件檢查責任、風險
+            <span className="no-break">與原始碼</span>。固定布局保留跨視圖的空間記憶。
           </p>
         </div>
         <dl className="metric-strip" aria-label="架構快照統計">
@@ -352,7 +353,7 @@ export function SystemMapView() {
               proOptions={{ hideAttribution: true }}
             >
               <Background color="#bac4c8" gap={24} size={1} variant={BackgroundVariant.Dots} />
-              <Controls showInteractive={false} position="bottom-left" />
+              <MapControls />
               <MiniMap
                 pannable
                 zoomable
@@ -364,7 +365,7 @@ export function SystemMapView() {
           ) : (
             <CatalogView nodes={catalogNodes} onSelect={setSelectedNode} />
           )}
-          <div className="edge-legend" aria-label="連線圖例">
+          <div className="edge-legend" role="group" aria-label="連線圖例">
             {(
               [
                 ["event", "Redis event"],
