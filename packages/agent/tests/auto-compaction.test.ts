@@ -6,8 +6,11 @@ import { ModelCapability } from "@stanley2058/lilac-utils";
 
 import {
   attachAutoCompaction,
+  buildSummaryProviderOptions,
+  combineCompactionSummaryParts,
   compactMessages,
   __autoCompactionInternals,
+  type CompactionProgress,
 } from "../auto-compaction";
 import { AiSdkPiAgent } from "../ai-sdk-pi-agent";
 
@@ -146,6 +149,7 @@ describe("auto-compaction internals", () => {
       maxReductionPasses: 6,
       initialMaxCharsPerMessage: 516_000,
       initialMaxCharsTotal: 774_000,
+      stage: "history",
       summarizeChunk: async () => {
         calls += 1;
         return "summary";
@@ -173,6 +177,7 @@ describe("auto-compaction internals", () => {
       maxReductionPasses: 6,
       initialMaxCharsPerMessage: contextLimit * 4,
       initialMaxCharsTotal: contextLimit * 6,
+      stage: "history",
       summarizeChunk: async () => {
         calls += 1;
         return "summary";
@@ -257,6 +262,7 @@ describe("auto-compaction internals", () => {
       maxReductionPasses: 6,
       initialMaxCharsPerMessage: 8_000,
       initialMaxCharsTotal: 8_000,
+      stage: "history",
       summarizeChunk: async (transcript, previousSummary) => {
         calls += 1;
         if (transcript.length > 1600) {
@@ -284,6 +290,7 @@ describe("auto-compaction internals", () => {
       maxReductionPasses: 1,
       initialMaxCharsPerMessage: 200,
       initialMaxCharsTotal: 500,
+      stage: "history",
       summarizeChunk: async (transcript, previousSummary) => {
         transcripts.push(transcript);
         previousSummaries.push(previousSummary);
@@ -512,6 +519,287 @@ describe("auto-compaction internals", () => {
     for (const chars of requestedTranscriptChars) {
       expect(chars).toBeLessThanOrEqual(summaryModelContextLimit * 4);
     }
+  });
+
+  it("streams summary deltas that reconstruct the persisted summary", async () => {
+    const pieces = ["Condensed ", "prior ", "work."];
+    const model = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: "summary" },
+            ...pieces.map((delta) => ({ type: "text-delta" as const, id: "summary", delta })),
+            { type: "text-end" as const, id: "summary" },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      }),
+    });
+
+    const deltas: string[] = [];
+    const progressEvents: CompactionProgress[] = [];
+    const result = await compactMessages({
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain verbatim" },
+      ],
+      currentModel: model,
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 1,
+      keepLastMessages: 1,
+      onProgress: (progress) => progressEvents.push(progress),
+      onSummaryDelta: (delta) => deltas.push(delta),
+    });
+
+    expect(result.status).toBe("compacted");
+    // Deltas arrive piecewise and rejoin into exactly the summary that is persisted.
+    expect(deltas).toEqual(pieces);
+    expect(result.messages[0]).toMatchObject({ content: expect.stringContaining(deltas.join("")) });
+    // Progress precedes the request it describes, so a renderer can reset its buffer.
+    expect(progressEvents).toEqual([{ stage: "history", step: 1, stepCount: 1, pass: 1 }]);
+  });
+
+  it("reports a summary covering every stage, including the split turn", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        // The split-turn prompt is built separately from the history prompt, so
+        // the two stages are distinguishable by what they were asked to do.
+        const splitTurn = JSON.stringify(prompt).includes("split");
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "summary" },
+              {
+                type: "text-delta" as const,
+                id: "summary",
+                delta: splitTurn ? "Turn so far." : "Prior work.",
+              },
+              { type: "text-end" as const, id: "summary" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    const stages: Array<CompactionProgress["stage"]> = [];
+    const result = await compactMessages({
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request" },
+        // A trailing assistant message leaves a split turn, so both stages run.
+        { role: "assistant", content: `partial answer ${"c".repeat(6_000)}` },
+      ],
+      currentModel: model,
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 1,
+      keepLastMessages: 1,
+      onProgress: (progress) => stages.push(progress.stage),
+      buildSplitTurnSummaryPrompt: (prefix) => `Summarize this split turn:\n${prefix}`,
+    });
+
+    expect(result.status).toBe("compacted");
+    expect(new Set(stages)).toEqual(new Set(["history", "split-turn"]));
+    // The reported summary is the one written into the transcript, so a consumer
+    // never has to reassemble the stages itself and cannot get it wrong.
+    expect(result.summary).toBe(combineCompactionSummaryParts("Prior work.", "Turn so far."));
+    expect(result.messages[0]).toMatchObject({
+      content: expect.stringContaining(result.summary ?? " "),
+    });
+  });
+
+  it("aborts and awaits the sibling stage when one summarization fails", async () => {
+    let splitTurnAborted = false;
+    const model = new MockLanguageModelV4({
+      doStream: async ({ prompt, abortSignal }) => {
+        const splitTurn = JSON.stringify(prompt).includes("split");
+        if (!splitTurn) throw new Error("history summarization exploded");
+        // The split-turn request hangs like a live provider call. When its
+        // sibling fails, it must be aborted and awaited before the failure
+        // surfaces, or it would keep streaming after the terminal event.
+        await new Promise<never>((_, reject) => {
+          const fail = () => {
+            splitTurnAborted = true;
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (abortSignal?.aborted) fail();
+          else abortSignal?.addEventListener("abort", fail, { once: true });
+        });
+        throw new Error("unreachable");
+      },
+    });
+
+    const failure = await compactMessages({
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request" },
+        // A trailing assistant message leaves a split turn, so both run.
+        { role: "assistant", content: `partial answer ${"c".repeat(6_000)}` },
+      ],
+      currentModel: model,
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 1,
+      keepLastMessages: 1,
+      buildSplitTurnSummaryPrompt: (prefix) => `Summarize this split turn:\n${prefix}`,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    // The genuine failure wins over the abort it induced in the sibling, so
+    // callers classify this as a failure rather than a cancellation.
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure instanceof Error ? failure.name : "").not.toBe("AbortError");
+    // By the time the failure surfaced, the sibling request had been aborted
+    // (and awaited): nothing keeps streaming past the terminal event.
+    expect(splitTurnAborted).toBe(true);
+  });
+
+  it("stops before the next summarization request once aborted", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        // Cancel while the first request is in flight; the refine chain must not
+        // continue into the remaining segments.
+        controller.abort();
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "summary" },
+              { type: "text-delta" as const, id: "summary", delta: "partial" },
+              { type: "text-end" as const, id: "summary" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    // Ending on a user message keeps the cut off a split turn, so only the
+    // history chain runs and the call count is unambiguous.
+    const messages: ModelMessage[] = Array.from({ length: 41 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `msg ${index} ${"x".repeat(4_000)}`,
+    }));
+    expect(
+      __autoCompactionInternals.resolveCompactionBoundary({
+        messages,
+        keepRecentTokens: 1,
+        keepLastMessages: 1,
+      }).splitTurnStart,
+    ).toBeNull();
+
+    await expect(
+      compactMessages({
+        messages,
+        currentModel: model,
+        contextLimit: 200_000,
+        outputLimit: 1_000,
+        summaryContextLimit: 2_000,
+        keepRecentTokens: 1,
+        keepLastMessages: 1,
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toThrow();
+    expect(calls).toBe(1);
+  });
+
+  it("honours a split-turn summary update prompt override", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: "summary" },
+            { type: "text-delta" as const, id: "summary", delta: "Condensed prior work." },
+            { type: "text-end" as const, id: "summary" },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      }),
+    });
+
+    // Cutting on an assistant message makes the preceding turn a split-turn
+    // prefix; oversizing it forces a second segment, which is the only path that
+    // reaches the update prompt.
+    const messages: ModelMessage[] = [
+      { role: "user", content: `turn request ${"a".repeat(4_000)}` },
+      { role: "assistant", content: `early progress ${"b".repeat(4_000)}` },
+      { role: "assistant", content: `more progress ${"c".repeat(4_000)}` },
+      { role: "assistant", content: "retained suffix" },
+    ];
+    expect(
+      __autoCompactionInternals.resolveCompactionBoundary({
+        messages,
+        keepRecentTokens: 1,
+        keepLastMessages: 1,
+      }),
+    ).toEqual({ suffixStart: 3, splitTurnStart: 0 });
+
+    const splitTurnUpdates: string[] = [];
+    const result = await compactMessages({
+      messages,
+      currentModel: model,
+      contextLimit: 40_000,
+      outputLimit: 1_000,
+      // Small enough that the prefix cannot fit one segment.
+      summaryContextLimit: 500,
+      keepRecentTokens: 1,
+      keepLastMessages: 1,
+      buildSplitTurnSummaryUpdatePrompt: (previousSummary, nextTranscript) => {
+        const prompt = `CUSTOM SPLIT UPDATE\n${previousSummary}\n${nextTranscript}`;
+        splitTurnUpdates.push(prompt);
+        return prompt;
+      },
+    });
+
+    expect(result.status).toBe("compacted");
+    expect(splitTurnUpdates.length).toBeGreaterThan(0);
+  });
+
+  it("drops discarded reasoning summaries from summarization provider options", () => {
+    expect(
+      buildSummaryProviderOptions({
+        openai: {
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          reasoningSummary: "detailed",
+        },
+        anthropic: { cacheControl: "ephemeral" },
+      }),
+    ).toEqual({
+      openai: { store: false, include: ["reasoning.encrypted_content"] },
+      anthropic: { cacheControl: "ephemeral" },
+    });
+    expect(buildSummaryProviderOptions(undefined)).toBeUndefined();
   });
 
   it("returns typed noop metrics for an empty persisted transcript", async () => {
@@ -937,13 +1225,22 @@ describe("auto-compaction internals", () => {
     const shrunk = __autoCompactionInternals.shrinkCompactedMessagesToBudget({
       messages,
       inputBudget: budget,
+      summary,
     });
 
-    expect(__autoCompactionInternals.estimateMessagesTokens(shrunk)).toBeLessThanOrEqual(budget);
-    expect(shrunk.length).toBeGreaterThan(0);
-    expect(shrunk[shrunk.length - 1]?.role).not.toBe("assistant");
-    expect(JSON.stringify(shrunk)).toContain(retainedOutputMarker);
-    expect(JSON.stringify(shrunk)).not.toContain("tool output omitted by emergency compaction");
+    expect(__autoCompactionInternals.estimateMessagesTokens(shrunk.messages)).toBeLessThanOrEqual(
+      budget,
+    );
+    expect(shrunk.messages.length).toBeGreaterThan(0);
+    expect(shrunk.messages[shrunk.messages.length - 1]?.role).not.toBe("assistant");
+    expect(JSON.stringify(shrunk.messages)).toContain(retainedOutputMarker);
+    expect(JSON.stringify(shrunk.messages)).not.toContain(
+      "tool output omitted by emergency compaction",
+    );
+    // The reported summary is the truncated one the model will actually see.
+    expect(shrunk.summary.length).toBeLessThan(summary.length);
+    const first = shrunk.messages[0];
+    expect(typeof first?.content === "string" && first.content.includes(shrunk.summary)).toBe(true);
   });
 
   it("preserves the latest user request while shrinking the summary", () => {
@@ -952,9 +1249,10 @@ describe("auto-compaction internals", () => {
       { role: "user", content: "Please continue from here and make sure tests pass." },
     ];
 
-    const shrunk = __autoCompactionInternals.shrinkCompactedMessagesToBudget({
+    const { messages: shrunk } = __autoCompactionInternals.shrinkCompactedMessagesToBudget({
       messages,
       inputBudget: 300,
+      summary: "s".repeat(3_000),
     });
 
     expect(shrunk.length).toBeGreaterThan(0);
@@ -996,6 +1294,7 @@ describe("auto-compaction internals", () => {
       __autoCompactionInternals.shrinkCompactedMessagesToBudget({
         messages,
         inputBudget: 100,
+        summary: "summary",
       }),
     ).toThrow("no retained suffix messages were discarded");
     expect(JSON.stringify(messages)).toContain(retainedOutputMarker);
@@ -1019,6 +1318,7 @@ describe("auto-compaction internals", () => {
       __autoCompactionInternals.shrinkCompactedMessagesToBudget({
         messages,
         inputBudget: 1,
+        summary: "",
       }),
     ).toThrow("Compaction could not fit bounded context within the input budget");
   });
