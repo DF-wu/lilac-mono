@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -165,6 +166,8 @@ describe("tool-server discovery", () => {
     const tool = new Discovery({ discovery: discoveryService });
 
     return {
+      root,
+      dataDir,
       now,
       tool,
       discoveryService,
@@ -172,6 +175,125 @@ describe("tool-server discovery", () => {
       transcriptStore,
     };
   }
+
+  function openDiscoveryWriteAudit(dbPath: string): Database {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE discovery_write_audit (operation TEXT NOT NULL);
+      CREATE TRIGGER discovery_documents_audit_insert
+      AFTER INSERT ON discovery_documents
+      BEGIN
+        INSERT INTO discovery_write_audit(operation) VALUES ('insert');
+      END;
+      CREATE TRIGGER discovery_documents_audit_update
+      AFTER UPDATE ON discovery_documents
+      BEGIN
+        INSERT INTO discovery_write_audit(operation) VALUES ('update');
+      END;
+      CREATE TRIGGER discovery_documents_audit_delete
+      AFTER DELETE ON discovery_documents
+      BEGIN
+        INSERT INTO discovery_write_audit(operation) VALUES ('delete');
+      END;
+    `);
+    return db;
+  }
+
+  function discoveryWriteAuditRows(db: Database): unknown[] {
+    return db
+      .query(
+        "SELECT operation, COUNT(*) AS count FROM discovery_write_audit GROUP BY operation ORDER BY operation",
+      )
+      .all();
+  }
+
+  it("does not write discovery documents on an identical repeated search", async () => {
+    const fixture = await makeFixture();
+
+    try {
+      await fixture.discoveryService.search({ query: "deploy" });
+      const audit = openDiscoveryWriteAudit(path.join(fixture.root, "discovery.db"));
+      try {
+        const dataVersionBefore = Number(audit.query("PRAGMA data_version").values()[0]?.[0]);
+        await fixture.discoveryService.search({ query: "deploy" });
+        expect(discoveryWriteAuditRows(audit)).toEqual([]);
+        expect(Number(audit.query("PRAGMA data_version").values()[0]?.[0])).toBe(dataVersionBefore);
+      } finally {
+        audit.close();
+      }
+    } finally {
+      fixture.discoveryService.close();
+      fixture.discordSearchStore.close();
+      fixture.transcriptStore.close();
+    }
+  });
+
+  it("updates only the edited discovery document", async () => {
+    const fixture = await makeFixture();
+
+    try {
+      const agentsPath = path.join(fixture.dataDir, "prompts", "AGENTS.md");
+      await Bun.write(agentsPath, "original discovery document\n");
+      await fixture.discoveryService.search({ query: "original" });
+      const audit = openDiscoveryWriteAudit(path.join(fixture.root, "discovery.db"));
+      try {
+        await Bun.write(agentsPath, "edited discovery document\n");
+        await fixture.discoveryService.search({ query: "edited" });
+        expect(discoveryWriteAuditRows(audit)).toEqual([{ operation: "update", count: 1 }]);
+      } finally {
+        audit.close();
+      }
+    } finally {
+      fixture.discoveryService.close();
+      fixture.discordSearchStore.close();
+      fixture.transcriptStore.close();
+    }
+  });
+
+  it("deletes discovery documents removed from a source", async () => {
+    const fixture = await makeFixture();
+
+    try {
+      const agentsPath = path.join(fixture.dataDir, "prompts", "AGENTS.md");
+      await Bun.write(agentsPath, "removable discovery document\n");
+      await fixture.discoveryService.search({ query: "removable" });
+      const audit = openDiscoveryWriteAudit(path.join(fixture.root, "discovery.db"));
+      try {
+        await Bun.write(agentsPath, "\n");
+        await fixture.discoveryService.search({ query: "removable" });
+        expect(discoveryWriteAuditRows(audit)).toEqual([{ operation: "delete", count: 1 }]);
+      } finally {
+        audit.close();
+      }
+    } finally {
+      fixture.discoveryService.close();
+      fixture.discordSearchStore.close();
+      fixture.transcriptStore.close();
+    }
+  });
+
+  it("shares one source synchronization across concurrent searches", async () => {
+    const fixture = await makeFixture();
+    const audit = openDiscoveryWriteAudit(path.join(fixture.root, "discovery.db"));
+
+    try {
+      await Promise.all(
+        Array.from({ length: 4 }, () => fixture.discoveryService.search({ query: "deploy" })),
+      );
+
+      const documentCount = Number(
+        audit.query("SELECT COUNT(*) FROM discovery_documents").values()[0]?.[0],
+      );
+      expect(discoveryWriteAuditRows(audit)).toEqual([
+        { operation: "insert", count: documentCount },
+      ]);
+    } finally {
+      audit.close();
+      fixture.discoveryService.close();
+      fixture.discordSearchStore.close();
+      fixture.transcriptStore.close();
+    }
+  });
 
   it("groups by origin, dedupes linked transcripts, and hides verbose fields by default", async () => {
     const fixture = await makeFixture();
