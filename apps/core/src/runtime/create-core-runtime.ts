@@ -6,6 +6,7 @@ import {
   errorMessage,
   getCoreConfig,
   readCoreConfigVersion,
+  isTelegramSurfaceUsable,
   resolveDiscordDbPath,
   resolveCoreConfigPath,
   resolveCustomCommandsDir,
@@ -26,6 +27,7 @@ import {
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { GithubAdapter } from "../surface/github/github-adapter";
+import { TelegramAdapter } from "../surface/telegram/telegram-adapter";
 import type { SurfaceAdapter } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
@@ -254,6 +256,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
   const adapter = new DiscordAdapter({ customCommands });
   const githubAdapter = new GithubAdapter();
+  // Constructed lazily: the Telegram surface is opt-in and additionally needs a
+  // token, so deployments that never wanted it must be entirely unaffected.
+  let telegramAdapter: TelegramAdapter | null = null;
   const durableWorkflowStore = new DurableWorkflowStore();
 
   let transcriptStore: SqliteTranscriptStore | null = null;
@@ -278,6 +283,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   let workflowSubagentDispatcher: WorkflowSubagentDispatcher | null = null;
   let stopBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopGithubBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
+  let stopTelegramBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
+  let stopTelegramAdapterToBus: { stop(): Promise<void> } | null = null;
+  let stopTelegramRouter: { stop(): Promise<void> } | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
   let stopHeartbeat: Awaited<ReturnType<typeof startHeartbeatService>> | null = null;
   let stopConversationThreadWorker: Awaited<
@@ -433,6 +441,20 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       },
     });
 
+    if (telegramAdapter) {
+      const telegram = telegramAdapter.getHealthSnapshot();
+      checks.push({
+        name: "telegram.ready",
+        ok: !runtimeFullyStarted || telegram.isReady,
+        impact: "ready",
+        reason:
+          !runtimeFullyStarted || telegram.isReady
+            ? undefined
+            : "telegram long polling is not ready",
+        details: telegram,
+      });
+    }
+
     const redisHealth = await probeRedisHealth();
     checks.push({
       name: "redis.ping",
@@ -566,6 +588,12 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     if (stopGithubBusToAdapter) {
       await stopGithubBusToAdapter.restoreRelays(
         snapshot.relays.filter((r) => r.platform === "github"),
+      );
+    }
+
+    if (stopTelegramBusToAdapter) {
+      await stopTelegramBusToAdapter.restoreRelays(
+        snapshot.relays.filter((r) => r.platform === "telegram"),
       );
     }
 
@@ -710,6 +738,37 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       logger.info("Surface adapter connected", {
         platform: "discord",
       });
+
+      if (isTelegramSurfaceUsable(startupConfig)) {
+        telegramAdapter = new TelegramAdapter();
+
+        // Subscribe before connecting so early updates are not missed.
+        stopTelegramAdapterToBus = await bridgeAdapterToBus({
+          adapter: telegramAdapter,
+          bus,
+          subscriptionId: subId(subscriptionPrefix, "telegram-adapter-to-bus"),
+          transcriptStore: transcriptStore ?? undefined,
+        });
+
+        await telegramAdapter.connect();
+
+        stopTelegramRouter = await startBusRequestRouter({
+          adapter: telegramAdapter,
+          bus,
+          platform: "telegram",
+          subscriptionId: subId(subscriptionPrefix, "telegram-router"),
+          customCommands,
+          transcriptStore: transcriptStore ?? undefined,
+        });
+
+        logger.info("Surface adapter connected", {
+          platform: "telegram",
+        });
+      } else if (startupConfig.surface.telegram.enabled) {
+        logger.warn("telegram surface enabled but no token available; skipping", {
+          tokenEnv: startupConfig.surface.telegram.tokenEnv,
+        });
+      }
 
       const workflowAdapters = new Map<"discord" | "github", SurfaceAdapter>([
         ["discord", adapter],
@@ -873,6 +932,20 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       logger.info("bridgeBusToAdapter started", {
         subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
       });
+
+      if (telegramAdapter) {
+        stopTelegramBusToAdapter = await bridgeBusToAdapter({
+          adapter: telegramAdapter,
+          bus,
+          platform: "telegram",
+          subscriptionId: subId(subscriptionPrefix, "bus-to-telegram"),
+          transcriptStore: transcriptStore ?? undefined,
+        });
+
+        logger.info("bridgeBusToAdapter started for telegram", {
+          subscriptionId: subId(subscriptionPrefix, "bus-to-telegram"),
+        });
+      }
 
       // GitHub surface (webhook ingress + non-streamed comment egress)
       const ghSecret = await readGithubAppSecret(env.dataDir);
@@ -1148,10 +1221,18 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           Promise.resolve(),
       );
 
+      await safe(
+        "graceful.telegramBridge.beginDrain",
+        () =>
+          stopTelegramBusToAdapter?.beginDrain({ deadlineMs: GRACEFUL_DRAIN_DEADLINE_MS }) ??
+          Promise.resolve(),
+      );
+
       const agentRecoverables = agentRunner.snapshotRecoverables();
       const relayRecoverables = [
         ...(stopBusToAdapter?.snapshotRelays() ?? []),
         ...(stopGithubBusToAdapter?.snapshotRelays() ?? []),
+        ...(stopTelegramBusToAdapter?.snapshotRelays() ?? []),
       ];
 
       if (agentRecoverables.length > 0 || relayRecoverables.length > 0) {
@@ -1221,6 +1302,10 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       "bridgeGithubBusToAdapter.stop",
       () => stopGithubBusToAdapter?.stop() ?? Promise.resolve(),
     );
+    await safe(
+      "bridgeTelegramBusToAdapter.stop",
+      () => stopTelegramBusToAdapter?.stop() ?? Promise.resolve(),
+    );
     await safe("githubWebhook.stop", () => stopGithubWebhook?.stop() ?? Promise.resolve());
 
     await safe("toolServer.stop", () => toolServer?.stop() ?? Promise.resolve());
@@ -1234,10 +1319,19 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
     );
     stopWorkflowActionResolver = null;
+    await safe("telegramRouter.stop", () => stopTelegramRouter?.stop() ?? Promise.resolve());
     await safe("bridgeAdapterToBus.stop", () => stopAdapterToBus?.stop() ?? Promise.resolve());
+    await safe(
+      "bridgeTelegramAdapterToBus.stop",
+      () => stopTelegramAdapterToBus?.stop() ?? Promise.resolve(),
+    );
 
     await safe("adapter.disconnect", () => adapter.disconnect());
     await safe("githubAdapter.disconnect", () => githubAdapter.disconnect());
+    await safe("telegramAdapter.disconnect", async () => {
+      await telegramAdapter?.disconnect();
+      telegramAdapter = null;
+    });
     await safe("durableWorkflowStore.close", async () => durableWorkflowStore.close());
     await safe("discoveryService.close", async () => {
       discoveryService?.close();
