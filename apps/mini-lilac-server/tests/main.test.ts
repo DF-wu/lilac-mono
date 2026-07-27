@@ -288,6 +288,7 @@ describe("mini-lilac-server shutdown", () => {
 
     await shutdownMiniLilacServer({
       stopListener: (force) => void events.push(`stop:${force}`),
+      requestRuntimeShutdown: () => void events.push("runtime-shutdown"),
       listActiveRuns: () => (active ? [{ sessionId: "session-1", runId: "run-1" }] : []),
       cancelRun: async () => {
         events.push("cancel");
@@ -296,7 +297,28 @@ describe("mini-lilac-server shutdown", () => {
       closeRuntime: () => void events.push("close"),
     });
 
-    expect(events).toEqual(["stop:false", "cancel", "close"]);
+    expect(events).toEqual(["stop:false", "cancel", "runtime-shutdown", "close"]);
+  });
+
+  it("requests runtime shutdown before waiting for listener drain", async () => {
+    const events: string[] = [];
+    const listener = Promise.withResolvers<void>();
+
+    await shutdownMiniLilacServer({
+      stopListener: (force) => {
+        events.push(`stop:${force}`);
+        return force ? undefined : listener.promise;
+      },
+      requestRuntimeShutdown: () => {
+        events.push("runtime-shutdown");
+        listener.resolve();
+      },
+      listActiveRuns: () => [],
+      cancelRun: async () => {},
+      closeRuntime: () => void events.push("close"),
+    });
+
+    expect(events).toEqual(["stop:false", "runtime-shutdown", "close"]);
   });
 
   it("force-closes connections after the bounded grace", async () => {
@@ -368,5 +390,22 @@ describe("mini-lilac-server shutdown", () => {
     ).rejects.toThrow("force close failed");
 
     expect(events).toEqual(["stop:false", "stop:true", "close"]);
+  });
+
+  it("closes the runtime when active-run inspection fails", async () => {
+    const events: string[] = [];
+
+    await expect(
+      shutdownMiniLilacServer({
+        stopListener: (force) => void events.push(`stop:${force}`),
+        listActiveRuns: () => {
+          throw new Error("run inspection failed");
+        },
+        cancelRun: async () => {},
+        closeRuntime: () => void events.push("close"),
+      }),
+    ).rejects.toThrow("run inspection failed");
+
+    expect(events).toEqual(["stop:false", "close"]);
   });
 });
