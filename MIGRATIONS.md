@@ -95,6 +95,46 @@ for replay, tail reconnect, resume projection, and final UI reconstruction. The 
 run finalization. A process crash therefore retains no partial chunks and startup marks interrupted
 runs as errors; finalized canonical transcripts remain durable.
 
+## Mini Lilac Database Schema 4
+
+Mini Lilac migrates schema 3 databases to schema 4 transactionally at startup. Schema 4 rebuilds the
+`sessions` table to widen its status `CHECK` with `compacting` and to add
+`input_tokens_estimated`. Every other table cascades from `sessions`, so the rebuild follows
+SQLite's documented recipe: `foreign_keys` off and `legacy_alter_table` on around the transaction,
+with `PRAGMA foreign_key_check` verified afterwards. No row content changes; existing sessions get
+`input_tokens_estimated = 0`. Database versions other than 0, 2, 3, and 4 are rejected, and a
+schema 2 database migrates through 3 to 4 in one startup.
+
+Behaviour changes that accompany the schema:
+
+- Manual compaction sets the session status to `compacting` for its duration instead of leaving it
+  `idle`, and `commitCompaction` accepts `compacting` as a valid pre-commit state. An interrupted
+  compaction is recovered to `idle` at startup rather than to `error`, because compaction commits
+  only on success and therefore never leaves a partial transcript.
+- A committed manual compaction now writes the post-compaction token estimate to `input_tokens`
+  with `input_tokens_estimated = 1`, where it previously wrote `NULL`. The next turn's reported
+  usage clears the flag.
+
+## Mini Lilac Protocol: compaction lifecycle
+
+`miniLilacCompactionEventSchema` replaces its terminal-only `status: "completed" | "failed"` field
+with a `phase` discriminant (`started`, `progress`, `completed`, `failed`, `cancelled`) plus
+`outcome`, `progress`, `summary`, `elapsedMs`, `durationMs`, and `modelCalls`. Persisted
+`data-compaction` UI parts written by older builds carry `status` and no longer parse; they are
+rejected at the transcript boundary rather than silently dropped.
+
+`POST /sessions/:id/compact` returns a UI message event stream instead of a JSON body. Admission
+still happens before the stream opens, so a non-quiescent session is still a 409.
+
+The response stream is a view of the compaction, not its owner. Abandoning the request only detaches
+the client: the compaction continues and still commits, and reattaching to it is not supported.
+Stopping it is `POST /sessions/:id/compact/cancel`, which answers `{"status":"cancelling"}` or
+`{"status":"inactive"}`; the terminal `cancelled` event then arrives on any stream still attached.
+Clients that previously cancelled by aborting the request will no longer stop anything.
+
+`compacting` is a session status, and every admission path — prompts included — now requires
+`idle`/`error`. A prompt sent during a compaction is rejected rather than raced.
+
 ## Historical Workflow Schema 18
 
 Workflow capability review now stores a normalized maximum envelope with per-operation narrowing, exact Level-1 tools, concrete Level-2 callable IDs, destination-scoped origin surface operations, allowed roots, bounded reasoning, and explicit trusted executable authority.

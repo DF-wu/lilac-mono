@@ -27,7 +27,7 @@ export interface DraftPastedText {
  * while this module stays deterministic and fully unit-testable.
  */
 
-export type EditorPhase = "idle" | "submitting" | "active" | "disconnected";
+export type EditorPhase = "idle" | "submitting" | "compacting" | "active" | "disconnected";
 
 export interface InputState {
   /** Current multiline editor buffer. */
@@ -64,6 +64,7 @@ export type InputEvent =
   | { readonly type: "submit" }
   | { readonly type: "request-undo" }
   | { readonly type: "request-compact" }
+  | { readonly type: "compaction-observed" }
   | { readonly type: "escape" }
   | { readonly type: "ctrl-c" }
   | {
@@ -101,6 +102,7 @@ export type InputEffect =
   | { readonly type: "compact" }
   | { readonly type: "interrupt-queued-steering" }
   | { readonly type: "cancel" }
+  | { readonly type: "cancel-compaction" }
   | { readonly type: "exit" };
 
 export interface InputTransition {
@@ -167,7 +169,15 @@ export function reduceInput(state: InputState, event: InputEvent): InputTransiti
       if (state.phase !== "idle" || state.files.length > 0 || state.pastedTexts.length > 0) {
         return commit(state);
       }
-      return commit({ ...state, phase: "submitting" }, { type: "compact" });
+      // Compaction gets its own phase so the footer can name the operation
+      // instead of falling back to the generic "submitting" label.
+      return commit({ ...state, phase: "compacting" }, { type: "compact" });
+    case "compaction-observed":
+      // A compaction is running server-side that this client is not attached
+      // to (reopened session or interrupted stream). Representing it as idle
+      // would offer operations the server rejects and lose `esc cancel`.
+      if (state.phase === "active" || state.phase === "disconnected") return commit(state);
+      return commit({ ...state, phase: "compacting", exitArmed: false });
     case "escape":
       return onEscape(state);
     case "ctrl-c":
@@ -227,7 +237,7 @@ function onSubmit(state: InputState): InputTransition {
     if (slash === "/compact") {
       if (state.files.length > 0 || state.pastedTexts.length > 0) return commit(state);
       return commit(
-        { ...state, editor: "", phase: "submitting", exitArmed: false },
+        { ...state, editor: "", phase: "compacting", exitArmed: false },
         { type: "compact" },
       );
     }
@@ -277,6 +287,10 @@ function onSubmit(state: InputState): InputTransition {
 }
 
 function onEscape(state: InputState): InputTransition {
+  if (state.phase === "compacting") {
+    // Compaction is not a run, so the run cancel endpoint does not apply to it.
+    return commit({ ...state, exitArmed: false }, { type: "cancel-compaction" });
+  }
   if (state.phase !== "idle") {
     // Esc only interrupts server work. The current draft remains available.
     return commit(resetSteering({ ...state, exitArmed: false }), { type: "cancel" });

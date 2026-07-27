@@ -5,11 +5,14 @@ import {
   AiSdkPiAgent,
   attachAutoCompaction,
   buildSafeRecoveryCheckpoint,
+  combineCompactionSummaryParts,
   compactMessages,
   createAgentRunIdleWatchdog,
   createTransientModelRetryController,
+  isAbortError,
   type AiSdkPiAgentEvent,
   type AutoCompactionOptions,
+  type CompactionProgress,
   type TransientModelRetryConfig,
   type TurnBoundaryDecision,
 } from "@stanley2058/lilac-agent";
@@ -33,6 +36,7 @@ import {
 } from "@stanley2058/lilac-tool-results";
 import {
   miniLilacCancelResultSchema,
+  miniLilacCompactionEventSchema,
   miniLilacCompactResultSchema,
   miniLilacInterruptQueuedSteeringRequestSchema,
   miniLilacInterruptQueuedSteeringResultSchema,
@@ -50,6 +54,11 @@ import {
   miniLilacUpdateSessionBindingsRequestSchema,
   type MiniLilacCancelRequest,
   type MiniLilacCancelResult,
+  type MiniLilacCompactionEvent,
+  type MiniLilacCompactionPhase,
+  type MiniLilacCompactionProgress,
+  type MiniLilacCancelCompactionRequest,
+  type MiniLilacCancelCompactionResult,
   type MiniLilacCompactRequest,
   type MiniLilacCompactResult,
   type MiniLilacControlResult,
@@ -222,6 +231,70 @@ export type CreateSessionInput = {
 export type StartedSessionRun = {
   runId: string;
   stream: ReadableStream<MiniLilacRuntimeChunk>;
+};
+
+export type StartedCompaction = {
+  stream: ReadableStream<MiniLilacRuntimeChunk>;
+};
+
+/**
+ * How often streamed summary text is republished.
+ *
+ * A summary emits thousands of deltas; forwarding each one would flood the
+ * transport (and, on the automatic path, the persisted run log) far faster than
+ * any terminal redraws.
+ */
+const COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS = 100;
+
+/** Replay a previously committed compaction as a one-shot terminal event. */
+function compactionEventFor(result: MiniLilacCompactResult): MiniLilacCompactionEvent {
+  return miniLilacCompactionEventSchema.parse({
+    source: "manual",
+    reason: "manual",
+    phase: "completed",
+    outcome: result.status,
+    messageCountBefore: result.messageCountBefore,
+    messageCountAfter: result.messageCountAfter,
+    estimatedInputTokensBefore: result.estimatedInputTokensBefore,
+    estimatedInputTokensAfter: result.estimatedInputTokensAfter,
+  });
+}
+
+function singleCompactionEventStream(
+  data: MiniLilacCompactionEvent,
+): ReadableStream<MiniLilacRuntimeChunk> {
+  return new ReadableStream<MiniLilacRuntimeChunk>({
+    start(controller) {
+      controller.enqueue({ type: "data-compaction", id: crypto.randomUUID(), data });
+      controller.close();
+    },
+  });
+}
+
+/**
+ * A session snapshot as clients see it.
+ *
+ * `compactionThreshold` is server-side config rather than session state, but
+ * without it on the wire the client cannot say "compacts at 80%" at all. Every
+ * client-facing path goes through here so the field cannot go missing from one
+ * response shape and be present in another.
+ */
+function describeSessionSnapshot(
+  snapshot: MiniLilacSessionSnapshot,
+  config: RuntimeConfig,
+): MiniLilacSessionSnapshot {
+  return { ...snapshot, compactionThreshold: config.agent.compaction.earlyCompactionPoint };
+}
+
+type ManualCompaction = {
+  readonly id: string;
+  readonly chunkId: string;
+  readonly startedAt: number;
+  readonly controller: AbortController;
+  readonly subscribers: Set<Subscriber>;
+  /** Last published event, replayed to every stream that attaches later. */
+  latest: MiniLilacCompactionEvent;
+  finished: boolean;
 };
 
 type StartPromptOptions = {
@@ -758,6 +831,13 @@ class SessionActor {
     return terminal;
   }
 
+  private describe(snapshot: MiniLilacSessionSnapshot): MiniLilacSessionSnapshot {
+    const described = describeSessionSnapshot(snapshot, this.config);
+    return snapshot.status === "compacting" && this.manualCompaction?.finished === false
+      ? { ...described, activeCompactionCommandId: this.manualCompaction.id }
+      : described;
+  }
+
   getSnapshot(): MiniLilacSessionSnapshot {
     this.snapshot = this.store.getSession(this.snapshot.id);
     const terminal = this.reconcileTerminalReplay(this.snapshot);
@@ -766,7 +846,7 @@ class SessionActor {
     } else if (terminal !== undefined) {
       this.snapshot = terminal.snapshot;
     }
-    return this.snapshot;
+    return this.describe(this.snapshot);
   }
 
   getMessages(): MiniLilacUIMessage[] {
@@ -780,9 +860,12 @@ class SessionActor {
         const durableSnapshot = this.store.getSession(this.snapshot.id);
         this.snapshot = durableSnapshot;
         const terminal = this.reconcileTerminalReplay(durableSnapshot);
-        if (terminal === undefined) return this.store.getSessionResume(this.snapshot.id);
+        if (terminal === undefined) {
+          const resume = this.store.getSessionResume(this.snapshot.id);
+          return { ...resume, snapshot: this.describe(resume.snapshot) };
+        }
         return {
-          snapshot: terminal.snapshot,
+          snapshot: this.describe(terminal.snapshot),
           messages: [...terminal.chronologicalUiPrefix],
           replayCursor: { runId: terminal.runId, afterSeq: terminal.uiChunkCursor },
         };
@@ -793,7 +876,7 @@ class SessionActor {
         inputTokens: active.inputTokens,
       };
       return {
-        snapshot: this.snapshot,
+        snapshot: this.describe(this.snapshot),
         messages: [...active.chronologicalUiPrefix],
         replayCursor: { runId: active.runId, afterSeq: active.uiChunkCursor },
       };
@@ -817,6 +900,7 @@ class SessionActor {
   isQuiescent(): boolean {
     return (
       this.active === undefined &&
+      this.manualCompaction === undefined &&
       this.delegatedCancels.size === 0 &&
       this.titleControllers.size === 0
     );
@@ -825,6 +909,12 @@ class SessionActor {
   requestShutdown(): Promise<void> {
     for (const controller of this.titleControllers.values()) controller.abort();
     return this.withLock(() => {
+      // Aborted under the actor lock so an admission that won the lock first is
+      // always visible here; checking before acquiring it could miss a freshly
+      // admitted compaction and exhaust the grace period instead of cancelling.
+      // Compaction writes nothing until summarization succeeds, so aborting it
+      // during shutdown leaves the transcript exactly as it was.
+      this.manualCompaction?.controller.abort();
       const active = this.active;
       if (active === undefined) return;
       active.cancelRequested = true;
@@ -895,6 +985,14 @@ class SessionActor {
       }
       if (this.active || this.store.getLatestRun(this.snapshot.id)?.status === "active") {
         throw new Error(`Session '${this.snapshot.id}' already has an active run`);
+      }
+      // Compaction rewrites the whole transcript and holds no run, so an active
+      // run check alone would let a prompt slip in beside it and be summarized
+      // away. Session status is the only thing that covers both.
+      if (!["idle", "error"].includes(this.snapshot.status)) {
+        throw new Error(
+          `Session '${this.snapshot.id}' is '${this.snapshot.status}' and cannot accept a prompt`,
+        );
       }
 
       const profileId = options.profileId ?? this.snapshot.profile;
@@ -1283,7 +1381,49 @@ class SessionActor {
           ? undefined
           : async () => (await this.resolveModelLimits(configuredSummaryModel))?.context,
       baseTurnErrorHandler: transientRetryController?.handler,
-      onCompactionEnd: (event) => this.queueAutomaticCompaction(event),
+      onCompactionStart: (event) => {
+        this.automaticCompaction = {
+          chunkId: crypto.randomUUID(),
+          startedAt: Date.now(),
+          modelCalls: 0,
+          stageSummaries: { history: "", "split-turn": "" },
+          lastPublishedAt: 0,
+        };
+        this.queueAutomaticCompaction({ ...event, phase: "started" });
+        this.lastAutomaticCompactionEvent = event;
+      },
+      onProgress: (progress) => {
+        const live = this.automaticCompaction;
+        const base = this.lastAutomaticCompactionEvent;
+        if (!live || !base) return;
+        live.modelCalls += 1;
+        // Each step rewrites its stage's summary rather than extending it.
+        live.stageSummaries[progress.stage] = "";
+        this.queueAutomaticCompaction({ ...base, phase: "progress", progress });
+      },
+      onSummaryDelta: (delta, progress) => {
+        const live = this.automaticCompaction;
+        const base = this.lastAutomaticCompactionEvent;
+        if (!live || !base) return;
+        live.stageSummaries[progress.stage] += delta;
+        // A summary emits thousands of deltas; republishing each one would bloat
+        // the persisted run log for no visible gain at terminal refresh rates.
+        const now = Date.now();
+        if (now - live.lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
+        live.lastPublishedAt = now;
+        this.queueAutomaticCompaction({ ...base, phase: "progress", progress });
+      },
+      onCompactionEnd: (event) =>
+        this.queueAutomaticCompaction({
+          ...event,
+          phase:
+            event.status === "completed"
+              ? "completed"
+              : event.status === "cancelled"
+                ? "cancelled"
+                : "failed",
+          ...(event.summary === undefined ? {} : { finalSummary: event.summary }),
+        }),
     });
     if (context.depth === 0) {
       agent.appendTransformMessages((outboundMessages) => {
@@ -1366,7 +1506,7 @@ class SessionActor {
         const active = this.active;
         if (!active || active.runId !== runId || active.streamFinished) return;
         const operation = active.eventQueue.then(() =>
-          this.appendChunk(runId, { type: "data-session", data: this.snapshot }),
+          this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) }),
         );
         active.eventQueue = operation.catch((error) => this.reportEventFailure(runId, error));
         await operation;
@@ -1966,7 +2106,10 @@ class SessionActor {
           messageMetadata: metadata(this.snapshot),
         });
         if (active !== undefined) {
-          await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+          await this.appendChunk(runId, {
+            type: "data-session",
+            data: this.describe(this.snapshot),
+          });
         }
         return;
       case "agent_end": {
@@ -2008,7 +2151,10 @@ class SessionActor {
             runId,
             active.inputTokens,
           );
-          await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+          await this.appendChunk(runId, {
+            type: "data-session",
+            data: this.describe(this.snapshot),
+          });
         }
         return;
       case "turn_retry":
@@ -2070,7 +2216,10 @@ class SessionActor {
             this.snapshot.status,
             this.queuedSteeringCount(),
           );
-          await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+          await this.appendChunk(runId, {
+            type: "data-session",
+            data: this.describe(this.snapshot),
+          });
         } else if (event.message.role === "tool") {
           for (const part of event.message.content) {
             if (part.type !== "tool-result") continue;
@@ -2416,7 +2565,7 @@ class SessionActor {
     const operation = active.eventQueue.then(async () => {
       if (active.phase !== "accepting-controls" || active.streamFinished) return;
       await this.appendChunk(runId, { type: "data-control", id, data: result });
-      await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+      await this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) });
     });
     active.eventQueue = operation.catch((error) => {
       this.reportEventFailure(runId, error);
@@ -2451,35 +2600,82 @@ class SessionActor {
     });
   }
 
+  /**
+   * Live state for the automatic compaction happening inside the current run.
+   *
+   * Every phase reuses one chunk id so the renderer updates a single entry, and
+   * the summary buffer resets per step because each summarization request
+   * rewrites the whole summary rather than appending to it.
+   */
+  private automaticCompaction:
+    | {
+        readonly chunkId: string;
+        readonly startedAt: number;
+        readonly stageSummaries: Record<CompactionProgress["stage"], string>;
+        modelCalls: number;
+        lastPublishedAt: number;
+      }
+    | undefined;
+
+  /** Immutable facts about the running automatic compaction, reused by every phase. */
+  private lastAutomaticCompactionEvent:
+    | {
+        readonly reason: "threshold" | "overflow";
+        readonly messageCountBefore: number;
+        readonly estimatedInputTokens: number;
+      }
+    | undefined;
+
   private queueAutomaticCompaction(event: {
     readonly reason: "threshold" | "overflow";
-    readonly status: "completed" | "failed";
+    readonly phase: MiniLilacCompactionPhase;
     readonly messageCountBefore: number;
     readonly messageCountAfter?: number;
     readonly estimatedInputTokens: number;
     readonly estimatedInputTokensAfter?: number;
+    readonly progress?: MiniLilacCompactionProgress;
+    readonly finalSummary?: string;
     readonly error?: unknown;
   }): void {
     const active = this.active;
     if (!active) return;
-    const id = crypto.randomUUID();
+    // Terminal events must still publish even if the start hook never fired, so
+    // the live state is created on demand rather than assumed.
+    const live = (this.automaticCompaction ??= {
+      chunkId: crypto.randomUUID(),
+      startedAt: Date.now(),
+      stageSummaries: { history: "", "split-turn": "" },
+      modelCalls: 0,
+      lastPublishedAt: 0,
+    });
+    // Publication is deferred behind the run's event queue, but the live state
+    // keeps mutating. Everything the chunk reports is captured now so a backed-up
+    // queue cannot backdate later progress onto an earlier phase.
+    const terminal = event.phase !== "started" && event.phase !== "progress";
+    const summary =
+      event.finalSummary ??
+      combineCompactionSummaryParts(live.stageSummaries.history, live.stageSummaries["split-turn"]);
+    const data: MiniLilacCompactionEvent = {
+      source: "automatic",
+      reason: event.reason,
+      phase: event.phase,
+      messageCountBefore: event.messageCountBefore,
+      messageCountAfter: event.messageCountAfter,
+      estimatedInputTokensBefore: event.estimatedInputTokens,
+      estimatedInputTokensAfter: event.estimatedInputTokensAfter,
+      progress: event.progress,
+      summary: summary.length > 0 ? summary : undefined,
+      modelCalls: live.modelCalls,
+      ...(event.phase === "completed" ? { outcome: "compacted" as const } : {}),
+      elapsedMs: event.phase === "started" ? 0 : Math.max(0, Date.now() - live.startedAt),
+      ...(terminal ? { durationMs: Math.max(0, Date.now() - live.startedAt) } : {}),
+      ...(event.error === undefined
+        ? {}
+        : { error: event.error instanceof Error ? event.error.message : String(event.error) }),
+    };
+    if (terminal) this.automaticCompaction = undefined;
     const operation = active.eventQueue.then(() =>
-      this.appendChunk(active.runId, {
-        type: "data-compaction",
-        id,
-        data: {
-          source: "automatic",
-          reason: event.reason,
-          status: event.status,
-          messageCountBefore: event.messageCountBefore,
-          messageCountAfter: event.messageCountAfter,
-          estimatedInputTokensBefore: event.estimatedInputTokens,
-          estimatedInputTokensAfter: event.estimatedInputTokensAfter,
-          ...(event.error === undefined
-            ? {}
-            : { error: event.error instanceof Error ? event.error.message : String(event.error) }),
-        },
-      }),
+      this.appendChunk(active.runId, { type: "data-compaction", id: live.chunkId, data }),
     );
     active.eventQueue = operation.catch((error) => {
       this.reportEventFailure(active.runId, error);
@@ -2666,12 +2862,36 @@ class SessionActor {
     });
   }
 
-  compact(request: MiniLilacCompactRequest): Promise<MiniLilacCompactResult> {
-    return this.withLock(async () => {
+  /**
+   * A manual compaction that is running right now.
+   *
+   * Deliberately not owned by the request that started it: clients attach and
+   * detach freely, but the compaction itself has to reach a terminal state so
+   * the reserved command and the `compacting` status are always resolved.
+   */
+  private manualCompaction: ManualCompaction | undefined;
+
+  /**
+   * Admit a manual compaction and return a stream of its lifecycle.
+   *
+   * Admission runs under the actor lock; the summarization itself does not,
+   * because it is long-running and holding the lock would block reads. The
+   * `compacting` session status is what keeps the session exclusive: every other
+   * admission path (prompts, undo, bindings, a second compaction) requires
+   * `idle`/`error`, so none can interleave. Nothing is written until
+   * summarization succeeds, which is what makes cancellation safe.
+   */
+  async compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
+    const admitted = await this.withLock(async () => {
+      if (!this.acceptsAdmissions()) {
+        throw new Error("SessionService is shutting down and is not accepting admissions");
+      }
       const id = commandId(request.clientCommandId);
       const command = compactCommandRequest();
       const stored = this.store.getCommandResult(this.snapshot.id, id, command);
-      if (stored !== undefined) return miniLilacCompactResultSchema.parse(stored);
+      if (stored !== undefined) {
+        return { kind: "replay", result: miniLilacCompactResultSchema.parse(stored) } as const;
+      }
       this.snapshot = this.store.getSession(this.snapshot.id);
       if (
         this.active ||
@@ -2680,78 +2900,321 @@ class SessionActor {
       ) {
         throw new Error(`Session '${this.snapshot.id}' must be quiescent to compact`);
       }
-
       const messages = this.store.getModelMessages(this.snapshot.id);
       this.store.reserveCommand(this.snapshot.id, id, command);
+      this.snapshot = this.store.updateSessionState(this.snapshot.id, "compacting", 0, null);
+      const live: ManualCompaction = {
+        id,
+        chunkId: `compaction:${id}`,
+        startedAt: Date.now(),
+        controller: new AbortController(),
+        subscribers: new Set<Subscriber>(),
+        latest: miniLilacCompactionEventSchema.parse({
+          source: "manual",
+          reason: "manual",
+          phase: "started",
+          messageCountBefore: messages.length,
+          modelCalls: 0,
+          elapsedMs: 0,
+        }),
+        finished: false,
+      };
+      // Installed before the admission lock releases: an explicit cancel or a
+      // shutdown that takes the lock next must always see the operation, or it
+      // would answer `inactive` while the compaction proceeds regardless.
+      this.manualCompaction = live;
+      return { kind: "admitted", id, command, messages, live } as const;
+    });
+
+    if (admitted.kind === "replay") {
+      return { stream: singleCompactionEventStream(compactionEventFor(admitted.result)) };
+    }
+
+    // Tracked as runtime work rather than as part of the caller's promise: the
+    // store must stay open, and shutdown must wait, even with no client attached.
+    void this.trackExecution(this.runCompaction(admitted, admitted.live));
+    return { stream: this.subscribeCompaction(admitted.live) };
+  }
+
+  /**
+   * Stop the running compaction.
+   *
+   * Separate from `cancel()` because compaction owns no run, and separate from
+   * the request that started it because detaching a client must not stop work
+   * that other clients (and the session itself) still depend on.
+   */
+  cancelCompaction(
+    request: MiniLilacCancelCompactionRequest,
+  ): Promise<MiniLilacCancelCompactionResult> {
+    return this.withLock(async () => {
+      const live = this.manualCompaction;
+      if (live === undefined || live.finished) return { status: "inactive" as const };
+      // A cancel aimed at a compaction that finished, with a successor already
+      // admitted, must not stop the newer operation. Callers that know their
+      // target name it; a session-scoped cancel still stops whatever runs.
+      if (request.clientCommandId !== undefined && request.clientCommandId !== live.id) {
+        return { status: "inactive" as const };
+      }
+      live.controller.abort();
+      return { status: "cancelling" as const };
+    });
+  }
+
+  /**
+   * Attach a client to the running compaction.
+   *
+   * The last event is replayed on attach so a stream opened after `started` (or
+   * after the whole compaction finished) still sees a coherent lifecycle.
+   */
+  private subscribeCompaction(live: ManualCompaction): ReadableStream<MiniLilacRuntimeChunk> {
+    let subscriber: Subscriber | undefined;
+    return new ReadableStream<MiniLilacRuntimeChunk>({
+      start: (controller) => {
+        controller.enqueue({ type: "data-compaction", id: live.chunkId, data: live.latest });
+        if (live.finished) {
+          controller.close();
+          return;
+        }
+        subscriber = controller;
+        live.subscribers.add(controller);
+      },
+      cancel: () => {
+        // Detaching never cancels: compaction keeps running and still commits.
+        // Stopping it is `cancelCompaction`, an explicit operation.
+        if (subscriber) live.subscribers.delete(subscriber);
+      },
+    });
+  }
+
+  private publishCompaction(live: ManualCompaction, data: MiniLilacCompactionEvent): void {
+    live.latest = data;
+    this.broadcastCompaction(live, { type: "data-compaction", id: live.chunkId, data });
+  }
+
+  private broadcastCompaction(live: ManualCompaction, chunk: MiniLilacRuntimeChunk): void {
+    for (const subscriber of live.subscribers) {
       try {
-        if (messages.length === 0) {
-          const empty = miniLilacCompactResultSchema.parse({
-            status: "empty",
-            clientCommandId: id,
-            messageCountBefore: 0,
-            messageCountAfter: 0,
-            estimatedInputTokensBefore: 0,
-            estimatedInputTokensAfter: 0,
-          });
-          return this.store.commitCompaction(this.snapshot.id, id, command, messages, empty);
-        }
-        const modelSpecifier = this.snapshot.model;
-        if (modelSpecifier === null) throw new Error("Session model is required for compaction");
-        const limits = await this.resolveModelLimits(modelSpecifier);
-        if (limits === undefined || limits.context <= 0) {
-          throw new Error(`Context window is unavailable for model '${modelSpecifier}'`);
-        }
-        const configuredSummaryModel = this.config.agent.compaction.model;
-        const summaryModelSpecifier =
-          configuredSummaryModel === "inherit" ? modelSpecifier : configuredSummaryModel;
-        const summaryLimits =
-          summaryModelSpecifier === modelSpecifier
-            ? limits
-            : await this.resolveModelLimits(summaryModelSpecifier);
-        const compacted = await compactMessages({
-          messages,
-          currentModel: this.resolveModel(modelSpecifier),
-          contextLimit: limits.context,
-          outputLimit: limits.output,
-          summaryContextLimit: summaryLimits?.context,
-          thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
-          summaryModel:
-            configuredSummaryModel === "inherit"
-              ? "current"
-              : this.resolveModel(configuredSummaryModel),
-          providerOptions: this.supersededProviderIds.has(
-            parseModelRef(summaryModelSpecifier).providerId,
-          )
-            ? { openai: { store: false, include: ["reasoning.encrypted_content"] } }
-            : undefined,
-        });
-        const result = miniLilacCompactResultSchema.parse({
-          status:
-            compacted.status === "compacted"
-              ? "compacted"
-              : compacted.reason === "empty"
-                ? "empty"
-                : "noop",
-          clientCommandId: id,
-          messageCountBefore: compacted.messageCountBefore,
-          messageCountAfter: compacted.messageCountAfter,
-          estimatedInputTokensBefore: compacted.estimatedTokensBefore,
-          estimatedInputTokensAfter: compacted.estimatedTokensAfter,
-        });
-        const committed = this.store.commitCompaction(
-          this.snapshot.id,
+        subscriber.enqueue(chunk);
+      } catch {
+        // The client went away mid-write; the next detach cleans it up.
+      }
+    }
+  }
+
+  private async runCompaction(
+    admitted: {
+      readonly id: string;
+      readonly command: StoredCommandRequest;
+      readonly messages: readonly ModelMessage[];
+    },
+    live: ManualCompaction,
+  ): Promise<void> {
+    const sessionId = this.snapshot.id;
+    const { id, command, messages } = admitted;
+    const messageCountBefore = messages.length;
+
+    let modelCalls = 0;
+    let lastPublishedAt = 0;
+    // History and split-turn prefixes summarize concurrently, so their deltas
+    // interleave; keeping one buffer per stage is what lets the live text be
+    // assembled the same way the engine assembles the persisted summary.
+    const stageSummaries: Record<CompactionProgress["stage"], string> = {
+      history: "",
+      "split-turn": "",
+    };
+    const combinedSummary = (): string =>
+      combineCompactionSummaryParts(stageSummaries.history, stageSummaries["split-turn"]);
+
+    const event = (
+      phase: MiniLilacCompactionPhase,
+      extra: Partial<MiniLilacCompactionEvent> = {},
+    ): MiniLilacCompactionEvent => {
+      const summary = combinedSummary();
+      return miniLilacCompactionEventSchema.parse({
+        source: "manual",
+        reason: "manual",
+        phase,
+        messageCountBefore,
+        modelCalls,
+        elapsedMs: Math.max(0, Date.now() - live.startedAt),
+        ...(summary.length > 0 ? { summary } : {}),
+        ...extra,
+      });
+    };
+    const publish = (data: MiniLilacCompactionEvent): void => this.publishCompaction(live, data);
+    const publishSession = (): void =>
+      this.broadcastCompaction(live, {
+        type: "data-session",
+        data: this.describe(this.snapshot),
+      });
+
+    publishSession();
+
+    try {
+      const result = await this.summarizeForCompaction({
+        messages,
+        clientCommandId: id,
+        abortSignal: live.controller.signal,
+        onProgress: (progress) => {
+          modelCalls += 1;
+          // Each step rewrites its stage's summary rather than extending it.
+          stageSummaries[progress.stage] = "";
+          publish(event("progress", { progress }));
+        },
+        onSummaryDelta: (delta, progress) => {
+          stageSummaries[progress.stage] += delta;
+          const now = Date.now();
+          if (now - lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
+          lastPublishedAt = now;
+          publish(event("progress", { progress }));
+        },
+      });
+
+      // Validate the terminal payload before committing. Once the transaction
+      // below returns, no failure may be reported as if the transcript were
+      // unchanged.
+      const completedEvent = event("completed", {
+        outcome: result.result.status,
+        messageCountAfter: result.result.messageCountAfter,
+        estimatedInputTokensBefore: result.result.estimatedInputTokensBefore,
+        estimatedInputTokensAfter: result.result.estimatedInputTokensAfter,
+        durationMs: Math.max(0, Date.now() - live.startedAt),
+        ...(result.summary === undefined ? {} : { summary: result.summary }),
+      });
+
+      await this.withLock(async () => {
+        // A cancel that lands while summarization is finishing must still stop
+        // the commit; the transcript is only rewritten here.
+        live.controller.signal.throwIfAborted();
+        const saved = this.store.commitCompaction(
+          sessionId,
           id,
           command,
-          compacted.messages,
-          result,
+          result.messages,
+          result.result,
+          {
+            // Prefer the engine's own summary: it is post-truncation and covers
+            // every stage, which a live delta buffer cannot guarantee.
+            summary: result.summary ?? combinedSummary(),
+            durationMs: Math.max(0, Date.now() - live.startedAt),
+            modelCalls,
+          },
         );
-        this.snapshot = this.store.getSession(this.snapshot.id);
-        return committed;
-      } catch (error) {
-        this.store.releaseCommand(this.snapshot.id, id, command);
-        throw error;
+        live.finished = true;
+        this.snapshot = saved.snapshot;
+      });
+
+      // The session snapshot precedes the terminal event: the terminal event is
+      // where clients stop reading, so anything after it would never arrive.
+      publishSession();
+      publish(completedEvent);
+    } catch (error) {
+      await this.withLock(async () => {
+        this.store.releaseCommand(sessionId, id, command);
+        this.snapshot = this.store.updateSessionState(sessionId, "idle", 0, null);
+      });
+      const cancelled = live.controller.signal.aborted || isAbortError(error);
+      // Snapshot before the terminal event, for the same reason as on success.
+      publishSession();
+      publish(
+        event(cancelled ? "cancelled" : "failed", {
+          durationMs: Math.max(0, Date.now() - live.startedAt),
+          ...(cancelled ? {} : { error: error instanceof Error ? error.message : String(error) }),
+        }),
+      );
+    } finally {
+      live.finished = true;
+      if (this.manualCompaction === live) this.manualCompaction = undefined;
+      for (const subscriber of live.subscribers) {
+        try {
+          subscriber.close();
+        } catch {
+          // Already closed by the client.
+        }
       }
+      live.subscribers.clear();
+    }
+  }
+
+  private async summarizeForCompaction(params: {
+    readonly messages: readonly ModelMessage[];
+    readonly clientCommandId: string;
+    readonly abortSignal: AbortSignal;
+    readonly onProgress: (progress: CompactionProgress) => void;
+    readonly onSummaryDelta: (delta: string, progress: CompactionProgress) => void;
+  }): Promise<{
+    messages: readonly ModelMessage[];
+    result: MiniLilacCompactResult;
+    summary?: string;
+  }> {
+    const id = params.clientCommandId;
+    if (params.messages.length === 0) {
+      return {
+        messages: params.messages,
+        result: miniLilacCompactResultSchema.parse({
+          status: "empty",
+          clientCommandId: id,
+          messageCountBefore: 0,
+          messageCountAfter: 0,
+          estimatedInputTokensBefore: 0,
+          estimatedInputTokensAfter: 0,
+        }),
+      };
+    }
+    const modelSpecifier = this.snapshot.model;
+    if (modelSpecifier === null) throw new Error("Session model is required for compaction");
+    const limits = await this.resolveModelLimits(modelSpecifier);
+    if (limits === undefined || limits.context <= 0) {
+      throw new Error(`Context window is unavailable for model '${modelSpecifier}'`);
+    }
+    const configuredSummaryModel = this.config.agent.compaction.model;
+    const summaryModelSpecifier =
+      configuredSummaryModel === "inherit" ? modelSpecifier : configuredSummaryModel;
+    // A configured summary model can be far smaller than the session model, so
+    // size chunk budgets against its own window rather than the session's.
+    const summaryLimits =
+      summaryModelSpecifier === modelSpecifier
+        ? limits
+        : await this.resolveModelLimits(summaryModelSpecifier);
+    const compacted = await compactMessages({
+      messages: params.messages,
+      currentModel: this.resolveModel(modelSpecifier),
+      contextLimit: limits.context,
+      outputLimit: limits.output,
+      summaryContextLimit: summaryLimits?.context,
+      thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
+      summaryModel:
+        configuredSummaryModel === "inherit"
+          ? "current"
+          : this.resolveModel(configuredSummaryModel),
+      providerOptions: this.supersededProviderIds.has(
+        parseModelRef(summaryModelSpecifier).providerId,
+      )
+        ? { openai: { store: false, include: ["reasoning.encrypted_content"] } }
+        : undefined,
+      abortSignal: params.abortSignal,
+      onProgress: params.onProgress,
+      onSummaryDelta: params.onSummaryDelta,
     });
+    return {
+      messages: compacted.messages,
+      ...(compacted.status === "compacted" && compacted.summary !== undefined
+        ? { summary: compacted.summary }
+        : {}),
+      result: miniLilacCompactResultSchema.parse({
+        status:
+          compacted.status === "compacted"
+            ? "compacted"
+            : compacted.reason === "empty"
+              ? "empty"
+              : "noop",
+        clientCommandId: id,
+        messageCountBefore: compacted.messageCountBefore,
+        messageCountAfter: compacted.messageCountAfter,
+        estimatedInputTokensBefore: compacted.estimatedTokensBefore,
+        estimatedInputTokensAfter: compacted.estimatedTokensAfter,
+      }),
+    };
   }
 
   updateBindings(
@@ -2765,7 +3228,9 @@ class SessionActor {
         request.clientCommandId,
         command,
       );
-      if (stored !== undefined) return miniLilacSessionSnapshotSchema.parse(stored);
+      if (stored !== undefined) {
+        return this.describe(miniLilacSessionSnapshotSchema.parse(stored));
+      }
       this.snapshot = this.store.getSession(this.snapshot.id);
       if (
         this.active ||
@@ -2800,7 +3265,7 @@ class SessionActor {
           contextWindow: limits?.context,
         },
       );
-      return this.snapshot;
+      return this.describe(this.snapshot);
     });
   }
 
@@ -2824,7 +3289,10 @@ class SessionActor {
         this.snapshot.status,
         this.queuedSteeringCount(),
       );
-      await this.appendChunk(active.runId, { type: "data-session", data: this.snapshot });
+      await this.appendChunk(active.runId, {
+        type: "data-session",
+        data: this.describe(this.snapshot),
+      });
     });
   }
 }
@@ -3169,9 +3637,21 @@ export class SessionService {
     return this.trackOperation(this.actor(request.sessionId).undo(request));
   }
 
-  compact(request: MiniLilacCompactRequest): Promise<MiniLilacCompactResult> {
+  compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
     this.assertAcceptingAdmissions();
     return this.trackOperation(this.actor(request.sessionId).compact(request));
+  }
+
+  cancelCompaction(
+    request: MiniLilacCancelCompactionRequest,
+  ): Promise<MiniLilacCancelCompactionResult> {
+    this.assertAcceptingAdmissions();
+    return this.trackOperation(this.actor(request.sessionId).cancelCompaction(request));
+  }
+
+  /** Decorate a store snapshot with the server-side config clients need. */
+  describeSession(snapshot: MiniLilacSessionSnapshot): MiniLilacSessionSnapshot {
+    return describeSessionSnapshot(snapshot, this.options.config);
   }
 
   updateSessionBindings(
@@ -3208,6 +3688,13 @@ export class SessionService {
     });
     this.shutdownAttempt = attempt;
     return attempt;
+  }
+
+  /** Stop admissions and ask actor-owned work to cancel without closing the store. */
+  async requestShutdown(): Promise<void> {
+    if (this.closed) return;
+    this.acceptingAdmissions = false;
+    await Promise.all([...this.actors.values()].map((actor) => actor.requestShutdown()));
   }
 
   private actor(sessionId: string): SessionActor {

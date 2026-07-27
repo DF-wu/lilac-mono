@@ -15,6 +15,7 @@ import {
   type MiniLilacUIMessageMetadata,
   type MiniLilacUndoRequest,
   type MiniLilacUpdateSessionBindingsRequest,
+  miniLilacCompactionEventSchema,
   miniLilacCompactRequestSchema,
   miniLilacCompactResultSchema,
   miniLilacReconnectQuerySchema,
@@ -487,7 +488,8 @@ describe("miniLilacUIMessageSchema", () => {
         data: {
           source: "automatic",
           reason: "threshold",
-          status: "completed",
+          phase: "completed",
+          outcome: "compacted",
           messageCountBefore: 12,
           messageCountAfter: 4,
           estimatedInputTokensBefore: 8_000,
@@ -653,7 +655,7 @@ describe("miniLilacUIMessageSchema", () => {
         data: {
           source: "manual",
           reason: "threshold",
-          status: "completed",
+          phase: "completed",
           messageCountBefore: 1,
         },
       }).success,
@@ -662,6 +664,26 @@ describe("miniLilacUIMessageSchema", () => {
       miniLilacUIMessageSchema.safeParse(
         messageWith({ type: "data-unknown", data: { value: true } }),
       ).success,
+    ).toBe(false);
+  });
+
+  it("requires terminal result fields on completed compaction events", () => {
+    const completed = {
+      source: "manual",
+      reason: "manual",
+      phase: "completed",
+      messageCountBefore: 4,
+      messageCountAfter: 2,
+      outcome: "compacted",
+    } as const;
+
+    expect(miniLilacCompactionEventSchema.safeParse(completed).success).toBe(true);
+    expect(
+      miniLilacCompactionEventSchema.safeParse({ ...completed, outcome: undefined }).success,
+    ).toBe(false);
+    expect(
+      miniLilacCompactionEventSchema.safeParse({ ...completed, messageCountAfter: undefined })
+        .success,
     ).toBe(false);
   });
 

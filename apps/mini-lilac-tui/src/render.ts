@@ -197,13 +197,69 @@ function compactTokenCount(tokens: number | undefined): string | undefined {
   return `${Math.round((tokens / divisor) * 10) / 10}${suffix}`;
 }
 
-function compactionSummary(event: MiniLilacCompactionEvent): string {
-  if (event.status === "failed")
-    return `Context compaction failed${event.error ? `: ${event.error}` : ""}`;
+function formatCompactionDuration(ms: number | undefined): string | undefined {
+  if (ms === undefined) return undefined;
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/**
+ * Header line for a compaction entry.
+ *
+ * The entry is updated in place across the lifecycle, so this covers the live
+ * phases as well as every terminal one. `noop`/`empty` deliberately get their
+ * own wording: reporting a saving when nothing was compacted is worse than
+ * saying nothing, which is what the UI used to do.
+ */
+export function compactionHeadline(event: MiniLilacCompactionEvent): string {
+  const elapsed = formatCompactionDuration(event.durationMs ?? event.elapsedMs);
+  switch (event.phase) {
+    case "started":
+    case "progress": {
+      const progress = event.progress;
+      const step =
+        progress === undefined || progress.stepCount <= 1
+          ? "summarizing"
+          : `summarizing ${progress.step}/${progress.stepCount}`;
+      const pass = progress !== undefined && progress.pass > 1 ? ` · pass ${progress.pass}` : "";
+      return ["Compacting context", step + pass, elapsed].filter(Boolean).join(" · ");
+    }
+    case "cancelled":
+      return "Compaction cancelled · transcript unchanged";
+    case "failed":
+      return `Compaction failed${event.error ? `: ${event.error}` : ""} · transcript unchanged`;
+    case "completed":
+      break;
+  }
+  if (event.outcome !== undefined && event.outcome !== "compacted") {
+    return "Nothing to compact · transcript already minimal";
+  }
   const before = compactTokenCount(event.estimatedInputTokensBefore);
   const after = compactTokenCount(event.estimatedInputTokensAfter);
-  const usage = before !== undefined && after !== undefined ? ` · ${before} → ${after}` : "";
-  return `Context compacted${usage}`;
+  const parts = ["Context compacted"];
+  if (event.messageCountAfter !== undefined) {
+    parts.push(`${event.messageCountBefore} → ${event.messageCountAfter} msgs`);
+  }
+  if (before !== undefined && after !== undefined) parts.push(`${before} → ${after}`);
+  if (elapsed !== undefined) parts.push(elapsed);
+  if (event.modelCalls !== undefined && event.modelCalls > 0) {
+    parts.push(`${event.modelCalls} ${event.modelCalls === 1 ? "call" : "calls"}`);
+  }
+  return parts.join(" · ");
+}
+
+export function compactionEntry(event: MiniLilacCompactionEvent): Omit<TranscriptEntry, "id"> {
+  const live = event.phase === "started" || event.phase === "progress";
+  const summary = event.summary?.trim();
+  return {
+    kind: "compaction",
+    tone: event.phase === "failed" ? "danger" : "warning",
+    // The summary is the thing the user cannot otherwise see; carrying it on the
+    // entry lets the transcript show what compaction actually kept.
+    text: summary ? `${compactionHeadline(event)}\n${summary}` : compactionHeadline(event),
+    ...(live ? { running: true, streaming: true } : {}),
+  };
 }
 
 const pathInputSchema = z.object({ path: z.string() });
@@ -1030,11 +1086,7 @@ function dataEntry(
     case "data-subagentStatus":
       return undefined;
     case "data-compaction":
-      return {
-        kind: "compaction",
-        tone: parsed.data.data.status === "failed" ? "danger" : "warning",
-        text: compactionSummary(parsed.data.data),
-      };
+      return compactionEntry(parsed.data.data);
   }
 }
 
@@ -1193,6 +1245,7 @@ export class ChunkRenderer {
   private exploration: ExplorationState | undefined;
   private readonly reasoningEntries = new Map<string, { id: string; text: string }>();
   private readonly textEntryIds = new Map<string, string>();
+  private readonly compactionEntryIds = new Map<string, string>();
 
   constructor(
     private readonly output: ChunkOutputSink,
@@ -1314,13 +1367,26 @@ export class ChunkRenderer {
         this.renderSubagentStatus(part.data);
         return;
       case "data-compaction":
-        this.append({
-          kind: "compaction",
-          tone: part.data.status === "failed" ? "danger" : "warning",
-          text: compactionSummary(part.data),
-        });
+        this.renderCompaction(part.id, part.data);
         return;
     }
+  }
+
+  /**
+   * Compaction publishes its whole lifecycle under one chunk id, so the entry is
+   * updated in place. Appending each phase instead would turn a single
+   * compaction into a wall of started/progress/summary lines.
+   */
+  private renderCompaction(chunkId: string | undefined, event: MiniLilacCompactionEvent): void {
+    const key = chunkId ?? "compaction";
+    const existing = this.compactionEntryIds.get(key);
+    if (existing === undefined) {
+      this.finishOpenText();
+      this.finalizeReasoning();
+      this.compactionEntryIds.set(key, this.append(compactionEntry(event)));
+      return;
+    }
+    this.output.update(existing, compactionEntry(event));
   }
 
   private renderSubagentStatus(status: MiniLilacSubagentStatus): void {
@@ -1745,5 +1811,6 @@ export class ChunkRenderer {
     this.exploration = undefined;
     this.textEntryIds.clear();
     this.reasoningEntries.clear();
+    this.compactionEntryIds.clear();
   }
 }

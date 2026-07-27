@@ -5,6 +5,8 @@ import path from "node:path";
 
 import { createOpenAI } from "@ai-sdk/openai";
 import type {
+  MiniLilacCancelCompactionResult,
+  MiniLilacCompactionEvent,
   MiniLilacTodo,
   MiniLilacTodoState,
   MiniLilacUIMessage,
@@ -427,6 +429,20 @@ async function collect<T>(stream: ReadableStream<T>): Promise<T[]> {
   return values;
 }
 
+/** Drive a manual compaction to completion and return its lifecycle plus result. */
+async function compact(
+  service: SessionService,
+  request: { sessionId: string; clientCommandId: string },
+): Promise<{ events: MiniLilacCompactionEvent[]; result: MiniLilacCompactionEvent }> {
+  const started = await service.compact(request);
+  const events = (await collect(started.stream)).flatMap((chunk) =>
+    chunk.type === "data-compaction" ? [chunk.data] : [],
+  );
+  const terminal = events.at(-1);
+  if (terminal === undefined) throw new Error("Compaction produced no events");
+  return { events, result: terminal };
+}
+
 describe("MiniLilacSqliteStore", () => {
   it("rejects experiment database versions instead of migrating them", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-old-schema-"));
@@ -437,6 +453,72 @@ describe("MiniLilacSqliteStore", () => {
     original.close();
 
     expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(MiniLilacDatabaseVersionError);
+  });
+
+  it("clears the post-compaction estimate flag on reported usage and model changes", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-estimate-flag-"));
+    temporaryDirectories.push(directory);
+    const store = new MiniLilacSqliteStore(path.join(directory, "runtime.sqlite"));
+    store.createSession({
+      id: "session-1",
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+    store.replaceMessages("session-1", [{ role: "user", content: "keep" }], [userMessage("keep")]);
+    const command = { kind: "compact", runId: null, payload: {} } as const;
+    const commit = (commandId: string): void => {
+      store.reserveCommand("session-1", commandId, command);
+      store.commitCompaction(
+        "session-1",
+        commandId,
+        command,
+        [{ role: "user", content: "summary" }],
+        {
+          status: "compacted",
+          clientCommandId: commandId,
+          messageCountBefore: 1,
+          messageCountAfter: 1,
+          estimatedInputTokensBefore: 9_000,
+          estimatedInputTokensAfter: 1_200,
+        },
+      );
+    };
+
+    commit("compact-1");
+    expect(store.getSession("session-1")).toMatchObject({
+      inputTokens: 1_200,
+      inputTokensEstimated: true,
+    });
+
+    store.createRun({ id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 });
+    store.updateSessionState("session-1", "streaming", 0, "run-1");
+    // Reported usage that happens to equal the estimate is still real usage, so
+    // it has to clear the flag rather than read as "nothing changed".
+    store.updateActiveRunInputTokens("session-1", "run-1", 1_200);
+    expect(store.getSession("session-1")).toMatchObject({
+      inputTokens: 1_200,
+      inputTokensEstimated: false,
+    });
+
+    store.finishRun("run-1", "completed");
+    store.updateSessionState("session-1", "idle", 0, null);
+    commit("compact-2");
+    expect(store.getSession("session-1").inputTokensEstimated).toBe(true);
+
+    const bindings = {
+      kind: "update-bindings",
+      runId: null,
+      payload: { model: "test/other" },
+    } as const;
+    store.updateSessionBindings("session-1", "bindings-1", bindings, { model: "test/other" });
+    // A model change drops the count; leaving the flag on would render an
+    // estimate of nothing.
+    const afterBindings = store.getSession("session-1");
+    expect(afterBindings.inputTokens).toBeNull();
+    expect(afterBindings.inputTokensEstimated).toBe(false);
+    store.close();
   });
 
   it("marks active root and child runs as errors on startup", async () => {
@@ -1145,9 +1227,11 @@ describe("SessionService", () => {
       inputTokens: 41,
     });
 
-    expect(service.getSnapshot(session.id)).toEqual(durableSnapshot);
+    // The service mirrors server-side compaction config onto outbound snapshots.
+    const published = { ...durableSnapshot, compactionThreshold: 0.8 };
+    expect(service.getSnapshot(session.id)).toEqual(published);
     expect(await service.getSessionResume(session.id)).toEqual({
-      snapshot: durableSnapshot,
+      snapshot: published,
       messages: service.store.getUiMessages(session.id),
       replayCursor: null,
     });
@@ -1231,6 +1315,9 @@ describe("SessionService", () => {
       reasoning: "xhigh",
       status: "idle",
       activeRunId: null,
+      // Every client-facing snapshot path is decorated, so changing bindings
+      // cannot silently drop the threshold the meter renders from.
+      compactionThreshold: 0.8,
     });
     expect(
       await first.updateSessionBindings({
@@ -1318,7 +1405,7 @@ describe("SessionService", () => {
         profile: "child",
       }),
     ).rejects.toThrow("subagent-only");
-    expect(service.getSnapshot(session.id)).toEqual(session);
+    expect(service.getSnapshot(session.id)).toEqual({ ...session, compactionThreshold: 0.8 });
     expect(
       service.store.database
         .query("SELECT COUNT(*) AS count FROM commands WHERE kind = 'update-bindings'")
@@ -1559,6 +1646,337 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("reports compacting status and leaves the transcript intact when cancelled", async () => {
+    // Set once the service exists; the model has to reach back into it to cancel
+    // mid-summarization, which is the only window a compaction is stoppable in.
+    let cancelDuringSummarization: (() => Promise<unknown>) | undefined;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        await cancelDuringSummarization?.();
+        return textResult("summary", "Condensed prior context.");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-cancel-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const cancelResults: MiniLilacCancelCompactionResult[] = [];
+    cancelDuringSummarization = async () => {
+      const snapshot = service.getSnapshot(session.id);
+      expect(snapshot.activeCompactionCommandId).toBe("compact-cancelled");
+      cancelResults.push(
+        await service.cancelCompaction({
+          sessionId: session.id,
+          clientCommandId: snapshot.activeCompactionCommandId ?? undefined,
+        }),
+      );
+    };
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [
+        userMessage(`old request ${"a".repeat(6_000)}`),
+        { id: "assistant-old", role: "assistant", parts: [{ type: "text", text: "old answer" }] },
+        userMessage("latest request must remain"),
+      ],
+    );
+    const before = service.store.getModelMessages(session.id);
+
+    const { events, result } = await compact(service, {
+      sessionId: session.id,
+      clientCommandId: "compact-cancelled",
+    });
+
+    expect(events[0]?.phase).toBe("started");
+    expect(cancelResults).toEqual([{ status: "cancelling" }]);
+    expect(result.phase).toBe("cancelled");
+    // Nothing is written until summarization succeeds, so a cancel is a no-op.
+    expect(service.store.getModelMessages(session.id)).toEqual(before);
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+    // Cancelling when nothing is compacting is reported rather than thrown.
+    expect(await service.cancelCompaction({ sessionId: session.id })).toEqual({
+      status: "inactive",
+    });
+    // The reserved command is released, so the same id can be retried.
+    cancelDuringSummarization = undefined;
+    expect(
+      (await compact(service, { sessionId: session.id, clientCommandId: "compact-cancelled" }))
+        .result.phase,
+    ).toBe("completed");
+    service.close();
+  });
+
+  it("commits compaction and the idle transition in one store transaction", async () => {
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => textResult("summary", "Condensed prior context."),
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-atomic-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [userMessage("old request"), userMessage("latest request must remain")],
+    );
+    const updateSessionState = service.store.updateSessionState.bind(service.store);
+    service.store.updateSessionState = ((sessionId, status, ...rest) => {
+      if (status === "idle") throw new Error("idle must be committed atomically");
+      return updateSessionState(sessionId, status, ...rest);
+    }) as typeof service.store.updateSessionState;
+
+    const { result } = await compact(service, {
+      sessionId: session.id,
+      clientCommandId: "compact-atomic",
+    });
+
+    expect(result.phase).toBe("completed");
+    expect(service.store.getSession(session.id).status).toBe("idle");
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).toContain(
+      "Condensed prior context.",
+    );
+    service.close();
+  });
+
+  it("keeps compacting when the client detaches, and blocks prompts until it commits", async () => {
+    // Held open so the compaction is provably still running while the client is
+    // gone and while admission is attempted.
+    let releaseSummary: (() => void) | undefined;
+    const summarizationReached = Promise.withResolvers<void>();
+    const summaryGate = new Promise<void>((resolve) => {
+      releaseSummary = resolve;
+    });
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summarizationReached.resolve();
+        await summaryGate;
+        return textResult("summary", "Condensed prior context.");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-detach-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [
+        userMessage(`old request ${"a".repeat(6_000)}`),
+        { id: "assistant-old", role: "assistant", parts: [{ type: "text", text: "old answer" }] },
+        userMessage("latest request must remain"),
+      ],
+    );
+
+    const started = await service.compact({
+      sessionId: session.id,
+      clientCommandId: "compact-detached",
+    });
+    await summarizationReached.promise;
+
+    // The client goes away mid-compaction.
+    await started.stream.cancel();
+
+    expect(service.getSnapshot(session.id).status).toBe("compacting");
+    // A prompt would be summarized away by the compaction it raced, so it is
+    // refused for as long as the session is compacting.
+    await expect(
+      service.startPrompt(session.id, userMessage("must not interleave")),
+    ).rejects.toThrow(/cannot accept a prompt/);
+    // So is a second compaction, and so is an undo.
+    await expect(
+      service.compact({ sessionId: session.id, clientCommandId: "compact-second" }),
+    ).rejects.toThrow(/must be quiescent to compact/);
+
+    // The commit is the only observable moment the detached compaction reaches,
+    // so it is what the test waits on rather than a timer.
+    const committed = Promise.withResolvers<void>();
+    const commitCompaction = service.store.commitCompaction.bind(service.store);
+    service.store.commitCompaction = ((...args) => {
+      const saved = commitCompaction(...args);
+      committed.resolve();
+      return saved;
+    }) as typeof service.store.commitCompaction;
+
+    releaseSummary?.();
+    await committed.promise;
+
+    // It committed with nobody watching.
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).toContain(
+      "Condensed prior context.",
+    );
+    await service.shutdown();
+  });
+
+  it("refuses to close while a compaction is running", async () => {
+    const summarizationReached = Promise.withResolvers<void>();
+    let releaseSummary: (() => void) | undefined;
+    const summaryGate = new Promise<void>((resolve) => {
+      releaseSummary = resolve;
+    });
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summarizationReached.resolve();
+        await summaryGate;
+        return textResult("summary", "Condensed prior context.");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-close-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [userMessage("old request"), userMessage("latest request must remain")],
+    );
+
+    const started = await service.compact({
+      sessionId: session.id,
+      clientCommandId: "compact-open",
+    });
+    await summarizationReached.promise;
+
+    expect(() => service.close()).toThrow(/use shutdown\(\)/);
+
+    releaseSummary?.();
+    await collect(started.stream);
+    await service.shutdown();
+  });
+
+  it("cancels a compaction whose admission is still in the lock queue", async () => {
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => textResult("summary", "Condensed prior context."),
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-race-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [userMessage("old request"), userMessage("latest request must remain")],
+    );
+    const before = service.store.getModelMessages(session.id);
+
+    // The cancel is issued while the compact admission still sits in the actor
+    // lock queue. It must observe the freshly admitted operation and stop it;
+    // answering `inactive` here would let the compaction proceed despite the
+    // user's explicit request.
+    const startedPromise = service.compact({
+      sessionId: session.id,
+      clientCommandId: "compact-race",
+    });
+    const cancelPromise = service.cancelCompaction({ sessionId: session.id });
+    const [started, cancel] = await Promise.all([startedPromise, cancelPromise]);
+
+    expect(cancel).toEqual({ status: "cancelling" });
+    const events = (await collect(started.stream)).flatMap((chunk) =>
+      chunk.type === "data-compaction" ? [chunk.data] : [],
+    );
+    expect(events.at(-1)?.phase).toBe("cancelled");
+    expect(service.store.getModelMessages(session.id)).toEqual(before);
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+    service.close();
+  });
+
+  it("shutdown cancels a running compaction instead of exhausting its grace", async () => {
+    const summarizationReached = Promise.withResolvers<void>();
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ abortSignal }) => {
+        summarizationReached.resolve();
+        // Hangs until aborted, like a provider request mid-flight: shutdown
+        // must cancel the compaction rather than wait out its grace period.
+        await new Promise<never>((_, reject) => {
+          const fail = () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (abortSignal?.aborted) fail();
+          else abortSignal?.addEventListener("abort", fail, { once: true });
+        });
+        return textResult("summary", "unreachable");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-compact-shutdown-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request must remain" },
+      ],
+      [userMessage("old request"), userMessage("latest request must remain")],
+    );
+
+    const started = await service.compact({
+      sessionId: session.id,
+      clientCommandId: "compact-shutdown",
+    });
+    await summarizationReached.promise;
+
+    await service.shutdown();
+
+    const events = (await collect(started.stream)).flatMap((chunk) =>
+      chunk.type === "data-compaction" ? [chunk.data] : [],
+    );
+    expect(events.at(-1)?.phase).toBe("cancelled");
+  });
+
   it("manually compacts model context durably while preserving visible messages", async () => {
     const summaryModel = new MockLanguageModelV4({
       doStream: async () => textResult("summary", "Condensed prior context."),
@@ -1609,9 +2027,14 @@ describe("SessionService", () => {
     service.store.updateSessionState(session.id, "idle", 0, null);
 
     const request = { sessionId: session.id, clientCommandId: "compact-1" };
-    const result = await service.compact(request);
-    expect(result.status).toBe("compacted");
+    const { events, result } = await compact(service, request);
+    expect(result.phase).toBe("completed");
+    expect(result.outcome).toBe("compacted");
     expect(result.messageCountAfter).toBeLessThan(result.messageCountBefore);
+    // The lifecycle opens with `started` and streams the summary as it generates.
+    expect(events[0]?.phase).toBe("started");
+    expect(events.some((event) => event.phase === "progress")).toBe(true);
+    expect(result.summary).toContain("Condensed prior context.");
     expect(JSON.stringify(service.store.getModelMessages(session.id))).toContain(
       "Condensed prior context.",
     );
@@ -1630,17 +2053,24 @@ describe("SessionService", () => {
             data: {
               source: "manual",
               reason: "manual",
-              status: "completed",
+              phase: "completed",
+              outcome: "compacted",
               messageCountBefore: result.messageCountBefore,
               messageCountAfter: result.messageCountAfter,
               estimatedInputTokensBefore: result.estimatedInputTokensBefore,
               estimatedInputTokensAfter: result.estimatedInputTokensAfter,
+              summary: result.summary,
+              durationMs: expect.any(Number),
+              modelCalls: expect.any(Number),
             },
           },
         ],
       },
     ]);
-    expect(await service.compact(request)).toEqual(result);
+    expect((await compact(service, request)).result).toMatchObject({
+      phase: "completed",
+      outcome: "compacted",
+    });
     expect(
       await service.undo({ sessionId: session.id, clientCommandId: "undo-before-barrier" }),
     ).toEqual({
@@ -1683,7 +2113,10 @@ describe("SessionService", () => {
       modelResolver: () => summaryModel,
       modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
     });
-    expect(await reopened.compact(request)).toEqual(result);
+    expect((await compact(reopened, request)).result).toMatchObject({
+      phase: "completed",
+      outcome: "compacted",
+    });
     expect(JSON.stringify(reopened.store.getModelMessages(session.id))).toContain(
       "Condensed prior context.",
     );
@@ -1711,20 +2144,37 @@ describe("SessionService", () => {
         return agent.subscribe((event) => {
           if (event.type !== "agent_start") return;
           queueMicrotask(() => {
-            options.onCompactionEnd?.({
-              spec: "test/mock",
-              reason: "threshold",
-              status: "completed",
+            const base = {
+              spec: "test/mock" as const,
+              reason: "threshold" as const,
               messageCountBefore: 12,
-              messageCountAfter: 4,
               estimatedInputTokens: 8_000,
-              estimatedInputTokensAfter: 2_000,
-              durationMs: 20,
               budget: {
                 inputBudget: 9_000,
                 safeInputBudget: 8_000,
                 reservedOutputTokens: 1_000,
               },
+            };
+            const progress = {
+              stage: "history" as const,
+              step: 1,
+              stepCount: 1,
+              pass: 1,
+            };
+            const splitTurn = { ...progress, stage: "split-turn" as const };
+            options.onCompactionStart?.(base);
+            // The split turn summarizes concurrently with history; its deltas
+            // must reach the summary rather than being dropped.
+            options.onSummaryDelta?.("Mid-turn state.", splitTurn);
+            options.onProgress?.(progress);
+            options.onSummaryDelta?.("Condensed prior context.", progress);
+            options.onCompactionEnd?.({
+              ...base,
+              status: "completed",
+              messageCountAfter: 4,
+              estimatedInputTokensAfter: 2_000,
+              durationMs: 20,
+              summary: "Engine summary covering both stages.",
             });
           });
         });
@@ -1735,34 +2185,49 @@ describe("SessionService", () => {
     const streamed = await collect(started.stream);
 
     expect(resolvedLimits).toEqual({ context: 32_000, output: 12_000 });
-    expect(streamed.filter((chunk) => chunk.type === "data-compaction")).toEqual([
-      {
-        type: "data-compaction",
-        id: expect.any(String),
-        data: {
-          source: "automatic",
-          reason: "threshold",
-          status: "completed",
-          messageCountBefore: 12,
-          messageCountAfter: 4,
-          estimatedInputTokensBefore: 8_000,
-          estimatedInputTokensAfter: 2_000,
-        },
-      },
+    const compactionChunks = streamed.filter((chunk) => chunk.type === "data-compaction");
+    // One chunk id spans the lifecycle so the renderer updates a single entry.
+    expect(new Set(compactionChunks.map((chunk) => chunk.id)).size).toBe(1);
+    expect(compactionChunks.map((chunk) => chunk.data.phase)).toEqual([
+      "started",
+      "progress",
+      "progress",
+      "completed",
     ]);
-    expect(service.getMessages(session.id).at(-1)?.parts).toContainEqual({
-      type: "data-compaction",
-      id: expect.any(String),
-      data: {
-        source: "automatic",
-        reason: "threshold",
-        status: "completed",
-        messageCountBefore: 12,
-        messageCountAfter: 4,
-        estimatedInputTokensBefore: 8_000,
-        estimatedInputTokensAfter: 2_000,
-      },
+    // Publication is deferred behind the run's event queue, so each chunk must
+    // carry the state captured when it was raised, not whatever came later.
+    expect(compactionChunks.at(0)?.data).toMatchObject({ modelCalls: 0, elapsedMs: 0 });
+    expect(compactionChunks.at(0)?.data.summary).toBeUndefined();
+    // Split-turn text is part of the summary, assembled the way the engine does.
+    expect(compactionChunks.at(1)?.data.summary).toBe(
+      "**Turn Context (split turn):**\n\nMid-turn state.",
+    );
+    expect(compactionChunks.at(2)?.data.progress).toEqual({
+      stage: "history",
+      step: 1,
+      stepCount: 1,
+      pass: 1,
     });
+    // The engine's own summary wins at the terminal phase: it is post-truncation
+    // and complete, which a throttled delta buffer cannot guarantee.
+    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine summary covering both stages.");
+    expect(compactionChunks.at(-1)?.data).toMatchObject({
+      source: "automatic",
+      reason: "threshold",
+      phase: "completed",
+      outcome: "compacted",
+      messageCountBefore: 12,
+      messageCountAfter: 4,
+      estimatedInputTokensBefore: 8_000,
+      estimatedInputTokensAfter: 2_000,
+      modelCalls: 1,
+    });
+    expect(service.getMessages(session.id).at(-1)?.parts).toContainEqual(
+      expect.objectContaining({
+        type: "data-compaction",
+        data: expect.objectContaining({ phase: "completed", outcome: "compacted" }),
+      }),
+    );
     service.close();
   });
 

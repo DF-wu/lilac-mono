@@ -2,9 +2,14 @@ import { describe, expect, it } from "bun:test";
 import type { UIMessageChunk } from "ai";
 
 import {
+  MiniLilacCompactionCancelledError,
   MiniLilacTransport,
+  type MiniLilacCancelCompactionRequest,
+  type MiniLilacCancelCompactionResult,
   type MiniLilacCancelResult,
+  type MiniLilacCompactionEvent,
   type MiniLilacCompactInput,
+  type MiniLilacCompactOptions,
   type MiniLilacCompactResult,
   type MiniLilacInterruptQueuedSteeringResult,
   type MiniLilacSteerRequest,
@@ -18,6 +23,7 @@ import {
   type MiniLilacUserUIMessage,
 } from "@stanley2058/mini-lilac-client";
 
+import type { SessionPresentation } from "./presentation";
 import { Controller, expandDraftText, type ControllerUISink } from "./controller";
 import type { InputState } from "./input-state";
 import type { TranscriptEntry } from "./render";
@@ -73,6 +79,7 @@ class FakeTransport extends MiniLilacTransport {
   streamCancelCount = 0;
   undoRequests: MiniLilacUndoRequest[] = [];
   compactRequests: MiniLilacCompactInput[] = [];
+  cancelCompactionRequests: MiniLilacCancelCompactionRequest[] = [];
   bindingRequests: MiniLilacUpdateSessionBindingsInput[] = [];
   localBindings: Array<{ model?: string; profile?: string; reasoning?: string }> = [];
   sendAbortSignal: AbortSignal | undefined;
@@ -95,7 +102,11 @@ class FakeTransport extends MiniLilacTransport {
       readonly getMessages?: () => Promise<MiniLilacUIMessage[]>;
       readonly cancel?: () => Promise<MiniLilacCancelResult>;
       readonly undo?: (request: MiniLilacUndoRequest) => Promise<MiniLilacUndoResult>;
-      readonly compact?: (request: MiniLilacCompactInput) => Promise<MiniLilacCompactResult>;
+      readonly compact?: (
+        request: MiniLilacCompactInput,
+        options: MiniLilacCompactOptions,
+      ) => Promise<MiniLilacCompactResult>;
+      readonly cancelCompaction?: () => Promise<MiniLilacCancelCompactionResult>;
       readonly updateBindings?: (
         request: MiniLilacUpdateSessionBindingsInput,
       ) => Promise<MiniLilacSessionSnapshot>;
@@ -192,11 +203,22 @@ class FakeTransport extends MiniLilacTransport {
     return Promise.reject(new Error("undo not configured"));
   }
 
-  override compact(request: MiniLilacCompactInput): Promise<MiniLilacCompactResult> {
+  override compact(
+    request: MiniLilacCompactInput,
+    options: MiniLilacCompactOptions = {},
+  ): Promise<MiniLilacCompactResult> {
     this.calls.push("compact");
     this.compactRequests.push(request);
-    if (this.behavior.compact !== undefined) return this.behavior.compact(request);
+    if (this.behavior.compact !== undefined) return this.behavior.compact(request, options);
     return Promise.reject(new Error("compact not configured"));
+  }
+
+  override cancelCompaction(
+    request: MiniLilacCancelCompactionRequest,
+  ): Promise<MiniLilacCancelCompactionResult> {
+    this.calls.push("cancelCompaction");
+    this.cancelCompactionRequests.push(request);
+    return this.behavior.cancelCompaction?.() ?? Promise.resolve({ status: "cancelling" as const });
   }
 
   override setSessionBindings(bindings: {
@@ -513,6 +535,47 @@ describe("Controller effect wiring", () => {
     expect(controller.transcript.map((entry) => entry.text)).toEqual(["admitted once"]);
   });
 
+  it("follows compaction discovered while recovering ambiguous prompt admission", async () => {
+    const compacting: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: null,
+      activeCompactionCommandId: "compact-recovery",
+      status: "compacting",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "high",
+      queuedSteeringCount: 0,
+    };
+    const snapshots = [compacting, { ...compacting, status: "idle" as const }];
+    const transport = new FakeTransport({
+      admissionError: new Error("response lost"),
+      getSession: () => Promise.resolve(snapshots.shift() ?? snapshots[0]!),
+    });
+    transport.canonicalMessages = [
+      { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "before" }] },
+    ];
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialSnapshot: { ...compacting, status: "idle" },
+      initialMessages: transport.canonicalMessages,
+      compactionWatchDelay: () => Promise.resolve(),
+      onExit: () => {},
+    });
+    controller.start();
+
+    submitText(controller, "keep this draft");
+    await flush();
+    await flush();
+
+    expect(controller.inputState.phase).toBe("idle");
+    expect(controller.inputState.editor).toBe("keep this draft");
+    expect(controller.transcript.some((entry) => entry.text === "keep this draft")).toBe(false);
+  });
+
   it("reconciles a completed prompt after its admission response is lost", async () => {
     const snapshot: MiniLilacSessionSnapshot = {
       ...SESSION_PRESENTATION,
@@ -634,7 +697,9 @@ describe("Controller effect wiring", () => {
     controller.escape();
     await flush();
     await flush();
-    expect(snapshotCalls).toBe(2);
+    // One recovery read identifies the run; completion then rechecks session
+    // activity before exposing idle controls.
+    expect(snapshotCalls).toBe(3);
     expect(transport.calls).toContain("cancel");
   });
 
@@ -802,7 +867,8 @@ describe("Controller effect wiring", () => {
             data: {
               source: "manual",
               reason: "manual",
-              status: "completed",
+              phase: "completed",
+              outcome: "compacted",
               messageCountBefore: 4,
               messageCountAfter: 2,
             },
@@ -820,7 +886,7 @@ describe("Controller effect wiring", () => {
     controller.start();
 
     submitText(controller, "/compact");
-    expect(controller.inputState.phase).toBe("submitting");
+    expect(controller.inputState.phase).toBe("compacting");
     expect(transport.calls).toEqual(["compact"]);
     expect(transport.compactRequests[0]).toEqual({
       sessionId: "session-1",
@@ -837,8 +903,232 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.phase).toBe("idle");
     expect(controller.transcript.map((entry) => entry.text)).toEqual([
       "hello",
-      "Context compacted",
+      "Context compacted · 4 → 2 msgs",
     ]);
+  });
+
+  it("streams compaction progress into one entry that the summary fills in", async () => {
+    const completion = deferred<MiniLilacCompactResult>();
+    let emit: MiniLilacCompactOptions["onEvent"];
+    const transport = new FakeTransport({
+      compact: (_request, options) => {
+        emit = options.onEvent;
+        return completion.promise;
+      },
+    });
+    transport.canonicalMessages = [];
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [{ id: "a", role: "assistant", parts: [{ type: "text", text: "hi" }] }],
+      onExit: () => {},
+    });
+    controller.start();
+    controller.compact();
+    await flush();
+
+    const base = { source: "manual", reason: "manual", messageCountBefore: 4 } as const;
+    emit?.({ ...base, phase: "started" });
+    emit?.({
+      ...base,
+      phase: "progress",
+      progress: { stage: "history", step: 1, stepCount: 2, pass: 1 },
+      summary: "Condensed",
+      elapsedMs: 3_000,
+    });
+
+    // One entry, rewritten in place, carrying the summary as it generates.
+    expect(controller.transcript).toHaveLength(2);
+    expect(controller.transcript[1]?.text).toBe(
+      "Compacting context · summarizing 1/2 · 3s\nCondensed",
+    );
+    expect(controller.transcript[1]?.running).toBe(true);
+
+    completion.resolve({
+      status: "noop",
+      clientCommandId: transport.compactRequests[0]?.clientCommandId ?? "compact-1",
+      messageCountBefore: 4,
+      messageCountAfter: 4,
+    });
+    await flush();
+    expect(controller.inputState.phase).toBe("idle");
+  });
+
+  it("cancels an in-flight compaction on escape through the server, not the request", async () => {
+    const completion = deferred<MiniLilacCompactResult>();
+    let signal: AbortSignal | undefined;
+    let emit: ((event: MiniLilacCompactionEvent) => void) | undefined;
+    const transport = new FakeTransport({
+      compact: (request, options) => {
+        signal = options.signal;
+        emit = (event) => options.onEvent?.(event);
+        emit({ source: "manual", reason: "manual", phase: "started", messageCountBefore: 4 });
+        // Runtime publishes the committed idle snapshot before the terminal
+        // event. That must not erase this operation's cancel target in between.
+        options.onSession?.({
+          ...SESSION_PRESENTATION,
+          id: "session-1",
+          activeRunId: null,
+          status: "idle",
+          cwd: process.cwd(),
+          model: "provider/model",
+          profile: "coding",
+          reasoning: "low",
+          queuedSteeringCount: 0,
+        });
+        return completion.promise;
+      },
+      // The server acknowledges, then reports the terminal phase on the stream
+      // that is still open, exactly as the real one does.
+      cancelCompaction: () => {
+        emit?.({ source: "manual", reason: "manual", phase: "cancelled", messageCountBefore: 4 });
+        completion.reject(new MiniLilacCompactionCancelledError());
+        return Promise.resolve({ status: "cancelling" as const });
+      },
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [{ id: "a", role: "assistant", parts: [{ type: "text", text: "hi" }] }],
+      onExit: () => {},
+    });
+    controller.start();
+    controller.compact();
+    await flush();
+
+    controller.escape();
+    await flush();
+
+    // Cancellation is a server command; the request signal is only a detach and
+    // must not be used to stop work the server owns.
+    expect(transport.cancelCompactionRequests).toEqual([
+      {
+        sessionId: "session-1",
+        clientCommandId: transport.compactRequests[0]?.clientCommandId,
+      },
+    ]);
+    expect(signal?.aborted).toBe(false);
+    expect(controller.inputState.phase).toBe("idle");
+    // A cancel is reported on the entry, not as a transport error line.
+    expect(controller.transcript.map((entry) => entry.kind)).toEqual(["assistant", "compaction"]);
+    expect(controller.transcript[1]?.text).toBe("Compaction cancelled · transcript unchanged");
+  });
+
+  it("reports a streamed compaction failure once, not twice", async () => {
+    const transport = new FakeTransport({
+      compact: (_request, options) => {
+        options.onEvent?.({
+          source: "manual",
+          reason: "manual",
+          phase: "started",
+          messageCountBefore: 4,
+        });
+        options.onEvent?.({
+          source: "manual",
+          reason: "manual",
+          phase: "failed",
+          messageCountBefore: 4,
+          error: "summary model unavailable",
+        });
+        return Promise.reject(new Error("summary model unavailable"));
+      },
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [{ id: "a", role: "assistant", parts: [{ type: "text", text: "hi" }] }],
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+
+    expect(controller.inputState.phase).toBe("idle");
+    // The rejection that follows a terminal event is that same event, so the
+    // entry carries the failure and nothing else is appended.
+    expect(controller.transcript.map((entry) => entry.kind)).toEqual(["assistant", "compaction"]);
+    expect(controller.transcript[1]?.text).toBe(
+      "Compaction failed: summary model unavailable · transcript unchanged",
+    );
+  });
+
+  it("does not claim a compaction failed when only the refresh did", async () => {
+    const transport = new FakeTransport({
+      compact: (request) =>
+        Promise.resolve({
+          status: "compacted",
+          clientCommandId: request.clientCommandId ?? "compact-1",
+          messageCountBefore: 4,
+          messageCountAfter: 2,
+        }),
+      messagesError: new Error("connection reset"),
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [{ id: "a", role: "assistant", parts: [{ type: "text", text: "hi" }] }],
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+
+    expect(controller.inputState.phase).toBe("idle");
+    expect(controller.transcript.at(-1)?.text).toBe(
+      "context compacted, but refreshing the transcript failed: connection reset",
+    );
+  });
+
+  it("adopts successor activity even when the committed transcript refresh fails", async () => {
+    const successor: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: "run-successor",
+      status: "streaming",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "low",
+      queuedSteeringCount: 0,
+    };
+    const reconnect = deferred<ReadableStream<UIMessageChunk> | null>();
+    const transport = new FakeTransport({
+      compact: (request) =>
+        Promise.resolve({
+          status: "compacted",
+          clientCommandId: request.clientCommandId ?? "compact-1",
+          messageCountBefore: 4,
+          messageCountAfter: 2,
+        }),
+      messagesError: new Error("connection reset"),
+      session: successor,
+      reconnectPromise: reconnect.promise,
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+
+    expect(controller.inputState.phase).toBe("active");
+    expect(controller.transcript.at(-1)?.text).toBe(
+      "context compacted, but refreshing the transcript failed: connection reset",
+    );
+    controller.dispose();
   });
 
   it("keeps compact noop and empty results quiet", async () => {
@@ -871,9 +1161,231 @@ describe("Controller effect wiring", () => {
     expect(controller.transcript.map((entry) => entry.text)).toEqual(["hello"]);
   });
 
-  it("keeps compact failures visible", async () => {
+  it("keeps representing a detached compaction and refreshes when it ends", async () => {
+    const base: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: null,
+      activeCompactionCommandId: "compact-detached",
+      status: "compacting",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "low",
+      queuedSteeringCount: 0,
+    };
+    const firstPoll = deferred<MiniLilacSessionSnapshot>();
+    const secondPoll = deferred<MiniLilacSessionSnapshot>();
+    const polls = [firstPoll, secondPoll];
     const transport = new FakeTransport({
-      compact: () => Promise.reject(new Error("compaction failed")),
+      compact: () => Promise.reject(new Error("socket hang up")),
+      getSession: () => (polls.shift() ?? secondPoll).promise,
+    });
+    transport.canonicalMessages = [
+      { id: "summary-1", role: "assistant", parts: [{ type: "text", text: "compacted view" }] },
+    ];
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      compactionWatchDelay: () => Promise.resolve(),
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+    // No terminal event arrived, so the compaction is out of view rather than
+    // known to have failed; the client keeps representing it instead of lying
+    // about being idle, and follows the session until the server reports.
+    expect(controller.inputState.phase).toBe("compacting");
+    expect(controller.transcript.at(-1)?.text).toBe(
+      "compaction stream interrupted (socket hang up); it continues server-side",
+    );
+
+    firstPoll.resolve(base);
+    await flush();
+    expect(controller.inputState.phase).toBe("compacting");
+
+    secondPoll.resolve({ ...base, status: "idle" });
+    await flush();
+    expect(controller.inputState.phase).toBe("idle");
+    expect(transport.getMessagesCount).toBe(1);
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["compacted view"]);
+  });
+
+  it("keeps polling when transcript refresh reveals a successor compaction", async () => {
+    const idle: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: null,
+      status: "idle",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "low",
+      queuedSteeringCount: 0,
+    };
+    const successor = {
+      ...idle,
+      status: "compacting" as const,
+      activeCompactionCommandId: "compact-successor",
+    };
+    const snapshots = [idle, successor, idle, idle];
+    const transport = new FakeTransport({
+      compact: () => Promise.reject(new Error("socket hang up")),
+      getSession: () => Promise.resolve(snapshots.shift() ?? idle),
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      compactionWatchDelay: () => Promise.resolve(),
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+    await flush();
+
+    expect(transport.getMessagesCount).toBe(2);
+    expect(controller.inputState.phase).toBe("idle");
+  });
+
+  it("retargets escape when a detached compaction is replaced between polls", async () => {
+    const base: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: null,
+      activeCompactionCommandId: "compact-successor",
+      status: "compacting",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "low",
+      queuedSteeringCount: 0,
+    };
+    const compactingPoll = deferred<MiniLilacSessionSnapshot>();
+    const idlePoll = deferred<MiniLilacSessionSnapshot>();
+    const polls = [compactingPoll, idlePoll];
+    const transport = new FakeTransport({
+      compact: () => Promise.reject(new Error("socket hang up")),
+      getSession: () => (polls.shift() ?? idlePoll).promise,
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      compactionWatchDelay: () => Promise.resolve(),
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+    expect(controller.inputState.phase).toBe("compacting");
+
+    // The original detached compaction ended and this poll observed its
+    // successor without an idle status in between.
+    compactingPoll.resolve(base);
+    await flush();
+
+    // `esc cancel` must target the observed generation, not the command whose
+    // stream was interrupted.
+    controller.escape();
+    await flush();
+    expect(transport.cancelCompactionRequests).toEqual([
+      { sessionId: "session-1", clientCommandId: "compact-successor" },
+    ]);
+
+    idlePoll.resolve({ ...base, status: "idle" });
+    await flush();
+    expect(controller.inputState.phase).toBe("idle");
+  });
+
+  it("represents a reopened session's running compaction instead of idling", async () => {
+    const base: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: null,
+      activeCompactionCommandId: "compact-reopened",
+      status: "compacting",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "low",
+      queuedSteeringCount: 0,
+    };
+    const poll = deferred<MiniLilacSessionSnapshot>();
+    const transport = new FakeTransport({ getSession: () => poll.promise });
+    transport.canonicalMessages = [
+      { id: "summary-1", role: "assistant", parts: [{ type: "text", text: "compacted view" }] },
+    ];
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialSnapshot: base,
+      compactionWatchDelay: () => Promise.resolve(),
+      onExit: () => {},
+    });
+    controller.start();
+
+    // The server rejects prompts while compacting; showing `Ready` would offer
+    // work the server refuses and hide the `esc cancel` affordance.
+    expect(controller.inputState.phase).toBe("compacting");
+
+    controller.escape();
+    await flush();
+    expect(transport.cancelCompactionRequests).toEqual([
+      { sessionId: "session-1", clientCommandId: "compact-reopened" },
+    ]);
+
+    poll.resolve({ ...base, status: "idle" });
+    await flush();
+    expect(controller.inputState.phase).toBe("idle");
+    expect(transport.getMessagesCount).toBe(1);
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["compacted view"]);
+  });
+
+  it("adopts a prompt run that starts as detached compaction ends", async () => {
+    const successor: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: "run-successor",
+      status: "streaming",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "coding",
+      reasoning: "low",
+      queuedSteeringCount: 0,
+    };
+    const reconnect = deferred<ReadableStream<UIMessageChunk> | null>();
+    let steerRequest: MiniLilacSteerRequest | undefined;
+    const transport = new FakeTransport({
+      compact: (request) =>
+        Promise.resolve({
+          status: "compacted",
+          clientCommandId: request.clientCommandId ?? "compact-1",
+          messageCountBefore: 4,
+          messageCountAfter: 2,
+        }),
+      session: successor,
+      reconnectPromise: reconnect.promise,
+      steer: (request) => {
+        steerRequest = request;
+        return Promise.resolve({ status: "queued", steeringId: "steer-successor" });
+      },
     });
     const controller = new Controller({
       transport,
@@ -888,8 +1400,84 @@ describe("Controller effect wiring", () => {
 
     controller.compact();
     await flush();
+    expect(controller.inputState.phase).toBe("active");
+
+    submitText(controller, "for the successor");
+    await flush();
+    expect(steerRequest?.runId).toBe("run-successor");
+    controller.dispose();
+  });
+
+  it("holds escape cancellation until the server admits the compaction", async () => {
+    const completion = deferred<MiniLilacCompactResult>();
+    let emit: ((event: MiniLilacCompactionEvent) => void) | undefined;
+    const transport = new FakeTransport({
+      compact: (_request, options) => {
+        emit = (event) => options.onEvent?.(event);
+        return completion.promise;
+      },
+      cancelCompaction: () => {
+        emit?.({ source: "manual", reason: "manual", phase: "cancelled", messageCountBefore: 4 });
+        completion.reject(new MiniLilacCompactionCancelledError());
+        return Promise.resolve({ status: "cancelling" as const });
+      },
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+    controller.escape();
+    await flush();
+    // A cancel that reaches the server before the compact command is admitted
+    // answers `inactive`, and the compaction then proceeds despite the user.
+    expect(transport.cancelCompactionRequests).toEqual([]);
+
+    emit?.({ source: "manual", reason: "manual", phase: "started", messageCountBefore: 4 });
+    await flush();
+    expect(transport.cancelCompactionRequests).toEqual([
+      {
+        sessionId: "session-1",
+        clientCommandId: transport.compactRequests[0]?.clientCommandId,
+      },
+    ]);
     expect(controller.inputState.phase).toBe("idle");
-    expect(controller.transcript.at(-1)?.text).toBe("compaction failed");
+    expect(controller.transcript.at(-1)?.text).toBe("Compaction cancelled · transcript unchanged");
+  });
+
+  it("reports a refused compaction request instead of watching for it", async () => {
+    const transport = new FakeTransport({
+      compact: () =>
+        Promise.reject(
+          new Error(
+            "MiniLilac request failed (409): Session 'session-1' must be quiescent to compact",
+          ),
+        ),
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+
+    controller.compact();
+    await flush();
+    // The server answered: nothing was admitted, so there is nothing to follow.
+    expect(controller.inputState.phase).toBe("idle");
+    expect(controller.transcript.at(-1)?.kind).toBe("error");
   });
 
   it("never compacts or steers while active", async () => {
@@ -941,8 +1529,7 @@ describe("Controller effect wiring", () => {
       title: "Updated title",
       inputTokens: 2_500,
     };
-    const seen: Array<{ title: string; inputTokens: number | null; contextWindow: number | null }> =
-      [];
+    const seen: SessionPresentation[] = [];
     const transport = new FakeTransport({ updateBindings: () => Promise.resolve(updated) });
     const controller = new Controller({
       transport,
@@ -959,14 +1546,18 @@ describe("Controller effect wiring", () => {
     expect(seen.at(-1)).toEqual({
       title: "Initial title",
       inputTokens: 1_000,
+      inputTokensEstimated: false,
       contextWindow: 10_000,
+      compactionThreshold: null,
     });
 
     expect(await controller.updateSessionBindings({ profile: "review" })).toBe(true);
     expect(seen.at(-1)).toEqual({
       title: "Updated title",
       inputTokens: 2_500,
+      inputTokensEstimated: false,
       contextWindow: 10_000,
+      compactionThreshold: null,
     });
   });
 
@@ -2173,6 +2764,56 @@ describe("Controller effect wiring", () => {
       "existing",
       expect.any(String),
     ]);
+  });
+
+  it("follows compaction that starts after a resumed prompt run completes", async () => {
+    const initial: MiniLilacSessionSnapshot = {
+      ...SESSION_PRESENTATION,
+      id: "session-1",
+      activeRunId: "run-1",
+      status: "streaming",
+      cwd: process.cwd(),
+      model: "provider/model",
+      profile: "general",
+      reasoning: null,
+      queuedSteeringCount: 0,
+    };
+    const compacting: MiniLilacSessionSnapshot = {
+      ...initial,
+      activeRunId: null,
+      activeCompactionCommandId: "compact-after-run",
+      status: "compacting",
+    };
+    const idlePoll = deferred<MiniLilacSessionSnapshot>();
+    let sessionRead = 0;
+    const transport = new FakeTransport({
+      getSession: () => {
+        sessionRead += 1;
+        return sessionRead === 1 ? Promise.resolve(compacting) : idlePoll.promise;
+      },
+    });
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialSnapshot: initial,
+      compactionWatchDelay: () => Promise.resolve(),
+      onExit: () => {},
+    });
+
+    controller.start();
+    await flush();
+    expect(controller.inputState.phase).toBe("compacting");
+
+    controller.escape();
+    await flush();
+    expect(transport.cancelCompactionRequests).toEqual([
+      { sessionId: "session-1", clientCommandId: "compact-after-run" },
+    ]);
+
+    idlePoll.resolve({ ...compacting, activeCompactionCommandId: null, status: "idle" });
+    await flush();
+    expect(controller.inputState.phase).toBe("idle");
   });
 
   it("replays only uncommitted steering into the queue", async () => {

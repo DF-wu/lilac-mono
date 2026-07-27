@@ -8,10 +8,13 @@ import {
 import { z } from "zod";
 
 import {
+  type MiniLilacCancelCompactionRequest,
+  type MiniLilacCancelCompactionResult,
   type MiniLilacCancelRequest,
   type MiniLilacCancelResult,
   type MiniLilacChatRequestExtras,
   type MiniLilacCompactInput,
+  type MiniLilacCompactionEvent,
   type MiniLilacCompactResult,
   type MiniLilacInterruptQueuedSteeringInput,
   type MiniLilacInterruptQueuedSteeringResult,
@@ -28,6 +31,8 @@ import {
   type MiniLilacUndoInput,
   type MiniLilacUndoResult,
   type MiniLilacUpdateSessionBindingsInput,
+  miniLilacCancelCompactionRequestSchema,
+  miniLilacCancelCompactionResultSchema,
   miniLilacCancelRequestSchema,
   miniLilacCancelResultSchema,
   miniLilacChatRequestExtrasSchema,
@@ -46,6 +51,7 @@ import {
   miniLilacSteerRequestSchema,
   miniLilacSteerResultSchema,
   miniLilacTodoStateSchema,
+  miniLilacUIMessageDataPartSchema,
   miniLilacUndoRequestSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
@@ -73,6 +79,21 @@ export type MiniLilacTransportOptions = Omit<MiniLilacChatRequestExtras, "client
 
 export type MiniLilacRequestOptions = {
   signal?: AbortSignal;
+};
+
+/** Thrown by `compact()` when the compaction was deliberately stopped. */
+export class MiniLilacCompactionCancelledError extends Error {
+  constructor() {
+    super("Context compaction was cancelled");
+    this.name = "MiniLilacCompactionCancelledError";
+  }
+}
+
+export type MiniLilacCompactOptions = MiniLilacRequestOptions & {
+  /** Receives every lifecycle event, including streamed summary text. */
+  onEvent?: (event: MiniLilacCompactionEvent) => void;
+  /** Receives session snapshots published while compaction runs. */
+  onSession?: (snapshot: MiniLilacSessionSnapshot) => void;
 };
 
 const sessionIdSchema = z.string().trim().min(1);
@@ -397,20 +418,129 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     return this.postControl(payload.sessionId, "undo", payload, miniLilacUndoResultSchema, options);
   }
 
-  compact(
-    request: MiniLilacCompactInput,
+  /** Stop a running compaction. Detaching the stream does not; this does. */
+  cancelCompaction(
+    request: MiniLilacCancelCompactionRequest,
     options: MiniLilacRequestOptions = {},
+  ): Promise<MiniLilacCancelCompactionResult> {
+    const payload = miniLilacCancelCompactionRequestSchema.parse(request);
+    return this.postControl(
+      payload.sessionId,
+      "compact/cancel",
+      payload,
+      miniLilacCancelCompactionResultSchema,
+      options,
+    );
+  }
+
+  /**
+   * Run a manual compaction, reporting lifecycle events as they arrive.
+   *
+   * The response is an event stream rather than a JSON body because compaction
+   * is long-running: without a channel there is nothing to stream the summary or
+   * an elapsed timer over.
+   *
+   * Aborting `options.signal` only detaches this client. Compaction keeps
+   * running and still commits server-side; stopping it is `cancelCompaction`.
+   */
+  async compact(
+    request: MiniLilacCompactInput,
+    options: MiniLilacCompactOptions = {},
   ): Promise<MiniLilacCompactResult> {
     const payload = miniLilacCompactRequestSchema.parse({
       ...request,
       clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
     });
-    return this.postControl(
-      payload.sessionId,
-      "compact",
+    const stream = await this.postStream(
+      `sessions/${encodeURIComponent(payload.sessionId)}/compact`,
       payload,
-      miniLilacCompactResultSchema,
-      options,
+      options.signal,
+    );
+
+    let result: MiniLilacCompactResult | undefined;
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const part = miniLilacUIMessageDataPartSchema.safeParse(value);
+        if (!part.success) {
+          if (z.object({ type: z.literal("data-compaction") }).safeParse(value).success) {
+            throw new Error("Invalid compaction lifecycle event");
+          }
+          continue;
+        }
+        if (part.data.type === "data-session") {
+          options.onSession?.(part.data.data);
+          continue;
+        }
+        if (part.data.type !== "data-compaction") continue;
+        const event = part.data.data;
+        options.onEvent?.(event);
+        if (event.phase === "failed") {
+          throw new Error(event.error ?? "Context compaction failed");
+        }
+        // A cancel is a deliberate stop, not a failure, and callers render it
+        // differently; a distinct error type is what lets them tell.
+        if (event.phase === "cancelled") throw new MiniLilacCompactionCancelledError();
+        if (event.phase !== "completed") continue;
+        if (event.outcome === undefined || event.messageCountAfter === undefined) {
+          throw new Error("Context compaction completed without a terminal result");
+        }
+        result = miniLilacCompactResultSchema.parse({
+          status: event.outcome,
+          clientCommandId: payload.clientCommandId,
+          messageCountBefore: event.messageCountBefore,
+          messageCountAfter: event.messageCountAfter,
+          estimatedInputTokensBefore: event.estimatedInputTokensBefore,
+          estimatedInputTokensAfter: event.estimatedInputTokensAfter,
+        });
+        // `completed` is terminal: the compaction is committed. Waiting for EOF
+        // would let a post-terminal disconnect (or a stream held open) turn a
+        // committed compaction into an error or a hang.
+        break;
+      }
+    } finally {
+      // Failed/cancelled/completed all leave the loop with the stream possibly
+      // open; releasing it is a detach, which never cancels server-side work.
+      await reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+    if (!result) throw new Error("Context compaction ended without a result");
+    return result;
+  }
+
+  private async postStream(
+    endpoint: string,
+    body: object,
+    signal: AbortSignal | undefined,
+  ): Promise<ReadableStream<UIMessageChunk>> {
+    const headers = await this.createHeaders(true);
+    const response = await this.fetch(joinUrl(this.baseUrl, endpoint), {
+      method: "POST",
+      body: JSON.stringify(body),
+      credentials: this.credentials,
+      headers,
+      signal,
+    });
+    if (!response.ok || !response.body) {
+      const detail = response.ok ? "" : await response.text();
+      throw new Error(
+        detail.length > 0
+          ? `MiniLilac request failed (${response.status}): ${detail}`
+          : `MiniLilac request failed (${response.status})`,
+      );
+    }
+    return parseJsonEventStream({
+      stream: response.body,
+      schema: uiMessageChunkSchema,
+    }).pipeThrough(
+      new TransformStream({
+        transform(chunk, controller) {
+          if (!chunk.success) throw chunk.error;
+          controller.enqueue(chunk.value);
+        },
+      }),
     );
   }
 

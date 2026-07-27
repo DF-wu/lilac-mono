@@ -344,7 +344,8 @@ describe("reduceInput slash commands and files", () => {
     const transition = reduceInput(state, { type: "submit" });
     expect(transition.effects).toEqual([{ type: "compact" }]);
     expect(transition.state.editor).toBe("");
-    expect(transition.state.phase).toBe("submitting");
+    // Compaction has its own phase so the footer can name the operation.
+    expect(transition.state.phase).toBe("compacting");
   });
 
   it("never steers typed /compact during active work", () => {

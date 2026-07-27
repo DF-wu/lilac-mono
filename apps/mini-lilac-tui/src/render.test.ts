@@ -494,7 +494,8 @@ describe("renderInitialMessages", () => {
       data: {
         source: "automatic" as const,
         reason: "threshold" as const,
-        status: "completed" as const,
+        phase: "completed" as const,
+        outcome: "compacted" as const,
         messageCountBefore: 20,
         messageCountAfter: 5,
         estimatedInputTokensBefore: 12_500,
@@ -512,7 +513,7 @@ describe("renderInitialMessages", () => {
             data: {
               source: "manual",
               reason: "manual",
-              status: "failed",
+              phase: "failed",
               messageCountBefore: 8,
               error: "summary unavailable",
             },
@@ -528,21 +529,72 @@ describe("renderInitialMessages", () => {
       {
         kind: "compaction",
         tone: "warning",
-        text: "Context compacted · 12.5K → 3.2K",
+        text: "Context compacted · 20 → 5 msgs · 12.5K → 3.2K",
       },
     ]);
     expect(renderInitialMessages(messages)).toMatchObject([
       {
         kind: "compaction",
         tone: "warning",
-        text: "Context compacted · 12.5K → 3.2K",
+        text: "Context compacted · 20 → 5 msgs · 12.5K → 3.2K",
       },
       {
         kind: "compaction",
         tone: "danger",
-        text: "Context compaction failed: summary unavailable",
+        text: "Compaction failed: summary unavailable · transcript unchanged",
       },
     ]);
+  });
+
+  it("updates one entry across an automatic compaction lifecycle", () => {
+    const { renderer, entries } = createRendererHarness();
+    const base = {
+      source: "automatic" as const,
+      reason: "threshold" as const,
+      messageCountBefore: 20,
+      estimatedInputTokensBefore: 12_500,
+    };
+    // Every phase carries the same chunk id, which is what makes the entry
+    // addressable; appending per phase would flood the transcript instead.
+    const chunk = (data: Record<string, unknown>) => ({
+      type: "data-compaction" as const,
+      id: "automatic-1",
+      data: { ...base, ...data },
+    });
+
+    renderer.handle(chunk({ phase: "started" }));
+    renderer.handle(
+      chunk({
+        phase: "progress",
+        progress: { stage: "history", step: 1, stepCount: 3, pass: 1 },
+        summary: "partial",
+      }),
+    );
+    renderer.handle(
+      chunk({
+        phase: "progress",
+        progress: { stage: "history", step: 2, stepCount: 3, pass: 1 },
+        summary: "partial summary",
+      }),
+    );
+    renderer.handle(
+      chunk({
+        phase: "completed",
+        outcome: "compacted",
+        messageCountAfter: 5,
+        estimatedInputTokensAfter: 3_200,
+        summary: "final summary",
+      }),
+    );
+
+    expect(entries()).toMatchObject([
+      {
+        kind: "compaction",
+        tone: "warning",
+        text: "Context compacted · 20 → 5 msgs · 12.5K → 3.2K\nfinal summary",
+      },
+    ]);
+    expect(entries()[0]?.running).toBeUndefined();
   });
 
   it("keeps canonical and live invalid/denied tool entries in parity", () => {

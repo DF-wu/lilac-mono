@@ -20,6 +20,7 @@ import {
   miniLilacMessagesSchema,
   miniLilacProviderMetadataSchema,
   miniLilacSessionSnapshotSchema,
+  miniLilacSessionStatusSchema,
   miniLilacSteeringCommittedChunkSchema,
   miniLilacSteeringChunkSchema,
   miniLilacSubagentStatusSchema,
@@ -35,9 +36,9 @@ import type { ModelMessage } from "ai";
 import superjson from "superjson";
 import { z } from "zod";
 
-const sessionStatusSchema = z.enum(["idle", "streaming", "cancelling", "error"]);
+const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
-export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 3;
+export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 4;
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -60,6 +61,7 @@ const sessionRowSchema = z.object({
   reasoning: z.string(),
   title: z.string(),
   input_tokens: z.number().int().nonnegative().nullable(),
+  input_tokens_estimated: z.number().int().min(0).max(1),
   context_window: z.number().int().positive().nullable(),
   status: sessionStatusSchema,
   queued_steering_count: z.number().int().nonnegative(),
@@ -347,6 +349,18 @@ export type StoredCommandRequest = {
   payload: unknown;
 };
 
+/** Presentation details recorded alongside a committed manual compaction. */
+export type CommitCompactionDetails = {
+  readonly summary?: string;
+  readonly durationMs?: number;
+  readonly modelCalls?: number;
+};
+
+export type CommittedCompaction = {
+  readonly result: MiniLilacCompactResult;
+  readonly snapshot: MiniLilacSessionSnapshot;
+};
+
 export type StoredSessionBindingUpdate = Pick<
   MiniLilacUpdateSessionBindingsRequest,
   "model" | "profile" | "reasoning"
@@ -428,6 +442,7 @@ function toSnapshot(rowValue: unknown): MiniLilacSessionSnapshot {
       .parse(row.reasoning),
     title: row.title,
     inputTokens: row.input_tokens,
+    inputTokensEstimated: row.input_tokens_estimated === 1,
     contextWindow: row.context_window,
     queuedSteeringCount: row.queued_steering_count,
     createdAt: row.created_at,
@@ -493,21 +508,38 @@ export class MiniLilacSqliteStore {
       .object({ user_version: z.number().int() })
       .parse(this.database.query("PRAGMA user_version").get()).user_version;
     if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return;
-    if (version !== 0 && version !== 2) {
+    if (version !== 0 && version !== 2 && version !== 3) {
       throw new MiniLilacDatabaseVersionError(version);
     }
 
-    this.database.transaction(() => {
-      if (version === 0) {
-        this.createSchemaV3();
-      } else {
-        this.migrateSchemaV2ToV3();
-      }
-      this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
-    })();
+    // The v3->v4 rebuild of `sessions` follows SQLite's documented table-rebuild
+    // recipe: foreign keys must be off (every other table cascades from
+    // `sessions`), and the rename must run in legacy mode so reparsing does not
+    // fail on references to the table being replaced. Neither pragma takes
+    // effect inside a transaction, so both are set around it.
+    this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+    try {
+      this.database.transaction(() => {
+        if (version === 0) {
+          this.createSchemaV4();
+        } else {
+          if (version === 2) this.migrateSchemaV2ToV3();
+          this.migrateSchemaV3ToV4();
+        }
+        this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
+      })();
+    } finally {
+      this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
+    }
+    const violations = this.database.query("PRAGMA foreign_key_check").all();
+    if (violations.length > 0) {
+      throw new Error(
+        `Mini Lilac schema migration to v${MINI_LILAC_DATABASE_SCHEMA_VERSION} left ${violations.length} foreign key violation(s)`,
+      );
+    }
   }
 
-  private createSchemaV3(): void {
+  private createSchemaV4(): void {
     this.database.exec(`
         CREATE TABLE sessions (
           id TEXT PRIMARY KEY,
@@ -518,8 +550,9 @@ export class MiniLilacSqliteStore {
           reasoning TEXT NOT NULL,
           title TEXT NOT NULL DEFAULT 'Mini Lilac',
           input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+          input_tokens_estimated INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens_estimated IN (0, 1)),
           context_window INTEGER CHECK(context_window IS NULL OR context_window > 0),
-          status TEXT NOT NULL CHECK(status IN ('idle', 'streaming', 'cancelling', 'error')),
+          status TEXT NOT NULL CHECK(status IN ('idle', 'streaming', 'compacting', 'cancelling', 'error')),
           queued_steering_count INTEGER NOT NULL DEFAULT 0 CHECK(queued_steering_count >= 0),
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
@@ -599,6 +632,41 @@ export class MiniLilacSqliteStore {
           updated_at TEXT NOT NULL
         );
       `);
+  }
+
+  /**
+   * Widen the session status CHECK for `compacting` and record whether
+   * `input_tokens` is a post-compaction estimate.
+   *
+   * SQLite cannot alter a CHECK constraint in place, so the table is rebuilt.
+   */
+  private migrateSchemaV3ToV4(): void {
+    this.database.exec(`
+      CREATE TABLE sessions_v4 (
+        id TEXT PRIMARY KEY,
+        active_run_id TEXT,
+        cwd TEXT NOT NULL,
+        model TEXT NOT NULL,
+        profile TEXT NOT NULL,
+        reasoning TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT 'Mini Lilac',
+        input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+        input_tokens_estimated INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens_estimated IN (0, 1)),
+        context_window INTEGER CHECK(context_window IS NULL OR context_window > 0),
+        status TEXT NOT NULL CHECK(status IN ('idle', 'streaming', 'compacting', 'cancelling', 'error')),
+        queued_steering_count INTEGER NOT NULL DEFAULT 0 CHECK(queued_steering_count >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO sessions_v4
+        (id, active_run_id, cwd, model, profile, reasoning, title, input_tokens,
+         input_tokens_estimated, context_window, status, queued_steering_count, created_at, updated_at)
+      SELECT id, active_run_id, cwd, model, profile, reasoning, title, input_tokens,
+             0, context_window, status, queued_steering_count, created_at, updated_at
+      FROM sessions;
+      DROP TABLE sessions;
+      ALTER TABLE sessions_v4 RENAME TO sessions;
+    `);
   }
 
   private migrateSchemaV2ToV3(): void {
@@ -721,6 +789,11 @@ export class MiniLilacSqliteStore {
           "UPDATE sessions SET status = 'error', active_run_id = NULL, queued_steering_count = 0, updated_at = ? WHERE status IN ('streaming', 'cancelling')",
         )
         .run(now);
+      // Compaction commits only on success, so an interrupted one left the
+      // transcript untouched: return the session to idle rather than to error.
+      this.database
+        .query("UPDATE sessions SET status = 'idle', updated_at = ? WHERE status = 'compacting'")
+        .run(now);
       this.database
         .query(
           `DELETE FROM commands
@@ -805,8 +878,12 @@ export class MiniLilacSqliteStore {
     z.number().int().nonnegative().parse(inputTokens);
     const updated = this.database
       .query(
-        `UPDATE sessions SET input_tokens = ?, updated_at = ?
-         WHERE id = ? AND active_run_id = ? AND input_tokens IS NOT ?`,
+        // Reported usage supersedes any post-compaction estimate. The estimate
+        // flag has to clear even when the reported count happens to equal the
+        // estimate, so a matching count is not treated as "nothing changed".
+        `UPDATE sessions SET input_tokens = ?, input_tokens_estimated = 0, updated_at = ?
+         WHERE id = ? AND active_run_id = ?
+           AND (input_tokens IS NOT ? OR input_tokens_estimated = 1)`,
       )
       .run(inputTokens, new Date().toISOString(), sessionId, runId, inputTokens);
     const snapshot = this.getSession(sessionId);
@@ -858,7 +935,7 @@ export class MiniLilacSqliteStore {
         .query(
           `UPDATE sessions
            SET model = ?, profile = ?, reasoning = ?,
-               context_window = ?, input_tokens = ?, updated_at = ?
+               context_window = ?, input_tokens = ?, input_tokens_estimated = ?, updated_at = ?
            WHERE id = ?`,
         )
         .run(
@@ -869,6 +946,9 @@ export class MiniLilacSqliteStore {
             ? (snapshot.contextWindow ?? null)
             : (bindings.contextWindow ?? null),
           bindings.model === undefined ? (snapshot.inputTokens ?? null) : null,
+          // Clearing the count must clear the flag with it: an estimate marker
+          // left on a null count renders as an estimate of nothing.
+          bindings.model === undefined ? (snapshot.inputTokensEstimated ? 1 : 0) : 0,
           now,
           sessionId,
         );
@@ -1113,7 +1193,8 @@ export class MiniLilacSqliteStore {
     request: StoredCommandRequest,
     modelMessages: readonly ModelMessage[],
     resultValue: MiniLilacCompactResult,
-  ): MiniLilacCompactResult {
+    details: CommitCompactionDetails = {},
+  ): CommittedCompaction {
     modelMessagesSchema.parse(modelMessages);
     const result = miniLilacCompactResultSchema.parse(resultValue);
     const command = canonicalCommandPayload(request.payload);
@@ -1126,8 +1207,10 @@ export class MiniLilacSqliteStore {
             .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
             .get(sessionId),
         ).count;
+      // `compacting` is admissible here: it is the status this very compaction
+      // set on itself. What must still hold is that no run is in flight.
       if (
-        !["idle", "error"].includes(snapshot.status) ||
+        !["idle", "compacting", "error"].includes(snapshot.status) ||
         snapshot.activeRunId !== null ||
         activeRunCount > 0
       ) {
@@ -1147,11 +1230,17 @@ export class MiniLilacSqliteStore {
               data: {
                 source: "manual",
                 reason: "manual",
-                status: "completed",
+                phase: "completed",
+                outcome: "compacted",
                 messageCountBefore: result.messageCountBefore,
                 messageCountAfter: result.messageCountAfter,
                 estimatedInputTokensBefore: result.estimatedInputTokensBefore,
                 estimatedInputTokensAfter: result.estimatedInputTokensAfter,
+                // Persisted so the summary stays expandable after a reload, not
+                // only in the session that generated it.
+                ...(details.summary === undefined ? {} : { summary: details.summary }),
+                ...(details.durationMs === undefined ? {} : { durationMs: details.durationMs }),
+                ...(details.modelCalls === undefined ? {} : { modelCalls: details.modelCalls }),
               },
             },
           ],
@@ -1160,9 +1249,20 @@ export class MiniLilacSqliteStore {
         // Manual compaction is an undo barrier. New prompts create checkpoints
         // against the compacted transcript while the visible UI history remains intact.
         this.database.query("DELETE FROM user_checkpoints WHERE session_id = ?").run(sessionId);
+        // Record the engine's post-compaction estimate rather than nulling the
+        // column: the meter should visibly drop, which is the point of running
+        // compaction, instead of blanking until the next turn reports usage.
         this.database
-          .query("UPDATE sessions SET input_tokens = NULL, updated_at = ? WHERE id = ?")
-          .run(new Date().toISOString(), sessionId);
+          .query(
+            `UPDATE sessions SET input_tokens = ?, input_tokens_estimated = ?, updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(
+            result.estimatedInputTokensAfter ?? null,
+            result.estimatedInputTokensAfter === undefined ? 0 : 1,
+            new Date().toISOString(),
+            sessionId,
+          );
       }
       const saved = this.database
         .query(
@@ -1182,7 +1282,16 @@ export class MiniLilacSqliteStore {
       if (saved.changes !== 1) {
         throw new Error(`Compact command '${commandId}' could not be committed atomically`);
       }
-      return result;
+      this.database
+        .query(
+          `UPDATE sessions
+           SET status = 'idle', active_run_id = NULL, queued_steering_count = 0, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(new Date().toISOString(), sessionId);
+      // Read inside the transaction so a malformed post-commit snapshot rolls
+      // back the transcript rewrite instead of being reported as a later failure.
+      return { result, snapshot: this.getSession(sessionId) };
     })();
   }
 

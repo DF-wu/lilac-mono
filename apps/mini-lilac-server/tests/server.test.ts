@@ -6,7 +6,8 @@ import path from "node:path";
 import {
   MiniLilacTransport,
   miniLilacCancelResultSchema,
-  miniLilacCompactResultSchema,
+  miniLilacUIMessageDataPartSchema,
+  type MiniLilacCompactionEvent,
   miniLilacInterruptQueuedSteeringResultSchema,
   miniLilacMessagesSchema,
   miniLilacModelsSchema,
@@ -263,6 +264,20 @@ function appHandleFetch(
     return app.handle(request);
   };
   return Object.assign(handler, { preconnect() {} });
+}
+
+/** Read a compaction endpoint's event stream into its lifecycle events. */
+async function compactionEvents(response: Response): Promise<MiniLilacCompactionEvent[]> {
+  expect(response.status).toBe(200);
+  const body = await response.text();
+  return body
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line): unknown => JSON.parse(line.slice("data: ".length)))
+    .flatMap((chunk) => {
+      const part = miniLilacUIMessageDataPartSchema.safeParse(chunk);
+      return part.success && part.data.type === "data-compaction" ? [part.data.data] : [];
+    });
 }
 
 async function responseJson(response: Response): Promise<unknown> {
@@ -824,39 +839,47 @@ describe("createMiniLilacServer", () => {
     );
     const body = { sessionId: session.id, clientCommandId: "compact-command" };
 
-    const response = await app.handle(
-      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, body),
+    const events = await compactionEvents(
+      await app.handle(
+        jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, body),
+      ),
     );
-    expect(response.status).toBe(200);
-    const result = miniLilacCompactResultSchema.parse(await responseJson(response));
-    expect(result.status).toBe("compacted");
-    expect(service.getMessages(session.id)).toEqual([
-      ...visibleMessages,
-      {
-        id: "compaction:compact-command",
-        role: "assistant",
-        parts: [
-          {
-            type: "data-compaction",
-            id: "compact-command",
-            data: {
-              source: "manual",
-              reason: "manual",
-              status: "completed",
-              messageCountBefore: result.messageCountBefore,
-              messageCountAfter: result.messageCountAfter,
-              estimatedInputTokensBefore: result.estimatedInputTokensBefore,
-              estimatedInputTokensAfter: result.estimatedInputTokensAfter,
-            },
+    // The endpoint answers with the compaction lifecycle, not a JSON body.
+    expect(events[0]?.phase).toBe("started");
+    const result = events.at(-1);
+    expect(result).toMatchObject({ phase: "completed", outcome: "compacted" });
+    expect(result?.summary).toContain("Condensed server context.");
+    expect(service.getMessages(session.id).slice(0, -1)).toEqual(visibleMessages);
+    // The committed entry carries the generated summary so it survives a reload.
+    expect(service.getMessages(session.id).at(-1)).toMatchObject({
+      id: "compaction:compact-command",
+      role: "assistant",
+      parts: [
+        {
+          type: "data-compaction",
+          id: "compact-command",
+          data: {
+            source: "manual",
+            reason: "manual",
+            phase: "completed",
+            outcome: "compacted",
+            messageCountBefore: result?.messageCountBefore,
+            messageCountAfter: result?.messageCountAfter,
+            summary: result?.summary,
+            durationMs: expect.any(Number),
+            modelCalls: expect.any(Number),
           },
-        ],
-      },
-    ]);
+        },
+      ],
+    });
 
-    const duplicate = await app.handle(
-      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, body),
+    const duplicate = await compactionEvents(
+      await app.handle(
+        jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, body),
+      ),
     );
-    expect(miniLilacCompactResultSchema.parse(await responseJson(duplicate))).toEqual(result);
+    // A replayed command id returns the stored outcome without re-summarizing.
+    expect(duplicate).toMatchObject([{ phase: "completed", outcome: "compacted" }]);
     const mismatch = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/other/compact`, body),
     );
@@ -868,6 +891,123 @@ describe("createMiniLilacServer", () => {
       }),
     );
     expect(malformed.status).toBe(400);
+    service.close();
+  });
+
+  it("cancels compaction through its own endpoint, not by dropping the request", async () => {
+    let cancelDuringSummarization: (() => Promise<Response>) | undefined;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        await cancelDuringSummarization?.();
+        return textResult("summary", "Condensed server context.");
+      },
+    });
+    const { app, directory, service } = await testServer(model);
+    const session = await service.createSession({ cwd: directory, model: "test/reasoner" });
+    cancelDuringSummarization = () =>
+      app.handle(
+        jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact/cancel`, {
+          sessionId: session.id,
+        }),
+      );
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request" },
+      ],
+      [userMessage("old-user", "old request"), userMessage("latest-user", "latest request")],
+    );
+    const before = service.store.getModelMessages(session.id);
+
+    const events = await compactionEvents(
+      await app.handle(
+        jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, {
+          sessionId: session.id,
+          clientCommandId: "compact-cancel-command",
+        }),
+      ),
+    );
+
+    expect(events.at(-1)?.phase).toBe("cancelled");
+    expect(service.store.getModelMessages(session.id)).toEqual(before);
+    expect(service.getSnapshot(session.id).status).toBe("idle");
+
+    cancelDuringSummarization = undefined;
+    const idle = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact/cancel`, {
+        sessionId: session.id,
+      }),
+    );
+    expect(await idle.json()).toEqual({ status: "inactive" });
+    const mismatch = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/other/compact/cancel`, {
+        sessionId: session.id,
+      }),
+    );
+    expect(mismatch.status).toBe(409);
+    service.close();
+  });
+
+  it("answers 409, not 500, when a prompt arrives while the session is compacting", async () => {
+    const summarizationReached = Promise.withResolvers<void>();
+    let releaseSummary: (() => void) | undefined;
+    const summaryGate = new Promise<void>((resolve) => {
+      releaseSummary = resolve;
+    });
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        summarizationReached.resolve();
+        await summaryGate;
+        return textResult("summary", "Condensed server context.");
+      },
+    });
+    const { app, directory, service } = await testServer(model);
+    const session = await service.createSession({ cwd: directory, model: "test/reasoner" });
+    service.store.replaceMessages(
+      session.id,
+      [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request" },
+      ],
+      [userMessage("old-user", "old request"), userMessage("latest-user", "latest request")],
+    );
+
+    const compacting = app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/compact`, {
+        sessionId: session.id,
+        clientCommandId: "compact-vs-prompt",
+      }),
+    );
+    await summarizationReached.promise;
+
+    const snapshot = service.getSnapshot(session.id);
+    const prompt = await app.handle(
+      jsonRequest(
+        "POST",
+        `${MINI_LILAC_API_PREFIX}/chat`,
+        chatBody(directory, {
+          id: session.id,
+          model: snapshot.model,
+          profile: snapshot.profile,
+          reasoning: snapshot.reasoning,
+        }),
+      ),
+    );
+    // Refusing a prompt mid-compaction is an admission conflict per the
+    // documented contract, not an internal server error.
+    expect(prompt.status).toBe(409);
+    const rejection = z
+      .object({ error: z.object({ code: z.string(), message: z.string() }) })
+      .parse(await responseJson(prompt));
+    expect(rejection.error.code).toBe("conflict");
+    expect(rejection.error.message).toContain("cannot accept a prompt");
+
+    releaseSummary?.();
+    const events = await compactionEvents(await compacting);
+    expect(events.at(-1)?.phase).toBe("completed");
     service.close();
   });
 

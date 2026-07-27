@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { MiniLilacTransport } from "./mini-lilac-transport";
+import { MiniLilacCompactionCancelledError, MiniLilacTransport } from "./mini-lilac-transport";
 import {
   type MiniLilacStreamCursorChunk,
   miniLilacProfileSummarySchema,
@@ -16,6 +16,11 @@ function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), {
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function eventStreamResponse(chunks: readonly unknown[]): Response {
+  const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
+  return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
 }
 
 function cursor(seq: number, runId = "run-1"): MiniLilacStreamCursorChunk {
@@ -626,26 +631,51 @@ describe("MiniLilacTransport", () => {
     ).toEqual({ status: "empty", clientCommandId: "empty-command" });
   });
 
-  it("posts durable compaction commands with generated IDs and validates the result", async () => {
+  it("streams compaction lifecycle events and resolves with the terminal result", async () => {
     const calls: FetchCall[] = [];
-    const result = {
-      status: "compacted" as const,
-      clientCommandId: "compact-command",
-      messageCountBefore: 18,
-      messageCountAfter: 6,
-      estimatedInputTokensBefore: 12_000,
-      estimatedInputTokensAfter: 3_500,
-    };
+    const events = [
+      { source: "manual", reason: "manual", phase: "started", messageCountBefore: 18 },
+      {
+        source: "manual",
+        reason: "manual",
+        phase: "progress",
+        messageCountBefore: 18,
+        summary: "Condensed",
+      },
+      {
+        source: "manual",
+        reason: "manual",
+        phase: "completed",
+        outcome: "compacted",
+        messageCountBefore: 18,
+        messageCountAfter: 6,
+        estimatedInputTokensBefore: 12_000,
+        estimatedInputTokensAfter: 3_500,
+      },
+    ];
     const transport = new MiniLilacTransport({
       baseUrl: "/mini",
       createClientCommandId: () => "compact-command",
       fetch: mockFetch(async (input, init) => {
         calls.push({ input, init });
-        return jsonResponse(result);
+        return eventStreamResponse(
+          events.map((data) => ({ type: "data-compaction", id: "compaction:1", data })),
+        );
       }),
     });
 
-    expect(await transport.compact({ sessionId: "session / one" })).toEqual(result);
+    const seen: unknown[] = [];
+    expect(
+      await transport.compact({ sessionId: "session / one" }, { onEvent: (e) => seen.push(e) }),
+    ).toEqual({
+      status: "compacted",
+      clientCommandId: "compact-command",
+      messageCountBefore: 18,
+      messageCountAfter: 6,
+      estimatedInputTokensBefore: 12_000,
+      estimatedInputTokensAfter: 3_500,
+    });
+    expect(seen).toEqual(events);
     expect(String(calls[0]?.input)).toBe("/mini/sessions/session%20%2F%20one/compact");
     expect(calls[0]?.init?.method).toBe("POST");
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
@@ -654,20 +684,131 @@ describe("MiniLilacTransport", () => {
     });
   });
 
-  it("rejects malformed compaction results at the HTTP boundary", async () => {
+  it("treats a completed compaction as terminal even if the stream never closes", async () => {
+    const event = {
+      type: "data-compaction",
+      id: "compaction:1",
+      data: {
+        source: "manual",
+        reason: "manual",
+        phase: "completed",
+        outcome: "compacted",
+        messageCountBefore: 18,
+        messageCountAfter: 6,
+      },
+    };
+    // The stream is deliberately never closed: a committed compaction must not
+    // hinge on EOF from a server (or proxy) that holds the connection open.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+      },
+    });
+    const transport = new MiniLilacTransport({
+      createClientCommandId: () => "compact-command",
+      fetch: mockFetch(
+        async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+      ),
+    });
+
+    expect(await transport.compact({ sessionId: "session-1" })).toEqual({
+      status: "compacted",
+      clientCommandId: "compact-command",
+      messageCountBefore: 18,
+      messageCountAfter: 6,
+    });
+  });
+
+  it("rejects a malformed completed event without waiting for the stream to close", async () => {
+    const event = {
+      type: "data-compaction",
+      id: "compaction:1",
+      data: {
+        source: "manual",
+        reason: "manual",
+        phase: "completed",
+        messageCountBefore: 18,
+        // A current terminal event must identify both its outcome and final count.
+      },
+    };
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+      },
+    });
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(
+        async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+      ),
+    });
+
+    await expect(transport.compact({ sessionId: "session-1" })).rejects.toThrow(
+      "Invalid compaction lifecycle event",
+    );
+  });
+
+  it("surfaces a failed compaction as a rejection rather than a silent no-op", async () => {
     const transport = new MiniLilacTransport({
       fetch: mockFetch(async () =>
-        jsonResponse({
-          status: "noop",
-          clientCommandId: "compact-command",
-          messageCountBefore: 4,
-        }),
+        eventStreamResponse([
+          {
+            type: "data-compaction",
+            data: {
+              source: "manual",
+              reason: "manual",
+              phase: "failed",
+              messageCountBefore: 4,
+              error: "summary unavailable",
+            },
+          },
+        ]),
       ),
     });
 
     await expect(
       transport.compact({ sessionId: "session-1", clientCommandId: "compact-command" }),
-    ).rejects.toThrow();
+    ).rejects.toThrow("summary unavailable");
+  });
+
+  it("distinguishes a cancelled compaction from a failed one", async () => {
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () =>
+        eventStreamResponse([
+          {
+            type: "data-compaction",
+            data: {
+              source: "manual",
+              reason: "manual",
+              phase: "cancelled",
+              messageCountBefore: 4,
+            },
+          },
+        ]),
+      ),
+    });
+
+    // A cancel is a deliberate stop, so callers can render it as one instead of
+    // as an error they have to explain.
+    await expect(
+      transport.compact({ sessionId: "session-1", clientCommandId: "compact-command" }),
+    ).rejects.toBeInstanceOf(MiniLilacCompactionCancelledError);
+  });
+
+  it("cancels compaction through its own endpoint", async () => {
+    const calls: FetchCall[] = [];
+    const transport = new MiniLilacTransport({
+      baseUrl: "/mini",
+      fetch: mockFetch(async (input, init) => {
+        calls.push({ input, init });
+        return jsonResponse({ status: "cancelling" });
+      }),
+    });
+
+    expect(await transport.cancelCompaction({ sessionId: "session / one" })).toEqual({
+      status: "cancelling",
+    });
+    expect(String(calls[0]?.input)).toBe("/mini/sessions/session%20%2F%20one/compact/cancel");
+    expect(calls[0]?.init?.method).toBe("POST");
   });
 
   it("parses transcript reset, subagent status, and updated profile summaries", () => {
