@@ -92,7 +92,6 @@ For the full system mental model, terminology, and file-level architecture, see 
 | `apps/core/` | Main runtime process and supporting subsystems. |
 | `apps/tool-bridge/` | `tools` bridge CLI and standalone tool-server entrypoints. |
 | `apps/acp-controller/` | `lilac-acp` CLI for ACP harness operations. |
-| `apps/architecture-atlas/` | Optional static architecture explorer; it is not imported, started, or served by the Core runtime. |
 | `packages/event-bus/` | Typed event spec and Redis Streams bus implementation. |
 | `packages/agent/` | AI SDK-based agent execution, streaming, and turn control. |
 | `packages/utils/` | Runtime config, model/provider resolution, prompts, and skill discovery. |
@@ -124,18 +123,6 @@ Remote runner build used by the core package:
 ```bash
 cd apps/core && bun run build:remote-runner
 ```
-
-### Architecture Atlas
-
-The Atlas is an opt-in Vite/React documentation app built from a pinned source snapshot. It does not connect to Redis and is not live runtime telemetry. It participates in workspace validation, but the normal Core startup path never starts or imports it.
-
-```bash
-bun run atlas:dev
-bun run atlas:open
-bun run atlas:build
-```
-
-See [`apps/architecture-atlas/README.md`](./apps/architecture-atlas/README.md) for its evidence scope and update process.
 
 ### ACP controller workflow
 
@@ -189,7 +176,6 @@ If you persist `/data`, the `smart-search` config and provider credentials persi
 - [`PROJECT.md`](./PROJECT.md): architecture, terminology, and runtime flow
 - [`AGENTS.md`](./AGENTS.md): repo-specific coding and validation rules
 - [`apps/acp-controller/README.md`](./apps/acp-controller/README.md): ACP controller usage details
-- [`apps/architecture-atlas/README.md`](./apps/architecture-atlas/README.md): static architecture explorer, evidence snapshot, and maintenance contract
 
 ### Runtime and deployment smoke commands
 
