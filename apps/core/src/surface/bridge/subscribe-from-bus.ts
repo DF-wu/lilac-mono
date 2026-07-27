@@ -28,6 +28,33 @@ import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./re
 
 import type { TranscriptStore } from "../../transcript/transcript-store";
 
+/** Platforms that own a bus->adapter output relay. */
+export type SurfaceRelayPlatform = "discord" | "github" | "telegram";
+
+function isSurfaceRelayPlatform(x: unknown): x is SurfaceRelayPlatform {
+  return x === "discord" || x === "github" || x === "telegram";
+}
+
+/**
+ * Surfaces that render a live, incrementally-edited progress UI (reasoning
+ * timers, tool status lines, in-place message edits).
+ *
+ * GitHub posts a single comment at the end of a run and therefore has no
+ * streaming UI to drive.
+ */
+function supportsStreamingProgressUi(platform: SurfaceRelayPlatform): boolean {
+  return platform === "discord" || platform === "telegram";
+}
+
+/**
+ * Surfaces where the relay owns (and may clean up) the messages it created.
+ *
+ * GitHub comments are deliberately left in place as an audit trail.
+ */
+function supportsCreatedOutputCleanup(platform: SurfaceRelayPlatform): boolean {
+  return platform === "discord" || platform === "telegram";
+}
+
 function getConsumerId(prefix: string): string {
   return `${prefix}:${process.pid}:${Math.random().toString(16).slice(2)}`;
 }
@@ -63,6 +90,18 @@ function parseGithubReplyTo(params: { requestId: string; sessionId: string }): M
     platform: "github",
     channelId: params.sessionId,
     messageId: parsed.triggerId,
+  };
+}
+
+function parseTelegramReplyTo(params: { requestId: string; sessionId: string }): MsgRef | null {
+  const parsed = parseRequestId(params.requestId);
+  if (parsed?.kind !== "telegram_message") return null;
+  if (parsed.sessionId !== params.sessionId) return null;
+
+  return {
+    platform: "telegram",
+    channelId: params.sessionId,
+    messageId: parsed.messageId,
   };
 }
 
@@ -179,7 +218,7 @@ export type BusToAdapterRelaySnapshot = {
   requestId: string;
   sessionId: string;
   requestClient?: string;
-  platform: "discord" | "github";
+  platform: SurfaceRelayPlatform;
   requestStartedAtMs?: number;
   routerSessionMode?: "mention" | "active";
   replyTo?: MsgRef;
@@ -202,7 +241,7 @@ function toMsgRefFromSurfaceMsgRef(raw: unknown): MsgRef | null {
   const platform = o["platform"];
   const channelId = o["channelId"];
   const messageId = o["messageId"];
-  if (platform !== "discord" && platform !== "github") return null;
+  if (!isSurfaceRelayPlatform(platform)) return null;
   if (typeof channelId !== "string" || typeof messageId !== "string") return null;
   return {
     platform,
@@ -231,7 +270,7 @@ function mergeContinuationText(existing: string, continuation: string): string {
 export async function bridgeBusToAdapter(params: {
   adapter: SurfaceAdapter;
   bus: LilacBus;
-  platform: "discord" | "github";
+  platform: SurfaceRelayPlatform;
   subscriptionId: string;
   idleTimeoutMs?: number;
   scheduleIdleTimeout?: (callback: () => void, delayMs: number) => () => void;
@@ -568,7 +607,7 @@ export async function bridgeBusToAdapter(params: {
   async function startRelay(input: {
     adapter: SurfaceAdapter;
     bus: LilacBus;
-    platform: "discord" | "github";
+    platform: SurfaceRelayPlatform;
     requestId: string;
     sessionId: string;
     requestStartedAtMs?: number;
@@ -585,15 +624,22 @@ export async function bridgeBusToAdapter(params: {
       input.restore?.requestStartedAtMs ?? input.requestStartedAtMs ?? relayStartedAt,
     );
 
-    const sessionRef: SessionRef =
-      platform === "discord"
-        ? { platform, channelId: sessionId }
-        : { platform: "github", channelId: sessionId };
+    const sessionRef: SessionRef = { platform, channelId: sessionId };
 
-    const replyTo =
-      platform === "discord"
-        ? parseDiscordReplyTo({ requestId, sessionId })
-        : parseGithubReplyTo({ requestId, sessionId });
+    const replyTo = (() => {
+      switch (platform) {
+        case "discord":
+          return parseDiscordReplyTo({ requestId, sessionId });
+        case "github":
+          return parseGithubReplyTo({ requestId, sessionId });
+        case "telegram":
+          return parseTelegramReplyTo({ requestId, sessionId });
+        default: {
+          const _exhaustive: never = platform;
+          return _exhaustive;
+        }
+      }
+    })();
 
     const baseReplyTo = input.restore?.replyTo ?? replyTo ?? undefined;
     let currentReplyTo: MsgRef | undefined = baseReplyTo;
@@ -738,7 +784,7 @@ export async function bridgeBusToAdapter(params: {
         await out.push({ type: "text.set", text: visibleTextAcc });
         streamHasVisibleOutput = true;
       }
-      if (platform === "discord" && typeof reasoningStartedAtMs === "number") {
+      if (supportsStreamingProgressUi(platform) && typeof reasoningStartedAtMs === "number") {
         await out.push({
           type: "reasoning.status",
           update: {
@@ -793,7 +839,7 @@ export async function bridgeBusToAdapter(params: {
     let handlingOutputEvent = false;
 
     const deleteCreatedOutputMessages = async () => {
-      if (platform !== "discord") return;
+      if (!supportsCreatedOutputCleanup(platform)) return;
 
       for (let i = createdOutputRefs.length - 1; i >= 0; i--) {
         const ref = createdOutputRefs[i];
@@ -928,7 +974,7 @@ export async function bridgeBusToAdapter(params: {
               }
 
               case lilacEventTypes.EvtAgentOutputDeltaReasoning: {
-                if (platform === "discord") {
+                if (supportsStreamingProgressUi(platform)) {
                   const startedAtMs = reasoningStartedAtMs ?? outMsg.ts;
                   reasoningStartedAtMs = startedAtMs;
 
@@ -962,7 +1008,7 @@ export async function bridgeBusToAdapter(params: {
                 totalTextChars += outMsg.data.delta.length;
 
                 if (
-                  platform === "discord" &&
+                  supportsStreamingProgressUi(platform) &&
                   typeof reasoningStartedAtMs === "number" &&
                   typeof reasoningFrozenAtMs !== "number"
                 ) {
@@ -1119,7 +1165,7 @@ export async function bridgeBusToAdapter(params: {
                 pendingNoReplyPrefix = "";
                 bufferNoReplyPrefix = false;
                 if (
-                  platform === "discord" &&
+                  supportsStreamingProgressUi(platform) &&
                   typeof reasoningStartedAtMs === "number" &&
                   typeof reasoningFrozenAtMs !== "number"
                 ) {
@@ -1243,7 +1289,7 @@ export async function bridgeBusToAdapter(params: {
           out = await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken));
           finalTextMode = out.getFinalTextMode?.() ?? "continuation";
 
-          if (platform === "discord" && typeof reasoningStartedAtMs === "number") {
+          if (supportsStreamingProgressUi(platform) && typeof reasoningStartedAtMs === "number") {
             await out.push({
               type: "reasoning.status",
               update: {

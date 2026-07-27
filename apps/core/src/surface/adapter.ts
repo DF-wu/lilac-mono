@@ -7,6 +7,7 @@ import type {
   SessionRef,
   SurfaceAttachment,
   SurfaceMessage,
+  SurfacePlatform,
   SurfaceSelf,
   SurfaceSession,
 } from "./types";
@@ -22,7 +23,7 @@ export type SurfaceToolStatusUpdate = {
 
 export class SurfaceMessageNotFoundError extends Error {
   constructor(
-    readonly platform: "discord" | "github",
+    readonly platform: SurfacePlatform,
     readonly code: number | string,
     message: string,
   ) {
@@ -76,7 +77,7 @@ export interface SurfaceOutputStream {
 
 export type StartOutputOpts = {
   replyTo?: MsgRef;
-  /** Disable all Discord notifications for this output stream (mentions + reply ping). */
+  /** Suppress surface notifications for this output stream (mentions + reply ping). */
   silent?: boolean;
   /** Router-derived session mode. Used for surface-specific behaviors (e.g. mention pings). */
   sessionMode?: "mention" | "active";

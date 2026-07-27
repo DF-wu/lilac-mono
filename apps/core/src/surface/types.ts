@@ -18,6 +18,19 @@ export type GithubSessionRef = {
   channelId: string;
 };
 
+/**
+ * Telegram session:
+ * - channelId: "<chat_id>" for private chats, groups and channels,
+ *   "<chat_id>:<message_thread_id>" for forum topics.
+ *
+ * Use the helpers in `telegram/telegram-ids.ts` to build and parse this id
+ * rather than doing string surgery at call sites.
+ */
+export type TelegramSessionRef = {
+  platform: "telegram";
+  channelId: string;
+};
+
 export type DiscordMsgRef = {
   platform: "discord";
   channelId: string;
@@ -34,8 +47,19 @@ export type GithubMsgRef = {
   messageId: string;
 };
 
-export type SessionRef = DiscordSessionRef | GithubSessionRef;
-export type MsgRef = DiscordMsgRef | GithubMsgRef;
+/**
+ * Telegram message reference:
+ * - channelId: the session id (see `TelegramSessionRef`).
+ * - messageId: Telegram `message_id`, stringified.
+ */
+export type TelegramMsgRef = {
+  platform: "telegram";
+  channelId: string;
+  messageId: string;
+};
+
+export type SessionRef = DiscordSessionRef | GithubSessionRef | TelegramSessionRef;
+export type MsgRef = DiscordMsgRef | GithubMsgRef | TelegramMsgRef;
 
 export type SurfaceSelf = {
   platform: SurfacePlatform;
@@ -139,7 +163,7 @@ export type ContentOpts = {
 
 export type SendOpts = {
   replyTo?: MsgRef;
-  /** Disable all Discord notifications for this send (mentions + reply ping). */
+  /** Suppress surface notifications for this send (mentions + reply ping). */
   silent?: boolean;
 };
 
