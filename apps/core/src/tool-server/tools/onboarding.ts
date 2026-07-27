@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import {
   env,
   ensurePromptWorkspace,
+  findWorkspaceRoot,
   getCoreConfig,
   resolveCoreConfigPath,
   resolvePromptDir,
@@ -1125,9 +1126,13 @@ export class Onboarding implements ServerTool {
       };
 
       await runStep("skills.coding-agent", async () => {
-        const src = path.resolve(
-          process.cwd(),
-          "packages/utils/skill-templates/coding-agent/SKILL.md",
+        const src = path.join(
+          findWorkspaceRoot(),
+          "packages",
+          "utils",
+          "skill-templates",
+          "coding-agent",
+          "SKILL.md",
         );
         const dst = path.join(paths.lilacSkillsDir, "coding-agent", "SKILL.md");
         const { copied, overwritten } = await copyFileIfNeeded({
@@ -1141,8 +1146,36 @@ export class Onboarding implements ServerTool {
         };
       });
 
+      await runStep("skills.mcp-management", async () => {
+        const src = path.join(
+          findWorkspaceRoot(),
+          "packages",
+          "utils",
+          "skill-templates",
+          "mcp-management",
+          "SKILL.md",
+        );
+        const dst = path.join(paths.lilacSkillsDir, "mcp-management", "SKILL.md");
+        const { copied, overwritten } = await copyFileIfNeeded({
+          from: src,
+          to: dst,
+          overwrite: input.overwriteSkills,
+        });
+        return {
+          status: copied ? "installed" : "already_present",
+          details: { src, dst, overwritten },
+        };
+      });
+
       await runStep("skills.mcporter", async () => {
-        const src = path.resolve(process.cwd(), "packages/utils/skill-templates/mcporter/SKILL.md");
+        const src = path.join(
+          findWorkspaceRoot(),
+          "packages",
+          "utils",
+          "skill-templates",
+          "mcporter",
+          "SKILL.md",
+        );
         const dst = path.join(paths.lilacSkillsDir, "mcporter", "SKILL.md");
         const { copied, overwritten } = await copyFileIfNeeded({
           from: src,
@@ -1156,7 +1189,14 @@ export class Onboarding implements ServerTool {
       });
 
       await runStep("skills.gog", async () => {
-        const src = path.resolve(process.cwd(), "packages/utils/skill-templates/gog/SKILL.md");
+        const src = path.join(
+          findWorkspaceRoot(),
+          "packages",
+          "utils",
+          "skill-templates",
+          "gog",
+          "SKILL.md",
+        );
         const dst = path.join(paths.lilacSkillsDir, "gog", "SKILL.md");
         const { copied, overwritten } = await copyFileIfNeeded({
           from: src,

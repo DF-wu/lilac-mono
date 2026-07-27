@@ -70,6 +70,7 @@ cat payload.json | tools <tool> --stdin
   - When combining multi-query input with options, prefer JSON input with `--input` and `query` as an array.
 - `conversation.thread.metadata` — (Template setup: remove this bullet if conversation thread indexing/summarization is not enabled in core config; if enabled, delete this parenthetical.) Read summary metadata for one or more threads without loading the full transcripts. Use this to compare candidates before reading a full thread.
 - `conversation.thread.read` — (Template setup: remove this bullet if conversation thread indexing/summarization is not enabled in core config; if enabled, delete this parenthetical.) Read a conversation thread transcript by `threadId` with offset/limit pagination.
+- `mcp.*` - Manage configured MCP servers. Load the `mcp-management` skill before adding, removing, authenticating, or reloading one.
 - `surface.help` — Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.
 - `surface.activities.recentAgentWrites` — List recent visible writes produced by the agent, with message ids and thin previews.
 - `surface.sessions.list` — List cached sessions.
