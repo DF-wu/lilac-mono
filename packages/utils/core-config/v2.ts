@@ -16,7 +16,11 @@ import {
   webExtractConfigSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
-import { MODEL_REASONING_EFFORTS } from "./types";
+import {
+  cloneDefaultTelegramSurface,
+  MODEL_REASONING_EFFORTS,
+  TELEGRAM_SURFACE_DEFAULTS,
+} from "./types";
 
 import type {
   ConfigParser,
@@ -275,6 +279,45 @@ const discordSurfaceSchema = z
       fallbackMode: "list",
     },
   });
+
+const telegramSurfaceSchema = z
+  .object({
+    enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.enabled),
+    tokenEnv: z.string().min(1).default(TELEGRAM_SURFACE_DEFAULTS.tokenEnv),
+    botName: z
+      .string()
+      .min(1)
+      .refine((s) => !/\s/u.test(s), "botName must not contain spaces")
+      .default(TELEGRAM_SURFACE_DEFAULTS.botName),
+    botUsername: z
+      .string()
+      .min(1)
+      .refine((s) => !s.startsWith("@"), "botUsername must not include a leading '@'")
+      .optional(),
+    // Lazy defaults: a literal default is evaluated once at schema construction
+    // and would then be shared (and mutable) across every parsed config.
+    allowedChatIds: z.array(z.string().min(1)).default(() => []),
+    allowedUserIds: z.array(z.string().min(1)).default(() => []),
+    dbPath: z.string().min(1).optional(),
+    outputMode: z.enum(["inline", "preview"]).default(TELEGRAM_SURFACE_DEFAULTS.outputMode),
+    parseMode: z.enum(["html", "plain"]).default(TELEGRAM_SURFACE_DEFAULTS.parseMode),
+    // Telegram throttles edits at roughly one per second per chat; going below
+    // this reliably trips 429 retry_after responses during streaming.
+    streamEditIntervalMs: z
+      .number()
+      .int()
+      .min(500)
+      .max(60_000)
+      .default(TELEGRAM_SURFACE_DEFAULTS.streamEditIntervalMs),
+    outputNotification: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.outputNotification),
+    workingIndicators: z
+      .array(z.string().trim().min(1))
+      .min(1)
+      .default(() => cloneDefaultWorkingIndicators()),
+    commandMenu: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.commandMenu),
+    markdownTableRender: discordMarkdownTableRenderSchema,
+  })
+  .default(() => cloneDefaultTelegramSurface());
 
 const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
 const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
@@ -544,31 +587,35 @@ export const coreConfigInputSchemaV2 = z.object({
     .object({
       router: routerSchema,
       discord: discordSurfaceSchema,
+      telegram: telegramSurfaceSchema,
       heartbeat: heartbeatSchema,
     })
-    .default({
+    // Lazy: a literal default object is built once at module load and handed
+    // out by reference, so every config would share the same nested arrays.
+    .default(() => ({
       router: {
-        defaultMode: "mention",
+        defaultMode: "mention" as const,
         sessionModes: {},
         activeDebounceMs: 3000,
         activeGate: { enabled: false, timeoutMs: 2500 },
       },
       discord: {
         tokenEnv: "DISCORD_TOKEN",
-        allowedChannelIds: [],
-        allowedGuildIds: [],
+        allowedChannelIds: [] as string[],
+        allowedGuildIds: [] as string[],
         botName: "lilac",
-        outputMode: "preview",
-        outputPreviewModeFinalStyle: "plain",
+        outputMode: "preview" as const,
+        outputPreviewModeFinalStyle: "plain" as const,
         outputNotification: true,
         workingIndicators: cloneDefaultWorkingIndicators(),
         markdownTableRender: {
           enabled: true,
-          style: "unicode",
+          style: "unicode" as const,
           maxWidth: 50,
-          fallbackMode: "list",
+          fallbackMode: "list" as const,
         },
       },
+      telegram: cloneDefaultTelegramSurface(),
       heartbeat: {
         enabled: false,
         cron: "*/30 * * * *",
@@ -577,7 +624,7 @@ export const coreConfigInputSchemaV2 = z.object({
         defaultOutputSession: undefined,
         softQuietHours: undefined,
       },
-    }),
+    })),
 
   agent: z
     .object({

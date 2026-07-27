@@ -180,6 +180,65 @@ surface:
       # - passthrough: keep original markdown table unchanged
       fallbackMode: list
 
+  # Telegram surface (opt-in). Requires configVersion 2.
+  # See docs/telegram-surface.md for BotFather setup and group privacy notes.
+  telegram:
+    # The adapter is only constructed when this is true.
+    enabled: false
+
+    tokenEnv: "TELEGRAM_BOT_TOKEN"
+
+    # Fails closed: while allowedChatIds is empty the bot ignores every chat.
+    # Use numeric chat ids (negative for groups/supergroups), as strings.
+    allowedChatIds: []
+
+    # Optional second gate. Empty means "any user in an allowed chat".
+    allowedUserIds: []
+
+    # Display name used in attribution + mention stripping. Must not contain spaces.
+    botName: "lilac"
+
+    # Optional: the @username of the bot, without the leading "@".
+    # Resolved from getMe on connect when omitted.
+    # botUsername: "Catalina_agentbot"
+
+    # Optional: override surface DB location (default: <dataDir>/telegram-surface.db).
+    # Telegram has no history API, so the adapter keeps its own message index.
+    # dbPath: "/path/to/telegram-surface.db"
+
+    # Output rendering mode (mirrors the Discord surface):
+    # - inline: keep editing the streaming message into the final answer
+    # - preview: stream a transient preview, then post the final answer and
+    #   delete the preview
+    outputMode: preview
+
+    # Message formatting sent to the Bot API:
+    # - html: convert markdown to Telegram HTML (recommended)
+    # - plain: send unformatted text
+    parseMode: html
+
+    # Minimum gap between streaming edits. Telegram throttles edits at roughly
+    # one per second per chat; lowering this trips 429 retry_after responses.
+    streamEditIntervalMs: 1500
+
+    # - true: allow messages to notify chat members
+    # - false: send with disable_notification
+    outputNotification: true
+
+    # Register the bot command menu via setMyCommands on connect.
+    commandMenu: true
+
+    # Streaming title phrases for in-progress updates.
+    # Defaults live in packages/utils/working-indicators.ts.
+    # workingIndicators: []
+
+    # Telegram renders fixed-width tables well inside <pre> blocks.
+    markdownTableRender:
+      enabled: true
+      style: unicode
+      maxWidth: 50
+      fallbackMode: list
+
   heartbeat:
     # Enable the internal autonomous heartbeat lane.
     enabled: false

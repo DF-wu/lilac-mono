@@ -69,6 +69,10 @@ New v2 fields:
 - `agent.subagents.delegatePromptOverlay`: optional free-form guidance appended to the parent-visible `subagent_delegate` tool description.
 - `models.def.<alias>.comment`: optional guidance shown when an agent selects a model for a subagent.
 - `models.def.<alias>.agentCanSelect`: explicitly opts an alias into dynamic selection through `subagent_delegate`; defaults to `false`. It does not restrict static profiles, model slots, or explicit human overrides.
+- `surface.telegram`: the Telegram surface. It is disabled by default, so adding it changes no existing behavior. Frozen v1 configs receive the same universal fallback (`enabled: false`) but cannot enable or configure the surface — enabling Telegram requires `configVersion: 2`. Keys: `enabled`, `tokenEnv` (default `TELEGRAM_BOT_TOKEN`), `botName`, `botUsername`, `allowedChatIds`, `allowedUserIds`, `dbPath`, `outputMode`, `parseMode`, `streamEditIntervalMs`, `outputNotification`, `workingIndicators`, `commandMenu`, and `markdownTableRender`.
+  - `allowedChatIds` fails closed: while it is empty the bot ignores every chat.
+  - `streamEditIntervalMs` defaults to `1500`. Telegram throttles `editMessageText` at roughly one call per second per chat, so lower values trip `429 retry_after`.
+  - `parseMode` defaults to `html`. Telegram's MarkdownV2 requires escaping 18 reserved characters, whereas HTML needs only three, and a malformed entity degrades to plain text instead of failing the send.
 
 Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`, `s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the frozen v1 input shape, but v1 receives the same universal runtime defaults.
 
