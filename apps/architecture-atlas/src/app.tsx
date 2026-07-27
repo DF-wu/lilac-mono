@@ -69,7 +69,7 @@ export function App() {
         跳到主要內容
       </a>
       <header className="topbar">
-        <div className="brand-block" aria-label="Lilac System Atlas">
+        <div className="brand-block">
           <span className="brand-mark" aria-hidden="true">
             <Flower2 size={20} strokeWidth={1.8} />
           </span>
