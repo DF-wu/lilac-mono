@@ -89,6 +89,12 @@ function safeJsonPreview(value: unknown, maxChars = 2000): string {
   return raw.length > maxChars ? `${raw.slice(0, maxChars)}...` : raw;
 }
 
+function safeToolInputPreview(callableId: string, input: unknown): string {
+  if (callableId === "mcp.add") return "<redacted mcp.add input>";
+  if (callableId.startsWith("workflow.")) return "<redacted workflow input>";
+  return safeJsonPreview(input);
+}
+
 function headerStr(h: unknown): string | undefined {
   return typeof h === "string" && h.length > 0 ? h : undefined;
 }
@@ -638,9 +644,7 @@ export function createToolServer(options: ToolServerOptions) {
 
       logger.debug("tool call input", {
         callableId: body.callableId,
-        input: safeJsonPreview(
-          body.callableId.startsWith("workflow.") ? "<redacted workflow input>" : body.input,
-        ),
+        input: safeToolInputPreview(body.callableId, body.input),
       });
 
       try {
@@ -742,32 +746,48 @@ export function createToolServer(options: ToolServerOptions) {
             cancelled: combinedSignal.aborted,
           });
         }
-        logger.error(
-          "tool.call.result",
-          {
-            callableId: body.callableId,
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            requestClient: ctx.requestClient,
-            inputBytes,
-            durationMs: Date.now() - startedAt,
-            timeoutMs,
-            ok: false,
-            errorClass: e instanceof Error ? e.name : "unknown",
-            cancelled: combinedSignal.aborted,
-            ...extractAiErrorLogDetails(e),
-          },
-          e,
-        );
+        const errorLogDetails = {
+          callableId: body.callableId,
+          requestId: ctx.requestId,
+          sessionId: ctx.sessionId,
+          requestClient: ctx.requestClient,
+          inputBytes,
+          durationMs: Date.now() - startedAt,
+          timeoutMs,
+          ok: false,
+          errorClass: e instanceof Error ? e.name : "unknown",
+          cancelled: combinedSignal.aborted,
+        };
+        if (body.callableId === "mcp.add") {
+          // mcp.add accepts arbitrary credential-bearing strings. Do not inspect or serialize
+          // unexpected failures because providers may echo partial command-line values.
+          logger.error("tool.call.result", {
+            ...errorLogDetails,
+            errorClass: e instanceof ToolInputValidationError ? e.name : "McpAddError",
+          });
+        } else {
+          logger.error(
+            "tool.call.result",
+            {
+              ...errorLogDetails,
+              ...extractAiErrorLogDetails(e),
+            },
+            e,
+          );
+        }
 
         return {
           isError: true,
           output:
-            e instanceof ToolInputValidationError
-              ? e.message
-              : e instanceof Error
+            body.callableId === "mcp.add"
+              ? e instanceof ToolInputValidationError
+                ? "mcp.add input validation failed"
+                : "mcp.add failed without exposing sensitive configuration"
+              : e instanceof ToolInputValidationError
                 ? e.message
-                : String(e),
+                : e instanceof Error
+                  ? e.message
+                  : String(e),
         };
       }
     },

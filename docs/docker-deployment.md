@@ -41,13 +41,15 @@ External plugins are trusted in-process Core code loaded from `/data/plugins`. T
 
 ## Storage And UID
 
-Compose mounts persistent state at `/data` and optional agent configuration and SSH directories under `/home/lilac`. Keep secrets out of the image and source control, restrict deployment environment-file permissions, and recreate the container after rotating credentials:
+Compose mounts persistent state at `/data` and optional agent configuration and SSH directories under `/home/lilac`. Configured MCP servers live in `/data/mcp-config.yaml`; MCP OAuth credentials persist under `/data/secret/mcp-oauth` and are deliberately retained when a server definition is removed. Keep secrets out of the image and source control, restrict deployment environment-file permissions, and recreate the container after rotating credentials:
 
 ```sh
 docker compose up -d --force-recreate lilac
 ```
 
 `CONTAINER_UID` is a build argument, not a runtime setting. It must be an available numeric UID from 1000 through 60000. Rebuild after changing it and ensure bind-mounted files are owned by or writable for that UID.
+
+Filesystem-tool denylists and trusted Bash's direct static check reduce accidental reads of `/data/secret`; they are not isolation from trusted same-user execution. Core, trusted Bash, plugins, and MCP stdio children share the `lilac` UID and can access service-readable credentials. Use separate containers, users, or another OS security boundary when agent-executed code must not be able to read them.
 
 ## Diagnostics
 

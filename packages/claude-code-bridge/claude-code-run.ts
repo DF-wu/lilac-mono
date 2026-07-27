@@ -12,6 +12,7 @@ import {
   createClaudeCodeToolBridge,
   validateClaudeCodeBuiltInTools,
   type ClaudeCodeBuiltInTool,
+  type ClaudeCodeToolCatalogMetadataMap,
   type ClaudeCodeToolExecutionRequest,
 } from "./claude-code-tools";
 
@@ -34,6 +35,7 @@ export async function materializeClaudeCodeRun(options: {
   modelId: string;
   cwd: string;
   tools: ToolSet;
+  catalogMetadata?: ClaudeCodeToolCatalogMetadataMap;
   execute(request: ClaudeCodeToolExecutionRequest): Promise<AtomicToolExecutionOutcome>;
   /**
    * Claude built-in tools this run may call. Applied to the agent model only;
@@ -45,9 +47,12 @@ export async function materializeClaudeCodeRun(options: {
 }): Promise<MaterializedClaudeCodeRun> {
   // Validated here as well as in the bridge, because this array also reaches
   // the Agent SDK's own built-in allowlist.
-  const builtInTools = validateClaudeCodeBuiltInTools(options.builtInTools);
+  const builtInTools = [
+    ...new Set([...validateClaudeCodeBuiltInTools(options.builtInTools), "ToolSearch" as const]),
+  ];
   const bridge = await createClaudeCodeToolBridge({
     tools: options.tools,
+    catalogMetadata: options.catalogMetadata,
     execute: options.execute,
     builtInTools,
   });
@@ -94,6 +99,7 @@ export async function materializeClaudeCodeRun(options: {
     const agentModel = createModel(options.modelId, {
       ...executable,
       cwd: options.cwd,
+      env: { ENABLE_TOOL_SEARCH: "true" },
       tools: builtInTools,
       settingSources: [],
       persistSession: false,

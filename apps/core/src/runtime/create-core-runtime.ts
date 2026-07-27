@@ -84,6 +84,16 @@ import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import { createToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
+import {
+  createEmptyMcpConfig,
+  McpOAuthCallbackService,
+  McpOAuthProviderService,
+  McpRegistry,
+  readMcpConfigFile,
+  resolveMcpConfigPath,
+  type McpOAuthCallbackListenerStatus,
+  type UniversalMcpConfig,
+} from "../mcp";
 
 export type CoreRuntime = {
   start(): Promise<void>;
@@ -101,6 +111,54 @@ export type CoreRuntimeOptions = {
   logLevel?: LogLevel;
   onUnhealthy?: (snapshot: ToolServerHealthSnapshot) => void | Promise<void>;
 };
+
+type CoreMcpStartupLogger = {
+  info(message: string, details: Readonly<Record<string, unknown>>): void;
+  warn(message: string, details: Readonly<Record<string, unknown>>): void;
+  error(message: string, details: Readonly<Record<string, unknown>>): void;
+};
+
+export type CoreMcpStartupOptions = {
+  readonly configPath: string;
+  readonly providers: { reconcile(config: UniversalMcpConfig): void };
+  readonly registry: { init(): Promise<void> };
+  readonly callback: { start(): McpOAuthCallbackListenerStatus };
+  readonly logger: CoreMcpStartupLogger;
+  readonly readConfig?: typeof readMcpConfigFile;
+};
+
+export async function startCoreMcpServices(
+  options: CoreMcpStartupOptions,
+): Promise<{ readonly registryInit: Promise<void> }> {
+  let config = createEmptyMcpConfig();
+  try {
+    config = (await (options.readConfig ?? readMcpConfigFile)(options.configPath)).config;
+  } catch (error) {
+    options.logger.warn("MCP OAuth providers reconciled to empty configuration", {
+      path: options.configPath,
+      error: errorMessage(error),
+    });
+  }
+  options.providers.reconcile(config);
+
+  const callbackStatus = options.callback.start();
+  if (callbackStatus.status === "unavailable") {
+    options.logger.warn("MCP OAuth callback listener unavailable", callbackStatus);
+  } else {
+    options.logger.info("MCP OAuth callback listener started", callbackStatus);
+  }
+
+  const registryInit = Promise.resolve()
+    .then(() => options.registry.init())
+    .catch((error: unknown) => {
+      options.logger.error("MCP registry background initialization failed", {
+        path: options.configPath,
+        error: errorMessage(error),
+      });
+    });
+
+  return { registryInit };
+}
 
 function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
@@ -236,7 +294,20 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   let gracefulRestartStore: SqliteGracefulRestartStore | null = null;
   let pluginManager: CoreToolPluginManager | null = null;
   const toolResultArtifacts = createToolResultArtifactStore(path.join(env.dataDir, "tool-results"));
+  const mcpConfigPath = resolveMcpConfigPath({ dataDir: env.dataDir });
+  const mcpOAuthProviders = new McpOAuthProviderService({
+    dataDir: env.dataDir,
+    configBaseDir: path.dirname(mcpConfigPath),
+  });
+  const mcpOAuthCallback = new McpOAuthCallbackService({ providers: mcpOAuthProviders });
+  const mcpRegistry = new McpRegistry({
+    configPath: mcpConfigPath,
+    dependencies: {
+      createAuthProvider: ({ server }) => mcpOAuthProviders.getProvider(server.id),
+    },
+  });
   let runtimeFullyStarted = false;
+  let mcpRegistryInitPromise: Promise<void> | null = null;
   let coreConfigWatcher: FSWatcher | null = null;
   let coreConfigValidationTimer: ReturnType<typeof setTimeout> | null = null;
   let coreConfigValidationHadError = false;
@@ -377,6 +448,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         runtime: {
           started,
           runtimeFullyStarted,
+          mcpRegistryInitPending: mcpRegistryInitPromise !== null,
+          mcpOAuthCallback: mcpOAuthCallback.getStatus(),
         },
         discord,
         redis: redisHealth,
@@ -514,6 +587,18 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       // Ensure data dir exists before creating sqlite-backed stores.
       await fs.mkdir(env.dataDir, { recursive: true });
       await toolResultArtifacts.init();
+
+      const mcpStartup = await startCoreMcpServices({
+        configPath: mcpConfigPath,
+        providers: mcpOAuthProviders,
+        registry: mcpRegistry,
+        callback: mcpOAuthCallback,
+        logger,
+      });
+      const registryInitPromise = mcpStartup.registryInit.finally(() => {
+        if (mcpRegistryInitPromise === registryInitPromise) mcpRegistryInitPromise = null;
+      });
+      mcpRegistryInitPromise = registryInitPromise;
 
       const startupConfig = await getCoreConfig();
       if (startupConfig.tools.fsBackend === "fff") {
@@ -730,6 +815,10 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           toolResultArtifacts,
           durableWorkflowStore,
           workflowProgressCards: workflowProgressProjector,
+          mcpRegistry,
+          mcpOAuthProviders,
+          mcpOAuthCallback,
+          mcpConfigPath,
         },
         dataDir: env.dataDir,
       });
@@ -1135,6 +1224,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     await safe("githubWebhook.stop", () => stopGithubWebhook?.stop() ?? Promise.resolve());
 
     await safe("toolServer.stop", () => toolServer?.stop() ?? Promise.resolve());
+    await safe("mcpOAuthCallback.stop", () => mcpOAuthCallback.stop());
+    await safe("mcpRegistry.shutdown", () => mcpRegistry.shutdown());
     await safe("requestMessageCache.stop", () => requestMessageCache?.stop() ?? Promise.resolve());
 
     await safe("router.stop", () => stopRouter?.stop() ?? Promise.resolve());

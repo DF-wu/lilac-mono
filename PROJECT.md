@@ -290,16 +290,16 @@ There are three tool “levels”. They all serve the agent; higher levels are u
    - External plugins are discovered from `DATA_DIR/plugins/*`.
    - Key ones:
       - `bash` (`apps/core/src/tools/bash.ts`), guarded by `apps/core/src/tools/bash-safety/*` unless `dangerouslyAllow=true`.
-        - Bash safety is an evidence-only accidental-damage guardrail. It blocks statically identified destructive operations and sensitive-path access, but parsing failures, unsupported syntax, and runtime-dependent behavior fail open. Dynamic `rm -rf` targets are the deliberate exception and remain blocked because their deletion scope cannot be verified.
+        - Bash safety is an evidence-only accidental-damage guardrail. It blocks statically identified destructive operations and sensitive-path access, including direct static access to `DATA_DIR/secret`, but parsing failures, unsupported syntax, and runtime-dependent behavior fail open. Dynamic `rm -rf` targets are the deliberate exception and remain blocked because their deletion scope cannot be verified.
         - Child env always includes request context vars (`LILAC_REQUEST_ID`, `LILAC_SESSION_ID`, `LILAC_REQUEST_CLIENT`, `LILAC_CWD`) and VCS vars (`GIT_CONFIG_GLOBAL`, `GNUPGHOME`, with color forced off via `NO_COLOR=1`).
         - Trusted local bash also loads `$DATA_DIR/secret/tool-env.jsonc` before each process. This overlay is not used for restricted bash or SSH execution.
-        - Bash output redaction is best-effort accidental-leak prevention, not a security boundary. Trusted local commands can read, transform, or transmit their environment and same-user files; use restricted bash or OS-level isolation when commands must not access secrets.
+        - Bash path denial and output redaction are best-effort accidental-leak prevention, not a security boundary. Trusted local commands can evade static analysis and read, transform, or transmit their environment and same-user files; use restricted bash or OS-level isolation when commands must not access secrets.
         - When GitHub outbound auth is configured, bash also injects GitHub auth vars from `apps/core/src/github/github-auth.ts`:
           - Canonical: `GH_TOKEN`, `GITHUB_TOKEN` (prefer user token when configured, otherwise app token).
           - Optional host: `GH_HOST`.
           - Explicit alternates: `LILAC_GITHUB_USER_TOKEN`, `LILAC_GITHUB_USER_HOST`, `LILAC_GITHUB_APP_TOKEN`, `LILAC_GITHUB_APP_HOST`.
           - This allows command-level override to app auth when needed (for example: `GH_TOKEN="$LILAC_GITHUB_APP_TOKEN" gh ...`).
-      - `read_file`, `glob`, `grep` (`apps/core/src/tools/fs/fs.ts`) (denylists include `DATA_DIR/secret`, `~/.ssh`, `~/.aws`, `~/.gnupg` unless `dangerouslyAllow=true`).
+      - `read_file`, `glob`, `grep` (`apps/core/src/tools/fs/fs.ts`) (normal-operation denylists include `DATA_DIR/secret`, including MCP OAuth credentials, plus `~/.ssh`, `~/.aws`, and `~/.gnupg` unless `dangerouslyAllow=true`).
       - `apply_patch` (`apps/core/src/tools/apply-patch/index.ts`) (format docs: `apps/core/src/tools/apply-patch/README.md`; remote denylist can be bypassed with `dangerouslyAllow=true`).
       - `batch` (`apps/core/src/tools/batch.ts`) expands one call into ordinary synthetic Level 1 tool-call/result pairs.
       - `subagent_delegate` (`apps/core/src/tools/subagent.ts`) when `agent.subagents` is enabled and depth limits allow delegation. Its model argument is generated from agent-selectable `models.def` aliases, with optional per-call reasoning overrides and config-authored routing guidance.
@@ -319,6 +319,7 @@ There are three tool “levels”. They all serve the agent; higher levels are u
    - The tool server uses request context headers (`x-lilac-request-id`, etc.) and generic server-issued request capabilities for request-scoped behavior. Capabilities bind cwd and native profile identity; profile headers are context only and cannot expand Level-2 access.
    - `apps/tool-bridge/client.ts` provides a human-friendly `tools` CLI that calls the tool server; the agent can also invoke it through Level-1 `bash`.
    - Capability-bound plugins skip cleanly in dev mode when required services are absent.
+   - Configured MCP servers are Core-owned, process-wide clients managed through ordinary `mcp.list`, `mcp.add`, `mcp.remove`, `mcp.status`, `mcp.auth`, and `mcp.reload` callable IDs. Every accepted server is attempted at startup; unavailable servers wait for explicit reload rather than retrying on requests or in the background. Load the `mcp-management` skill for operational syntax and OAuth flow.
    - Health distinguishes fatal liveness failures from readiness degradation. Sustained event-loop
      lag is readiness-only: it is retained as a diagnostic incident and can make `/readyz` return
      503, but lag alone never invokes the process watchdog. Incident diagnostics contain process
@@ -353,6 +354,7 @@ There are three tool “levels”. They all serve the agent; higher levels are u
 Expected contents over time:
 
 - `core-config.yaml` (seeded from `packages/utils/config-templates/core-config.example.yaml` if missing)
+- `mcp-config.yaml` (independently versioned configured MCP servers)
 - `prompts/` (seeded from `packages/utils/prompt-templates/*` if missing)
 - `discord-surface.db` (Discord cache DB; default path)
 - `discord-search.db` (Discord search index DB)
@@ -361,7 +363,7 @@ Expected contents over time:
 - `graceful-restart.db` (in-flight relay/agent recovery snapshots)
 - `skills/` (skill bundles installed/seeded for discovery)
 - `plugins/` (external Level 1 / Level 2 tool plugins)
-- `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home)
+- `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home, and `mcp-oauth/<server-id>.json`)
 - `workspace/` (default working directory for bash/fs tools in the core runtime)
 
 Onboarding-related tools may also create additional persisted directories under `DATA_DIR` (for example `bin/`, `.bun/`, `.npm-global/`, `.config/`, `tmp/`).

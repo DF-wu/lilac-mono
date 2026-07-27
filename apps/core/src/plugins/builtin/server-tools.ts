@@ -7,6 +7,7 @@ import {
   ContentInspect,
   Discovery,
   Generate,
+  McpManagement,
   Onboarding,
   ProgrammaticWorkflow,
   SSH,
@@ -35,6 +36,31 @@ export function createBuiltinWebPlugin(): CoreToolPlugin {
 
 export function createBuiltinSkillsPlugin(): CoreToolPlugin {
   return singletonLevel2("skills", () => new Skills());
+}
+
+export function createBuiltinMcpPlugin(): CoreToolPlugin {
+  return {
+    meta: {
+      id: "mcp",
+    },
+    create({ runtime }) {
+      if (!runtime.mcpRegistry || !runtime.mcpOAuthProviders || !runtime.mcpConfigPath) {
+        throw new ToolPluginSkipError(
+          "mcp requires registry, OAuth provider service, and config path",
+        );
+      }
+      return {
+        level2: [
+          new McpManagement({
+            registry: runtime.mcpRegistry,
+            providers: runtime.mcpOAuthProviders,
+            callback: runtime.mcpOAuthCallback,
+            configPath: runtime.mcpConfigPath,
+          }),
+        ],
+      };
+    },
+  };
 }
 
 export function createBuiltinDiscoveryPlugin(): CoreToolPlugin {

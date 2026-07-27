@@ -572,4 +572,160 @@ describe("SqliteTranscriptStore", () => {
     store.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
+
+  it("persists unbounded tool selections within their Lilac session namespace", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const catalogIds = Array.from(
+      { length: 5_000 },
+      (_, index) => `plugin_catalog_tool_${index.toString().padStart(4, "0")}`,
+    );
+
+    const first = new SqliteTranscriptStore(dbPath);
+    first.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "shared-session-id",
+      catalogIds,
+    });
+    first.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "shared-session-id",
+      catalogIds: [catalogIds[0]!],
+    });
+    first.selectSessionToolIds({
+      requestClient: "github",
+      sessionId: "shared-session-id",
+      catalogIds: ["mcp_github_only_tool"],
+    });
+    first.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "other-session",
+      catalogIds: ["mcp_other_session_tool"],
+    });
+    first.close();
+
+    const second = new SqliteTranscriptStore(dbPath);
+    expect(
+      second.listSessionToolIds({
+        requestClient: "discord",
+        sessionId: "shared-session-id",
+      }),
+    ).toEqual(catalogIds);
+    expect(
+      second.listSessionToolIds({
+        requestClient: "github",
+        sessionId: "shared-session-id",
+      }),
+    ).toEqual(["mcp_github_only_tool"]);
+    expect(
+      second.listSessionToolIds({ requestClient: "discord", sessionId: "other-session" }),
+    ).toEqual(["mcp_other_session_tool"]);
+    second.close();
+
+    const db = new Database(dbPath);
+    const row = db
+      .query(
+        `SELECT selected_ts FROM session_loaded_tools
+         WHERE request_client = ? AND session_id = ? AND catalog_id = ?`,
+      )
+      .get("discord", "shared-session-id", catalogIds[0]!) as {
+      selected_ts: number;
+    } | null;
+    expect(row?.selected_ts).toBeGreaterThan(0);
+    db.close();
+
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("prunes tool selections after their session transcripts expire", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+
+    store.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "abandoned-session",
+      catalogIds: ["mcp_abandoned_tool"],
+    });
+    store.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "active-session",
+      catalogIds: ["mcp_active_tool"],
+    });
+    store.selectSessionToolIds({
+      requestClient: "discord",
+      sessionId: "in-flight-session",
+      catalogIds: ["mcp_in_flight_tool"],
+    });
+    const rawDb = new Database(dbPath);
+    rawDb.run("UPDATE session_loaded_tools SET selected_ts = 0 WHERE session_id = ?", [
+      "abandoned-session",
+    ]);
+    rawDb.close();
+    store.saveRequestTranscript({
+      requestId: "active-request",
+      sessionId: "active-session",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "keep this session" }],
+    });
+
+    expect(
+      store.listSessionToolIds({ requestClient: "discord", sessionId: "abandoned-session" }),
+    ).toEqual([]);
+    expect(
+      store.listSessionToolIds({ requestClient: "discord", sessionId: "active-session" }),
+    ).toEqual(["mcp_active_tool"]);
+    expect(
+      store.listSessionToolIds({ requestClient: "discord", sessionId: "in-flight-session" }),
+    ).toEqual(["mcp_in_flight_tool"]);
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("creates the generic selection table without migrating attempt-1 state", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const db = new Database(dbPath);
+    db.run(`
+      CREATE TABLE session_loaded_mcp_tools (
+        request_client TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        server_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        loaded_ts INTEGER NOT NULL
+      )
+    `);
+    db.run("INSERT INTO session_loaded_mcp_tools VALUES (?, ?, ?, ?, ?)", [
+      "discord",
+      "session",
+      "legacy-server",
+      "legacy-tool",
+      1,
+    ]);
+    db.close();
+
+    const store = new SqliteTranscriptStore(dbPath);
+    expect(store.listSessionToolIds({ requestClient: "discord", sessionId: "session" })).toEqual(
+      [],
+    );
+    store.close();
+
+    const rawDb = new Database(dbPath);
+    const columns = rawDb.query("PRAGMA table_info(session_loaded_tools)").all() as Array<{
+      name: string;
+    }>;
+    expect(columns.map((column) => column.name)).toEqual([
+      "request_client",
+      "session_id",
+      "catalog_id",
+      "selected_ts",
+    ]);
+    expect(rawDb.query("SELECT COUNT(*) AS count FROM session_loaded_mcp_tools").get()).toEqual({
+      count: 1,
+    });
+    rawDb.close();
+
+    await fs.rm(dir, { recursive: true, force: true });
+  });
 });

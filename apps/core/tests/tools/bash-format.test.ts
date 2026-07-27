@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { redactSecrets } from "../../src/tools/bash-safety/format";
+import { formatBlockedMessage, redactSecrets } from "../../src/tools/bash-safety/format";
 
 describe("bash output redaction", () => {
   it("redacts dynamically injected tool environment values wherever they appear", () => {
@@ -13,5 +13,54 @@ describe("bash output redaction", () => {
     expect(redactSecrets("token-long token", ["", "token", "token-long"])).toBe(
       "<redacted> <redacted>",
     );
+  });
+
+  it("redacts sensitive query parameters in quoted and unquoted callback URLs", () => {
+    const input = [
+      "curl http://localhost/callback?code=plain-code&state=plain-state&other=visible",
+      `curl 'https://example.test/callback?token=quoted-token&key=quoted-key'`,
+      `curl "https://example.test/callback?secret=quoted-secret#done"`,
+      "curl https://example.test/callback?access_token=access-value&refresh_token=refresh-value",
+      "curl https://example.test/callback?client-secret=client-value&api_key=key-value",
+      "curl https://example.test/callback?code_verifier=verifier-value&other=visible",
+    ].join("\n");
+
+    const redacted = redactSecrets(input);
+
+    expect(redacted).toContain(
+      "http://localhost/callback?code=<redacted>&state=<redacted>&other=visible",
+    );
+    expect(redacted).toContain("'https://example.test/callback?token=<redacted>&key=<redacted>'");
+    expect(redacted).toContain('"https://example.test/callback?secret=<redacted>#done"');
+    expect(redacted).not.toContain("plain-code");
+    expect(redacted).not.toContain("plain-state");
+    expect(redacted).not.toContain("quoted-token");
+    expect(redacted).not.toContain("quoted-key");
+    expect(redacted).not.toContain("quoted-secret");
+    for (const secret of [
+      "access-value",
+      "refresh-value",
+      "client-value",
+      "key-value",
+      "verifier-value",
+    ]) {
+      expect(redacted).not.toContain(secret);
+    }
+    expect(redacted).toContain("other=visible");
+  });
+
+  it("redacts callback query secrets from blocked command and segment text", () => {
+    const message = formatBlockedMessage({
+      reason: "test block",
+      command: "curl 'http://localhost/callback?code=command-code&state=command-state'",
+      segment: "http://localhost/callback?token=segment-token",
+      redact: redactSecrets,
+    });
+
+    expect(message).toContain("code=<redacted>&state=<redacted>");
+    expect(message).toContain("token=<redacted>");
+    expect(message).not.toContain("command-code");
+    expect(message).not.toContain("command-state");
+    expect(message).not.toContain("segment-token");
   });
 });

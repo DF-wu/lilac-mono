@@ -603,7 +603,11 @@ export async function executeBash(
   if (!dangerouslyAllow) {
     const safetyCwd =
       cwdTarget.kind === "ssh" ? toBashSafetyCwdForRemote(cwdTarget.cwd) : resolvedCwd;
-    const blocked = analyzeBashCommand(command, { cwd: safetyCwd });
+    const blocked = analyzeBashCommand(command, {
+      cwd: safetyCwd,
+      protectedPaths:
+        cwdTarget.kind === "local" ? [path.resolve(env.dataDir, "secret")] : undefined,
+    });
     if (blocked) {
       logger.warn("bash blocked", {
         command: redactedCommand,

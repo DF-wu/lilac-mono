@@ -1,0 +1,531 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import {
+  McpOAuthCallbackService,
+  McpOAuthProviderService,
+  readMcpConfigFile,
+  readMcpOAuthCredentialFile,
+  resolveMcpConfigPath,
+  writeMcpOAuthCredentialFileAtomic,
+  type McpCatalogTool,
+  type McpRegistryApi,
+  type McpRegistryConfigStatus,
+  type McpReloadOutcome,
+  type McpServerStatus,
+  type UniversalMcpConfig,
+} from "../../src/mcp";
+import { createBuiltinMcpPlugin } from "../../src/plugins/builtin/server-tools";
+import { McpManagement } from "../../src/tool-server/tools/mcp";
+import { ToolInputValidationError } from "../../src/tool-server/validation-error-message";
+
+const temporaryDirectories: string[] = [];
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function createDataDir(): Promise<string> {
+  const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-mcp-management-"));
+  temporaryDirectories.push(dataDir);
+  return dataDir;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+class RecordingRegistry implements McpRegistryApi {
+  readonly reloadCalls: (string | undefined)[] = [];
+  statuses: readonly McpServerStatus[] = [];
+  configStatus: McpRegistryConfigStatus = { status: "valid" };
+  reloadOutcomes: readonly McpReloadOutcome[] = [];
+  waitUntilInitializedImpl: () => Promise<void> = async () => undefined;
+
+  async init(): Promise<void> {}
+
+  waitUntilInitialized(): Promise<void> {
+    return this.waitUntilInitializedImpl();
+  }
+
+  async reload(serverId?: string): Promise<readonly McpReloadOutcome[]> {
+    this.reloadCalls.push(serverId);
+    return this.reloadOutcomes.length > 0
+      ? this.reloadOutcomes
+      : [
+          {
+            serverId: serverId ?? "all",
+            reconciliation: "unchanged",
+            result: "retained",
+          },
+        ];
+  }
+
+  list(): readonly McpServerStatus[] {
+    return this.statuses;
+  }
+
+  getConfigStatus(): McpRegistryConfigStatus {
+    return this.configStatus;
+  }
+
+  getTools(): readonly McpCatalogTool[] {
+    return [];
+  }
+
+  async shutdown(): Promise<void> {}
+}
+
+function createProviders() {
+  const reconciledConfigs: UniversalMcpConfig[] = [];
+  const authorizationCalls: string[] = [];
+  return {
+    reconciledConfigs,
+    authorizationCalls,
+    reconcile(config: UniversalMcpConfig) {
+      reconciledConfigs.push(config);
+    },
+    async startAuthorization(serverId: string) {
+      authorizationCalls.push(serverId);
+      return {
+        status: "authorization_required" as const,
+        authorizationUrl: "https://auth.example.test/authorize?state=one-time-state",
+        callbackUrl: "http://localhost:1456/mcp/oauth/callback",
+      };
+    },
+  };
+}
+
+function createListeningCallback() {
+  const status = { status: "listening", hostname: "localhost", port: 1456 } as const;
+  return {
+    start: () => status,
+    getStatus: () => status,
+  };
+}
+
+async function createTool() {
+  const dataDir = await createDataDir();
+  const registry = new RecordingRegistry();
+  const providers = createProviders();
+  const configPath = resolveMcpConfigPath({ dataDir });
+  const callback = createListeningCallback();
+  const tool = new McpManagement({ registry, providers, callback, configPath });
+  return { dataDir, configPath, registry, providers, tool };
+}
+
+describe("MCP management metadata", () => {
+  it("exposes six ordinary callables with serverId positional help and flattened add fields", async () => {
+    const setup = await createTool();
+    const entries = await setup.tool.list();
+
+    expect(entries.map((entry) => entry.callableId)).toEqual([
+      "mcp.list",
+      "mcp.add",
+      "mcp.remove",
+      "mcp.status",
+      "mcp.auth",
+      "mcp.reload",
+    ]);
+    for (const entry of entries.filter((entry) => entry.callableId !== "mcp.list")) {
+      expect(entry.primaryPositional).toEqual({ field: "serverId" });
+    }
+
+    const add = entries.find((entry) => entry.callableId === "mcp.add");
+    expect(add?.shortInput).toContain('--transport=<"stdio" | "http">');
+    expect(add?.input).toContain("--server-id=<string> | Configured MCP server ID.");
+    expect(add?.input).toContain('--url=<string> (Required when transport="http")');
+    expect(add?.input).toContain('--command=<string> (Required when transport="stdio")');
+  });
+
+  it("registers one builtin Level-2 tool only when all MCP runtime services exist", async () => {
+    const setup = await createTool();
+    const plugin = createBuiltinMcpPlugin();
+    const providers = new McpOAuthProviderService({ dataDir: setup.dataDir });
+
+    expect(plugin.meta.id).toBe("mcp");
+    const instance = await plugin.create({
+      runtime: {
+        mcpRegistry: setup.registry,
+        mcpOAuthProviders: providers,
+        mcpConfigPath: setup.configPath,
+      },
+      dataDir: setup.dataDir,
+      pluginConfig: undefined,
+      source: "builtin",
+    });
+    expect(instance.level2).toHaveLength(1);
+    expect(instance.level2?.[0]?.id).toBe("mcp");
+
+    expect(() =>
+      plugin.create({
+        runtime: { mcpRegistry: setup.registry },
+        dataDir: setup.dataDir,
+        pluginConfig: undefined,
+        source: "builtin",
+      }),
+    ).toThrow("mcp requires registry, OAuth provider service, and config path");
+  });
+});
+
+describe("MCP management calls", () => {
+  it("adds, lists, inspects, authenticates, reloads, and removes servers", async () => {
+    const setup = await createTool();
+    setup.registry.statuses = [
+      { serverId: "docs", transport: "http", status: "available", toolCount: 3 },
+      {
+        serverId: "local",
+        transport: "stdio",
+        status: "unavailable",
+        phase: "connection",
+        error: "connection refused",
+      },
+    ];
+
+    const added = await setup.tool.call("mcp.add", {
+      serverId: "docs",
+      transport: "http",
+      url: "https://mcp.example.test/service",
+    });
+    expect(added).toEqual({
+      mutation: { type: "upsert", serverId: "docs", changed: true, result: "added" },
+      reload: [
+        {
+          serverId: "docs",
+          reconciliation: "unchanged",
+          result: "retained",
+        },
+      ],
+    });
+    expect(
+      (await readMcpConfigFile(setup.configPath)).config.servers.docs?.transportConfig,
+    ).toEqual({
+      transport: "http",
+      url: "https://mcp.example.test/service",
+      headers: {},
+    });
+
+    expect(await setup.tool.call("mcp.list", {})).toEqual({
+      servers: [{ serverId: "docs", transport: "http", authentication: "none" }],
+    });
+    expect(await setup.tool.call("mcp.status", { serverId: "docs" })).toEqual({
+      config: { status: "valid" },
+      statuses: [{ serverId: "docs", transport: "http", status: "available", toolCount: 3 }],
+      callback: { status: "listening", hostname: "localhost", port: 1456 },
+    });
+    expect(await setup.tool.call("mcp.status", {})).toEqual({
+      config: { status: "valid" },
+      statuses: setup.registry.statuses,
+      callback: { status: "listening", hostname: "localhost", port: 1456 },
+    });
+
+    expect(await setup.tool.call("mcp.auth", { serverId: "docs" })).toEqual({
+      status: "authorization_required",
+      authorizationUrl: "https://auth.example.test/authorize?state=one-time-state",
+      callbackUrl: "http://localhost:1456/mcp/oauth/callback",
+    });
+    expect(setup.providers.authorizationCalls).toEqual(["docs"]);
+
+    expect(await setup.tool.call("mcp.reload", {})).toEqual({
+      reload: [{ serverId: "all", reconciliation: "unchanged", result: "retained" }],
+    });
+    const removed = await setup.tool.call("mcp.remove", { serverId: "docs" });
+    expect(removed).toEqual({
+      mutation: { type: "remove", serverId: "docs", changed: true, result: "removed" },
+      reload: [
+        {
+          serverId: "docs",
+          reconciliation: "unchanged",
+          result: "retained",
+        },
+      ],
+    });
+    expect((await readMcpConfigFile(setup.configPath)).config.servers).toEqual({});
+
+    expect(setup.providers.reconciledConfigs).toHaveLength(3);
+    expect(setup.registry.reloadCalls).toEqual(["docs", undefined, "docs"]);
+  });
+
+  it("normalizes flattened stdio input and reconciles exactly once even for no-op mutations", async () => {
+    const setup = await createTool();
+    const input = {
+      serverId: "local",
+      transport: "stdio" as const,
+      command: "bun",
+      args: ["run", "server.ts"],
+      cwd: "/workspace",
+      env: { TOKEN: { env: "MCP_TOKEN" } },
+    };
+
+    await setup.tool.call("mcp.add", input);
+    const unchanged = await setup.tool.call("mcp.add", input);
+    expect(unchanged).toMatchObject({
+      mutation: { changed: false, result: "unchanged" },
+    });
+    expect(
+      (await readMcpConfigFile(setup.configPath)).config.servers.local?.transportConfig,
+    ).toEqual({
+      transport: "stdio",
+      command: "bun",
+      args: ["run", "server.ts"],
+      cwd: "/workspace",
+      env: { TOKEN: { env: "MCP_TOKEN" } },
+    });
+
+    await setup.tool.call("mcp.remove", { serverId: "missing" });
+    expect(setup.providers.reconciledConfigs).toHaveLength(3);
+    expect(setup.registry.reloadCalls).toEqual(["local", "local", "missing"]);
+  });
+
+  it("serializes concurrent mutations through provider reconciliation and registry reload", async () => {
+    const setup = await createTool();
+
+    await Promise.all([
+      setup.tool.call("mcp.add", {
+        serverId: "alpha",
+        transport: "stdio",
+        command: "alpha-command",
+      }),
+      setup.tool.call("mcp.add", {
+        serverId: "beta",
+        transport: "stdio",
+        command: "beta-command",
+      }),
+      setup.tool.call("mcp.remove", { serverId: "alpha" }),
+    ]);
+
+    expect(
+      setup.providers.reconciledConfigs.map((config) => Object.keys(config.servers).sort()),
+    ).toEqual([["alpha"], ["alpha", "beta"], ["beta"]]);
+    expect(setup.registry.reloadCalls).toEqual(["alpha", "beta", "alpha"]);
+  });
+
+  it("waits for deferred registry initialization before reconciling providers and reloading", async () => {
+    const setup = await createTool();
+    const initGate = deferred<void>();
+    const waitStarted = deferred<void>();
+    setup.registry.waitUntilInitializedImpl = async () => {
+      waitStarted.resolve();
+      await initGate.promise;
+    };
+
+    const adding = setup.tool.call("mcp.add", {
+      serverId: "deferred",
+      transport: "stdio",
+      command: "deferred-command",
+    });
+    await waitStarted.promise;
+
+    expect(Object.keys((await readMcpConfigFile(setup.configPath)).config.servers)).toEqual([
+      "deferred",
+    ]);
+    expect(setup.providers.reconciledConfigs).toHaveLength(0);
+    expect(setup.registry.reloadCalls).toHaveLength(0);
+
+    initGate.resolve();
+    await adding;
+
+    expect(setup.providers.reconciledConfigs).toHaveLength(1);
+    expect(setup.registry.reloadCalls).toEqual(["deferred"]);
+  });
+
+  it("serializes explicit reload with config mutations", async () => {
+    const setup = await createTool();
+
+    await Promise.all([
+      setup.tool.call("mcp.add", {
+        serverId: "alpha",
+        transport: "stdio",
+        command: "alpha-command",
+      }),
+      setup.tool.call("mcp.reload", {}),
+      setup.tool.call("mcp.add", {
+        serverId: "beta",
+        transport: "stdio",
+        command: "beta-command",
+      }),
+    ]);
+
+    expect(
+      setup.providers.reconciledConfigs.map((config) => Object.keys(config.servers).sort()),
+    ).toEqual([["alpha"], ["alpha"], ["alpha", "beta"]]);
+    expect(setup.registry.reloadCalls).toEqual(["alpha", undefined, "beta"]);
+  });
+
+  it("retries callback binding through mcp.auth before starting authorization", async () => {
+    const setup = await createTool();
+    const callbackProviders = new McpOAuthProviderService({ dataDir: setup.dataDir });
+    let portAvailable = false;
+    let bindAttempts = 0;
+    const callback = new McpOAuthCallbackService({
+      providers: callbackProviders,
+      serverFactory: (options) => {
+        bindAttempts += 1;
+        if (!portAvailable) throw new Error("listen EADDRINUSE");
+        return { port: options.port, stop() {} };
+      },
+    });
+    const tool = new McpManagement({
+      registry: setup.registry,
+      providers: setup.providers,
+      callback,
+      configPath: setup.configPath,
+    });
+
+    expect(callback.start()).toMatchObject({ status: "unavailable" });
+    expect(setup.providers.authorizationCalls).toEqual([]);
+
+    portAvailable = true;
+    expect(await tool.call("mcp.auth", { serverId: "docs" })).toMatchObject({
+      status: "authorization_required",
+    });
+    expect(bindAttempts).toBe(2);
+    expect(setup.providers.authorizationCalls).toEqual(["docs"]);
+    expect(await tool.call("mcp.status", {})).toMatchObject({
+      callback: { status: "listening", hostname: "localhost", port: 1456 },
+    });
+
+    await callback.stop();
+  });
+
+  it("does not start authorization while callback binding remains unavailable", async () => {
+    const setup = await createTool();
+    const callback = new McpOAuthCallbackService({
+      providers: new McpOAuthProviderService({ dataDir: setup.dataDir }),
+      serverFactory: () => {
+        throw new Error("listen EADDRINUSE");
+      },
+    });
+    const tool = new McpManagement({
+      registry: setup.registry,
+      providers: setup.providers,
+      callback,
+      configPath: setup.configPath,
+    });
+
+    await expect(tool.call("mcp.auth", { serverId: "docs" })).rejects.toThrow(
+      "MCP OAuth callback listener is unavailable on localhost:1456. Ensure the port is free, then retry mcp.auth.",
+    );
+    expect(setup.providers.authorizationCalls).toEqual([]);
+    expect(callback.getStatus()).toEqual({
+      status: "unavailable",
+      hostname: "localhost",
+      port: 1456,
+      error: "listen EADDRINUSE",
+    });
+  });
+
+  it("strictly rejects malformed and nested add inputs", async () => {
+    const setup = await createTool();
+
+    await expect(
+      setup.tool.call("mcp.add", {
+        serverId: "docs",
+        transport: "http",
+        url: "not-a-url",
+      }),
+    ).rejects.toBeInstanceOf(ToolInputValidationError);
+    await expect(
+      setup.tool.call("mcp.add", {
+        serverId: "docs",
+        transport: "stdio",
+        command: "bun",
+        url: "https://unexpected.example.test",
+      }),
+    ).rejects.toBeInstanceOf(ToolInputValidationError);
+    await expect(
+      setup.tool.call("mcp.add", {
+        serverId: "docs",
+        server: {
+          transport: "http",
+          url: "https://mcp.example.test",
+        },
+      }),
+    ).rejects.toBeInstanceOf(ToolInputValidationError);
+    await expect(setup.tool.call("mcp.auth", {})).rejects.toBeInstanceOf(ToolInputValidationError);
+    await expect(setup.tool.call("mcp.list", { verbose: true })).rejects.toBeInstanceOf(
+      ToolInputValidationError,
+    );
+    expect(setup.providers.reconciledConfigs).toHaveLength(0);
+    expect(setup.registry.reloadCalls).toHaveLength(0);
+  });
+
+  it("retains the OAuth credential file when removing its server", async () => {
+    const setup = await createTool();
+    await setup.tool.call("mcp.add", {
+      serverId: "docs",
+      transport: "http",
+      url: "https://mcp.example.test/service",
+      auth: {
+        type: "oauth",
+        grant: "authorization_code",
+        client: { type: "dynamic" },
+      },
+    });
+    await writeMcpOAuthCredentialFileAtomic({
+      dataDir: setup.dataDir,
+      serverId: "docs",
+      credential: {
+        version: 1,
+        serverUrl: "https://mcp.example.test/service",
+        tokens: { access_token: "persisted-access-token", token_type: "Bearer" },
+      },
+    });
+
+    await setup.tool.call("mcp.remove", { serverId: "docs" });
+    expect(
+      await readMcpOAuthCredentialFile({ dataDir: setup.dataDir, serverId: "docs" }),
+    ).toMatchObject({
+      tokens: { access_token: "persisted-access-token" },
+    });
+  });
+
+  it("never returns configured credential material or prior OAuth callback data", async () => {
+    const setup = await createTool();
+    const secrets = ["header-secret", "url-query-secret", "callback-secret", "one-time-state"];
+
+    const added = await setup.tool.call("mcp.add", {
+      serverId: "private",
+      transport: "http",
+      url: "https://mcp.example.test/service?token=url-query-secret",
+      headers: { Authorization: "Bearer header-secret" },
+    });
+    await setup.tool.call("mcp.auth", { serverId: "private" });
+    const list = await setup.tool.call("mcp.list", {});
+    const status = await setup.tool.call("mcp.status", {});
+    const serializedSafeOutputs = JSON.stringify({ added, list, status });
+
+    for (const secret of secrets) expect(serializedSafeOutputs).not.toContain(secret);
+    expect(list).toEqual({
+      servers: [{ serverId: "private", transport: "http", authentication: "none" }],
+    });
+  });
+
+  it("reports a retained config diagnostic without rereading an invalid file", async () => {
+    const setup = await createTool();
+    setup.registry.configStatus = {
+      status: "invalid",
+      error:
+        "Invalid MCP configuration: servers.docs.transport is invalid. Fix the file, then run mcp.reload.",
+    };
+
+    expect(await setup.tool.call("mcp.status", {})).toEqual({
+      config: setup.registry.configStatus,
+      statuses: [],
+      callback: { status: "listening", hostname: "localhost", port: 1456 },
+    });
+  });
+});

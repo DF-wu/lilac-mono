@@ -9,7 +9,7 @@ import {
   type Level1ToolSpec,
   type RequestContext,
 } from "@stanley2058/lilac-plugin-runtime";
-import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
+import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 
 import {
   createToolServer,
@@ -1635,6 +1635,130 @@ describe("createToolServer", () => {
     });
 
     await server.stop();
+  });
+
+  it("never logs mcp.add input or retained validation secrets", async () => {
+    const chunks: string[] = [];
+    const output = {
+      write(chunk: string) {
+        chunks.push(chunk);
+      },
+    };
+    const tool: ServerTool = {
+      id: "mcp-log-redaction",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "mcp.add",
+            name: "MCP Add",
+            description: "validates sensitive MCP input",
+            shortInput: [],
+            input: [],
+          },
+        ];
+      },
+      async call(callableId, input) {
+        if (input && typeof input === "object" && Reflect.get(input, "transport") === "stdio") {
+          const error = new Error(`MCP runtime failed: ${JSON.stringify(input)}`);
+          error.name = `McpRuntimeError:${Reflect.get(input, "env") ? "env-secret-value" : ""}`;
+          throw error;
+        }
+        return parseToolInput({
+          callableId,
+          input,
+          schema: z.strictObject({
+            serverId: z.string(),
+            transport: z.literal("http"),
+            url: z.url(),
+          }),
+        });
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "mcp-log-redaction-test",
+        logLevel: "debug",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+    });
+    const secrets = {
+      clientSecret: "client-secret-value",
+      authorization: "Bearer header-secret-value",
+      envToken: "env-secret-value",
+      commandToken: "command-token-value",
+      argumentToken: "argument-token-value",
+      code: "query-code-value",
+      state: "query-state-value",
+    };
+
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            callableId: "mcp.add",
+            input: {
+              transport: "http",
+              url: `https://mcp.example/callback?code=${secrets.code}&state=${secrets.state}`,
+              auth: {
+                client: { clientSecret: secrets.clientSecret },
+              },
+              headers: { authorization: secrets.authorization },
+              env: { MCP_TOKEN: secrets.envToken },
+            },
+          }),
+        }),
+      );
+      const validationResult = await response.json();
+      expect(validationResult).toEqual({
+        isError: true,
+        output: "mcp.add input validation failed",
+      });
+
+      const runtimeResponse = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            callableId: "mcp.add",
+            input: {
+              transport: "stdio",
+              command: `bun --token=${secrets.commandToken}`,
+              args: [`--api-key=${secrets.argumentToken}`],
+              url: `https://mcp.example/callback?code=${secrets.code}&state=${secrets.state}`,
+              auth: {
+                client: { clientSecret: secrets.clientSecret },
+              },
+              headers: { authorization: secrets.authorization },
+              env: { MCP_TOKEN: secrets.envToken },
+            },
+          }),
+        }),
+      );
+      const runtimeResult = await runtimeResponse.json();
+      expect(runtimeResult).toEqual({
+        isError: true,
+        output: "mcp.add failed without exposing sensitive configuration",
+      });
+
+      const logged = chunks.join("");
+      expect(logged).toContain("<redacted mcp.add input>");
+      expect(logged).toContain("McpAddError");
+      expect(logged).not.toContain("MCP runtime failed");
+      expect(logged).not.toContain("mcp.add has invalid input");
+      expect(logged).not.toContain("?code=");
+      const observableOutput = `${logged}\n${JSON.stringify({ validationResult, runtimeResult })}`;
+      for (const secret of Object.values(secrets)) expect(observableOutput).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
   });
 
   it("preserves runtime Zod errors that are not input parsing failures", async () => {

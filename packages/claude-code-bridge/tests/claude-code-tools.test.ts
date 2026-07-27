@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { tool, type ToolSet } from "ai";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 import { createClaudeCodeToolBridge, displayClaudeCodeToolName } from "../claude-code-tools";
@@ -27,6 +29,17 @@ async function connectBridge(
   return client;
 }
 
+async function connectStdioFixture(fixtureName: string): Promise<Client> {
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [fileURLToPath(new URL(`./fixtures/${fixtureName}`, import.meta.url))],
+  });
+  closeCallbacks.push(() => client.close());
+  await client.connect(transport);
+  return client;
+}
+
 function permissionOptions(
   toolUseID: string,
 ): Parameters<Awaited<ReturnType<typeof createClaudeCodeToolBridge>>["canUseTool"]>[2] {
@@ -38,7 +51,7 @@ function permissionOptions(
 }
 
 describe("Claude Code tool bridge", () => {
-  it("omits batch and preserves whole-schema input transforms exactly once", async () => {
+  it("omits batch and portable tool_search and preserves input transforms exactly once", async () => {
     let transforms = 0;
     const seen: unknown[] = [];
     const bridge = await createClaudeCodeToolBridge({
@@ -51,6 +64,10 @@ describe("Claude Code tool bridge", () => {
           execute: () => "unused",
         }),
         batch: tool({ inputSchema: z.object({}), execute: () => "unused" }),
+        tool_search: tool({
+          inputSchema: z.object({ query: z.string() }),
+          execute: () => "unused",
+        }),
       },
       execute: async (request) => {
         seen.push(request);
@@ -187,12 +204,16 @@ describe("Claude Code tool bridge", () => {
       execute: async () => {
         throw new Error("unreachable");
       },
-      builtInTools: ["WebSearch"],
+      builtInTools: ["WebSearch", "ToolSearch"],
     });
 
     expect(
       await bridge.canUseTool("WebSearch", { query: "lilac" }, permissionOptions("toolu_search")),
     ).toEqual({ behavior: "allow", updatedInput: { query: "lilac" } });
+    expect(await bridge.canUseTool("ToolSearch", {}, permissionOptions("toolu_tools"))).toEqual({
+      behavior: "allow",
+      updatedInput: {},
+    });
     for (const denied of ["Bash", "WebFetch", "WebSearchExtra", "websearch"]) {
       expect(
         await bridge.canUseTool(denied, {}, permissionOptions(`toolu_${denied}`)),
@@ -210,6 +231,81 @@ describe("Claude Code tool bridge", () => {
 
     expect(await bridge.canUseTool("WebSearch", {}, permissionOptions("toolu_x"))).toMatchObject({
       behavior: "deny",
+    });
+  });
+
+  it("marks Lilac built-ins always-load and gives deferred catalog tools search hints", async () => {
+    const bridge = await createClaudeCodeToolBridge({
+      tools: {
+        read_file: tool({
+          description: "Read a workspace file",
+          inputSchema: z.object({ path: z.string() }),
+          execute: () => "value",
+        }),
+        mcp_issue_tracker_lookup: tool({
+          description: "Normalized description",
+          inputSchema: z.object({ issue: z.string() }),
+          execute: () => "value",
+        }),
+        tool_search: tool({ inputSchema: z.object({ query: z.string() }), execute: () => "value" }),
+      },
+      catalogMetadata: {
+        mcp_issue_tracker_lookup: {
+          sourceId: "linear-production",
+          rawName: "ticket/search-by-customer-reference",
+          title: "Customer escalation finder",
+          description: "Finds escalations using the original account codename marmalade.",
+        },
+        tool_search: {
+          sourceId: "lilac",
+          rawName: "tool_search",
+          description: "Portable search must not be exposed to Claude Code.",
+        },
+      },
+      execute: async () => {
+        throw new Error("unreachable");
+      },
+    });
+    const client = await connectBridge(bridge);
+
+    const listed = await client.listTools();
+    expect(listed.tools).toHaveLength(2);
+    expect(listed.tools.find((entry) => entry.name === "read_file")?._meta).toEqual({
+      "anthropic/alwaysLoad": true,
+    });
+    expect(listed.tools.find((entry) => entry.name === "mcp_issue_tracker_lookup")?._meta).toEqual({
+      "anthropic/searchHint": [
+        "Source ID: linear-production",
+        "Raw tool name: ticket/search-by-customer-reference",
+        "Title: Customer escalation finder",
+        "Description: Finds escalations using the original account codename marmalade.",
+      ].join("\n"),
+    });
+    expect(bridge.exposedToolNames).not.toContain("tool_search");
+  });
+
+  it("serializes and parses all 5,000 deferred declarations over stdio MCP", async () => {
+    const client = await connectStdioFixture("scale-tools-stdio-server.ts");
+
+    const listed = await client.listTools();
+    expect(listed.tools).toHaveLength(5_000);
+    expect(listed.tools[0]?.name).toBe("mcp_scale_tool_0");
+    expect(listed.tools[0]?.description).toBe("Scale tool 0");
+    expect(listed.tools[0]?._meta).toEqual({
+      "anthropic/searchHint": [
+        "Source ID: scale-server",
+        "Raw tool name: original/tool/0",
+        "Description: Original scale description 0",
+      ].join("\n"),
+    });
+    expect(listed.tools[4_999]?.name).toBe("mcp_scale_tool_4999");
+    expect(listed.tools[4_999]?.description).toBe("Scale tool 4999");
+    expect(listed.tools[4_999]?._meta).toEqual({
+      "anthropic/searchHint": [
+        "Source ID: scale-server",
+        "Raw tool name: original/tool/4999",
+        "Description: Original scale description 4999",
+      ].join("\n"),
     });
   });
 
