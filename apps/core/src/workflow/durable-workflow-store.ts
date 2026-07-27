@@ -2414,6 +2414,17 @@ export class DurableWorkflowStore {
     );
   }
 
+  isWorkflowWaitResolverLeaseOwner(ownerId: string): boolean {
+    return (
+      this.db
+        .query<{ owned: number }, [string]>(
+          `SELECT 1 AS owned FROM workflow_wait_resolver_lease
+           WHERE singleton = 1 AND owner_id = ?`,
+        )
+        .get(ownerId)?.owned === 1
+    );
+  }
+
   releaseWorkflowWaitResolverLease(ownerId: string): void {
     this.db.run("DELETE FROM workflow_wait_resolver_lease WHERE singleton = 1 AND owner_id = ?", [
       ownerId,

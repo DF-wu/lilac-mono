@@ -78,6 +78,13 @@ export type TailSubscriptionOptions = {
 /** Options shared by `subscribe()` variants. */
 export type SubscriptionOptions = WorkOrFanoutSubscriptionOptions | TailSubscriptionOptions;
 
+/** Handle for a live subscription. */
+export type BusSubscription = {
+  stop(): Promise<void>;
+  /** Settles when the underlying subscription loop exits, if exposed by the transport. */
+  done?: Promise<void>;
+};
+
 /** Manual pull API options for `fetch()`. */
 export type FetchOptions = {
   offset: Offset;
