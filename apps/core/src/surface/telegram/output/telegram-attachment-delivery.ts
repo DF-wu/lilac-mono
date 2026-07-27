@@ -2,10 +2,20 @@ import { InputFile } from "grammy";
 import type { Bot } from "grammy";
 
 import type { MsgRef, SurfaceAttachment } from "../../types";
-import type { SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
+import type { SurfaceFinalTextMode, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
 import { parseTelegramSessionId, telegramMsgRef } from "../telegram-ids";
 import type { TelegramSessionRef } from "../../types";
-import type { TelegramOutputStream } from "./telegram-output-stream";
+/**
+ * The capabilities the wrapper needs after `finish()`. Depending on this rather
+ * than the concrete stream class keeps the two loosely coupled and lets tests
+ * substitute a double without casting.
+ */
+export type TelegramDeliverableStream = SurfaceOutputStream & {
+  // Required here, unlike on SurfaceOutputStream where it is optional.
+  getFinalTextMode(): SurfaceFinalTextMode;
+  getDeliveredMessages(): { messageId: number; text: string }[];
+  takePendingAttachments(): SurfaceAttachment[];
+};
 
 /**
  * Telegram rejects `sendPhoto` for image types it cannot render inline
@@ -79,12 +89,17 @@ export async function deliverTelegramAttachments(input: {
  */
 export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream {
   constructor(
-    private readonly stream: TelegramOutputStream,
+    private readonly stream: TelegramDeliverableStream,
     private readonly deps: {
       api: TelegramAttachmentApi;
       sessionRef: TelegramSessionRef;
       silent: boolean;
       onError: (error: unknown) => void;
+      /**
+       * Records what was delivered. Telegram does not echo the bot's own
+       * messages back as updates, so this is the only chance to index them.
+       */
+      onDelivered: (messages: readonly { messageId: number; text: string }[]) => void;
     },
   ) {}
 
@@ -94,6 +109,14 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
 
   async finish(): Promise<SurfaceOutputResult> {
     const result = await this.stream.finish();
+
+    try {
+      this.deps.onDelivered(this.stream.getDeliveredMessages());
+    } catch (error: unknown) {
+      // Indexing is best-effort; it must not fail a delivered reply.
+      this.deps.onError(error);
+    }
+
     const attachments = this.stream.takePendingAttachments();
     if (attachments.length === 0) return result;
 
@@ -122,7 +145,7 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
     return this.stream.abort(reason);
   }
 
-  getFinalTextMode(): ReturnType<NonNullable<SurfaceOutputStream["getFinalTextMode"]>> {
+  getFinalTextMode(): SurfaceFinalTextMode {
     return this.stream.getFinalTextMode();
   }
 }

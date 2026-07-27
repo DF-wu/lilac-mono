@@ -313,6 +313,7 @@ export class TelegramAdapter implements SurfaceAdapter {
       onError: (error: unknown) => {
         this.logger.warn("failed to deliver telegram attachments", {}, error);
       },
+      onDelivered: (messages) => this.recordOwnOutput(sessionRef, messages),
     });
   }
 
@@ -644,9 +645,14 @@ export class TelegramAdapter implements SurfaceAdapter {
 
   private async onMessage(message: Message, kind: "created" | "updated"): Promise<void> {
     if (!this.isAllowed({ chatId: message.chat.id, userId: message.from?.id })) return;
-    if (!isRoutableTelegramMessage({ message, botUserId: this.me?.id })) return;
 
-    this.recordMessage(message, { fromBot: false });
+    // Record first, gate second. Non-routable messages (other bots, service
+    // posts) still belong in the local index so they can appear as reply
+    // context; only routing them to the agent would be wrong.
+    const fromBot = message.from?.is_bot === true;
+    this.recordMessage(message, { fromBot });
+
+    if (!isRoutableTelegramMessage({ message, botUserId: this.me?.id })) return;
 
     const surfaceMessage = toSurfaceMessage({
       message,
@@ -718,6 +724,39 @@ export class TelegramAdapter implements SurfaceAdapter {
         ...(this.me?.id === undefined ? {} : { botUserId: this.me.id }),
       }),
     });
+  }
+
+  /**
+   * Indexes the bot's own replies.
+   *
+   * Telegram long polling never echoes them back as updates, so without this
+   * the agent would have no record of what it already said and reply context
+   * would show only the human side of the conversation.
+   */
+  private recordOwnOutput(
+    sessionRef: TelegramSessionRef,
+    messages: readonly { messageId: number; text: string }[],
+  ): void {
+    const store = this.store;
+    if (!store || messages.length === 0) return;
+
+    const { chatId, threadId } = parseTelegramSessionId(sessionRef.channelId);
+    const self = this.self;
+    const now = Date.now();
+
+    for (const message of messages) {
+      store.upsertMessage({
+        sessionId: sessionRef.channelId,
+        messageId: String(message.messageId),
+        chatId: String(chatId),
+        ...(threadId === undefined ? {} : { threadId: String(threadId) }),
+        userId: self?.userId ?? "bot",
+        ...(self?.userName === undefined ? {} : { userName: self.userName }),
+        text: message.text,
+        ts: now,
+        fromBot: true,
+      });
+    }
   }
 
   private async emit(evt: AdapterEvent): Promise<void> {

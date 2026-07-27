@@ -316,6 +316,20 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     return "full";
   }
 
+  /**
+   * Messages this stream delivered, with their rendered text.
+   *
+   * Telegram long polling does not echo the bot's own messages back as
+   * updates, so the adapter has to record them into its local index from here
+   * or the agent would never see its own prior replies as reply context.
+   */
+  getDeliveredMessages(): { messageId: number; text: string }[] {
+    return this.messages.map((message) => ({
+      messageId: message.messageId,
+      text: stripTelegramHtml(message.sentText),
+    }));
+  }
+
   /** Attachments are buffered here; the adapter owns their delivery. */
   takePendingAttachments(): SurfaceAttachment[] {
     return this.pendingAttachments.splice(0, this.pendingAttachments.length);
