@@ -649,7 +649,8 @@ export function ContractsView() {
           <h1 id="contracts-title">契約、狀態與證據圖鑑</h1>
           <p>
             把圖上容易被忽略的細節攤平成可查表格：topic payload、consumer mode、workspace
-            dependencies、資料 ownership、context 層與 current/plan 邊界。
+            dependencies、<span className="no-break">資料 ownership</span>、context 層與
+            current/plan 邊界。
           </p>
         </div>
         <dl className="metric-strip" aria-label="契約檢查台統計">

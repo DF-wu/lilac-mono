@@ -8,14 +8,14 @@
   text-rendering: optimizeLegibility;
   --ink: #172026;
   --muted-ink: #5b6972;
-  --quiet-ink: #7b8991;
+  --quiet-ink: #56646b;
   --paper: #fbfcfc;
   --paper-raised: #ffffff;
   --canvas: #edf1f2;
   --line: #cbd4d8;
   --line-strong: #aab7bd;
   --focus: #006c78;
-  --cyan: #007f8f;
+  --cyan: #006d7a;
   --amber: #b35a00;
   --coral: #b83a4b;
   --indigo: #4455a7;
@@ -285,6 +285,11 @@ select:focus-visible {
   color: var(--muted-ink);
   font-size: 14px;
   line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.no-break {
+  white-space: nowrap;
 }
 
 .metric-strip {
@@ -895,6 +900,7 @@ select:focus-visible {
   color: var(--muted-ink);
   font-size: 11px;
   line-height: 1.4;
+  text-wrap: balance;
 }
 
 .catalog-row__metrics {
@@ -1186,7 +1192,7 @@ select:focus-visible {
 
 .playback-count {
   min-width: 48px;
-  color: var(--muted-ink);
+  color: var(--quiet-ink);
   font-family: "JetBrains Mono", monospace;
   font-size: 9px;
   text-align: center;
@@ -1245,9 +1251,11 @@ select:focus-visible {
 }
 
 .sequence-lane-head strong {
-  overflow-wrap: anywhere;
+  overflow: hidden;
   font-size: 9px;
   line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sequence-steps {
@@ -1286,7 +1294,7 @@ select:focus-visible {
   z-index: 3;
   top: 7px;
   left: 7px;
-  color: #87949a;
+  color: #59676e;
   font-family: "JetBrains Mono", monospace;
   font-size: 8px;
 }
@@ -2790,7 +2798,11 @@ select:focus-visible {
   .view-switcher__item {
     min-height: 60px;
     padding-inline: 10px;
-    font-size: 14px;
+    font-size: 13px;
+  }
+
+  .view-switcher__item > span {
+    white-space: nowrap;
   }
 
   .atlas-view {
@@ -2874,6 +2886,20 @@ select:focus-visible {
   .catalog-row > svg {
     grid-column: 2;
     grid-row: 1 / span 3;
+  }
+
+  .catalog-row small,
+  .inspector-summary {
+    text-wrap: balance;
+    word-break: auto-phrase;
+  }
+
+  .inspector-io {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .inspector-io > svg {
+    display: none;
   }
 
   .map-footnotes {

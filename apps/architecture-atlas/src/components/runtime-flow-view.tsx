@@ -138,6 +138,7 @@ function SequenceBoard({
     <div
       className="sequence-scroll"
       tabIndex={0}
+      role="region"
       aria-label={`${scenario.label} 時序圖，可水平捲動`}
     >
       <div className="sequence-board" style={{ minWidth: scenario.lanes.length * 126 }}>
@@ -255,9 +256,8 @@ export function RuntimeFlowView() {
           <p className="view-kicker">VERSION 02 / DYNAMIC + FAILURE PATHS</p>
           <h1 id="flow-title">Lilac 執行劇場</h1>
           <p>
-            選一條真實 scenario，逐格看
-            process、event、payload、狀態與失敗分支。播放只改閱讀焦點，不假裝是 production
-            telemetry。
+            選一條真實 scenario，逐格看 process、event、payload、狀態與失敗分支。播放只改閱讀焦點，
+            <span className="no-break">不假裝是 production telemetry</span>。
           </p>
         </div>
         <dl className="metric-strip" aria-label="執行劇場統計">
