@@ -105,8 +105,46 @@ type SplitPoint = {
   readonly next: number;
 };
 
-/** Best boundary at or before `budget`, or `null` when the run has none. */
-function findSoftSplitPoint(text: string, budget: number): SplitPoint | null {
+/**
+ * Best boundary at or before `budget`, or `null` when the run has none.
+ *
+ * `preserveSeparator` keeps the separator characters instead of dropping them.
+ * Between prose messages a dangling space or newline is noise, but inside a
+ * `<pre>`/`<code>` block the text is literal content: dropping a separator
+ * there silently corrupts the code, joining `alpha beta` into `alphabeta`
+ * across the split.
+ */
+function findSoftSplitPoint(
+  text: string,
+  budget: number,
+  preserveSeparator = false,
+): SplitPoint | null {
+  if (preserveSeparator) {
+    // Search one character earlier so the retained separator still fits.
+    const limit = budget - 1;
+    if (limit < 1) return null;
+
+    const paragraph = text.lastIndexOf("\n\n", limit - 1);
+    if (paragraph > 0) {
+      const end = paragraph + 2;
+      return { end, next: end };
+    }
+
+    const line = text.lastIndexOf("\n", limit);
+    if (line > 0) {
+      const end = line + 1;
+      return { end, next: end };
+    }
+
+    const word = text.lastIndexOf(" ", limit);
+    if (word > 0) {
+      const end = word + 1;
+      return { end, next: end };
+    }
+
+    return null;
+  }
+
   const paragraph = text.lastIndexOf("\n\n", budget);
   if (paragraph > 0) {
     let next = paragraph + 2;
@@ -121,6 +159,11 @@ function findSoftSplitPoint(text: string, budget: number): SplitPoint | null {
   if (word > 0) return { end: word, next: word + 1 };
 
   return null;
+}
+
+/** Inside these tags the text is literal content, not prose. */
+function isLiteralContext(open: readonly { readonly name: string }[]): boolean {
+  return open.some((tag) => tag.name === "pre" || tag.name === "code");
 }
 
 function hardSplitPoint(text: string, budget: number): SplitPoint {
@@ -206,7 +249,8 @@ export function chunkTelegramHtml(html: string, opts?: ChunkTelegramHtmlOptions)
         break;
       }
 
-      let split = findSoftSplitPoint(rest, budget);
+      const literal = isLiteralContext(open);
+      let split = findSoftSplitPoint(rest, budget, literal);
       if (!split && hasVisibleContent(current)) {
         // No boundary fits in what is left of this chunk, but a fresh chunk has
         // the full budget and may well contain one. Flushing first keeps words
