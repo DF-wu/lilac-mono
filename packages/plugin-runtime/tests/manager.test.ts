@@ -460,4 +460,56 @@ export const value = 2;
       ]),
     );
   });
+
+  it("separates Level 1 registration keys from stable status names", async () => {
+    const contexts: string[] = [];
+    const manager = new ToolPluginManager<Runtime, Level1ToolSpec<Runtime>, ServerTool>({
+      runtime: {},
+      dataDir: "/tmp/unused",
+      builtinPlugins: [
+        {
+          meta: { id: "first" },
+          create: () => ({ level1: [createLevel1Spec("shared")] }),
+        },
+        {
+          meta: { id: "second" },
+          create: () => ({ level1: [createLevel1Spec("shared")] }),
+        },
+      ],
+      getLevel1RegistrationKey: (spec, context) => {
+        contexts.push(`${context.source}:${context.pluginId}:${spec.name}`);
+        return `${context.pluginId}:${spec.name}`;
+      },
+      getLevel1Name: (spec) => spec.name,
+    });
+
+    await manager.init();
+
+    expect(contexts).toEqual(["builtin:first:shared", "builtin:second:shared"]);
+    expect(manager.getStatuses().map((status) => status.level1Names)).toEqual([
+      ["shared"],
+      ["shared"],
+    ]);
+  });
+
+  it("rejects duplicate builtin registration keys", async () => {
+    const manager = new ToolPluginManager<Runtime, Level1ToolSpec<Runtime>, ServerTool>({
+      runtime: {},
+      dataDir: "/tmp/unused",
+      builtinPlugins: [
+        {
+          meta: { id: "first" },
+          create: () => ({ level1: [createLevel1Spec("shared")] }),
+        },
+        {
+          meta: { id: "second" },
+          create: () => ({ level1: [createLevel1Spec("shared")] }),
+        },
+      ],
+      getLevel1RegistrationKey: (spec) => spec.name,
+      getLevel1Name: (spec) => spec.name,
+    });
+
+    await expect(manager.init()).rejects.toThrow("duplicate Level 1 registration key 'shared'");
+  });
 });

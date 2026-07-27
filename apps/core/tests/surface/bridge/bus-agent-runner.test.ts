@@ -19,11 +19,13 @@ import {
   parseCoreConfigV1ToUniversal,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
-import type { ModelMessage } from "ai";
-import { buildSyntheticToolCallId } from "@stanley2058/lilac-agent";
+import { jsonSchema, tool, type ModelMessage, type ToolSet } from "ai";
+import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { AiSdkPiAgent, ToolExpansion, buildSyntheticToolCallId } from "@stanley2058/lilac-agent";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
+  applyCompleteLevel1Tools,
   assertWorkflowDispatchPolicy,
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
@@ -31,6 +33,7 @@ import {
   buildCustomCommandFailureFinalText,
   consumeAssistantTextDelta,
   consumeReasoningChunkEvent,
+  completeLevel1ToolMapping,
   computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
   createAgentRunIdleWatchdog,
@@ -52,18 +55,21 @@ import {
   mergeToSingleUserMessage,
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
+  refreshSelectedLevel1Tools,
   resolveAgentRunModel,
   shouldRunAutoInjectedThreadSearch,
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
   shouldEnableAnthropicPromptCache,
   selectPersistedTranscriptMessages,
+  selectedLevel1ToolNames,
   resolveCompactionCheckpointMeta,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
   withReasoningSummaryDefaultForOpenAIModels,
 } from "../../../src/surface/bridge/bus-agent-runner";
+import type { BuiltLevel1Toolset } from "../../../src/plugins";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createIdleTimer } from "../../../src/shared/idle-timer";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
@@ -76,6 +82,317 @@ import {
   shouldForceUrlDownloadForAnthropicFallback,
   withStableAnthropicUpstreamOrder,
 } from "../../../src/surface/bridge/bus-agent-runner/anthropic-fallback-media";
+
+function level1TestTool(execute: () => unknown) {
+  return tool({
+    inputSchema: jsonSchema<Record<string, never>>({
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    }),
+    execute,
+  });
+}
+
+function level1TestToolset(params?: {
+  catalogExecute?: () => unknown;
+  searchExecute?: () => unknown;
+  onCatalogCreate?: () => void;
+  onBatchUpdate?: (activeToolNames: ReadonlySet<string>) => void;
+}): BuiltLevel1Toolset {
+  params?.onCatalogCreate?.();
+  const catalogTool = level1TestTool(params?.catalogExecute ?? (() => "catalog"));
+  const tools = {
+    builtin: level1TestTool(() => "builtin"),
+    tool_search: level1TestTool(params?.searchExecute ?? (() => "search")),
+    deferred_tool: catalogTool,
+  } satisfies ToolSet;
+  return {
+    tools,
+    specs: new Map(),
+    directToolNames: new Set(["builtin", "tool_search"]),
+    catalog: [
+      {
+        source: "mcp",
+        sourceId: "server",
+        rawName: "raw_tool",
+        modelName: "deferred_tool",
+        title: "Deferred tool",
+        description: "Deferred metadata",
+        identity: { source: "mcp", sourceId: "server", rawToolName: "raw_tool" },
+        stableId: "catalog-id",
+        tool: catalogTool,
+      },
+    ],
+    catalogMetadata: {
+      deferred_tool: {
+        sourceId: "server",
+        rawName: "raw_tool",
+        title: "Deferred tool",
+        description: "Deferred metadata",
+      },
+    },
+    updateActiveBatchTools: (activeToolNames) => params?.onBatchUpdate?.(activeToolNames),
+    genericOutputNormalizerBypassTools: new Set(["builtin"]),
+  };
+}
+
+function level1ZeroUsage() {
+  return {
+    inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 0, text: 0, reasoning: 0 },
+  };
+}
+
+function level1TextStep(text: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "text" },
+        { type: "text-delta" as const, id: "text", delta: text },
+        { type: "text-end" as const, id: "text" },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: level1ZeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function level1ToolCallStep(calls: readonly { toolCallId: string; toolName: string }[]) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        ...calls.map((call) => ({ type: "tool-call" as const, ...call, input: "{}" })),
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: level1ZeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function level1OfferedToolNames(options: { tools?: ReadonlyArray<{ name: string }> }): string[] {
+  return (options.tools ?? []).map((entry) => entry.name);
+}
+
+describe("runner Level 1 catalog selection", () => {
+  it("applies persisted initial selection by stable ID and omits unavailable selected rows", () => {
+    const toolset = level1TestToolset();
+    const persistedRows = ["catalog-id", "missing-catalog-id"];
+
+    expect([...selectedLevel1ToolNames(toolset, persistedRows)]).toEqual([
+      "builtin",
+      "tool_search",
+      "deferred_tool",
+    ]);
+    expect(persistedRows).toEqual(["catalog-id", "missing-catalog-id"]);
+    expect([...selectedLevel1ToolNames({ ...toolset, catalog: [] }, persistedRows)]).toEqual([
+      "builtin",
+      "tool_search",
+    ]);
+    expect(persistedRows).toEqual(["catalog-id", "missing-catalog-id"]);
+  });
+
+  it("activates tool_search results on the next step and denies hidden same-step calls", async () => {
+    const offered: string[][] = [];
+    const selectedIds: string[] = [];
+    let catalogCreates = 0;
+    let catalogExecutions = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async (options) => {
+        offered.push(level1OfferedToolNames(options));
+        if (offered.length === 1) {
+          return level1ToolCallStep([
+            { toolCallId: "search", toolName: "tool_search" },
+            { toolCallId: "hidden", toolName: "deferred_tool" },
+          ]);
+        }
+        return offered.length === 2
+          ? level1ToolCallStep([{ toolCallId: "selected", toolName: "deferred_tool" }])
+          : level1TextStep("done");
+      },
+    });
+    const toolset = level1TestToolset({
+      onCatalogCreate: () => {
+        catalogCreates += 1;
+      },
+      searchExecute: () => {
+        selectedIds.push("catalog-id");
+        return "selected";
+      },
+      catalogExecute: () => {
+        catalogExecutions += 1;
+        return "catalog";
+      },
+    });
+    let agent: AiSdkPiAgent<ToolSet> | null = null;
+    agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: toolset.tools,
+      beforeStep: async () => {
+        if (!agent) throw new Error("agent not ready");
+        await refreshSelectedLevel1Tools({
+          target: agent,
+          toolset,
+          listSelectedCatalogIds: () => selectedIds,
+        });
+      },
+    });
+
+    await agent.prompt("find it");
+
+    expect(catalogCreates).toBe(1);
+    expect(catalogExecutions).toBe(1);
+    expect(offered).toEqual([
+      ["builtin", "tool_search"],
+      ["builtin", "tool_search", "deferred_tool"],
+      ["builtin", "tool_search", "deferred_tool"],
+    ]);
+    expect(agent.getLastStepToolSnapshot()?.names).toEqual([
+      "builtin",
+      "tool_search",
+      "deferred_tool",
+    ]);
+  });
+
+  it("executes selected expansion children and denies hidden children under the same step authority", async () => {
+    let selectedExecutions = 0;
+    let hiddenExecutions = 0;
+    const selectedTool = level1TestTool(() => {
+      selectedExecutions += 1;
+      return "selected";
+    });
+    const hiddenTool = level1TestTool(() => {
+      hiddenExecutions += 1;
+      return "hidden";
+    });
+    const tools = {
+      batch: level1TestTool(
+        () =>
+          new ToolExpansion("expanded", [
+            { toolCallId: "selected-child", toolName: "selected_tool", input: {} },
+            { toolCallId: "hidden-child", toolName: "hidden_tool", input: {} },
+          ]),
+      ),
+      selected_tool: selectedTool,
+      hidden_tool: hiddenTool,
+    } satisfies ToolSet;
+    const toolset: BuiltLevel1Toolset = {
+      tools,
+      specs: new Map(),
+      directToolNames: new Set(["batch"]),
+      catalog: [
+        {
+          source: "plugin",
+          sourceId: "selected-plugin",
+          rawName: "selected",
+          modelName: "selected_tool",
+          identity: { source: "plugin", sourceId: "selected-plugin", rawToolName: "selected" },
+          stableId: "selected-id",
+          tool: selectedTool,
+        },
+        {
+          source: "plugin",
+          sourceId: "hidden-plugin",
+          rawName: "hidden",
+          modelName: "hidden_tool",
+          identity: { source: "plugin", sourceId: "hidden-plugin", rawToolName: "hidden" },
+          stableId: "hidden-id",
+          tool: hiddenTool,
+        },
+      ],
+      catalogMetadata: {},
+      updateActiveBatchTools: () => {},
+      genericOutputNormalizerBypassTools: new Set(),
+    };
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        return calls === 1
+          ? level1ToolCallStep([{ toolCallId: "batch", toolName: "batch" }])
+          : level1TextStep("done");
+      },
+    });
+    let agent: AiSdkPiAgent<ToolSet> | null = null;
+    agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools,
+      beforeStep: async () => {
+        if (!agent) throw new Error("agent not ready");
+        await refreshSelectedLevel1Tools({
+          target: agent,
+          toolset,
+          listSelectedCatalogIds: () => ["selected-id"],
+        });
+      },
+    });
+
+    await agent.prompt("batch it");
+
+    expect(selectedExecutions).toBe(1);
+    expect(hiddenExecutions).toBe(0);
+  });
+
+  it("passes Claude the exact complete tools and deferred metadata with complete authority", () => {
+    const toolset = level1TestToolset();
+    const mapping = completeLevel1ToolMapping(toolset);
+    const applied: { tools?: ToolSet; names?: ReadonlySet<string> } = {};
+
+    applyCompleteLevel1Tools(
+      {
+        setTools: (tools) => {
+          applied.tools = tools;
+        },
+        setActiveTools: (names) => {
+          applied.names = new Set(names);
+        },
+      },
+      toolset,
+    );
+
+    expect(mapping.tools).toBe(toolset.tools);
+    expect(mapping.catalogMetadata).toBe(toolset.catalogMetadata);
+    expect(Object.keys(mapping.catalogMetadata)).toEqual(["deferred_tool"]);
+    expect(applied.tools).toBe(toolset.tools);
+    expect([...(applied.names ?? [])]).toEqual(["builtin", "tool_search", "deferred_tool"]);
+  });
+
+  it("refreshes selection and batch authority without rebuilding the catalog", async () => {
+    let catalogCreates = 0;
+    let batchUpdates = 0;
+    let appliedNames: ReadonlySet<string> = new Set();
+    const toolset = level1TestToolset({
+      onCatalogCreate: () => {
+        catalogCreates += 1;
+      },
+      onBatchUpdate: () => {
+        batchUpdates += 1;
+      },
+    });
+
+    await refreshSelectedLevel1Tools({
+      target: {
+        setActiveTools: (names) => {
+          appliedNames = names;
+        },
+      },
+      toolset,
+      listSelectedCatalogIds: () => [],
+    });
+
+    expect(catalogCreates).toBe(1);
+    expect(batchUpdates).toBe(1);
+    expect([...appliedNames]).toEqual(["builtin", "tool_search"]);
+  });
+});
 
 describe("reasoning chunk streaming", () => {
   it("publishes accumulated snapshots before thinking_end without duplicating on end", () => {

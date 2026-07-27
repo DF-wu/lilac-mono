@@ -44,6 +44,16 @@ export type { NormalizeToolResultOutputFn, ToolResultOutput } from "./atomic-too
 
 export type SystemPrompt = string | SystemModelMessage | SystemModelMessage[];
 
+/** Immutable tool authority for one model step. */
+export type StepToolSnapshot<TOOLS extends ToolSet = ToolSet> = {
+  /** Monotonic model-step number, 1-based. */
+  readonly step: number;
+  /** Exact tool implementations authorized for calls produced by this step. */
+  readonly tools: TOOLS;
+  /** Authorized names in toolset order. */
+  readonly names: readonly string[];
+};
+
 /**
  * Controls how `steer()` messages are drained.
  *
@@ -348,6 +358,12 @@ export type TurnBoundaryHandler = (
   context: TurnBoundaryContext,
 ) => TurnBoundaryDecision | Promise<TurnBoundaryDecision>;
 
+/** Hook run immediately before each model step's tool authority is frozen. */
+export type BeforeStepHandler = (context: {
+  step: number;
+  abortSignal?: AbortSignal;
+}) => void | Promise<void>;
+
 export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   /** System prompt for the model. */
   system: SystemPrompt;
@@ -372,6 +388,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   turnErrorHandler?: TurnErrorHandler;
   /** Inject messages after tools finish and before the next model turn. */
   turnBoundaryHandler?: TurnBoundaryHandler;
+  /** Refresh active tools and other per-step state before tool authority is frozen. */
+  beforeStep?: BeforeStepHandler;
   /** Normalize model-facing tool output before it enters the canonical transcript. */
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
   /** Tool names whose specs guarantee already-bounded model output. */
@@ -511,6 +529,10 @@ function mergeUserMessages(messages: ModelMessage[]): ModelMessage[] {
   if (!merged) return messages;
 
   return [{ role: "user", content: merged }];
+}
+
+function hiddenToolRejection(toolName: string): string {
+  return `Tool '${toolName}' was not offered on the step that produced this call, so it was not executed.`;
 }
 
 function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet {
@@ -681,6 +703,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private readonly captureModelViewMessages: boolean;
   private readonly sendToolsToModel: boolean;
 
+  /** `null` authorizes every tool in the current toolset. */
+  private activeToolNames: ReadonlySet<string> | null = null;
+  private lastStepToolSnapshot: StepToolSnapshot<TOOLS> | null = null;
+
   private steeringMode: SteeringMode = "one-at-a-time";
   private followUpMode: FollowUpMode = "one-at-a-time";
   private nextSteeringId = 1;
@@ -696,6 +722,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private transformMessages: TransformMessagesFn | undefined;
   private turnErrorHandler: TurnErrorHandler | undefined;
   private turnBoundaryHandler: TurnBoundaryHandler | undefined;
+  private beforeStep: BeforeStepHandler | undefined;
   private experimentalDownload: DownloadFunction | undefined;
   private normalizeToolResultOutput: NormalizeToolResultOutputFn | undefined;
   private genericOutputNormalizerBypassTools: ReadonlySet<string>;
@@ -711,6 +738,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.transformMessages = options.transformMessages;
     this.turnErrorHandler = options.turnErrorHandler;
     this.turnBoundaryHandler = options.turnBoundaryHandler;
+    this.beforeStep = options.beforeStep;
     this.experimentalDownload = options.experimentalDownload;
     this.normalizeToolResultOutput = options.normalizeToolResultOutput;
     this.genericOutputNormalizerBypassTools =
@@ -771,6 +799,51 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.state.tools = tools;
   }
 
+  /** Replace the tool names authorized on subsequent model steps. */
+  setActiveTools(names: ReadonlySet<string>) {
+    this.activeToolNames = new Set(names);
+  }
+
+  /** Authorize every tool in the current toolset on subsequent model steps. */
+  clearActiveTools() {
+    this.activeToolNames = null;
+  }
+
+  /** Add tool names to the authority of subsequent model steps. */
+  activateTools(names: readonly string[]) {
+    if (names.length === 0) return;
+    const next = new Set(this.activeToolNames ?? Object.keys(this.state.tools));
+    for (const name of names) next.add(name);
+    this.activeToolNames = next;
+  }
+
+  /** Snapshot the configured active names, or `null` when unrestricted. */
+  getActiveToolNames(): ReadonlySet<string> | null {
+    return this.activeToolNames ? new Set(this.activeToolNames) : null;
+  }
+
+  /** Return the immutable authority used by the most recent model step. */
+  getLastStepToolSnapshot(): StepToolSnapshot<TOOLS> | null {
+    return this.lastStepToolSnapshot;
+  }
+
+  private createStepToolSnapshot(step: number): StepToolSnapshot<TOOLS> {
+    const entries = Object.entries(this.state.tools).filter(
+      ([name]) => this.activeToolNames === null || this.activeToolNames.has(name),
+    );
+    const tools = Object.freeze(
+      Object.fromEntries(
+        entries.map(([name, definition]) => [name, Object.freeze({ ...definition })]),
+      ),
+    ) as TOOLS;
+
+    return Object.freeze({
+      step,
+      tools,
+      names: Object.freeze(entries.map(([name]) => name)),
+    });
+  }
+
   /** Replace the tool context used for subsequent turns. */
   setContext(context: unknown) {
     this.context = context;
@@ -797,13 +870,18 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const abortSignal =
       signals.length > 1 ? AbortSignal.any(signals) : signals.length === 1 ? signals[0] : undefined;
 
+    const snapshotTools = this.lastStepToolSnapshot?.tools ?? this.state.tools;
+
     return executeAtomicToolCall({
       call: {
         toolCallId: input.toolCallId,
         toolName: input.toolName,
         input: input.input,
       },
-      tools: this.state.tools,
+      tools: snapshotTools,
+      ...(snapshotTools[input.toolName] === undefined && this.state.tools[input.toolName]
+        ? { executionRejection: hiddenToolRejection(input.toolName) }
+        : {}),
       messages: this.state.messages,
       context: this.context,
       abortSignal,
@@ -840,6 +918,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   /** Replace the post-tool, pre-model turn-boundary hook. */
   setTurnBoundaryHandler(turnBoundaryHandler: TurnBoundaryHandler | undefined) {
     this.turnBoundaryHandler = turnBoundaryHandler;
+  }
+
+  /** Replace the pre-model-step refresh hook. */
+  setBeforeStep(beforeStep: BeforeStepHandler | undefined) {
+    this.beforeStep = beforeStep;
   }
 
   /** Replace the entire transcript. Use with care. */
@@ -1259,7 +1342,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                 (message) => message.role === "tool" || hasInlineToolResult(message),
               );
             const executedToolCallCount = hasLocalToolCalls
-              ? await this.executeToolCalls(turn.toolCalls)
+              ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
               : 0;
 
             const boundaryDecision = await this.applyTurnBoundary({
@@ -1467,10 +1550,34 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     usage: LanguageModelUsage;
     totalUsage: LanguageModelUsage;
     modelInputMessages: ModelMessage[];
+    toolSnapshot: StepToolSnapshot<TOOLS>;
   }> {
     this.emit({ type: "turn_start" });
 
     const turnIndex = ++this.turnCounter;
+
+    if (this.beforeStep) {
+      const preStepSignal = this.abortController?.signal;
+      if (preStepSignal?.aborted) {
+        throw new TurnAbortedError({
+          reason: this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual"),
+          phase: "model",
+        });
+      }
+      await this.beforeStep({
+        step: turnIndex,
+        ...(preStepSignal ? { abortSignal: preStepSignal } : {}),
+      });
+      if (preStepSignal?.aborted) {
+        throw new TurnAbortedError({
+          reason: this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual"),
+          phase: "model",
+        });
+      }
+    }
+
+    const toolSnapshot = this.createStepToolSnapshot(turnIndex);
+    this.lastStepToolSnapshot = toolSnapshot;
 
     const getAbortReason = (): TurnAbortReason =>
       this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual");
@@ -1526,7 +1633,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       model: this.state.model,
       instructions: this.state.system,
       messages: messagesForModel,
-      ...(this.sendToolsToModel ? { tools: stripToolExecuteForModel(this.state.tools) } : {}),
+      ...(this.sendToolsToModel ? { tools: stripToolExecuteForModel(toolSnapshot.tools) } : {}),
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
@@ -1907,6 +2014,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       usage,
       totalUsage,
       modelInputMessages: messagesForModel.map(cloneMessage),
+      toolSnapshot,
     };
   }
 
@@ -1949,6 +2057,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   private async executeToolCalls(
     toolCalls: ExpandedToolCall[],
+    snapshot: StepToolSnapshot<TOOLS>,
     expansionDepth = 0,
   ): Promise<number> {
     const MAX_PARALLEL_TOOLS = 8;
@@ -1967,7 +2076,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const executeOne = (call: ExpandedToolCall): Promise<AtomicToolExecutionOutcome> =>
       executeAtomicToolCall({
         call,
-        tools: this.state.tools,
+        tools: snapshot.tools,
         messages: this.state.messages,
         context: this.context,
         abortSignal: this.abortController?.signal,
@@ -1985,9 +2094,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
         executionRejection:
-          hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
-            ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
-            : undefined,
+          snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
+            ? hiddenToolRejection(call.toolName)
+            : hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
+              ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
+              : undefined,
         assertNotAborted,
         onEvent: (event) => this.emit(event),
       });
@@ -2065,7 +2176,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         })),
       };
       this.appendMessage(syntheticAssistant);
-      executed += await this.executeToolCalls([...expansion.children], expansionDepth + 1);
+      executed += await this.executeToolCalls(
+        [...expansion.children],
+        snapshot,
+        expansionDepth + 1,
+      );
     }
 
     return executed;

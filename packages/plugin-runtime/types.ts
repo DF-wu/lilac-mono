@@ -129,6 +129,8 @@ export type Level1ContributionInfo = {
   source: PluginSource;
 };
 
+export type Level1RegistrationContext = Level1ContributionInfo;
+
 export type Level2ContributionInfo = Level1ContributionInfo;
 
 export type ToolPluginCreateContext<TRuntimeContext> = {

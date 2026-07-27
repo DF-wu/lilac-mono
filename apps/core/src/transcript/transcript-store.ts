@@ -96,6 +96,14 @@ export type TranscriptStore = {
 
   listDiscoveryRecords?(): TranscriptDiscoveryRecord[];
 
+  selectSessionToolIds?(input: {
+    requestClient: AdapterPlatform;
+    sessionId: string;
+    catalogIds: readonly string[];
+  }): void;
+
+  listSessionToolIds?(input: { requestClient: AdapterPlatform; sessionId: string }): string[];
+
   close(): void;
 };
 
@@ -155,6 +163,62 @@ export class SqliteTranscriptStore implements TranscriptStore {
       CREATE INDEX IF NOT EXISTS idx_surface_message_to_request_request
       ON surface_message_to_request(request_id);
     `);
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS session_loaded_tools (
+        request_client TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        catalog_id TEXT NOT NULL,
+        selected_ts INTEGER NOT NULL,
+        PRIMARY KEY (request_client, session_id, catalog_id)
+      );
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_session_loaded_tools_session
+      ON session_loaded_tools(request_client, session_id);
+    `);
+  }
+
+  selectSessionToolIds(input: {
+    requestClient: AdapterPlatform;
+    sessionId: string;
+    catalogIds: readonly string[];
+  }): void {
+    if (input.catalogIds.length === 0) return;
+
+    const selectedTs = Date.now();
+    const select = this.db.transaction(() => {
+      for (const catalogId of input.catalogIds) {
+        this.db.run(
+          `
+          INSERT INTO session_loaded_tools (
+            request_client, session_id, catalog_id, selected_ts
+          ) VALUES (?, ?, ?, ?)
+          ON CONFLICT(request_client, session_id, catalog_id) DO UPDATE SET
+            selected_ts=excluded.selected_ts;
+          `,
+          [input.requestClient, input.sessionId, catalogId, selectedTs],
+        );
+      }
+    });
+
+    select();
+  }
+
+  listSessionToolIds(input: { requestClient: AdapterPlatform; sessionId: string }): string[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT catalog_id
+        FROM session_loaded_tools
+        WHERE request_client = ? AND session_id = ?
+        ORDER BY catalog_id ASC
+        `,
+      )
+      .all(input.requestClient, input.sessionId) as Array<{ catalog_id: string }>;
+
+    return rows.map((row) => row.catalog_id);
   }
 
   saveRequestTranscript(input: {

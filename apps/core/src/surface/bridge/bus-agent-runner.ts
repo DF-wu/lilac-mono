@@ -57,7 +57,7 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { CoreToolPluginManager } from "../../plugins";
+import type { BuiltLevel1Toolset, CoreToolPluginManager } from "../../plugins";
 import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
 import { createAgentOutputActivityPublisher } from "../../shared/agent-output-activity";
 import {
@@ -1452,6 +1452,52 @@ export function assertWorkflowDispatchPolicy(
   if ((workflowPolicy.reasoning ?? null) !== (subagentMeta.reasoning ?? null)) {
     throw new Error("Workflow request reasoning does not match the approved operation policy");
   }
+}
+
+type Level1ToolAuthorityTarget = Pick<AiSdkPiAgent<ToolSet>, "setTools" | "setActiveTools">;
+
+export function selectedLevel1ToolNames(
+  toolset: BuiltLevel1Toolset,
+  selectedCatalogIds: readonly string[],
+): ReadonlySet<string> {
+  const selected = new Set(selectedCatalogIds);
+  const active = new Set(toolset.directToolNames);
+  for (const entry of toolset.catalog) {
+    if (selected.has(entry.stableId)) active.add(entry.modelName);
+  }
+  return active;
+}
+
+export async function refreshSelectedLevel1Tools(params: {
+  target: Pick<Level1ToolAuthorityTarget, "setActiveTools">;
+  toolset: BuiltLevel1Toolset;
+  listSelectedCatalogIds: () => readonly string[];
+}): Promise<BuiltLevel1Toolset> {
+  const toolset = params.toolset;
+  const activeToolNames = selectedLevel1ToolNames(toolset, params.listSelectedCatalogIds());
+  toolset.updateActiveBatchTools(activeToolNames);
+  params.target.setActiveTools(activeToolNames);
+  return toolset;
+}
+
+export function applyCompleteLevel1Tools(
+  target: Level1ToolAuthorityTarget,
+  toolset: BuiltLevel1Toolset,
+): void {
+  toolset.updateActiveBatchTools(new Set(Object.keys(toolset.tools)));
+  target.setTools(toolset.tools);
+  target.setActiveTools(new Set(Object.keys(toolset.tools)));
+}
+
+export function completeLevel1ToolMapping(toolset: BuiltLevel1Toolset): {
+  tools: ToolSet;
+  catalogMetadata: BuiltLevel1Toolset["catalogMetadata"];
+} {
+  toolset.updateActiveBatchTools(new Set(Object.keys(toolset.tools)));
+  return {
+    tools: toolset.tools,
+    catalogMetadata: toolset.catalogMetadata,
+  };
 }
 
 type SessionQueue = {
@@ -2967,11 +3013,7 @@ export async function startBusAgentRunner(params: {
 
       const fallbackSurfaceForDelegation = trustedFallbackSurface;
       const executionCwd = workflowPolicy?.cwd ?? cwd;
-      const {
-        tools,
-        specs: level1ToolSpecs,
-        genericOutputNormalizerBypassTools,
-      } = await waitForPreAgent(
+      const initialLevel1Toolset = await waitForPreAgent(
         params.pluginManager.buildLevel1Toolset({
           cwd: executionCwd,
           runProfile,
@@ -3024,6 +3066,11 @@ export async function startBusAgentRunner(params: {
           },
         }),
       );
+      const {
+        tools,
+        specs: level1ToolSpecs,
+        genericOutputNormalizerBypassTools,
+      } = initialLevel1Toolset;
       const agentSystem = anthropicPromptCachingEnabled
         ? {
             role: "system" as const,
@@ -3039,11 +3086,13 @@ export async function startBusAgentRunner(params: {
         modelSpec: resolved.spec,
       });
       if (resolved.provider === "claude-code") {
+        const claudeCodeToolMapping = completeLevel1ToolMapping(initialLevel1Toolset);
         claudeCodeRun = await waitForPreAgent(
           materializeClaudeCodeRun({
             modelId: resolved.modelId,
             cwd: executionCwd,
-            tools,
+            tools: claudeCodeToolMapping.tools,
+            catalogMetadata: claudeCodeToolMapping.catalogMetadata,
             // Core admits no Claude built-ins; Lilac remains the only tool source.
             builtInTools: [],
             execute: async (request) => {
@@ -3057,7 +3106,8 @@ export async function startBusAgentRunner(params: {
         if (state.activeRun) state.activeRun.claudeCodeControl = claudeCodeRun.control;
       }
 
-      const agent = new AiSdkPiAgent<ToolSet>({
+      let agent: AiSdkPiAgent<ToolSet> | null = null;
+      agent = new AiSdkPiAgent<ToolSet>({
         system: agentSystem,
         model: claudeCodeRun?.agentModel ?? resolved.model,
         modelSpecifier: resolved.spec,
@@ -3066,6 +3116,21 @@ export async function startBusAgentRunner(params: {
         providerOptions: providerOptionsForAgent,
         reasoning: resolved.reasoning,
         turnErrorHandler: transientRetryController.handler,
+        beforeStep:
+          claudeCodeRun === null
+            ? async () => {
+                if (!agent) throw new Error("Tool refresh started before the agent was ready");
+                await refreshSelectedLevel1Tools({
+                  target: agent,
+                  toolset: initialLevel1Toolset,
+                  listSelectedCatalogIds: () =>
+                    params.transcriptStore?.listSessionToolIds?.({
+                      requestClient: next.requestClient,
+                      sessionId: next.sessionId,
+                    }) ?? [],
+                });
+              }
+            : undefined,
         normalizeToolResultOutput,
         genericOutputNormalizerBypassTools,
         experimentalDownload: experimentalDownloadForAgent,
@@ -3074,6 +3139,7 @@ export async function startBusAgentRunner(params: {
           captureModelViewMessages: env.debug.contextDump.enabled,
         },
       });
+      if (claudeCodeRun !== null) applyCompleteLevel1Tools(agent, initialLevel1Toolset);
       activeAgent = agent;
 
       agent.setContext({
