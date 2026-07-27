@@ -1,5 +1,11 @@
 import { Bot, GrammyError, HttpError } from "grammy";
-import type { Message, ReactionTypeEmoji, Update, UserFromGetMe } from "grammy/types";
+import type {
+  InlineKeyboardMarkup,
+  Message,
+  ReactionTypeEmoji,
+  Update,
+  UserFromGetMe,
+} from "grammy/types";
 
 import {
   createLogger,
@@ -55,6 +61,11 @@ import {
   toTelegramRawEnvelope,
 } from "./telegram-raw";
 import { TelegramSurfaceStore } from "./store/telegram-surface-store";
+import {
+  TelegramOutputStream,
+  type TelegramOutputApi,
+  type TelegramReplyMarkup,
+} from "./output/telegram-output-stream";
 
 export type TelegramAdapterHealthSnapshot = {
   connectionState: "idle" | "connecting" | "ready" | "disconnected";
@@ -262,11 +273,30 @@ export class TelegramAdapter implements SurfaceAdapter {
     }));
   }
 
-  async startOutput(
-    _sessionRef: SessionRef,
-    _opts?: StartOutputOpts,
-  ): Promise<SurfaceOutputStream> {
-    throw new Error("telegram adapter: startOutput is wired in a follow-up commit");
+  async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream> {
+    assertTelegramSessionRef(sessionRef);
+    const bot = this.mustBot();
+    const cfg = this.cfg ?? (await this.resolveCoreConfig());
+    const telegram = cfg.surface.telegram;
+
+    return new TelegramOutputStream({
+      api: createGrammyOutputApi(bot),
+      sessionRef,
+      ...(opts ? { opts } : {}),
+      now: () => Date.now(),
+      scheduleEdit: (cb, delayMs) => {
+        const timer = setTimeout(cb, delayMs);
+        return () => clearTimeout(timer);
+      },
+      streamEditIntervalMs: telegram.streamEditIntervalMs,
+      parseMode: telegram.parseMode,
+      outputMode: telegram.outputMode,
+      outputNotification: opts?.silent === true ? false : telegram.outputNotification,
+      workingIndicators: telegram.workingIndicators,
+      ...(telegram.markdownTableRender.enabled
+        ? { markdownTableRender: telegram.markdownTableRender }
+        : {}),
+    });
   }
 
   async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts): Promise<MsgRef> {
@@ -683,6 +713,82 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (!store) throw new Error("telegram adapter: not connected");
     return store;
   }
+}
+
+/**
+ * Backs the stream's narrow Bot API surface with grammY.
+ *
+ * The stream stays framework-agnostic so it can be unit-tested against a
+ * recorder; this is the only place the two are joined.
+ */
+function createGrammyOutputApi(bot: Bot): TelegramOutputApi {
+  return {
+    sendMessage: async (params) => {
+      const {
+        chat_id,
+        text,
+        message_thread_id,
+        parse_mode,
+        reply_to_message_id,
+        disable_notification,
+        reply_markup,
+        link_preview_options,
+      } = params;
+
+      const sent = await bot.api.sendMessage(chat_id, text, {
+        ...(message_thread_id === undefined ? {} : { message_thread_id }),
+        ...(parse_mode === undefined ? {} : { parse_mode }),
+        ...(disable_notification === undefined ? {} : { disable_notification }),
+        ...(reply_to_message_id === undefined
+          ? {}
+          : {
+              reply_parameters: {
+                message_id: reply_to_message_id,
+                allow_sending_without_reply: true,
+              },
+            }),
+        ...(reply_markup === undefined ? {} : { reply_markup: toGrammyKeyboard(reply_markup) }),
+        ...(link_preview_options === undefined
+          ? {}
+          : { link_preview_options: { is_disabled: true } }),
+      });
+      return { message_id: sent.message_id };
+    },
+    editMessageText: async (params) => {
+      const { chat_id, message_id, text, parse_mode, reply_markup, link_preview_options } = params;
+
+      await bot.api.editMessageText(chat_id, message_id, text, {
+        ...(parse_mode === undefined ? {} : { parse_mode }),
+        ...(reply_markup === undefined ? {} : { reply_markup: toGrammyKeyboard(reply_markup) }),
+        ...(link_preview_options === undefined
+          ? {}
+          : { link_preview_options: { is_disabled: true } }),
+      });
+    },
+    deleteMessage: async (params) => {
+      await bot.api.deleteMessage(params.chat_id, params.message_id);
+    },
+    sendChatAction: async (params) => {
+      const { chat_id, action, message_thread_id } = params;
+      await bot.api.sendChatAction(
+        chat_id,
+        action,
+        message_thread_id === undefined ? {} : { message_thread_id },
+      );
+    },
+  };
+}
+
+/**
+ * The stream models its keyboard as deeply readonly; grammY's parameter types
+ * are mutable. Copy rather than assert, so neither side has to relax its types.
+ */
+function toGrammyKeyboard(markup: TelegramReplyMarkup): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: markup.inline_keyboard.map((row) =>
+      row.map((button) => ({ text: button.text, callback_data: button.callback_data })),
+    ),
+  };
 }
 
 function chatTitleOf(message: Message): string | undefined {
