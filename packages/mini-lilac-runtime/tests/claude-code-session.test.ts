@@ -66,6 +66,19 @@ function providerExecutedSearchResult() {
     stream: simulateReadableStream({
       chunks: [
         {
+          type: "tool-input-start" as const,
+          id: "toolu_search",
+          toolName: "WebSearch",
+          providerExecuted: true,
+          dynamic: true,
+        },
+        {
+          type: "tool-input-delta" as const,
+          id: "toolu_search",
+          delta: JSON.stringify({ query: "lilac" }),
+        },
+        { type: "tool-input-end" as const, id: "toolu_search" },
+        {
           type: "tool-call" as const,
           toolCallId: "toolu_search",
           toolName: "WebSearch",
@@ -84,6 +97,50 @@ function providerExecutedSearchResult() {
         { type: "text-start" as const, id: "answer" },
         { type: "text-delta" as const, id: "answer", delta: "searched" },
         { type: "text-end" as const, id: "answer" },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+/** A Lilac MCP call reported inline when no Lilac execution event was emitted. */
+function providerExecutedMcpReadResult() {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        {
+          type: "tool-input-start" as const,
+          id: "toolu_read",
+          toolName: "mcp__lilac__read_file",
+          providerExecuted: true,
+          dynamic: true,
+        },
+        {
+          type: "tool-input-delta" as const,
+          id: "toolu_read",
+          delta: JSON.stringify({ path: "README.md" }),
+        },
+        { type: "tool-input-end" as const, id: "toolu_read" },
+        {
+          type: "tool-call" as const,
+          toolCallId: "toolu_read",
+          toolName: "mcp__lilac__read_file",
+          input: JSON.stringify({ path: "README.md" }),
+          providerExecuted: true,
+          dynamic: true,
+        },
+        {
+          type: "tool-result" as const,
+          toolCallId: "toolu_read",
+          toolName: "mcp__lilac__read_file",
+          result: "contents",
+          providerExecuted: true,
+          dynamic: true,
+        },
         {
           type: "finish" as const,
           finishReason: { unified: "stop" as const, raw: "stop" },
@@ -329,6 +386,51 @@ describe("claude-code sessions", () => {
     expect(inputs).toHaveLength(1);
     expect(outputs).toHaveLength(1);
     expect(inputs[0]).toMatchObject({ toolName: "WebSearch" });
+    expect(chunks).toContainEqual(
+      expect.objectContaining({
+        type: "tool-input-start",
+        toolCallId: "toolu_search",
+        toolName: "WebSearch",
+      }),
+    );
+    service.close();
+  });
+
+  it("suppresses Claude MCP input drafts and keeps the plain-name inline fallback", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [providerExecutedMcpReadResult(), textResult("final", "done")],
+    });
+    const { service, session } = await temporaryRuntime({ model });
+
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("read it"))).stream,
+    );
+
+    expect(
+      chunks.filter(
+        (chunk) => chunk.type === "tool-input-start" && chunk.toolCallId === "toolu_read",
+      ),
+    ).toEqual([]);
+    expect(
+      chunks.filter(
+        (chunk) => chunk.type === "tool-input-delta" && chunk.toolCallId === "toolu_read",
+      ),
+    ).toEqual([]);
+    expect(
+      chunks.filter(
+        (chunk) => chunk.type === "tool-input-available" && chunk.toolCallId === "toolu_read",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        toolName: "read_file",
+        input: { path: "README.md" },
+      }),
+    ]);
+    expect(
+      chunks.filter(
+        (chunk) => chunk.type === "tool-output-available" && chunk.toolCallId === "toolu_read",
+      ),
+    ).toHaveLength(1);
     service.close();
   });
 

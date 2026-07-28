@@ -360,6 +360,7 @@ type RunProjection = {
   eventError?: string;
   toolInputsAvailable: Map<string, { toolName: string; input: unknown }>;
   streamedToolInputIds: Set<string>;
+  suppressedClaudeMcpToolInputIds: Set<string>;
   toolOutputsAvailable: Set<string>;
   openReasoningIds: Set<string>;
   openTextIds: Set<string>;
@@ -1186,6 +1187,7 @@ class SessionActor {
           inputTokens: this.snapshot.inputTokens ?? null,
           toolInputsAvailable: new Map(),
           streamedToolInputIds: new Set(),
+          suppressedClaudeMcpToolInputIds: new Set(),
           toolOutputsAvailable: new Set(),
           openReasoningIds: new Set(),
           openTextIds: new Set(),
@@ -2280,6 +2282,7 @@ class SessionActor {
           await this.appendChunk(runId, { type: "finish-step" });
         }
         for (const toolCallId of event.abandonedToolCallIds) {
+          if (projection.suppressedClaudeMcpToolInputIds.delete(toolCallId)) continue;
           if (!projection.streamedToolInputIds.has(toolCallId)) continue;
           await this.appendChunk(runId, {
             type: "tool-output-error",
@@ -2409,6 +2412,16 @@ class SessionActor {
           case "toolcall_start":
             projection.openReasoningIds.clear();
             projection.openTextIds.clear();
+            if (
+              projection.claudeCodeRun !== null &&
+              displayClaudeCodeToolName(update.toolName) !== update.toolName
+            ) {
+              // Claude streams bridged MCP input before Lilac's authoritative
+              // execution event. Projecting both creates an orphaned running
+              // row and interrupts grouping of adjacent tool entries.
+              projection.suppressedClaudeMcpToolInputIds.add(update.toolCallId);
+              return;
+            }
             projection.streamedToolInputIds.add(update.toolCallId);
             projection.visibleToolCallIds.add(update.toolCallId);
             await this.appendChunk(runId, {
@@ -2422,6 +2435,7 @@ class SessionActor {
             });
             return;
           case "toolcall_delta":
+            if (projection.suppressedClaudeMcpToolInputIds.has(update.toolCallId)) return;
             await this.appendChunk(runId, {
               type: "tool-input-delta",
               toolCallId: update.toolCallId,
@@ -2429,6 +2443,7 @@ class SessionActor {
             });
             return;
           case "toolcall_end":
+            projection.suppressedClaudeMcpToolInputIds.delete(update.toolCallId);
             return;
           case "custom":
             await this.appendChunk(runId, {
@@ -2576,6 +2591,7 @@ class SessionActor {
           });
           projection.openReasoningIds.clear();
           projection.openTextIds.clear();
+          projection.suppressedClaudeMcpToolInputIds.clear();
           for (const toolCallId of rollback.toolCallIds) {
             projection.visibleToolCallIds.delete(toolCallId);
             projection.toolInputsAvailable.delete(toolCallId);
@@ -2593,13 +2609,18 @@ class SessionActor {
           // with no execution events. Calls Lilac ran are already registered.
           for (const part of event.message.content) {
             if (part.type === "tool-result") {
+              projection.suppressedClaudeMcpToolInputIds.delete(part.toolCallId);
               await this.appendToolResultChunk(runId, projection, part);
               continue;
             }
             if (part.type !== "tool-call") continue;
+            projection.suppressedClaudeMcpToolInputIds.delete(part.toolCallId);
             projection.visibleToolCallIds.add(part.toolCallId);
             if (projection.toolInputsAvailable.has(part.toolCallId)) continue;
-            const toolName = displayClaudeCodeToolName(part.toolName);
+            const toolName =
+              projection.claudeCodeRun === null
+                ? part.toolName
+                : displayClaudeCodeToolName(part.toolName);
             projection.toolInputsAvailable.set(part.toolCallId, {
               toolName,
               input: part.input,
@@ -2649,7 +2670,10 @@ class SessionActor {
           ? {
               type: "tool-input-error",
               toolCallId: part.toolCallId,
-              toolName: displayClaudeCodeToolName(part.toolName),
+              toolName:
+                projection.claudeCodeRun === null
+                  ? part.toolName
+                  : displayClaudeCodeToolName(part.toolName),
               input: toolInput?.input,
               errorText,
               dynamic: true,
