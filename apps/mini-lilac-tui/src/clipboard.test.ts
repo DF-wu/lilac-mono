@@ -20,7 +20,7 @@ describe("clipboard image bounds", () => {
     const bytes = await __clipboardInternals.command(
       process.execPath,
       ["-e", "process.stdout.write(Buffer.from([0, 1, 2, 0]))"],
-      { maxBytes: 4, timeoutMs: 1_000 },
+      { maxBytes: 4 },
     );
 
     expect([...bytes]).toEqual([0, 1, 2, 0]);
@@ -31,7 +31,7 @@ describe("clipboard image bounds", () => {
       __clipboardInternals.command(
         process.execPath,
         ["-e", "process.stdout.write(Buffer.alloc(17)); setTimeout(() => {}, 10_000)"],
-        { maxBytes: 16, timeoutMs: 1_000 },
+        { maxBytes: 16 },
       ),
     ).rejects.toBeInstanceOf(ClipboardImageTooLargeError);
   });
