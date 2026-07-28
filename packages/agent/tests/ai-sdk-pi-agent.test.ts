@@ -1411,6 +1411,272 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     ]);
   });
 
+  it("rewinds cancellation to the last completed streamed content block", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "completed-call",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
+              type: "tool-result",
+              toolCallId: "completed-call",
+              toolName: "provider_search",
+              input: {},
+              result: "result",
+              providerExecuted: true,
+            },
+            { type: "text-start", id: "completed-text" },
+            { type: "text-delta", id: "completed-text", delta: "kept text" },
+            { type: "text-end", id: "completed-text" },
+            { type: "reasoning-start", id: "discarded-reasoning" },
+            { type: "reasoning-delta", id: "discarded-reasoning", delta: "discard me" },
+            { type: "reasoning-end", id: "discarded-reasoning" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    let cancelled = false;
+    agent.subscribe((event) => {
+      if (
+        !cancelled &&
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "thinking_delta" &&
+        event.assistantMessageEvent.id === "discarded-reasoning"
+      ) {
+        cancelled = true;
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "completed-call",
+            toolName: "provider_search",
+            input: {},
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "completed-call",
+            toolName: "provider_search",
+            output: { type: "text", value: "result" },
+          },
+          { type: "text", text: "kept text" },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(agent.state.messages)).not.toContain("discard me");
+  });
+
+  it("drops open text while retaining completed reasoning", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "reasoning-start", id: "completed-reasoning" },
+            { type: "reasoning-delta", id: "completed-reasoning", delta: "kept reasoning" },
+            { type: "reasoning-end", id: "completed-reasoning" },
+            { type: "text-start", id: "discarded-text" },
+            { type: "text-delta", id: "discarded-text", delta: "discard me" },
+            { type: "text-end", id: "discarded-text" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    agent.subscribe((event) => {
+      if (
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "text_delta" &&
+        event.assistantMessageEvent.id === "discarded-text"
+      ) {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "reasoning", text: "kept reasoning" }] },
+    ]);
+  });
+
+  it("drops an unresolved provider tool while retaining the preceding text", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "completed-text" },
+            { type: "text-delta", id: "completed-text", delta: "kept text" },
+            { type: "text-end", id: "completed-text" },
+            {
+              type: "tool-call",
+              toolCallId: "discarded-call",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    agent.subscribe((event) => {
+      if (
+        event.type === "message_end" &&
+        event.message.role === "assistant" &&
+        Array.isArray(event.message.content) &&
+        event.message.content.some(
+          (part) => part.type === "tool-call" && part.toolCallId === "discarded-call",
+        )
+      ) {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "text", text: "kept text" }] },
+    ]);
+  });
+
+  it("drops a cancelled local tool while retaining preceding assistant content", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "completed-text" },
+            { type: "text-delta", id: "completed-text", delta: "kept text" },
+            { type: "text-end", id: "completed-text" },
+            {
+              type: "tool-call",
+              toolCallId: "discarded-local-call",
+              toolName: "lookup",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "unexpected",
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_start" && event.toolCallId === "discarded-local-call") {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "text", text: "kept text" }] },
+    ]);
+  });
+
+  it("keeps an inline tool pair when a later local tool is cancelled", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "completed-inline",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
+              type: "tool-result",
+              toolCallId: "completed-inline",
+              toolName: "provider_search",
+              input: {},
+              result: "inline result",
+              providerExecuted: true,
+            },
+            {
+              type: "tool-call",
+              toolCallId: "discarded-local",
+              toolName: "lookup",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "unexpected",
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_start" && event.toolCallId === "discarded-local") {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(JSON.stringify(agent.state.messages)).toContain("completed-inline");
+    expect(JSON.stringify(agent.state.messages)).toContain("inline result");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("discarded-local");
+  });
+
   it("normalizes an inline provider tool result and continues the completed exchange", async () => {
     const model = new MockLanguageModelV4({
       doStream: [
@@ -1799,6 +2065,55 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
 
     expect(cleanedUp).toBe(true);
     expect(agent.state.messages).toEqual([{ role: "user", content: "cancel streaming tool" }]);
+  });
+
+  it("keeps completed siblings when a parallel tool batch is cancelled", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "prefix" },
+            { type: "text-delta", id: "prefix", delta: "kept prefix" },
+            { type: "text-end", id: "prefix" },
+            { type: "tool-call", toolCallId: "completed", toolName: "fast", input: "{}" },
+            { type: "tool-call", toolCallId: "discarded", toolName: "slow", input: "{}" },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        fast: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "fast result",
+        }),
+        slow: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: (_input, { abortSignal }) =>
+            new Promise<string>((_resolve, reject) => {
+              const abort = () => reject(new DOMException("cancelled", "AbortError"));
+              if (abortSignal?.aborted) abort();
+              else abortSignal?.addEventListener("abort", abort, { once: true });
+            }),
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_end" && event.toolCallId === "completed") agent.cancel();
+    });
+
+    await agent.prompt("start");
+
+    expect(JSON.stringify(agent.state.messages)).toContain("kept prefix");
+    expect(JSON.stringify(agent.state.messages)).toContain("fast result");
+    expect(JSON.stringify(agent.state.messages)).not.toContain('"toolCallId":"discarded"');
   });
 });
 

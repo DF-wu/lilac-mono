@@ -2278,6 +2278,52 @@ describe("Controller effect wiring", () => {
     expect(controller.inputState.phase).toBe("idle");
   });
 
+  it("rolls back only the interrupted block and keeps completed run output", async () => {
+    const transport = new FakeTransport();
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      onExit: () => {},
+    });
+    controller.start();
+    submitText(controller, "hello");
+    await flush();
+    submitText(controller, "discard queued steer");
+
+    transport.enqueue({ type: "text-start", id: "completed" });
+    transport.enqueue({ type: "text-delta", id: "completed", delta: "keep me" });
+    transport.enqueue({ type: "text-end", id: "completed" });
+    transport.enqueue({ type: "reasoning-start", id: "discarded" });
+    transport.enqueue({ type: "reasoning-delta", id: "discarded", delta: "remove me" });
+    transport.enqueue({
+      type: "data-outputRollback",
+      data: {
+        reason: "cancel",
+        reasoningIds: ["discarded"],
+        textIds: [],
+        toolCallIds: [],
+      },
+    });
+    await flush();
+
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["hello", "keep me"]);
+    expect(controller.steeringQueue).toEqual([]);
+
+    transport.canonicalMessages = [
+      { id: "user", role: "user", parts: [{ type: "text", text: "hello" }] },
+      {
+        id: "assistant",
+        role: "assistant",
+        parts: [{ type: "text", text: "keep me", state: "done" }],
+      },
+    ];
+    transport.closeStream();
+    await flush();
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["hello", "keep me"]);
+    expect(controller.inputState.phase).toBe("idle");
+  });
+
   it("keeps admitted steering queued across an interrupt reset until it commits", async () => {
     const transport = new FakeTransport();
     const controller = new Controller({

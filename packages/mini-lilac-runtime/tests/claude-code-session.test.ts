@@ -485,6 +485,96 @@ describe("claude-code sessions", () => {
     service.close();
   });
 
+  it("keeps completed Claude blocks and removes only the interrupted block", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: async ({ abortSignal }) => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({
+              type: "tool-call",
+              toolCallId: "completed-call",
+              toolName: "WebSearch",
+              input: JSON.stringify({ query: "lilac" }),
+              providerExecuted: true,
+            });
+            controller.enqueue({
+              type: "tool-result",
+              toolCallId: "completed-call",
+              toolName: "WebSearch",
+              result: "completed result",
+            });
+            controller.enqueue({ type: "text-start", id: "completed-text" });
+            controller.enqueue({
+              type: "text-delta",
+              id: "completed-text",
+              delta: "completed text",
+            });
+            controller.enqueue({ type: "text-end", id: "completed-text" });
+            controller.enqueue({ type: "reasoning-start", id: "active-reasoning" });
+            controller.enqueue({
+              type: "reasoning-delta",
+              id: "active-reasoning",
+              delta: "discarded reasoning",
+            });
+            const abort = () => controller.error(new DOMException("cancelled", "AbortError"));
+            if (abortSignal?.aborted) abort();
+            else abortSignal?.addEventListener("abort", abort, { once: true });
+          },
+        }),
+      }),
+    });
+    const runs: FakeClaudeRun[] = [];
+    const { directory, service, session } = await temporaryRuntime({ model, runs });
+
+    const started = await service.startPrompt(session.id, userMessage("start"));
+    const reader = started.stream.getReader();
+    const chunks: MiniLilacRuntimeChunk[] = [];
+    while (!chunks.some((chunk) => chunk.type === "reasoning-delta")) {
+      const next = await reader.read();
+      if (next.done) throw new Error("run ended before interrupted reasoning was projected");
+      chunks.push(next.value);
+    }
+    await service.cancel({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: crypto.randomUUID(),
+    });
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(next.value);
+    }
+
+    const rollback = chunks.find((chunk) => chunk.type === "data-outputRollback");
+    expect(rollback).toMatchObject({
+      data: {
+        reason: "cancel",
+        reasoningIds: ["active-reasoning"],
+        textIds: [],
+        toolCallIds: [],
+      },
+    });
+    const messages = service.getMessages(session.id);
+    expect(JSON.stringify(messages)).toContain("completed result");
+    expect(JSON.stringify(messages)).toContain("completed text");
+    expect(JSON.stringify(messages)).not.toContain("discarded reasoning");
+    const modelMessages = service.store.getModelMessages(session.id);
+    expect(JSON.stringify(modelMessages)).toContain("completed result");
+    expect(JSON.stringify(modelMessages)).toContain("completed text");
+    expect(JSON.stringify(modelMessages)).not.toContain("discarded reasoning");
+    service.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers: claudeProviders(),
+      modelResolver: () => new MockLanguageModelV4({}),
+      materializeClaudeCodeRun: fakeClaudeCode({ agentModel: new MockLanguageModelV4({}) }),
+    });
+    expect(reopened.getMessages(session.id)).toEqual(messages);
+    reopened.close();
+  });
+
   it("releases the Claude run when agent construction fails after materialization", async () => {
     const runs: FakeClaudeRun[] = [];
     const { service, session } = await temporaryRuntime({

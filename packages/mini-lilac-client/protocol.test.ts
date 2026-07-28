@@ -469,6 +469,15 @@ describe("miniLilacUIMessageSchema", () => {
       { type: "data-control", data: { status: "empty" } },
       { type: "data-transcriptReset", data: { reason: "interrupt" } },
       {
+        type: "data-outputRollback",
+        data: {
+          reason: "interrupt",
+          reasoningIds: ["reasoning-current"],
+          textIds: [],
+          toolCallIds: ["tool-current"],
+        },
+      },
+      {
         type: "data-subagentStatus",
         data: {
           toolCallId: "tool-1",

@@ -48,6 +48,7 @@ import {
   miniLilacSteerResultSchema,
   miniLilacTodoSchema,
   miniLilacTodoStateSchema,
+  miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageSchema,
   miniLilacUserUIMessageSchema,
   miniLilacUndoResultSchema,
@@ -66,6 +67,7 @@ import {
   type MiniLilacInterruptQueuedSteeringInput,
   type MiniLilacInterruptQueuedSteeringResult,
   type MiniLilacLanguageModelUsage,
+  type MiniLilacOutputRollback,
   type MiniLilacReasoning,
   type MiniLilacSessionSnapshot,
   type MiniLilacSkillSummary,
@@ -359,6 +361,9 @@ type RunProjection = {
   toolInputsAvailable: Map<string, { toolName: string; input: unknown }>;
   streamedToolInputIds: Set<string>;
   toolOutputsAvailable: Set<string>;
+  openReasoningIds: Set<string>;
+  openTextIds: Set<string>;
+  visibleToolCallIds: Set<string>;
   preliminaryToolOutputBytes: Map<string, number>;
   truncatedPreliminaryToolOutputs: Set<string>;
 };
@@ -713,6 +718,103 @@ function terminalText(messages: readonly ModelMessage[]): string {
   return "";
 }
 
+function modelToolCallIds(messages: readonly ModelMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === "tool-call") ids.add(part.toolCallId);
+    }
+  }
+  return ids;
+}
+
+function rollbackStartIndexes(
+  chunks: readonly UIMessageChunk[],
+  rollback: MiniLilacOutputRollback,
+): Map<string, number> {
+  const starts = new Map<string, number>();
+  const trackedText = new Set(rollback.textIds);
+  const trackedReasoning = new Set(rollback.reasoningIds);
+  const trackedTools = new Set(rollback.toolCallIds);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index]!;
+    if (
+      (chunk.type === "text-start" || chunk.type === "text-delta") &&
+      trackedText.has(chunk.id) &&
+      (chunk.type === "text-start" || !starts.has(`text:${chunk.id}`))
+    ) {
+      starts.set(`text:${chunk.id}`, index);
+    }
+    if (chunk.type === "text-end" && trackedText.has(chunk.id)) {
+      starts.delete(`text:${chunk.id}`);
+    }
+    if (
+      (chunk.type === "reasoning-start" || chunk.type === "reasoning-delta") &&
+      trackedReasoning.has(chunk.id) &&
+      (chunk.type === "reasoning-start" || !starts.has(`reasoning:${chunk.id}`))
+    ) {
+      starts.set(`reasoning:${chunk.id}`, index);
+    }
+    if (chunk.type === "reasoning-end" && trackedReasoning.has(chunk.id)) {
+      starts.delete(`reasoning:${chunk.id}`);
+    }
+    if (
+      (chunk.type === "tool-input-start" || chunk.type === "tool-input-available") &&
+      trackedTools.has(chunk.toolCallId) &&
+      (chunk.type === "tool-input-start" || !starts.has(`tool:${chunk.toolCallId}`))
+    ) {
+      starts.set(`tool:${chunk.toolCallId}`, index);
+    }
+  }
+  return starts;
+}
+
+function chunkMatchesRollback(
+  chunk: UIMessageChunk,
+  index: number,
+  rollback: MiniLilacOutputRollback,
+  starts: ReadonlyMap<string, number>,
+): boolean {
+  if (
+    (chunk.type === "text-start" || chunk.type === "text-delta" || chunk.type === "text-end") &&
+    rollback.textIds.includes(chunk.id) &&
+    index >= (starts.get(`text:${chunk.id}`) ?? 0)
+  ) {
+    return true;
+  }
+  if (
+    (chunk.type === "reasoning-start" ||
+      chunk.type === "reasoning-delta" ||
+      chunk.type === "reasoning-end") &&
+    rollback.reasoningIds.includes(chunk.id) &&
+    index >= (starts.get(`reasoning:${chunk.id}`) ?? 0)
+  ) {
+    return true;
+  }
+  if (
+    (chunk.type === "tool-input-start" ||
+      chunk.type === "tool-input-delta" ||
+      chunk.type === "tool-input-available" ||
+      chunk.type === "tool-input-error" ||
+      chunk.type === "tool-output-available" ||
+      chunk.type === "tool-output-error" ||
+      chunk.type === "tool-output-denied") &&
+    rollback.toolCallIds.includes(chunk.toolCallId) &&
+    index >= (starts.get(`tool:${chunk.toolCallId}`) ?? 0)
+  ) {
+    return true;
+  }
+  if (chunk.type !== "data-subagentStatus") return false;
+  const dataPart = miniLilacUIMessageDataPartSchema.safeParse(chunk);
+  return (
+    dataPart.success &&
+    dataPart.data.type === "data-subagentStatus" &&
+    rollback.toolCallIds.includes(dataPart.data.data.toolCallId) &&
+    index >= (starts.get(`tool:${dataPart.data.data.toolCallId}`) ?? 0)
+  );
+}
+
 async function assistantMessageFromChunks(
   runChunks: readonly StoredRunChunk[],
   afterSeq: number,
@@ -720,9 +822,25 @@ async function assistantMessageFromChunks(
   const segment = runChunks.filter((entry) => entry.seq > afterSeq);
   const throughSeq = segment.at(-1)?.seq ?? afterSeq;
   if (segment.length === 0) return { message: null, throughSeq };
-  const segmentChunks = segment
-    .map((entry) => entry.chunk)
-    .filter((chunk) => chunk.type !== "data-steering" && chunk.type !== "data-steeringCommitted");
+  let segmentChunks: UIMessageChunk[] = [];
+  for (const { chunk } of segment) {
+    if (chunk.type === "data-steering" || chunk.type === "data-steeringCommitted") continue;
+    if (chunk.type === "data-outputRollback") {
+      const starts = rollbackStartIndexes(segmentChunks, chunk.data);
+      segmentChunks = segmentChunks.filter(
+        (candidate, index) => !chunkMatchesRollback(candidate, index, chunk.data, starts),
+      );
+      continue;
+    }
+    if (chunk.type === "data-transcriptReset") {
+      // Compatibility for streams produced before output rollback became
+      // block-scoped. Old reset markers had only run-wide semantics.
+      const start = segmentChunks.find((candidate) => candidate.type === "start");
+      segmentChunks = start === undefined ? [] : [start];
+      continue;
+    }
+    segmentChunks.push(chunk);
+  }
   const originalStart = runChunks.find((entry) => entry.chunk.type === "start")?.chunk;
   const firstSegmentSeq = segment[0]?.seq;
   const chunks =
@@ -735,13 +853,9 @@ async function assistantMessageFromChunks(
           ...segmentChunks,
         ]
       : segmentChunks;
-  const resetIndex = chunks.findLastIndex((chunk) => chunk.type === "data-transcriptReset");
-  const start = chunks.find((chunk) => chunk.type === "start");
-  const canonicalChunks =
-    resetIndex >= 0 && start ? [start, ...chunks.slice(resetIndex + 1)] : chunks;
   const stream = new ReadableStream<UIMessageChunk>({
     start(controller) {
-      canonicalChunks.forEach((chunk) => controller.enqueue(chunk));
+      chunks.forEach((chunk) => controller.enqueue(chunk));
       controller.close();
     },
   });
@@ -1073,6 +1187,9 @@ class SessionActor {
           toolInputsAvailable: new Map(),
           streamedToolInputIds: new Set(),
           toolOutputsAvailable: new Set(),
+          openReasoningIds: new Set(),
+          openTextIds: new Set(),
+          visibleToolCallIds: new Set(),
           preliminaryToolOutputBytes: new Map(),
           truncatedPreliminaryToolOutputs: new Set(),
         };
@@ -2178,6 +2295,7 @@ class SessionActor {
           projection.stepOpen = false;
           await this.appendChunk(runId, { type: "finish-step" });
         }
+        if (event.reason === "cancel" || event.reason === "interrupt") return;
         await this.appendChunk(runId, {
           type: "abort",
           reason: event.detail ?? `${event.reason}:${event.phase}`,
@@ -2231,6 +2349,9 @@ class SessionActor {
         const update = event.assistantMessageEvent;
         switch (update.type) {
           case "text_start":
+            projection.openReasoningIds.clear();
+            projection.openTextIds.clear();
+            projection.openTextIds.add(update.id);
             await this.appendChunk(runId, {
               type: "text-start",
               id: update.id,
@@ -2238,6 +2359,9 @@ class SessionActor {
             });
             return;
           case "text_delta":
+            projection.openReasoningIds.clear();
+            if (!projection.openTextIds.has(update.id)) projection.openTextIds.clear();
+            projection.openTextIds.add(update.id);
             await this.appendChunk(runId, {
               type: "text-delta",
               id: update.id,
@@ -2251,8 +2375,12 @@ class SessionActor {
               id: update.id,
               providerMetadata: browserSafeProviderMetadata(update.raw.providerMetadata),
             });
+            projection.openTextIds.delete(update.id);
             return;
           case "thinking_start":
+            projection.openTextIds.clear();
+            projection.openReasoningIds.clear();
+            projection.openReasoningIds.add(update.id);
             await this.appendChunk(runId, {
               type: "reasoning-start",
               id: update.id,
@@ -2260,6 +2388,9 @@ class SessionActor {
             });
             return;
           case "thinking_delta":
+            projection.openTextIds.clear();
+            if (!projection.openReasoningIds.has(update.id)) projection.openReasoningIds.clear();
+            projection.openReasoningIds.add(update.id);
             await this.appendChunk(runId, {
               type: "reasoning-delta",
               id: update.id,
@@ -2273,9 +2404,13 @@ class SessionActor {
               id: update.id,
               providerMetadata: browserSafeProviderMetadata(update.raw.providerMetadata),
             });
+            projection.openReasoningIds.delete(update.id);
             return;
           case "toolcall_start":
+            projection.openReasoningIds.clear();
+            projection.openTextIds.clear();
             projection.streamedToolInputIds.add(update.toolCallId);
+            projection.visibleToolCallIds.add(update.toolCallId);
             await this.appendChunk(runId, {
               type: "tool-input-start",
               toolCallId: update.toolCallId,
@@ -2335,6 +2470,9 @@ class SessionActor {
         return;
       }
       case "tool_execution_start":
+        projection.openReasoningIds.clear();
+        projection.openTextIds.clear();
+        projection.visibleToolCallIds.add(event.toolCallId);
         if (projection.toolInputsAvailable.has(event.toolCallId)) return;
         projection.toolInputsAvailable.set(event.toolCallId, {
           toolName: event.toolName,
@@ -2423,10 +2561,29 @@ class SessionActor {
         return;
       case "messages_reset":
         if (event.reason === "cancel" || event.reason === "interrupt") {
+          const retainedToolCallIds = modelToolCallIds(event.messages);
+          const rollback: MiniLilacOutputRollback = {
+            reason: event.reason,
+            reasoningIds: [...projection.openReasoningIds],
+            textIds: [...projection.openTextIds],
+            toolCallIds: [...projection.visibleToolCallIds].filter(
+              (toolCallId) => !retainedToolCallIds.has(toolCallId),
+            ),
+          };
           await this.appendChunk(runId, {
-            type: "data-transcriptReset",
-            data: { reason: event.reason },
+            type: "data-outputRollback",
+            data: rollback,
           });
+          projection.openReasoningIds.clear();
+          projection.openTextIds.clear();
+          for (const toolCallId of rollback.toolCallIds) {
+            projection.visibleToolCallIds.delete(toolCallId);
+            projection.toolInputsAvailable.delete(toolCallId);
+            projection.streamedToolInputIds.delete(toolCallId);
+            projection.toolOutputsAvailable.delete(toolCallId);
+            projection.preliminaryToolOutputBytes.delete(toolCallId);
+            projection.truncatedPreliminaryToolOutputs.delete(toolCallId);
+          }
         }
         return;
       case "message_end":
@@ -2440,6 +2597,7 @@ class SessionActor {
               continue;
             }
             if (part.type !== "tool-call") continue;
+            projection.visibleToolCallIds.add(part.toolCallId);
             if (projection.toolInputsAvailable.has(part.toolCallId)) continue;
             const toolName = displayClaudeCodeToolName(part.toolName);
             projection.toolInputsAvailable.set(part.toolCallId, {

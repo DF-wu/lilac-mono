@@ -297,6 +297,14 @@ export const miniLilacTranscriptResetSchema = z
   .strict();
 export type MiniLilacTranscriptReset = z.infer<typeof miniLilacTranscriptResetSchema>;
 
+export const miniLilacOutputRollbackSchema = z.strictObject({
+  reason: z.enum(["cancel", "interrupt"]),
+  reasoningIds: z.array(identifierSchema),
+  textIds: z.array(identifierSchema),
+  toolCallIds: z.array(identifierSchema),
+});
+export type MiniLilacOutputRollback = z.infer<typeof miniLilacOutputRollbackSchema>;
+
 export const miniLilacSubagentStatusSchema = z
   .object({
     toolCallId: identifierSchema,
@@ -490,6 +498,7 @@ export type MiniLilacUIMessageDataParts = {
   session: MiniLilacSessionSnapshot;
   control: MiniLilacControlResult;
   transcriptReset: MiniLilacTranscriptReset;
+  outputRollback: MiniLilacOutputRollback;
   subagentStatus: MiniLilacSubagentStatus;
   compaction: MiniLilacCompactionEvent;
   streamCursor: MiniLilacStreamCursor;
@@ -511,6 +520,11 @@ export const miniLilacUIMessageDataPartSchema = z.discriminatedUnion("type", [
     type: z.literal("data-transcriptReset"),
     id: identifierSchema.optional(),
     data: miniLilacTranscriptResetSchema,
+  }),
+  z.strictObject({
+    type: z.literal("data-outputRollback"),
+    id: identifierSchema.optional(),
+    data: miniLilacOutputRollbackSchema,
   }),
   z.strictObject({
     type: z.literal("data-subagentStatus"),

@@ -25,6 +25,9 @@ function createRendererHarness() {
       update: (id, next) => {
         entries = entries.map((entry) => (entry.id === id ? { id, ...next } : entry));
       },
+      remove: (id) => {
+        entries = entries.filter((entry) => entry.id !== id);
+      },
       appendText: (id, delta) => {
         entries = entries.map((entry) =>
           entry.id === id ? { ...entry, text: entry.text + delta } : entry,
@@ -95,6 +98,9 @@ describe("renderInitialMessages", () => {
         update: (id, next) => {
           entries = entries.map((entry) => (entry.id === id ? { id, ...next } : entry));
         },
+        remove: (id) => {
+          entries = entries.filter((entry) => entry.id !== id);
+        },
         appendText: (id, delta) => {
           entries = entries.map((entry) =>
             entry.id === id ? { ...entry, text: entry.text + delta } : entry,
@@ -148,6 +154,7 @@ describe("renderInitialMessages", () => {
           throw new Error("todo chunks must not append transcript output");
         },
         update: () => {},
+        remove: () => {},
         appendText: () => {},
         finish: () => {},
       },
@@ -1344,6 +1351,9 @@ describe("renderInitialMessages", () => {
         update: (id, next) => {
           entries = entries.map((entry) => (entry.id === id ? { id, ...next } : entry));
         },
+        remove: (id) => {
+          entries = entries.filter((entry) => entry.id !== id);
+        },
         appendText: () => {},
         finish: () => {},
       },
@@ -1414,6 +1424,9 @@ describe("renderInitialMessages", () => {
         },
         update: (id, next) => {
           entries = entries.map((entry) => (entry.id === id ? { id, ...next } : entry));
+        },
+        remove: (id) => {
+          entries = entries.filter((entry) => entry.id !== id);
         },
         appendText: () => {},
         finish: () => {},
@@ -1671,6 +1684,7 @@ describe("renderInitialMessages", () => {
       {
         append: () => `entry-${count++}`,
         update: () => {},
+        remove: () => {},
         appendText: () => {},
         finish: () => {},
       },
@@ -1802,5 +1816,135 @@ describe("renderInitialMessages", () => {
       },
     ]);
     expect(transcriptSemantics(entries())).toEqual(transcriptSemantics(persisted));
+  });
+});
+
+describe("ChunkRenderer output rollback", () => {
+  it("removes only open reasoning and keeps completed blocks", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({ type: "reasoning-start", id: "reasoning-a" });
+    renderer.handle({ type: "reasoning-delta", id: "reasoning-a", delta: "kept reasoning" });
+    renderer.handle({ type: "reasoning-end", id: "reasoning-a" });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "tool-b",
+      toolName: "read_file",
+      input: { path: "kept.ts" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "tool-b",
+      output: "kept tool result",
+      dynamic: true,
+    });
+    renderer.handle({ type: "text-start", id: "text-c" });
+    renderer.handle({ type: "text-delta", id: "text-c", delta: "kept text" });
+    renderer.handle({ type: "text-end", id: "text-c" });
+    renderer.handle({ type: "reasoning-start", id: "reasoning-d" });
+    renderer.handle({
+      type: "reasoning-delta",
+      id: "reasoning-d",
+      delta: "discarded reasoning",
+    });
+
+    renderer.handle({
+      type: "data-outputRollback",
+      data: {
+        reason: "cancel",
+        reasoningIds: ["reasoning-d"],
+        textIds: [],
+        toolCallIds: [],
+      },
+    });
+
+    expect(entries().map((entry) => entry.text)).toEqual([
+      "Thought\nkept reasoning",
+      "Explored · 1 read",
+      "kept text",
+    ]);
+  });
+
+  it("removes a cancelled tool without removing earlier exploration", () => {
+    const { renderer, entries } = createRendererHarness();
+    for (const [toolCallId, path] of [
+      ["kept-read", "kept.ts"],
+      ["discarded-read", "discarded.ts"],
+    ] as const) {
+      renderer.handle({
+        type: "tool-input-available",
+        toolCallId,
+        toolName: "read_file",
+        input: { path },
+        dynamic: true,
+      });
+      if (toolCallId === "kept-read") {
+        renderer.handle({
+          type: "tool-output-available",
+          toolCallId,
+          output: "done",
+          dynamic: true,
+        });
+      }
+    }
+    renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "discarded-read",
+      errorText: "aborted",
+      dynamic: true,
+    });
+
+    renderer.handle({
+      type: "data-outputRollback",
+      data: {
+        reason: "cancel",
+        reasoningIds: [],
+        textIds: [],
+        toolCallIds: ["discarded-read"],
+      },
+    });
+
+    expect(entries()).toHaveLength(1);
+    expect(entries()[0]?.text).toBe("Explored · 1 read");
+    expect(entries()[0]?.exploration?.operations).toEqual([{ action: "Read", detail: "kept.ts" }]);
+  });
+
+  it("allows a replacement turn to reuse a rolled-back stream id", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({ type: "text-start", id: "text" });
+    renderer.handle({ type: "text-delta", id: "text", delta: "discarded" });
+    renderer.handle({
+      type: "data-outputRollback",
+      data: {
+        reason: "interrupt",
+        reasoningIds: [],
+        textIds: ["text"],
+        toolCallIds: [],
+      },
+    });
+    renderer.handle({ type: "text-start", id: "text" });
+    renderer.handle({ type: "text-delta", id: "text", delta: "replacement" });
+    renderer.handle({ type: "text-end", id: "text" });
+
+    expect(entries().map((entry) => entry.text)).toEqual(["replacement"]);
+  });
+
+  it("treats a new same-type block as the prior block's implicit boundary", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({ type: "reasoning-start", id: "reasoning-a" });
+    renderer.handle({ type: "reasoning-delta", id: "reasoning-a", delta: "keep A" });
+    renderer.handle({ type: "reasoning-start", id: "reasoning-d" });
+    renderer.handle({ type: "reasoning-delta", id: "reasoning-d", delta: "discard D" });
+    renderer.handle({
+      type: "data-outputRollback",
+      data: {
+        reason: "cancel",
+        reasoningIds: ["reasoning-d"],
+        textIds: [],
+        toolCallIds: [],
+      },
+    });
+
+    expect(entries().map((entry) => entry.text)).toEqual(["Thought\nkeep A"]);
   });
 });

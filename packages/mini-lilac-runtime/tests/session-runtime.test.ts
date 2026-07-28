@@ -3557,11 +3557,9 @@ describe("SessionService", () => {
     });
     expect(service.getSnapshot(session.id).status).toBe("error");
     expect(JSON.stringify(service.store.getModelMessages(session.id))).not.toContain("silent-bash");
-    expect(
-      chunks.some(
-        (chunk) => chunk.type === "data-transcriptReset" && chunk.data.reason === "cancel",
-      ),
-    ).toBe(true);
+    expect(chunks.find((chunk) => chunk.type === "data-outputRollback")).toMatchObject({
+      data: { reason: "cancel", toolCallIds: ["silent-bash"] },
+    });
 
     const followUp = await service.startPrompt(session.id, userMessage("continue after timeout"));
     await collect(followUp.stream);
@@ -5162,12 +5160,15 @@ describe("SessionService", () => {
     expect(JSON.stringify(reconstructed)).toContain('"state":"output-denied"');
   });
 
-  it("emits interrupt transcript reset and persists only canonical assistant text", async () => {
+  it("rolls back only interrupted output and persists canonical assistant text", async () => {
     const model = new MockLanguageModelV4({
       doStream: [
         {
           stream: simulateReadableStream({
             chunks: [
+              { type: "text-start", id: "aborted" },
+              { type: "text-delta", id: "aborted", delta: "completed prior text" },
+              { type: "text-end", id: "aborted" },
               { type: "text-start", id: "aborted" },
               { type: "text-delta", id: "aborted", delta: "aborted partial" },
               { type: "text-end", id: "aborted" },
@@ -5180,14 +5181,17 @@ describe("SessionService", () => {
             chunkDelayInMs: 50,
           }),
         },
-        textResult("final", "canonical final"),
+        // Providers may reuse stream part ids for the replacement turn.
+        textResult("aborted", "canonical final"),
       ],
     });
     const { service, session } = await temporaryRuntime(model);
     const started = await service.startPrompt(session.id, userMessage("start"));
     const reader = started.stream.getReader();
     const chunks: MiniLilacRuntimeChunk[] = [];
-    while (!chunks.some((chunk) => chunk.type === "text-delta")) {
+    while (
+      !chunks.some((chunk) => chunk.type === "text-delta" && chunk.delta === "aborted partial")
+    ) {
       const next = await reader.read();
       if (next.done) throw new Error("run ended before partial text");
       chunks.push(next.value);
@@ -5212,12 +5216,10 @@ describe("SessionService", () => {
       chunks.push(next.value);
     }
 
-    expect(
-      chunks.some(
-        (chunk) => chunk.type === "data-transcriptReset" && chunk.data.reason === "interrupt",
-      ),
-    ).toBe(true);
-    const resetIndex = chunks.findIndex((chunk) => chunk.type === "data-transcriptReset");
+    expect(chunks.find((chunk) => chunk.type === "data-outputRollback")).toMatchObject({
+      data: { reason: "interrupt", textIds: ["aborted"] },
+    });
+    const resetIndex = chunks.findIndex((chunk) => chunk.type === "data-outputRollback");
     const commitIndex = chunks.findIndex((chunk) => chunk.type === "data-steeringCommitted");
     expect(commitIndex).toBeGreaterThan(resetIndex);
     expect(chunks[commitIndex]).toEqual({
@@ -5226,9 +5228,11 @@ describe("SessionService", () => {
       data: replacement,
     });
     const persisted = JSON.stringify(service.getMessages(session.id));
+    expect(persisted).toContain("completed prior text");
     expect(persisted).toContain("canonical final");
     expect(persisted).not.toContain("aborted partial");
     const canonicalModel = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(canonicalModel).toContain("completed prior text");
     expect(canonicalModel).toContain("canonical final");
     expect(canonicalModel).not.toContain("aborted partial");
     service.close();

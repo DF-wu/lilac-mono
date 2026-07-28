@@ -1274,8 +1274,7 @@ describe("createMiniLilacServer", () => {
     const expectedTail = fullChunks.slice(controlIndex - 1);
     const tailTypes = expectedTail.map((chunk) => chunk.type);
     expect(tailTypes).toContain("data-control");
-    expect(tailTypes).toContain("abort");
-    expect(tailTypes).toContain("data-transcriptReset");
+    expect(tailTypes).toContain("data-outputRollback");
     expect(tailTypes).toContain("finish");
 
     const withoutCursor = await app.handle(

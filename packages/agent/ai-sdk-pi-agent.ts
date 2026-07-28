@@ -437,6 +437,12 @@ function cloneMessage(message: ModelMessage): ModelMessage {
   return { ...message };
 }
 
+function cloneAssistantMessage(message: AssistantModelMessage): AssistantModelMessage {
+  const cloned = cloneMessage(message);
+  if (cloned.role !== "assistant") throw new Error("Expected an assistant message");
+  return cloned;
+}
+
 function sumOptionalNumber(a: number | undefined, b: number | undefined): number | undefined {
   if (a === undefined && b === undefined) return undefined;
   return (a ?? 0) + (b ?? 0);
@@ -607,6 +613,69 @@ function getUnresolvedAssistantToolCallIds(message: ModelMessage): string[] {
   return [...open];
 }
 
+function completedAssistantPrefix(message: AssistantModelMessage): AssistantModelMessage | null {
+  if (!Array.isArray(message.content)) {
+    return message.content.length === 0 ? null : cloneAssistantMessage(message);
+  }
+
+  const openToolCallIds = new Set<string>();
+  let lastValidIndex = -1;
+  for (let index = 0; index < message.content.length; index += 1) {
+    const part = message.content[index]!;
+    if (part.type === "tool-call") openToolCallIds.add(part.toolCallId);
+    if (part.type === "tool-result") openToolCallIds.delete(part.toolCallId);
+    if (openToolCallIds.size === 0) lastValidIndex = index;
+  }
+  if (lastValidIndex < 0) return null;
+  return {
+    ...message,
+    content: message.content.slice(0, lastValidIndex + 1).map((part) => ({ ...part })),
+  };
+}
+
+type RecoveryCheckpoint = {
+  baseMessages: ModelMessage[];
+  suffixMessages: ModelMessage[];
+};
+
+function cloneMessages(messages: readonly ModelMessage[]): ModelMessage[] {
+  return messages.map(cloneMessage);
+}
+
+function recoveryCheckpointForMessages(messages: readonly ModelMessage[]): RecoveryCheckpoint {
+  const truncated = truncateToLastValidBoundary([...messages]);
+  const baseMessages = cloneMessages(truncated.messages);
+  if (truncated.droppedMessageCount === 0) return { baseMessages, suffixMessages: [] };
+
+  const assistant = messages[baseMessages.length];
+  if (assistant?.role !== "assistant" || !Array.isArray(assistant.content)) {
+    return { baseMessages, suffixMessages: [] };
+  }
+  const completedToolCallIds = new Set(getToolResultToolCallIds(assistant));
+  for (const message of messages.slice(baseMessages.length + 1)) {
+    for (const toolCallId of getToolResultToolCallIds(message))
+      completedToolCallIds.add(toolCallId);
+  }
+  const assistantContent = assistant.content.filter(
+    (part) => part.type !== "tool-call" || completedToolCallIds.has(part.toolCallId),
+  );
+  const suffixMessages: ModelMessage[] = [];
+  if (assistantContent.length > 0) {
+    suffixMessages.push({
+      ...assistant,
+      content: assistantContent.map((part) => ({ ...part })),
+    });
+  }
+  for (const message of messages.slice(baseMessages.length + 1)) {
+    if (message.role !== "tool") continue;
+    const content = message.content
+      .filter((part) => part.type === "tool-result" && completedToolCallIds.has(part.toolCallId))
+      .map((part) => ({ ...part }));
+    if (content.length > 0) suffixMessages.push({ ...message, content });
+  }
+  return { baseMessages, suffixMessages };
+}
+
 function hasInlineToolResult(message: ModelMessage): boolean {
   return (
     message.role === "assistant" &&
@@ -713,7 +782,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private steeringQueue: Array<{ id: SteeringQueueId; message: ModelMessage }> = [];
   private deliveredSteeringMessages: ModelMessage[] = [];
   private followUpQueue: ModelMessage[] = [];
-  private recoveryDraft: AssistantModelMessage | null = null;
+  private recoveryCheckpoint: RecoveryCheckpoint | null = null;
 
   private pendingInterrupt: ModelMessage[] | null = null;
   private cancelResetPending = false;
@@ -851,9 +920,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   /** Snapshot the last replay-safe boundary, including completed provider-executed tool activity. */
   getRecoverableMessages(): ModelMessage[] {
-    return this.recoveryDraft
-      ? [...this.state.messages, cloneMessage(this.recoveryDraft)]
-      : [...this.state.messages];
+    const checkpoint = this.recoveryCheckpoint;
+    return checkpoint
+      ? [...cloneMessages(checkpoint.baseMessages), ...cloneMessages(checkpoint.suffixMessages)]
+      : cloneMessages(this.state.messages);
   }
 
   /** Execute a provider-originated tool call through the same atomic path as local calls. */
@@ -937,7 +1007,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.state.messages = normalizeReplayMessages(messages);
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
-    this.recoveryDraft = null;
+    this.recoveryCheckpoint = null;
 
     this.emit({
       type: "messages_reset",
@@ -1208,12 +1278,18 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   private resetMessagesAfterAbort(
     reason: "cancel" | "interrupt",
-    appendAfterBoundary: ModelMessage[] = [],
+    appendBeforeRecovery: ModelMessage[] = [],
   ) {
     const truncated = truncateToLastValidBoundary(this.state.messages);
-    this.state.messages = [...truncated.messages, ...appendAfterBoundary];
+    const checkpoint = this.recoveryCheckpoint;
+    this.state.messages = [
+      ...(checkpoint === null ? truncated.messages : cloneMessages(checkpoint.baseMessages)),
+      ...appendBeforeRecovery,
+      ...(checkpoint === null ? [] : cloneMessages(checkpoint.suffixMessages)),
+    ];
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
+    this.recoveryCheckpoint = null;
 
     this.emit({
       type: "messages_reset",
@@ -1221,6 +1297,19 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       messages: this.state.messages.map(cloneMessage),
       droppedMessageCount: truncated.droppedMessageCount,
     });
+  }
+
+  private checkpointRecoveryDraft(message: AssistantModelMessage): void {
+    const checkpoint = completedAssistantPrefix(message);
+    if (checkpoint === null) return;
+    this.recoveryCheckpoint = {
+      baseMessages: cloneMessages(truncateToLastValidBoundary(this.state.messages).messages),
+      suffixMessages: [checkpoint],
+    };
+  }
+
+  private checkpointCurrentToolExchange(): void {
+    this.recoveryCheckpoint = recoveryCheckpointForMessages(this.state.messages);
   }
 
   private finishCancellation() {
@@ -1239,7 +1328,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.state.isStreaming = true;
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
-    this.recoveryDraft = null;
+    this.recoveryCheckpoint = null;
     this.state.error = undefined;
 
     this.abortController = new AbortController();
@@ -1316,7 +1405,18 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             for (const added of turn.newMessages) {
               this.state.messages.push(added);
             }
-            this.recoveryDraft = null;
+            this.recoveryCheckpoint = null;
+            for (const added of turn.newMessages) {
+              if (
+                added.role === "assistant" &&
+                getUnresolvedAssistantToolCallIds(added).length > 0
+              ) {
+                this.checkpointCurrentToolExchange();
+              }
+            }
+            if (truncateToLastValidBoundary(this.state.messages).droppedMessageCount === 0) {
+              this.recoveryCheckpoint = null;
+            }
 
             runTotalUsage = sumLanguageModelUsage(runTotalUsage, turn.totalUsage);
 
@@ -1344,6 +1444,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             const executedToolCallCount = hasLocalToolCalls
               ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
               : 0;
+            if (hasLocalToolCalls) this.recoveryCheckpoint = null;
 
             const boundaryDecision = await this.applyTurnBoundary({
               finishReason: turn.finishReason,
@@ -1390,6 +1491,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               continue;
             }
 
+            // A normally completed run persists its finalized messages. The
+            // checkpoint is only authoritative when the active block aborts.
+            this.recoveryCheckpoint = null;
             break;
           } catch (err) {
             if (err instanceof TurnAbortedError) {
@@ -1659,6 +1763,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         aborted = true;
         break;
       }
+      if (this.abortController?.signal.aborted) {
+        aborted = true;
+        break;
+      }
       if (part.type === "start-step") {
         continue;
       }
@@ -1687,6 +1795,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
       switch (part.type) {
         case "text-start": {
+          // Some providers omit the preceding block's explicit end event. A new
+          // block still makes the accumulated prefix a completed boundary.
+          this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -1699,6 +1810,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "text-delta": {
+          if (partialAssistant.content.at(-1)?.type === "reasoning") {
+            this.checkpointRecoveryDraft(partialAssistant);
+          }
           upsertTextPart(partialAssistant.content, "text", part.text);
           this.state.streamMessage = partialAssistant;
           this.emit({
@@ -1714,6 +1828,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "text-end": {
+          if (this.abortController?.signal.aborted) break;
+          this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -1726,6 +1842,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-start": {
+          this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -1738,6 +1855,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-delta": {
+          if (partialAssistant.content.at(-1)?.type === "text") {
+            this.checkpointRecoveryDraft(partialAssistant);
+          }
           upsertTextPart(partialAssistant.content, "reasoning", part.text);
           this.state.streamMessage = partialAssistant;
           this.emit({
@@ -1753,6 +1873,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "reasoning-end": {
+          if (this.abortController?.signal.aborted) break;
+          this.checkpointRecoveryDraft(partialAssistant);
           this.emit({
             type: "message_update",
             message: cloneMessage(partialAssistant),
@@ -1765,9 +1887,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-input-start": {
+          this.checkpointRecoveryDraft(partialAssistant);
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
-            this.recoveryDraft = partialAssistant;
           } else {
             params.onLocalToolDraft(part.id);
           }
@@ -1841,6 +1963,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-call": {
+          if (this.abortController?.signal.aborted) break;
+          this.checkpointRecoveryDraft(partialAssistant);
           const { toolCallId, toolName, input } = part;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
@@ -1858,6 +1982,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           break;
         }
         case "tool-result": {
+          if (this.abortController?.signal.aborted) break;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
             partialAssistant.content.push({
@@ -1867,11 +1992,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               output: recoveryToolOutput(part.output),
             });
             this.state.streamMessage = partialAssistant;
-            this.recoveryDraft = partialAssistant;
+            this.checkpointRecoveryDraft(partialAssistant);
           }
           break;
         }
         case "tool-error": {
+          if (this.abortController?.signal.aborted) break;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
             partialAssistant.content.push({
@@ -1881,11 +2007,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               output: { type: "error-text", value: String(part.error) },
             });
             this.state.streamMessage = partialAssistant;
-            this.recoveryDraft = partialAssistant;
+            this.checkpointRecoveryDraft(partialAssistant);
           }
           break;
         }
         case "tool-output-denied": {
+          if (this.abortController?.signal.aborted) break;
           if (part.providerExecuted === true) {
             params.onProviderExecutedTool();
             partialAssistant.content.push({
@@ -1895,7 +2022,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               output: { type: "execution-denied", reason: "Tool output was denied." },
             });
             this.state.streamMessage = partialAssistant;
-            this.recoveryDraft = partialAssistant;
+            this.checkpointRecoveryDraft(partialAssistant);
           }
           break;
         }
@@ -2108,6 +2235,30 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     });
     let nextAppendIndex = 0;
 
+    const checkpointCompletedOutcomes = () => {
+      const baseLength = truncateToLastValidBoundary(this.state.messages).messages.length;
+      const assistant = this.state.messages[baseLength];
+      if (assistant?.role !== "assistant") return;
+      const candidate = this.state.messages.slice(0, baseLength + 1).map(cloneMessage);
+      for (let index = 0; index < toolCalls.length; index += 1) {
+        const outcome = outcomes[index];
+        if (outcome === undefined) continue;
+        const call = toolCalls[index]!;
+        candidate.push({
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: call.toolCallId,
+              toolName: call.toolName,
+              output: outcome.toolOutput,
+            },
+          ],
+        });
+      }
+      this.recoveryCheckpoint = recoveryCheckpointForMessages(candidate);
+    };
+
     const appendReadyOutcomes = () => {
       while (nextAppendIndex < toolCalls.length) {
         const call = toolCalls[nextAppendIndex]!;
@@ -2129,6 +2280,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         this.state.messages.push(toolMessage);
         this.emit({ type: "message_start", message: cloneMessage(toolMessage) });
         this.emit({ type: "message_end", message: cloneMessage(toolMessage) });
+        this.checkpointCurrentToolExchange();
 
         nextAppendIndex += 1;
       }
@@ -2145,6 +2297,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           next += 1;
 
           outcomes[index] = await executeOne(toolCalls[index]!);
+          checkpointCompletedOutcomes();
           appendReadyOutcomes();
         }
       })(),

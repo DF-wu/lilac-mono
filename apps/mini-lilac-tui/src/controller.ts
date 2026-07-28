@@ -6,6 +6,7 @@ import {
   miniLilacStreamCursorChunkSchema,
   type MiniLilacCompactResult,
   type MiniLilacControlResult,
+  type MiniLilacOutputRollback,
   type MiniLilacReasoning,
   type MiniLilacSessionSnapshot,
   type MiniLilacTodoState,
@@ -173,6 +174,7 @@ export class Controller {
       {
         append: (entry) => this.appendOutput(entry),
         update: (id, entry) => this.updateOutput(id, entry),
+        remove: (id) => this.removeOutput(id),
         appendText: (id, delta) => this.appendOutputText(id, delta),
         finish: (id) => this.finishOutput(id),
       },
@@ -181,6 +183,7 @@ export class Controller {
         onControl: (result) => this.onControl(result),
         onTodos: (todos) => this.onTodos(todos),
         onTranscriptReset: (reset) => this.onTranscriptReset(reset),
+        onOutputRollback: (rollback) => this.onOutputRollback(rollback),
       },
       { cwd: options.cwd ?? options.initialSnapshot?.cwd },
     );
@@ -859,6 +862,14 @@ export class Controller {
       ...renderInitialMessages(preservedSteering),
     ];
     this.notifyOutput();
+  }
+
+  private onOutputRollback(rollback: MiniLilacOutputRollback): void {
+    if (rollback.reason !== "cancel") return;
+    this.clearSteering();
+    this.pendingSteerOptimistic.clear();
+    this.pendingSteerCommandIds.clear();
+    this.interruptSteerCommandIds.clear();
   }
 
   private async runUndo(): Promise<void> {

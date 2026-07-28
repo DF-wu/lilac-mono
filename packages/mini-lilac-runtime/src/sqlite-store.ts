@@ -18,6 +18,7 @@ import {
   miniLilacCompactResultSchema,
   miniLilacCompactionEventSchema,
   miniLilacMessagesSchema,
+  miniLilacOutputRollbackSchema,
   miniLilacProviderMetadataSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSessionStatusSchema,
@@ -266,6 +267,11 @@ const standardChunkSchema = z.discriminatedUnion("type", [
     type: z.literal("data-transcriptReset"),
     id: z.string().optional(),
     data: miniLilacTranscriptResetSchema,
+  }),
+  z.strictObject({
+    type: z.literal("data-outputRollback"),
+    id: z.string().optional(),
+    data: miniLilacOutputRollbackSchema,
   }),
   z.strictObject({
     type: z.literal("data-subagentStatus"),

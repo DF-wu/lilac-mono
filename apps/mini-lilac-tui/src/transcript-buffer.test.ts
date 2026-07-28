@@ -42,4 +42,18 @@ describe("createBufferedChunkOutput", () => {
     expect(publications).toEqual(["working"]);
     buffer.dispose();
   });
+
+  it("removes an entry and keeps later indexes writable", () => {
+    const buffer = createBufferedChunkOutput("child", [], () => {});
+    const first = buffer.output.append({ kind: "assistant", tone: "normal", text: "remove" });
+    const second = buffer.output.append({ kind: "assistant", tone: "normal", text: "keep" });
+
+    buffer.output.remove(first);
+    buffer.output.appendText(second, " updated");
+
+    expect(buffer.snapshot()).toEqual([
+      { id: second, kind: "assistant", tone: "normal", text: "keep updated" },
+    ]);
+    buffer.dispose();
+  });
 });
