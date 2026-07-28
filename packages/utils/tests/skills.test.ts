@@ -101,7 +101,7 @@ describe("skills discovery", () => {
     expect(skill?.source).toBe("agent-user");
   });
 
-  it("discovers the bundled workflow skill at lowest precedence", async () => {
+  it("discovers bundled skills at lowest precedence", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-skills-"));
     const workspaceRoot = path.join(tmpRoot, "ws");
     const dataDir = path.join(tmpRoot, "data");
@@ -131,9 +131,11 @@ describe("skills discovery", () => {
       dataDir,
       homeDir: path.join(tmpRoot, "home"),
     });
-    expect(bundled.skills.find((skill) => skill.name === "workflow-authoring")).toMatchObject({
-      source: "lilac-builtin",
-    });
+    for (const name of ["coding-agent", "mcp-management", "workflow-authoring"]) {
+      expect(bundled.skills.find((skill) => skill.name === name)).toMatchObject({
+        source: "lilac-builtin",
+      });
+    }
   });
 
   it("caps discovered skills and reports truncation", async () => {
@@ -337,10 +339,10 @@ describe("skills prompt formatting", () => {
   });
 });
 
-describe("bundled skill templates", () => {
-  it("includes a strong coding-agent template", async () => {
+describe("bundled skills", () => {
+  it("includes a strong built-in coding-agent skill", async () => {
     const raw = await Bun.file(
-      path.join(import.meta.dir, "..", "skill-templates", "coding-agent", "SKILL.md"),
+      path.join(import.meta.dir, "..", "builtin-skills", "coding-agent", "SKILL.md"),
     ).text();
 
     const skill = parseSkillMarkdown(raw);
@@ -354,7 +356,7 @@ describe("bundled skill templates", () => {
 
   it("documents Core MCP management separately from direct mcporter usage", async () => {
     const managementRaw = await Bun.file(
-      path.join(import.meta.dir, "..", "skill-templates", "mcp-management", "SKILL.md"),
+      path.join(import.meta.dir, "..", "builtin-skills", "mcp-management", "SKILL.md"),
     ).text();
     const mcporterRaw = await Bun.file(
       path.join(import.meta.dir, "..", "skill-templates", "mcporter", "SKILL.md"),
