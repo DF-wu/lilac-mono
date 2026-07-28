@@ -13,6 +13,7 @@ import {
   type AiSdkPiAgentEvent,
   type AutoCompactionOptions,
   type CompactionProgress,
+  type NormalizeToolResultOutputFn,
   type TransientModelRetryConfig,
   type TurnBoundaryDecision,
 } from "@stanley2058/lilac-agent";
@@ -1441,6 +1442,10 @@ class SessionActor {
       claudeBuiltInTools,
       claudeCodeRun,
     } = input;
+    const normalizeToolResultOutput: NormalizeToolResultOutputFn = (output, normalizationContext) =>
+      normalizationContext.bypassGenericOutputNormalizer
+        ? output
+        : normalizeOverflow(output, normalizationContext);
     const agent = new AiSdkPiAgent<ToolSet>({
       system: systemPrompt(
         this.config,
@@ -1461,10 +1466,9 @@ class SessionActor {
       sendToolsToModel: claudeCodeRun === null,
       exclusiveToolNames: tools.skill === undefined ? undefined : new Set(["skill"]),
       messages,
-      normalizeToolResultOutput: (output, normalizationContext) =>
-        normalizationContext.bypassGenericOutputNormalizer
-          ? output
-          : normalizeOverflow(output, normalizationContext),
+      normalizeToolResultOutput,
+      normalizeSettledToolResultOutputs: (entries) =>
+        normalizeOverflow.normalizeSettled(entries, normalizeToolResultOutput),
       genericOutputNormalizerBypassTools: new Set(["bash"]),
       providerOptions,
       turnErrorHandler: transientRetryController?.handler,

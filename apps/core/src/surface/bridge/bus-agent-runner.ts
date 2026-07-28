@@ -50,7 +50,6 @@ import {
   buildSyntheticToolCallId,
   createAgentRunIdleWatchdog,
   type AiSdkPiAgentEvent,
-  type NormalizeToolResultOutputFn,
   type TransformMessagesFn,
 } from "@stanley2058/lilac-agent";
 
@@ -2377,16 +2376,14 @@ export async function startBusAgentRunner(params: {
       runIdleWatchdog?.reset();
     };
 
-    const normalizeToolResultOutput: NormalizeToolResultOutputFn = createToolResultOutputNormalizer(
-      {
-        artifacts: params.toolResultArtifacts,
-        owner: {
-          requestId: next.requestId,
-          sessionId: next.sessionId,
-        },
-        getOutputConfig: () => cfg.tools.output,
+    const normalizeToolResultOutput = createToolResultOutputNormalizer({
+      artifacts: params.toolResultArtifacts,
+      owner: {
+        requestId: next.requestId,
+        sessionId: next.sessionId,
       },
-    );
+      getOutputConfig: () => cfg.tools.output,
+    });
 
     const liveParentSession = params.workflowLiveParentBridge?.registerParent({
       parentRequestId: next.requestId,
@@ -3136,6 +3133,7 @@ export async function startBusAgentRunner(params: {
               }
             : undefined,
         normalizeToolResultOutput,
+        normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
         genericOutputNormalizerBypassTools,
         experimentalDownload: experimentalDownloadForAgent,
         sendToolsToModel: claudeCodeRun === null,

@@ -1,7 +1,9 @@
 import type { NormalizeToolResultOutputFn } from "@stanley2058/lilac-agent";
 import {
   createOverflowReferenceNormalizer,
+  type NormalizeSettledToolResultOutputsFn,
   type ToolResultOutput,
+  type ToolResultOutputGroupNormalizer,
   type ToolResultOutputNormalizerOwner,
 } from "@stanley2058/lilac-tool-results/tool-result-output-normalizer";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
@@ -15,13 +17,13 @@ export function createToolResultOutputNormalizer(params: {
   artifacts?: ToolResultArtifactStore;
   owner: ToolResultOutputNormalizerOwner;
   getOutputConfig: () => CoreConfig["tools"]["output"];
-}): NormalizeToolResultOutputFn {
+}): ToolResultOutputGroupNormalizer {
   const normalizeOverflow = createOverflowReferenceNormalizer({
     ...params,
     sanitize: redactSecrets,
   });
 
-  return async (output, context) => {
+  const normalize: NormalizeToolResultOutputFn = async (output, context) => {
     if (
       context.bypassGenericOutputNormalizer === true &&
       context.toolName === "subagent_delegate" &&
@@ -49,6 +51,11 @@ export function createToolResultOutputNormalizer(params: {
     if (context.bypassGenericOutputNormalizer === true) return output;
     return normalizeOverflow(output, context);
   };
+
+  const normalizeSettled: NormalizeSettledToolResultOutputsFn = (entries) =>
+    normalizeOverflow.normalizeSettled(entries, normalize);
+
+  return Object.assign(normalize, { normalizeSettled });
 }
 
 export async function normalizeSubagentFinalText(params: {

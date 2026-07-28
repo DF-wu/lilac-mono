@@ -250,6 +250,28 @@ function batchedSkillResult(name: string) {
   };
 }
 
+function batchedReadResult(paths: readonly string[]) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        {
+          type: "tool-call" as const,
+          toolCallId: "batch-read",
+          toolName: "batch",
+          input: JSON.stringify({
+            tool_calls: paths.map((path) => ({ tool: "read_file", parameters: { path } })),
+          }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 function todoWriteResult(todos: readonly MiniLilacTodo[], toolCallId = "write-todos") {
   return {
     stream: simulateReadableStream({
@@ -677,6 +699,49 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("shares the inline result budget across settled batch children", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
+    temporaryDirectories.push(directory);
+    const largePayload = `large:${"x".repeat(900)}\n`;
+    const smallPayload = `small:${"y".repeat(400)}\n`;
+    await Promise.all([
+      writeFile(path.join(directory, "large.txt"), largePayload),
+      writeFile(path.join(directory, "small.txt"), smallPayload),
+    ]);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    const model = new MockLanguageModelV4({
+      doStream: [batchedReadResult(["large.txt", "small.txt"]), textResult("answer", "inspected")],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+      toolResultOutputConfig: {
+        maxInlineBytes: 1_000,
+        artifactTtlMs: 60_000,
+        maxArtifactBytesPerScope: 1024 * 1024,
+        maxArtifactBytes: 1024 * 1024,
+      },
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect((await service.startPrompt(session.id, userMessage("read both"))).stream);
+
+    const transcript = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(transcript.match(/\[tool result overflow\]/gu)).toHaveLength(1);
+    expect(transcript).not.toContain("x".repeat(500));
+    expect(transcript).toContain("y".repeat(300));
+    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(transcript)?.[0];
+    if (uri === undefined) throw new Error("batch overflow artifact URI was not persisted");
+    const artifact = await artifacts.read(uri, session.id);
+    expect(artifact.ok).toBe(true);
+    if (artifact.ok) expect(artifact.content).toContain(largePayload.trim());
+    service.close();
+  });
+
   it("stores oversized grep output out of line before the next model turn and UI persistence", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-tool-overflow-"));
     temporaryDirectories.push(directory);

@@ -162,7 +162,7 @@ export function createBatchTool(params: {
       description: [
         "Expand multiple independent operations into ordinary tool calls that execute after this batch call.",
         "Supports every enabled Level-1 tool except batch; tools may explicitly opt out of batching.",
-        "The batch result only confirms expansion. Each child returns its own normal tool result.",
+        "Each child keeps its own normal tool result and identity; transports may return them as one ordered aggregate.",
         "Notes:",
         "- Child calls use the same parallel scheduler as provider-emitted tool calls.",
         "- Child failures do not stop sibling calls or change the accepted batch result.",
