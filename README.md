@@ -31,8 +31,8 @@ This monorepo uses Bun workspaces. Install dependencies in the workspace(s) you 
 
 - Build the `tools` CLI: `cd apps/tool-bridge && bun run build`
 - Build the `lilac-acp` CLI: `cd apps/acp-controller && bun run build`
-- Run all tests (workspace harness): `bun test`
-- Run workspace tests: `cd apps/core && bun test`
+- Run all root and workspace tests: `bun run test:all`
+- Run workspace tests: `cd apps/core && bun run test`
 - Typecheck `lilac-acp`: `cd apps/acp-controller && bun run typecheck`
 - Typecheck (per workspace): `cd <workspace> && bunx tsc -p tsconfig.json --noEmit`
 - Lint workspaces: `bun run lint`

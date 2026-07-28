@@ -32,6 +32,9 @@
   },
   "private": true,
   "license": "MIT",
+  "scripts": {
+    "test": "bun test"
+  },
   "dependencies": {
     "@stanley2058/lilac-agent": "workspace:*",
     "@stanley2058/lilac-bash-safety": "workspace:*",

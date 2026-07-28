@@ -9,7 +9,8 @@
     "tools": "dist/index.js"
   },
   "scripts": {
-    "build": "bun build.ts && chmod +x dist/index.js"
+    "build": "bun build.ts && chmod +x dist/index.js",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14"

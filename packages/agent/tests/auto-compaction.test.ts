@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { LanguageModel, ModelMessage } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
@@ -645,33 +645,38 @@ describe("auto-compaction internals", () => {
       },
     });
 
-    const failure = await compactMessages({
-      messages: [
-        { role: "user", content: `old request ${"a".repeat(6_000)}` },
-        { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
-        { role: "user", content: "latest request" },
-        // A trailing assistant message leaves a split turn, so both run.
-        { role: "assistant", content: `partial answer ${"c".repeat(6_000)}` },
-      ],
-      currentModel: model,
-      contextLimit: 10_000,
-      outputLimit: 1_000,
-      thresholdFraction: 0.25,
-      keepRecentTokens: 1,
-      keepLastMessages: 1,
-      buildSplitTurnSummaryPrompt: (prefix) => `Summarize this split turn:\n${prefix}`,
-    }).then(
-      () => undefined,
-      (error: unknown) => error,
-    );
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const failure = await compactMessages({
+        messages: [
+          { role: "user", content: `old request ${"a".repeat(6_000)}` },
+          { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+          { role: "user", content: "latest request" },
+          // A trailing assistant message leaves a split turn, so both run.
+          { role: "assistant", content: `partial answer ${"c".repeat(6_000)}` },
+        ],
+        currentModel: model,
+        contextLimit: 10_000,
+        outputLimit: 1_000,
+        thresholdFraction: 0.25,
+        keepRecentTokens: 1,
+        keepLastMessages: 1,
+        buildSplitTurnSummaryPrompt: (prefix) => `Summarize this split turn:\n${prefix}`,
+      }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
 
-    // The genuine failure wins over the abort it induced in the sibling, so
-    // callers classify this as a failure rather than a cancellation.
-    expect(failure).toBeInstanceOf(Error);
-    expect(failure instanceof Error ? failure.name : "").not.toBe("AbortError");
-    // By the time the failure surfaced, the sibling request had been aborted
-    // (and awaited): nothing keeps streaming past the terminal event.
-    expect(splitTurnAborted).toBe(true);
+      // The genuine failure wins over the abort it induced in the sibling, so
+      // callers classify this as a failure rather than a cancellation.
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure instanceof Error ? failure.name : "").not.toBe("AbortError");
+      // By the time the failure surfaced, the sibling request had been aborted
+      // (and awaited): nothing keeps streaming past the terminal event.
+      expect(splitTurnAborted).toBe(true);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("stops before the next summarization request once aborted", async () => {

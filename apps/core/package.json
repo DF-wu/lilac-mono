@@ -9,7 +9,8 @@
   "license": "MIT",
   "scripts": {
     "bench:fs-search": "bun scripts/bench-fs-search.ts",
-    "build:remote-runner": "bun run build-remote-runner.ts"
+    "build:remote-runner": "bun run build-remote-runner.ts",
+    "test": "bun run build:remote-runner && bun test --parallel=4"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
