@@ -55,7 +55,8 @@ Tests use Bun’s built-in runner + `bun:test`.
 ### Typechecking
 
 - Treat running `tsc` as essential (same tier as running tests).
-- Run typecheck in the package you changed (root level `typecheck` also exist):
+- Run all root and workspace typechecks: `bun run typecheck`.
+- Run typecheck in the package you changed:
   - `cd <package> && bunx tsc -p tsconfig.json --noEmit`
 
 ### Lint / Format

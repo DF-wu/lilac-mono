@@ -24,5 +24,5 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["build.ts", "src/**/*.ts"]
+  "include": ["build.ts", "install-local.ts", "src/**/*.ts"]
 }
