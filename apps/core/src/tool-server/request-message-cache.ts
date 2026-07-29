@@ -1,4 +1,4 @@
-import type { SurfacePrincipalPlatform } from "../surface/types";
+import { isSurfacePrincipalPlatform, type SurfacePrincipalPlatform } from "../surface/types";
 import {
   lilacEventTypes,
   type LilacBus,
@@ -41,17 +41,22 @@ export type RequestMessageCache = {
   stop(): Promise<void>;
 };
 
+// Widening the type alone is not enough: these validators run at runtime, and
+// leaving them narrow made every Telegram request fail origin parsing and end
+// up unattributed.
+const surfacePrincipalPlatformSchema = z.enum(["discord", "github", "telegram"]);
+
 const requestRawSchema = z
   .object({
     authenticatedActor: z
-      .object({ platform: z.enum(["discord", "github"]), userId: z.string().min(1).optional() })
+      .object({ platform: surfacePrincipalPlatformSchema, userId: z.string().min(1).optional() })
       .optional(),
     authenticatedOrigin: z
       .object({
-        platform: z.enum(["discord", "github"]),
+        platform: surfacePrincipalPlatformSchema,
         userId: z.string().min(1),
         messageRef: z.object({
-          platform: z.enum(["discord", "github"]),
+          platform: surfacePrincipalPlatformSchema,
           channelId: z.string().min(1),
           messageId: z.string().min(1),
         }),
@@ -68,13 +73,14 @@ const requestRawSchema = z
   })
   .passthrough();
 
-function resolveAuthenticatedOrigin(
+/** Exported for tests: the platform validation here is easy to widen by type only. */
+export function resolveAuthenticatedOrigin(
   msg: Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>,
 ): AuthenticatedRequestOrigin | undefined {
   const requestId = msg.headers?.request_id;
   const sessionId = msg.headers?.session_id;
   const platform = msg.headers?.request_client;
-  if (!requestId || !sessionId || (platform !== "discord" && platform !== "github")) {
+  if (!requestId || !sessionId || !isSurfacePrincipalPlatform(platform)) {
     return undefined;
   }
 
