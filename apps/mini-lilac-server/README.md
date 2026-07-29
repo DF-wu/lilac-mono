@@ -93,8 +93,8 @@ needed:
 mini-lilac server --config ./config.yaml --database ./data/mini-lilac.sqlite
 ```
 
-This port starts a new persistence lineage. Databases created by the experimental
-`expr/lilac-coding-agent` branch are not migrated; select a fresh database path before starting.
+Mini Lilac automatically migrates its schema-v2 databases to schema v3 in one startup transaction.
+Other database versions, including databases from unrelated experimental lineages, are rejected.
 
 Build the unified executable from `apps/mini-lilac`. Run `mini-lilac server --help` for serve and
 auth usage.
@@ -163,10 +163,13 @@ Chat and reconnect endpoints return the AI SDK UI message SSE protocol. A networ
 removes that stream subscriber; use the cancel endpoint to cancel a run explicitly. Reconnect with
 `?runId=<run>&after=<sequence>` to resume that exact run after the latest received
 `data-streamCursor` sequence. The resume endpoint returns a chronological message prefix and its
-matching run cursor atomically for active sessions. Completed
-runs return `204`; their canonical model and UI transcripts are stored on the session and finalized
-run chunks are removed. Active SSE responses emit comment keepalives while quiet so long-running
-deferred subagents do not lose their parent connection to intermediary idle timeouts.
+matching run cursor atomically for active sessions. Active chunks and cursors exist only in the
+owning session actor; they are replayable after a network disconnect while that process and run are
+active, but are not retained after finalization or a process crash. A crash marks active runs as
+errors. Completed runs return `204`; canonical model and UI transcripts are stored as shared,
+immutable SQLite chains at durable boundaries. Active SSE responses emit comment keepalives while
+quiet so long-running deferred subagents do not lose their parent connection to intermediary idle
+timeouts.
 
 Subagents are ordinary sessions. `subagent_delegate` returns a stable `sessionName`; reusing it from
 the same parent session continues that child session with its canonical model transcript. Child

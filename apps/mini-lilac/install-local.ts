@@ -4,16 +4,14 @@ import { z } from "zod";
 
 const PACKAGE_NAME = "@stanley2058/mini-lilac";
 
-const npmPackOutputSchema = z
-  .array(
-    z.object({
-      filename: z.string().min(1),
-    }),
-  )
-  .length(1);
+const npmPackOutputSchema = z.tuple([
+  z.object({
+    filename: z.string().min(1),
+  }),
+]);
 
 async function run(command: readonly string[]): Promise<void> {
-  const child = Bun.spawn(command, {
+  const child = Bun.spawn([...command], {
     cwd: import.meta.dir,
     stdin: "inherit",
     stdout: "inherit",

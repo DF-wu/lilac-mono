@@ -15,8 +15,26 @@ export type ToolResultOutput = Extract<
 
 export type NormalizeToolResultOutputFn = (
   output: ToolResultOutput,
-  context: { toolCallId: string; toolName: string },
+  context: {
+    toolCallId: string;
+    toolName: string;
+    bypassGenericOutputNormalizer?: boolean;
+  },
 ) => ToolResultOutput | Promise<ToolResultOutput>;
+
+export type SettledToolResultOutputEntry = {
+  output: ToolResultOutput;
+  context: Parameters<NormalizeToolResultOutputFn>[1];
+};
+
+export type NormalizeSettledToolResultOutputsFn = (
+  entries: readonly SettledToolResultOutputEntry[],
+  normalizeUnspilled?: NormalizeToolResultOutputFn,
+) => Promise<ToolResultOutput[]>;
+
+export type ToolResultOutputGroupNormalizer = NormalizeToolResultOutputFn & {
+  normalizeSettled: NormalizeSettledToolResultOutputsFn;
+};
 
 export type ToolResultOutputNormalizerConfig = {
   maxInlineBytes: number;
@@ -95,16 +113,17 @@ function ownerScopeId(owner: ToolResultOutputNormalizerOwner): string {
 
 export function createOverflowReferenceNormalizer(
   params: ToolResultOutputNormalizerOptions,
-): NormalizeToolResultOutputFn {
+): ToolResultOutputGroupNormalizer {
   const logger = createLogger({ module: "tool-result-output" });
 
   async function normalizeCapturedText(
     value: string,
-    context: { toolCallId: string; toolName: string },
+    context: Parameters<NormalizeToolResultOutputFn>[1],
+    forceOverflow = false,
+    config = resolveConfig(params.getOutputConfig()),
   ): Promise<{ value: string; overflow: boolean }> {
     if (GENERATED_OVERFLOW_REFERENCE.test(value)) return { value, overflow: true };
-    const config = resolveConfig(params.getOutputConfig());
-    const overflow = utf8Bytes(value) > config.maxInlineBytes;
+    const overflow = forceOverflow || utf8Bytes(value) > config.maxInlineBytes;
     value = removeUnsafeControls(value);
     if (params.sanitize) value = removeUnsafeControls(params.sanitize(value));
     if (!overflow) return { value, overflow: false };
@@ -139,7 +158,7 @@ export function createOverflowReferenceNormalizer(
     return { value: buildOverflowReference(uri), overflow: true };
   }
 
-  return async (output, context) => {
+  const normalize: NormalizeToolResultOutputFn = async (output, context) => {
     if (output.type === "text" || output.type === "error-text") {
       const normalized = await normalizeCapturedText(output.value, context);
       if (!normalized.overflow) return { ...output, value: normalized.value };
@@ -189,6 +208,65 @@ export function createOverflowReferenceNormalizer(
 
     return output;
   };
+
+  const normalizeSettled: NormalizeSettledToolResultOutputsFn = async (
+    entries,
+    normalizeUnspilled = normalize,
+  ) => {
+    const config = resolveConfig(params.getOutputConfig());
+    const measured = entries.map((entry, index) => {
+      let payload: string | undefined;
+      if (entry.output.type === "text" || entry.output.type === "error-text") {
+        payload = entry.output.value;
+      } else if (entry.output.type === "execution-denied") {
+        payload = entry.output.reason;
+      } else if (
+        entry.output.type === "json" ||
+        entry.output.type === "error-json" ||
+        entry.output.type === "content"
+      ) {
+        try {
+          payload = JSON.stringify(entry.output.value, null, 2);
+        } catch {
+          payload = undefined;
+        }
+      }
+
+      return {
+        index,
+        payload,
+        bytes: payload === undefined ? 0 : utf8Bytes(payload),
+        alreadySpilled: payload !== undefined && GENERATED_OVERFLOW_REFERENCE.test(payload),
+      };
+    });
+    let activeCount = measured.reduce((count, entry) => count + (entry.alreadySpilled ? 0 : 1), 0);
+    const selected = new Set<number>();
+    const candidates = measured
+      .filter((entry) => !entry.alreadySpilled && entry.payload !== undefined)
+      .sort((left, right) => right.bytes - left.bytes || left.index - right.index);
+
+    for (const candidate of candidates) {
+      if (candidate.bytes * activeCount <= config.maxInlineBytes) break;
+      selected.add(candidate.index);
+      activeCount -= 1;
+    }
+
+    return await Promise.all(
+      entries.map(async (entry, index) => {
+        if (!selected.has(index)) return await normalizeUnspilled(entry.output, entry.context);
+
+        const payload = measured[index]!.payload;
+        if (payload === undefined) return await normalizeUnspilled(entry.output, entry.context);
+        const reference = await normalizeCapturedText(payload, entry.context, true, config);
+        if (entry.output.type === "execution-denied") {
+          return { ...entry.output, reason: reference.value };
+        }
+        return { type: "error-text", value: reference.value };
+      }),
+    );
+  };
+
+  return Object.assign(normalize, { normalizeSettled });
 }
 
 export const createToolResultOutputNormalizer = createOverflowReferenceNormalizer;

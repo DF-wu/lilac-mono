@@ -49,10 +49,6 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build remote runner
-        working-directory: apps/core
-        run: bun run build:remote-runner
-
       - name: Run CI script
         run: bun run ci
 

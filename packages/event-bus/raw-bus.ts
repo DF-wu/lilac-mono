@@ -1,4 +1,5 @@
 import type {
+  BusSubscription,
   Cursor,
   FetchOptions,
   HandleContext,
@@ -26,7 +27,7 @@ export interface RawBus {
     topic: Topic,
     opts: SubscriptionOptions,
     handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-  ): Promise<{ stop(): Promise<void> }>;
+  ): Promise<BusSubscription>;
 
   /** Fetch messages without creating a subscription. */
   fetch<TData>(

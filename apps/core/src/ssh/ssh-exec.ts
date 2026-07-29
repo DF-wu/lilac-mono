@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 
+import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
+
 import { requireConfiguredSshHost } from "./ssh-config";
 
 const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
@@ -48,27 +50,7 @@ function isResponseBodyInit(value: unknown): value is BodyInit {
   );
 }
 
-async function appendOverflowChunk(params: {
-  overflowFilePath: string;
-  chunk: string;
-  initialized: boolean;
-}): Promise<boolean> {
-  try {
-    if (!params.initialized) {
-      await fs.writeFile(params.overflowFilePath, params.chunk, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-    } else {
-      await fs.appendFile(params.overflowFilePath, params.chunk, "utf8");
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readStreamTextCapped(
+export async function readStreamTextCapped(
   stream: unknown,
   maxChars: number,
   options?: { overflowFilePath?: string; onActivity?: () => void },
@@ -85,28 +67,47 @@ async function readStreamTextCapped(
     let text = "";
     let totalChars = 0;
     let capped = false;
-    let overflowInitialized = false;
     let overflowWriteFailed = false;
     let overflowFilePath: string | undefined;
+    let overflowSink: BufferedFileSink | undefined;
+    let overflowFileCreated = false;
+    const bufferedRawChunks: Buffer[] | undefined = options?.overflowFilePath ? [] : undefined;
 
-    const writeOverflowChunk = async (chunk: string) => {
-      if (chunk.length === 0) return;
+    const failOverflow = async () => {
+      overflowWriteFailed = true;
+      overflowFilePath = undefined;
+      const sink = overflowSink;
+      overflowSink = undefined;
+      await sink?.abort();
+      if (overflowFileCreated && options?.overflowFilePath) {
+        await fs.rm(options.overflowFilePath, { force: true }).catch(() => undefined);
+      }
+      overflowFileCreated = false;
+      if (bufferedRawChunks) bufferedRawChunks.length = 0;
+    };
+
+    const writeOverflowChunk = async (chunk: Uint8Array) => {
+      if (chunk.byteLength === 0) return;
       if (overflowWriteFailed) return;
       const target = options?.overflowFilePath;
       if (!target) return;
 
-      const ok = await appendOverflowChunk({
-        overflowFilePath: target,
-        chunk,
-        initialized: overflowInitialized,
-      });
-      if (!ok) {
-        overflowWriteFailed = true;
-        overflowFilePath = undefined;
-        return;
+      try {
+        if (!overflowSink) {
+          overflowSink = await BufferedFileSink.open(target, { flags: "wx", mode: 0o600 });
+          overflowFileCreated = true;
+        }
+        await overflowSink.write(chunk);
+        overflowFilePath = target;
+      } catch {
+        await failOverflow();
       }
-      overflowInitialized = true;
-      overflowFilePath = target;
+    };
+
+    const activateOverflow = async () => {
+      if (!bufferedRawChunks) return;
+      for (const chunk of bufferedRawChunks) await writeOverflowChunk(chunk);
+      bufferedRawChunks.length = 0;
     };
 
     const consumeChunkText = async (chunkText: string) => {
@@ -114,10 +115,7 @@ async function readStreamTextCapped(
 
       totalChars += chunkText.length;
 
-      if (capped) {
-        await writeOverflowChunk(chunkText);
-        return;
-      }
+      if (capped) return;
 
       const previousText = text;
       const nextLen = previousText.length + chunkText.length;
@@ -129,7 +127,7 @@ async function readStreamTextCapped(
       capped = true;
       const remaining = Math.max(0, maxChars - previousText.length);
       text = previousText + chunkText.slice(0, remaining);
-      await writeOverflowChunk(previousText + chunkText);
+      await activateOverflow();
     };
 
     try {
@@ -139,6 +137,8 @@ async function readStreamTextCapped(
         if (!value) continue;
 
         options?.onActivity?.();
+        if (capped) await writeOverflowChunk(value);
+        else if (bufferedRawChunks) bufferedRawChunks.push(Buffer.from(value));
         const chunkText = decoder.decode(value, { stream: true });
         await consumeChunkText(chunkText);
       }
@@ -147,6 +147,16 @@ async function readStreamTextCapped(
       if (tail.length > 0) {
         await consumeChunkText(tail);
       }
+      if (overflowSink) {
+        try {
+          await overflowSink.close();
+        } catch {
+          await failOverflow();
+        }
+      }
+    } catch (error) {
+      await failOverflow();
+      throw error;
     } finally {
       reader.releaseLock();
     }
@@ -154,16 +164,26 @@ async function readStreamTextCapped(
     return { text, totalChars, capped, overflowFilePath };
   }
 
-  const full = await new Response(isResponseBodyInit(stream) ? stream : String(stream)).text();
+  const response = new Response(isResponseBodyInit(stream) ? stream : String(stream));
+  const fullBytes = Buffer.from(await response.arrayBuffer());
+  const full = new TextDecoder().decode(fullBytes);
   const capped = full.length > maxChars;
   let overflowFilePath: string | undefined;
   if (capped && options?.overflowFilePath) {
-    const ok = await appendOverflowChunk({
-      overflowFilePath: options.overflowFilePath,
-      chunk: full,
-      initialized: false,
-    });
-    if (ok) overflowFilePath = options.overflowFilePath;
+    let sink: BufferedFileSink | undefined;
+    let overflowFileCreated = false;
+    try {
+      sink = await BufferedFileSink.open(options.overflowFilePath, { flags: "wx", mode: 0o600 });
+      overflowFileCreated = true;
+      await sink.write(fullBytes);
+      await sink.close();
+      overflowFilePath = options.overflowFilePath;
+    } catch {
+      await sink?.abort();
+      if (overflowFileCreated) {
+        await fs.rm(options.overflowFilePath, { force: true }).catch(() => undefined);
+      }
+    }
   }
 
   return {

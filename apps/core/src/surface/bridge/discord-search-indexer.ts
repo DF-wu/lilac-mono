@@ -1,4 +1,7 @@
 import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
+
+import type { ThreadMaterializer } from "../../conversation/thread-materializer";
+import { classifyConversationThreadMessageUpdate } from "../../conversation/thread-store";
 import type { SurfaceAdapter } from "../adapter";
 import type { AdapterEvent } from "../events";
 import type { DiscordSearchService } from "../store/discord-search-store";
@@ -12,9 +15,7 @@ export async function startDiscordSearchIndexer(params: {
   adapter: SurfaceAdapter;
   search: DiscordSearchIndexerService;
   getConfig: () => Promise<CoreConfig>;
-  conversationThreads?: {
-    refreshThreads(cfg?: CoreConfig): { channels: number; threads: number; messages: number };
-  };
+  materializer?: Pick<ThreadMaterializer, "markDirty">;
 }) {
   const logger = createLogger({
     module: "surface:discord-search-indexer",
@@ -23,24 +24,36 @@ export async function startDiscordSearchIndexer(params: {
   const handleEvent = async (evt: AdapterEvent): Promise<void> => {
     if (evt.platform !== "discord") return;
 
-    const refreshThreads = async () => {
-      if (!params.conversationThreads) return;
-      try {
-        params.conversationThreads.refreshThreads(await params.getConfig());
-      } catch (e) {
-        logger.error("conversation thread refresh after discord indexing failed", e);
-      }
-    };
-
     switch (evt.type) {
       case "adapter.message.created": {
         await params.search.onMessageCreated(evt.message);
-        await refreshThreads();
+        params.materializer?.markDirty({
+          channelId: evt.message.session.channelId,
+          kind: "topology",
+        });
         return;
       }
       case "adapter.message.updated": {
-        params.search.onMessageUpdated(evt.message);
-        await refreshThreads();
+        const mutation = params.search.onMessageUpdated(evt.message);
+        if (!mutation?.changed || !mutation.after) return;
+
+        const kind = classifyConversationThreadMessageUpdate(
+          mutation.before,
+          mutation.after,
+          await params.getConfig(),
+        );
+        if (kind === "topology") {
+          params.materializer?.markDirty({
+            channelId: evt.message.session.channelId,
+            kind,
+          });
+        } else if (kind === "content") {
+          params.materializer?.markDirty({
+            channelId: evt.message.session.channelId,
+            messageId: evt.message.ref.messageId,
+            kind,
+          });
+        }
         return;
       }
       case "adapter.message.deleted": {
@@ -49,7 +62,10 @@ export async function startDiscordSearchIndexer(params: {
           channelId: evt.session.channelId,
           messageId: evt.messageRef.messageId,
         });
-        await refreshThreads();
+        params.materializer?.markDirty({
+          channelId: evt.session.channelId,
+          kind: "topology",
+        });
         return;
       }
       case "adapter.reaction.added":
@@ -72,9 +88,24 @@ export async function startDiscordSearchIndexer(params: {
     }
   };
 
-  return await params.adapter.subscribe((evt) => {
-    return handleEvent(evt).catch((e) => {
-      logger.error("discord search indexer handler failed", e);
-    });
+  const inFlight = new Set<Promise<void>>();
+  const subscription = await params.adapter.subscribe((evt) => {
+    let task: Promise<void>;
+    task = handleEvent(evt)
+      .catch((e) => {
+        logger.error("discord search indexer handler failed", e);
+      })
+      .finally(() => {
+        inFlight.delete(task);
+      });
+    inFlight.add(task);
+    return task;
   });
+
+  return {
+    async stop() {
+      await subscription.stop();
+      await Promise.allSettled(inFlight);
+    },
+  };
 }

@@ -11,6 +11,7 @@ import {
   miniLilacUIMessageDataPartSchema,
   type MiniLilacCompactionEvent,
   type MiniLilacControlResult,
+  type MiniLilacOutputRollback,
   type MiniLilacSessionSnapshot,
   type MiniLilacSubagentStatus,
   type MiniLilacTodoState,
@@ -118,6 +119,7 @@ const DEFAULT_SHELL_OUTPUT_CHARACTERS = 2_000;
 export interface ChunkOutputSink {
   append(entry: Omit<TranscriptEntry, "id">): string;
   update(id: string, entry: Omit<TranscriptEntry, "id">): void;
+  remove(id: string): void;
   appendText(id: string, delta: string): void;
   finish(id: string): void;
 }
@@ -127,6 +129,7 @@ export interface ChunkRendererHooks {
   onControl?(result: MiniLilacControlResult): void;
   onTodos?(todos: MiniLilacTodoState): void;
   onTranscriptReset(reset: MiniLilacTranscriptReset): void;
+  onOutputRollback?(rollback: MiniLilacOutputRollback): void;
 }
 
 function previewText(value: string, max = 120): string {
@@ -197,13 +200,69 @@ function compactTokenCount(tokens: number | undefined): string | undefined {
   return `${Math.round((tokens / divisor) * 10) / 10}${suffix}`;
 }
 
-function compactionSummary(event: MiniLilacCompactionEvent): string {
-  if (event.status === "failed")
-    return `Context compaction failed${event.error ? `: ${event.error}` : ""}`;
+function formatCompactionDuration(ms: number | undefined): string | undefined {
+  if (ms === undefined) return undefined;
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/**
+ * Header line for a compaction entry.
+ *
+ * The entry is updated in place across the lifecycle, so this covers the live
+ * phases as well as every terminal one. `noop`/`empty` deliberately get their
+ * own wording: reporting a saving when nothing was compacted is worse than
+ * saying nothing, which is what the UI used to do.
+ */
+export function compactionHeadline(event: MiniLilacCompactionEvent): string {
+  const elapsed = formatCompactionDuration(event.durationMs ?? event.elapsedMs);
+  switch (event.phase) {
+    case "started":
+    case "progress": {
+      const progress = event.progress;
+      const step =
+        progress === undefined || progress.stepCount <= 1
+          ? "summarizing"
+          : `summarizing ${progress.step}/${progress.stepCount}`;
+      const pass = progress !== undefined && progress.pass > 1 ? ` · pass ${progress.pass}` : "";
+      return ["Compacting context", step + pass, elapsed].filter(Boolean).join(" · ");
+    }
+    case "cancelled":
+      return "Compaction cancelled · transcript unchanged";
+    case "failed":
+      return `Compaction failed${event.error ? `: ${event.error}` : ""} · transcript unchanged`;
+    case "completed":
+      break;
+  }
+  if (event.outcome !== undefined && event.outcome !== "compacted") {
+    return "Nothing to compact · transcript already minimal";
+  }
   const before = compactTokenCount(event.estimatedInputTokensBefore);
   const after = compactTokenCount(event.estimatedInputTokensAfter);
-  const usage = before !== undefined && after !== undefined ? ` · ${before} → ${after}` : "";
-  return `Context compacted${usage}`;
+  const parts = ["Context compacted"];
+  if (event.messageCountAfter !== undefined) {
+    parts.push(`${event.messageCountBefore} → ${event.messageCountAfter} msgs`);
+  }
+  if (before !== undefined && after !== undefined) parts.push(`${before} → ${after}`);
+  if (elapsed !== undefined) parts.push(elapsed);
+  if (event.modelCalls !== undefined && event.modelCalls > 0) {
+    parts.push(`${event.modelCalls} ${event.modelCalls === 1 ? "call" : "calls"}`);
+  }
+  return parts.join(" · ");
+}
+
+export function compactionEntry(event: MiniLilacCompactionEvent): Omit<TranscriptEntry, "id"> {
+  const live = event.phase === "started" || event.phase === "progress";
+  const summary = event.summary?.trim();
+  return {
+    kind: "compaction",
+    tone: event.phase === "failed" ? "danger" : "warning",
+    // The summary is the thing the user cannot otherwise see; carrying it on the
+    // entry lets the transcript show what compaction actually kept.
+    text: summary ? `${compactionHeadline(event)}\n${summary}` : compactionHeadline(event),
+    ...(live ? { running: true, streaming: true } : {}),
+  };
 }
 
 const pathInputSchema = z.object({ path: z.string() });
@@ -364,6 +423,8 @@ type ExplorationState = {
   errors: number;
   cancellations: number;
   operations: ExplorationOperation[];
+  toolCallIds: string[];
+  outcomes: Map<string, "error" | "denied" | "cancelled" | undefined>;
   pending: Set<string>;
 };
 
@@ -1027,14 +1088,12 @@ function dataEntry(
         tone: "warning",
         text: `transcript rewound (${parsed.data.data.reason})`,
       };
+    case "data-outputRollback":
+      return undefined;
     case "data-subagentStatus":
       return undefined;
     case "data-compaction":
-      return {
-        kind: "compaction",
-        tone: parsed.data.data.status === "failed" ? "danger" : "warning",
-        text: compactionSummary(parsed.data.data),
-      };
+      return compactionEntry(parsed.data.data);
   }
 }
 
@@ -1113,6 +1172,8 @@ export function renderInitialMessages(
               errors: 0,
               cancellations: 0,
               operations: [],
+              toolCallIds: [],
+              outcomes: new Map(),
               pending: new Set(),
             };
             entries.push({ id, ...explorationEntry(exploration) });
@@ -1120,6 +1181,7 @@ export function renderInitialMessages(
           if (category === "read") exploration.reads += 1;
           else exploration.searches += 1;
           exploration.operations.push(explorationOperation(name, input, options));
+          exploration.toolCallIds.push(part.toolCallId);
           if (part.state !== "output-available") {
             if (part.state === "output-error" || part.state === "output-denied") {
               exploration.failures += 1;
@@ -1128,6 +1190,14 @@ export function renderInitialMessages(
               exploration.pending.add(id);
             }
           }
+          exploration.outcomes.set(
+            part.toolCallId,
+            part.state === "output-error"
+              ? "error"
+              : part.state === "output-denied"
+                ? "denied"
+                : undefined,
+          );
           const entryIndex = entries.findIndex((entry) => entry.id === exploration?.id);
           if (entryIndex >= 0)
             entries[entryIndex] = { id: exploration.id, ...explorationEntry(exploration) };
@@ -1193,6 +1263,7 @@ export class ChunkRenderer {
   private exploration: ExplorationState | undefined;
   private readonly reasoningEntries = new Map<string, { id: string; text: string }>();
   private readonly textEntryIds = new Map<string, string>();
+  private readonly compactionEntryIds = new Map<string, string>();
 
   constructor(
     private readonly output: ChunkOutputSink,
@@ -1213,9 +1284,11 @@ export class ChunkRenderer {
     switch (chunk.type) {
       case "text-start":
         this.finalizeReasoning();
+        this.finishOpenText();
         return;
       case "text-delta":
         this.finalizeReasoning();
+        if (!this.textEntryIds.has(chunk.id)) this.finishOpenText();
         this.renderTextDelta(chunk.id, chunk.delta);
         return;
       case "text-end":
@@ -1226,9 +1299,13 @@ export class ChunkRenderer {
         this.finalizeReasoning();
         return;
       case "reasoning-start":
+        this.finishOpenText();
+        this.finalizeReasoning();
         this.startReasoning(chunk.id);
         return;
       case "reasoning-delta":
+        this.finishOpenText();
+        if (!this.reasoningEntries.has(chunk.id)) this.finalizeReasoning();
         this.appendReasoning(chunk.id, chunk.delta);
         return;
       case "reasoning-end":
@@ -1310,17 +1387,34 @@ export class ChunkRenderer {
           text: `transcript rewound (${part.data.reason}); canonical transcript will be reconciled`,
         });
         return;
+      case "data-outputRollback":
+        this.rollbackOutput(part.data);
+        this.hooks.onOutputRollback?.(part.data);
+        return;
       case "data-subagentStatus":
         this.renderSubagentStatus(part.data);
         return;
       case "data-compaction":
-        this.append({
-          kind: "compaction",
-          tone: part.data.status === "failed" ? "danger" : "warning",
-          text: compactionSummary(part.data),
-        });
+        this.renderCompaction(part.id, part.data);
         return;
     }
+  }
+
+  /**
+   * Compaction publishes its whole lifecycle under one chunk id, so the entry is
+   * updated in place. Appending each phase instead would turn a single
+   * compaction into a wall of started/progress/summary lines.
+   */
+  private renderCompaction(chunkId: string | undefined, event: MiniLilacCompactionEvent): void {
+    const key = chunkId ?? "compaction";
+    const existing = this.compactionEntryIds.get(key);
+    if (existing === undefined) {
+      this.finishOpenText();
+      this.finalizeReasoning();
+      this.compactionEntryIds.set(key, this.append(compactionEntry(event)));
+      return;
+    }
+    this.output.update(existing, compactionEntry(event));
   }
 
   private renderSubagentStatus(status: MiniLilacSubagentStatus): void {
@@ -1385,6 +1479,8 @@ export class ChunkRenderer {
           errors: 0,
           cancellations: 0,
           operations: [explorationOperation(toolName, input, this.options)],
+          toolCallIds: [toolCallId],
+          outcomes: new Map([[toolCallId, undefined]]),
           pending: new Set([toolCallId]),
         };
         state.id = this.output.append(explorationEntry(state));
@@ -1393,6 +1489,8 @@ export class ChunkRenderer {
         if (category === "read") this.exploration.reads += 1;
         else this.exploration.searches += 1;
         this.exploration.operations.push(explorationOperation(toolName, input, this.options));
+        this.exploration.toolCallIds.push(toolCallId);
+        this.exploration.outcomes.set(toolCallId, undefined);
         this.exploration.pending.add(toolCallId);
         this.output.update(this.exploration.id, explorationEntry(this.exploration));
       }
@@ -1540,7 +1638,7 @@ export class ChunkRenderer {
       return;
     }
     if (this.flattenedBatchToolIds.has(toolCallId)) {
-      this.append(
+      const id = this.append(
         toolEntry(
           name,
           this.toolInputs.get(toolCallId),
@@ -1552,6 +1650,7 @@ export class ChunkRenderer {
           text: toolErrorSummary("Parallel tools", errorText),
         },
       );
+      this.toolEntryIds.set(toolCallId, id);
       return;
     }
     const id = this.toolEntryIds.get(toolCallId);
@@ -1625,6 +1724,7 @@ export class ChunkRenderer {
     const state = this.explorationByToolId.get(toolCallId);
     if (state === undefined) return;
     state.pending.delete(toolCallId);
+    state.outcomes.set(toolCallId, failure);
     if (failure === "error" || failure === "denied") state.failures += 1;
     if (failure === "error") state.errors += 1;
     if (failure === "cancelled") state.cancellations += 1;
@@ -1675,6 +1775,56 @@ export class ChunkRenderer {
       );
     }
     this.activeToolIds.clear();
+  }
+
+  private rollbackOutput(rollback: MiniLilacOutputRollback): void {
+    for (const chunkId of rollback.textIds) {
+      const id = this.textEntryIds.get(chunkId);
+      if (id !== undefined) this.output.remove(id);
+      this.textEntryIds.delete(chunkId);
+    }
+    for (const chunkId of rollback.reasoningIds) {
+      const entry = this.reasoningEntries.get(chunkId);
+      if (entry !== undefined) this.output.remove(entry.id);
+      this.reasoningEntries.delete(chunkId);
+    }
+    for (const toolCallId of rollback.toolCallIds) {
+      const exploration = this.explorationByToolId.get(toolCallId);
+      if (exploration !== undefined) {
+        const index = exploration.toolCallIds.indexOf(toolCallId);
+        if (index >= 0) {
+          exploration.toolCallIds.splice(index, 1);
+          exploration.operations.splice(index, 1);
+          const category = explorationCategory(this.toolNames.get(toolCallId) ?? "");
+          if (category === "read") exploration.reads -= 1;
+          if (category === "search") exploration.searches -= 1;
+          const outcome = exploration.outcomes.get(toolCallId);
+          if (outcome === "error" || outcome === "denied") exploration.failures -= 1;
+          if (outcome === "error") exploration.errors -= 1;
+          if (outcome === "cancelled") exploration.cancellations -= 1;
+        }
+        exploration.pending.delete(toolCallId);
+        exploration.outcomes.delete(toolCallId);
+        this.explorationByToolId.delete(toolCallId);
+        if (exploration.toolCallIds.length === 0) {
+          this.output.remove(exploration.id);
+          if (this.exploration === exploration) this.exploration = undefined;
+        } else {
+          this.output.update(exploration.id, explorationEntry(exploration));
+        }
+      } else {
+        const id = this.toolEntryIds.get(toolCallId);
+        if (id !== undefined) this.output.remove(id);
+      }
+      this.activeToolIds.delete(toolCallId);
+      this.toolNames.delete(toolCallId);
+      this.toolEntryIds.delete(toolCallId);
+      this.toolSummaries.delete(toolCallId);
+      this.toolInputs.delete(toolCallId);
+      this.bashOutputByToolId.delete(toolCallId);
+      this.flattenedBatchToolIds.delete(toolCallId);
+      this.subagents.delete(toolCallId);
+    }
   }
 
   private startReasoning(chunkId: string): void {
@@ -1745,5 +1895,6 @@ export class ChunkRenderer {
     this.exploration = undefined;
     this.textEntryIds.clear();
     this.reasoningEntries.clear();
+    this.compactionEntryIds.clear();
   }
 }

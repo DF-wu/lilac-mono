@@ -39,6 +39,12 @@ export type DiscordSearchIndexedMessage = {
   updatedTs: number;
 };
 
+export type DiscordSearchMessageMutation = {
+  before: DiscordSearchIndexedMessage | null;
+  after: DiscordSearchIndexedMessage | null;
+  changed: boolean;
+};
+
 export type DiscordSearchHealResult = {
   attempted: boolean;
   skipped: boolean;
@@ -106,6 +112,23 @@ type RawIndexedRow = {
   deleted: number;
   updated_ts: number;
 };
+
+function asDiscordSearchIndexedMessage(row: RawIndexedRow): DiscordSearchIndexedMessage {
+  return {
+    ref: asDiscordMsgRef(row.channel_id, row.message_id),
+    session: asDiscordSessionRef({
+      channelId: row.channel_id,
+      guildId: row.guild_id,
+    }),
+    userId: row.user_id,
+    userName: row.user_name ?? undefined,
+    text: row.text,
+    ts: row.ts,
+    editedTs: row.edited_ts ?? undefined,
+    deleted: row.deleted !== 0,
+    updatedTs: row.updated_ts,
+  };
+}
 
 export class DiscordSearchStore {
   private readonly db: Database;
@@ -205,7 +228,7 @@ export class DiscordSearchStore {
       for (const message of input) {
         if (!isDiscordMessage(message)) continue;
 
-        this.db.run(
+        const result = this.db.run(
           `
           INSERT INTO discord_search_messages (
             channel_id,
@@ -252,7 +275,8 @@ export class DiscordSearchStore {
             now,
           ],
         );
-        wrote += 1;
+        // FTS trigger writes are included in SQLite's change count, but each upsert affects one message.
+        wrote += result.changes > 0 ? 1 : 0;
       }
     });
 
@@ -276,6 +300,33 @@ export class DiscordSearchStore {
       .query("SELECT COUNT(1) AS c FROM discord_search_messages WHERE channel_id = ?")
       .get(channelId) as { c: number };
     return typeof row?.c === "number" ? row.c : 0;
+  }
+
+  getIndexedMessage(input: {
+    channelId: string;
+    messageId: string;
+  }): DiscordSearchIndexedMessage | null {
+    const row = this.db
+      .query(
+        `
+        SELECT
+          channel_id,
+          guild_id,
+          message_id,
+          user_id,
+          user_name,
+          text,
+          ts,
+          edited_ts,
+          deleted,
+          updated_ts
+        FROM discord_search_messages
+        WHERE channel_id = ? AND message_id = ?
+        `,
+      )
+      .get(input.channelId, input.messageId) as RawIndexedRow | null;
+
+    return row ? asDiscordSearchIndexedMessage(row) : null;
   }
 
   listMessagesForDiscovery(sinceUpdatedTs?: number): DiscordSearchIndexedMessage[] {
@@ -322,20 +373,7 @@ export class DiscordSearchStore {
             .all(sinceUpdatedTs)
     ) as RawIndexedRow[];
 
-    return rows.map((row) => ({
-      ref: asDiscordMsgRef(row.channel_id, row.message_id),
-      session: asDiscordSessionRef({
-        channelId: row.channel_id,
-        guildId: row.guild_id,
-      }),
-      userId: row.user_id,
-      userName: row.user_name ?? undefined,
-      text: row.text,
-      ts: row.ts,
-      editedTs: row.edited_ts ?? undefined,
-      deleted: row.deleted !== 0,
-      updatedTs: row.updated_ts,
-    }));
+    return rows.map(asDiscordSearchIndexedMessage);
   }
 
   searchChannel(input: { channelId: string; query: string; limit?: number }): DiscordSearchHit[] {
@@ -403,6 +441,7 @@ export class DiscordSearchService {
     private readonly params: {
       adapter: DiscordSearchAdapter;
       store: DiscordSearchStore;
+      onMessagesIndexed?: (channelId: string) => void;
     },
   ) {}
 
@@ -417,9 +456,18 @@ export class DiscordSearchService {
     });
   }
 
-  onMessageUpdated(message: SurfaceMessage): void {
-    if (!isDiscordMessage(message)) return;
-    this.params.store.upsertMessages([message]);
+  onMessageUpdated(message: SurfaceMessage): DiscordSearchMessageMutation | null {
+    if (!isDiscordMessage(message)) return null;
+
+    const input = {
+      channelId: message.session.channelId,
+      messageId: message.ref.messageId,
+    };
+    const before = this.params.store.getIndexedMessage(input);
+    const changed = this.params.store.upsertMessages([message]) > 0;
+    const after = this.params.store.getIndexedMessage(input);
+
+    return { before, after, changed };
   }
 
   onMessageDeleted(input: {
@@ -497,6 +545,7 @@ export class DiscordSearchService {
         limit,
       });
       const indexed = this.params.store.upsertMessages(messages);
+      if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
 
       return {
         attempted: true,

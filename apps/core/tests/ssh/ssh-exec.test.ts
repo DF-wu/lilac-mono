@@ -1,10 +1,10 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 
-import { sshExecBash, sshExecScriptJson } from "../../src/ssh/ssh-exec";
+import { readStreamTextCapped, sshExecBash, sshExecScriptJson } from "../../src/ssh/ssh-exec";
 import { remoteFuzzySearch } from "../../src/tools/fs/remote-fs";
 
 describe("ssh exec transport", () => {
@@ -126,6 +126,137 @@ exec "$@"
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe("missing");
+  });
+
+  it("does not copy raw stream chunks when overflow retention is disabled", async () => {
+    const bytes = new TextEncoder().encode("ab😀Z");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, 3));
+        controller.enqueue(bytes.slice(3));
+        controller.close();
+      },
+    });
+    const bufferFromSpy = spyOn(Buffer, "from");
+    let rawCopyCalls = 0;
+
+    try {
+      const result = await readStreamTextCapped(stream, 4);
+      rawCopyCalls = bufferFromSpy.mock.calls.length;
+
+      expect(result).toEqual({ text: "ab😀", totalChars: 5, capped: true });
+    } finally {
+      bufferFromSpy.mockRestore();
+    }
+
+    expect(rawCopyCalls).toBe(0);
+  });
+
+  it("creates secure byte-exact SSH overflow files only after the cap", async () => {
+    const underLimitBase = path.join(tempDir, "under-limit");
+    const underLimit = await sshExecBash({
+      host: "fakehost",
+      cmd: "printf small",
+      timeoutMs: 5_000,
+      maxOutputChars: 100,
+      overflowOutputPath: underLimitBase,
+    });
+
+    expect(underLimit.capped).toEqual({ stdout: false, stderr: false });
+    await expect(stat(`${underLimitBase}.stdout.part`)).rejects.toThrow();
+    await expect(stat(`${underLimitBase}.stderr.part`)).rejects.toThrow();
+
+    const overflowBase = path.join(tempDir, "overflow");
+    const overflow = await sshExecBash({
+      host: "fakehost",
+      cmd: "printf stdout-content; printf stderr-content >&2",
+      timeoutMs: 5_000,
+      maxOutputChars: 5,
+      overflowOutputPath: overflowBase,
+    });
+    const stdoutPath = `${overflowBase}.stdout.part`;
+    const stderrPath = `${overflowBase}.stderr.part`;
+
+    expect(overflow.stdout).toBe("stdou");
+    expect(overflow.stderr).toBe("stder");
+    expect(overflow.capped).toEqual({ stdout: true, stderr: true });
+    expect(overflow.overflowPaths).toEqual({ stdout: stdoutPath, stderr: stderrPath });
+    expect(await readFile(stdoutPath, "utf8")).toBe("stdout-content");
+    expect(await readFile(stderrPath, "utf8")).toBe("stderr-content");
+    expect((await stat(stdoutPath)).mode & 0o777).toBe(0o600);
+    expect((await stat(stderrPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it("retains exact non-ASCII, BOM, and malformed UTF-8 bytes in streaming overflow", async () => {
+    const overflowPath = path.join(tempDir, "stream-bytes.part");
+    const bytes = Uint8Array.from([
+      0xef,
+      0xbb,
+      0xbf,
+      ...Buffer.from("é", "utf8"),
+      0xff,
+      0xfe,
+      ...Buffer.from("tail", "utf8"),
+    ]);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes.slice(0, 4));
+        controller.enqueue(bytes.slice(4, 7));
+        controller.enqueue(bytes.slice(7));
+        controller.close();
+      },
+    });
+
+    const result = await readStreamTextCapped(stream, 2, { overflowFilePath: overflowPath });
+
+    expect(result.capped).toBeTrue();
+    expect(result.text).toBe("é�");
+    expect(result.overflowFilePath).toBe(overflowPath);
+    expect(await readFile(overflowPath)).toEqual(Buffer.from(bytes));
+  });
+
+  it("retains exact non-ASCII, BOM, and malformed UTF-8 bytes in non-stream overflow", async () => {
+    const overflowPath = path.join(tempDir, "fallback-bytes.part");
+    const bytes = Uint8Array.from([
+      0xef,
+      0xbb,
+      0xbf,
+      ...Buffer.from("é", "utf8"),
+      0xff,
+      ...Buffer.from("tail", "utf8"),
+    ]);
+
+    const result = await readStreamTextCapped(new Blob([bytes]), 1, {
+      overflowFilePath: overflowPath,
+    });
+
+    expect(result.capped).toBeTrue();
+    expect(result.text).toBe("é");
+    expect(result.overflowFilePath).toBe(overflowPath);
+    expect(await readFile(overflowPath)).toEqual(Buffer.from(bytes));
+  });
+
+  it("does not clobber or remove pre-existing SSH overflow targets", async () => {
+    const overflowBase = path.join(tempDir, "existing-overflow");
+    const stdoutPath = `${overflowBase}.stdout.part`;
+    const stderrPath = `${overflowBase}.stderr.part`;
+    await writeFile(stdoutPath, "existing stdout", { mode: 0o640 });
+    await writeFile(stderrPath, "existing stderr", { mode: 0o640 });
+
+    const result = await sshExecBash({
+      host: "fakehost",
+      cmd: "printf stdout-content; printf stderr-content >&2",
+      timeoutMs: 5_000,
+      maxOutputChars: 5,
+      overflowOutputPath: overflowBase,
+    });
+
+    expect(result.capped).toEqual({ stdout: true, stderr: true });
+    expect(result.overflowPaths).toEqual({});
+    expect(await readFile(stdoutPath, "utf8")).toBe("existing stdout");
+    expect(await readFile(stderrPath, "utf8")).toBe("existing stderr");
+    expect((await stat(stdoutPath)).mode & 0o777).toBe(0o640);
+    expect((await stat(stderrPath)).mode & 0o777).toBe(0o640);
   });
 
   it("prefers bunx and passes JSON stdin to the default remote FFF runner command", async () => {

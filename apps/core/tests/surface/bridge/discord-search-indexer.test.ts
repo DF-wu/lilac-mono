@@ -4,6 +4,10 @@ import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lila
 import type { SurfaceAdapter, AdapterEventHandler } from "../../../src/surface/adapter";
 import type { AdapterEvent } from "../../../src/surface/events";
 import { startDiscordSearchIndexer } from "../../../src/surface/bridge/discord-search-indexer";
+import type {
+  DiscordSearchIndexedMessage,
+  DiscordSearchMessageMutation,
+} from "../../../src/surface/store/discord-search-store";
 import type { SurfaceMessage } from "../../../src/surface/types";
 
 class FakeAdapter {
@@ -40,12 +44,28 @@ function discordMessage(): SurfaceMessage {
   };
 }
 
+function indexedMessage(text: string): DiscordSearchIndexedMessage {
+  return {
+    ref: { platform: "discord", channelId: "c1", messageId: "m1" },
+    session: { platform: "discord", channelId: "c1", guildId: "g1" },
+    userId: "u1",
+    text,
+    ts: 1,
+    deleted: false,
+    updatedTs: 1,
+  };
+}
+
+type DirtyInput =
+  | { channelId: string; kind: "topology" }
+  | { channelId: string; kind: "content"; messageId: string };
+
 describe("discord search indexer", () => {
-  it("passes current config into conversation thread refreshes", async () => {
+  it("marks creates topology-dirty without waiting for materialization", async () => {
     const adapter = new FakeAdapter();
     const cfg = testConfig();
     const createdMessages: SurfaceMessage[] = [];
-    const refreshConfigs: Array<CoreConfig | undefined> = [];
+    const dirties: DirtyInput[] = [];
 
     await startDiscordSearchIndexer({
       adapter: adapter as unknown as SurfaceAdapter,
@@ -53,14 +73,15 @@ describe("discord search indexer", () => {
         async onMessageCreated(message) {
           createdMessages.push(message);
         },
-        onMessageUpdated() {},
+        onMessageUpdated() {
+          return null;
+        },
         onMessageDeleted() {},
       },
       getConfig: async () => cfg,
-      conversationThreads: {
-        refreshThreads(inputCfg) {
-          refreshConfigs.push(inputCfg);
-          return { channels: 1, threads: 1, messages: 1 };
+      materializer: {
+        markDirty(input) {
+          dirties.push(input);
         },
       },
     });
@@ -75,6 +96,80 @@ describe("discord search indexer", () => {
     await adapter.handler?.(evt);
 
     expect(createdMessages).toHaveLength(1);
-    expect(refreshConfigs).toEqual([cfg]);
+    expect(dirties).toEqual([{ channelId: "c1", kind: "topology" }]);
+  });
+
+  it("keeps ordinary edits on the content-only path", async () => {
+    const adapter = new FakeAdapter();
+    const dirties: DirtyInput[] = [];
+    const before = indexedMessage("partial reply");
+    const after = { ...before, text: "final reply", editedTs: 2, updatedTs: 2 };
+    const mutation: DiscordSearchMessageMutation = { before, after, changed: true };
+
+    await startDiscordSearchIndexer({
+      adapter: adapter as unknown as SurfaceAdapter,
+      search: {
+        async onMessageCreated() {},
+        onMessageUpdated() {
+          return mutation;
+        },
+        onMessageDeleted() {},
+      },
+      getConfig: async () => testConfig(),
+      materializer: {
+        markDirty(input) {
+          dirties.push(input);
+        },
+      },
+    });
+
+    await adapter.handler?.({
+      type: "adapter.message.updated",
+      platform: "discord",
+      ts: 2,
+      message: { ...discordMessage(), text: "final reply", editedTs: 2 },
+    });
+
+    expect(dirties).toEqual([{ channelId: "c1", messageId: "m1", kind: "content" }]);
+  });
+
+  it("marks structural edits topology-dirty and ignores duplicate updates", async () => {
+    const adapter = new FakeAdapter();
+    const dirties: DirtyInput[] = [];
+    const before = indexedMessage("hello");
+    let mutation: DiscordSearchMessageMutation = {
+      before,
+      after: { ...before, text: "[LILAC_SESSION_DIVIDER]", updatedTs: 2 },
+      changed: true,
+    };
+
+    await startDiscordSearchIndexer({
+      adapter: adapter as unknown as SurfaceAdapter,
+      search: {
+        async onMessageCreated() {},
+        onMessageUpdated() {
+          return mutation;
+        },
+        onMessageDeleted() {},
+      },
+      getConfig: async () => testConfig(),
+      materializer: {
+        markDirty(input) {
+          dirties.push(input);
+        },
+      },
+    });
+
+    const evt: AdapterEvent = {
+      type: "adapter.message.updated",
+      platform: "discord",
+      ts: 2,
+      message: { ...discordMessage(), text: "[LILAC_SESSION_DIVIDER]" },
+    };
+    await adapter.handler?.(evt);
+    mutation = { before, after: before, changed: false };
+    await adapter.handler?.(evt);
+
+    expect(dirties).toEqual([{ channelId: "c1", kind: "topology" }]);
   });
 });

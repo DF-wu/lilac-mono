@@ -3,7 +3,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { AiSdkPiAgent, ToolExpansion } from "@stanley2058/lilac-agent";
 import { tool, type ToolSet } from "ai";
+import { MockLanguageModelV4 } from "ai/test";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
@@ -51,7 +53,7 @@ function permissionOptions(
 }
 
 describe("Claude Code tool bridge", () => {
-  it("omits batch and portable tool_search and preserves input transforms exactly once", async () => {
+  it("lists batch, omits portable tool_search, and preserves input transforms exactly once", async () => {
     let transforms = 0;
     const seen: unknown[] = [];
     const bridge = await createClaudeCodeToolBridge({
@@ -82,7 +84,7 @@ describe("Claude Code tool bridge", () => {
     const client = await connectBridge(bridge);
 
     const listed = await client.listTools();
-    expect(listed.tools.map((entry) => entry.name)).toEqual(["transformed"]);
+    expect(listed.tools.map((entry) => entry.name)).toEqual(["transformed", "batch"]);
 
     const permission = await bridge.canUseTool(
       "mcp__lilac__transformed",
@@ -106,6 +108,156 @@ describe("Claude Code tool bridge", () => {
     ]);
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toEqual({ value: 3 });
+  });
+
+  it("aggregates executed batch children in order without failing the accepted parent", async () => {
+    const bridge = await createClaudeCodeToolBridge({
+      tools: {
+        batch: tool({ inputSchema: z.object({}), execute: () => "unused" }),
+      },
+      execute: async () => ({
+        result: { raw: "parent result must not be exposed" },
+        isError: false,
+        outcome: "success",
+        toolOutput: { type: "json", value: { accepted: true } },
+        executedExpansion: {
+          children: [
+            {
+              toolCallId: "child-image",
+              toolName: "render_preview",
+              outcome: "success",
+              isError: false,
+              toolOutput: {
+                type: "content",
+                value: [
+                  { type: "text", text: "preview ready" },
+                  { type: "image-data", data: "AA==", mediaType: "image/png" },
+                ],
+              },
+            },
+            {
+              toolCallId: "child-error",
+              toolName: "publish_preview",
+              outcome: "error",
+              isError: true,
+              toolOutput: { type: "error-json", value: { message: "publish failed" } },
+            },
+          ],
+        },
+      }),
+    });
+    const client = await connectBridge(bridge);
+    const permission = await bridge.canUseTool(
+      "mcp__lilac__batch",
+      {},
+      permissionOptions("batch-parent"),
+    );
+    if (!permission || permission.behavior !== "allow") throw new Error("Expected allow");
+
+    const result = CallToolResultSchema.parse(
+      await client.callTool({ name: "batch", arguments: permission.updatedInput }),
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toEqual([
+      { type: "text", text: "Batch accepted: 2 children." },
+      {
+        type: "text",
+        text: "[1/2] tool=render_preview id=child-image outcome=success isError=false",
+      },
+      { type: "text", text: "preview ready" },
+      { type: "image", data: "AA==", mimeType: "image/png" },
+      {
+        type: "text",
+        text: "[2/2] tool=publish_preview id=child-error outcome=error isError=true",
+      },
+      { type: "text", text: '{"message":"publish failed"}' },
+    ]);
+    expect(result.structuredContent).toEqual({
+      type: "lilac.batch-result",
+      version: 1,
+      accepted: true,
+      total: 2,
+      children: [
+        {
+          index: 1,
+          toolCallId: "child-image",
+          toolName: "render_preview",
+          outcome: "success",
+          isError: false,
+          outputType: "content",
+          contentStart: 1,
+          contentCount: 3,
+        },
+        {
+          index: 2,
+          toolCallId: "child-error",
+          toolName: "publish_preview",
+          outcome: "error",
+          isError: true,
+          outputType: "error-json",
+          contentStart: 4,
+          contentCount: 2,
+        },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("parent result must not be exposed");
+  });
+
+  it("executes a batch expansion end to end through the agent-backed bridge", async () => {
+    const tools = {
+      batch: tool({
+        inputSchema: z.object({ value: z.string() }),
+        execute: ({ value }) =>
+          new ToolExpansion({ accepted: true }, [
+            {
+              toolCallId: "batch-child-1",
+              toolName: "echo",
+              input: { value },
+            },
+          ]),
+      }),
+      echo: tool({
+        inputSchema: z.object({ value: z.string() }),
+        execute: ({ value }) => ({ echoed: value }),
+      }),
+    };
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: new MockLanguageModelV4({}),
+      tools,
+    });
+    const bridge = await createClaudeCodeToolBridge({
+      tools,
+      execute: (request) => agent.executeExternalToolCall(request),
+    });
+    const client = await connectBridge(bridge);
+    const permission = await bridge.canUseTool(
+      "mcp__lilac__batch",
+      { value: "hello" },
+      permissionOptions("batch-parent"),
+    );
+    if (!permission || permission.behavior !== "allow") throw new Error("Expected allow");
+
+    const result = CallToolResultSchema.parse(
+      await client.callTool({ name: "batch", arguments: permission.updatedInput }),
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toMatchObject({
+      type: "lilac.batch-result",
+      total: 1,
+      children: [
+        {
+          toolCallId: "batch-child-1",
+          toolName: "echo",
+          outcome: "success",
+          isError: false,
+        },
+      ],
+    });
+    expect(result.content).toContainEqual({ type: "text", text: '{"echoed":"hello"}' });
+    expect(agent.state.pendingToolCalls.size).toBe(0);
   });
 
   it("fails closed without valid correlation and supports parallel identical calls", async () => {

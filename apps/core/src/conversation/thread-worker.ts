@@ -193,11 +193,16 @@ export function startConversationThreadWorker(params: {
   let stopped = false;
   let running = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let tickPromise: Promise<void> | null = null;
 
   const schedule = (delayMs: number) => {
     if (stopped) return;
     timer = setTimeout(() => {
-      void tick();
+      const current = tick();
+      tickPromise = current;
+      void current.finally(() => {
+        if (tickPromise === current) tickPromise = null;
+      });
     }, delayMs);
     timer.unref?.();
   };
@@ -241,6 +246,7 @@ export function startConversationThreadWorker(params: {
       logger.debug("conversation thread periodic worker stopping");
       stopped = true;
       if (timer) clearTimeout(timer);
+      await tickPromise;
       logger.debug("conversation thread periodic worker stopped");
     },
   };

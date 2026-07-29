@@ -1,4 +1,4 @@
-import type { AtomicToolExecutionOutcome } from "@stanley2058/lilac-agent";
+import type { ExternalToolExecutionOutcome } from "@stanley2058/lilac-agent";
 import { claudeCodeExecutableSettings } from "@stanley2058/lilac-utils";
 import type { LanguageModel, ToolSet } from "ai";
 import {
@@ -36,7 +36,7 @@ export async function materializeClaudeCodeRun(options: {
   cwd: string;
   tools: ToolSet;
   catalogMetadata?: ClaudeCodeToolCatalogMetadataMap;
-  execute(request: ClaudeCodeToolExecutionRequest): Promise<AtomicToolExecutionOutcome>;
+  execute(request: ClaudeCodeToolExecutionRequest): Promise<ExternalToolExecutionOutcome>;
   /**
    * Claude built-in tools this run may call. Applied to the agent model only;
    * the utility model is always tool-free so a summarization prompt cannot

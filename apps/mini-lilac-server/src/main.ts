@@ -135,6 +135,8 @@ export async function acquireDatabaseLock(databasePath: string): Promise<MiniLil
 
 export type MiniLilacShutdownOptions = {
   readonly stopListener: (force: boolean) => void | Promise<void>;
+  /** Reject new runtime admissions and abort actor-owned work before listener drain waits on it. */
+  readonly requestRuntimeShutdown?: () => void | Promise<void>;
   readonly listActiveRuns: () => readonly { readonly sessionId: string; readonly runId: string }[];
   readonly cancelRun: (run: {
     readonly sessionId: string;
@@ -148,46 +150,63 @@ export type MiniLilacShutdownOptions = {
 };
 
 export async function shutdownMiniLilacServer(options: MiniLilacShutdownOptions): Promise<void> {
-  const now = options.now ?? Date.now;
-  const sleep = options.sleep ?? Bun.sleep;
-  const graceMs = options.graceMs ?? SHUTDOWN_GRACE_MS;
-  const pollIntervalMs = options.pollIntervalMs ?? SHUTDOWN_POLL_INTERVAL_MS;
-  const deadline = now() + graceMs;
-  let listenerSettled = false;
-  let listenerFailed = false;
-  let stopResult: void | Promise<void> = undefined;
   try {
-    stopResult = options.stopListener(false);
-  } catch {
-    listenerSettled = true;
-    listenerFailed = true;
-  }
-  const gracefulStop = Promise.resolve(stopResult).then(
-    () => void (listenerSettled = true),
-    () => {
+    const now = options.now ?? Date.now;
+    const sleep = options.sleep ?? Bun.sleep;
+    const graceMs = options.graceMs ?? SHUTDOWN_GRACE_MS;
+    const pollIntervalMs = options.pollIntervalMs ?? SHUTDOWN_POLL_INTERVAL_MS;
+    const deadline = now() + graceMs;
+    let listenerSettled = false;
+    let listenerFailed = false;
+    let stopResult: void | Promise<void> = undefined;
+    try {
+      stopResult = options.stopListener(false);
+    } catch {
       listenerSettled = true;
       listenerFailed = true;
-    },
-  );
+    }
+    const gracefulStop = Promise.resolve(stopResult).then(
+      () => void (listenerSettled = true),
+      () => {
+        listenerSettled = true;
+        listenerFailed = true;
+      },
+    );
 
-  let cancellationsSettled = false;
-  const cancellations = Promise.allSettled(
-    options.listActiveRuns().map((run) => options.cancelRun(run)),
-  ).then(() => void (cancellationsSettled = true));
+    // Admit explicit run cancellations before the runtime shutdown request closes
+    // admission. Actor shutdown also cancels them, but these requests preserve the
+    // server's normal run lifecycle and must not throw out of cleanup synchronously.
+    const runCancellationRequests = options.listActiveRuns().map((run) => {
+      try {
+        return options.cancelRun(run);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    });
+    let runtimeShutdownRequest: void | Promise<void>;
+    try {
+      runtimeShutdownRequest = options.requestRuntimeShutdown?.();
+    } catch (error) {
+      runtimeShutdownRequest = Promise.reject(error);
+    }
+    let cancellationsSettled = false;
+    const cancellations = Promise.allSettled([
+      Promise.resolve(runtimeShutdownRequest),
+      ...runCancellationRequests,
+    ]).then(() => void (cancellationsSettled = true));
 
-  while (
-    (!listenerSettled || !cancellationsSettled || options.listActiveRuns().length > 0) &&
-    now() < deadline
-  ) {
-    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - now())));
-  }
+    while (
+      (!listenerSettled || !cancellationsSettled || options.listActiveRuns().length > 0) &&
+      now() < deadline
+    ) {
+      await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - now())));
+    }
 
-  const force =
-    listenerFailed ||
-    !listenerSettled ||
-    !cancellationsSettled ||
-    options.listActiveRuns().length > 0;
-  try {
+    const force =
+      listenerFailed ||
+      !listenerSettled ||
+      !cancellationsSettled ||
+      options.listActiveRuns().length > 0;
     if (force) {
       await options.stopListener(true);
     } else {
@@ -503,6 +522,7 @@ export async function main(
       try {
         await shutdownMiniLilacServer({
           stopListener: (force) => app.stop(force).then(() => undefined),
+          requestRuntimeShutdown: () => runtime.requestShutdown(),
           listActiveRuns,
           cancelRun: (run) =>
             runtime

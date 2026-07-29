@@ -6,6 +6,9 @@ import { Readable } from "node:stream";
 
 import {
   createBashOutputSanitizerTransform,
+  getPreOverflowRawByteLimit,
+  MAX_PRE_OVERFLOW_RAW_BYTES,
+  MIN_PRE_OVERFLOW_RAW_BYTES,
   readSanitizedStreamTextCapped,
 } from "../../src/tools/bash-output-sanitizer";
 import { redactLiteralSecrets } from "../../src/tools/bash-safety/format";
@@ -63,6 +66,13 @@ function streamFromBytes(chunks: readonly Uint8Array[]): ReadableStream<Uint8Arr
 }
 
 describe("bash output sanitizer stream", () => {
+  it("scales and hard-caps pre-overflow raw retention", () => {
+    expect(getPreOverflowRawByteLimit(0)).toBe(MIN_PRE_OVERFLOW_RAW_BYTES);
+    expect(getPreOverflowRawByteLimit(512 * 1024)).toBe(2 * 1024 * 1024 + 64 * 1024);
+    expect(getPreOverflowRawByteLimit(Number.POSITIVE_INFINITY)).toBe(MAX_PRE_OVERFLOW_RAW_BYTES);
+    expect(getPreOverflowRawByteLimit(Number.MAX_SAFE_INTEGER)).toBe(MAX_PRE_OVERFLOW_RAW_BYTES);
+  });
+
   it("reports activity for each received output chunk", async () => {
     let activityCount = 0;
     const result = await readSanitizedStreamTextCapped(streamFromStrings(["one", "two"]), 100, {
@@ -248,6 +258,88 @@ describe("bash output sanitizer stream", () => {
       expect(result.text).toBe("prefix x");
       expect(result.overflowFilePath).toBe(overflowFilePath);
       expect(await fs.readFile(overflowFilePath, "utf8")).toBe("prefix xyababa suffix");
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not create an overflow file below the sanitized cap", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-output-sanitizer-"));
+    const overflowFilePath = path.join(tempDir, "overflow.log");
+
+    try {
+      const result = await readSanitizedStreamTextCapped(streamFromStrings(["small output"]), 100, {
+        overflowFilePath,
+      });
+
+      expect(result).toEqual({
+        text: "small output",
+        totalChars: 12,
+        totalBytes: 12,
+        capped: false,
+      });
+      await expect(fs.stat(overflowFilePath)).rejects.toThrow();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("abandons overflow retention when pre-cap raw output exceeds its memory bound", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-output-sanitizer-"));
+    const overflowFilePath = path.join(tempDir, "overflow.log");
+    const hiddenPayload = `API_TOKEN=secret-token${"x".repeat(getPreOverflowRawByteLimit(4))}`;
+
+    try {
+      const result = await readSanitizedStreamTextCapped(
+        streamFromStrings([`\u001b]0;${hiddenPayload}`, "\u0007API_TOKEN=visible-secret done"]),
+        4,
+        { overflowFilePath, literalSecrets: ["secret-token", "visible-secret"] },
+      );
+
+      expect(result.capped).toBeTrue();
+      expect(result.text).toBe("API_");
+      expect(result.overflowFilePath).toBeUndefined();
+      await expect(fs.stat(overflowFilePath)).rejects.toThrow();
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not clobber or remove a pre-existing overflow target", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-output-sanitizer-"));
+    const overflowFilePath = path.join(tempDir, "overflow.log");
+
+    try {
+      await fs.writeFile(overflowFilePath, "existing", { mode: 0o640 });
+      const result = await readSanitizedStreamTextCapped(
+        streamFromStrings(["output beyond cap"]),
+        4,
+        { overflowFilePath },
+      );
+
+      expect(result.capped).toBeTrue();
+      expect(result.overflowFilePath).toBeUndefined();
+      expect(await fs.readFile(overflowFilePath, "utf8")).toBe("existing");
+      expect((await fs.stat(overflowFilePath)).mode & 0o777).toBe(0o640);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a partial overflow file when its buffered sink cannot finish", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-output-sanitizer-"));
+    const overflowFilePath = path.join(tempDir, "missing", "overflow.log");
+
+    try {
+      const result = await readSanitizedStreamTextCapped(
+        streamFromStrings(["output beyond cap"]),
+        4,
+        { overflowFilePath },
+      );
+
+      expect(result.capped).toBeTrue();
+      expect(result.overflowFilePath).toBeUndefined();
+      await expect(fs.stat(overflowFilePath)).rejects.toThrow();
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }

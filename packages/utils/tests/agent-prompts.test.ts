@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 import {
@@ -255,6 +255,22 @@ describe("agent prompts", () => {
 
       expect(agents?.newFileCreated).toBe(false);
       expect(secondStat.mtimeMs).toBe(firstStat.mtimeMs);
+    });
+  });
+
+  it("does not rewrite unchanged prompt template state", async () => {
+    await withTempDataDir(async (dataDir) => {
+      await ensurePromptWorkspace({ dataDir });
+
+      const statePath = path.join(promptDirFromDataDir(dataDir), PROMPT_TEMPLATE_STATE_FILENAME);
+      const initialContent = await Bun.file(statePath).text();
+      const knownTime = new Date("2020-01-02T03:04:05.000Z");
+      await utimes(statePath, knownTime, knownTime);
+
+      await ensurePromptWorkspace({ dataDir });
+
+      expect(await Bun.file(statePath).text()).toBe(initialContent);
+      expect((await Bun.file(statePath).stat()).mtimeMs).toBe(knownTime.getTime());
     });
   });
 

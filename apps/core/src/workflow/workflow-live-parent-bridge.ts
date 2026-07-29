@@ -27,6 +27,11 @@ type ParentSignal = {
   version: number;
   waiters: Set<() => void>;
   onActivity?: () => void;
+  publishToolStatus?: (update: {
+    toolCallId: string;
+    status: "update";
+    display: string;
+  }) => Promise<void>;
 };
 
 type LiveParentTarget = Extract<WorkflowRun["completionTarget"], { kind: "live_parent" }>;
@@ -41,6 +46,9 @@ type ChildActivityForwarding = {
   subscriptions: Map<string, { stop(): Promise<void> }>;
   subscriptionStarts: Map<string, Promise<void>>;
   publicationTail: Promise<void>;
+  publishToolStatus: ParentSignal["publishToolStatus"];
+  hasPublishedActivity: boolean;
+  trailingActivityPublication: { display: string } | null;
   stopPromise: Promise<void> | null;
 };
 
@@ -193,6 +201,7 @@ export class WorkflowLiveParentBridge {
   registerParent(input: {
     parentRequestId: string;
     onActivity?: () => void;
+    publishToolStatus?: ParentSignal["publishToolStatus"];
     recoverSynchronousDeliveries?: boolean;
   }) {
     const existing = this.parents.get(input.parentRequestId);
@@ -201,7 +210,12 @@ export class WorkflowLiveParentBridge {
     const protection = this.protectedParents.get(input.parentRequestId);
     if (protection) clearTimeout(protection);
     this.protectedParents.delete(input.parentRequestId);
-    const signal: ParentSignal = { version: 0, waiters: new Set(), onActivity: input.onActivity };
+    const signal: ParentSignal = {
+      version: 0,
+      waiters: new Set(),
+      onActivity: input.onActivity,
+      publishToolStatus: input.publishToolStatus,
+    };
     this.parents.set(input.parentRequestId, signal);
     this.notify(signal);
     const runsById = new Map<string, WorkflowRun>();
@@ -421,6 +435,8 @@ export class WorkflowLiveParentBridge {
           forwarding,
           run.completionTarget,
           this.buildFallbackDisplay(forwarding.runId, run.completionTarget, run.state),
+          false,
+          true,
         );
       }
       return;
@@ -444,8 +460,10 @@ export class WorkflowLiveParentBridge {
     const target = run.completionTarget;
     let forwarding = this.childActivitySubscriptions.get(run.runId);
     if (!forwarding) {
-      forwarding = this.createChildActivityForwarding(run.runId, target);
+      forwarding = this.createChildActivityForwarding(run.runId, target, signal.publishToolStatus);
       this.childActivitySubscriptions.set(run.runId, forwarding);
+    } else {
+      forwarding.publishToolStatus = signal.publishToolStatus;
     }
     await Promise.all(
       this.resolveChildRequestIds(run, target).map(async (childRequestId) => {
@@ -493,6 +511,7 @@ export class WorkflowLiveParentBridge {
   private createChildActivityForwarding(
     runId: string,
     target: LiveParentTarget,
+    publishToolStatus?: ParentSignal["publishToolStatus"],
   ): ChildActivityForwarding {
     return {
       runId,
@@ -503,6 +522,9 @@ export class WorkflowLiveParentBridge {
       subscriptions: new Map(),
       subscriptionStarts: new Map(),
       publicationTail: Promise.resolve(),
+      publishToolStatus,
+      hasPublishedActivity: false,
+      trailingActivityPublication: null,
       stopPromise: null,
     };
   }
@@ -549,6 +571,8 @@ export class WorkflowLiveParentBridge {
         forwarding,
         target,
         this.buildFallbackDisplay(forwarding.runId, target, "running", detail),
+        false,
+        true,
       );
     }
   }
@@ -590,35 +614,58 @@ export class WorkflowLiveParentBridge {
     target: LiveParentTarget,
     fallbackDisplay?: string,
     force = false,
+    coalesceActivity = false,
   ): Promise<void> {
+    const selection = this.resolveChildModelSelection(forwarding.runId);
+    const display =
+      forwarding.children.size > 0
+        ? renderSubagentDisplay({
+            profile: target.profile,
+            children: forwarding.children,
+            ...(selection?.model ? { model: selection.model } : {}),
+            ...(selection?.reasoning ? { reasoning: selection.reasoning } : {}),
+          })
+        : fallbackDisplay;
+    if (!display) return;
+
+    if (coalesceActivity && forwarding.hasPublishedActivity) {
+      const trailing = forwarding.trailingActivityPublication;
+      if (trailing) {
+        trailing.display = display;
+        await forwarding.publicationTail;
+        return;
+      }
+    }
+
+    const publication = { display };
+    if (coalesceActivity) {
+      if (forwarding.hasPublishedActivity) forwarding.trailingActivityPublication = publication;
+      else forwarding.hasPublishedActivity = true;
+    } else {
+      forwarding.trailingActivityPublication = null;
+    }
+
     const publish = forwarding.publicationTail.then(async () => {
+      if (forwarding.trailingActivityPublication === publication) {
+        forwarding.trailingActivityPublication = null;
+      }
       if (!force && !forwarding.acceptingLive) return;
-      const selection = this.resolveChildModelSelection(forwarding.runId);
-      const display =
-        forwarding.children.size > 0
-          ? renderSubagentDisplay({
-              profile: target.profile,
-              children: forwarding.children,
-              ...(selection?.model ? { model: selection.model } : {}),
-              ...(selection?.reasoning ? { reasoning: selection.reasoning } : {}),
-            })
-          : fallbackDisplay;
-      if (!display) return;
-      await this.input.bus.publish(
-        lilacEventTypes.EvtAgentOutputToolCall,
-        {
-          toolCallId: target.parentToolCallId,
-          status: "update",
-          display,
+      const update = {
+        toolCallId: target.parentToolCallId,
+        status: "update" as const,
+        display: publication.display,
+      };
+      if (forwarding.publishToolStatus) {
+        await forwarding.publishToolStatus(update);
+        return;
+      }
+      await this.input.bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
+        headers: {
+          request_id: target.parentRequestId,
+          session_id: target.parentSessionId,
+          request_client: target.parentRequestClient,
         },
-        {
-          headers: {
-            request_id: target.parentRequestId,
-            session_id: target.parentSessionId,
-            request_client: target.parentRequestClient,
-          },
-        },
-      );
+      });
     });
     forwarding.publicationTail = publish.catch((error: unknown) => {
       this.logger.warn(
@@ -677,7 +724,7 @@ export class WorkflowLiveParentBridge {
     const target = run.completionTarget;
     const forwarding =
       this.childActivitySubscriptions.get(run.runId) ??
-      this.createChildActivityForwarding(run.runId, target);
+      this.createChildActivityForwarding(run.runId, target, signal.publishToolStatus);
     forwarding.acceptingLive = false;
     await this.stopChildActivity(forwarding);
 

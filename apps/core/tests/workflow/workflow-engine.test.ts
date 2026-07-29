@@ -47,6 +47,33 @@ class HandoffInterceptStore extends DurableWorkflowStore {
   }
 }
 
+class HeartbeatTrackingWorkflowStore extends DurableWorkflowStore {
+  readonly runClaimRefreshes: number[] = [];
+  private queuedScanObserver: { resolve: () => void; error?: Error } | null = null;
+
+  observeNextQueuedScan(error?: Error): Promise<void> {
+    return new Promise((resolve) => {
+      this.queuedScanObserver = { resolve, ...(error ? { error } : {}) };
+    });
+  }
+
+  override listRuns(options?: Parameters<DurableWorkflowStore["listRuns"]>[0]) {
+    const runs = super.listRuns(options);
+    if (options?.state === "queued" && this.queuedScanObserver) {
+      const observer = this.queuedScanObserver;
+      this.queuedScanObserver = null;
+      queueMicrotask(observer.resolve);
+      if (observer.error) throw observer.error;
+    }
+    return runs;
+  }
+
+  override refreshRunClaim(runId: string, claimerId: string, now: number): boolean {
+    this.runClaimRefreshes.push(now);
+    return super.refreshRunClaim(runId, claimerId, now);
+  }
+}
+
 class CapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   readonly history: Message<unknown>[] = [];
@@ -115,6 +142,23 @@ class LiveCapturingRawBus implements RawBus {
 
   async close() {
     this.subscriptions.clear();
+  }
+}
+
+class FailingWorkflowRunPublishRawBus extends LiveCapturingRawBus {
+  runPublishFailures = 0;
+  readonly durableFailurePublishAttempted = Promise.withResolvers<void>();
+
+  override async publish<TData>(
+    message: Omit<Message<TData>, "id" | "ts">,
+    options: PublishOptions,
+  ) {
+    if (message.type === lilacEventTypes.EvtWorkflowRunChanged) {
+      this.runPublishFailures += 1;
+      if (this.runPublishFailures === 2) this.durableFailurePublishAttempted.resolve();
+      throw new Error("workflow run publication failed");
+    }
+    return await super.publish(message, options);
   }
 }
 
@@ -246,6 +290,152 @@ function firstOperationId(source: string): string {
 }
 
 describe("WorkflowEngine", () => {
+  it("paces active run heartbeats independently of polling and event-triggered ticks", async () => {
+    const dbPath = join(tmpdir(), `workflow-heartbeat-pacing-${crypto.randomUUID()}.sqlite`);
+    const store = new HeartbeatTrackingWorkflowStore(dbPath);
+    const bus = createLilacBus(new LiveCapturingRawBus());
+    let now = 100;
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "heartbeat-pacing",
+      now: () => now,
+      pollMs: 1_000_000,
+      runClaimHeartbeatMs: 20_000,
+      loadSnapshot: async () => agentWorkflowSource("hold the run open"),
+      compileSource: compileTestWorkflow,
+      dispatchAgentRequest: async ({ signal }) =>
+        await new Promise((resolve) => {
+          signal.addEventListener(
+            "abort",
+            () => resolve({ state: "cancelled", output: "", detail: "stopped", usage: null }),
+            { once: true },
+          );
+        }),
+    });
+    const triggerTick = async (): Promise<void> => {
+      const scanned = store.observeNextQueuedScan();
+      await bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+        runId: "run-1",
+        revisionId: "revision-1",
+        reason: "operation_changed",
+        ts: now,
+      });
+      await scanned;
+    };
+    try {
+      await engine.start();
+      expect(store.getRun("run-1")?.claimedAt).toBe(100);
+
+      now = 20_099;
+      await triggerTick();
+      await triggerTick();
+      expect(store.runClaimRefreshes).toEqual([]);
+
+      now = 20_100;
+      await triggerTick();
+      await triggerTick();
+      expect(store.runClaimRefreshes).toEqual([20_100]);
+
+      now = 40_099;
+      await triggerTick();
+      expect(store.runClaimRefreshes).toEqual([20_100]);
+
+      now = 40_100;
+      await triggerTick();
+      expect(store.runClaimRefreshes).toEqual([20_100, 40_100]);
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("awaits a wake-triggered tick failure before acknowledging the event", async () => {
+    const dbPath = join(tmpdir(), `workflow-wake-tick-failure-${crypto.randomUUID()}.sqlite`);
+    const store = new HeartbeatTrackingWorkflowStore(dbPath);
+    const bus = createLilacBus(new LiveCapturingRawBus());
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "wake-tick-failure",
+      pollMs: 1_000_000,
+    });
+    try {
+      await engine.start();
+      const scan = store.observeNextQueuedScan(new Error("wake tick failed"));
+      await expect(
+        bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+          runId: "missing-run",
+          revisionId: "missing-revision",
+          reason: "operation_changed",
+          ts: 1,
+        }),
+      ).rejects.toThrow("wake tick failed");
+      await scan;
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("contains timer tick failures and continues polling", async () => {
+    const dbPath = join(tmpdir(), `workflow-timer-tick-failure-${crypto.randomUUID()}.sqlite`);
+    const store = new HeartbeatTrackingWorkflowStore(dbPath);
+    const bus = createLilacBus(new CapturingRawBus());
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "timer-tick-failure",
+      pollMs: 1,
+    });
+    try {
+      await engine.start();
+      await store.observeNextQueuedScan(new Error("timer tick failed"));
+      await store.observeNextQueuedScan();
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("durably fails a run when its initial publication fails without leaking the run rejection", async () => {
+    const dbPath = join(tmpdir(), `workflow-initial-publish-failure-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new FailingWorkflowRunPublishRawBus();
+    const bus = createLilacBus(raw);
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "initial-publish-failure",
+      pollMs: 1_000_000,
+      loadSnapshot: async () => workflowSource("", 'return "unused";'),
+      compileSource: compileTestWorkflow,
+    });
+    try {
+      await engine.start();
+      await raw.durableFailurePublishAttempted.promise;
+      expect(store.getRun("run-1")?.terminalDetail).toBe("workflow run publication failed");
+      expect(raw.runPublishFailures).toBe(2);
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("allows concurrent shared profile-native writers", async () => {
     const dbPath = join(tmpdir(), `workflow-mixed-authority-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1945,6 +2135,7 @@ describe("WorkflowEngine", () => {
       expect(
         store.getWait("run-reply", store.listOperations("run-reply")[0]!.operationId)?.state,
       ).toBe("pending");
+      await resolver.start();
       await resolver.resolveAdapterEvent(
         {
           platform: "discord",

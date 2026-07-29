@@ -1,5 +1,5 @@
 import type { RawBus } from "./raw-bus";
-import type { Cursor, FetchOptions, Message, SubscriptionOptions } from "./types";
+import type { BusSubscription, Cursor, FetchOptions, Message, SubscriptionOptions } from "./types";
 import {
   lilacEventTypes,
   outReqTopic,
@@ -210,7 +210,7 @@ export interface LilacBus {
       msg: LilacMessageForTopic<TTopic>,
       ctx: { cursor: Cursor; commit(): Promise<void> },
     ) => Promise<void>,
-  ): Promise<{ stop(): Promise<void> }>;
+  ): Promise<BusSubscription>;
 
   /**
    * Subscribe to a single event type.
@@ -225,7 +225,7 @@ export interface LilacBus {
       msg: LilacMessage<TType>,
       ctx: { cursor: Cursor; commit(): Promise<void> },
     ) => Promise<void>,
-  ): Promise<{ stop(): Promise<void> }>;
+  ): Promise<BusSubscription>;
 
   /** Fetch typed messages from a topic (manual pull API). */
   fetchTopic<TTopic extends LilacTopic>(

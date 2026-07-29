@@ -105,7 +105,7 @@ For the full system mental model, terminology, and file-level architecture, see 
 
 ```bash
 bun install
-bun test
+bun run test:all
 bun run lint
 bun run typecheck
 bun run fmt:check
