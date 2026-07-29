@@ -49,12 +49,16 @@ export function isRoutableTelegramMessage(input: {
 
   if (isTelegramServiceMessage(message)) return false;
 
-  // Anything with no text and no supported attachment has nothing to act on.
+  // Media requires a caption to be routable.
+  //
+  // Inbound attachments are not yet forwarded to the model, so an uncaptioned
+  // photo would start a run whose user content is only attribution metadata,
+  // inviting the agent to answer about an image it never received. Once
+  // attachment resolution lands this becomes `hasText || hasCaption || hasMedia`.
   const hasText = typeof message.text === "string" && message.text.trim().length > 0;
   const hasCaption = typeof message.caption === "string" && message.caption.trim().length > 0;
-  const hasMedia = hasSupportedTelegramMedia(message);
 
-  return hasText || hasCaption || hasMedia;
+  return hasText || hasCaption;
 }
 
 /**

@@ -381,6 +381,9 @@ export class TelegramAdapter implements SurfaceAdapter {
       text: record.text,
       ts: record.ts,
       ...(record.editedTs === undefined ? {} : { editedTs: record.editedTs }),
+      // Reply-chain traversal reads the reply reference out of raw, so a read
+      // that drops it silently truncates conversation context to one message.
+      ...(record.raw === undefined ? {} : { raw: record.raw }),
     };
   }
 
@@ -405,6 +408,7 @@ export class TelegramAdapter implements SurfaceAdapter {
       text: record.text,
       ts: record.ts,
       ...(record.editedTs === undefined ? {} : { editedTs: record.editedTs }),
+      ...(record.raw === undefined ? {} : { raw: record.raw }),
     }));
   }
 
@@ -786,12 +790,21 @@ export class TelegramAdapter implements SurfaceAdapter {
     }
   }
 
+  /**
+   * Publishes the bot command menu.
+   *
+   * Deliberately empty for now. The menu previously advertised `/help`,
+   * `/cancel` and `/new`, none of which had a handler: `/cancel` was routed as
+   * ordinary conversation rather than cancelling anything. Advertising
+   * behaviour that does not exist is worse than advertising nothing.
+   *
+   * The executable custom commands cannot be listed yet either: their text
+   * name is `lilac:<name>`, and Telegram restricts command names to
+   * `[a-z0-9_]{1,32}`, so exposing them needs a naming scheme the shared
+   * router also understands. Tracked separately.
+   */
   private async registerCommandMenu(bot: Bot): Promise<void> {
-    await bot.api.setMyCommands([
-      { command: "help", description: "Show what this bot can do" },
-      { command: "cancel", description: "Cancel the request currently running" },
-      { command: "new", description: "Start a fresh conversation in this chat" },
-    ]);
+    await bot.api.setMyCommands([]);
   }
 
   private async resolveCoreConfig(): Promise<CoreConfig> {

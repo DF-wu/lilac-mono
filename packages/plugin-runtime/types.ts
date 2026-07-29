@@ -12,7 +12,7 @@ export type RequestContext = {
   serverOwnedRequest?: boolean;
   /** Set only after authenticating the root-only container operator token. */
   operator?: boolean;
-  authenticatedPrincipal?: { platform: "discord" | "github"; userId: string };
+  authenticatedPrincipal?: { platform: "discord" | "github" | "telegram"; userId: string };
   toolCallId?: string;
   controlCapability?: string;
   controlPolicy?: {

@@ -131,6 +131,24 @@ export async function startBusRequestRouter(params: {
   const { adapter, bus, subscriptionId, customCommands } = params;
   const platform: RoutedSurfacePlatform = params.platform ?? "discord";
 
+  /**
+   * Names that count as addressing the bot on this surface.
+   *
+   * Resolving this per platform matters because directive parsing
+   * (`!model`, `!continue`, `!interrupt`) and mention stripping all key off it;
+   * falling back to the Discord name would mis-parse Telegram messages whenever
+   * the two names differ.
+   */
+  const botMentionNamesFor = async (botUserId?: string): Promise<string[]> => {
+    const self = await adapter.getSelf().catch(() => null);
+    return resolveBotMentionNames({
+      cfg,
+      platform,
+      ...(botUserId === undefined ? {} : { botUserId }),
+      ...(self?.userName === undefined ? {} : { botUsername: self.userName }),
+    });
+  };
+
   const logger = createLogger({
     module: "bus-request-router",
   });
@@ -403,10 +421,9 @@ export async function startBusRequestRouter(params: {
       const flags = getSurfaceFlags(msg.data.raw, platform);
       const isDm = flags.isDMBased === true;
       const parentChannelId = flags.parentChannelId;
-      const botMentionNames = resolveBotMentionNames({
-        cfg,
-        botUserId: flags.botUserId ?? (await adapter.getSelf()).userId,
-      });
+      const botMentionNames = await botMentionNamesFor(
+        flags.botUserId ?? (await adapter.getSelf()).userId,
+      );
       const requestModelOverride = parseLeadingModelOverride({
         text: msg.data.text,
         botNames: botMentionNames,
@@ -1471,6 +1488,7 @@ export async function startBusRequestRouter(params: {
     const modelOverride =
       overrideCarrier?.model ?? b.messages[b.messages.length - 1]?.sessionModelOverride;
     const self = await adapter.getSelf();
+    const overrideBotNames = await botMentionNamesFor(overrideCarrier?.botUserId);
 
     // Gate-forwarded prompt: do NOT reply-to a message.
     // Use newest message as the context anchor.
@@ -1488,16 +1506,14 @@ export async function startBusRequestRouter(params: {
       triggerType: undefined,
       sessionMode: "active",
       modelOverride,
-      botMentionNames: resolveBotMentionNames({
-        cfg,
-        botUserId:
-          overrideCarrier?.botUserId ?? b.messages[b.messages.length - 1]?.botUserId ?? self.userId,
-      }),
+      botMentionNames: await botMentionNamesFor(
+        overrideCarrier?.botUserId ?? b.messages[b.messages.length - 1]?.botUserId ?? self.userId,
+      ),
       transformTriggerUserText: overrideCarrier
         ? (text: string) =>
             stripLeadingModelOverrideDirective({
               text,
-              botNames: resolveBotMentionNames({ cfg, botUserId: overrideCarrier?.botUserId }),
+              botNames: overrideBotNames,
             })
         : undefined,
       transformUserTextForMessageId: overrideCarrier?.messageId,

@@ -577,6 +577,45 @@ export class TelegramOutputStream implements SurfaceOutputStream {
       }
       await this.sendNewMessage(text, messageMarkup);
     }
+
+    await this.removeSurplusMessages(bodies.length);
+  }
+
+  /**
+   * Deletes messages beyond the current render.
+   *
+   * A stream can grow past 4096 chars and later shrink — a long draft replaced
+   * by a short final answer. Without this, the old tail stays visible in the
+   * chat and its refs are still reported from `finish()`, so the surface shows
+   * text the agent has retracted.
+   */
+  private async removeSurplusMessages(keep: number): Promise<void> {
+    if (this.messages.length <= keep) return;
+
+    const surplus = this.messages.splice(keep, this.messages.length - keep);
+
+    for (const message of surplus.reverse()) {
+      const ref = telegramMsgRef({
+        chatId: this.chatId,
+        threadId: this.threadId,
+        messageId: message.messageId,
+      });
+      const key = `${ref.channelId}:${ref.messageId}`;
+      const index = this.created.findIndex(
+        (created) => `${created.channelId}:${created.messageId}` === key,
+      );
+      if (index !== -1) this.created.splice(index, 1);
+
+      try {
+        await this.deps.api.deleteMessage({
+          chat_id: this.chatId,
+          message_id: message.messageId,
+        });
+      } catch {
+        // Already gone, or outside the 48h delete window: the surplus entry is
+        // dropped either way so it is not reported as part of the answer.
+      }
+    }
   }
 
   private async ensureTyping(): Promise<void> {

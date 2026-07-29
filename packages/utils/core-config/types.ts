@@ -251,6 +251,12 @@ export type UniversalCoreConfig = {
       /** Empty means "no user-level restriction" (chat allowlist still applies). */
       allowedUserIds: string[];
       dbPath?: string;
+      /**
+       * Telegram edits the streamed message in place, so on a successful run
+       * both modes produce the same result. The mode only changes what happens
+       * on cancellation: `preview` removes the streamed messages, `inline`
+       * leaves the partial answer visible.
+       */
       outputMode: "inline" | "preview";
       parseMode: "html" | "plain";
       /** Minimum gap between streaming editMessageText calls, per Bot API rate limits. */

@@ -99,12 +99,14 @@ describe("isRoutableTelegramMessage", () => {
     expect(isRoutableTelegramMessage({ message })).toBe(true);
   });
 
-  it("accepts a document with no caption at all", () => {
+  it("ignores media with no caption, which would start an empty run", () => {
+    // Inbound attachments are not forwarded to the model yet, so an uncaptioned
+    // photo would produce a request containing only attribution metadata.
     const message = makeMessage({
       text: undefined,
       document: { file_id: "f", file_unique_id: "u" },
     });
-    expect(isRoutableTelegramMessage({ message })).toBe(true);
+    expect(isRoutableTelegramMessage({ message })).toBe(false);
   });
 });
 

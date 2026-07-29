@@ -1,5 +1,6 @@
 /* oxlint-disable eslint/no-control-regex */
 
+import { isSurfacePrincipalPlatform, type SurfacePrincipalPlatform } from "../types";
 import {
   type CallWarning,
   type FinishReason,
@@ -1565,15 +1566,15 @@ export async function startBusAgentRunner(params: {
     canonicalCwd: string;
     safetyMode: SessionSafetyMode;
     expiresAt: number;
-    principal?: { platform: "discord" | "github"; userId: string };
+    principal?: { platform: SurfacePrincipalPlatform; userId: string };
   }) =>
     | {
         capability: string;
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
       }
     | Promise<{
         capability: string;
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
       }>;
   issueHeartbeatCapability?: (input: {
     requestId: string;
@@ -2504,8 +2505,7 @@ export async function startBusAgentRunner(params: {
         workflowPolicy = authorized.policy;
         trustedFallbackSurface =
           authorized.policy.originSession.sessionId &&
-          (authorized.policy.originSession.client === "discord" ||
-            authorized.policy.originSession.client === "github") &&
+          isSurfacePrincipalPlatform(authorized.policy.originSession.client) &&
           authorized.policy.originSession.userId
             ? {
                 platform: authorized.policy.originSession.client,
@@ -2863,11 +2863,7 @@ export async function startBusAgentRunner(params: {
         if (!controlCapability) {
           throw new Error("Heartbeat request is missing server-issued Level-2 authority");
         }
-      } else if (
-        workflowPolicy ||
-        next.requestClient === "discord" ||
-        next.requestClient === "github"
-      ) {
+      } else if (workflowPolicy || isSurfacePrincipalPlatform(next.requestClient)) {
         const capabilityPrincipal = trustedFallbackSurface
           ? {
               platform: trustedFallbackSurface.platform,

@@ -19,6 +19,7 @@ import {
 import {
   buildDiscordUserAliasById,
   previewText,
+  resolveSurfaceBotName,
   type RoutedSurfacePlatform,
   type SessionMode,
 } from "./common";
@@ -129,7 +130,7 @@ export async function publishComposedRequest(params: {
   const composed = await composeRequestMessages(params.adapter, {
     platform: params.input.platform,
     botUserId: self.userId,
-    botName: params.cfg.surface.discord.botName,
+    botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     transcriptStore: params.transcriptStore,
     currentRequestId: params.input.requestId,
     discordUserAliasById,
@@ -202,7 +203,7 @@ export async function publishActiveChannelPrompt(params: {
       ? await composeRequestMessages(params.adapter, {
           platform: params.input.platform,
           botUserId: self.userId,
-          botName: params.cfg.surface.discord.botName,
+          botName: resolveSurfaceBotName(params.cfg, params.input.platform),
           transcriptStore: params.transcriptStore,
           currentRequestId: params.input.requestId,
           discordUserAliasById,
@@ -217,7 +218,7 @@ export async function publishActiveChannelPrompt(params: {
           platform: params.input.platform,
           sessionId: params.input.sessionId,
           botUserId: self.userId,
-          botName: params.cfg.surface.discord.botName,
+          botName: resolveSurfaceBotName(params.cfg, params.input.platform),
           botMentionNames: params.input.botMentionNames,
           limit: 8,
           transcriptStore: params.transcriptStore,
@@ -292,7 +293,7 @@ export async function publishSingleMessageToActiveRequest(params: {
   const msg = await composeSingleMessage(params.adapter, {
     platform: params.input.platform,
     botUserId: self.userId,
-    botName: params.cfg.surface.discord.botName,
+    botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     msgRef: params.input.msgRef,
     discordUserAliasById,
     transformUserText: params.input.transformUserText,
@@ -358,7 +359,7 @@ export async function publishSingleMessagePrompt(params: {
   const msg = await composeSingleMessage(params.adapter, {
     platform: params.input.platform,
     botUserId: self.userId,
-    botName: params.cfg.surface.discord.botName,
+    botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     msgRef: params.input.msgRef,
     discordUserAliasById,
     transformUserText: params.input.transformUserText,

@@ -11,6 +11,16 @@ export type SurfacePlatform = Exclude<AdapterPlatform, "unknown"> | "unknown";
  */
 export type RoutedSurfacePlatform = "discord" | "telegram";
 
+/**
+ * Surfaces that can act as an authenticated principal for Level-2 tool
+ * authority. A request from one of these carries a real, attributable actor.
+ */
+export type SurfacePrincipalPlatform = "discord" | "github" | "telegram";
+
+export function isSurfacePrincipalPlatform(x: unknown): x is SurfacePrincipalPlatform {
+  return x === "discord" || x === "github" || x === "telegram";
+}
+
 export type DiscordSessionRef = {
   platform: "discord";
   channelId: string;

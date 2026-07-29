@@ -116,7 +116,7 @@ TELEGRAM_BOT_TOKEN=8792842071:AAF...
 | `allowedChatIds` | `[]` | **Fails closed.** Empty means the bot ignores every chat. |
 | `allowedUserIds` | `[]` | Empty means no user-level restriction; the chat allowlist still applies. |
 | `dbPath` | `<dataDir>/telegram-surface.db` | Local message index (see §6). |
-| `outputMode` | `preview` | `inline` edits one message into the final answer; `preview` streams a transient message, posts the final answer, and removes the preview. |
+| `outputMode` | `preview` | Cancellation behaviour only. Telegram edits the streamed message in place, so a **successful** run is identical in both modes. `preview` deletes the streamed messages when a request is cancelled; `inline` leaves the partial answer visible. |
 | `parseMode` | `html` | `html` renders markdown as Telegram HTML; `plain` sends unformatted text. |
 | `streamEditIntervalMs` | `1500` | Minimum gap between streaming edits. Minimum accepted value is 500. |
 | `outputNotification` | `true` | `false` sends with `disable_notification`. |

@@ -502,6 +502,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       coreConfigValidationHadError = false;
       lastCoreConfigValidationError = null;
       await adapter.refreshCoreConfig();
+      // Telegram authorization reads the adapter's cached config, so skipping
+      // this leaves a removed chat or user allowlisted until the next restart.
+      await telegramAdapter?.refreshCoreConfig();
     } catch (e) {
       const msg = errorMessage(e);
       if (!coreConfigValidationHadError || lastCoreConfigValidationError !== msg) {

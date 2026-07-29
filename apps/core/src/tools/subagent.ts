@@ -1,3 +1,4 @@
+import type { SurfacePrincipalPlatform } from "../surface/types";
 import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
 import { type AdapterPlatform, type LilacBus } from "@stanley2058/lilac-event-bus";
@@ -238,7 +239,7 @@ export type SubagentDelegationRegistration = {
 export type TrustedSubagentDelegationRegistration = SubagentDelegationRegistration & {
   projectRoot: string;
   fallbackSurface: {
-    platform: "discord" | "github";
+    platform: SurfacePrincipalPlatform;
     sessionId: string;
     userId: string;
   };

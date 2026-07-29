@@ -206,10 +206,10 @@ surface:
     # Telegram has no history API, so the adapter keeps its own message index.
     # dbPath: "/path/to/telegram-surface.db"
 
-    # Output rendering mode (mirrors the Discord surface):
-    # - inline: keep editing the streaming message into the final answer
-    # - preview: stream a transient preview, then post the final answer and
-    #   delete the preview
+    # What happens to the streamed messages when a request is cancelled.
+    # Telegram edits in place, so a successful run looks identical either way.
+    # - inline: leave the partial answer visible
+    # - preview: delete the streamed messages on cancellation
     outputMode: preview
 
     # Message formatting sent to the Bot API:

@@ -50,8 +50,21 @@ export type TelegramMessageRecord = {
   raw?: unknown;
 };
 
+function parseRawJson(value: string | null): unknown {
+  if (value === null) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    // A corrupt row must not break history reads.
+    return undefined;
+  }
+}
+
 function toRecord(row: DbTelegramMessage): TelegramMessageRecord {
+  const raw = parseRawJson(row.raw_json);
+
   return {
+    ...(raw === undefined ? {} : { raw }),
     sessionId: row.session_id,
     messageId: row.message_id,
     chatId: row.chat_id,

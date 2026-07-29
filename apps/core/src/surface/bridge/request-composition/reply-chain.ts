@@ -4,6 +4,7 @@ import type { MsgRef, SurfaceMessage } from "../../types";
 import { hasReplyChainPlannerProvider, type SurfaceAdapter } from "../../adapter";
 import { buildDiscordRichTextFromContentAndEmbeds } from "../../discord/discord-embed-text";
 import { normalizeDiscordRaw } from "../../discord/discord-raw-normalizer";
+import { normalizeTelegramReplyReference } from "../../telegram/telegram-raw";
 
 import { splitByDiscordWindowOldestToNewest } from "../../discord/merge-window";
 
@@ -47,8 +48,13 @@ function getReferenceFromRaw(raw: unknown): {
   messageId?: string;
   channelId?: string;
 } {
-  const replyReference = normalizeDiscordRaw(raw)?.replyReference;
-  return replyReference ?? {};
+  // Each adapter publishes its own envelope shape, so try them in turn rather
+  // than assuming Discord. Without the Telegram branch, chain traversal stops
+  // at the trigger message and replies lose their ancestors.
+  const discordReference = normalizeDiscordRaw(raw)?.replyReference;
+  if (discordReference) return discordReference;
+
+  return normalizeTelegramReplyReference(raw) ?? {};
 }
 
 function hasReplyTargetInRaw(raw: unknown): boolean {

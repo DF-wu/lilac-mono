@@ -1,3 +1,4 @@
+import type { SurfacePrincipalPlatform } from "../surface/types";
 import {
   lilacEventTypes,
   type LilacBus,
@@ -12,7 +13,7 @@ import type { MsgRef } from "../surface/types";
 export type AuthenticatedRequestOrigin = {
   requestId: string;
   sessionId: string;
-  platform: "discord" | "github";
+  platform: SurfacePrincipalPlatform;
   messageRef: MsgRef | null;
   actorUserId: string | null;
 };

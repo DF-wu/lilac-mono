@@ -1,7 +1,9 @@
+import { z } from "zod";
+
 import type { Message, MessageEntity } from "grammy/types";
 
 import type { SurfaceMessage } from "../types";
-import { telegramMsgRef, telegramSessionRef } from "./telegram-ids";
+import { formatTelegramSessionId, telegramMsgRef, telegramSessionRef } from "./telegram-ids";
 import { telegramUserName } from "./telegram-guards";
 
 /**
@@ -173,4 +175,34 @@ export function resolveTelegramBotMentionNames(input: {
   const names = new Set<string>([input.botName]);
   if (input.botUsername) names.add(input.botUsername);
   return [...names];
+}
+
+const telegramReplyEnvelopeSchema = z.object({
+  telegram: z.object({
+    chatId: z.string().min(1),
+    threadId: z.string().min(1).optional(),
+    replyToMessageId: z.string().min(1).optional(),
+  }),
+});
+
+/**
+ * Reply reference for chain traversal, read back out of the published
+ * `raw.telegram` envelope.
+ *
+ * The channel is the *session* id, not the bare chat id, so a reply inside a
+ * forum topic resolves within that topic rather than the parent chat.
+ */
+export function normalizeTelegramReplyReference(
+  raw: unknown,
+): { messageId?: string; channelId?: string } | null {
+  const parsed = telegramReplyEnvelopeSchema.safeParse(raw);
+  if (!parsed.success) return null;
+
+  const { chatId, threadId, replyToMessageId } = parsed.data.telegram;
+  if (replyToMessageId === undefined) return {};
+
+  return {
+    messageId: replyToMessageId,
+    channelId: formatTelegramSessionId({ chatId, threadId }),
+  };
 }

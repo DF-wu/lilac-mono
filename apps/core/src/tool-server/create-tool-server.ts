@@ -1,3 +1,4 @@
+import type { SurfacePrincipalPlatform } from "../surface/types";
 import Elysia, { NotFoundError } from "elysia";
 import {
   createLogger,
@@ -213,7 +214,7 @@ export type ToolServerOptions = {
     getOrigin?(requestId: string):
       | {
           sessionId: string;
-          platform: "discord" | "github";
+          platform: SurfacePrincipalPlatform;
           actorUserId: string | null;
         }
       | undefined;
@@ -228,7 +229,7 @@ export type ToolServerOptions = {
     now: number;
   }) => {
     kind: "primary" | "heartbeat";
-    principal: { platform: "discord" | "github"; userId: string } | null;
+    principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
     allowedCallables: readonly string[] | null;
     profile: "primary" | NativeSubagentProfile;
     canonicalCwd: string;
