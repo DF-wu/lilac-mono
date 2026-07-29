@@ -72,6 +72,7 @@ describe("generate plugin registration", () => {
 
   it("honors the on-disk provider when the runtime supplies neither config nor getConfig", async () => {
     // Given
+    const originalDataDir = env.dataDir;
     const originalOpenai = { ...env.providers.openai };
     const originalCompatible = { ...env.providers.openaiCompatible };
     let compatibleRequests = 0;
@@ -98,8 +99,10 @@ describe("generate plugin registration", () => {
       apiKey: "official-key",
       baseUrl: `http://127.0.0.1:${officialServer.port}/v1`,
     });
+    const dataDir = await mkdtemp(join(tmpdir(), "lilac-generate-data-"));
+    Object.assign(env, { dataDir });
     await writeFile(
-      join(env.dataDir, "core-config.yaml"),
+      join(dataDir, "core-config.yaml"),
       "configVersion: 2\ntools:\n  generate:\n    image:\n      provider: openai-compatible\n",
     );
     const outputDir = await mkdtemp(join(tmpdir(), "lilac-generate-ondisk-"));
@@ -110,7 +113,7 @@ describe("generate plugin registration", () => {
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadService,
       },
-      dataDir: env.dataDir,
+      dataDir,
     });
 
     try {
@@ -130,7 +133,8 @@ describe("generate plugin registration", () => {
       await manager.destroy();
       compatibleServer.stop(true);
       officialServer.stop(true);
-      await rm(join(env.dataDir, "core-config.yaml"), { force: true });
+      Object.assign(env, { dataDir: originalDataDir });
+      await rm(dataDir, { force: true, recursive: true });
       await rm(outputDir, { force: true, recursive: true });
       Object.assign(env.providers.openai, originalOpenai);
       Object.assign(env.providers.openaiCompatible, originalCompatible);
