@@ -61,7 +61,7 @@ describe("Generate image upstream characterization", () => {
 
     // Then
     expect(entries.find((entry) => entry.callableId === "generate.image")?.description).toEndWith(
-      "Available models: gpt-5-image, nanobanana, nanobanana-2, nanobanana-pro, grok-imagine-image, grok-imagine-image-pro",
+      "Available models: gpt-image-2, nanobanana-2, nanobanana-pro, gpt-5-image, grok-imagine-image-pro, grok-imagine-image, nanobanana-2-lite, nanobanana",
     );
   });
 
@@ -111,10 +111,20 @@ describe("Generate image upstream characterization", () => {
     temporaryPaths.push(outputDir);
 
     // When / Then
+    // With only OpenRouter configured, the fallback order still resolves to
+    // gpt-image-2, so its validator rejects a ratio it does not support.
     await expect(
       new Generate().call("generate.image", {
         prompt: "test",
         aspectRatio: "1:8",
+        inputImages: [join(outputDir, "missing.png")],
+      }),
+    ).rejects.toThrow("Unsupported aspectRatio '1:8' for gpt-image-2");
+    // A supported ratio gets past validation and fails on the missing input.
+    await expect(
+      new Generate().call("generate.image", {
+        prompt: "test",
+        aspectRatio: "1:1",
         inputImages: [join(outputDir, "missing.png")],
       }),
     ).rejects.toMatchObject({ code: "ENOENT" });
