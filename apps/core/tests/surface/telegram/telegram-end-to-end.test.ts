@@ -1,0 +1,289 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import {
+  createLilacBus,
+  lilacEventTypes,
+  type HandleContext,
+  type Message,
+  type PublishOptions,
+  type RawBus,
+  type SubscriptionOptions,
+} from "@stanley2058/lilac-event-bus";
+import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
+import type { CoreConfig } from "@stanley2058/lilac-utils";
+import type { Message as TelegramMessage, Update } from "grammy/types";
+
+import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
+import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
+import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
+import { FakeBotApiServer } from "./fake-bot-api-server";
+import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
+
+/**
+ * The whole inbound chain, with only the Bot API faked:
+ *
+ *   TelegramAdapter -> bridgeAdapterToBus -> bus -> startBusRequestRouter
+ *
+ * This is the seam that shipped broken. The adapter integration suite stops at
+ * the emitted `AdapterEvent`, and the router suite starts by publishing bus
+ * events directly, so the mapper between them was exercised by neither — and
+ * it labelled every Telegram event as Discord, which sent it to the wrong
+ * router and got it silently skipped.
+ */
+const CHAT = 1001;
+const TOKEN_ENV = "TELEGRAM_BOT_TOKEN";
+
+let server: FakeBotApiServer;
+let adapter: TelegramAdapter | null = null;
+let stopBridge: { stop(): Promise<void> } | null = null;
+let stopRouter: { stop(): Promise<void> } | null = null;
+let scratchDir = "";
+let previousToken: string | undefined;
+
+function createInMemoryRawBus(): RawBus {
+  const topics = new Map<string, Array<Message<unknown>>>();
+  const subs = new Set<{
+    topic: string;
+    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+  }>();
+
+  return {
+    publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      const id = `${Date.now()}-${topics.get(opts.topic)?.length ?? 0}`;
+      const stored: Message<unknown> = {
+        topic: opts.topic,
+        id,
+        type: opts.type,
+        ts: Date.now(),
+        key: opts.key,
+        headers: opts.headers,
+        data: msg.data as unknown,
+      };
+      topics.set(opts.topic, [...(topics.get(opts.topic) ?? []), stored]);
+      for (const s of subs) {
+        if (s.topic !== opts.topic) continue;
+        await s.handler(stored, { cursor: id, commit: async () => {} });
+      }
+      return { id, cursor: id };
+    },
+    subscribe: async <TData>(
+      topic: string,
+      _opts: SubscriptionOptions,
+      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
+    ) => {
+      const entry = {
+        topic,
+        handler: handler as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
+      };
+      subs.add(entry);
+      return { stop: async () => void subs.delete(entry) };
+    },
+    fetch: async <TData>(topic: string) => {
+      const existing = topics.get(topic) ?? [];
+      return {
+        messages: existing.map((m) => ({ msg: m as unknown as Message<TData>, cursor: m.id })),
+        ...(existing.length > 0 ? { next: existing[existing.length - 1]?.id } : {}),
+      };
+    },
+    close: async () => {},
+  };
+}
+
+function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
+  const cfg = parseCoreConfigV2ToUniversal({
+    configVersion: 2,
+    surface: {
+      // Deliberately different from the Telegram name, so an identity fallback
+      // is visible rather than silently harmless.
+      discord: { botName: "lilac" },
+      telegram: {
+        enabled: true,
+        botName: "catalina",
+        botUsername: BOT_USERNAME,
+        allowedChatIds: [String(CHAT)],
+        ...telegram,
+      },
+      router: {
+        // Mirrors the shipped default. A private chat must still be routed,
+        // which only works when the DM flag survives the bus hop.
+        defaultMode: "mention",
+        sessionModes: {},
+        activeDebounceMs: 1,
+        activeGate: { enabled: false, timeoutMs: 2500 },
+      },
+    },
+  });
+  return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
+async function startChain(cfg: CoreConfig = testConfig()) {
+  const bus = createLilacBus(createInMemoryRawBus());
+  const requests: Array<Message<unknown>> = [];
+
+  await bus.subscribeTopic(
+    "cmd.request",
+    { mode: "fanout", subscriptionId: "sink", consumerId: "sink-1", offset: { type: "now" } },
+    async (msg, ctx) => {
+      if (msg.type === lilacEventTypes.CmdRequestMessage) requests.push(msg);
+      await ctx.commit();
+    },
+  );
+
+  const created = new TelegramAdapter({
+    apiRoot: server.url,
+    getConfig: async () => ({
+      ...cfg,
+      surface: {
+        ...cfg.surface,
+        telegram: { ...cfg.surface.telegram, dbPath: path.join(scratchDir, "telegram.db") },
+      },
+    }),
+  });
+
+  // Exactly the runtime's order: both subscriptions live before polling starts.
+  stopBridge = await bridgeAdapterToBus({ adapter: created, bus, subscriptionId: "e2e-bridge" });
+  stopRouter = await startBusRequestRouter({
+    adapter: created,
+    bus,
+    platform: "telegram",
+    subscriptionId: "e2e-router",
+    config: {
+      configVersion: 2,
+      surface: {
+        discord: { botName: "lilac" },
+        telegram: cfg.surface.telegram,
+        router: cfg.surface.router,
+      },
+    },
+  });
+
+  await created.connect();
+  await created.whenReady();
+  adapter = created;
+
+  return { requests };
+}
+
+async function waitForRequest(requests: Array<Message<unknown>>): Promise<Message<unknown>> {
+  const deadline = Date.now() + 10_000;
+  while (requests.length === 0) {
+    if (Date.now() > deadline) throw new Error("no cmd.request.message was published");
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return requests[0] as Message<unknown>;
+}
+
+function privateMessage(overrides: Partial<TelegramMessage> = {}): NonNullable<Update["message"]> {
+  return makeMessage({
+    chat: { id: CHAT, type: "private", first_name: "Ada" },
+    from: { id: 547_663_716, is_bot: false, first_name: "Ada" },
+    ...overrides,
+  }) as NonNullable<Update["message"]>;
+}
+
+beforeEach(async () => {
+  previousToken = process.env[TOKEN_ENV];
+  process.env[TOKEN_ENV] = "000000:fake-token";
+  scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-e2e-"));
+  server = new FakeBotApiServer(BOT_USER_ID, BOT_USERNAME);
+});
+
+afterEach(async () => {
+  await stopRouter?.stop();
+  await stopBridge?.stop();
+  stopRouter = null;
+  stopBridge = null;
+  await adapter?.disconnect();
+  adapter = null;
+  await server.close();
+  await rm(scratchDir, { recursive: true, force: true });
+
+  if (previousToken === undefined) delete process.env[TOKEN_ENV];
+  else process.env[TOKEN_ENV] = previousToken;
+});
+
+describe("a telegram message reaches the router as a telegram message", () => {
+  it("routes a plain DM even under the default mention mode", async () => {
+    // The regression: the DM flag lives in raw.telegram, and a mislabelled
+    // platform made the router look under raw.discord, see no flags, treat the
+    // chat as a non-DM channel, and skip it as 'mention_mode_non_trigger'.
+    const { requests } = await startChain();
+
+    server.enqueueMessage(privateMessage({ message_id: 33, text: "hello there" }));
+    const msg = await waitForRequest(requests);
+
+    expect(msg.headers?.request_client).toBe("telegram");
+    expect(msg.headers?.session_id).toBe(String(CHAT));
+    expect(String(msg.headers?.request_id ?? "")).toStartWith("telegram:");
+  });
+
+  it("carries the user's text through to the composed request", async () => {
+    const { requests } = await startChain();
+
+    server.enqueueMessage(privateMessage({ message_id: 34, text: "what is 2 plus 2?" }));
+    const msg = await waitForRequest(requests);
+
+    const data = msg.data as { messages: Array<{ content: unknown }> };
+    expect(JSON.stringify(data.messages)).toContain("what is 2 plus 2?");
+  });
+
+  it("attributes the request to telegram, not discord", async () => {
+    const { requests } = await startChain();
+
+    server.enqueueMessage(privateMessage({ message_id: 35, text: "who am I talking to?" }));
+    const msg = await waitForRequest(requests);
+
+    const serialized = JSON.stringify(msg.data);
+    expect(serialized).toContain("telegram");
+    // The attribution header would otherwise label a Telegram message as Discord.
+    expect(serialized).not.toContain("[discord");
+  });
+
+  it("routes a group message that mentions the bot", async () => {
+    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
+    const { requests } = await startChain(cfg);
+
+    const mention = `@${BOT_USERNAME}`;
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 36,
+        chat: makeSupergroupChat(),
+        text: `${mention} status please`,
+        entities: [{ type: "mention", offset: 0, length: mention.length }],
+      }) as NonNullable<Update["message"]>,
+    );
+
+    const msg = await waitForRequest(requests);
+    expect(msg.headers?.request_client).toBe("telegram");
+  });
+
+  it("ignores a group message that does not address the bot", async () => {
+    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
+    const { requests } = await startChain(cfg);
+
+    // Not a DM and no mention: correctly skipped under mention mode. Sending an
+    // addressed message afterwards proves the first was seen and rejected.
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 37,
+        chat: makeSupergroupChat(),
+        text: "just chatting among ourselves",
+      }) as NonNullable<Update["message"]>,
+    );
+    const mention = `@${BOT_USERNAME}`;
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 38,
+        chat: makeSupergroupChat(),
+        text: `${mention} now I mean you`,
+        entities: [{ type: "mention", offset: 0, length: mention.length }],
+      }) as NonNullable<Update["message"]>,
+    );
+
+    await waitForRequest(requests);
+    expect(requests).toHaveLength(1);
+  });
+});
