@@ -101,6 +101,25 @@ async function connectAdapter(input: {
   return { adapter: created, sink };
 }
 
+/**
+ * Runs `fn` with the adapter's logger raised above `warn`.
+ *
+ * A test that deliberately fails an upload gets a warning from the adapter,
+ * which is expected output rather than signal. The level is read when the
+ * logger is constructed, so this has to wrap the `connectAdapter` call and not
+ * just the failing operation.
+ */
+async function withQuietLogger<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.LOG_LEVEL;
+  process.env.LOG_LEVEL = "error";
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env.LOG_LEVEL;
+    else process.env.LOG_LEVEL = previous;
+  }
+}
+
 /** A message from the allowlisted chat, authored by a human. */
 function inboundMessage(overrides: Partial<Message> = {}): NonNullable<Update["message"]> {
   const message = makeMessage({
@@ -258,6 +277,85 @@ describe("telegram adapter against a fake Bot API", () => {
     for (const call of server.callsOf("sendMessage")) {
       expect(String(call.params.text ?? "").length).toBeLessThanOrEqual(4096);
     }
+  });
+
+  it("indexes a delivered attachment so a reply to it resolves", async () => {
+    // Telegram never echoes the bot's own sends back, and an attachment message
+    // carries no text, so without an explicit index entry a user replying to
+    // the picture produces a reply target that readMsg cannot resolve — and the
+    // reply chain silently truncates there.
+    const { adapter: a } = await connectAdapter({});
+
+    const stream = await a.startOutput({ platform: "telegram", channelId: String(ALLOWED_CHAT) });
+    await stream.push({ type: "text.set", text: "here is the chart" });
+    await stream.push({
+      type: "attachment.add",
+      attachment: {
+        kind: "image",
+        mimeType: "image/png",
+        filename: "chart.png",
+        bytes: new Uint8Array([1, 2, 3]),
+      },
+    });
+    const result = await stream.finish();
+
+    const upload = await server.waitForCall("sendPhoto");
+    expect(upload.params.chat_id).toBe(ALLOWED_CHAT);
+    // grammY uploads the file as a separate multipart part and points `photo`
+    // at it with `attach://`; the fake resolves that back.
+    expect(upload.params.photo).toMatchObject({ filename: "chart.png" });
+
+    // The attachment lands last, so it is what a user replying to the bot's
+    // picture would target.
+    const read = await a.readMsg(result.last);
+    expect(read).not.toBeNull();
+    expect(read?.text).toBe("[image] chart.png");
+  });
+
+  it("keeps the first upload indexed when a later one fails", async () => {
+    // The document is already in the chat by the time the photo is rejected.
+    // Discarding its ref would leave a visible message nothing can resolve.
+    const { adapter: a, result } = await withQuietLogger(async () => {
+      const connected = await connectAdapter({});
+      server.failNext("sendPhoto", {
+        errorCode: 400,
+        description: "Bad Request: IMAGE_PROCESS_FAILED",
+      });
+
+      const stream = await connected.adapter.startOutput({
+        platform: "telegram",
+        channelId: String(ALLOWED_CHAT),
+      });
+      await stream.push({ type: "text.set", text: "two files" });
+      await stream.push({
+        type: "attachment.add",
+        attachment: {
+          kind: "file",
+          mimeType: "application/pdf",
+          filename: "report.pdf",
+          bytes: new Uint8Array([1]),
+        },
+      });
+      await stream.push({
+        type: "attachment.add",
+        attachment: {
+          kind: "image",
+          mimeType: "image/png",
+          filename: "chart.png",
+          bytes: new Uint8Array([2]),
+        },
+      });
+
+      return { adapter: connected.adapter, result: await stream.finish() };
+    });
+
+    expect(server.callsOf("sendDocument")).toHaveLength(1);
+    expect(server.callsOf("sendPhoto")).toHaveLength(1);
+
+    // `last` is the document, not the text reply: the surviving upload is the
+    // most recent message the bot actually put in the chat.
+    const read = await a.readMsg(result.last);
+    expect(read?.text).toBe("[file] report.pdf");
   });
 
   it("turns the cancel button into a cancellation, not a workflow action", async () => {

@@ -52,7 +52,7 @@ function wrap(
   stream: TelegramDeliverableStream,
   overrides: Partial<{
     onDelivered: (m: readonly { messageId: number; text: string }[]) => void;
-    onError: (e: unknown) => void;
+    onError: (e: unknown, context?: Record<string, unknown>) => void;
     api: TelegramAttachmentApi;
   }> = {},
 ) {
@@ -138,6 +138,141 @@ describe("recording the bot's own delivered output", () => {
     expect(order).toEqual(["indexed", "uploaded"]);
     // The text reply was already delivered; a failed upload must not discard it.
     expect(result).toEqual(RESULT);
+  });
+
+  it("indexes an uploaded attachment so a reply to it can resolve", async () => {
+    // An attachment message has no text of its own. Without a row in the index
+    // there is nothing for readMsg to return, and a reply chain that reaches
+    // the attachment stops there.
+    const stream = fakeStream({
+      attachments: [
+        { kind: "image", mimeType: "image/png", filename: "chart.png", bytes: new Uint8Array([1]) },
+      ],
+    });
+
+    const { wrapper, delivered } = wrap(stream, {
+      api: {
+        sendPhoto: async () => ({ message_id: 42 }),
+        sendDocument: async () => ({ message_id: 0 }),
+      },
+    });
+
+    await wrapper.finish();
+
+    expect(delivered.flat()).toContainEqual({ messageId: 42, text: "[image] chart.png" });
+  });
+
+  it("indexes the uploads that succeeded before a later one failed", async () => {
+    // Upload 1 is in the chat. If only upload 2's failure is recorded, that
+    // message stays permanently unresolvable as a reply target.
+    let attempt = 0;
+    const stream = fakeStream({
+      delivered: [{ messageId: 7, text: "answer" }],
+      attachments: [
+        { kind: "image", mimeType: "image/png", filename: "a.png", bytes: new Uint8Array([1]) },
+        { kind: "image", mimeType: "image/png", filename: "b.png", bytes: new Uint8Array([2]) },
+      ],
+    });
+
+    const { wrapper, errors, delivered } = wrap(stream, {
+      api: {
+        sendPhoto: async () => {
+          attempt += 1;
+          if (attempt === 2) throw new Error("upload failed");
+          return { message_id: 50 };
+        },
+        sendDocument: async () => ({ message_id: 0 }),
+      },
+    });
+
+    const result = await wrapper.finish();
+
+    expect(delivered.flat()).toContainEqual({ messageId: 50, text: "[image] a.png" });
+    // The surviving upload is still a real message, so its ref belongs in the
+    // result even though the batch as a whole failed.
+    expect(result.created).toContainEqual({
+      platform: "telegram",
+      channelId: "1001",
+      messageId: "50",
+    });
+    expect(result.last).toEqual({ platform: "telegram", channelId: "1001", messageId: "50" });
+    expect(errors).toHaveLength(1);
+  });
+
+  it("tells the error reporter how much of the batch survived", async () => {
+    let attempt = 0;
+    const stream = fakeStream({
+      attachments: [
+        { kind: "image", mimeType: "image/png", filename: "a.png", bytes: new Uint8Array([1]) },
+        { kind: "image", mimeType: "image/png", filename: "b.png", bytes: new Uint8Array([2]) },
+      ],
+    });
+
+    const contexts: (Record<string, unknown> | undefined)[] = [];
+    const { wrapper } = wrap(stream, {
+      onError: (_e, context) => contexts.push(context),
+      api: {
+        sendPhoto: async () => {
+          attempt += 1;
+          if (attempt === 2) throw new Error("upload failed");
+          return { message_id: 50 };
+        },
+        sendDocument: async () => ({ message_id: 0 }),
+      },
+    });
+
+    await wrapper.finish();
+
+    expect(contexts[0]).toEqual({ filename: "b.png", uploaded: 1, total: 2 });
+  });
+
+  it("still indexes the text reply when every upload fails", async () => {
+    const stream = fakeStream({
+      delivered: [{ messageId: 7, text: "answer" }],
+      attachments: [
+        { kind: "image", mimeType: "image/png", filename: "a.png", bytes: new Uint8Array([1]) },
+      ],
+    });
+
+    const { wrapper, delivered } = wrap(stream, {
+      api: {
+        sendPhoto: async () => {
+          throw new Error("upload failed");
+        },
+        sendDocument: async () => ({ message_id: 0 }),
+      },
+    });
+
+    const result = await wrapper.finish();
+
+    expect(delivered.flat()).toEqual([{ messageId: 7, text: "answer" }]);
+    expect(result).toEqual(RESULT);
+  });
+
+  it("keeps the reply when indexing the attachments throws", async () => {
+    // Indexing is best-effort on both passes, not just the text one.
+    const stream = fakeStream({
+      attachments: [
+        { kind: "image", mimeType: "image/png", filename: "a.png", bytes: new Uint8Array([1]) },
+      ],
+    });
+
+    let call = 0;
+    const { wrapper, errors } = wrap(stream, {
+      onDelivered: () => {
+        call += 1;
+        if (call === 2) throw new Error("index unavailable");
+      },
+      api: {
+        sendPhoto: async () => ({ message_id: 42 }),
+        sendDocument: async () => ({ message_id: 0 }),
+      },
+    });
+
+    const result = await wrapper.finish();
+
+    expect(errors).toHaveLength(1);
+    expect(result.created).toHaveLength(2);
   });
 
   it("appends successful attachment refs to the result", async () => {

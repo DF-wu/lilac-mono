@@ -24,10 +24,152 @@ export type ProgrammedFailure = {
 
 const requestBodySchema = z.record(z.string(), z.unknown());
 
-/** Only the fields the fake needs to interpret; the rest is echoed back. */
+/**
+ * Recorded stand-in for an uploaded file. Only metadata: the bytes are of no
+ * interest to a test and would bloat every recorded call.
+ */
+const uploadedFileSchema = z.object({ filename: z.string(), size: z.number() });
+
+export type UploadedFile = z.infer<typeof uploadedFileSchema>;
+
+/**
+ * `req.formData()` yields `string | File` per part. A file part is recorded as
+ * small, assertable metadata so attachment bytes never land in
+ * `RecordedCall.params`.
+ */
+const formEntrySchema = z.union([
+  z.instanceof(File).transform((file): UploadedFile => ({ filename: file.name, size: file.size })),
+  z.string(),
+]);
+
+/**
+ * Multipart carries every field as text, so scalars that the JSON transport
+ * delivers as numbers/booleans arrive here as strings (`message_thread_id: "7"`
+ * rather than `7`).
+ *
+ * The conversion happens here, driven by an explicit field list, rather than by
+ * relaxing `sendMessageSchema` to `z.coerce.number()`: schema-level coercion
+ * would leave the *recorded* params shape different between the two transports
+ * (a string for multipart, a number for JSON) so tests would have to assert
+ * differently depending on how grammY happened to encode the call, and
+ * `z.coerce.number()` turns a malformed value into `NaN` instead of rejecting
+ * it. Conversion only applies to fields Telegram actually types as non-strings,
+ * and only when the text round-trips exactly, so `message_thread_id: "abc"`
+ * stays the string it was and a free-text field such as `caption: "42"` is
+ * never rewritten.
+ */
+const NUMERIC_FORM_FIELDS: ReadonlySet<string> = new Set([
+  "chat_id",
+  "message_id",
+  "message_thread_id",
+  "reply_to_message_id",
+  "offset",
+  "limit",
+  "timeout",
+]);
+
+const BOOLEAN_FORM_FIELDS: ReadonlySet<string> = new Set([
+  "disable_notification",
+  "disable_web_page_preview",
+  "protect_content",
+  "allow_sending_without_reply",
+  "has_spoiler",
+]);
+
+function coerceFormScalar(key: string, value: string): string | number | boolean {
+  if (BOOLEAN_FORM_FIELDS.has(key) && (value === "true" || value === "false")) {
+    return value === "true";
+  }
+
+  if (NUMERIC_FORM_FIELDS.has(key)) {
+    const asNumber = Number(value);
+    // Round-trip guard: only an exact numeric literal converts, never `NaN`.
+    if (Number.isFinite(asNumber) && String(asNumber) === value) return asNumber;
+  }
+
+  return value;
+}
+
+/** grammY names the file part with a random id and points at it from the field. */
+const ATTACH_PREFIX = "attach://";
+
+async function readMultipartParams(req: Request): Promise<Record<string, unknown>> {
+  const params: Record<string, unknown> = {};
+  const files: Record<string, UploadedFile> = {};
+
+  for (const [key, value] of (await req.formData()).entries()) {
+    const parsed = formEntrySchema.safeParse(value);
+    // Neither text nor a file: nothing assertable to record, so skip the part
+    // rather than fabricating a value for it.
+    if (!parsed.success) continue;
+
+    if (typeof parsed.data === "string") {
+      params[key] = coerceFormScalar(key, parsed.data);
+      continue;
+    }
+    // Park the file under its part name; the `attach://` pass below moves it to
+    // whichever logical field refers to it.
+    files[key] = parsed.data;
+  }
+
+  // grammY does not put the upload on `photo`/`document` directly: it emits a
+  // randomly named file part and sets the logical field to
+  // `attach://<part-name>`. Resolving that indirection here is what lets a test
+  // assert `params.photo` instead of hunting for a random key.
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value !== "string" || !value.startsWith(ATTACH_PREFIX)) continue;
+
+    const partName = value.slice(ATTACH_PREFIX.length);
+    const file = files[partName];
+    if (file === undefined) continue;
+
+    params[key] = file;
+    delete files[partName];
+  }
+
+  // Any file part nothing pointed at stays recorded under its own name so it is
+  // still visible to a test rather than silently dropped.
+  return { ...params, ...files };
+}
+
+function readJsonParams(raw: string): Record<string, unknown> {
+  if (raw.length === 0) return {};
+
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    // A body that is not JSON must not escape the handler as a 500; the call is
+    // still recorded, just without params.
+    return {};
+  }
+
+  const parsed = requestBodySchema.safeParse(decoded);
+  return parsed.success ? parsed.data : {};
+}
+
+async function readParams(req: Request): Promise<Record<string, unknown>> {
+  const contentType = req.headers.get("content-type") ?? "";
+  // grammY switches to multipart/form-data as soon as an `InputFile` is in play
+  // (sendPhoto/sendDocument uploads); everything else stays JSON.
+  if (contentType.toLowerCase().includes("multipart/form-data")) {
+    return await readMultipartParams(req);
+  }
+
+  return readJsonParams(await req.text());
+}
+
+/**
+ * Only the fields the fake needs to interpret; the rest is echoed back.
+ *
+ * `text` is optional because `sendPhoto`/`sendDocument` route through the same
+ * handler and carry no text. Requiring it would fail the parse for every
+ * upload, and the handler would then fall back to `chat_id: 0` and drop the
+ * thread id — a response that quietly misdescribes where the message landed.
+ */
 const sendMessageSchema = z.object({
   chat_id: z.union([z.number(), z.string()]),
-  text: z.string(),
+  text: z.string().optional(),
   message_thread_id: z.number().optional(),
 });
 
@@ -149,9 +291,7 @@ export class FakeBotApiServer {
     // grammY calls POST {apiRoot}/bot{token}/{method}
     const method = new URL(req.url).pathname.split("/").pop() ?? "";
 
-    const raw = await req.text();
-    const parsedBody = raw.length > 0 ? requestBodySchema.safeParse(JSON.parse(raw)) : null;
-    const params: Record<string, unknown> = parsedBody?.success ? parsedBody.data : {};
+    const params = await readParams(req);
 
     this.calls.push({ method, params });
     this.callWaiters = this.callWaiters.filter((waiter) => {
@@ -254,7 +394,7 @@ export class FakeBotApiServer {
 
     const parsed = sendMessageSchema.safeParse(params);
     const chatId = parsed.success ? Number(parsed.data.chat_id) : 0;
-    const text = parsed.success ? parsed.data.text : "";
+    const text = (parsed.success ? parsed.data.text : undefined) ?? "";
     const threadId = parsed.success ? parsed.data.message_thread_id : undefined;
 
     if (method === "sendMessage") this.sentText.set(messageId, text);

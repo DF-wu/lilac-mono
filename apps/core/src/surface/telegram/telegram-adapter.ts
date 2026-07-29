@@ -487,8 +487,15 @@ export class TelegramAdapter implements SurfaceAdapter {
       api: createGrammyAttachmentApi(bot),
       sessionRef,
       silent,
-      onError: (error: unknown) => {
-        this.logger.warn("failed to deliver telegram attachments", {}, error);
+      onError: (error: unknown, context?: Record<string, unknown>) => {
+        // The counts matter: a partial upload leaves some files in the chat
+        // and drops the rest, and the log is the only place that difference
+        // shows up.
+        this.logger.warn(
+          "failed to deliver telegram attachments",
+          { sessionId: sessionRef.channelId, ...context },
+          error,
+        );
       },
       onDelivered: (messages) => this.recordOwnOutput(sessionRef, messages),
       onUnreconciled: (failures) => {

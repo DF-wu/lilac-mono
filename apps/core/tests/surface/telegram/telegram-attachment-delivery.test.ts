@@ -6,6 +6,7 @@ import type { SurfaceAttachment, TelegramSessionRef } from "../../../src/surface
 import {
   deliverTelegramAttachments,
   shouldSendAsPhoto,
+  telegramAttachmentIndexText,
   type TelegramAttachmentApi,
 } from "../../../src/surface/telegram/output/telegram-attachment-delivery";
 
@@ -75,21 +76,21 @@ describe("deliverTelegramAttachments", () => {
   it("does nothing when there is nothing to send", async () => {
     const { api, calls } = recorder();
 
-    const created = await deliverTelegramAttachments({
+    const delivery = await deliverTelegramAttachments({
       api,
       sessionRef: session,
       attachments: [],
       silent: false,
     });
 
-    expect(created).toEqual([]);
+    expect(delivery).toEqual({ uploaded: [] });
     expect(calls).toHaveLength(0);
   });
 
   it("uploads an image via sendPhoto and returns its ref", async () => {
     const { api, calls } = recorder();
 
-    const created = await deliverTelegramAttachments({
+    const delivery = await deliverTelegramAttachments({
       api,
       sessionRef: session,
       attachments: [attachment()],
@@ -97,7 +98,14 @@ describe("deliverTelegramAttachments", () => {
     });
 
     expect(calls).toMatchObject([{ method: "sendPhoto", chatId: 1001, filename: "chart.png" }]);
-    expect(created).toEqual([{ platform: "telegram", channelId: "1001", messageId: "101" }]);
+    expect(delivery.failure).toBeUndefined();
+    expect(delivery.uploaded).toEqual([
+      {
+        ref: { platform: "telegram", channelId: "1001", messageId: "101" },
+        messageId: 101,
+        attachment: attachment(),
+      },
+    ]);
   });
 
   it("uploads a non-image via sendDocument", async () => {
@@ -173,5 +181,125 @@ describe("deliverTelegramAttachments", () => {
     });
 
     expect(calls[0]?.opts.disable_notification).toBeUndefined();
+  });
+});
+
+describe("deliverTelegramAttachments partial success", () => {
+  /** Fails the nth upload (1-based) and succeeds on every other one. */
+  function failingAt(n: number): { api: TelegramAttachmentApi; calls: string[] } {
+    const calls: string[] = [];
+    let attempt = 0;
+    let nextId = 200;
+
+    const send = async (_chatId: number, file: InputFile) => {
+      attempt += 1;
+      calls.push(file.filename ?? "?");
+      if (attempt === n) throw new Error(`upload ${n} failed`);
+      nextId += 1;
+      return { message_id: nextId };
+    };
+
+    return { calls, api: { sendPhoto: send, sendDocument: send } };
+  }
+
+  it("keeps the refs of uploads that already reached Telegram", async () => {
+    // Upload 1 is visible in the chat whatever happens next. Dropping its ref
+    // would leave a message no reply could ever resolve against.
+    const { api } = failingAt(2);
+
+    const delivery = await deliverTelegramAttachments({
+      api,
+      sessionRef: session,
+      attachments: [attachment({ filename: "a.png" }), attachment({ filename: "b.png" })],
+      silent: false,
+    });
+
+    expect(delivery.uploaded).toHaveLength(1);
+    expect(delivery.uploaded[0]?.ref).toEqual({
+      platform: "telegram",
+      channelId: "1001",
+      messageId: "201",
+    });
+    expect(delivery.uploaded[0]?.attachment.filename).toBe("a.png");
+  });
+
+  it("reports which attachment stopped the run", async () => {
+    const { api } = failingAt(2);
+
+    const delivery = await deliverTelegramAttachments({
+      api,
+      sessionRef: session,
+      attachments: [attachment({ filename: "a.png" }), attachment({ filename: "b.png" })],
+      silent: false,
+    });
+
+    expect(delivery.failure?.attachment?.filename).toBe("b.png");
+    expect(delivery.failure?.error).toBeInstanceOf(Error);
+  });
+
+  it("does not attempt the attachments queued behind a failure", async () => {
+    // A gap in the middle (1 and 3 delivered, 2 missing) reads as corruption;
+    // a truncated prefix reads as an interruption, which is what happened.
+    const { api, calls } = failingAt(2);
+
+    const delivery = await deliverTelegramAttachments({
+      api,
+      sessionRef: session,
+      attachments: [
+        attachment({ filename: "a.png" }),
+        attachment({ filename: "b.png" }),
+        attachment({ filename: "c.png" }),
+      ],
+      silent: false,
+    });
+
+    expect(calls).toEqual(["a.png", "b.png"]);
+    expect(delivery.uploaded.map((u) => u.attachment.filename)).toEqual(["a.png"]);
+  });
+
+  it("reports a first-upload failure with nothing uploaded", async () => {
+    const { api } = failingAt(1);
+
+    const delivery = await deliverTelegramAttachments({
+      api,
+      sessionRef: session,
+      attachments: [attachment()],
+      silent: false,
+    });
+
+    expect(delivery.uploaded).toEqual([]);
+    expect(delivery.failure).toBeDefined();
+  });
+
+  it("never throws, so a delivered text reply is not lost to an upload fault", async () => {
+    const { api } = failingAt(1);
+
+    // The assertion is that the call resolves at all.
+    await expect(
+      deliverTelegramAttachments({
+        api,
+        sessionRef: session,
+        attachments: [attachment()],
+        silent: false,
+      }),
+    ).resolves.toBeDefined();
+  });
+});
+
+describe("telegramAttachmentIndexText", () => {
+  it("labels an image by kind and filename", () => {
+    expect(telegramAttachmentIndexText(attachment({ filename: "chart.png" }))).toBe(
+      "[image] chart.png",
+    );
+  });
+
+  it("labels a file by kind and filename", () => {
+    expect(telegramAttachmentIndexText(attachment({ kind: "file", filename: "report.pdf" }))).toBe(
+      "[file] report.pdf",
+    );
+  });
+
+  it("is never empty, so an indexed attachment is distinguishable from a blank message", () => {
+    expect(telegramAttachmentIndexText(attachment({ filename: "" })).trim()).not.toBe("");
   });
 });

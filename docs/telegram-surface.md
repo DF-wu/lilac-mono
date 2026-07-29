@@ -220,6 +220,26 @@ than failing the call.
 needs no public HTTPS endpoint and works behind NAT. Webhook ingress is not
 implemented.
 
+**The bot never sees its own messages.** Telegram does not echo a bot's own
+sends back as updates, so anything the bot says has to be written into the local
+index at the moment it is sent, or it is absent from history forever. Outbound
+attachments are indexed under a synthetic body — `[image] chart.png`,
+`[file] report.pdf` — because an attachment-only message carries no text of its
+own. Without a row, a reply to the attachment resolves to nothing and the reply
+chain truncates there; a label rather than an empty string means an agent
+reading its own history can tell what it sent instead of seeing a message it
+apparently left blank.
+
+**Attachment batches fail forward, not atomically.** Each attachment is a
+separate upload, and one that has returned is already visible in the chat and
+cannot be recalled. When upload *n* fails, the run stops there: the uploads
+before it keep their refs and are indexed as normal, and the ones behind it are
+never attempted. Continuing past the failure would leave a gap in the sequence
+(1 and 3 delivered, 2 missing) that is harder to read than a truncated prefix,
+and the usual causes — rate limits, auth — would only recur on the next call.
+The warning log carries `uploaded` and `total` counts so a partial batch is
+distinguishable from a total one.
+
 ### Custom commands and the menu alias
 
 Telegram's command grammar is `[a-z0-9_]{1,32}`, which the canonical
