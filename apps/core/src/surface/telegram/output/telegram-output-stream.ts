@@ -169,6 +169,25 @@ export function telegramRetryAfterSeconds(error: unknown): number | null {
   return errorText(error).includes("too many requests") ? 0 : null;
 }
 
+/**
+ * True when a delete failed because the message is already gone.
+ *
+ * These are terminal: retrying cannot succeed, and the desired end state
+ * (message absent) already holds. Anything else is treated as retryable, so a
+ * transient network failure never silently drops a message that is still
+ * visible to the user.
+ */
+export function isTelegramMessageAlreadyGone(error: unknown): boolean {
+  const text = errorText(error);
+  return (
+    text.includes("message to delete not found") ||
+    text.includes("message can't be deleted") ||
+    text.includes("cant be deleted") ||
+    text.includes("message identifier is not specified") ||
+    text.includes("message to edit not found")
+  );
+}
+
 /** True when Telegram rejected the message because it could not parse entities. */
 export function isTelegramEntityError(error: unknown): boolean {
   const text = errorText(error);
@@ -267,6 +286,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   private readonly created: MsgRef[] = [];
   private readonly toolEntries: ProgressEntry[] = [];
   private readonly pendingAttachments: SurfaceAttachment[] = [];
+  private readonly surplusDeletionFailures: { messageId: number; reason: string }[] = [];
 
   private textAcc = "";
   private statsLine: string | null = null;
@@ -592,30 +612,47 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   private async removeSurplusMessages(keep: number): Promise<void> {
     if (this.messages.length <= keep) return;
 
-    const surplus = this.messages.splice(keep, this.messages.length - keep);
+    // Delete first, drop tracking second.
+    //
+    // Discarding the entry up front would mean a transient failure leaves the
+    // stale text visible in the chat while throwing away the only reference
+    // needed to retry it or report it. A retained entry is retried by the next
+    // flush, since it is still beyond the rendered body count.
+    for (let index = this.messages.length - 1; index >= keep; index -= 1) {
+      const message = this.messages[index];
+      if (!message) continue;
 
-    for (const message of surplus.reverse()) {
-      const ref = telegramMsgRef({
-        chatId: this.chatId,
-        threadId: this.threadId,
-        messageId: message.messageId,
-      });
-      const key = `${ref.channelId}:${ref.messageId}`;
-      const index = this.created.findIndex(
-        (created) => `${created.channelId}:${created.messageId}` === key,
+      const removed = await this.deleteSurplusMessage(message.messageId);
+      if (!removed) continue;
+
+      this.messages.splice(index, 1);
+      const key = `${this.deps.sessionRef.channelId}:${message.messageId}`;
+      const createdIndex = this.created.findIndex(
+        (ref) => `${ref.channelId}:${ref.messageId}` === key,
       );
-      if (index !== -1) this.created.splice(index, 1);
-
-      try {
-        await this.deps.api.deleteMessage({
-          chat_id: this.chatId,
-          message_id: message.messageId,
-        });
-      } catch {
-        // Already gone, or outside the 48h delete window: the surplus entry is
-        // dropped either way so it is not reported as part of the answer.
-      }
+      if (createdIndex !== -1) this.created.splice(createdIndex, 1);
     }
+  }
+
+  /** Returns true when the message is confirmed absent from the chat. */
+  private async deleteSurplusMessage(messageId: number): Promise<boolean> {
+    try {
+      await this.deps.api.deleteMessage({ chat_id: this.chatId, message_id: messageId });
+      return true;
+    } catch (error: unknown) {
+      if (isTelegramMessageAlreadyGone(error)) return true;
+
+      this.surplusDeletionFailures.push({
+        messageId,
+        reason: errorText(error),
+      });
+      return false;
+    }
+  }
+
+  /** Surplus messages this stream could not remove, newest failure last. */
+  getSurplusDeletionFailures(): { messageId: number; reason: string }[] {
+    return [...this.surplusDeletionFailures];
   }
 
   private async ensureTyping(): Promise<void> {

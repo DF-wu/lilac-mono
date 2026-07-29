@@ -354,6 +354,23 @@ describe("telegram adapter against a fake Bot API", () => {
     expect(server.callsOf("deleteMessage")).toHaveLength(1);
   });
 
+  it("delivers a message that was already waiting in the first getUpdates", async () => {
+    // Long polling can return a backlog immediately on connect. Anything
+    // published before every bus subscriber is live would be dropped, since
+    // the router subscribes at offset "now" — which is why create-core-runtime
+    // starts the router before calling connect().
+    const sink = new EventSink();
+    server.enqueueMessage(inboundMessage({ message_id: 5, text: "queued before connect" }));
+
+    const { adapter: a } = await connectAdapter({ sink });
+    const evt = await sink.waitFor((e) => e.type === "adapter.message.created", "backlog message");
+
+    expect(evt.type === "adapter.message.created" && evt.message.text).toBe(
+      "queued before connect",
+    );
+    expect(a.getHealthSnapshot().isReady).toBe(true);
+  });
+
   it("disconnects cleanly and tolerates a second disconnect", async () => {
     const { adapter: a } = await connectAdapter({});
 

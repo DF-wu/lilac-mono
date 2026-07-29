@@ -11,7 +11,11 @@ const SESSION: TelegramSessionRef = { platform: "telegram", channelId: "1001" };
 
 type Recorded = { method: string; messageId?: number; text?: string };
 
-function harness(): { api: TelegramOutputApi; calls: Recorded[]; live: Map<number, string> } {
+function harness(opts: { failDelete?: () => Error | null } = {}): {
+  api: TelegramOutputApi;
+  calls: Recorded[];
+  live: Map<number, string>;
+} {
   const calls: Recorded[] = [];
   const live = new Map<number, string>();
   let nextId = 100;
@@ -31,8 +35,10 @@ function harness(): { api: TelegramOutputApi; calls: Recorded[]; live: Map<numbe
         calls.push({ method: "editMessageText", messageId: params.message_id, text: params.text });
       },
       deleteMessage: async (params) => {
-        live.delete(params.message_id);
         calls.push({ method: "deleteMessage", messageId: params.message_id });
+        const failure = opts.failDelete?.();
+        if (failure) throw failure;
+        live.delete(params.message_id);
       },
       sendChatAction: async () => undefined,
     },
@@ -147,5 +153,48 @@ describe("output mode only governs cancellation, not successful completion", () 
     await stream.abort("cancelled");
 
     expect(live.size).toBe(1);
+  });
+});
+
+describe("a surplus message that cannot be deleted must stay tracked", () => {
+  it("keeps the ref when deletion fails transiently, so it is not silently lost", async () => {
+    // Dropping the entry before a successful delete would leave the stale text
+    // visible while discarding the only reference able to retry or report it.
+    let attempts = 0;
+    const { api, live } = harness({
+      failDelete: () => {
+        attempts += 1;
+        return new Error("network unreachable");
+      },
+    });
+    const stream = makeStream(api);
+
+    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    await stream.settled();
+    await stream.push({ type: "text.set", text: "short" });
+    const result = await stream.finish();
+
+    expect(attempts).toBeGreaterThan(0);
+    // The message is still in the chat, so it is still reported.
+    expect(live.size).toBeGreaterThan(1);
+    expect(result.created.length).toBeGreaterThan(1);
+    expect(stream.getSurplusDeletionFailures().length).toBeGreaterThan(0);
+  });
+
+  it("drops the ref when telegram confirms the message is already gone", async () => {
+    // Terminal outcome: the desired end state already holds, so retrying would
+    // never succeed and retaining the ref would misreport the answer.
+    const { api } = harness({
+      failDelete: () => new Error("Bad Request: message to delete not found"),
+    });
+    const stream = makeStream(api);
+
+    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    await stream.settled();
+    await stream.push({ type: "text.set", text: "short" });
+    const result = await stream.finish();
+
+    expect(result.created).toHaveLength(1);
+    expect(stream.getSurplusDeletionFailures()).toHaveLength(0);
   });
 });

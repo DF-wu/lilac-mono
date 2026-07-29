@@ -745,15 +745,20 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       if (isTelegramSurfaceUsable(startupConfig)) {
         telegramAdapter = new TelegramAdapter();
 
-        // Subscribe before connecting so early updates are not missed.
+        // Both bus subscriptions must exist before polling starts.
+        //
+        // Long polling can return a backlog on its very first getUpdates, and
+        // the router subscribes at offset "now": anything published before it
+        // is live is dropped. Bridging adapter->bus first is not enough,
+        // because that only moves the event onto a topic nobody is reading yet.
+        // The router does not need bot identity until an event arrives, so it
+        // is safe to start it before connect().
         stopTelegramAdapterToBus = await bridgeAdapterToBus({
           adapter: telegramAdapter,
           bus,
           subscriptionId: subId(subscriptionPrefix, "telegram-adapter-to-bus"),
           transcriptStore: transcriptStore ?? undefined,
         });
-
-        await telegramAdapter.connect();
 
         stopTelegramRouter = await startBusRequestRouter({
           adapter: telegramAdapter,
@@ -763,6 +768,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           customCommands,
           transcriptStore: transcriptStore ?? undefined,
         });
+
+        await telegramAdapter.connect();
 
         logger.info("Surface adapter connected", {
           platform: "telegram",
