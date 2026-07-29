@@ -299,6 +299,7 @@ const telegramSurfaceSchema = z
     allowedChatIds: z.array(z.string().min(1)).default(() => []),
     allowedUserIds: z.array(z.string().min(1)).default(() => []),
     dbPath: z.string().min(1).optional(),
+    apiRoot: z.string().url().optional(),
     outputMode: z.enum(["inline", "preview"]).default(TELEGRAM_SURFACE_DEFAULTS.outputMode),
     parseMode: z.enum(["html", "plain"]).default(TELEGRAM_SURFACE_DEFAULTS.parseMode),
     // Telegram throttles edits at roughly one per second per chat; going below

@@ -99,7 +99,7 @@ seed_config() {
   # entity aliases — is preserved so the verification run behaves like the
   # real deployment.
   docker exec "${REF_CONTAINER}" sh -c 'cat /data/core-config.yaml' |
-    bun "$(dirname "${BASH_SOURCE[0]}")/telegram-verify-config.ts" "${chat_id}"
+    bun "$(dirname "${BASH_SOURCE[0]}")/telegram-verify-config.ts" "${chat_id}" "${TELEGRAM_API_ROOT:-}"
 }
 
 cmd_start() {

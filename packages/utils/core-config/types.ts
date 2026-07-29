@@ -252,6 +252,12 @@ export type UniversalCoreConfig = {
       allowedUserIds: string[];
       dbPath?: string;
       /**
+       * Bot API endpoint. Telegram supports self-hosted Bot API servers, which
+       * raise the file-size limits; this also lets a verification run point at
+       * a local endpoint. Defaults to https://api.telegram.org.
+       */
+      apiRoot?: string;
+      /**
        * Telegram edits the streamed message in place, so on a successful run
        * both modes produce the same result. The mode only changes what happens
        * on cancellation: `preview` removes the streamed messages, `inline`

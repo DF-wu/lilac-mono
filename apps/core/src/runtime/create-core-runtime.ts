@@ -743,7 +743,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       });
 
       if (isTelegramSurfaceUsable(startupConfig)) {
-        telegramAdapter = new TelegramAdapter();
+        telegramAdapter = new TelegramAdapter(
+          startupConfig.surface.telegram.apiRoot
+            ? { apiRoot: startupConfig.surface.telegram.apiRoot }
+            : {},
+        );
 
         // Both bus subscriptions must exist before polling starts.
         //

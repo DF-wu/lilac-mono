@@ -317,17 +317,72 @@ overall ready  : true
 bus            : redis://…/15  (live bus is /5)
 ```
 
-### Inbound smoke test (owner)
+### Inbound verification
 
-_Outstanding._ A Telegram bot cannot send messages to itself, so the inbound
-half — user message → router → agent → streamed reply — needs a human to type
-one message. Steps in `docs/telegram-surface.md` §7.
+A Telegram bot cannot message itself or another bot, so the inbound half has no
+fully automated path: driving it needs a human or a user account over MTProto.
+It was verified in two parts.
 
-| Step | Result |
-|------|--------|
-| DM reply with streamed edits | |
-| Cancel button stops a running request | |
-| Group behaviour under privacy mode | |
+**Part 1 — delivery, observed directly.** The operator sent two real messages.
+Both were delivered by ordinary long polling and reached the router. This is the
+only part that genuinely requires a person, and it is done.
+
+That run also exposed the defect described below: both messages were *skipped*,
+because the shared `toBusEvtAdapter*` mappers labelled every Telegram event as
+Discord. See "Defect found by the live run".
+
+**Part 2 — the rest of the chain, after the fix.** `scripts/telegram-inject-proxy.ts`
+forwards every call to the real `api.telegram.org` and augments only
+`getUpdates`, injecting one synthetic user message. Everything downstream is
+real: real adapter, real bridge, real router, real agent runner, real model, and
+the reply is rendered and delivered by the real API into the real chat.
+
+Result (2026-07-29, verification container on `lilac-mono:telegram-verify`):
+
+| Stage | Evidence |
+|-------|----------|
+| Update reaches the router as a DM | `isDm: true`, `textPreview: '用一句話說明你現在跑在哪個 surface 上。'` |
+| Routed as a Telegram request | `requestId: 'telegram:547663716:34085'` |
+| Discord relay correctly declines it | `reason: 'platform_mismatch'` |
+| Agent runs | `agent run starting`, `evt.agent.output.delta.text` |
+| Typing indicator | `sendChatAction -> ok` |
+| Reply sent to the real API | `sendMessage -> ok` |
+| Streaming edit applied | `editMessageText -> ok` |
+| Relay completes | `reply relay finished { finalTextChars: 25 }` |
+
+What this does **not** cover: that Telegram delivers user messages to the bot,
+which Part 1 established independently.
+
+### Defect found by the live run
+
+The operator's real message was the only thing that caught this, and it is worth
+recording because of what it says about the test strategy.
+
+```
+[bus-request-router] adapter.message.created
+  sessionId: "547663716"  messageId: "33"
+  mode: "mention"   isDm: false   mentionsBot: false
+[bus-request-router] router.route.decision
+  decision: "skip"  reason: "mention_mode_non_trigger"
+```
+
+`isDm: false` for a private chat was the tell. The `toBusEvtAdapter*` mappers —
+shared by every adapter, since `bridgeAdapterToBus` calls them for whichever
+adapter it is bridging — hardcoded `platform: "discord"`. So a Telegram event
+was published as a Discord one, handed to the Discord router, which read
+`raw.discord`, found no flags, and skipped it.
+
+Every suite passed while this was broken:
+
+- the adapter integration suite stops at the emitted `AdapterEvent`, one layer above
+- the router suite starts by publishing bus events **directly** with `platform: "telegram"`, one layer below
+- the live output-path smoke exercises only egress
+
+The mapper between them was covered by nothing. Fixed in `40b3a97`; the gap is
+closed by `telegram-end-to-end.test.ts`, which wires adapter → bridge → router
+together and was confirmed to fail (5/5 red) without the fix.
+
+One real message was worth more than 241 green tests here.
 
 ---
 

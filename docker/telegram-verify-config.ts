@@ -14,6 +14,7 @@
  *   cat core-config.yaml | bun docker/telegram-verify-config.ts <chatId>
  */
 const chatId = process.argv[2];
+const apiRoot = process.argv[3];
 if (!chatId) {
   console.error("usage: telegram-verify-config.ts <chatId>");
   process.exit(2);
@@ -56,6 +57,9 @@ const derived = {
       ...telegram,
       enabled: true,
       allowedChatIds: [chatId],
+      // Optional Bot API endpoint override. Telegram supports self-hosted Bot
+      // API servers; a verification run also uses it to reach a local proxy.
+      ...(apiRoot ? { apiRoot } : {}),
     },
   },
 };
