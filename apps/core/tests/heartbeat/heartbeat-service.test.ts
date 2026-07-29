@@ -139,16 +139,47 @@ function createHeartbeatConfig(input?: {
 
 describe("heartbeat service", () => {
   it("falls back gracefully when quiet-hours timezone is invalid", () => {
+    // An unusable timezone makes `createQuietHoursFormatter` drop the
+    // `timeZone` option, so the window is evaluated in the machine's own zone.
+    // Asserting a fixed label here would only hold where that zone happens to
+    // put 10:00 UTC outside 23:00-08:00 — true on a UTC runner, false at
+    // America/New_York (06:00). The contract that is actually timezone-
+    // independent is that an invalid zone behaves exactly as no zone at all.
+    const nowMs = Date.UTC(2026, 2, 11, 10, 0, 0);
+    const window = { start: "23:00", end: "08:00" } as const;
+
+    const invalid = getHeartbeatQuietState({
+      nowMs,
+      quietHours: { ...window, timezone: "Asia/Taipai" },
+    });
+    const unset = getHeartbeatQuietState({ nowMs, quietHours: { ...window } });
+
+    expect(invalid.label).toBe(unset.label);
+    expect(invalid.localTime).toBe(unset.localTime);
+    expect(invalid.inside).toBe(unset.inside);
+  });
+
+  it("evaluates the quiet-hours window in the configured timezone", () => {
+    // 10:00 UTC is 18:00 in Taipei, which is outside 23:00-08:00 no matter
+    // where the suite runs — the assertion the test above cannot make.
     const quietState = getHeartbeatQuietState({
       nowMs: Date.UTC(2026, 2, 11, 10, 0, 0),
-      quietHours: {
-        start: "23:00",
-        end: "08:00",
-        timezone: "Asia/Taipai",
-      },
+      quietHours: { start: "23:00", end: "08:00", timezone: "Asia/Taipei" },
     });
 
+    expect(quietState.localTime).toBe("18:00");
     expect(quietState.label).toBe("outside");
+  });
+
+  it("reports inside when the configured timezone puts the clock in the window", () => {
+    // The same instant is 06:00 in New York, which is inside the window.
+    const quietState = getHeartbeatQuietState({
+      nowMs: Date.UTC(2026, 2, 11, 10, 0, 0),
+      quietHours: { start: "23:00", end: "08:00", timezone: "America/New_York" },
+    });
+
+    expect(quietState.localTime).toBe("06:00");
+    expect(quietState.label).toBe("inside");
   });
 
   it("schedules the next heartbeat wake from the cron expression", async () => {
