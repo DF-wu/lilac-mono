@@ -159,6 +159,37 @@ existing OpenAI, OpenRouter, and xAI provider selection behavior.
   OpenAI-compatible routing is selected.
 - `generate.video` remains independent of this image-provider setting.
 
+## Known limitation: `aspectRatio` is not sent upstream
+
+The OpenAI-compatible image API has no aspect-ratio parameter, so
+`aspectRatio` is **not** forwarded to the provider in this mode. Lilac still
+validates it against the alias, then the request omits it and the result
+carries a warning:
+
+```json
+{
+  "type": "unsupported",
+  "feature": "aspectRatio",
+  "details": "This model does not support aspect ratio. Use `size` instead."
+}
+```
+
+The image is generated at the provider's default ratio. This differs from
+`default` mode, where `aspectRatio` reaches OpenRouter and xAI as a real
+parameter.
+
+Practical consequences:
+
+- Prefer `size` in this mode. For `gpt-image-2` and `gpt-5-image`, Lilac
+  already converts `aspectRatio` into an equivalent `size`, so those two
+  aliases are unaffected.
+- The `nanobanana*` and `grok-imagine-image*` aliases are aspect-ratio-driven
+  and have no `size` equivalent here. `grok-imagine-image*` rejects `size`
+  outright, so in this mode those aliases can only produce the provider's
+  default ratio.
+- Check the `warnings` array in the tool result to detect a dropped
+  `aspectRatio`.
+
 ## Troubleshooting
 
 ### The provider returns model-not-found

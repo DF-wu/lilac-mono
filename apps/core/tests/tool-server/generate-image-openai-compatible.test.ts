@@ -257,4 +257,72 @@ describe("Generate OpenAI-compatible image routing", () => {
     expect(requestCount).toBe(1);
     expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outputDir }))).toEqual([]);
   });
+
+  it("drops aspectRatio upstream and surfaces an unsupported warning", async () => {
+    // Given
+    const previousLogWarnings = globalThis.AI_SDK_LOG_WARNINGS;
+    globalThis.AI_SDK_LOG_WARNINGS = false;
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-aspect-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    try {
+      const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+        prompt: "wide shot",
+        model: "nanobanana-2",
+        aspectRatio: "16:9",
+        outputDir,
+      });
+
+      // Then
+      expect(body).toEqual({
+        model: "google/gemini-3.1-flash-image-preview",
+        prompt: "wide shot",
+        n: 1,
+        response_format: "b64_json",
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        warnings: [{ type: "unsupported", feature: "aspectRatio" }],
+      });
+    } finally {
+      globalThis.AI_SDK_LOG_WARNINGS = previousLogWarnings;
+    }
+  });
+
+  it("still converts aspectRatio to size for gpt aliases", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-gpt-aspect-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "portrait shot",
+      model: "gpt-5-image",
+      aspectRatio: "2:3",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toEqual({
+      model: "gpt-image-1.5",
+      prompt: "portrait shot",
+      n: 1,
+      size: "1024x1536",
+      response_format: "b64_json",
+    });
+    expect(result).toMatchObject({ ok: true, warnings: [] });
+  });
 });
