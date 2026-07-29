@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -351,9 +351,14 @@ describe("credentialless claude-code provider", () => {
   };
 
   it("builds a registry without any stored credential", async () => {
-    const loaded = await loadTestRegistry(claudeConfig, {}, null);
-    expect(loaded.supersededProviderIds).toEqual([]);
-    expect(loaded.registry.languageModel("claude-code/claude-sonnet-4-6")).toBeDefined();
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const loaded = await loadTestRegistry(claudeConfig, {}, null);
+      expect(loaded.supersededProviderIds).toEqual([]);
+      expect(loaded.registry.languageModel("claude-code/claude-sonnet-4-6")).toBeDefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("rejects credentials supplied for a locally authenticated provider", async () => {

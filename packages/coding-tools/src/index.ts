@@ -14,6 +14,7 @@ export * from "./apply-patch";
 export * from "./artifact-integration";
 export * from "./bash";
 export * from "./batch";
+export * from "./buffered-file-sink";
 export * from "./filesystem";
 export * from "./guardrails";
 export * from "./instructions";

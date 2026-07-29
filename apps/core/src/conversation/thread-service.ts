@@ -1242,10 +1242,6 @@ export class ConversationThreadService {
     },
   ) {}
 
-  refreshThreads(cfg?: CoreConfig): { channels: number; threads: number; messages: number } {
-    return this.params.store.refreshInferredThreads({ cfg });
-  }
-
   async search(input: {
     query: string | readonly string[];
     limit?: number;
@@ -1260,7 +1256,6 @@ export class ConversationThreadService {
     queryAboutness?: ConversationThreadQueryAboutness;
   }): Promise<ConversationThreadSearchResult> {
     const cfg = await this.params.getConfig();
-    this.refreshThreads(cfg);
     const limit = Math.min(50, Math.max(1, Math.floor(input.limit ?? 5)));
     const minScore = Math.max(0, input.minScore ?? DEFAULT_SEARCH_MIN_SCORE);
     const mode = input.mode ?? "hybrid";
@@ -1338,7 +1333,6 @@ export class ConversationThreadService {
     limit?: number;
   }): Promise<ConversationThreadReadOutput> {
     const cfg = await this.params.getConfig();
-    this.refreshThreads(cfg);
     const offset = Math.max(0, Math.floor(input.offset ?? 0));
     const limit = Math.min(200, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
     const result = this.params.store.readThread(input.threadId, offset, limit);
@@ -1388,7 +1382,6 @@ export class ConversationThreadService {
     threadIds: readonly string[];
   }): Promise<ConversationThreadMetadataOutput> {
     const cfg = await this.params.getConfig();
-    this.refreshThreads(cfg);
     const threadIds = normalizeMetadataThreadIds(input);
     const threads: ConversationThreadMetadataOutput["threads"] = [];
     const missing: string[] = [];
@@ -1427,9 +1420,7 @@ export class ConversationThreadService {
   ): Promise<ConversationThreadRunSummarizationResult> {
     const jobId = input.jobId;
     const cfg = await this.params.getConfig();
-    this.logger.debug("thread summarization refresh started", { jobId });
-    const refreshed = this.refreshThreads(cfg);
-    this.logger.debug("thread summarization refresh completed", { jobId, refreshed });
+    const refreshed = { channels: 0, threads: 0, messages: 0 };
 
     if (input.clear === true && input.dryRun === true) {
       const clearTargets = this.params.store.listThreadsForSummarizationClear();
@@ -1603,6 +1594,7 @@ export class ConversationThreadService {
                 thread.summary_input_hash ?? "",
                 summary ?? buildFallbackSummary(summaryMessages),
                 promptContext?.hash ?? null,
+                { ifCurrent: true },
               );
             })()
           : {
@@ -1610,6 +1602,13 @@ export class ConversationThreadService {
               embeddingInputHash:
                 this.params.store.computeEmbeddingInputHash(thread.thread_id) ?? "",
             };
+        if (!summaryWrite) {
+          this.logger.debug("thread summary generation discarded after concurrent update", {
+            jobId,
+            threadId: thread.thread_id,
+          });
+          return;
+        }
         if (summaryIsStale) {
           this.logger.debug("thread summary generation completed", {
             jobId,

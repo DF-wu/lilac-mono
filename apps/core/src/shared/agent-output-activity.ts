@@ -1,16 +1,9 @@
-import { lilacEventTypes, type AdapterPlatform, type LilacBus } from "@stanley2058/lilac-event-bus";
-
 export type AgentOutputActivitySource = "model" | "tool" | "subagent";
 
 const DEFAULT_PUBLISH_INTERVAL_MS = 30_000;
 
 export function createAgentOutputActivityPublisher(params: {
-  bus: LilacBus;
-  headers: {
-    request_id: string;
-    session_id?: string;
-    request_client?: AdapterPlatform;
-  };
+  publish: (source: AgentOutputActivitySource) => Promise<unknown>;
   intervalMs?: number;
   onError?: (error: unknown) => void;
 }): (source: AgentOutputActivitySource) => void {
@@ -22,8 +15,6 @@ export function createAgentOutputActivityPublisher(params: {
     if (lastPublishedAt !== null && now - lastPublishedAt < intervalMs) return;
     lastPublishedAt = now;
 
-    void params.bus
-      .publish(lilacEventTypes.EvtAgentOutputActivity, { source }, { headers: params.headers })
-      .catch((error: unknown) => params.onError?.(error));
+    void params.publish(source).catch((error: unknown) => params.onError?.(error));
   };
 }

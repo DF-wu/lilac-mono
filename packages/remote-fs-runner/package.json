@@ -27,7 +27,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun run build.ts && chmod +x dist/cli.js"
+    "build": "bun run build.ts && chmod +x dist/cli.js",
+    "test": "bun test"
   },
   "devDependencies": {
     "@stanley2058/lilac-fs": "workspace:*",

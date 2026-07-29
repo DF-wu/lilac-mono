@@ -179,7 +179,10 @@ async function writePromptTemplateState(
   state: PromptTemplateState,
 ): Promise<void> {
   const statePath = path.join(promptDir, PROMPT_TEMPLATE_STATE_FILENAME);
-  await Bun.write(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  await writeTextIfChanged({
+    filePath: statePath,
+    content: `${JSON.stringify(state, null, 2)}\n`,
+  });
 }
 
 async function writeTextIfChanged(params: {

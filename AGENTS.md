@@ -17,7 +17,7 @@ This repo uses Bun's install layout. Many packages in `apps/*/node_modules` are 
 
 ### Build
 
-- `apps/core`: `cd apps/core && bun run build:remote-runner` (test suite need this for parity test on remote runner)
+- `apps/core`: `cd apps/core && bun run build:remote-runner` (`bun run test` builds this automatically for the remote-runner parity test)
 - `apps/tool-bridge`: `cd apps/tool-bridge && bun run build`
 - `apps/acp-controller`: `cd apps/acp-controller && bun run build` (`lilac-acp`)
 
@@ -25,13 +25,16 @@ This repo uses Bun's install layout. Many packages in `apps/*/node_modules` are 
 
 Tests use Bun’s built-in runner + `bun:test`.
 
-- Run all tests in a package:
-  - `cd apps/core && bun test`
-  - `cd packages/utils && bun test`
-  - `cd packages/event-bus && bun test`
+- Every newly added workspace package under `apps/*` or `packages/*` must define a `test` script in its `package.json`.
+- Tests that intentionally trigger errors or warnings must suppress the expected console/logger output and restore mocks afterward so test output stays high-signal.
 
-- Run the monorepo test harness from repo root:
-  - `bun test`
+- Run all tests in a package:
+  - `cd apps/core && bun run test`
+  - `cd packages/utils && bun run test`
+  - `cd packages/event-bus && bun run test`
+
+- Run all root and workspace tests from repo root:
+  - `bun run test:all`
 
 - Run a single test file:
   - `cd apps/core && bun test tests/tools/bash.test.ts`
@@ -52,7 +55,8 @@ Tests use Bun’s built-in runner + `bun:test`.
 ### Typechecking
 
 - Treat running `tsc` as essential (same tier as running tests).
-- Run typecheck in the package you changed (root level `typecheck` also exist):
+- Run all root and workspace typechecks: `bun run typecheck`.
+- Run typecheck in the package you changed:
   - `cd <package> && bunx tsc -p tsconfig.json --noEmit`
 
 ### Lint / Format

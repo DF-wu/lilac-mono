@@ -61,13 +61,12 @@ describe("MiniLilacSqliteStore todos", () => {
       { state: { revision: 0, todos: [] } },
     );
     expect(store.getSession("session-1").updatedAt).toBe(updatedAt);
-    expect(store.getChunks("run-1")).toEqual([]);
     expect(store.database.query("SELECT * FROM session_todos").all()).toEqual([]);
 
     store.close();
   });
 
-  it("replaces, clears, and emits strict transient chunks with monotonic revisions", () => {
+  it("replaces and clears durable state with monotonic revisions", () => {
     const store = createStore();
     createSession(store, "session-1");
     createActiveRootRun(store, "session-1", "run-1");
@@ -79,14 +78,6 @@ describe("MiniLilacSqliteStore todos", () => {
     });
     expect(changed).toEqual({
       state: { revision: 1, todos: [FIRST_TODO, SECOND_TODO] },
-      storedChunk: {
-        seq: 1,
-        chunk: {
-          type: "data-todos",
-          data: { revision: 1, todos: [FIRST_TODO, SECOND_TODO] },
-          transient: true,
-        },
-      },
     });
     expect(store.getTodos("session-1")).toEqual(changed.state);
 
@@ -96,42 +87,12 @@ describe("MiniLilacSqliteStore todos", () => {
       todos: [FIRST_TODO, SECOND_TODO],
     });
     expect(noOp).toEqual({ state: changed.state });
-    expect(store.getChunks("run-1")).toEqual([
-      {
-        seq: 1,
-        chunk: {
-          type: "data-todos",
-          data: { revision: 1, todos: [FIRST_TODO, SECOND_TODO] },
-          transient: true,
-        },
-      },
-    ]);
-
     const cleared = store.replaceTodosForRun({
       sessionId: "session-1",
       runId: "run-1",
       todos: [],
     });
     expect(cleared.state).toEqual({ revision: 2, todos: [] });
-    expect(cleared.storedChunk?.seq).toBe(2);
-    expect(store.getChunks("run-1")).toEqual([
-      {
-        seq: 1,
-        chunk: {
-          type: "data-todos",
-          data: { revision: 1, todos: [FIRST_TODO, SECOND_TODO] },
-          transient: true,
-        },
-      },
-      {
-        seq: 2,
-        chunk: {
-          type: "data-todos",
-          data: { revision: 2, todos: [] },
-          transient: true,
-        },
-      },
-    ]);
 
     store.close();
   });
@@ -177,7 +138,6 @@ describe("MiniLilacSqliteStore todos", () => {
       }),
     ).toThrow("Todo list may contain at most one in-progress todo");
     expect(store.getTodos("session-1")).toEqual({ revision: 0, todos: [] });
-    expect(store.getChunks("run-1")).toEqual([]);
 
     store.close();
   });
@@ -224,7 +184,7 @@ describe("MiniLilacSqliteStore todos", () => {
     store.close();
   });
 
-  it("rolls back todo and session updates when chunk insertion fails", () => {
+  it("rolls back todo state when its durable session update fails", () => {
     const store = createStore();
     createSession(store, "session-1");
     createActiveRootRun(store, "session-1", "run-1");
@@ -236,9 +196,9 @@ describe("MiniLilacSqliteStore todos", () => {
     const beforeState = store.getTodos("session-1");
     const beforeUpdatedAt = store.getSession("session-1").updatedAt;
     store.database.exec(`
-      CREATE TRIGGER reject_todo_chunk BEFORE INSERT ON run_chunks
+      CREATE TRIGGER reject_todo_session_update BEFORE UPDATE ON sessions
       BEGIN
-        SELECT RAISE(ABORT, 'rejected test chunk');
+        SELECT RAISE(ABORT, 'rejected session update');
       END;
     `);
 
@@ -248,10 +208,9 @@ describe("MiniLilacSqliteStore todos", () => {
         runId: "run-1",
         todos: [SECOND_TODO],
       }),
-    ).toThrow("rejected test chunk");
+    ).toThrow("rejected session update");
     expect(store.getTodos("session-1")).toEqual(beforeState);
     expect(store.getSession("session-1").updatedAt).toBe(beforeUpdatedAt);
-    expect(store.getChunks("run-1")).toHaveLength(1);
 
     store.close();
   });
@@ -282,7 +241,6 @@ describe("MiniLilacSqliteStore todos", () => {
       revision: Number.MAX_SAFE_INTEGER,
       todos: [FIRST_TODO],
     });
-    expect(store.getChunks("run-1")).toEqual([]);
     store.close();
   });
 });

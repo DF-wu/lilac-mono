@@ -11,6 +11,7 @@ import { isDiscordSessionDividerText } from "../surface/discord/discord-session-
 import { splitByDiscordWindowOldestToNewest } from "../surface/discord/merge-window";
 import { parseLeadingContinueDirective } from "../surface/bridge/bus-request-router/common";
 import { configureSqliteConnection } from "../shared/sqlite";
+import type { DiscordSearchIndexedMessage } from "../surface/store/discord-search-store";
 
 const SEARCH_LIMIT_MAX = 50;
 const THREAD_DISCOVERY_GAP_MS = 60 * 60 * 1000;
@@ -19,6 +20,19 @@ export const CONVERSATION_THREAD_SUMMARY_VERSION = 5;
 export const CONVERSATION_THREAD_EMBEDDING_VERSION = 1;
 
 export type ConversationThreadKind = "discord_thread" | "inferred_channel_thread";
+
+export type ConversationThreadRepairKind = "content" | "topology";
+
+export type ConversationThreadRefreshResult = {
+  channels: number;
+  threads: number;
+  messages: number;
+};
+
+export type ConversationThreadContentInvalidationResult = {
+  messages: number;
+  threads: number;
+};
 
 type ConversationThreadGroupingMode = "mention" | "active";
 
@@ -159,6 +173,7 @@ type IndexedMessageRow = {
   user_name: string | null;
   text: string;
   ts: number;
+  edited_ts: number | null;
   updated_ts: number;
   is_chat: number;
   reply_to_channel_id: string | null;
@@ -331,6 +346,7 @@ function computeThreadInputHash(messages: readonly IndexedMessageRow[]): string 
           message.user_id,
           message.user_name ?? "",
           message.ts,
+          message.edited_ts ?? "",
           message.text,
         ].join("\u001f"),
       )
@@ -490,6 +506,45 @@ function resolveConversationThreadBotMentionNames(input: {
   for (const name of input.mainAgentUserNames) add(name);
 
   return names;
+}
+
+export function classifyConversationThreadMessageUpdate(
+  before: DiscordSearchIndexedMessage | null | undefined,
+  after: DiscordSearchIndexedMessage,
+  cfg?: CoreConfig,
+): ConversationThreadRepairKind | null {
+  if (!before) return "topology";
+
+  const persistedContentChanged = before.text !== after.text || before.editedTs !== after.editedTs;
+  const persistedTopologyFieldChanged =
+    before.ref.platform !== after.ref.platform ||
+    before.ref.channelId !== after.ref.channelId ||
+    before.ref.messageId !== after.ref.messageId ||
+    before.session.platform !== after.session.platform ||
+    before.session.channelId !== after.session.channelId ||
+    before.session.guildId !== after.session.guildId ||
+    before.session.parentChannelId !== after.session.parentChannelId ||
+    before.userId !== after.userId ||
+    before.userName !== after.userName ||
+    before.ts !== after.ts ||
+    before.deleted !== after.deleted;
+
+  if (!persistedContentChanged && !persistedTopologyFieldChanged) return null;
+  if (persistedTopologyFieldChanged) return "topology";
+  if ((before.text.trim().length === 0) !== (after.text.trim().length === 0)) return "topology";
+  if (isDiscordSessionDividerText(before.text) !== isDiscordSessionDividerText(after.text)) {
+    return "topology";
+  }
+
+  const botNames = resolveConversationThreadBotMentionNames({
+    cfg,
+    mainAgentUserNames: new Set<string>(),
+  });
+  const beforeContinueCount = parseLeadingContinueDirective({ text: before.text, botNames });
+  const afterContinueCount = parseLeadingContinueDirective({ text: after.text, botNames });
+  if (beforeContinueCount !== afterContinueCount) return "topology";
+
+  return "content";
 }
 
 function isMainAgentMessageRow(
@@ -720,6 +775,11 @@ export class ConversationThreadStore {
     `);
 
     this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_conversation_thread_messages_channel_message
+      ON conversation_thread_messages(channel_id, message_id);
+    `);
+
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS conversation_thread_summaries (
         thread_id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
@@ -836,11 +896,37 @@ export class ConversationThreadStore {
     `);
   }
 
-  refreshInferredThreads(input?: { cfg?: CoreConfig }): {
-    channels: number;
-    threads: number;
-    messages: number;
-  } {
+  listMaterializationChannelIds(): string[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT channel_id
+        FROM discord_search_messages
+        UNION
+        SELECT channel_id
+        FROM conversation_threads
+        ORDER BY channel_id ASC
+        `,
+      )
+      .all() as Array<{ channel_id: string }>;
+    return rows.map((row) => row.channel_id);
+  }
+
+  refreshInferredThreads(input?: { cfg?: CoreConfig }): ConversationThreadRefreshResult {
+    const result: ConversationThreadRefreshResult = { channels: 0, threads: 0, messages: 0 };
+    for (const channelId of this.listMaterializationChannelIds()) {
+      const channelResult = this.refreshInferredChannel({ channelId, cfg: input?.cfg });
+      result.channels += channelResult.channels;
+      result.threads += channelResult.threads;
+      result.messages += channelResult.messages;
+    }
+    return result;
+  }
+
+  refreshInferredChannel(input: {
+    channelId: string;
+    cfg?: CoreConfig;
+  }): ConversationThreadRefreshResult {
     const hasSurfaceDb = this.ensureSurfaceDb();
     const metadataSelect = hasSurfaceDb
       ? `
@@ -878,51 +964,44 @@ export class ConversationThreadStore {
           m.user_name,
           m.text,
           m.ts,
+          m.edited_ts,
           m.updated_ts
         FROM discord_search_messages m
         ${metadataJoin}
-        WHERE m.deleted = 0
+        WHERE m.channel_id = ?
+          AND m.deleted = 0
           AND trim(m.text) <> ''
           AND (${hasSurfaceDb ? "r.is_chat IS NULL OR r.is_chat != 0" : "1 = 1"})
-        ORDER BY m.channel_id ASC, m.ts ASC, m.message_id ASC
+        ORDER BY m.ts ASC, m.message_id ASC
         `,
       )
-      .all() as IndexedMessageRow[];
-
-    const inferredByChannel = new Map<string, IndexedMessageRow[]>();
-    for (const row of rows) {
-      const list = inferredByChannel.get(row.channel_id);
-      if (list) list.push(row);
-      else inferredByChannel.set(row.channel_id, [row]);
-    }
+      .all(input.channelId) as IndexedMessageRow[];
 
     let threadCount = 0;
     const activeThreadIds = new Set<string>();
     const botMentionNames = resolveConversationThreadBotMentionNames({
-      cfg: input?.cfg,
+      cfg: input.cfg,
       mainAgentUserNames: this.mainAgentUserNames,
     });
 
     const tx = this.db.transaction(() => {
-      for (const messages of inferredByChannel.values()) {
-        for (const segment of splitMessagesBySessionDivider({
-          messages,
+      for (const segment of splitMessagesBySessionDivider({
+        messages: rows,
+        mainAgentUserNames: this.mainAgentUserNames,
+      })) {
+        const first = segment[0];
+        if (!first) continue;
+        const mode = resolveThreadGroupingMode({ message: first, cfg: input.cfg });
+        for (const group of groupInferredMessages({
+          messages: segment,
+          mode,
+          botMentionNames,
           mainAgentUserNames: this.mainAgentUserNames,
         })) {
-          const first = segment[0];
-          if (!first) continue;
-          const mode = resolveThreadGroupingMode({ message: first, cfg: input?.cfg });
-          for (const group of groupInferredMessages({
-            messages: segment,
-            mode,
-            botMentionNames,
-            mainAgentUserNames: this.mainAgentUserNames,
-          })) {
-            if (!this.hasMainAgentMessage(group)) continue;
-            const threadId = this.upsertInferredThread(group);
-            activeThreadIds.add(threadId);
-            threadCount += 1;
-          }
+          if (!this.hasMainAgentMessage(group)) continue;
+          const threadId = this.upsertInferredThread(group);
+          activeThreadIds.add(threadId);
+          threadCount += 1;
         }
       }
 
@@ -930,8 +1009,15 @@ export class ConversationThreadStore {
         ? "('inferred_channel_thread', 'discord_thread')"
         : "('inferred_channel_thread')";
       const existing = this.db
-        .query(`SELECT thread_id FROM conversation_threads WHERE kind IN ${managedKinds}`)
-        .all() as Array<{ thread_id: string }>;
+        .query(
+          `
+          SELECT thread_id
+          FROM conversation_threads
+          WHERE channel_id = ?
+            AND kind IN ${managedKinds}
+          `,
+        )
+        .all(input.channelId) as Array<{ thread_id: string }>;
       for (const row of existing) {
         if (activeThreadIds.has(row.thread_id)) continue;
         this.deleteThread(row.thread_id);
@@ -941,10 +1027,47 @@ export class ConversationThreadStore {
     tx();
 
     return {
-      channels: new Set(rows.map((row) => row.channel_id)).size,
+      channels: rows.length > 0 ? 1 : 0,
       threads: threadCount,
       messages: rows.length,
     };
+  }
+
+  invalidateMaterializedMessages(input: {
+    channelId: string;
+    messageIds: readonly string[];
+  }): ConversationThreadContentInvalidationResult {
+    const messageIds = [...new Set(input.messageIds.map((id) => id.trim()).filter(Boolean))];
+    if (messageIds.length === 0) return { messages: 0, threads: 0 };
+
+    const updatedAt = Date.now();
+    const contentRevision = `dirty:${crypto.randomUUID()}`;
+    const tx = this.db.transaction(() => {
+      let changed = 0;
+      for (const messageId of messageIds) {
+        const result = this.db.run(
+          `
+          UPDATE conversation_threads
+          SET updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END,
+              last_summarized_at = NULL,
+              last_embedded_at = NULL,
+              summary_input_hash = ?,
+              summary_prompt_context_hash = NULL,
+              embedding_input_hash = NULL
+          WHERE thread_id IN (
+            SELECT thread_id
+            FROM conversation_thread_messages
+            WHERE channel_id = ? AND message_id = ?
+          )
+          `,
+          [updatedAt, updatedAt, contentRevision, input.channelId, messageId],
+        );
+        changed += result.changes;
+      }
+      return changed;
+    });
+
+    return { messages: messageIds.length, threads: tx() };
   }
 
   private hasMainAgentMessage(messages: readonly IndexedMessageRow[]): boolean {
@@ -1345,7 +1468,8 @@ export class ConversationThreadStore {
     summaryInputHash: string,
     summary: ConversationThreadSummaryInput,
     promptContextHash: string | null = null,
-  ): ConversationThreadSummaryWriteResult {
+    options?: { ifCurrent?: boolean },
+  ): ConversationThreadSummaryWriteResult | null {
     const normalized = normalizeSummary(summary);
     const now = Date.now();
     const topicsJson = JSON.stringify(normalized.topics);
@@ -1385,7 +1509,14 @@ export class ConversationThreadStore {
       { facet: "topics", text: normalized.topics.join("\n") },
     ];
 
-    const tx = this.db.transaction(() => {
+    const tx = this.db.transaction((): boolean => {
+      if (options?.ifCurrent) {
+        const current = this.db
+          .query("SELECT summary_input_hash FROM conversation_threads WHERE thread_id = ?")
+          .get(threadId) as { summary_input_hash: string | null } | null;
+        if (current?.summary_input_hash !== summaryInputHash) return false;
+      }
+
       this.db.run(
         `
         INSERT INTO conversation_thread_summaries (
@@ -1449,9 +1580,10 @@ export class ConversationThreadStore {
           threadId,
         ],
       );
+      return true;
     });
 
-    tx();
+    if (!tx()) return null;
     const filteredFacets = facets.filter((facet) => facet.text.trim().length > 0);
     return {
       facets: filteredFacets,

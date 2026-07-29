@@ -10,6 +10,7 @@ import {
   type RedisConnectionPoolAutoscaleOptions,
 } from "./redis-connection-pool";
 import type {
+  BusSubscription,
   Cursor,
   FetchOptions,
   HandleContext,
@@ -548,7 +549,7 @@ export class RedisStreamsBus implements RawBus {
     topic: Topic,
     opts: SubscriptionOptions,
     handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-  ): Promise<{ stop(): Promise<void> }> {
+  ): Promise<BusSubscription> {
     const streamKey = this.streamKey(topic);
     const abortController = new AbortController();
 
@@ -747,8 +748,11 @@ export class RedisStreamsBus implements RawBus {
         }
       }
     })();
+    // Callers may opt into `done`; transports must not create an unhandled rejection for older callers.
+    void running.catch(() => undefined);
 
     return {
+      done: running,
       stop: async () => {
         abortController.abort();
 

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -21,6 +21,7 @@ import {
   loadWorkspaceInstructions,
 } from "../src";
 import { createBashOutputSanitizer } from "../src/bash-output-sanitizer";
+import { BufferedFileSink } from "../src/buffered-file-sink";
 
 type ToolOptions = ToolExecutionOptions<unknown>;
 
@@ -291,7 +292,7 @@ describe("coding tools", () => {
         await executable(tools, "bash").execute(
           {
             command:
-              "printf '\\x1b[31mSTART\\x1b[0m'; printf 'x%.0s' {1..300}; printf ' API_TO'; sleep 0.02; printf 'KEN=very-secret-value END'; { printf 'ERR_START'; printf 'y%.0s' {1..200}; printf 'ERR_END'; } >&2",
+              "printf '\\x1b[31mSTART\\x1b[0m'; printf 'x%.0s' {1..300}; printf ' API_TOKEN=very-secret-value END'; { printf 'ERR_START'; printf 'y%.0s' {1..200}; printf 'ERR_END'; } >&2",
           },
           options("bash-artifact"),
         ),
@@ -329,13 +330,59 @@ describe("coding tools", () => {
       start = window.nextStart;
     }
     const complete = pages.join("");
-    expect(complete).toContain("<bash_tool_full_output>");
-    expect(complete).toContain("--- stdout ---");
-    expect(complete).toContain("--- stderr ---");
-    expect(complete).toContain("API_TOKEN=<redacted> END");
+    expect(complete).toBe(
+      `<bash_tool_full_output>\n--- stdout ---\nSTART${"x".repeat(300)} API_TOKEN=<redacted> END\n\n--- stderr ---\nERR_START${"y".repeat(200)}ERR_END\n</bash_tool_full_output>\n`,
+    );
     expect(complete).not.toContain("very-secret-value");
     expect(complete).not.toContain("\u001b");
-    expect(complete).toContain("ERR_END");
+  });
+
+  it("does not create a Bash spool directory for under-limit artifact output", async () => {
+    const isolatedTmp = path.join(cwd, "tmp");
+    await mkdir(isolatedTmp);
+    const previousTmpDir = process.env.TMPDIR;
+    process.env.TMPDIR = isolatedTmp;
+    try {
+      const artifacts = createToolResultArtifactStore(path.join(cwd, "small-artifacts"));
+      await artifacts.init();
+      const result = await executable(
+        createCodingToolset({
+          cwd,
+          bashMaxOutputBytes: 1024,
+          artifactIntegration: {
+            artifacts,
+            scopeId: "scope-small",
+            requestId: "request-small",
+          },
+        }),
+        "bash",
+      ).execute(
+        {
+          command:
+            'shopt -s nullglob; spools=("$TMPDIR"/lilac-coding-bash-*); printf "%s" "${#spools[@]}"',
+        },
+        options("bash-small-artifact"),
+      );
+
+      expect(result).toMatchObject({ stdout: "0", stderr: "", exitCode: 0 });
+      expect(await readdir(isolatedTmp)).toEqual([]);
+    } finally {
+      if (previousTmpDir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpDir;
+    }
+  });
+
+  it("buffers persistent spool writes into configured blocks", async () => {
+    const filePath = path.join(cwd, "buffered-sink.log");
+    const sink = await BufferedFileSink.open(filePath, { flags: "wx", blockBytes: 8 });
+
+    await sink.write("abc");
+    expect((await stat(filePath)).size).toBe(0);
+    await sink.write("defghijk");
+    expect((await stat(filePath)).size).toBe(8);
+    await sink.close();
+
+    expect(await readFile(filePath, "utf8")).toBe("abcdefghijk");
   });
 
   it("sanitizes terminal controls and secrets split across chunks", () => {
@@ -390,6 +437,27 @@ describe("coding tools", () => {
     expect(JSON.stringify(result)).not.toContain("artifactUri");
     expect(await readdir(artifacts.rootDir)).toEqual([]);
     expect(await bashSpoolDirectories()).toEqual(before);
+  });
+
+  it("throws for an invalid maxSpoolBytes configuration", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "invalid-spool-artifacts"));
+    await artifacts.init();
+    const bash = executable(
+      createCodingToolset({
+        cwd,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-invalid-spool",
+          requestId: "request-invalid-spool",
+          maxSpoolBytes: Number.POSITIVE_INFINITY,
+        },
+      }),
+      "bash",
+    );
+
+    await expect(
+      Promise.resolve(bash.execute({ command: "true" }, options("bash-invalid-spool"))),
+    ).rejects.toThrow("artifactIntegration.maxSpoolBytes must be a non-negative finite number");
   });
 
   it("cleans Bash spools after timeout, abort, and artifact persistence failure", async () => {

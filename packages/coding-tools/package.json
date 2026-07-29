@@ -24,10 +24,17 @@
     "./instructions": {
       "import": "./src/instructions.ts",
       "types": "./src/instructions.ts"
+    },
+    "./buffered-file-sink": {
+      "import": "./src/buffered-file-sink.ts",
+      "types": "./src/buffered-file-sink.ts"
     }
   },
   "private": true,
   "license": "MIT",
+  "scripts": {
+    "test": "bun test"
+  },
   "dependencies": {
     "@stanley2058/lilac-agent": "workspace:*",
     "@stanley2058/lilac-bash-safety": "workspace:*",

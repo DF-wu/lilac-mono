@@ -4,7 +4,9 @@ import {
   miniLilacSteeringCommittedChunkSchema,
   miniLilacSteeringChunkSchema,
   miniLilacStreamCursorChunkSchema,
+  type MiniLilacCompactResult,
   type MiniLilacControlResult,
+  type MiniLilacOutputRollback,
   type MiniLilacReasoning,
   type MiniLilacSessionSnapshot,
   type MiniLilacTodoState,
@@ -25,7 +27,12 @@ import {
   type InputEvent,
   type InputState,
 } from "./input-state";
-import { ChunkRenderer, renderInitialMessages, type TranscriptEntry } from "./render";
+import {
+  ChunkRenderer,
+  compactionEntry,
+  renderInitialMessages,
+  type TranscriptEntry,
+} from "./render";
 import { sessionPresentation, type SessionPresentation } from "./presentation";
 
 export interface ControllerUISink {
@@ -58,8 +65,13 @@ export interface ControllerOptions {
   readonly initialTodos?: MiniLilacTodoState;
   readonly initialBindings?: SessionBindings;
   readonly reconnectDelay?: (attempt: number) => Promise<void>;
+  /** Delay between session polls while following a detached compaction. */
+  readonly compactionWatchDelay?: () => Promise<void>;
   readonly onExit: () => void;
 }
+
+/** How often a detached compaction is polled for its outcome. */
+const COMPACTION_WATCH_INTERVAL_MS = 1_500;
 
 type StreamOutcome = "completed" | "disconnected" | "disposed" | "superseded";
 
@@ -84,6 +96,22 @@ export class Controller {
   private activeRunId: string | undefined;
   private activeReader: ReadableStreamDefaultReader<UIMessageChunk> | undefined;
   private pendingUndoCommandId: string | undefined;
+  /**
+   * Resolves once the running compact request is admitted server-side (its
+   * first lifecycle event). `esc` cancellation awaits this: a cancel that
+   * reaches the server before admission answers `inactive`, and the compaction
+   * would then proceed despite the user's request.
+   */
+  private compactionAdmission: Promise<void> = Promise.resolve();
+  private resolveCompactionAdmission: (() => void) | undefined;
+  /**
+   * Command id of the compaction this controller started, so `esc` cancels
+   * that operation and not an unrelated successor. Undefined when following a
+   * compaction admitted by an earlier client (reopened session).
+   */
+  private compactionCommandId: string | undefined;
+  private watchingDetachedCompaction = false;
+  /** Cancels only the in-flight manual compaction, not the whole session. */
   private bindings: SessionBindings;
   private presentation: SessionPresentation;
   private todos: MiniLilacTodoState;
@@ -135,10 +163,18 @@ export class Controller {
         queuedSteeringCount: options.initialSnapshot.queuedSteeringCount,
       }).state;
     }
+    if (options.initialSnapshot?.status === "compacting") {
+      // A compaction admitted by an earlier client is still running. It cannot
+      // be re-attached for live progress, but it must not be shown as idle:
+      // the server refuses prompts, and `esc` must still be able to cancel it.
+      this.state = reduceInput(this.state, { type: "compaction-observed" }).state;
+      this.compactionCommandId = options.initialSnapshot.activeCompactionCommandId ?? undefined;
+    }
     this.renderer = new ChunkRenderer(
       {
         append: (entry) => this.appendOutput(entry),
         update: (id, entry) => this.updateOutput(id, entry),
+        remove: (id) => this.removeOutput(id),
         appendText: (id, delta) => this.appendOutputText(id, delta),
         finish: (id) => this.finishOutput(id),
       },
@@ -147,6 +183,7 @@ export class Controller {
         onControl: (result) => this.onControl(result),
         onTodos: (todos) => this.onTodos(todos),
         onTranscriptReset: (reset) => this.onTranscriptReset(reset),
+        onOutputRollback: (rollback) => this.onOutputRollback(rollback),
       },
       { cwd: options.cwd ?? options.initialSnapshot?.cwd },
     );
@@ -165,6 +202,7 @@ export class Controller {
     this.options.ui.onBindings?.(this.bindings);
     this.options.ui.onSession?.(this.presentation);
     if (this.state.phase === "active") void this.resumeActiveSession();
+    else if (this.state.phase === "compacting") void this.watchDetachedCompaction();
   }
 
   /** Replace the editor value from a managed textarea. */
@@ -316,6 +354,9 @@ export class Controller {
       case "cancel":
         this.enqueueCancel();
         return;
+      case "cancel-compaction":
+        this.cancelCompaction();
+        return;
       case "exit":
         this.options.onExit();
         return;
@@ -384,6 +425,7 @@ export class Controller {
 
       if (
         recovery.kind === "session" &&
+        recovery.snapshot.status !== "compacting" &&
         recovery.messages?.some((candidate) => candidate.id === message.id)
       ) {
         resolveAdmission(undefined);
@@ -391,6 +433,30 @@ export class Controller {
         this.replaceMessages(recovery.messages);
         this.activeRunId = undefined;
         this.dispatch({ type: "agent-stopped" });
+        return;
+      }
+
+      if (recovery.kind === "session" && recovery.snapshot.status === "compacting") {
+        const promptWasCommitted =
+          recovery.messages?.some((candidate) => candidate.id === message.id) === true;
+        resolveAdmission(undefined);
+        if (this.resolvePromptAdmission === resolveAdmission) {
+          this.resolvePromptAdmission = undefined;
+        }
+        if (recovery.messages !== undefined) this.replaceMessages(recovery.messages);
+        else {
+          this.messages = this.messages.filter((candidate) => candidate.id !== message.id);
+          outputIds.forEach((id) => this.removeOutput(id));
+          this.runMessageBaseline = this.messages.length;
+          this.runOutputBaseline = this.output.length;
+        }
+        this.dispatch({ type: "admission-failed" });
+        if (!promptWasCommitted) {
+          this.restoreSubmittedDraft(draftText, files, pastedTexts, false, true);
+          this.commitError(error);
+        }
+        this.compactionCommandId = recovery.snapshot.activeCompactionCommandId ?? undefined;
+        void this.watchDetachedCompaction();
         return;
       }
 
@@ -747,6 +813,9 @@ export class Controller {
   }
 
   private acceptSnapshot(snapshot: MiniLilacSessionSnapshot): void {
+    if (snapshot.status === "compacting") {
+      this.compactionCommandId = snapshot.activeCompactionCommandId ?? undefined;
+    }
     this.bindings = {
       model: snapshot.model ?? undefined,
       profile: snapshot.profile ?? undefined,
@@ -793,6 +862,14 @@ export class Controller {
       ...renderInitialMessages(preservedSteering),
     ];
     this.notifyOutput();
+  }
+
+  private onOutputRollback(rollback: MiniLilacOutputRollback): void {
+    if (rollback.reason !== "cancel") return;
+    this.clearSteering();
+    this.pendingSteerOptimistic.clear();
+    this.pendingSteerCommandIds.clear();
+    this.interruptSteerCommandIds.clear();
   }
 
   private async runUndo(): Promise<void> {
@@ -857,29 +934,285 @@ export class Controller {
       this.dispatch({ type: "operation-completed" });
       return;
     }
+
+    // One entry, updated in place: a line per progress chunk would bury the
+    // transcript under the very operation meant to shrink it.
+    let entryId: string | undefined;
+    // Whether the server already told us how this ended. If it did, the promise
+    // rejection that follows is that same event, not a second thing to report.
+    let terminated = false;
+    let result: MiniLilacCompactResult;
+    // Cancellation must wait for the server to acknowledge the operation, so
+    // the admission gate opens on the first lifecycle event (or on failure).
+    this.compactionAdmission = new Promise((resolve) => {
+      this.resolveCompactionAdmission = resolve;
+    });
+    const clientCommandId = crypto.randomUUID();
+    this.compactionCommandId = clientCommandId;
     try {
-      const result = await this.options.transport.compact(
-        { sessionId: this.sessionId, clientCommandId: crypto.randomUUID() },
-        { signal: this.abortController.signal },
-      );
-      if (this.disposed) return;
-      if (result.status === "compacted") {
-        const messages = await this.options.transport.getMessages(this.sessionId, {
+      result = await this.options.transport.compact(
+        { sessionId: this.sessionId, clientCommandId },
+        {
+          // Only unsubscribes on teardown. Detaching does not cancel: the
+          // compaction keeps running and commits server-side either way.
           signal: this.abortController.signal,
-        });
-        if (this.disposed) return;
-        this.replaceMessages(messages);
+          onEvent: (event) => {
+            this.openCompactionAdmissionGate();
+            if (this.disposed) return;
+            if (event.phase !== "started" && event.phase !== "progress") terminated = true;
+            if (entryId === undefined) entryId = this.appendOutput(compactionEntry(event));
+            else this.updateOutput(entryId, compactionEntry(event));
+          },
+          onSession: (snapshot) => {
+            if (!this.disposed) this.acceptSnapshot(snapshot);
+          },
+        },
+      );
+    } catch (error) {
+      this.openCompactionAdmissionGate();
+      if (this.disposed) return;
+      if (terminated) {
+        // The terminal event already rendered on the entry; this rejection is
+        // the same news, not a second thing to report.
+        this.compactionCommandId = undefined;
+        if (!(await this.followLatestSessionActivity())) {
+          this.dispatch({ type: "operation-failed" });
+        }
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (entryId === undefined && message.includes("MiniLilac request failed")) {
+        // The server refused the request outright; nothing was admitted and
+        // there is nothing to keep following.
+        this.compactionCommandId = undefined;
+        if (!(await this.followLatestSessionActivity())) {
+          this.dispatch({ type: "operation-failed" });
+        }
+        this.commitError(error);
+        return;
+      }
+      // The stream broke before any terminal event, so the compaction is not
+      // known to have failed — it is only out of view. Keep representing it
+      // and follow the session until the server reports how it ended.
+      if (entryId !== undefined) this.removeOutput(entryId);
+      this.appendOutput({
+        kind: "status",
+        tone: "warning",
+        text: `compaction stream interrupted (${message}); it continues server-side`,
+      });
+      await this.watchDetachedCompaction();
+      return;
+    } finally {
+      this.openCompactionAdmissionGate();
+    }
+
+    if (this.disposed) return;
+    this.compactionCommandId = undefined;
+    if (result.status !== "compacted") {
+      if (!(await this.followLatestSessionActivity())) {
+        this.dispatch({ type: "operation-completed" });
+      }
+      return;
+    }
+
+    // Compaction is committed from here on. A failure below is a failure to
+    // refresh the local view, not a failed compaction, and must not be reported
+    // as one.
+    try {
+      const messages = await this.options.transport.getMessages(this.sessionId, {
+        signal: this.abortController.signal,
+      });
+      if (this.disposed) return;
+      // The server persists its own compaction entry, so the live one would
+      // otherwise be shown twice after the transcript is replaced.
+      const liveEntryId = entryId;
+      entryId = undefined;
+      this.replaceMessages(messages);
+      if (liveEntryId !== undefined) this.removeOutput(liveEntryId);
+      const snapshot = await this.options.transport.getSession(this.sessionId, {
+        signal: this.abortController.signal,
+      });
+      if (this.disposed) return;
+      this.acceptSnapshot(snapshot);
+      if (!this.followSnapshotActivity(snapshot)) {
+        this.dispatch({ type: "operation-completed" });
+      }
+    } catch (error) {
+      if (this.disposed) return;
+      if (!(await this.followLatestSessionActivity())) {
+        this.dispatch({ type: "operation-completed" });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendOutput({
+        kind: "status",
+        tone: "warning",
+        text: `context compacted, but refreshing the transcript failed: ${message}`,
+      });
+    }
+  }
+
+  /**
+   * Ask the server to stop compacting.
+   *
+   * Compaction outlives the request that started it, so abandoning that request
+   * would only detach this client. The terminal `cancelled` event arrives on the
+   * still-open stream and updates the live entry.
+   */
+  private cancelCompaction(): void {
+    // Captured at `esc` time: if a successor compaction is admitted while this
+    // cancel is in flight, the server answers `inactive` for the old target
+    // instead of stopping the newer operation.
+    const observedCommandId = this.compactionCommandId;
+    void (async () => {
+      // `esc` can beat the compact POST to the server. A cancel that arrives
+      // before admission answers `inactive`, and the compaction then proceeds
+      // despite the user's request — so wait for the acknowledged admission.
+      await this.compactionAdmission;
+      if (this.disposed) return;
+      let clientCommandId = observedCommandId;
+      if (clientCommandId === undefined) {
         const snapshot = await this.options.transport.getSession(this.sessionId, {
           signal: this.abortController.signal,
         });
         if (this.disposed) return;
         this.acceptSnapshot(snapshot);
+        if (snapshot.status !== "compacting" || snapshot.activeCompactionCommandId == null) return;
+        clientCommandId = snapshot.activeCompactionCommandId;
       }
-      this.dispatch({ type: "operation-completed" });
-    } catch (error) {
-      if (this.disposed) return;
-      this.dispatch({ type: "operation-failed" });
-      this.commitError(error);
+      const result = await this.options.transport.cancelCompaction(
+        { sessionId: this.sessionId, clientCommandId },
+        { signal: this.abortController.signal },
+      );
+      if (result.status === "inactive" && this.state.phase === "compacting") {
+        await this.followLatestSessionActivity();
+      }
+    })().catch((error: unknown) => {
+      if (!this.disposed) this.commitError(error);
+    });
+  }
+
+  /** Open the gate that `esc` cancellation waits behind. */
+  private openCompactionAdmissionGate(): void {
+    this.resolveCompactionAdmission?.();
+    this.resolveCompactionAdmission = undefined;
+  }
+
+  /**
+   * Follow a server-side compaction this client is not attached to.
+   *
+   * Live progress cannot be re-joined once detached, so the session is polled
+   * until its status leaves `compacting`, then the transcript and snapshot are
+   * refreshed — the committed compaction entry (if any) arrives with them. The
+   * input stays in the `compacting` phase throughout, keeping `esc cancel`
+   * reachable and operations the server would reject unavailable.
+   */
+  private async watchDetachedCompaction(): Promise<void> {
+    if (this.watchingDetachedCompaction) return;
+    this.watchingDetachedCompaction = true;
+    try {
+      this.dispatch({ type: "compaction-observed" });
+      const wait =
+        this.options.compactionWatchDelay ?? (() => Bun.sleep(COMPACTION_WATCH_INTERVAL_MS));
+      for (;;) {
+        let terminal: MiniLilacSessionSnapshot | undefined;
+        // Follow one compaction generation to a non-compacting snapshot.
+        for (;;) {
+          if (this.disposed) return;
+          try {
+            const snapshot = await this.options.transport.getSession(this.sessionId, {
+              signal: this.abortController.signal,
+            });
+            if (this.disposed) return;
+            this.acceptSnapshot(snapshot);
+            if (snapshot.status !== "compacting") {
+              this.compactionCommandId = undefined;
+              terminal = snapshot;
+              break;
+            }
+          } catch {
+            // Transient: the outcome is still unknown, so keep watching.
+            if (this.disposed) return;
+          }
+          await wait();
+        }
+
+        try {
+          const messages = await this.options.transport.getMessages(this.sessionId, {
+            signal: this.abortController.signal,
+          });
+          if (this.disposed) return;
+          this.replaceMessages(messages);
+        } catch (error) {
+          if (this.disposed) return;
+          this.appendOutput({
+            kind: "status",
+            tone: "warning",
+            text: `compaction ended, but refreshing the transcript failed: ${errorMessage(error)}`,
+          });
+        }
+
+        if (terminal !== undefined) {
+          try {
+            terminal = await this.options.transport.getSession(this.sessionId, {
+              signal: this.abortController.signal,
+            });
+            if (this.disposed) return;
+            this.acceptSnapshot(terminal);
+          } catch {
+            // The terminal poll is still authoritative if this refresh fails.
+          }
+        }
+        // A successor compaction may begin while its predecessor's transcript is
+        // being refreshed. Continue in this watcher instead of recursively
+        // calling a watcher that the reentrancy guard would discard.
+        if (terminal?.status === "compacting") continue;
+        if (terminal !== undefined && this.followSnapshotActivity(terminal)) return;
+        this.dispatch({ type: "operation-completed" });
+        return;
+      }
+    } finally {
+      this.watchingDetachedCompaction = false;
+    }
+  }
+
+  /** Keep editor controls aligned with server-side work observed in a snapshot. */
+  private followSnapshotActivity(snapshot: MiniLilacSessionSnapshot): boolean {
+    if (snapshot.status === "compacting") {
+      this.compactionCommandId = snapshot.activeCompactionCommandId ?? undefined;
+      void this.watchDetachedCompaction();
+      return true;
+    }
+    this.compactionCommandId = undefined;
+    if (
+      (snapshot.status === "streaming" || snapshot.status === "cancelling") &&
+      snapshot.activeRunId !== null
+    ) {
+      // Another client started a run as compaction ended. Adopt its identity so
+      // steering and Escape target that run rather than a stale admission.
+      this.activeRunId = snapshot.activeRunId;
+      this.promptAdmission = Promise.resolve(snapshot.activeRunId);
+      this.dispatch({ type: "agent-started" });
+      this.dispatch({
+        type: "steering-updated",
+        queuedSteeringCount: snapshot.queuedSteeringCount,
+      });
+      void this.resumeActiveSession();
+      return true;
+    }
+    return false;
+  }
+
+  /** Refresh server activity after a terminal/refused operation before idling. */
+  private async followLatestSessionActivity(): Promise<boolean> {
+    try {
+      const snapshot = await this.options.transport.getSession(this.sessionId, {
+        signal: this.abortController.signal,
+      });
+      if (this.disposed) return false;
+      this.acceptSnapshot(snapshot);
+      return this.followSnapshotActivity(snapshot);
+    } catch {
+      return false;
     }
   }
 
@@ -887,7 +1220,28 @@ export class Controller {
     await this.reconcile(generation);
     if (!this.isCurrentRun(generation)) return;
     this.clearSteering();
+    const completedRunId = this.activeRunId;
     this.activeRunId = undefined;
+    try {
+      const snapshot = await this.options.transport.getSession(this.sessionId, {
+        signal: this.abortController.signal,
+      });
+      if (!this.isCurrentRun(generation)) return;
+      this.acceptSnapshot(snapshot);
+      if (snapshot.status === "compacting") {
+        // This run is over, so leave active before the compaction watcher asks
+        // the reducer to enter its distinct busy phase.
+        this.dispatch({ type: "agent-stopped" });
+        this.followSnapshotActivity(snapshot);
+        return;
+      }
+      const stillReportsCompletedRun =
+        (snapshot.status === "streaming" || snapshot.status === "cancelling") &&
+        snapshot.activeRunId === completedRunId;
+      if (!stillReportsCompletedRun && this.followSnapshotActivity(snapshot)) return;
+    } catch {
+      // Message reconciliation is still sufficient to finish the known run.
+    }
     this.dispatch({ type: "agent-stopped" });
   }
 

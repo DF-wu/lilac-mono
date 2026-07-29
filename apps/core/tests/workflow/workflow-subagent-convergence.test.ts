@@ -41,6 +41,7 @@ const AUTHENTICATED_PARENT = { platform: "discord", userId: "user-1" } as const;
 function createInMemoryRawBus(control?: {
   failProgressRequested?: boolean;
   progressRequestedFailures?: number;
+  beforePublish?: (input: { type: string; headers: PublishOptions["headers"] }) => Promise<void>;
 }): RawBus & { activeSubscriptions(): number } {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subscriptions = new Set<{
@@ -49,6 +50,7 @@ function createInMemoryRawBus(control?: {
   }>();
   return {
     publish: async <TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) => {
+      await control?.beforePublish?.({ type: options.type, headers: options.headers });
       if (
         control?.failProgressRequested &&
         options.type === lilacEventTypes.EvtWorkflowProgressRequested
@@ -104,6 +106,14 @@ function createInMemoryRawBus(control?: {
     activeSubscriptions: () => subscriptions.size,
     close: async () => {},
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 class FallbackTrackingWorkflowStore extends DurableWorkflowStore {
@@ -605,6 +615,82 @@ describe("workflow subagent convergence", () => {
     expect(parentActivity).toBe(activityBefore + 3);
     expect(updates).toHaveLength(updateCount);
     expect(updates.at(-1)?.display).toBe(expectedTree);
+
+    await parent.close();
+    await bridge.stop();
+    await bus.close();
+    store.close();
+  });
+
+  it("preserves first child activity and publishes only the latest queued trailing activity", async () => {
+    const { store } = await createRun("parent:activity-coalescing");
+    const firstParentPublishStarted = deferred<void>();
+    const releaseFirstParentPublish = deferred<void>();
+    let blockedFirstParentPublish = false;
+    const bus = createLilacBus(
+      createInMemoryRawBus({
+        beforePublish: async ({ type, headers }) => {
+          if (
+            blockedFirstParentPublish ||
+            type !== lilacEventTypes.EvtAgentOutputToolCall ||
+            headers?.request_id !== "parent:activity-coalescing"
+          ) {
+            return;
+          }
+          blockedFirstParentPublish = true;
+          firstParentPublishStarted.resolve();
+          await releaseFirstParentPublish.promise;
+        },
+      }),
+    );
+    const updates: string[] = [];
+    await bus.subscribeTopic(
+      outReqTopic("parent:activity-coalescing"),
+      { mode: "tail", offset: { type: "begin" } },
+      async (message, context) => {
+        if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+          updates.push(message.data.display);
+        }
+        await context.commit();
+      },
+    );
+    const bridge = new WorkflowLiveParentBridge({
+      bus,
+      store,
+      subscriptionId: "test-live-parent-activity-coalescing",
+    });
+    await bridge.start();
+    const parent = bridge.registerParent({ parentRequestId: "parent:activity-coalescing" });
+    await parent.ready;
+    const childHeaders = {
+      request_id: "sub:child:1",
+      session_id: "sub:channel:1:named:audit",
+      request_client: "unknown" as const,
+    };
+
+    const first = bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "first" },
+      { headers: childHeaders },
+    );
+    await firstParentPublishStarted.promise;
+    const second = bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "second" },
+      { headers: childHeaders },
+    );
+    const latest = bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "latest" },
+      { headers: childHeaders },
+    );
+
+    releaseFirstParentPublish.resolve();
+    await Promise.all([first, second, latest]);
+
+    expect(updates).toHaveLength(2);
+    expect(updates[0]).toContain("output: first");
+    expect(updates[1]).toContain("output: latest");
 
     await parent.close();
     await bridge.stop();

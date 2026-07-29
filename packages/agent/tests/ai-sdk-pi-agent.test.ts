@@ -1483,6 +1483,272 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     ]);
   });
 
+  it("rewinds cancellation to the last completed streamed content block", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "completed-call",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
+              type: "tool-result",
+              toolCallId: "completed-call",
+              toolName: "provider_search",
+              input: {},
+              result: "result",
+              providerExecuted: true,
+            },
+            { type: "text-start", id: "completed-text" },
+            { type: "text-delta", id: "completed-text", delta: "kept text" },
+            { type: "text-end", id: "completed-text" },
+            { type: "reasoning-start", id: "discarded-reasoning" },
+            { type: "reasoning-delta", id: "discarded-reasoning", delta: "discard me" },
+            { type: "reasoning-end", id: "discarded-reasoning" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    let cancelled = false;
+    agent.subscribe((event) => {
+      if (
+        !cancelled &&
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "thinking_delta" &&
+        event.assistantMessageEvent.id === "discarded-reasoning"
+      ) {
+        cancelled = true;
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "completed-call",
+            toolName: "provider_search",
+            input: {},
+            providerExecuted: true,
+          },
+          {
+            type: "tool-result",
+            toolCallId: "completed-call",
+            toolName: "provider_search",
+            output: { type: "text", value: "result" },
+          },
+          { type: "text", text: "kept text" },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(agent.state.messages)).not.toContain("discard me");
+  });
+
+  it("drops open text while retaining completed reasoning", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "reasoning-start", id: "completed-reasoning" },
+            { type: "reasoning-delta", id: "completed-reasoning", delta: "kept reasoning" },
+            { type: "reasoning-end", id: "completed-reasoning" },
+            { type: "text-start", id: "discarded-text" },
+            { type: "text-delta", id: "discarded-text", delta: "discard me" },
+            { type: "text-end", id: "discarded-text" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    agent.subscribe((event) => {
+      if (
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "text_delta" &&
+        event.assistantMessageEvent.id === "discarded-text"
+      ) {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "reasoning", text: "kept reasoning" }] },
+    ]);
+  });
+
+  it("drops an unresolved provider tool while retaining the preceding text", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "completed-text" },
+            { type: "text-delta", id: "completed-text", delta: "kept text" },
+            { type: "text-end", id: "completed-text" },
+            {
+              type: "tool-call",
+              toolCallId: "discarded-call",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    agent.subscribe((event) => {
+      if (
+        event.type === "message_end" &&
+        event.message.role === "assistant" &&
+        Array.isArray(event.message.content) &&
+        event.message.content.some(
+          (part) => part.type === "tool-call" && part.toolCallId === "discarded-call",
+        )
+      ) {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "text", text: "kept text" }] },
+    ]);
+  });
+
+  it("drops a cancelled local tool while retaining preceding assistant content", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "completed-text" },
+            { type: "text-delta", id: "completed-text", delta: "kept text" },
+            { type: "text-end", id: "completed-text" },
+            {
+              type: "tool-call",
+              toolCallId: "discarded-local-call",
+              toolName: "lookup",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "unexpected",
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_start" && event.toolCallId === "discarded-local-call") {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "text", text: "kept text" }] },
+    ]);
+  });
+
+  it("keeps an inline tool pair when a later local tool is cancelled", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "completed-inline",
+              toolName: "provider_search",
+              input: "{}",
+              providerExecuted: true,
+            },
+            {
+              type: "tool-result",
+              toolCallId: "completed-inline",
+              toolName: "provider_search",
+              input: {},
+              result: "inline result",
+              providerExecuted: true,
+            },
+            {
+              type: "tool-call",
+              toolCallId: "discarded-local",
+              toolName: "lookup",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "unexpected",
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_start" && event.toolCallId === "discarded-local") {
+        agent.cancel();
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(JSON.stringify(agent.state.messages)).toContain("completed-inline");
+    expect(JSON.stringify(agent.state.messages)).toContain("inline result");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("discarded-local");
+  });
+
   it("normalizes an inline provider tool result and continues the completed exchange", async () => {
     const model = new MockLanguageModelV4({
       doStream: [
@@ -1871,6 +2137,55 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
 
     expect(cleanedUp).toBe(true);
     expect(agent.state.messages).toEqual([{ role: "user", content: "cancel streaming tool" }]);
+  });
+
+  it("keeps completed siblings when a parallel tool batch is cancelled", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "prefix" },
+            { type: "text-delta", id: "prefix", delta: "kept prefix" },
+            { type: "text-end", id: "prefix" },
+            { type: "tool-call", toolCallId: "completed", toolName: "fast", input: "{}" },
+            { type: "tool-call", toolCallId: "discarded", toolName: "slow", input: "{}" },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        fast: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "fast result",
+        }),
+        slow: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: (_input, { abortSignal }) =>
+            new Promise<string>((_resolve, reject) => {
+              const abort = () => reject(new DOMException("cancelled", "AbortError"));
+              if (abortSignal?.aborted) abort();
+              else abortSignal?.addEventListener("abort", abort, { once: true });
+            }),
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_end" && event.toolCallId === "completed") agent.cancel();
+    });
+
+    await agent.prompt("start");
+
+    expect(JSON.stringify(agent.state.messages)).toContain("kept prefix");
+    expect(JSON.stringify(agent.state.messages)).toContain("fast result");
+    expect(JSON.stringify(agent.state.messages)).not.toContain('"toolCallId":"discarded"');
   });
 });
 
@@ -2372,6 +2687,323 @@ describe("AiSdkPiAgent turn boundaries", () => {
 });
 
 describe("AiSdkPiAgent tool-call expansion", () => {
+  it("settles native expansion children before ordered cohort normalization and finalization", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: "batch-ordered", toolName: "batch", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const firstRelease = deferred();
+    const secondRelease = deferred();
+    const bothStarted = deferred();
+    const secondConverted = deferred();
+    let started = 0;
+    let cohortCalls = 0;
+    const ordinaryNormalizedNames: string[] = [];
+    const cohortEntries: Array<Array<{ toolCallId: string; output: unknown }>> = [];
+    const childEndIds: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        batch: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () =>
+            new ToolExpansion({ ok: true }, [
+              { toolCallId: "child-first", toolName: "first_child", input: {} },
+              { toolCallId: "child-second", toolName: "second_child", input: {} },
+            ]),
+        }),
+        first_child: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            started += 1;
+            if (started === 2) bothStarted.resolve();
+            await firstRelease.promise;
+            return { raw: "first" };
+          },
+        }),
+        second_child: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            started += 1;
+            if (started === 2) bothStarted.resolve();
+            await secondRelease.promise;
+            return { raw: "second" };
+          },
+          toModelOutput: ({ output }) => {
+            secondConverted.resolve();
+            return { type: "json", value: output };
+          },
+        }),
+      },
+      normalizeToolResultOutput: (output, context) => {
+        ordinaryNormalizedNames.push(context.toolName);
+        return output;
+      },
+      normalizeSettledToolResultOutputs: async (entries) => {
+        cohortCalls += 1;
+        cohortEntries.push(
+          entries.map((entry) => ({
+            toolCallId: entry.context.toolCallId,
+            output: entry.output,
+          })),
+        );
+        return entries.map((entry) => ({
+          type: "text" as const,
+          value: `cohort:${entry.context.toolCallId}`,
+        }));
+      },
+    });
+    agent.subscribe((event) => {
+      if (
+        event.type === "tool_execution_end" &&
+        (event.toolCallId === "child-first" || event.toolCallId === "child-second")
+      ) {
+        childEndIds.push(event.toolCallId);
+      }
+    });
+
+    const run = agent.prompt("expand in order");
+    await bothStarted.promise;
+    secondRelease.resolve();
+    await secondConverted.promise;
+    await Promise.resolve();
+
+    expect(childEndIds).toEqual([]);
+    expect(cohortCalls).toBe(0);
+    expect(
+      agent.state.messages.some(
+        (message) =>
+          message.role === "tool" &&
+          message.content.some(
+            (part) =>
+              part.type === "tool-result" &&
+              (part.toolCallId === "child-first" || part.toolCallId === "child-second"),
+          ),
+      ),
+    ).toBe(false);
+
+    firstRelease.resolve();
+    await run;
+
+    expect(cohortCalls).toBe(1);
+    expect(cohortEntries).toEqual([
+      [
+        { toolCallId: "child-first", output: { type: "json", value: { raw: "first" } } },
+        { toolCallId: "child-second", output: { type: "json", value: { raw: "second" } } },
+      ],
+    ]);
+    expect(ordinaryNormalizedNames).toEqual(["batch"]);
+    expect(childEndIds).toEqual(["child-first", "child-second"]);
+    const childResultIds = agent.state.messages
+      .filter((message): message is ToolModelMessage => message.role === "tool")
+      .flatMap((message) =>
+        message.content.flatMap((part) =>
+          part.type === "tool-result" && part.toolCallId.startsWith("child-")
+            ? [part.toolCallId]
+            : [],
+        ),
+      );
+    expect(childResultIds).toEqual(["child-first", "child-second"]);
+  });
+
+  it("executes external expansion children without synthetic transcript messages", async () => {
+    const releaseFirst = deferred();
+    const firstStarted = deferred();
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      messages: [{ role: "user", content: "existing" }],
+      tools: {
+        batch: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () =>
+            new ToolExpansion({ accepted: true }, [
+              { toolCallId: "external-first", toolName: "first_child", input: {} },
+              { toolCallId: "external-second", toolName: "second_child", input: {} },
+            ]),
+        }),
+        first_child: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            firstStarted.resolve();
+            await releaseFirst.promise;
+            return "first";
+          },
+        }),
+        second_child: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            await firstStarted.promise;
+            releaseFirst.resolve();
+            return "second";
+          },
+        }),
+      },
+    });
+
+    const outcome = await agent.executeExternalToolCall({
+      toolCallId: "external-parent",
+      toolName: "batch",
+      input: {},
+    });
+
+    expect(outcome.executedExpansion).toEqual({
+      children: [
+        {
+          toolCallId: "external-first",
+          toolName: "first_child",
+          isError: false,
+          outcome: "success",
+          toolOutput: { type: "json", value: "first" },
+        },
+        {
+          toolCallId: "external-second",
+          toolName: "second_child",
+          isError: false,
+          outcome: "success",
+          toolOutput: { type: "json", value: "second" },
+        },
+      ],
+    });
+    expect(agent.state.messages).toEqual([{ role: "user", content: "existing" }]);
+    expect(agent.state.pendingToolCalls.size).toBe(0);
+  });
+
+  it("checkpoints finalized children when abort arrives during cohort normalization", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: "batch-abort", toolName: "batch", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+      ],
+    });
+    const normalizerEntered = deferred();
+    const releaseNormalizer = deferred();
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        batch: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () =>
+            new ToolExpansion({ ok: true }, [
+              { toolCallId: "abort-child", toolName: "child", input: {} },
+            ]),
+        }),
+        child: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => ({ completed: true }),
+        }),
+      },
+      normalizeSettledToolResultOutputs: async (entries) => {
+        normalizerEntered.resolve();
+        await releaseNormalizer.promise;
+        return entries.map((entry) => entry.output);
+      },
+    });
+    let endedMessages: readonly ModelMessage[] = [];
+    agent.subscribe((event) => {
+      if (event.type === "agent_end") endedMessages = event.messages;
+    });
+
+    const run = agent.prompt("expand then abort");
+    await normalizerEntered.promise;
+    agent.abort();
+    releaseNormalizer.resolve();
+    await run;
+
+    expect(agent.state.pendingToolCalls.size).toBe(0);
+    expect(
+      agent
+        .getRecoverableMessages()
+        .filter((message): message is ToolModelMessage => message.role === "tool")
+        .flatMap((message) =>
+          message.content.flatMap((part) => (part.type === "tool-result" ? [part.toolCallId] : [])),
+        ),
+    ).toContain("abort-child");
+    expect(
+      endedMessages
+        .filter((message): message is ToolModelMessage => message.role === "tool")
+        .flatMap((message) =>
+          message.content.flatMap((part) => (part.type === "tool-result" ? [part.toolCallId] : [])),
+        ),
+    ).toContain("abort-child");
+  });
+
+  it("returns bounded placeholders when cohort normalization fails", async () => {
+    const ordinaryNames: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      tools: {
+        batch: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () =>
+            new ToolExpansion({ ok: true }, [
+              { toolCallId: "fallback-child", toolName: "child", input: {} },
+            ]),
+        }),
+        child: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "raw",
+        }),
+      },
+      normalizeToolResultOutput: (output, context) => {
+        ordinaryNames.push(context.toolName);
+        return output;
+      },
+      normalizeSettledToolResultOutputs: async () => {
+        throw new Error("group failed");
+      },
+    });
+
+    const outcome = await agent.executeExternalToolCall({
+      toolCallId: "fallback-parent",
+      toolName: "batch",
+      input: {},
+    });
+
+    expect(outcome.executedExpansion?.children[0]?.toolOutput).toEqual({
+      type: "error-text",
+      value: "[settled tool results could not be normalized]",
+    });
+    expect(ordinaryNames).toEqual(["batch"]);
+    expect(agent.state.pendingToolCalls.size).toBe(0);
+  });
+
   it("appends synthetic child calls after the parent result and uses normal child semantics", async () => {
     const model = new MockLanguageModelV4({
       doStream: [

@@ -5,22 +5,38 @@ const MAX_TITLE_LENGTH = 100;
 const snapshotPresentationSchema = z.object({
   title: z.string().optional(),
   inputTokens: z.number().nonnegative().nullable().optional(),
+  inputTokensEstimated: z.boolean().optional(),
   contextWindow: z.number().positive().nullable().optional(),
+  compactionThreshold: z.number().positive().max(1).optional(),
 });
 
 export interface SessionPresentation {
   readonly title: string;
   readonly inputTokens: number | null;
+  /** True when `inputTokens` is a post-compaction estimate, not reported usage. */
+  readonly inputTokensEstimated: boolean;
   readonly contextWindow: number | null;
+  /** Context fraction at which the server compacts automatically. */
+  readonly compactionThreshold: number | null;
 }
+
+const EMPTY_PRESENTATION: SessionPresentation = {
+  title: "Mini Lilac",
+  inputTokens: null,
+  inputTokensEstimated: false,
+  contextWindow: null,
+  compactionThreshold: null,
+};
 
 export function sessionPresentation(snapshot: unknown): SessionPresentation {
   const parsed = snapshotPresentationSchema.safeParse(snapshot);
-  if (!parsed.success) return { title: "Mini Lilac", inputTokens: null, contextWindow: null };
+  if (!parsed.success) return EMPTY_PRESENTATION;
   return {
     title: parsed.data.title ?? "Mini Lilac",
     inputTokens: parsed.data.inputTokens ?? null,
+    inputTokensEstimated: parsed.data.inputTokensEstimated ?? false,
     contextWindow: parsed.data.contextWindow ?? null,
+    compactionThreshold: parsed.data.compactionThreshold ?? null,
   };
 }
 
@@ -46,10 +62,27 @@ export function resolveContextWindow(
   return sessionContextWindow ?? modelContextWindow ?? null;
 }
 
+/**
+ * Context meter text.
+ *
+ * The threshold is shown once usage is within ten points of it, so the user can
+ * compact at a clean boundary instead of being interrupted mid-task. A leading
+ * tilde marks an estimate, which is what post-compaction usage is until the next
+ * turn reports real numbers.
+ */
 export function formatTokenUsage(
   inputTokens: number | null,
   contextWindow: number | null,
+  options: { estimated?: boolean; compactionThreshold?: number | null } = {},
 ): string | undefined {
   if (inputTokens === null || contextWindow === null || contextWindow <= 0) return undefined;
-  return `${formatTokenCount(inputTokens)} (${Math.round((inputTokens / contextWindow) * 100)}%)`;
+  const fraction = inputTokens / contextWindow;
+  const percent = Math.round(fraction * 100);
+  const prefix = options.estimated === true ? "~" : "";
+  const threshold = options.compactionThreshold ?? null;
+  const showThreshold = threshold !== null && fraction >= threshold - 0.1;
+  const detail = showThreshold
+    ? `${percent}% · compacts at ${Math.round(threshold * 100)}%`
+    : `${percent}%`;
+  return `${prefix}${formatTokenCount(inputTokens)} (${detail})`;
 }

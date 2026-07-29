@@ -126,6 +126,96 @@ class FailingFirstWakeupRawBus extends IdleRawBus {
   }
 }
 
+class HeartbeatTrackingWaitStore extends DurableWorkflowStore {
+  readonly resolverLeaseRefreshes: number[] = [];
+
+  override refreshWorkflowWaitResolverLease(ownerId: string, now: number): boolean {
+    this.resolverLeaseRefreshes.push(now);
+    return super.refreshWorkflowWaitResolverLease(ownerId, now);
+  }
+}
+
+class LeaseTrackingWaitStore extends DurableWorkflowStore {
+  resolverLeaseReleases = 0;
+  private nextLeaseClaimObserver: (() => void) | null = null;
+
+  observeNextLeaseClaim(): Promise<void> {
+    return new Promise((resolve) => {
+      this.nextLeaseClaimObserver = resolve;
+    });
+  }
+
+  override claimWorkflowWaitResolverLease(
+    input: Parameters<DurableWorkflowStore["claimWorkflowWaitResolverLease"]>[0],
+  ): boolean {
+    const claimed = super.claimWorkflowWaitResolverLease(input);
+    const observer = this.nextLeaseClaimObserver;
+    this.nextLeaseClaimObserver = null;
+    observer?.();
+    return claimed;
+  }
+
+  override releaseWorkflowWaitResolverLease(ownerId: string): void {
+    this.resolverLeaseReleases += 1;
+    super.releaseWorkflowWaitResolverLease(ownerId);
+  }
+}
+
+class CompletingRawBus extends IdleRawBus {
+  subscriptionCount = 0;
+  subscriptionAttempts = 0;
+  private failingSubscriptions = 0;
+  private readonly completions: Array<{
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  private nextSubscriptionObserver: (() => void) | null = null;
+
+  observeNextSubscription(): Promise<void> {
+    return new Promise((resolve) => {
+      this.nextSubscriptionObserver = resolve;
+    });
+  }
+
+  failNextSubscriptions(count: number): void {
+    this.failingSubscriptions = count;
+  }
+
+  terminate(index: number, error?: unknown): void {
+    const completion = this.completions[index];
+    if (!completion) throw new Error(`Missing subscription completion ${index}`);
+    if (error === undefined) completion.resolve();
+    else completion.reject(error);
+  }
+
+  override async subscribe<TData>(
+    topic: string,
+    options: SubscriptionOptions,
+    handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+  ) {
+    this.subscriptionAttempts += 1;
+    if (this.failingSubscriptions > 0) {
+      this.failingSubscriptions -= 1;
+      throw new Error("simulated subscription startup failure");
+    }
+    const subscription = await super.subscribe(topic, options, handler);
+    const completion = Promise.withResolvers<void>();
+    this.completions.push(completion);
+    this.subscriptionCount += 1;
+    const observer = this.nextSubscriptionObserver;
+    this.nextSubscriptionObserver = null;
+    observer?.();
+    return {
+      done: completion.promise,
+      stop: async () => {
+        completion.resolve();
+        await subscription.stop();
+      },
+    };
+  }
+}
+
 function createRunAndWait(
   store: DurableWorkflowStore,
   input: { runId: string; operationId: string; wait: Omit<WorkflowWait, "runId" | "operationId"> },
@@ -231,6 +321,205 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("WorkflowWaitResolver", () => {
+  it("paces lease heartbeats independently of timer polls and adapter events", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-heartbeat-${crypto.randomUUID()}.sqlite`);
+    const store = new HeartbeatTrackingWaitStore(dbPath);
+    const bus = createLilacBus(new IdleRawBus());
+    let now = 100;
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-heartbeat-pacing",
+      now: () => now,
+      pollMs: 1_000_000,
+      leaseHeartbeatMs: 1_000,
+    });
+    const publishAdapterEvent = async (messageId: string): Promise<void> => {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: "unused-channel",
+        messageId,
+        userId: "user-1",
+        text: "unused",
+        ts: now,
+        raw: {},
+      });
+    };
+    try {
+      await resolver.start();
+      expect(store.resolverLeaseRefreshes).toEqual([]);
+
+      now = 350;
+      await resolver.reconcileTimers();
+      now = 600;
+      await publishAdapterEvent("early-event");
+      now = 1_099;
+      await resolver.reconcileTimers();
+      expect(store.resolverLeaseRefreshes).toEqual([]);
+
+      now = 1_100;
+      await publishAdapterEvent("due-event");
+      await publishAdapterEvent("same-time-event");
+      expect(store.resolverLeaseRefreshes).toEqual([1_100]);
+
+      now = 2_100;
+      await resolver.reconcileTimers();
+      expect(store.resolverLeaseRefreshes).toEqual([1_100, 2_100]);
+    } finally {
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("checks lease ownership without refreshing before timer side effects", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-read-ownership-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const bus = createLilacBus(new IdleRawBus());
+    let now = 50;
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-read-ownership",
+      now: () => now,
+      pollMs: 1_000_000,
+      leaseHeartbeatMs: 1_000,
+    });
+    try {
+      createRunAndWait(store, {
+        runId: "lease-lost-sleep",
+        operationId: "sleep-1",
+        wait: {
+          state: "pending",
+          match: { kind: "sleep" },
+          matchKey: "sleep:100",
+          dueAt: 100,
+          deadlineAt: null,
+          resolverCursor: null,
+          result: null,
+          resolvedBy: null,
+          claimedBy: null,
+          claimedAt: null,
+          createdAt: 3,
+          updatedAt: 3,
+          resolvedAt: null,
+        },
+      });
+      await resolver.start();
+      expect(
+        store.claimWorkflowWaitResolverLease({
+          ownerId: "successor",
+          now: 60,
+          staleBefore: Number.MAX_SAFE_INTEGER,
+        }),
+      ).toBe(true);
+
+      now = 100;
+      await resolver.reconcileTimers();
+      expect(store.getWait("lease-lost-sleep", "sleep-1")?.state).toBe("pending");
+      expect(store.isWorkflowWaitResolverLeaseOwner("successor")).toBe(true);
+    } finally {
+      await resolver.stop();
+      store.releaseWorkflowWaitResolverLease("successor");
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  for (const termination of ["completion", "failure"] as const) {
+    it(`releases its lease and resubscribes after unexpected subscription ${termination}`, async () => {
+      const dbPath = join(tmpdir(), `workflow-wait-subscription-${crypto.randomUUID()}.sqlite`);
+      const store = new LeaseTrackingWaitStore(dbPath);
+      const raw = new CompletingRawBus();
+      const bus = createLilacBus(raw);
+      const resolver = new WorkflowWaitResolver({
+        bus,
+        store,
+        subscriptionId: `resolver-${termination}`,
+        pollMs: 1_000_000,
+        subscriptionRecoveryRetryMs: 0,
+      });
+      try {
+        await resolver.start();
+        const resubscribed = raw.observeNextSubscription();
+        raw.terminate(0, termination === "failure" ? new Error("subscription failed") : undefined);
+        await resubscribed;
+
+        expect(raw.subscriptionCount).toBe(2);
+        expect(store.resolverLeaseReleases).toBe(1);
+        expect(
+          store.claimWorkflowWaitResolverLease({
+            ownerId: "competing-resolver",
+            now: Date.now(),
+            staleBefore: Number.MIN_SAFE_INTEGER,
+          }),
+        ).toBe(false);
+      } finally {
+        await resolver.stop();
+        await bus.close();
+        store.close();
+        rmSync(dbPath, { force: true });
+      }
+    });
+  }
+
+  it("continues subscription recovery beyond transient startup failures", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-subscription-retry-${crypto.randomUUID()}.sqlite`);
+    const store = new LeaseTrackingWaitStore(dbPath);
+    const raw = new CompletingRawBus();
+    const bus = createLilacBus(raw);
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-retry-until-recovered",
+      pollMs: 1_000_000,
+      subscriptionRecoveryRetryMs: 0,
+    });
+    try {
+      await resolver.start();
+      raw.failNextSubscriptions(6);
+      const resubscribed = raw.observeNextSubscription();
+      raw.terminate(0, new Error("subscription failed"));
+      await resubscribed;
+
+      expect(raw.subscriptionAttempts).toBe(8);
+      expect(raw.subscriptionCount).toBe(2);
+      expect(store.resolverLeaseReleases).toBe(7);
+    } finally {
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("does not recover a subscription completed by intentional stop", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-subscription-stop-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new CompletingRawBus();
+    const bus = createLilacBus(raw);
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-intentional-stop",
+      pollMs: 1_000_000,
+      subscriptionRecoveryRetryMs: 0,
+    });
+    try {
+      await resolver.start();
+      await resolver.stop();
+      await Promise.resolve();
+      expect(raw.subscriptionCount).toBe(1);
+    } finally {
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("advances its checkpoint and processes the next reply after wakeup publication fails", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-advisory-wakeup-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -344,7 +633,7 @@ describe("WorkflowWaitResolver", () => {
 
   it("waits for and takes over a crashed resolver lease after it becomes stale", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-crash-lease-${crypto.randomUUID()}.sqlite`);
-    const store = new DurableWorkflowStore(dbPath);
+    const store = new LeaseTrackingWaitStore(dbPath);
     const bus = createLilacBus(new IdleRawBus());
     let now = 100;
     const crashed = new WorkflowWaitResolver({
@@ -361,13 +650,13 @@ describe("WorkflowWaitResolver", () => {
       now: () => now,
       leaseStaleMs: 20,
       leaseAcquireTimeoutMs: 200,
-      leaseRetryMs: 5,
+      leaseRetryMs: 0,
     });
     try {
       await crashed.start();
+      const acquisitionAttempted = store.observeNextLeaseClaim();
       const takeover = replacement.start();
-      // test-wait-justification: leaves replacement lease acquisition pending until the simulated lease becomes stale
-      await Bun.sleep(15);
+      await acquisitionAttempted;
       now = 121;
       await takeover;
     } finally {

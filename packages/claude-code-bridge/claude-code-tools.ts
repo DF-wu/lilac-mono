@@ -6,7 +6,7 @@ import {
   type Tool as McpTool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { AtomicToolExecutionOutcome, ToolResultOutput } from "@stanley2058/lilac-agent";
+import type { ExternalToolExecutionOutcome, ToolResultOutput } from "@stanley2058/lilac-agent";
 import { isRecord } from "@stanley2058/lilac-utils";
 import { asSchema, type ToolSet } from "ai";
 import type { ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
@@ -252,6 +252,53 @@ export function mapToolResultOutputToMcp(
   }
 }
 
+function mapExecutedExpansionToMcp(
+  executedExpansion: NonNullable<ExternalToolExecutionOutcome["executedExpansion"]>,
+): CallToolResult {
+  const { children } = executedExpansion;
+  const content: CallToolResult["content"] = [
+    { type: "text", text: `Batch accepted: ${children.length} children.` },
+  ];
+  const childMetadata = children.map((child, childOffset) => {
+    const index = childOffset + 1;
+    const contentStart = content.length;
+    content.push({
+      type: "text",
+      text: `[${index}/${children.length}] tool=${child.toolName} id=${child.toolCallId} outcome=${child.outcome} isError=${child.isError}`,
+    });
+
+    try {
+      const mapped = mapToolResultOutputToMcp(child.toolOutput, child.isError);
+      content.push(...mapped.content);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      content.push({ type: "text", text: `Failed to map child tool output: ${message}` });
+    }
+
+    return {
+      index,
+      toolCallId: child.toolCallId,
+      toolName: child.toolName,
+      outcome: child.outcome,
+      isError: child.isError,
+      outputType: child.toolOutput.type,
+      contentStart,
+      contentCount: content.length - contentStart,
+    };
+  });
+
+  return {
+    content,
+    structuredContent: {
+      type: "lilac.batch-result",
+      version: 1,
+      accepted: true,
+      total: children.length,
+      children: childMetadata,
+    },
+  };
+}
+
 function pruneCorrelations(pending: Map<string, PendingCorrelation>, now: number): void {
   for (const [nonce, correlation] of pending) {
     if (now - correlation.createdAt > CORRELATION_TTL_MS) pending.delete(nonce);
@@ -279,7 +326,7 @@ export async function createClaudeCodeToolBridge(options: {
    * from this map are Lilac builtins and are marked always-load.
    */
   catalogMetadata?: ClaudeCodeToolCatalogMetadataMap;
-  execute(request: ClaudeCodeToolExecutionRequest): Promise<AtomicToolExecutionOutcome>;
+  execute(request: ClaudeCodeToolExecutionRequest): Promise<ExternalToolExecutionOutcome>;
   /**
    * Claude built-in tools this run may call directly. They bypass the MCP
    * bridge entirely, so they get no Lilac approval, execution events, output
@@ -293,8 +340,7 @@ export async function createClaudeCodeToolBridge(options: {
   // still fails loudly below, because that is a toolset bug rather than a
   // deliberate handover.
   const exposedEntries = Object.entries(options.tools).filter(
-    ([name, definition]) =>
-      name !== "batch" && name !== "tool_search" && definition.isProviderExecuted !== true,
+    ([name, definition]) => name !== "tool_search" && definition.isProviderExecuted !== true,
   );
   const exposedNames = new Set(exposedEntries.map(([name]) => name));
   const allowedBuiltIns = new Set<string>(validateClaudeCodeBuiltInTools(options.builtInTools));
@@ -374,6 +420,9 @@ export async function createClaudeCodeToolBridge(options: {
         abortSignal: extra.signal,
         inputValidation: "prevalidated",
       });
+      if (outcome.executedExpansion) {
+        return mapExecutedExpansionToMcp(outcome.executedExpansion);
+      }
       if (outcome.expansion) {
         return toolError(`Lilac tool '${toolName}' returned an unsupported tool-call expansion`);
       }

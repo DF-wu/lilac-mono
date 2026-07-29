@@ -2,11 +2,26 @@ import { StringDecoder } from "node:string_decoder";
 import fs from "node:fs/promises";
 import { Transform, type TransformCallback } from "node:stream";
 
+import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
+
 import { normalizeLiteralSecrets, REDACTION_PLACEHOLDER } from "./bash-literal-redactor";
 import { redactSecrets } from "./bash-safety/format";
 
 type AnsiState = "plain" | "escape" | "csi" | "osc" | "osc-escape";
 const MAX_PATTERN_REDACTION_BUFFER_CHARS = 64 * 1024;
+export const MIN_PRE_OVERFLOW_RAW_BYTES = 1024 * 1024;
+/**
+ * Hard memory ceiling for raw output retained before sanitized output exceeds
+ * its preview cap. Complete overflow retention is abandoned at this boundary.
+ */
+export const MAX_PRE_OVERFLOW_RAW_BYTES = 64 * 1024 * 1024;
+
+export function getPreOverflowRawByteLimit(maxChars: number): number {
+  if (maxChars === Number.POSITIVE_INFINITY) return MAX_PRE_OVERFLOW_RAW_BYTES;
+  const normalizedMaxChars = Number.isFinite(maxChars) ? Math.max(0, Math.floor(maxChars)) : 0;
+  const scaledLimit = normalizedMaxChars * 4 + MAX_PATTERN_REDACTION_BUFFER_CHARS;
+  return Math.min(MAX_PRE_OVERFLOW_RAW_BYTES, Math.max(MIN_PRE_OVERFLOW_RAW_BYTES, scaledLimit));
+}
 const PATTERN_CANDIDATE_MARKERS = [
   "authorization",
   "github_pat_",
@@ -296,25 +311,6 @@ export type StreamOutputBudget = {
   onExceeded(): void;
 };
 
-async function appendOverflowChunk(params: {
-  overflowFilePath: string;
-  chunk: Uint8Array;
-  initialized: boolean;
-}): Promise<boolean> {
-  try {
-    if (!params.initialized) {
-      await fs.writeFile(params.overflowFilePath, params.chunk, {
-        mode: 0o600,
-      });
-    } else {
-      await fs.appendFile(params.overflowFilePath, params.chunk);
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function isResponseBodyInit(value: unknown): value is BodyInit {
   return (
     typeof value === "string" ||
@@ -346,29 +342,43 @@ export async function readSanitizedStreamTextCapped(
   let totalChars = 0;
   let totalBytes = 0;
   let capped = false;
-  let overflowInitialized = false;
   let overflowWriteFailed = false;
   let overflowFilePath: string | undefined;
-  let bufferedRawBytes = 0;
+  let overflowSink: BufferedFileSink | undefined;
+  let overflowFileCreated = false;
   const bufferedRawChunks: Buffer[] = [];
-  const rawBufferLimit = Math.max(256 * 1024, maxChars * 4 + MAX_PATTERN_REDACTION_BUFFER_CHARS);
+  let bufferedRawBytes = 0;
+  const rawBufferLimit = getPreOverflowRawByteLimit(maxChars);
+
+  const failOverflow = async () => {
+    overflowWriteFailed = true;
+    overflowFilePath = undefined;
+    const sink = overflowSink;
+    overflowSink = undefined;
+    await sink?.abort();
+    if (overflowFileCreated && options?.overflowFilePath) {
+      await fs.rm(options.overflowFilePath, { force: true }).catch(() => undefined);
+    }
+    overflowFileCreated = false;
+    bufferedRawChunks.length = 0;
+    bufferedRawBytes = 0;
+  };
 
   const writeOverflowChunk = async (chunk: Uint8Array) => {
     if (chunk.byteLength === 0 || overflowWriteFailed || !options?.overflowFilePath) return;
-
-    const ok = await appendOverflowChunk({
-      overflowFilePath: options.overflowFilePath,
-      chunk,
-      initialized: overflowInitialized,
-    });
-    if (!ok) {
-      overflowWriteFailed = true;
-      overflowFilePath = undefined;
-      await fs.rm(options.overflowFilePath, { force: true }).catch(() => undefined);
-      return;
+    try {
+      if (!overflowSink) {
+        overflowSink = await BufferedFileSink.open(options.overflowFilePath, {
+          flags: "wx",
+          mode: 0o600,
+        });
+        overflowFileCreated = true;
+      }
+      await overflowSink.write(chunk);
+      overflowFilePath = options.overflowFilePath;
+    } catch {
+      await failOverflow();
     }
-    overflowInitialized = true;
-    overflowFilePath = options.overflowFilePath;
   };
 
   const flushBufferedRaw = async () => {
@@ -379,15 +389,18 @@ export async function readSanitizedStreamTextCapped(
 
   const retainRawChunk = async (chunk: Uint8Array) => {
     if (overflowWriteFailed || !options?.overflowFilePath) return;
-    if (overflowInitialized) {
+    if (overflowSink) {
       await writeOverflowChunk(chunk);
       return;
     }
 
-    const copy = Buffer.from(chunk);
-    bufferedRawChunks.push(copy);
-    bufferedRawBytes += copy.length;
-    if (bufferedRawBytes >= rawBufferLimit) await flushBufferedRaw();
+    if (bufferedRawBytes + chunk.byteLength > rawBufferLimit) {
+      await failOverflow();
+      return;
+    }
+
+    bufferedRawChunks.push(Buffer.from(chunk));
+    bufferedRawBytes += chunk.byteLength;
   };
 
   const consumeSanitizedText = async (chunk: string) => {
@@ -439,11 +452,21 @@ export async function readSanitizedStreamTextCapped(
           }
           await retainRawChunk(value);
           await consumeSanitizedText(sanitizer.write(value));
-          if (capped && !overflowInitialized) await flushBufferedRaw();
+          if (capped && !overflowSink) await flushBufferedRaw();
         }
       }
       await consumeSanitizedText(sanitizer.end());
-      if (capped && !overflowInitialized) await flushBufferedRaw();
+      if (capped && !overflowSink) await flushBufferedRaw();
+      if (overflowSink) {
+        try {
+          await overflowSink.close();
+        } catch {
+          await failOverflow();
+        }
+      }
+    } catch (error) {
+      await failOverflow();
+      throw error;
     } finally {
       reader.releaseLock();
     }
@@ -451,11 +474,6 @@ export async function readSanitizedStreamTextCapped(
     const response = new Response(isResponseBodyInit(stream) ? stream : String(stream));
     if (!response.body) return { text: "", totalChars: 0, totalBytes: 0, capped: false };
     return await readSanitizedStreamTextCapped(response.body, maxChars, options);
-  }
-
-  if (!capped && options?.overflowFilePath && overflowInitialized) {
-    await fs.rm(options.overflowFilePath, { force: true }).catch(() => undefined);
-    overflowFilePath = undefined;
   }
 
   return { text, totalChars, totalBytes, capped, overflowFilePath };
