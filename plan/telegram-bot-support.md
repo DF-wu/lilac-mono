@@ -116,7 +116,7 @@ webhook handler. We deliberately do **not** copy that shortcut (per D1).
 | 3 | `TelegramAdapter` (grammY, long polling) | [#34](https://github.com/DF-wu/lilac-mono/issues/34) | done |
 | 4 | `TelegramOutputStream` (throttled streaming, chunking, HTML) | [#35](https://github.com/DF-wu/lilac-mono/issues/35) | done |
 | 5 | Platform-aware request router | [#36](https://github.com/DF-wu/lilac-mono/issues/36) | done |
-| 6 | Attachments, cancel buttons, reactions, command menu | [#37](https://github.com/DF-wu/lilac-mono/issues/37) | done (inbound attachments deferred to [#42](https://github.com/DF-wu/lilac-mono/issues/42)) |
+| 6 | Attachments, cancel buttons, reactions, command menu | [#37](https://github.com/DF-wu/lilac-mono/issues/37) | done — registry-backed `lilac_<name>` menu aliases; inbound attachments deferred to [#42](https://github.com/DF-wu/lilac-mono/issues/42) |
 | 7 | Runtime wiring in `create-core-runtime.ts` | [#38](https://github.com/DF-wu/lilac-mono/issues/38) | done |
 | 8 | Tests: unit + fake Bot API integration in container | [#39](https://github.com/DF-wu/lilac-mono/issues/39) | done |
 | 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | done, pending owner smoke test |

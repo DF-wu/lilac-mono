@@ -231,7 +231,15 @@ surface:
     # - false: send with disable_notification
     outputNotification: true
 
-    # Register the bot command menu via setMyCommands on connect.
+    # Publish the custom-command menu via setMyCommands on connect.
+    #
+    # Each command in <dataDir>/cmds is advertised as /lilac_<name>, with
+    # hyphens mapped to underscores because Telegram only accepts
+    # [a-z0-9_]{1,32}. The typed /lilac:<name> form keeps working either way.
+    # An empty registry publishes an empty menu, so removing a command also
+    # removes it from the menu.
+    #
+    # false leaves the bot's existing menu untouched.
     commandMenu: true
 
     # Streaming title phrases for in-progress updates.

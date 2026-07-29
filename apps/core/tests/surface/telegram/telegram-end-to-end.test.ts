@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -16,6 +16,7 @@ import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-conf
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { Message as TelegramMessage, Update } from "grammy/types";
 
+import { CustomCommandManager } from "../../../src/custom-commands/manager";
 import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
@@ -119,7 +120,35 @@ function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
 }
 
-async function startChain(cfg: CoreConfig = testConfig()) {
+/**
+ * A registry on disk, so the menu alias is resolved by the real loader rather
+ * than a stand-in that could accept spellings the real one rejects.
+ */
+async function loadRegistry(
+  commands: readonly { name: string; description: string; args?: unknown[] }[],
+): Promise<CustomCommandManager> {
+  const dataDir = path.join(scratchDir, "data");
+  for (const cmd of commands) {
+    const dir = path.join(dataDir, "cmds", cmd.name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "def.json"),
+      JSON.stringify({
+        name: cmd.name,
+        description: cmd.description,
+        args: cmd.args ?? [],
+      }),
+      "utf8",
+    );
+    await writeFile(path.join(dir, "index.ts"), "export async function execute() {}\n", "utf8");
+  }
+
+  const manager = new CustomCommandManager(dataDir);
+  await manager.init();
+  return manager;
+}
+
+async function startChain(cfg: CoreConfig = testConfig(), customCommands?: CustomCommandManager) {
   const bus = createLilacBus(createInMemoryRawBus());
   const requests: Array<Message<unknown>> = [];
 
@@ -134,6 +163,7 @@ async function startChain(cfg: CoreConfig = testConfig()) {
 
   const created = new TelegramAdapter({
     apiRoot: server.url,
+    ...(customCommands ? { customCommands } : {}),
     getConfig: async () => ({
       ...cfg,
       surface: {
@@ -150,6 +180,7 @@ async function startChain(cfg: CoreConfig = testConfig()) {
     bus,
     platform: "telegram",
     subscriptionId: "e2e-router",
+    ...(customCommands ? { customCommands } : {}),
     config: {
       configVersion: 2,
       surface: {
@@ -285,5 +316,99 @@ describe("a telegram message reaches the router as a telegram message", () => {
 
     await waitForRequest(requests);
     expect(requests).toHaveLength(1);
+  });
+});
+
+/**
+ * A menu tap sends ordinary message text, so the alias has to survive the same
+ * adapter -> bridge -> router path as anything the user types. Asserting only
+ * that the registry resolves the alias would miss a surface that never gets it
+ * that far.
+ */
+describe("a command menu tap invokes the same command as the typed form", () => {
+  const customCommandOf = (msg: Message<unknown>) => {
+    const data = msg.data as { raw?: { customCommand?: Record<string, unknown> } };
+    return data.raw?.customCommand;
+  };
+
+  it("resolves the menu alias to the registry command", async () => {
+    const registry = await loadRegistry([
+      { name: "daily-standup", description: "Summarize yesterday" },
+    ]);
+    const { requests } = await startChain(testConfig(), registry);
+
+    server.enqueueMessage(privateMessage({ message_id: 40, text: "/lilac_daily_standup" }));
+    const msg = await waitForRequest(requests);
+
+    expect(customCommandOf(msg)).toMatchObject({
+      name: "daily-standup",
+      source: "text",
+    });
+    expect(customCommandOf(msg)?.["error"]).toBeUndefined();
+  });
+
+  it("carries arguments and trailing prompt from the alias form", async () => {
+    const registry = await loadRegistry([
+      {
+        name: "daily-standup",
+        description: "Summarize yesterday",
+        args: [{ key: "team", type: "string", required: true }],
+      },
+    ]);
+    const { requests } = await startChain(testConfig(), registry);
+
+    server.enqueueMessage(
+      privateMessage({ message_id: 41, text: "/lilac_daily_standup team=core keep it short" }),
+    );
+    const msg = await waitForRequest(requests);
+
+    expect(customCommandOf(msg)).toMatchObject({
+      name: "daily-standup",
+      args: ["core"],
+      prompt: "keep it short",
+    });
+  });
+
+  it("accepts the alias with the @botusername suffix a group tap produces", async () => {
+    const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
+    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
+    const { requests } = await startChain(cfg, registry);
+
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 42,
+        chat: makeSupergroupChat(),
+        text: `/lilac_tarot@${BOT_USERNAME}`,
+        entities: [
+          { type: "bot_command", offset: 0, length: `/lilac_tarot@${BOT_USERNAME}`.length },
+        ],
+      }) as NonNullable<Update["message"]>,
+    );
+
+    const msg = await waitForRequest(requests);
+    expect(customCommandOf(msg)).toMatchObject({ name: "tarot" });
+  });
+
+  it("reports an unknown alias instead of silently treating it as chat", async () => {
+    const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
+    const { requests } = await startChain(testConfig(), registry);
+
+    server.enqueueMessage(privateMessage({ message_id: 43, text: "/lilac_not_a_command" }));
+    const msg = await waitForRequest(requests);
+
+    expect(customCommandOf(msg)).toMatchObject({
+      name: "not-a-command",
+      error: "Unknown custom command 'not-a-command'.",
+    });
+  });
+
+  it("leaves an ordinary message alone", async () => {
+    const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
+    const { requests } = await startChain(testConfig(), registry);
+
+    server.enqueueMessage(privateMessage({ message_id: 44, text: "lilac_tarot without a slash" }));
+    const msg = await waitForRequest(requests);
+
+    expect(customCommandOf(msg)).toBeUndefined();
   });
 });

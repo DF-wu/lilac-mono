@@ -29,6 +29,8 @@ import type {
   TelegramMsgRef,
   TelegramSessionRef,
 } from "../types";
+import type { CustomCommandManager } from "../../custom-commands/manager";
+
 import type { AdapterEvent } from "../events";
 import type {
   AdapterEventHandler,
@@ -91,7 +93,19 @@ export type TelegramAdapterOptions = {
    * local fake server so tests never touch api.telegram.org.
    */
   apiRoot?: string;
+  /**
+   * Source of the command menu. Without it the menu is cleared rather than
+   * left stale, so a deployment that drops its commands does not keep
+   * advertising them.
+   */
+  customCommands?: CustomCommandManager;
 };
+
+/**
+ * Telegram's ceiling for `setMyCommands`. Exceeding it fails the whole call,
+ * so the list is trimmed rather than losing the menu entirely.
+ */
+const TELEGRAM_MAX_MENU_COMMANDS = 100;
 
 /**
  * Updates we ask Telegram to deliver.
@@ -816,7 +830,25 @@ export class TelegramAdapter implements SurfaceAdapter {
    * router also understands. Tracked separately.
    */
   private async registerCommandMenu(bot: Bot): Promise<void> {
-    await bot.api.setMyCommands([]);
+    const entries = this.opts?.customCommands?.listMenuEntries() ?? [];
+
+    if (entries.length > TELEGRAM_MAX_MENU_COMMANDS) {
+      this.logger.warn("too many custom commands for the telegram menu; extras are omitted", {
+        discovered: entries.length,
+        registered: TELEGRAM_MAX_MENU_COMMANDS,
+        omitted: entries
+          .slice(TELEGRAM_MAX_MENU_COMMANDS)
+          .map((entry) => `/${entry.command}`)
+          .join(", "),
+      });
+    }
+
+    const registered = entries.slice(0, TELEGRAM_MAX_MENU_COMMANDS);
+    await bot.api.setMyCommands([...registered]);
+    this.logger.info("telegram command menu registered", {
+      count: registered.length,
+      commands: registered.map((entry) => `/${entry.command}`),
+    });
   }
 
   private async resolveCoreConfig(): Promise<CoreConfig> {

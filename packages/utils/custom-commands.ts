@@ -8,6 +8,21 @@ export const CUSTOM_COMMAND_TEXT_PREFIX = "lilac:";
 export const CUSTOM_COMMAND_TOOL_NAME = "custom_command";
 export const CUSTOM_COMMAND_PROMPT_ARG_KEY = "prompt";
 
+/**
+ * Prefix for the menu-safe alias of a custom command.
+ *
+ * The canonical typed form is `lilac:<name>`, but a bot command menu cannot
+ * advertise it: Telegram's `setMyCommands` accepts only `[a-z0-9_]{1,32}`, so
+ * both `:` and `-` are illegal there. The alias exists purely so a command can
+ * be listed in such a menu, and resolves to the same definition as the typed
+ * form.
+ */
+export const CUSTOM_COMMAND_MENU_PREFIX = "lilac_";
+
+/** Telegram's command grammar — the tightest of the surfaces showing a menu. */
+export const CUSTOM_COMMAND_MENU_ALIAS_MAX_LENGTH = 32;
+const MENU_ALIAS_RE = /^[a-z0-9_]{1,32}$/;
+
 const COMMAND_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const COMMAND_ARG_KEY_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -157,6 +172,53 @@ export function resolveCustomCommandsDir(dataDir: string): string {
 
 export function buildCustomCommandTextName(name: string): string {
   return `${CUSTOM_COMMAND_TEXT_PREFIX}${name}`;
+}
+
+/**
+ * The menu alias for a command name, or `null` when none can represent it.
+ *
+ * Deliberately no truncation: shortening is what would make two distinct
+ * commands collide, and a silently clipped alias is worse than no menu entry —
+ * the command is still reachable through its typed `lilac:<name>` form either
+ * way. Registry names cannot contain `_`, so mapping `-` to `_` is reversible.
+ */
+export function buildCustomCommandMenuAlias(name: string): string | null {
+  const alias = `${CUSTOM_COMMAND_MENU_PREFIX}${name.replaceAll("-", "_")}`;
+  return MENU_ALIAS_RE.test(alias) ? alias : null;
+}
+
+export type CustomCommandToken = {
+  /** Which spelling the user used; both reach the same definition. */
+  readonly form: "text" | "menu";
+  /** Registry-shaped name, e.g. `foo-bar`, regardless of the form used. */
+  readonly name: string;
+  /** The alias exactly as written, present only for the menu form. */
+  readonly alias?: string;
+};
+
+/**
+ * Read a leading command token in either spelling.
+ *
+ * Accepts the `@botusername` suffix Telegram appends to commands sent in
+ * groups; without that, a menu tap in any group would parse as an unknown
+ * command.
+ */
+export function parseCustomCommandToken(token: string): CustomCommandToken | null {
+  const at = token.indexOf("@");
+  const bare = (at === -1 ? token : token.slice(0, at)).trim();
+
+  if (bare.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) {
+    const name = bare.slice(CUSTOM_COMMAND_TEXT_PREFIX.length).trim();
+    return name.length > 0 ? { form: "text", name } : null;
+  }
+
+  if (bare.startsWith(CUSTOM_COMMAND_MENU_PREFIX)) {
+    const alias = bare.slice(CUSTOM_COMMAND_MENU_PREFIX.length).trim();
+    if (alias.length === 0) return null;
+    return { form: "menu", name: alias.replaceAll("_", "-"), alias: bare };
+  }
+
+  return null;
 }
 
 export function isValidCustomCommandResult(value: unknown): value is CustomCommandResult {

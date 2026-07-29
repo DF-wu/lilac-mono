@@ -122,7 +122,7 @@ TELEGRAM_BOT_TOKEN=8792842071:AAF...
 | `parseMode` | `html` | `html` renders markdown as Telegram HTML; `plain` sends unformatted text. |
 | `streamEditIntervalMs` | `1500` | Minimum gap between streaming edits. Minimum accepted value is 500. |
 | `outputNotification` | `true` | `false` sends with `disable_notification`. |
-| `commandMenu` | `true` | Registers the bot command menu via `setMyCommands` on connect. |
+| `commandMenu` | `true` | Publishes the custom-command menu via `setMyCommands` on connect (see §6). `false` leaves whatever menu the bot already has untouched. |
 | `workingIndicators` | shared default | Streaming progress phrases. |
 | `markdownTableRender` | enabled | Renders markdown tables as fixed-width blocks. |
 
@@ -219,6 +219,35 @@ than failing the call.
 **Long polling, not webhooks.** The adapter opens an outbound connection, so it
 needs no public HTTPS endpoint and works behind NAT. Webhook ingress is not
 implemented.
+
+### Custom commands and the menu alias
+
+Telegram's command grammar is `[a-z0-9_]{1,32}`, which the canonical
+`lilac:<name>` form cannot satisfy — both `:` and `-` are illegal. Each custom
+command is therefore also given a **menu alias**, `lilac_<name>` with hyphens
+mapped to underscores, and that is what `setMyCommands` advertises:
+
+| Command in `<dataDir>/cmds` | Menu entry | Typed form |
+|---|---|---|
+| `tarot` | `/lilac_tarot` | `/lilac:tarot` |
+| `daily-standup` | `/lilac_daily_standup` | `/lilac:daily-standup` |
+
+Both spellings resolve to the same definition and take the same arguments, so
+`/lilac_daily_standup team=core keep it short` behaves exactly like the typed
+equivalent. The `@botusername` suffix Telegram appends in groups is accepted.
+
+Aliases are never truncated. A name longer than 26 characters cannot fit under
+the prefix, so it is left out of the menu and logged as a warning — it stays
+invocable by its typed form. Clipping would be worse than omitting: two long
+names would collide on one alias. Command names cannot contain `_`, which is
+what makes the hyphen mapping reversible and collision-free; if two candidates
+ever did contend for one alias, the first in code-point order wins and the
+other keeps its typed form.
+
+The menu is rewritten on every connect, including to an empty list when no
+commands are registered, so a removed command stops being advertised. Telegram
+caps a menu at 100 entries; beyond that the list is trimmed and the omitted
+commands are logged.
 
 ---
 
