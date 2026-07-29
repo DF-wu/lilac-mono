@@ -332,13 +332,55 @@ script cannot take the deployment down with the scratch environment.
 
 ---
 
-## 9. Not implemented
+## 9. What works, and what does not
 
+The conversational path is complete: messages in, routing, streamed replies,
+chunking, HTML rendering, reply-chain context, cancellation, custom commands and
+their menu, outbound attachments, reactions, typing indicators, and history
+served from the local index. Everything below is a gap in something *else* that
+Discord has, stated precisely so nobody has to infer it from silence.
+
+### Not implemented
+
+- **Inbound attachments.** A photo or document *sent to* the bot reaches the
+  agent as its caption text only; the media itself is dropped, and an
+  uncaptioned photo does not start a run at all. Outbound attachments work.
+  Tracked in [#42](https://github.com/DF-wu/lilac-mono/issues/42), which carries
+  the agreed design.
+- **Workflow progress cards and action buttons.** The projector is constructed
+  with `Map<"discord" | "github", SurfaceAdapter>`
+  (`create-core-runtime.ts:788`), so nothing is ever projected to Telegram. The
+  adapter already emits `adapter.action.invoked` for non-cancel callbacks
+  (`telegram-adapter.ts:679`), but that wiring is currently unreachable because
+  no buttons are ever drawn there. Blocked on `sendMsg` ignoring
+  `content.actions` — see below. Tracked in
+  [#43](https://github.com/DF-wu/lilac-mono/issues/43).
+- **The agent's surface tools on Telegram.** `tool-server/tools/surface.ts`
+  builds only Discord and GitHub refs and skips non-Discord sessions, so an
+  agent asked to send or read a message through a tool cannot act on Telegram
+  even when the request originated there. Request-level Level-2 authority *is*
+  granted to Telegram principals; the tools are what is missing. Tracked in
+  [#44](https://github.com/DF-wu/lilac-mono/issues/44).
 - **Webhook ingress.** Long polling only.
-- **Inbound attachments.** Images and documents *sent to* the bot are not yet
-  forwarded to the model; only outbound attachments are delivered. Tracked
-  separately.
+- **A Telegram-side conversation search index.** Discord has a dedicated search
+  store; Telegram relies on the shared transcript store.
 - **Inline queries and business accounts.**
 - **Voice/video note transcription.**
-- **A Telegram-side conversation search index.** The Discord surface has a
-  dedicated search store; Telegram relies on the shared transcript store.
+
+### Implemented, but behaves differently from Discord
+
+These are platform consequences rather than omissions. They are listed because
+code that assumes Discord semantics will be surprised.
+
+- **`listReactions()` always returns `[]`.** The Bot API delivers reactions only
+  as update events; there is no endpoint to query a message's current
+  reactions.
+- **`removeReaction()` clears every reaction, not the named one.**
+  `setMessageReaction` replaces the bot's whole reaction set, and a bot may hold
+  only one reaction, so removal is all-or-nothing.
+- **`sendMsg()` ignores `content.actions` and `content.attachments`.** The
+  streaming output path delivers attachments normally; it is only this direct
+  send path that drops them. This is what blocks workflow buttons above.
+- **History comes from a local SQLite index, not the platform.** A freshly
+  provisioned bot has no history of a chat it has just joined, however long that
+  chat has existed. See §6.
