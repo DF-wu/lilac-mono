@@ -277,14 +277,55 @@ taken on trust:
 | ` ```ts\n</code></pre>...\n``` ` | escaped inside the fence | no code-block breakout |
 | unterminated fence | closed anyway | never unbalanced |
 
-### Manual smoke test (owner)
+### Live verification against api.telegram.org
 
-_Pending._ Steps are in `docs/telegram-surface.md` §7.
+The fake Bot API can only confirm that the code does what *we believe* Telegram
+wants. `scripts/telegram-live-smoke.ts` drives the real `TelegramOutputStream`
+against the real API to confirm what Telegram actually accepts. Run:
+
+```bash
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bun scripts/telegram-live-smoke.ts
+```
+
+Result (2026-07-29, `c74ff2d`): **6/6 pass, 25 API calls, 0 failures**, and all
+12 messages it created were deleted before exit.
+
+| Check | Result |
+|-------|--------|
+| Markdown→HTML accepted (headings, bold/italic/strike, inline code, links with `&`, fenced code containing `<`/`&`/backticks, lists, blockquote) | pass — no entity rejection |
+| 4096-char overflow splits into messages Telegram accepts | pass — 4 messages |
+| Code block split across messages stays valid on both sides | pass — 4 messages, both accepted |
+| Streaming edits at the shipped 1500ms interval avoid `429` | pass — 0 rejected |
+| Cancel inline keyboard shape accepted | pass |
+| Shrinking output actually removes surplus messages remotely | pass — 3 → 1 |
+
+This closes the risk that the fake server was lying about entity validation,
+the character limit, or rate limiting — the three places a fake is most likely
+to be wrong.
+
+### Parallel verification stack
+
+`docker/telegram-verify-stack.sh` runs a Telegram-only runtime beside a live
+deployment: separate Redis logical db, separate volume, no published ports, and
+Discord allowlists emptied so the parallel instance stays inert on Discord.
+Confirmed healthy against the operator's deployment:
+
+```
+telegram.ready : true   botUsername: Catalina_agentbot
+discord.ready  : true   (allowlists empty — ignores all Discord traffic)
+overall ready  : true
+bus            : redis://…/15  (live bus is /5)
+```
+
+### Inbound smoke test (owner)
+
+_Outstanding._ A Telegram bot cannot send messages to itself, so the inbound
+half — user message → router → agent → streamed reply — needs a human to type
+one message. Steps in `docs/telegram-surface.md` §7.
 
 | Step | Result |
 |------|--------|
 | DM reply with streamed edits | |
-| Long answer splits cleanly across messages | |
 | Cancel button stops a running request | |
 | Group behaviour under privacy mode | |
 
