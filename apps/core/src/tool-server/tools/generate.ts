@@ -424,6 +424,7 @@ function validateGrokImagineInput(
 const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   {
     id: "gpt-image-2",
+    openAICompatibleModelId: "gpt-image-2",
     createModel: (providers) => {
       if (isConfiguredProvider("openai")) {
         const model = providers.openai?.image("gpt-image-2");
@@ -479,6 +480,7 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
   {
     id: "nanobanana-2-lite",
+    openAICompatibleModelId: "google/gemini-3.1-flash-lite-image",
     createModel: (providers) => {
       if (isConfiguredProvider("openrouter")) {
         return providers.openrouter?.imageModel("google/gemini-3.1-flash-lite-image");
