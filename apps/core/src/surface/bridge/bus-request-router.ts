@@ -491,7 +491,13 @@ export async function startBusRequestRouter(params: {
             : undefined,
       });
 
-      const customName = customCommands?.peekTextName(msg.data.text) ?? null;
+      // A command may carry an `@target`; without the connected bot's username
+      // one addressed to a different bot in the same group would run here,
+      // since this branch is ahead of mention gating.
+      const selfUserName = (await adapter.getSelf().catch(() => null))?.userName;
+      const commandTargetOpts = selfUserName === undefined ? {} : { botUsername: selfUserName };
+
+      const customName = customCommands?.peekTextName(msg.data.text, commandTargetOpts) ?? null;
       if (customName) {
         const requestId = formatSurfaceMessageRequestId({
           platform,
@@ -513,7 +519,7 @@ export async function startBusRequestRouter(params: {
           }
 
           try {
-            const parsed = customCommands?.parseText(msg.data.text);
+            const parsed = customCommands?.parseText(msg.data.text, commandTargetOpts);
             if (!parsed) {
               return {
                 customCommand: {

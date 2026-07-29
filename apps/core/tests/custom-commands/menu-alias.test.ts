@@ -145,14 +145,45 @@ describe("command tokens parse in both spellings", () => {
     });
   });
 
-  it("tolerates the @botusername suffix Telegram adds in groups", () => {
+  it("accepts the @botusername suffix when it names this bot", () => {
     // Without this a menu tap in any group parses as an unknown command.
-    expect(parseCustomCommandToken("lilac_tarot@Catalina_agentbot")).toEqual({
+    const opts = { botUsername: "Catalina_agentbot" };
+    expect(parseCustomCommandToken("lilac_tarot@Catalina_agentbot", opts)).toEqual({
       form: "menu",
       name: "tarot",
       alias: "lilac_tarot",
     });
-    expect(parseCustomCommandToken("lilac:tarot@Catalina_agentbot")?.name).toBe("tarot");
+    expect(parseCustomCommandToken("lilac:tarot@Catalina_agentbot", opts)?.name).toBe("tarot");
+  });
+
+  it("matches the target case-insensitively, as Telegram usernames are", () => {
+    expect(
+      parseCustomCommandToken("lilac_tarot@catalina_AGENTBOT", {
+        botUsername: "Catalina_agentbot",
+      })?.name,
+    ).toBe("tarot");
+  });
+
+  /**
+   * The defect this guards: stripping any `@suffix` let a command explicitly
+   * addressed to a different bot run ours. In a group with privacy mode off we
+   * receive those messages, and the router's custom-command branch runs before
+   * mention gating, so nothing downstream would have caught it.
+   */
+  it("refuses a command addressed to a different bot", () => {
+    const opts = { botUsername: "Catalina_agentbot" };
+    expect(parseCustomCommandToken("lilac_tarot@OtherBot", opts)).toBeNull();
+    expect(parseCustomCommandToken("lilac:tarot@OtherBot", opts)).toBeNull();
+  });
+
+  it("refuses a targeted command when the bot's own username is unknown", () => {
+    // Fail closed: a command aimed at someone we cannot identify is not ours.
+    expect(parseCustomCommandToken("lilac_tarot@SomeBot")).toBeNull();
+    expect(parseCustomCommandToken("lilac_tarot@SomeBot", { botUsername: "  " })).toBeNull();
+  });
+
+  it("still accepts an untargeted command without knowing the bot username", () => {
+    expect(parseCustomCommandToken("lilac_tarot")?.name).toBe("tarot");
   });
 
   it("ignores tokens that are not custom commands", () => {
@@ -263,6 +294,19 @@ describe("CustomCommandManager menu integration", () => {
     // The alias was never published, so the alias spelling must not resolve —
     // otherwise a dropped collision loser would still be reachable ambiguously.
     expect(manager.parseText(`/lilac_${long}`)).toBeNull();
+  });
+
+  it("does not resolve a command addressed to another bot", async () => {
+    const manager = await load([{ name: "tarot", description: "Draw a tarot spread" }]);
+    const opts = { botUsername: "Catalina_agentbot" };
+
+    expect(manager.parseText("/lilac_tarot@OtherBot", opts)).toBeNull();
+    // Nor should it report an unknown command, which would answer a message
+    // that was never addressed to us.
+    expect(manager.peekTextName("/lilac_tarot@OtherBot", opts)).toBeNull();
+    expect(manager.parseText("/lilac_tarot@Catalina_agentbot", opts)?.command.def.name).toBe(
+      "tarot",
+    );
   });
 
   it("reports an unknown alias under its registry-shaped name", async () => {

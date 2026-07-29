@@ -389,6 +389,44 @@ describe("a command menu tap invokes the same command as the typed form", () => 
     expect(customCommandOf(msg)).toMatchObject({ name: "tarot" });
   });
 
+  /**
+   * The targeting defect: the parser used to strip any `@suffix`, so a command
+   * explicitly addressed to another bot ran ours. Mention gating does not save
+   * us — the router's custom-command branch is ahead of it.
+   */
+  it("does not run a command addressed to a different bot in the same group", async () => {
+    const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
+    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
+    const { requests } = await startChain(cfg, registry);
+
+    const foreign = "/lilac_tarot@SomeOtherBot";
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 45,
+        chat: makeSupergroupChat(),
+        text: foreign,
+        entities: [{ type: "bot_command", offset: 0, length: foreign.length }],
+      }) as NonNullable<Update["message"]>,
+    );
+
+    // Send an addressed command afterwards: it proves the first was seen and
+    // rejected rather than merely still in flight.
+    const mine = `/lilac_tarot@${BOT_USERNAME}`;
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 46,
+        chat: makeSupergroupChat(),
+        text: mine,
+        entities: [{ type: "bot_command", offset: 0, length: mine.length }],
+      }) as NonNullable<Update["message"]>,
+    );
+
+    const msg = await waitForRequest(requests);
+    expect(requests).toHaveLength(1);
+    expect(customCommandOf(msg)).toMatchObject({ name: "tarot" });
+    expect(String(msg.headers?.request_id ?? "")).toContain("46");
+  });
+
   it("reports an unknown alias instead of silently treating it as chat", async () => {
     const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
     const { requests } = await startChain(testConfig(), registry);

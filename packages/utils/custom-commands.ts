@@ -196,16 +196,42 @@ export type CustomCommandToken = {
   readonly alias?: string;
 };
 
+export type ParseCustomCommandTokenOpts = {
+  /**
+   * Username of the connected bot, used to check a command's `@target`.
+   * Omitting it makes any targeted command unparseable rather than assumed
+   * ours — see below.
+   */
+  readonly botUsername?: string;
+};
+
 /**
  * Read a leading command token in either spelling.
  *
- * Accepts the `@botusername` suffix Telegram appends to commands sent in
- * groups; without that, a menu tap in any group would parse as an unknown
- * command.
+ * Telegram appends `@botusername` to commands sent in a group, and in a group
+ * with several bots it delivers commands aimed at *other* bots too when
+ * privacy mode is off. The target is therefore validated, not stripped: an
+ * earlier version discarded any `@suffix`, which let `/lilac_tarot@OtherBot`
+ * run this bot's command. Mention gating does not catch it, because the
+ * router's custom-command branch runs before that check.
+ *
+ * Fail closed on an unverifiable target. A command addressed to someone we
+ * cannot identify is not ours to answer, and no surface but Telegram uses this
+ * suffix convention, so nothing legitimate is lost.
  */
-export function parseCustomCommandToken(token: string): CustomCommandToken | null {
+export function parseCustomCommandToken(
+  token: string,
+  opts: ParseCustomCommandTokenOpts = {},
+): CustomCommandToken | null {
   const at = token.indexOf("@");
   const bare = (at === -1 ? token : token.slice(0, at)).trim();
+
+  if (at !== -1) {
+    const target = token.slice(at + 1).trim();
+    const self = opts.botUsername?.trim();
+    // Telegram usernames are case-insensitive.
+    if (!self || target.toLowerCase() !== self.toLowerCase()) return null;
+  }
 
   if (bare.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) {
     const name = bare.slice(CUSTOM_COMMAND_TEXT_PREFIX.length).trim();

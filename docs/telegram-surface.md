@@ -279,6 +279,43 @@ For a real smoke test:
 3. Send a long prompt and confirm the answer splits across messages cleanly.
 4. Press **Cancel** on a running request and confirm it stops.
 
+### Development builds stay local; deployment goes through `main`
+
+Images are only pulled from GHCR, and GHCR is only built from `main`
+(`.github/workflows/build-image.yml` triggers on pushes to `main`). So the
+deployment path is always **merge to `main`, then pull** — never a hand-built
+image pushed to the registry, and never `workflow_dispatch` on a feature
+branch, which would overwrite the `:catalina` and `:latest` tags the running
+stack uses.
+
+Before merging, build and exercise the branch locally in a throwaway container
+instead:
+
+```bash
+docker build -t lilac-mono:telegram-verify .
+docker/telegram-verify-stack.sh start      # separate Redis db, own volume, no published ports
+docker/telegram-verify-stack.sh logs
+```
+
+Stop it before deploying for real — two pollers on one bot token produce
+`409 Conflict`.
+
+### Cleaning up afterwards
+
+`telegram-verify-stack.sh stop` removes the container and its volume but leaves
+the locally built image and any host-side helper processes. To clear everything
+a verification session leaves behind:
+
+```bash
+docker/telegram-dev-cleanup.sh --dry-run   # show what would go
+docker/telegram-dev-cleanup.sh             # container, volume, inject proxy, scratch dirs
+docker/telegram-dev-cleanup.sh --all       # the above plus the ~2.8GB local image
+```
+
+Every resource is matched by exact name, never by a wildcard or a `docker
+prune`, and the running stack's container names are refused outright — so the
+script cannot take the deployment down with the scratch environment.
+
 ---
 
 ## 8. Troubleshooting

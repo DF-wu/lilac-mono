@@ -1,6 +1,6 @@
 # Telegram Bot Surface Support
 
-Status: **implementation complete — pending the owner's real-Telegram smoke test**
+Status: **implementation complete and smoke-tested against real Telegram (2026-07-29)** — open follow-ups tracked in [#42](https://github.com/DF-wu/lilac-mono/issues/42); not yet merged to `main`
 Branch: `feat/telegram-bot-support`
 Tracking: GitHub issues on `DF-wu/lilac-mono` (see [Issue Map](#issue-map))
 
@@ -119,7 +119,7 @@ webhook handler. We deliberately do **not** copy that shortcut (per D1).
 | 6 | Attachments, cancel buttons, reactions, command menu | [#37](https://github.com/DF-wu/lilac-mono/issues/37) | done — registry-backed `lilac_<name>` menu aliases; inbound attachments deferred to [#42](https://github.com/DF-wu/lilac-mono/issues/42) |
 | 7 | Runtime wiring in `create-core-runtime.ts` | [#38](https://github.com/DF-wu/lilac-mono/issues/38) | done |
 | 8 | Tests: unit + fake Bot API integration in container | [#39](https://github.com/DF-wu/lilac-mono/issues/39) | done |
-| 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | done, pending owner smoke test |
+| 9 | Docs, container harness, final lint/fmt/typecheck/test | [#40](https://github.com/DF-wu/lilac-mono/issues/40) | done — real outbound smoke and two-part inbound verification completed 2026-07-29 (see [Verification record](#verification-record)) |
 
 ---
 

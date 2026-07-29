@@ -11,6 +11,7 @@ import {
   type CustomCommandArgDef,
   type CustomCommandContext,
   type CustomCommandToken,
+  type ParseCustomCommandTokenOpts,
   type CustomCommandModule,
   type CustomCommandResult,
   type DiscoveredCustomCommand,
@@ -290,21 +291,28 @@ export class CustomCommandManager {
     return (token.alias === undefined ? null : this.byMenuAlias.get(token.alias)) ?? null;
   }
 
-  peekTextName(text: string): string | null {
+  /**
+   * `opts.botUsername` is required for a command carrying an `@target` to be
+   * recognized at all; without it such a command is treated as not ours.
+   */
+  peekTextName(text: string, opts: ParseCustomCommandTokenOpts = {}): string | null {
     const trimmed = text.trim();
     if (!trimmed.startsWith("/")) return null;
     const head = trimmed.slice(1).split(/\s/u, 1)[0];
-    const token = head === undefined ? null : parseCustomCommandToken(head);
+    const token = head === undefined ? null : parseCustomCommandToken(head, opts);
     return token?.name ?? null;
   }
 
-  parseText(text: string): ParsedCustomCommandInvocation | null {
+  parseText(
+    text: string,
+    opts: ParseCustomCommandTokenOpts = {},
+  ): ParsedCustomCommandInvocation | null {
     const trimmed = text.trim();
     if (!trimmed.startsWith("/")) return null;
 
     const tokens = tokenize(trimmed.slice(1));
     const head = tokens.shift();
-    const token = head === undefined ? null : parseCustomCommandToken(head);
+    const token = head === undefined ? null : parseCustomCommandToken(head, opts);
     if (!token) return null;
 
     const command = this.resolveToken(token);
