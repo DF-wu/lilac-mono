@@ -35,6 +35,24 @@ export type DbTelegramSession = {
   updated_ts: number;
 };
 
+export type DbTelegramIngressOutbox = {
+  dedupe_key: string;
+  payload_json: string;
+  enqueued_ts: number;
+  attempts: number;
+  last_attempt_ts: number | null;
+  last_error: string | null;
+};
+
+/** One inbound event still waiting to reach the bus. */
+export type TelegramIngressEntry = {
+  dedupeKey: string;
+  payload: unknown;
+  enqueuedTs: number;
+  attempts: number;
+  lastError?: string;
+};
+
 export type TelegramMessageRecord = {
   sessionId: string;
   messageId: string;
@@ -136,6 +154,107 @@ export class TelegramSurfaceStore {
         last_read_ts INTEGER NOT NULL
       );
     `);
+
+    // Durable ingress queue.
+    //
+    // grammY advances its poll offset *before* running the update handler
+    // (`lastTriedUpdateId = update.update_id` precedes `handleUpdate`), so a
+    // failed publish can never be recovered by rethrowing or retrying inside
+    // the handler — Telegram will not send that update again. The only way to
+    // survive a bus outage or a crash mid-publish is to commit the event here
+    // first and replay from this table afterwards.
+    //
+    // `dedupe_key` gives replay its exactly-once property: a redelivered or
+    // re-enqueued event collides on the primary key instead of producing a
+    // second bus message.
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS telegram_ingress_outbox (
+        dedupe_key TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        enqueued_ts INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_ts INTEGER,
+        last_error TEXT
+      );
+    `);
+
+    // Replay is oldest-first so ordering survives an outage.
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS telegram_ingress_outbox_enqueued
+        ON telegram_ingress_outbox (enqueued_ts ASC);
+    `);
+  }
+
+  /**
+   * Records an inbound event that still has to reach the bus.
+   *
+   * Returns false when the key is already queued, so a redelivery cannot
+   * enqueue the same event twice.
+   */
+  enqueueIngress(input: { dedupeKey: string; payload: unknown; ts: number }): boolean {
+    const result = this.db
+      .query(
+        `INSERT INTO telegram_ingress_outbox (dedupe_key, payload_json, enqueued_ts)
+         VALUES ($dedupe_key, $payload_json, $enqueued_ts)
+         ON CONFLICT(dedupe_key) DO NOTHING`,
+      )
+      .run({
+        $dedupe_key: input.dedupeKey,
+        $payload_json: JSON.stringify(input.payload),
+        $enqueued_ts: input.ts,
+      });
+
+    return result.changes > 0;
+  }
+
+  /** Oldest-first, so a backlog is replayed in arrival order. */
+  listPendingIngress(input: { limit?: number } = {}): TelegramIngressEntry[] {
+    const limit = Math.min(Math.max(input.limit ?? 100, 1), 1000);
+
+    return this.db
+      .query<DbTelegramIngressOutbox, { $limit: number }>(
+        `SELECT * FROM telegram_ingress_outbox
+          ORDER BY enqueued_ts ASC, rowid ASC
+          LIMIT $limit`,
+      )
+      .all({ $limit: limit })
+      .map((row) => ({
+        dedupeKey: row.dedupe_key,
+        payload: JSON.parse(row.payload_json) as unknown,
+        enqueuedTs: row.enqueued_ts,
+        attempts: row.attempts,
+        ...(row.last_error === null ? {} : { lastError: row.last_error }),
+      }));
+  }
+
+  /** Called only after the bus has accepted the event. */
+  deleteIngress(dedupeKey: string): void {
+    this.db
+      .query(`DELETE FROM telegram_ingress_outbox WHERE dedupe_key = $dedupe_key`)
+      .run({ $dedupe_key: dedupeKey });
+  }
+
+  /**
+   * Records a failed publish attempt without dropping the entry, so an
+   * operator can see how long something has been stuck and why.
+   */
+  recordIngressFailure(input: { dedupeKey: string; error: string; ts: number }): void {
+    this.db
+      .query(
+        `UPDATE telegram_ingress_outbox
+            SET attempts = attempts + 1,
+                last_attempt_ts = $ts,
+                last_error = $error
+          WHERE dedupe_key = $dedupe_key`,
+      )
+      .run({ $dedupe_key: input.dedupeKey, $error: input.error, $ts: input.ts });
+  }
+
+  countPendingIngress(): number {
+    const row = this.db
+      .query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM telegram_ingress_outbox`)
+      .get();
+    return row?.n ?? 0;
   }
 
   upsertMessage(record: TelegramMessageRecord): void {

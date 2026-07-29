@@ -1200,6 +1200,34 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
     if (runtimeFullyStarted && stopAgentRunner && gracefulRestartStore) {
       const agentRunner = stopAgentRunner;
 
+      // Telegram first, and polling before its bridges.
+      //
+      // Long polling is the only ingress that keeps pulling work in on its
+      // own, and grammY acks up to `lastTriedUpdateId` when it stops — so an
+      // update still in flight here is one Telegram will never resend. Left
+      // running, it can also land in the router's in-memory debounce buffer
+      // after the snapshot is taken, and the later teardown discards that
+      // buffer without ever producing a durable `cmd.request`.
+      //
+      // `stopIngress()` rather than `disconnect()`: the output relay drains
+      // after the snapshot below and still needs this adapter to deliver the
+      // replies, so the send side has to stay up.
+      await safe("graceful.ingress.telegram.stopPolling", async () => {
+        await telegramAdapter?.stopIngress();
+      });
+
+      await safe(
+        "graceful.ingress.telegramAdapterToBus.stop",
+        () => stopTelegramAdapterToBus?.stop() ?? Promise.resolve(),
+      );
+      stopTelegramAdapterToBus = null;
+
+      await safe(
+        "graceful.ingress.telegramRouter.stop",
+        () => stopTelegramRouter?.stop() ?? Promise.resolve(),
+      );
+      stopTelegramRouter = null;
+
       await safe(
         "graceful.ingress.bridgeAdapterToBus.stop",
         () => stopAdapterToBus?.stop() ?? Promise.resolve(),

@@ -63,6 +63,7 @@ import {
   toSurfaceMessage,
   toTelegramRawEnvelope,
 } from "./telegram-raw";
+import { parseStoredAdapterEvent, telegramIngressDedupeKey } from "./telegram-ingress";
 import { TelegramSurfaceStore } from "./store/telegram-surface-store";
 import {
   createGrammyAttachmentApi,
@@ -190,6 +191,11 @@ export class TelegramAdapter implements SurfaceAdapter {
    */
   private stopping = false;
   /**
+   * True once `stopIngress()` has quiesced polling but the adapter is still
+   * able to send. Keeps `disconnect()` from stopping an already-stopped bot.
+   */
+  private ingressStopped = false;
+  /**
    * Why polling exited, if it did. `whenReady()` throws this rather than the
    * deferred rejecting, so a failure with no waiter cannot become an unhandled
    * rejection.
@@ -249,6 +255,13 @@ export class TelegramAdapter implements SurfaceAdapter {
       userId: String(bot.botInfo.id),
       userName: bot.botInfo.username,
     };
+
+    // Drain anything a previous run committed but never published, before new
+    // updates start arriving, so a backlog keeps its arrival order. Subscribers
+    // are registered before connect(), so they are in place by now.
+    await this.replayPendingIngress().catch((e: unknown) => {
+      this.logger.error("telegram ingress replay failed; entries are retained", {}, e);
+    });
 
     if (cfg.surface.telegram.commandMenu) {
       await this.registerCommandMenu(bot).catch((e: unknown) => {
@@ -326,6 +339,37 @@ export class TelegramAdapter implements SurfaceAdapter {
     this.ready?.resolve();
   }
 
+  /**
+   * Stops taking new updates while leaving the surface able to send.
+   *
+   * Graceful restart needs these separated. Long polling is the one ingress
+   * that keeps pulling work in on its own, and grammY acks up to
+   * `lastTriedUpdateId` when it stops — so an update still in flight during a
+   * restart is one Telegram will never resend. It has to be quiesced before
+   * the snapshot. But the output relay drains *after* that snapshot and needs
+   * this adapter to deliver the replies, so a full `disconnect()` at that
+   * point would strand them.
+   *
+   * Awaits the polling loop, so in-flight handlers finish and their outbox
+   * entries commit before this resolves.
+   */
+  async stopIngress(): Promise<void> {
+    const bot = this.bot;
+    if (!bot || this.ingressStopped) return;
+
+    this.ingressStopped = true;
+    // Tell the supervisor this settlement is deliberate.
+    this.stopping = true;
+    await bot.stop().catch(() => undefined);
+    await this.pollingStopped?.catch(() => undefined);
+    this.pollingStopped = null;
+
+    this.healthState = { ...this.healthState, isReady: false };
+    this.logger.info("telegram ingress stopped; output remains available", {
+      pendingIngress: this.store?.countPendingIngress() ?? 0,
+    });
+  }
+
   async disconnect(): Promise<void> {
     const bot = this.bot;
     if (!bot) return;
@@ -334,12 +378,15 @@ export class TelegramAdapter implements SurfaceAdapter {
     // a deliberate shutdown rather than a failure.
     this.stopping = true;
     this.bot = null;
-    // Stopping aborts the in-flight getUpdates, which surfaces as a transport
-    // error. That is the expected shape of a clean shutdown, not a failure.
-    await bot.stop().catch(() => undefined);
-    // Let the polling loop unwind before tearing down the store it may touch.
-    await this.pollingStopped?.catch(() => undefined);
+    if (!this.ingressStopped) {
+      // Stopping aborts the in-flight getUpdates, which surfaces as a transport
+      // error. That is the expected shape of a clean shutdown, not a failure.
+      await bot.stop().catch(() => undefined);
+      // Let the polling loop unwind before tearing down the store it may touch.
+      await this.pollingStopped?.catch(() => undefined);
+    }
     this.pollingStopped = null;
+    this.ingressStopped = false;
 
     this.ready = null;
     this.store?.close();
@@ -905,14 +952,144 @@ export class TelegramAdapter implements SurfaceAdapter {
     }
   }
 
+  /**
+   * Delivers an event to subscribers, committing it durably first.
+   *
+   * The commit is not optional bookkeeping. grammY advances its poll offset
+   * before invoking the update handler, so by the time a publish fails
+   * Telegram already considers the update delivered and will never resend it.
+   * Rethrowing here would change nothing; only a record that outlives the
+   * handler can.
+   *
+   * Interactive events (cancel, button presses) are deliberately not queued —
+   * see `telegramIngressDedupeKey`.
+   */
   private async emit(evt: AdapterEvent): Promise<void> {
+    const dedupeKey = telegramIngressDedupeKey(evt);
+
+    if (dedupeKey !== null) {
+      const fresh = this.store?.enqueueIngress({
+        dedupeKey,
+        payload: evt,
+        ts: Date.now(),
+      });
+      // Already queued means this is a redelivery of something the replayer
+      // owns; publishing again here would duplicate it.
+      if (fresh === false) {
+        this.logger.debug("telegram ingress already queued; leaving it to replay", { dedupeKey });
+        return;
+      }
+    }
+
+    const delivered = await this.deliver(evt);
+
+    if (dedupeKey === null) return;
+    if (delivered.ok) {
+      this.store?.deleteIngress(dedupeKey);
+      return;
+    }
+
+    this.store?.recordIngressFailure({
+      dedupeKey,
+      error: delivered.error,
+      ts: Date.now(),
+    });
+    this.logger.error(
+      "telegram ingress publish failed; retained for replay",
+      { dedupeKey, type: evt.type },
+      delivered.cause,
+    );
+  }
+
+  /**
+   * Fans an event out to subscribers.
+   *
+   * A subscriber throwing is reported rather than swallowed, because
+   * `bridgeAdapterToBus` rethrows precisely when the bus rejected the publish
+   * — the one signal that says the event has not been accepted anywhere.
+   */
+  private async deliver(
+    evt: AdapterEvent,
+  ): Promise<{ ok: true } | { ok: false; error: string; cause: unknown }> {
+    // No subscribers means the event reached nothing. Reporting success here
+    // would delete it from the outbox, which is the exact loss the outbox
+    // exists to prevent.
+    if (this.handlers.size === 0) {
+      const error = "no adapter subscribers";
+      return { ok: false, error, cause: new Error(error) };
+    }
+
+    let failure: { error: string; cause: unknown } | null = null;
+
     for (const handler of this.handlers) {
       try {
         await handler(evt);
       } catch (e: unknown) {
         this.logger.error("telegram adapter handler failed", { type: evt.type }, e);
+        // Keep the first failure: later handlers may succeed, but the event
+        // is only safe to forget once every subscriber has taken it.
+        failure ??= { error: e instanceof Error ? e.message : String(e), cause: e };
       }
     }
+
+    return failure === null ? { ok: true } : { ok: false, ...failure };
+  }
+
+  /**
+   * Republishes everything the outbox still holds.
+   *
+   * Called after the bus subscriptions exist but before polling starts, so a
+   * backlog from a previous run is drained in arrival order ahead of anything
+   * new. Entries survive a failed replay and are tried again next time.
+   */
+  async replayPendingIngress(): Promise<{ replayed: number; failed: number }> {
+    const store = this.store;
+    if (!store) return { replayed: 0, failed: 0 };
+
+    const pending = store.listPendingIngress();
+    if (pending.length === 0) return { replayed: 0, failed: 0 };
+
+    this.logger.info("replaying telegram ingress backlog", { count: pending.length });
+
+    let replayed = 0;
+    let failed = 0;
+
+    for (const entry of pending) {
+      const evt = parseStoredAdapterEvent(entry.payload);
+      if (!evt) {
+        // Unparseable payloads can never succeed; keeping them would block the
+        // queue behind a permanent failure.
+        this.logger.error("dropping unreadable telegram ingress entry", {
+          dedupeKey: entry.dedupeKey,
+          attempts: entry.attempts,
+        });
+        store.deleteIngress(entry.dedupeKey);
+        failed += 1;
+        continue;
+      }
+
+      const delivered = await this.deliver(evt);
+      if (delivered.ok) {
+        store.deleteIngress(entry.dedupeKey);
+        replayed += 1;
+        continue;
+      }
+
+      failed += 1;
+      store.recordIngressFailure({
+        dedupeKey: entry.dedupeKey,
+        error: delivered.error,
+        ts: Date.now(),
+      });
+    }
+
+    this.logger.info("telegram ingress replay finished", {
+      replayed,
+      failed,
+      stillPending: store.countPendingIngress(),
+    });
+
+    return { replayed, failed };
   }
 
   /**
