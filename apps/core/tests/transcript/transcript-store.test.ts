@@ -401,6 +401,163 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("lists linked telegram surface messages and skips unsupported platforms", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+
+    const store = new SqliteTranscriptStore(dbPath);
+
+    store.saveRequestTranscript({
+      requestId: "r1",
+      sessionId: "42",
+      requestClient: "telegram",
+      messages: [{ role: "assistant", content: "first" }],
+      finalText: "first",
+    });
+
+    store.linkSurfaceMessagesToRequest({
+      requestId: "r1",
+      created: [
+        { platform: "telegram", channelId: "42", messageId: "m1" },
+        { platform: "telegram", channelId: "42:7", messageId: "m2" },
+      ],
+      last: { platform: "telegram", channelId: "42:7", messageId: "m2" },
+    });
+
+    insertRawSurfaceLink(dbPath, {
+      platform: "slack",
+      channelId: "42",
+      messageId: "m3",
+      requestId: "r1",
+      createdTs: Date.now(),
+    });
+
+    expect(store.listSurfaceMessagesForRequest?.({ requestId: "r1" })).toEqual([
+      { platform: "telegram", channelId: "42", messageId: "m1" },
+      { platform: "telegram", channelId: "42:7", messageId: "m2" },
+    ]);
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("lists telegram recent agent writes without letting unsupported rows consume the page", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+
+    const store = new SqliteTranscriptStore(dbPath);
+
+    store.saveRequestTranscript({
+      requestId: "r-unsupported",
+      sessionId: "42",
+      requestClient: "unknown",
+      messages: [{ role: "assistant", content: "unsupported" }],
+      finalText: "unsupported",
+    });
+    store.saveRequestTranscript({
+      requestId: "r-telegram",
+      sessionId: "42",
+      requestClient: "telegram",
+      messages: [{ role: "assistant", content: "telegram" }],
+      finalText: "telegram",
+    });
+    store.linkSurfaceMessagesToRequest({
+      requestId: "r-telegram",
+      created: [{ platform: "telegram", channelId: "42", messageId: "m1" }],
+      last: { platform: "telegram", channelId: "42", messageId: "m1" },
+    });
+
+    insertRawSurfaceLink(dbPath, {
+      platform: "slack",
+      channelId: "42",
+      messageId: "m2",
+      requestId: "r-unsupported",
+      createdTs: 2_000,
+    });
+    // Sort the unsupported row ahead of the telegram row so a JS-side filter
+    // applied after LIMIT would return an empty first page.
+    setUpdatedTs(dbPath, { "r-unsupported": 2_000, "r-telegram": 1_000 });
+
+    expect(store.listRecentAgentWrites?.({ limit: 1 })).toEqual([
+      {
+        requestId: "r-telegram",
+        sessionId: "42",
+        client: "telegram",
+        messageId: "m1",
+        updatedTs: 1_000,
+        finalText: "telegram",
+      },
+    ]);
+    expect(store.listRecentAgentWrites?.({ client: "telegram" })).toHaveLength(1);
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("includes telegram surface refs in discovery records", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+
+    const store = new SqliteTranscriptStore(dbPath);
+
+    store.saveRequestTranscript({
+      requestId: "r1",
+      sessionId: "42",
+      requestClient: "telegram",
+      messages: [{ role: "assistant", content: "answer" }],
+      finalText: "answer",
+    });
+    store.linkSurfaceMessagesToRequest({
+      requestId: "r1",
+      created: [{ platform: "telegram", channelId: "42", messageId: "m1" }],
+      last: { platform: "telegram", channelId: "42", messageId: "m1" },
+    });
+
+    insertRawSurfaceLink(dbPath, {
+      platform: "slack",
+      channelId: "42",
+      messageId: "m2",
+      requestId: "r1",
+      createdTs: Date.now(),
+    });
+
+    const records = store.listDiscoveryRecords?.() ?? [];
+    expect(records).toHaveLength(1);
+    expect(records[0]?.surfaceRefs).toEqual([
+      { platform: "telegram", channelId: "42", messageId: "m1" },
+    ]);
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("still lists a transcript that has no surface links at all", async () => {
+    // The platform filter lives in the LEFT JOIN's ON clause, not the WHERE.
+    // In the WHERE it would silently become an inner join, and a transcript
+    // with no surface link — every GitHub-less, Discord-less run — would
+    // vanish from discovery entirely.
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+
+    const store = new SqliteTranscriptStore(dbPath);
+
+    store.saveRequestTranscript({
+      requestId: "unlinked",
+      sessionId: "42",
+      requestClient: "telegram",
+      messages: [{ role: "assistant", content: "answer" }],
+      finalText: "answer",
+    });
+
+    const records = store.listDiscoveryRecords?.() ?? [];
+    expect(records).toHaveLength(1);
+    expect(records[0]?.requestId).toBe("unlinked");
+    expect(records[0]?.surfaceRefs).toEqual([]);
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("roundtrips compaction metadata and degrades invalid metadata to ordinary", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");
@@ -729,3 +886,37 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 });
+
+/**
+ * `linkSurfaceMessagesToRequest` only accepts `MsgRef` platforms, so writing a
+ * genuinely unsupported platform requires going around the store.
+ */
+function insertRawSurfaceLink(
+  dbPath: string,
+  row: {
+    platform: string;
+    channelId: string;
+    messageId: string;
+    requestId: string;
+    createdTs: number;
+  },
+): void {
+  const db = new Database(dbPath);
+  db.run(
+    "INSERT INTO surface_message_to_request (platform, channel_id, message_id, request_id, created_ts) VALUES (?, ?, ?, ?, ?)",
+    [row.platform, row.channelId, row.messageId, row.requestId, row.createdTs],
+  );
+  db.close();
+}
+
+function setUpdatedTs(dbPath: string, byRequestId: Record<string, number>): void {
+  const db = new Database(dbPath);
+  for (const [requestId, updatedTs] of Object.entries(byRequestId)) {
+    db.run("UPDATE request_transcripts SET updated_ts = ?, created_ts = ? WHERE request_id = ?", [
+      updatedTs,
+      updatedTs,
+      requestId,
+    ]);
+  }
+  db.close();
+}

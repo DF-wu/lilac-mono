@@ -12,13 +12,29 @@ export type SurfacePlatform = Exclude<AdapterPlatform, "unknown"> | "unknown";
 export type RoutedSurfacePlatform = "discord" | "telegram";
 
 /**
+ * Every platform a `SessionRef`/`MsgRef` can address. This is the single
+ * runtime source of truth for decoding persisted platform strings back into
+ * those discriminated unions; keep it in sync with `SessionRef`/`MsgRef`.
+ */
+export const SURFACE_REF_PLATFORMS = ["discord", "github", "telegram"] as const;
+
+export type SurfaceRefPlatform = (typeof SURFACE_REF_PLATFORMS)[number];
+
+export function isSurfaceRefPlatform(x: unknown): x is SurfaceRefPlatform {
+  return SURFACE_REF_PLATFORMS.some((platform) => platform === x);
+}
+
+/**
  * Surfaces that can act as an authenticated principal for Level-2 tool
  * authority. A request from one of these carries a real, attributable actor.
+ *
+ * Currently every referenceable surface is also a principal surface, so this
+ * reuses `SurfaceRefPlatform` instead of repeating the literal list.
  */
-export type SurfacePrincipalPlatform = "discord" | "github" | "telegram";
+export type SurfacePrincipalPlatform = SurfaceRefPlatform;
 
 export function isSurfacePrincipalPlatform(x: unknown): x is SurfacePrincipalPlatform {
-  return x === "discord" || x === "github" || x === "telegram";
+  return isSurfaceRefPlatform(x);
 }
 
 export type DiscordSessionRef = {

@@ -276,24 +276,42 @@ export class TelegramSurfaceStore {
       .run({ $session_id: input.sessionId, $message_id: input.messageId, $ts: input.ts });
   }
 
+  /** Oldest-first: unread is read as a catch-up transcript, not a history page. */
   listUnread(input: { sessionId: string; limit?: number }): TelegramMessageRecord[] {
     const state = this.db
-      .query<{ last_read_ts: number }, { $session_id: string }>(
-        `SELECT last_read_ts FROM telegram_read_state WHERE session_id = $session_id`,
+      .query<{ last_read_ts: number; last_read_message_id: string }, { $session_id: string }>(
+        `SELECT last_read_ts, last_read_message_id FROM telegram_read_state
+          WHERE session_id = $session_id`,
       )
       .get({ $session_id: input.sessionId });
 
-    const since = state?.last_read_ts ?? 0;
+    const sinceTs = state?.last_read_ts ?? 0;
+    const sinceId = state?.last_read_message_id ?? "0";
     const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
 
+    // Telegram timestamps have one-second resolution, so `ts` alone cannot
+    // separate messages that arrived in the same second. Tie-break on the
+    // (numeric, monotonic) message id so a burst is not swallowed by the marker.
     const rows = this.db
-      .query<DbTelegramMessage, { $session_id: string; $since: number; $limit: number }>(
+      .query<
+        DbTelegramMessage,
+        { $session_id: string; $since_ts: number; $since_id: string; $limit: number }
+      >(
         `SELECT * FROM telegram_messages
-          WHERE session_id = $session_id AND deleted = 0 AND ts > $since AND from_bot = 0
-          ORDER BY ts DESC
+          WHERE session_id = $session_id AND deleted = 0 AND from_bot = 0
+            AND (
+              ts > $since_ts
+              OR (ts = $since_ts AND CAST(message_id AS INTEGER) > CAST($since_id AS INTEGER))
+            )
+          ORDER BY ts ASC, CAST(message_id AS INTEGER) ASC
           LIMIT $limit`,
       )
-      .all({ $session_id: input.sessionId, $since: since, $limit: limit });
+      .all({
+        $session_id: input.sessionId,
+        $since_ts: sinceTs,
+        $since_id: sinceId,
+        $limit: limit,
+      });
 
     return rows.map(toRecord);
   }

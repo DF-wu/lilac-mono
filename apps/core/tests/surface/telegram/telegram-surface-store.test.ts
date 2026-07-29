@@ -164,4 +164,49 @@ describe("TelegramSurfaceStore read state", () => {
 
     expect(store.listUnread({ sessionId: "1001" })).toHaveLength(0);
   });
+
+  it("excludes deleted messages from unread", () => {
+    store.upsertMessage(record({ messageId: "1", ts: 1_000 }));
+    store.upsertMessage(record({ messageId: "2", ts: 2_000 }));
+    store.markDeleted({ sessionId: "1001", messageId: "2" });
+
+    expect(store.listUnread({ sessionId: "1001" }).map((m) => m.messageId)).toEqual(["1"]);
+  });
+
+  it("still returns messages sharing the read marker's second", () => {
+    // Telegram timestamps are second-resolution, so a burst lands on one `ts`.
+    store.upsertMessage(record({ messageId: "1", ts: 1_000 }));
+    store.upsertMessage(record({ messageId: "2", ts: 1_000 }));
+    store.markRead({ sessionId: "1001", messageId: "1", ts: 1_000 });
+
+    expect(store.listUnread({ sessionId: "1001" }).map((m) => m.messageId)).toEqual(["2"]);
+  });
+
+  it("lists unread oldest first", () => {
+    store.upsertMessage(record({ messageId: "1", ts: 1_000 }));
+    store.upsertMessage(record({ messageId: "2", ts: 2_000 }));
+    store.upsertMessage(record({ messageId: "3", ts: 3_000 }));
+
+    expect(store.listUnread({ sessionId: "1001" }).map((m) => m.messageId)).toEqual([
+      "1",
+      "2",
+      "3",
+    ]);
+  });
+
+  it("orders same-second unread numerically, not lexically", () => {
+    // "10" < "9" as strings, which would invert the arrival order.
+    store.upsertMessage(record({ messageId: "10", ts: 1_000 }));
+    store.upsertMessage(record({ messageId: "9", ts: 1_000 }));
+
+    expect(store.listUnread({ sessionId: "1001" }).map((m) => m.messageId)).toEqual(["9", "10"]);
+  });
+
+  it("compares the read marker id numerically", () => {
+    store.upsertMessage(record({ messageId: "9", ts: 1_000 }));
+    store.upsertMessage(record({ messageId: "10", ts: 1_000 }));
+    store.markRead({ sessionId: "1001", messageId: "9", ts: 1_000 });
+
+    expect(store.listUnread({ sessionId: "1001" }).map((m) => m.messageId)).toEqual(["10"]);
+  });
 });

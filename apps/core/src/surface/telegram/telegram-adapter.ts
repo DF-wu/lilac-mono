@@ -76,8 +76,17 @@ import {
 } from "./output/telegram-output-stream";
 
 export type TelegramAdapterHealthSnapshot = {
-  connectionState: "idle" | "connecting" | "ready" | "disconnected";
+  /**
+   * `failed` is distinct from `disconnected`: the latter is a deliberate
+   * shutdown, the former means polling stopped on its own and the surface is
+   * deaf. Collapsing the two would let a fatal exit read as a clean stop.
+   */
+  connectionState: "idle" | "connecting" | "ready" | "disconnected" | "failed";
   isReady: boolean;
+  /** Set when polling exited unexpectedly; drives `telegram.ready` red. */
+  pollingExitedAt?: number;
+  /** True when the exit can never succeed on retry (bad token, rival poller). */
+  pollingExitFatal?: boolean;
   readyAt?: number;
   lastUpdateAt?: number;
   lastErrorAt?: number;
@@ -153,6 +162,18 @@ export function classifyTelegramNotFound(error: unknown): SurfaceMessageNotFound
     : null;
 }
 
+/**
+ * Whether a polling exit can ever succeed on a retry.
+ *
+ * `401` means the token is wrong and `409` means another process is polling the
+ * same token; reconnecting in either case just produces the same failure while
+ * reporting healthy in between. Everything else is treated as transient.
+ */
+export function isFatalTelegramPollingExit(error: unknown): boolean {
+  if (!(error instanceof GrammyError)) return false;
+  return error.error_code === 401 || error.error_code === 409;
+}
+
 export class TelegramAdapter implements SurfaceAdapter {
   private bot: Bot | null = null;
   private store: TelegramSurfaceStore | null = null;
@@ -162,6 +183,18 @@ export class TelegramAdapter implements SurfaceAdapter {
   private readonly handlers = new Set<AdapterEventHandler>();
   private pollingStopped: Promise<void> | null = null;
   private ready: { promise: Promise<void>; resolve: () => void } | null = null;
+  /**
+   * Set by `disconnect()` so the supervisor can tell a deliberate stop from
+   * polling dying on its own. Without it every clean shutdown would be
+   * reported as a failure.
+   */
+  private stopping = false;
+  /**
+   * Why polling exited, if it did. `whenReady()` throws this rather than the
+   * deferred rejecting, so a failure with no waiter cannot become an unhandled
+   * rejection.
+   */
+  private pollingFailure: Error | null = null;
 
   private readonly logger = createLogger({ module: "surface:telegram" });
 
@@ -223,9 +256,18 @@ export class TelegramAdapter implements SurfaceAdapter {
       });
     }
 
+    this.stopping = false;
+    this.pollingFailure = null;
+
     // bot.start() resolves only once polling stops, so it is intentionally not
     // awaited here; connect() must return as soon as the bot is live.
-    this.pollingStopped = bot.start({
+    //
+    // grammY calls onStart *before* the first getUpdates, so "ready" is only a
+    // claim that polling was launched. A fatal 401/409 rejects this promise
+    // moments later, which is why the supervisor below is attached
+    // immediately rather than left until disconnect(): otherwise the surface
+    // keeps reporting ready while it is deaf, and the rejection sits unhandled.
+    const polling = bot.start({
       allowed_updates: [...TELEGRAM_ALLOWED_UPDATES],
       onStart: (info) => {
         this.healthState = {
@@ -238,12 +280,59 @@ export class TelegramAdapter implements SurfaceAdapter {
         this.ready?.resolve();
       },
     });
+
+    this.pollingStopped = polling.then(
+      () => this.onPollingSettled(null),
+      (error: unknown) => this.onPollingSettled(error),
+    );
+  }
+
+  /**
+   * Records an unexpected end of long polling.
+   *
+   * Runs for both outcomes, because a resolved `start()` is just as wrong as a
+   * rejected one while we still believe we are connected — either way no
+   * further updates arrive.
+   */
+  private onPollingSettled(error: unknown): void {
+    if (this.stopping) return;
+
+    const fatal = isFatalTelegramPollingExit(error);
+    const failure =
+      error === null
+        ? new Error("telegram long polling stopped unexpectedly")
+        : error instanceof Error
+          ? error
+          : new Error(String(error));
+
+    this.pollingFailure = failure;
+    this.healthState = {
+      ...this.healthState,
+      connectionState: "failed",
+      isReady: false,
+      pollingExitedAt: Date.now(),
+      pollingExitFatal: fatal,
+      lastErrorAt: Date.now(),
+      lastError: failure.message,
+    };
+
+    this.logger.error(
+      "telegram long polling exited; surface is no longer receiving updates",
+      { fatal, willRecoverOnRestart: !fatal },
+      failure,
+    );
+
+    // Unblock anyone waiting on readiness; whenReady() surfaces the failure.
+    this.ready?.resolve();
   }
 
   async disconnect(): Promise<void> {
     const bot = this.bot;
     if (!bot) return;
 
+    // Set before stopping so the supervisor treats the resulting settlement as
+    // a deliberate shutdown rather than a failure.
+    this.stopping = true;
     this.bot = null;
     // Stopping aborts the in-flight getUpdates, which surfaces as a transport
     // error. That is the expected shape of a clean shutdown, not a failure.
@@ -268,9 +357,19 @@ export class TelegramAdapter implements SurfaceAdapter {
    * `connect()` deliberately returns before this, because grammY's `start()`
    * only settles when polling stops. Callers that need the distinction — the
    * startup log line, and tests — await this instead of guessing.
+   *
+   * Throws if polling has already exited. Note the ordering caveat: grammY
+   * fires `onStart` before the first `getUpdates`, so a call that lands in
+   * that window returns successfully even though the very next poll will fail.
+   * Readiness is therefore "polling was launched", and the health snapshot is
+   * the authority on whether it is still running.
    */
   async whenReady(): Promise<void> {
     await this.ready?.promise;
+    // Polling can die between launch and the first getUpdates, in which case
+    // the deferred was resolved by the supervisor rather than by onStart.
+    // Throwing here means startup fails loudly instead of proceeding deaf.
+    if (this.pollingFailure) throw this.pollingFailure;
   }
 
   getHealthSnapshot(): TelegramAdapterHealthSnapshot {

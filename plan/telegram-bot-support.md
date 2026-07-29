@@ -1,6 +1,6 @@
 # Telegram Bot Surface Support
 
-Status: **implementation complete and smoke-tested against real Telegram (2026-07-29)** — open follow-ups tracked in [#42](https://github.com/DF-wu/lilac-mono/issues/42); not yet merged to `main`
+Status: **implementation complete and smoke-tested against real Telegram (2026-07-29)** — open follow-ups tracked under epic [#31](https://github.com/DF-wu/lilac-mono/issues/31) ([#42](https://github.com/DF-wu/lilac-mono/issues/42) inbound attachments, [#43](https://github.com/DF-wu/lilac-mono/issues/43) workflow progress cards/actions, [#44](https://github.com/DF-wu/lilac-mono/issues/44) Level-2 surface tools); not yet merged to `main`
 Branch: `feat/telegram-bot-support`
 Tracking: GitHub issues on `DF-wu/lilac-mono` (see [Issue Map](#issue-map))
 
