@@ -5,6 +5,7 @@ import {
   type TelegramOutputApi,
   type TelegramOutputStreamDeps,
 } from "../../../src/surface/telegram/output/telegram-output-stream";
+import { classifySurplusDeletionFailure } from "../../../src/surface/telegram/output/telegram-output-stream";
 import type { TelegramSessionRef } from "../../../src/surface/types";
 
 const SESSION: TelegramSessionRef = { platform: "telegram", channelId: "1001" };
@@ -196,5 +197,68 @@ describe("a surplus message that cannot be deleted must stay tracked", () => {
 
     expect(result.created).toHaveLength(1);
     expect(stream.getSurplusDeletionFailures()).toHaveLength(0);
+  });
+});
+
+describe("classifying why a surplus message survived", () => {
+  it("treats a genuine not-found as absent", () => {
+    expect(
+      classifySurplusDeletionFailure(new Error("Bad Request: message to delete not found")),
+    ).toBe("absent");
+  });
+
+  it("does NOT treat 'message can't be deleted' as absent", () => {
+    // Telegram returns this when the message still exists but the bot may not
+    // remove it — an expired 48h window, or missing rights. Calling it absent
+    // reports a clean reconciliation while stale text stays in the chat.
+    expect(classifySurplusDeletionFailure(new Error("Bad Request: message can't be deleted"))).toBe(
+      "unreconciled",
+    );
+  });
+
+  it("treats missing rights as unreconciled rather than retryable", () => {
+    expect(
+      classifySurplusDeletionFailure(new Error("Bad Request: not enough rights to delete")),
+    ).toBe("unreconciled");
+  });
+
+  it("treats a transport failure as retryable", () => {
+    expect(classifySurplusDeletionFailure(new Error("network unreachable"))).toBe("retryable");
+  });
+});
+
+describe("an unremovable surplus message is reported, not silently kept", () => {
+  it("keeps a can't-be-deleted message tracked and records it as unreconciled", async () => {
+    // There is no later flush after finish(), so "the next flush retries it"
+    // does not apply here: the only way this surfaces is by being reported.
+    const { api, live } = harness({
+      failDelete: () => new Error("Bad Request: message can't be deleted"),
+    });
+    const stream = makeStream(api);
+
+    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    await stream.settled();
+    await stream.push({ type: "text.set", text: "short" });
+    const result = await stream.finish();
+
+    const failures = stream.getSurplusDeletionFailures();
+    expect(failures.length).toBeGreaterThan(0);
+    expect(failures.every((f) => f.outcome === "unreconciled")).toBe(true);
+
+    // Still visible in the chat, so still reported as part of the answer.
+    expect(live.size).toBeGreaterThan(1);
+    expect(result.created.length).toBeGreaterThan(1);
+  });
+
+  it("distinguishes retryable failures from unreconciled ones", async () => {
+    const { api } = harness({ failDelete: () => new Error("socket hang up") });
+    const stream = makeStream(api);
+
+    await stream.push({ type: "text.set", text: "x".repeat(9000) });
+    await stream.settled();
+    await stream.push({ type: "text.set", text: "short" });
+    await stream.finish();
+
+    expect(stream.getSurplusDeletionFailures().every((f) => f.outcome === "retryable")).toBe(true);
   });
 });

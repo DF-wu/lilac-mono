@@ -169,23 +169,44 @@ export function telegramRetryAfterSeconds(error: unknown): number | null {
   return errorText(error).includes("too many requests") ? 0 : null;
 }
 
+export type TelegramSurplusDeletionFailure = {
+  messageId: number;
+  outcome: Exclude<SurplusDeletionOutcome, "absent">;
+  reason: string;
+};
+
+export type SurplusDeletionOutcome = "absent" | "retryable" | "unreconciled";
+
 /**
- * True when a delete failed because the message is already gone.
+ * Classifies why a surplus message could not be deleted.
  *
- * These are terminal: retrying cannot succeed, and the desired end state
- * (message absent) already holds. Anything else is treated as retryable, so a
- * transient network failure never silently drops a message that is still
- * visible to the user.
+ * The distinction that matters is whether the message is still *visible*:
+ *
+ * - `absent` — Telegram confirms it is gone. The desired end state holds, so
+ *   tracking can be dropped.
+ * - `unreconciled` — Telegram refused but the message still exists, typically
+ *   an expired 48h deletion window or missing rights. Retrying cannot help,
+ *   yet stale text remains in the chat, so this must stay tracked and be
+ *   surfaced rather than reported as a clean reconciliation.
+ * - `retryable` — anything else, including transport failures.
  */
-export function isTelegramMessageAlreadyGone(error: unknown): boolean {
+export function classifySurplusDeletionFailure(error: unknown): SurplusDeletionOutcome {
   const text = errorText(error);
-  return (
-    text.includes("message to delete not found") ||
+
+  if (text.includes("message to delete not found")) return "absent";
+
+  // "message can't be deleted" means the message is still there and the bot is
+  // not permitted to remove it — the opposite of absent.
+  if (
     text.includes("message can't be deleted") ||
     text.includes("cant be deleted") ||
     text.includes("message identifier is not specified") ||
-    text.includes("message to edit not found")
-  );
+    text.includes("not enough rights")
+  ) {
+    return "unreconciled";
+  }
+
+  return "retryable";
 }
 
 /** True when Telegram rejected the message because it could not parse entities. */
@@ -286,7 +307,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   private readonly created: MsgRef[] = [];
   private readonly toolEntries: ProgressEntry[] = [];
   private readonly pendingAttachments: SurfaceAttachment[] = [];
-  private readonly surplusDeletionFailures: { messageId: number; reason: string }[] = [];
+  private readonly surplusDeletionFailures: TelegramSurplusDeletionFailure[] = [];
 
   private textAcc = "";
   private statsLine: string | null = null;
@@ -640,18 +661,27 @@ export class TelegramOutputStream implements SurfaceOutputStream {
       await this.deps.api.deleteMessage({ chat_id: this.chatId, message_id: messageId });
       return true;
     } catch (error: unknown) {
-      if (isTelegramMessageAlreadyGone(error)) return true;
+      const outcome = classifySurplusDeletionFailure(error);
+      if (outcome === "absent") return true;
 
       this.surplusDeletionFailures.push({
         messageId,
+        outcome,
         reason: errorText(error),
       });
       return false;
     }
   }
 
-  /** Surplus messages this stream could not remove, newest failure last. */
-  getSurplusDeletionFailures(): { messageId: number; reason: string }[] {
+  /**
+   * Surplus messages still visible in the chat that this stream could not
+   * remove, newest failure last.
+   *
+   * A failure during the final flush has no later flush to retry it, so the
+   * adapter is expected to read this and report it rather than let the request
+   * finish looking clean.
+   */
+  getSurplusDeletionFailures(): TelegramSurplusDeletionFailure[] {
     return [...this.surplusDeletionFailures];
   }
 

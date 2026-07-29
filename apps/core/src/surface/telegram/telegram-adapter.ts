@@ -331,6 +331,18 @@ export class TelegramAdapter implements SurfaceAdapter {
         this.logger.warn("failed to deliver telegram attachments", {}, error);
       },
       onDelivered: (messages) => this.recordOwnOutput(sessionRef, messages),
+      onUnreconciled: (failures) => {
+        // Stale output is still visible to the user, so this is a warning
+        // rather than a debug line.
+        this.logger.warn("telegram surplus messages left in the chat", {
+          sessionId: sessionRef.channelId,
+          failures: failures.map((f) => ({
+            messageId: f.messageId,
+            outcome: f.outcome,
+            reason: f.reason,
+          })),
+        });
+      },
     });
   }
 

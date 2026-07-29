@@ -5,6 +5,8 @@ import type { MsgRef, SurfaceAttachment } from "../../types";
 import type { SurfaceFinalTextMode, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
 import { parseTelegramSessionId, telegramMsgRef } from "../telegram-ids";
 import type { TelegramSessionRef } from "../../types";
+import type { TelegramSurplusDeletionFailure } from "./telegram-output-stream";
+
 /**
  * The capabilities the wrapper needs after `finish()`. Depending on this rather
  * than the concrete stream class keeps the two loosely coupled and lets tests
@@ -15,6 +17,7 @@ export type TelegramDeliverableStream = SurfaceOutputStream & {
   getFinalTextMode(): SurfaceFinalTextMode;
   getDeliveredMessages(): { messageId: number; text: string }[];
   takePendingAttachments(): SurfaceAttachment[];
+  getSurplusDeletionFailures(): TelegramSurplusDeletionFailure[];
 };
 
 /**
@@ -100,6 +103,13 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
        * messages back as updates, so this is the only chance to index them.
        */
       onDelivered: (messages: readonly { messageId: number; text: string }[]) => void;
+      /**
+       * Reports surplus messages still visible in the chat that could not be
+       * removed. A failure on the final flush has no later flush to retry it,
+       * so without this the request finishes looking clean while stale output
+       * remains.
+       */
+      onUnreconciled: (failures: readonly TelegramSurplusDeletionFailure[]) => void;
     },
   ) {}
 
@@ -112,8 +122,11 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
 
     try {
       this.deps.onDelivered(this.stream.getDeliveredMessages());
+
+      const unreconciled = this.stream.getSurplusDeletionFailures();
+      if (unreconciled.length > 0) this.deps.onUnreconciled(unreconciled);
     } catch (error: unknown) {
-      // Indexing is best-effort; it must not fail a delivered reply.
+      // Reporting is best-effort; it must not fail a delivered reply.
       this.deps.onError(error);
     }
 

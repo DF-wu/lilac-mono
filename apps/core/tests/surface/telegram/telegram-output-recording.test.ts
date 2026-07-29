@@ -7,6 +7,7 @@ import {
   type TelegramAttachmentApi,
   type TelegramDeliverableStream,
 } from "../../../src/surface/telegram/output/telegram-attachment-delivery";
+import type { TelegramSurplusDeletionFailure } from "../../../src/surface/telegram/output/telegram-output-stream";
 
 const session: TelegramSessionRef = { platform: "telegram", channelId: "1001" };
 
@@ -24,6 +25,7 @@ function fakeStream(input: {
   delivered?: { messageId: number; text: string }[];
   attachments?: SurfaceAttachment[];
   deliveredThrows?: boolean;
+  unreconciled?: TelegramSurplusDeletionFailure[];
 }): TelegramDeliverableStream {
   const stream: TelegramDeliverableStream = {
     finish: async () => RESULT,
@@ -32,6 +34,7 @@ function fakeStream(input: {
       return input.delivered ?? [];
     },
     takePendingAttachments: () => input.attachments ?? [],
+    getSurplusDeletionFailures: () => input.unreconciled ?? [],
     push: async () => undefined,
     abort: async () => undefined,
     getFinalTextMode: () => "full" as const,
@@ -55,6 +58,7 @@ function wrap(
 ) {
   const errors: unknown[] = [];
   const delivered: (readonly { messageId: number; text: string }[])[] = [];
+  const unreconciled: (readonly TelegramSurplusDeletionFailure[])[] = [];
 
   const wrapper = new TelegramOutputStreamWithAttachments(stream, {
     api: overrides.api ?? noopApi,
@@ -62,9 +66,10 @@ function wrap(
     silent: false,
     onError: overrides.onError ?? ((e) => errors.push(e)),
     onDelivered: overrides.onDelivered ?? ((m) => delivered.push(m)),
+    onUnreconciled: (f) => unreconciled.push(f),
   });
 
-  return { wrapper, errors, delivered };
+  return { wrapper, errors, delivered, unreconciled };
 }
 
 describe("recording the bot's own delivered output", () => {
@@ -158,5 +163,27 @@ describe("recording the bot's own delivered output", () => {
 
     expect(result.created).toHaveLength(2);
     expect(result.last).toEqual({ platform: "telegram", channelId: "1001", messageId: "42" });
+  });
+});
+
+describe("unreconciled surplus messages reach the adapter", () => {
+  it("reports them so the runtime can log stale output", async () => {
+    const stream = fakeStream({
+      unreconciled: [{ messageId: 8, outcome: "unreconciled", reason: "message can't be deleted" }],
+    });
+    const { wrapper, unreconciled } = wrap(stream);
+
+    await wrapper.finish();
+
+    expect(unreconciled).toHaveLength(1);
+    expect(unreconciled[0]?.[0]?.messageId).toBe(8);
+  });
+
+  it("stays quiet when everything reconciled", async () => {
+    const { wrapper, unreconciled } = wrap(fakeStream({}));
+
+    await wrapper.finish();
+
+    expect(unreconciled).toHaveLength(0);
   });
 });

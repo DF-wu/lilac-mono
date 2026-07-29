@@ -101,6 +101,30 @@ describe("core config surface.telegram", () => {
     expect(seen).toContain("surface.telegram");
   });
 
+  it("has no apiRoot by default, so the public Bot API is used", async () => {
+    const cfg = await parseCoreConfig({ configVersion: 2 });
+    expect(cfg.surface.telegram.apiRoot).toBeUndefined();
+  });
+
+  it("accepts a self-hosted Bot API endpoint", async () => {
+    const cfg = await parseCoreConfig({
+      configVersion: 2,
+      surface: { telegram: { apiRoot: "http://127.0.0.1:8081" } },
+    });
+
+    expect(cfg.surface.telegram.apiRoot).toBe("http://127.0.0.1:8081");
+  });
+
+  it("rejects an apiRoot that is not a URL", async () => {
+    // A bare host would silently produce malformed request paths at runtime.
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        surface: { telegram: { apiRoot: "127.0.0.1:8081" } },
+      }),
+    ).rejects.toThrow();
+  });
+
   it("keeps a disabled surface usable only when explicitly enabled", async () => {
     const cfg = await parseCoreConfig({ configVersion: 2 });
     expect(isTelegramSurfaceUsable(cfg)).toBe(false);

@@ -76,6 +76,7 @@ surface:
   telegram:
     enabled: true
     tokenEnv: "TELEGRAM_BOT_TOKEN"
+    # apiRoot: "http://127.0.0.1:8081"   # self-hosted Bot API server
     botName: "lilac"
     # botUsername: "Catalina_agentbot"   # resolved from getMe when omitted
 
@@ -116,6 +117,7 @@ TELEGRAM_BOT_TOKEN=8792842071:AAF...
 | `allowedChatIds` | `[]` | **Fails closed.** Empty means the bot ignores every chat. |
 | `allowedUserIds` | `[]` | Empty means no user-level restriction; the chat allowlist still applies. |
 | `dbPath` | `<dataDir>/telegram-surface.db` | Local message index (see §6). |
+| `apiRoot` | `https://api.telegram.org` | Bot API endpoint. Set this to use a [self-hosted Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server). Must be a full URL. Read once at connect, so a change needs a restart. |
 | `outputMode` | `preview` | Cancellation behaviour only. Telegram edits the streamed message in place, so a **successful** run is identical in both modes. `preview` deletes the streamed messages when a request is cancelled; `inline` leaves the partial answer visible. |
 | `parseMode` | `html` | `html` renders markdown as Telegram HTML; `plain` sends unformatted text. |
 | `streamEditIntervalMs` | `1500` | Minimum gap between streaming edits. Minimum accepted value is 500. |

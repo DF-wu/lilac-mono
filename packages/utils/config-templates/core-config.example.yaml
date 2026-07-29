@@ -206,6 +206,12 @@ surface:
     # Telegram has no history API, so the adapter keeps its own message index.
     # dbPath: "/path/to/telegram-surface.db"
 
+    # Optional: Bot API endpoint. Telegram supports self-hosted Bot API servers,
+    # which raise the file-size limits and keep traffic on your own network.
+    # Must be a full URL. Changing it takes effect on restart.
+    # Default: https://api.telegram.org
+    # apiRoot: "http://127.0.0.1:8081"
+
     # What happens to the streamed messages when a request is cancelled.
     # Telegram edits in place, so a successful run looks identical either way.
     # - inline: leave the partial answer visible
