@@ -5,11 +5,15 @@ import {
   AiSdkPiAgent,
   attachAutoCompaction,
   buildSafeRecoveryCheckpoint,
+  combineCompactionSummaryParts,
   compactMessages,
   createAgentRunIdleWatchdog,
   createTransientModelRetryController,
+  isAbortError,
   type AiSdkPiAgentEvent,
   type AutoCompactionOptions,
+  type CompactionProgress,
+  type NormalizeToolResultOutputFn,
   type TransientModelRetryConfig,
   type TurnBoundaryDecision,
 } from "@stanley2058/lilac-agent";
@@ -33,6 +37,7 @@ import {
 } from "@stanley2058/lilac-tool-results";
 import {
   miniLilacCancelResultSchema,
+  miniLilacCompactionEventSchema,
   miniLilacCompactResultSchema,
   miniLilacInterruptQueuedSteeringRequestSchema,
   miniLilacInterruptQueuedSteeringResultSchema,
@@ -44,12 +49,18 @@ import {
   miniLilacSteerResultSchema,
   miniLilacTodoSchema,
   miniLilacTodoStateSchema,
+  miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageSchema,
   miniLilacUserUIMessageSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
   type MiniLilacCancelRequest,
   type MiniLilacCancelResult,
+  type MiniLilacCompactionEvent,
+  type MiniLilacCompactionPhase,
+  type MiniLilacCompactionProgress,
+  type MiniLilacCancelCompactionRequest,
+  type MiniLilacCancelCompactionResult,
   type MiniLilacCompactRequest,
   type MiniLilacCompactResult,
   type MiniLilacControlResult,
@@ -57,6 +68,7 @@ import {
   type MiniLilacInterruptQueuedSteeringInput,
   type MiniLilacInterruptQueuedSteeringResult,
   type MiniLilacLanguageModelUsage,
+  type MiniLilacOutputRollback,
   type MiniLilacReasoning,
   type MiniLilacSessionSnapshot,
   type MiniLilacSkillSummary,
@@ -109,6 +121,7 @@ import {
 import { MiniLilacSkillCatalog, type MiniLilacSkillCatalogSnapshot } from "./skills";
 import {
   MiniLilacSqliteStore,
+  parseStoredUIMessageChunk,
   type StoredCommandRequest,
   type StoredRunChunk,
   type StoredSessionResume,
@@ -223,6 +236,70 @@ export type StartedSessionRun = {
   stream: ReadableStream<MiniLilacRuntimeChunk>;
 };
 
+export type StartedCompaction = {
+  stream: ReadableStream<MiniLilacRuntimeChunk>;
+};
+
+/**
+ * How often streamed summary text is republished.
+ *
+ * A summary emits thousands of deltas; forwarding each one would flood the
+ * transport (and, on the automatic path, the persisted run log) far faster than
+ * any terminal redraws.
+ */
+const COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS = 100;
+
+/** Replay a previously committed compaction as a one-shot terminal event. */
+function compactionEventFor(result: MiniLilacCompactResult): MiniLilacCompactionEvent {
+  return miniLilacCompactionEventSchema.parse({
+    source: "manual",
+    reason: "manual",
+    phase: "completed",
+    outcome: result.status,
+    messageCountBefore: result.messageCountBefore,
+    messageCountAfter: result.messageCountAfter,
+    estimatedInputTokensBefore: result.estimatedInputTokensBefore,
+    estimatedInputTokensAfter: result.estimatedInputTokensAfter,
+  });
+}
+
+function singleCompactionEventStream(
+  data: MiniLilacCompactionEvent,
+): ReadableStream<MiniLilacRuntimeChunk> {
+  return new ReadableStream<MiniLilacRuntimeChunk>({
+    start(controller) {
+      controller.enqueue({ type: "data-compaction", id: crypto.randomUUID(), data });
+      controller.close();
+    },
+  });
+}
+
+/**
+ * A session snapshot as clients see it.
+ *
+ * `compactionThreshold` is server-side config rather than session state, but
+ * without it on the wire the client cannot say "compacts at 80%" at all. Every
+ * client-facing path goes through here so the field cannot go missing from one
+ * response shape and be present in another.
+ */
+function describeSessionSnapshot(
+  snapshot: MiniLilacSessionSnapshot,
+  config: RuntimeConfig,
+): MiniLilacSessionSnapshot {
+  return { ...snapshot, compactionThreshold: config.agent.compaction.earlyCompactionPoint };
+}
+
+type ManualCompaction = {
+  readonly id: string;
+  readonly chunkId: string;
+  readonly startedAt: number;
+  readonly controller: AbortController;
+  readonly subscribers: Set<Subscriber>;
+  /** Last published event, replayed to every stream that attaches later. */
+  latest: MiniLilacCompactionEvent;
+  finished: boolean;
+};
+
 type StartPromptOptions = {
   depth?: number;
   profileId?: string;
@@ -246,7 +323,7 @@ function enqueueStoredChunk(
   entry: StoredRunChunk,
 ): void {
   controller.enqueue(streamCursor(runId, entry.seq));
-  controller.enqueue(entry.chunk);
+  controller.enqueue(structuredClone(entry.chunk));
 }
 
 type DeferredChild = {
@@ -284,7 +361,11 @@ type RunProjection = {
   eventError?: string;
   toolInputsAvailable: Map<string, { toolName: string; input: unknown }>;
   streamedToolInputIds: Set<string>;
+  suppressedClaudeMcpToolInputIds: Set<string>;
   toolOutputsAvailable: Set<string>;
+  openReasoningIds: Set<string>;
+  openTextIds: Set<string>;
+  visibleToolCallIds: Set<string>;
   preliminaryToolOutputBytes: Map<string, number>;
   truncatedPreliminaryToolOutputs: Set<string>;
 };
@@ -296,6 +377,17 @@ type ActiveRootRun = RunProjection & {
   phase: "accepting-controls" | "finalizing";
   uiChunkCursor: number;
   chronologicalUiPrefix: MiniLilacUIMessage[];
+  liveLog: StoredRunChunk[];
+  nextSeq: number;
+  inputTokens: number | null;
+};
+
+type TerminalReplayProjection = {
+  runId: string;
+  snapshot: MiniLilacSessionSnapshot;
+  uiChunkCursor: number;
+  chronologicalUiPrefix: MiniLilacUIMessage[];
+  liveLog: StoredRunChunk[];
 };
 
 type SubagentCapacity = {
@@ -628,6 +720,103 @@ function terminalText(messages: readonly ModelMessage[]): string {
   return "";
 }
 
+function modelToolCallIds(messages: readonly ModelMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type === "tool-call") ids.add(part.toolCallId);
+    }
+  }
+  return ids;
+}
+
+function rollbackStartIndexes(
+  chunks: readonly UIMessageChunk[],
+  rollback: MiniLilacOutputRollback,
+): Map<string, number> {
+  const starts = new Map<string, number>();
+  const trackedText = new Set(rollback.textIds);
+  const trackedReasoning = new Set(rollback.reasoningIds);
+  const trackedTools = new Set(rollback.toolCallIds);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index]!;
+    if (
+      (chunk.type === "text-start" || chunk.type === "text-delta") &&
+      trackedText.has(chunk.id) &&
+      (chunk.type === "text-start" || !starts.has(`text:${chunk.id}`))
+    ) {
+      starts.set(`text:${chunk.id}`, index);
+    }
+    if (chunk.type === "text-end" && trackedText.has(chunk.id)) {
+      starts.delete(`text:${chunk.id}`);
+    }
+    if (
+      (chunk.type === "reasoning-start" || chunk.type === "reasoning-delta") &&
+      trackedReasoning.has(chunk.id) &&
+      (chunk.type === "reasoning-start" || !starts.has(`reasoning:${chunk.id}`))
+    ) {
+      starts.set(`reasoning:${chunk.id}`, index);
+    }
+    if (chunk.type === "reasoning-end" && trackedReasoning.has(chunk.id)) {
+      starts.delete(`reasoning:${chunk.id}`);
+    }
+    if (
+      (chunk.type === "tool-input-start" || chunk.type === "tool-input-available") &&
+      trackedTools.has(chunk.toolCallId) &&
+      (chunk.type === "tool-input-start" || !starts.has(`tool:${chunk.toolCallId}`))
+    ) {
+      starts.set(`tool:${chunk.toolCallId}`, index);
+    }
+  }
+  return starts;
+}
+
+function chunkMatchesRollback(
+  chunk: UIMessageChunk,
+  index: number,
+  rollback: MiniLilacOutputRollback,
+  starts: ReadonlyMap<string, number>,
+): boolean {
+  if (
+    (chunk.type === "text-start" || chunk.type === "text-delta" || chunk.type === "text-end") &&
+    rollback.textIds.includes(chunk.id) &&
+    index >= (starts.get(`text:${chunk.id}`) ?? 0)
+  ) {
+    return true;
+  }
+  if (
+    (chunk.type === "reasoning-start" ||
+      chunk.type === "reasoning-delta" ||
+      chunk.type === "reasoning-end") &&
+    rollback.reasoningIds.includes(chunk.id) &&
+    index >= (starts.get(`reasoning:${chunk.id}`) ?? 0)
+  ) {
+    return true;
+  }
+  if (
+    (chunk.type === "tool-input-start" ||
+      chunk.type === "tool-input-delta" ||
+      chunk.type === "tool-input-available" ||
+      chunk.type === "tool-input-error" ||
+      chunk.type === "tool-output-available" ||
+      chunk.type === "tool-output-error" ||
+      chunk.type === "tool-output-denied") &&
+    rollback.toolCallIds.includes(chunk.toolCallId) &&
+    index >= (starts.get(`tool:${chunk.toolCallId}`) ?? 0)
+  ) {
+    return true;
+  }
+  if (chunk.type !== "data-subagentStatus") return false;
+  const dataPart = miniLilacUIMessageDataPartSchema.safeParse(chunk);
+  return (
+    dataPart.success &&
+    dataPart.data.type === "data-subagentStatus" &&
+    rollback.toolCallIds.includes(dataPart.data.data.toolCallId) &&
+    index >= (starts.get(`tool:${dataPart.data.data.toolCallId}`) ?? 0)
+  );
+}
+
 async function assistantMessageFromChunks(
   runChunks: readonly StoredRunChunk[],
   afterSeq: number,
@@ -635,9 +824,25 @@ async function assistantMessageFromChunks(
   const segment = runChunks.filter((entry) => entry.seq > afterSeq);
   const throughSeq = segment.at(-1)?.seq ?? afterSeq;
   if (segment.length === 0) return { message: null, throughSeq };
-  const segmentChunks = segment
-    .map((entry) => entry.chunk)
-    .filter((chunk) => chunk.type !== "data-steering" && chunk.type !== "data-steeringCommitted");
+  let segmentChunks: UIMessageChunk[] = [];
+  for (const { chunk } of segment) {
+    if (chunk.type === "data-steering" || chunk.type === "data-steeringCommitted") continue;
+    if (chunk.type === "data-outputRollback") {
+      const starts = rollbackStartIndexes(segmentChunks, chunk.data);
+      segmentChunks = segmentChunks.filter(
+        (candidate, index) => !chunkMatchesRollback(candidate, index, chunk.data, starts),
+      );
+      continue;
+    }
+    if (chunk.type === "data-transcriptReset") {
+      // Compatibility for streams produced before output rollback became
+      // block-scoped. Old reset markers had only run-wide semantics.
+      const start = segmentChunks.find((candidate) => candidate.type === "start");
+      segmentChunks = start === undefined ? [] : [start];
+      continue;
+    }
+    segmentChunks.push(chunk);
+  }
   const originalStart = runChunks.find((entry) => entry.chunk.type === "start")?.chunk;
   const firstSegmentSeq = segment[0]?.seq;
   const chunks =
@@ -650,13 +855,9 @@ async function assistantMessageFromChunks(
           ...segmentChunks,
         ]
       : segmentChunks;
-  const resetIndex = chunks.findLastIndex((chunk) => chunk.type === "data-transcriptReset");
-  const start = chunks.find((chunk) => chunk.type === "start");
-  const canonicalChunks =
-    resetIndex >= 0 && start ? [start, ...chunks.slice(resetIndex + 1)] : chunks;
   const stream = new ReadableStream<UIMessageChunk>({
     start(controller) {
-      canonicalChunks.forEach((chunk) => controller.enqueue(chunk));
+      chunks.forEach((chunk) => controller.enqueue(chunk));
       controller.close();
     },
   });
@@ -669,6 +870,7 @@ async function assistantMessageFromChunks(
 
 class SessionActor {
   private active: ActiveRootRun | undefined;
+  private terminalReplay: TerminalReplayProjection | undefined;
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly delegatedCancels = new Map<string, () => void>();
   private readonly titleControllers = new Map<string, AbortController>();
@@ -728,9 +930,39 @@ class SessionActor {
     }
   }
 
+  private reconcileTerminalReplay(
+    durableSnapshot: MiniLilacSessionSnapshot,
+  ): TerminalReplayProjection | undefined {
+    const terminal = this.terminalReplay;
+    if (terminal === undefined) return undefined;
+    const run = this.store.getRun(terminal.runId);
+    if (
+      durableSnapshot.activeRunId !== terminal.runId ||
+      run.sessionId !== durableSnapshot.id ||
+      run.status !== "active"
+    ) {
+      this.terminalReplay = undefined;
+      return undefined;
+    }
+    return terminal;
+  }
+
+  private describe(snapshot: MiniLilacSessionSnapshot): MiniLilacSessionSnapshot {
+    const described = describeSessionSnapshot(snapshot, this.config);
+    return snapshot.status === "compacting" && this.manualCompaction?.finished === false
+      ? { ...described, activeCompactionCommandId: this.manualCompaction.id }
+      : described;
+  }
+
   getSnapshot(): MiniLilacSessionSnapshot {
     this.snapshot = this.store.getSession(this.snapshot.id);
-    return this.snapshot;
+    const terminal = this.reconcileTerminalReplay(this.snapshot);
+    if (this.active !== undefined) {
+      this.snapshot = { ...this.snapshot, inputTokens: this.active.inputTokens };
+    } else if (terminal !== undefined) {
+      this.snapshot = terminal.snapshot;
+    }
+    return this.describe(this.snapshot);
   }
 
   getMessages(): MiniLilacUIMessage[] {
@@ -740,14 +972,51 @@ class SessionActor {
   getSessionResume(): Promise<SessionResumeProjection> {
     return this.withLock(async () => {
       const active = this.active;
-      if (active !== undefined) await active.eventQueue;
-      return this.store.getSessionResume(this.snapshot.id);
+      if (active === undefined) {
+        const durableSnapshot = this.store.getSession(this.snapshot.id);
+        this.snapshot = durableSnapshot;
+        const terminal = this.reconcileTerminalReplay(durableSnapshot);
+        if (terminal === undefined) {
+          const resume = this.store.getSessionResume(this.snapshot.id);
+          return { ...resume, snapshot: this.describe(resume.snapshot) };
+        }
+        return {
+          snapshot: this.describe(terminal.snapshot),
+          messages: [...terminal.chronologicalUiPrefix],
+          replayCursor: { runId: terminal.runId, afterSeq: terminal.uiChunkCursor },
+        };
+      }
+      await active.eventQueue;
+      this.snapshot = {
+        ...this.store.getSession(this.snapshot.id),
+        inputTokens: active.inputTokens,
+      };
+      return {
+        snapshot: this.describe(this.snapshot),
+        messages: [...active.chronologicalUiPrefix],
+        replayCursor: { runId: active.runId, afterSeq: active.uiChunkCursor },
+      };
     });
+  }
+
+  getRunChunks(runId: string, afterSeq = 0): StoredRunChunk[] {
+    if (this.active === undefined) {
+      this.snapshot = this.store.getSession(this.snapshot.id);
+      this.reconcileTerminalReplay(this.snapshot);
+    }
+    const projection =
+      this.active?.runId === runId
+        ? this.active
+        : this.terminalReplay?.runId === runId
+          ? this.terminalReplay
+          : undefined;
+    return projection?.liveLog.filter((entry) => entry.seq > afterSeq) ?? [];
   }
 
   isQuiescent(): boolean {
     return (
       this.active === undefined &&
+      this.manualCompaction === undefined &&
       this.delegatedCancels.size === 0 &&
       this.titleControllers.size === 0
     );
@@ -756,6 +1025,12 @@ class SessionActor {
   requestShutdown(): Promise<void> {
     for (const controller of this.titleControllers.values()) controller.abort();
     return this.withLock(() => {
+      // Aborted under the actor lock so an admission that won the lock first is
+      // always visible here; checking before acquiring it could miss a freshly
+      // admitted compaction and exhaust the grace period instead of cancelling.
+      // Compaction writes nothing until summarization succeeds, so aborting it
+      // during shutdown leaves the transcript exactly as it was.
+      this.manualCompaction?.controller.abort();
       const active = this.active;
       if (active === undefined) return;
       active.cancelRequested = true;
@@ -778,10 +1053,15 @@ class SessionActor {
     let subscriber: Subscriber | undefined;
     return new ReadableStream<MiniLilacRuntimeChunk>({
       start: (controller) => {
-        for (const entry of this.store.getChunks(runId, afterSeq)) {
+        for (const entry of this.getRunChunks(runId, afterSeq)) {
           enqueueStoredChunk(controller, runId, entry);
         }
-        if (this.projection(runId) === undefined || this.store.getRun(runId).status !== "active") {
+        const projection = this.projection(runId);
+        if (
+          projection === undefined ||
+          projection.streamFinished ||
+          this.store.getRun(runId).status !== "active"
+        ) {
           controller.close();
           return;
         }
@@ -808,6 +1088,8 @@ class SessionActor {
       if (!this.acceptsAdmissions()) {
         throw new Error("SessionService is shutting down and is not accepting admissions");
       }
+      this.snapshot = this.store.getSession(this.snapshot.id);
+      this.reconcileTerminalReplay(this.snapshot);
       const parsedMessage = miniLilacUIMessageSchema.parse(userMessageValue);
       if (parsedMessage.role !== "user") throw new Error("startPrompt requires a user UI message");
       const userMessage = miniLilacUserUIMessageSchema.parse(parsedMessage);
@@ -819,6 +1101,14 @@ class SessionActor {
       }
       if (this.active || this.store.getLatestRun(this.snapshot.id)?.status === "active") {
         throw new Error(`Session '${this.snapshot.id}' already has an active run`);
+      }
+      // Compaction rewrites the whole transcript and holds no run, so an active
+      // run check alone would let a prompt slip in beside it and be summarized
+      // away. Session status is the only thing that covers both.
+      if (!["idle", "error"].includes(this.snapshot.status)) {
+        throw new Error(
+          `Session '${this.snapshot.id}' is '${this.snapshot.status}' and cannot accept a prompt`,
+        );
       }
 
       const profileId = options.profileId ?? this.snapshot.profile;
@@ -878,6 +1168,7 @@ class SessionActor {
           uiMessages: [...priorUiMessages, userMessage],
           title: initialTitle,
         });
+        this.terminalReplay = undefined;
         admitted = true;
         this.active = {
           runId,
@@ -892,9 +1183,16 @@ class SessionActor {
           streamFinished: false,
           uiChunkCursor: 0,
           chronologicalUiPrefix: [...priorUiMessages, userMessage],
+          liveLog: [],
+          nextSeq: 1,
+          inputTokens: this.snapshot.inputTokens ?? null,
           toolInputsAvailable: new Map(),
           streamedToolInputIds: new Set(),
+          suppressedClaudeMcpToolInputIds: new Set(),
           toolOutputsAvailable: new Set(),
+          openReasoningIds: new Set(),
+          openTextIds: new Set(),
+          visibleToolCallIds: new Set(),
           preliminaryToolOutputBytes: new Map(),
           truncatedPreliminaryToolOutputs: new Set(),
         };
@@ -1144,6 +1442,10 @@ class SessionActor {
       claudeBuiltInTools,
       claudeCodeRun,
     } = input;
+    const normalizeToolResultOutput: NormalizeToolResultOutputFn = (output, normalizationContext) =>
+      normalizationContext.bypassGenericOutputNormalizer
+        ? output
+        : normalizeOverflow(output, normalizationContext);
     const agent = new AiSdkPiAgent<ToolSet>({
       system: systemPrompt(
         this.config,
@@ -1164,10 +1466,9 @@ class SessionActor {
       sendToolsToModel: claudeCodeRun === null,
       exclusiveToolNames: tools.skill === undefined ? undefined : new Set(["skill"]),
       messages,
-      normalizeToolResultOutput: (output, normalizationContext) =>
-        normalizationContext.bypassGenericOutputNormalizer
-          ? output
-          : normalizeOverflow(output, normalizationContext),
+      normalizeToolResultOutput,
+      normalizeSettledToolResultOutputs: (entries) =>
+        normalizeOverflow.normalizeSettled(entries, normalizeToolResultOutput),
       genericOutputNormalizerBypassTools: new Set(["bash"]),
       providerOptions,
       turnErrorHandler: transientRetryController?.handler,
@@ -1198,8 +1499,54 @@ class SessionActor {
       resolveCurrentModelSpecifier: () => agent.state.modelSpecifier,
       resolveContextLimit: async ({ defaultModel, currentModelSpecifier }) =>
         (await this.resolveModelLimits(currentModelSpecifier ?? defaultModel)) ?? 0,
+      resolveSummaryContextLimit:
+        configuredSummaryModel === "inherit"
+          ? undefined
+          : async () => (await this.resolveModelLimits(configuredSummaryModel))?.context,
       baseTurnErrorHandler: transientRetryController?.handler,
-      onCompactionEnd: (event) => this.queueAutomaticCompaction(event),
+      onCompactionStart: (event) => {
+        this.automaticCompaction = {
+          chunkId: crypto.randomUUID(),
+          startedAt: Date.now(),
+          modelCalls: 0,
+          stageSummaries: { history: "", "split-turn": "" },
+          lastPublishedAt: 0,
+        };
+        this.queueAutomaticCompaction({ ...event, phase: "started" });
+        this.lastAutomaticCompactionEvent = event;
+      },
+      onProgress: (progress) => {
+        const live = this.automaticCompaction;
+        const base = this.lastAutomaticCompactionEvent;
+        if (!live || !base) return;
+        live.modelCalls += 1;
+        // Each step rewrites its stage's summary rather than extending it.
+        live.stageSummaries[progress.stage] = "";
+        this.queueAutomaticCompaction({ ...base, phase: "progress", progress });
+      },
+      onSummaryDelta: (delta, progress) => {
+        const live = this.automaticCompaction;
+        const base = this.lastAutomaticCompactionEvent;
+        if (!live || !base) return;
+        live.stageSummaries[progress.stage] += delta;
+        // A summary emits thousands of deltas; republishing each one would bloat
+        // the persisted run log for no visible gain at terminal refresh rates.
+        const now = Date.now();
+        if (now - live.lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
+        live.lastPublishedAt = now;
+        this.queueAutomaticCompaction({ ...base, phase: "progress", progress });
+      },
+      onCompactionEnd: (event) =>
+        this.queueAutomaticCompaction({
+          ...event,
+          phase:
+            event.status === "completed"
+              ? "completed"
+              : event.status === "cancelled"
+                ? "cancelled"
+                : "failed",
+          ...(event.summary === undefined ? {} : { finalSummary: event.summary }),
+        }),
     });
     if (context.depth === 0) {
       agent.appendTransformMessages((outboundMessages) => {
@@ -1282,7 +1629,7 @@ class SessionActor {
         const active = this.active;
         if (!active || active.runId !== runId || active.streamFinished) return;
         const operation = active.eventQueue.then(() =>
-          this.appendChunk(runId, { type: "data-session", data: this.snapshot }),
+          this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) }),
         );
         active.eventQueue = operation.catch((error) => this.reportEventFailure(runId, error));
         await operation;
@@ -1435,13 +1782,18 @@ class SessionActor {
         ) {
           throw new Error(`Run '${context.runId}' stopped accepting todo updates`);
         }
+        const priorRevision = this.store.getTodos(this.snapshot.id).revision;
         const result = await this.store.replaceTodosForRun({
           sessionId: this.snapshot.id,
           runId: context.runId,
           todos,
         });
-        if (result.storedChunk !== undefined) {
-          this.publishStoredChunk(context.runId, result.storedChunk);
+        if (result.state.revision !== priorRevision) {
+          await this.appendChunk(context.runId, {
+            type: "data-todos",
+            data: result.state,
+            transient: true,
+          });
         }
         return result.state;
       });
@@ -1734,7 +2086,7 @@ class SessionActor {
         await this.appendChunk(context.runId, { type: "error", errorText: error });
         await this.appendChunk(context.runId, { type: "finish", finishReason: "error" });
       }
-      const runChunks = this.store.getChunks(context.runId);
+      const runChunks = active.liveLog;
       const { message: assistantMessage } = await assistantMessageFromChunks(
         runChunks,
         active.uiChunkCursor,
@@ -1759,7 +2111,9 @@ class SessionActor {
         terminalResult: { text: terminalText(finalMessages) },
         modelMessages: finalMessages,
         uiMessages,
+        inputTokens: active.inputTokens,
       });
+      this.terminalReplay = undefined;
     } catch (finalizationError) {
       const message =
         finalizationError instanceof Error ? finalizationError.message : String(finalizationError);
@@ -1774,9 +2128,26 @@ class SessionActor {
           terminalResult: { text: terminalText(agent.state.messages) },
           modelMessages: this.store.getModelMessages(this.snapshot.id),
           uiMessages: this.store.getUiMessages(this.snapshot.id),
+          inputTokens: active.inputTokens,
         });
+        this.terminalReplay = undefined;
       } catch {
-        // Cleanup must still run if the persistence layer remains unavailable.
+        // Keep the only replayable response alive even though durable state
+        // remains active for startup recovery to terminalize.
+        this.terminalReplay = {
+          runId: active.runId,
+          snapshot: {
+            ...this.snapshot,
+            activeRunId: null,
+            status: "error",
+            queuedSteeringCount: 0,
+            inputTokens: active.inputTokens,
+            updatedAt: new Date().toISOString(),
+          },
+          uiChunkCursor: active.uiChunkCursor,
+          chronologicalUiPrefix: [...active.chronologicalUiPrefix],
+          liveLog: active.liveLog,
+        };
       }
     } finally {
       await this.disposeClaudeCodeRun(active.claudeCodeRun, context.runId);
@@ -1858,7 +2229,10 @@ class SessionActor {
           messageMetadata: metadata(this.snapshot),
         });
         if (active !== undefined) {
-          await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+          await this.appendChunk(runId, {
+            type: "data-session",
+            data: this.describe(this.snapshot),
+          });
         }
         return;
       case "agent_end": {
@@ -1889,9 +2263,21 @@ class SessionActor {
         return;
       case "turn_end":
         projection.lastFinishReason = event.finishReason;
-        if (active !== undefined && event.usage.inputTokens !== undefined) {
-          this.snapshot = this.store.updateSessionUsage(this.snapshot.id, event.usage.inputTokens);
-          await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+        if (
+          active !== undefined &&
+          event.usage.inputTokens !== undefined &&
+          active.inputTokens !== event.usage.inputTokens
+        ) {
+          active.inputTokens = event.usage.inputTokens;
+          this.snapshot = this.store.updateActiveRunInputTokens(
+            this.snapshot.id,
+            runId,
+            active.inputTokens,
+          );
+          await this.appendChunk(runId, {
+            type: "data-session",
+            data: this.describe(this.snapshot),
+          });
         }
         return;
       case "turn_retry":
@@ -1900,6 +2286,7 @@ class SessionActor {
           await this.appendChunk(runId, { type: "finish-step" });
         }
         for (const toolCallId of event.abandonedToolCallIds) {
+          if (projection.suppressedClaudeMcpToolInputIds.delete(toolCallId)) continue;
           if (!projection.streamedToolInputIds.has(toolCallId)) continue;
           await this.appendChunk(runId, {
             type: "tool-output-error",
@@ -1915,6 +2302,7 @@ class SessionActor {
           projection.stepOpen = false;
           await this.appendChunk(runId, { type: "finish-step" });
         }
+        if (event.reason === "cancel" || event.reason === "interrupt") return;
         await this.appendChunk(runId, {
           type: "abort",
           reason: event.detail ?? `${event.reason}:${event.phase}`,
@@ -1923,7 +2311,7 @@ class SessionActor {
       case "message_start":
         if (event.message.role === "user") {
           if (active === undefined || consumedSteeringCheckpoints.length === 0) return;
-          const runChunks = this.store.getChunks(runId);
+          const runChunks = active.liveLog;
           const segment = await assistantMessageFromChunks(runChunks, active.uiChunkCursor);
           const chronologicalUiPrefix = [...active.chronologicalUiPrefix];
           if (segment.message && segment.message.parts.length > 0) {
@@ -1953,7 +2341,10 @@ class SessionActor {
             this.snapshot.status,
             this.queuedSteeringCount(),
           );
-          await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+          await this.appendChunk(runId, {
+            type: "data-session",
+            data: this.describe(this.snapshot),
+          });
         } else if (event.message.role === "tool") {
           for (const part of event.message.content) {
             if (part.type !== "tool-result") continue;
@@ -1965,6 +2356,9 @@ class SessionActor {
         const update = event.assistantMessageEvent;
         switch (update.type) {
           case "text_start":
+            projection.openReasoningIds.clear();
+            projection.openTextIds.clear();
+            projection.openTextIds.add(update.id);
             await this.appendChunk(runId, {
               type: "text-start",
               id: update.id,
@@ -1972,6 +2366,9 @@ class SessionActor {
             });
             return;
           case "text_delta":
+            projection.openReasoningIds.clear();
+            if (!projection.openTextIds.has(update.id)) projection.openTextIds.clear();
+            projection.openTextIds.add(update.id);
             await this.appendChunk(runId, {
               type: "text-delta",
               id: update.id,
@@ -1985,8 +2382,12 @@ class SessionActor {
               id: update.id,
               providerMetadata: browserSafeProviderMetadata(update.raw.providerMetadata),
             });
+            projection.openTextIds.delete(update.id);
             return;
           case "thinking_start":
+            projection.openTextIds.clear();
+            projection.openReasoningIds.clear();
+            projection.openReasoningIds.add(update.id);
             await this.appendChunk(runId, {
               type: "reasoning-start",
               id: update.id,
@@ -1994,6 +2395,9 @@ class SessionActor {
             });
             return;
           case "thinking_delta":
+            projection.openTextIds.clear();
+            if (!projection.openReasoningIds.has(update.id)) projection.openReasoningIds.clear();
+            projection.openReasoningIds.add(update.id);
             await this.appendChunk(runId, {
               type: "reasoning-delta",
               id: update.id,
@@ -2007,9 +2411,23 @@ class SessionActor {
               id: update.id,
               providerMetadata: browserSafeProviderMetadata(update.raw.providerMetadata),
             });
+            projection.openReasoningIds.delete(update.id);
             return;
           case "toolcall_start":
+            projection.openReasoningIds.clear();
+            projection.openTextIds.clear();
+            if (
+              projection.claudeCodeRun !== null &&
+              displayClaudeCodeToolName(update.toolName) !== update.toolName
+            ) {
+              // Claude streams bridged MCP input before Lilac's authoritative
+              // execution event. Projecting both creates an orphaned running
+              // row and interrupts grouping of adjacent tool entries.
+              projection.suppressedClaudeMcpToolInputIds.add(update.toolCallId);
+              return;
+            }
             projection.streamedToolInputIds.add(update.toolCallId);
+            projection.visibleToolCallIds.add(update.toolCallId);
             await this.appendChunk(runId, {
               type: "tool-input-start",
               toolCallId: update.toolCallId,
@@ -2021,6 +2439,7 @@ class SessionActor {
             });
             return;
           case "toolcall_delta":
+            if (projection.suppressedClaudeMcpToolInputIds.has(update.toolCallId)) return;
             await this.appendChunk(runId, {
               type: "tool-input-delta",
               toolCallId: update.toolCallId,
@@ -2028,6 +2447,7 @@ class SessionActor {
             });
             return;
           case "toolcall_end":
+            projection.suppressedClaudeMcpToolInputIds.delete(update.toolCallId);
             return;
           case "custom":
             await this.appendChunk(runId, {
@@ -2069,6 +2489,9 @@ class SessionActor {
         return;
       }
       case "tool_execution_start":
+        projection.openReasoningIds.clear();
+        projection.openTextIds.clear();
+        projection.visibleToolCallIds.add(event.toolCallId);
         if (projection.toolInputsAvailable.has(event.toolCallId)) return;
         projection.toolInputsAvailable.set(event.toolCallId, {
           toolName: event.toolName,
@@ -2157,10 +2580,30 @@ class SessionActor {
         return;
       case "messages_reset":
         if (event.reason === "cancel" || event.reason === "interrupt") {
+          const retainedToolCallIds = modelToolCallIds(event.messages);
+          const rollback: MiniLilacOutputRollback = {
+            reason: event.reason,
+            reasoningIds: [...projection.openReasoningIds],
+            textIds: [...projection.openTextIds],
+            toolCallIds: [...projection.visibleToolCallIds].filter(
+              (toolCallId) => !retainedToolCallIds.has(toolCallId),
+            ),
+          };
           await this.appendChunk(runId, {
-            type: "data-transcriptReset",
-            data: { reason: event.reason },
+            type: "data-outputRollback",
+            data: rollback,
           });
+          projection.openReasoningIds.clear();
+          projection.openTextIds.clear();
+          projection.suppressedClaudeMcpToolInputIds.clear();
+          for (const toolCallId of rollback.toolCallIds) {
+            projection.visibleToolCallIds.delete(toolCallId);
+            projection.toolInputsAvailable.delete(toolCallId);
+            projection.streamedToolInputIds.delete(toolCallId);
+            projection.toolOutputsAvailable.delete(toolCallId);
+            projection.preliminaryToolOutputBytes.delete(toolCallId);
+            projection.truncatedPreliminaryToolOutputs.delete(toolCallId);
+          }
         }
         return;
       case "message_end":
@@ -2170,12 +2613,18 @@ class SessionActor {
           // with no execution events. Calls Lilac ran are already registered.
           for (const part of event.message.content) {
             if (part.type === "tool-result") {
+              projection.suppressedClaudeMcpToolInputIds.delete(part.toolCallId);
               await this.appendToolResultChunk(runId, projection, part);
               continue;
             }
             if (part.type !== "tool-call") continue;
+            projection.suppressedClaudeMcpToolInputIds.delete(part.toolCallId);
+            projection.visibleToolCallIds.add(part.toolCallId);
             if (projection.toolInputsAvailable.has(part.toolCallId)) continue;
-            const toolName = displayClaudeCodeToolName(part.toolName);
+            const toolName =
+              projection.claudeCodeRun === null
+                ? part.toolName
+                : displayClaudeCodeToolName(part.toolName);
             projection.toolInputsAvailable.set(part.toolCallId, {
               toolName,
               input: part.input,
@@ -2225,7 +2674,10 @@ class SessionActor {
           ? {
               type: "tool-input-error",
               toolCallId: part.toolCallId,
-              toolName: displayClaudeCodeToolName(part.toolName),
+              toolName:
+                projection.claudeCodeRun === null
+                  ? part.toolName
+                  : displayClaudeCodeToolName(part.toolName),
               input: toolInput?.input,
               errorText,
               dynamic: true,
@@ -2250,8 +2702,15 @@ class SessionActor {
   private async appendChunk(runId: string, chunk: StoredUIMessageChunk): Promise<void> {
     const projection = this.projection(runId);
     if (projection === undefined || projection.streamFinished) return;
-    const seq = this.store.appendChunk(runId, chunk);
-    this.publishStoredChunk(runId, { seq, chunk });
+    const active = this.active;
+    if (active?.runId !== runId) return;
+    const entry = {
+      seq: active.nextSeq,
+      chunk: structuredClone(parseStoredUIMessageChunk(chunk)),
+    } satisfies StoredRunChunk;
+    active.nextSeq += 1;
+    active.liveLog.push(entry);
+    this.publishStoredChunk(runId, entry);
   }
 
   private publishStoredChunk(runId: string, entry: StoredRunChunk): void {
@@ -2292,7 +2751,7 @@ class SessionActor {
     const operation = active.eventQueue.then(async () => {
       if (active.phase !== "accepting-controls" || active.streamFinished) return;
       await this.appendChunk(runId, { type: "data-control", id, data: result });
-      await this.appendChunk(runId, { type: "data-session", data: this.snapshot });
+      await this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) });
     });
     active.eventQueue = operation.catch((error) => {
       this.reportEventFailure(runId, error);
@@ -2327,35 +2786,82 @@ class SessionActor {
     });
   }
 
+  /**
+   * Live state for the automatic compaction happening inside the current run.
+   *
+   * Every phase reuses one chunk id so the renderer updates a single entry, and
+   * the summary buffer resets per step because each summarization request
+   * rewrites the whole summary rather than appending to it.
+   */
+  private automaticCompaction:
+    | {
+        readonly chunkId: string;
+        readonly startedAt: number;
+        readonly stageSummaries: Record<CompactionProgress["stage"], string>;
+        modelCalls: number;
+        lastPublishedAt: number;
+      }
+    | undefined;
+
+  /** Immutable facts about the running automatic compaction, reused by every phase. */
+  private lastAutomaticCompactionEvent:
+    | {
+        readonly reason: "threshold" | "overflow";
+        readonly messageCountBefore: number;
+        readonly estimatedInputTokens: number;
+      }
+    | undefined;
+
   private queueAutomaticCompaction(event: {
     readonly reason: "threshold" | "overflow";
-    readonly status: "completed" | "failed";
+    readonly phase: MiniLilacCompactionPhase;
     readonly messageCountBefore: number;
     readonly messageCountAfter?: number;
     readonly estimatedInputTokens: number;
     readonly estimatedInputTokensAfter?: number;
+    readonly progress?: MiniLilacCompactionProgress;
+    readonly finalSummary?: string;
     readonly error?: unknown;
   }): void {
     const active = this.active;
     if (!active) return;
-    const id = crypto.randomUUID();
+    // Terminal events must still publish even if the start hook never fired, so
+    // the live state is created on demand rather than assumed.
+    const live = (this.automaticCompaction ??= {
+      chunkId: crypto.randomUUID(),
+      startedAt: Date.now(),
+      stageSummaries: { history: "", "split-turn": "" },
+      modelCalls: 0,
+      lastPublishedAt: 0,
+    });
+    // Publication is deferred behind the run's event queue, but the live state
+    // keeps mutating. Everything the chunk reports is captured now so a backed-up
+    // queue cannot backdate later progress onto an earlier phase.
+    const terminal = event.phase !== "started" && event.phase !== "progress";
+    const summary =
+      event.finalSummary ??
+      combineCompactionSummaryParts(live.stageSummaries.history, live.stageSummaries["split-turn"]);
+    const data: MiniLilacCompactionEvent = {
+      source: "automatic",
+      reason: event.reason,
+      phase: event.phase,
+      messageCountBefore: event.messageCountBefore,
+      messageCountAfter: event.messageCountAfter,
+      estimatedInputTokensBefore: event.estimatedInputTokens,
+      estimatedInputTokensAfter: event.estimatedInputTokensAfter,
+      progress: event.progress,
+      summary: summary.length > 0 ? summary : undefined,
+      modelCalls: live.modelCalls,
+      ...(event.phase === "completed" ? { outcome: "compacted" as const } : {}),
+      elapsedMs: event.phase === "started" ? 0 : Math.max(0, Date.now() - live.startedAt),
+      ...(terminal ? { durationMs: Math.max(0, Date.now() - live.startedAt) } : {}),
+      ...(event.error === undefined
+        ? {}
+        : { error: event.error instanceof Error ? event.error.message : String(event.error) }),
+    };
+    if (terminal) this.automaticCompaction = undefined;
     const operation = active.eventQueue.then(() =>
-      this.appendChunk(active.runId, {
-        type: "data-compaction",
-        id,
-        data: {
-          source: "automatic",
-          reason: event.reason,
-          status: event.status,
-          messageCountBefore: event.messageCountBefore,
-          messageCountAfter: event.messageCountAfter,
-          estimatedInputTokensBefore: event.estimatedInputTokens,
-          estimatedInputTokensAfter: event.estimatedInputTokensAfter,
-          ...(event.error === undefined
-            ? {}
-            : { error: event.error instanceof Error ? event.error.message : String(event.error) }),
-        },
-      }),
+      this.appendChunk(active.runId, { type: "data-compaction", id: live.chunkId, data }),
     );
     active.eventQueue = operation.catch((error) => {
       this.reportEventFailure(active.runId, error);
@@ -2542,12 +3048,36 @@ class SessionActor {
     });
   }
 
-  compact(request: MiniLilacCompactRequest): Promise<MiniLilacCompactResult> {
-    return this.withLock(async () => {
+  /**
+   * A manual compaction that is running right now.
+   *
+   * Deliberately not owned by the request that started it: clients attach and
+   * detach freely, but the compaction itself has to reach a terminal state so
+   * the reserved command and the `compacting` status are always resolved.
+   */
+  private manualCompaction: ManualCompaction | undefined;
+
+  /**
+   * Admit a manual compaction and return a stream of its lifecycle.
+   *
+   * Admission runs under the actor lock; the summarization itself does not,
+   * because it is long-running and holding the lock would block reads. The
+   * `compacting` session status is what keeps the session exclusive: every other
+   * admission path (prompts, undo, bindings, a second compaction) requires
+   * `idle`/`error`, so none can interleave. Nothing is written until
+   * summarization succeeds, which is what makes cancellation safe.
+   */
+  async compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
+    const admitted = await this.withLock(async () => {
+      if (!this.acceptsAdmissions()) {
+        throw new Error("SessionService is shutting down and is not accepting admissions");
+      }
       const id = commandId(request.clientCommandId);
       const command = compactCommandRequest();
       const stored = this.store.getCommandResult(this.snapshot.id, id, command);
-      if (stored !== undefined) return miniLilacCompactResultSchema.parse(stored);
+      if (stored !== undefined) {
+        return { kind: "replay", result: miniLilacCompactResultSchema.parse(stored) } as const;
+      }
       this.snapshot = this.store.getSession(this.snapshot.id);
       if (
         this.active ||
@@ -2556,73 +3086,321 @@ class SessionActor {
       ) {
         throw new Error(`Session '${this.snapshot.id}' must be quiescent to compact`);
       }
-
       const messages = this.store.getModelMessages(this.snapshot.id);
       this.store.reserveCommand(this.snapshot.id, id, command);
+      this.snapshot = this.store.updateSessionState(this.snapshot.id, "compacting", 0, null);
+      const live: ManualCompaction = {
+        id,
+        chunkId: `compaction:${id}`,
+        startedAt: Date.now(),
+        controller: new AbortController(),
+        subscribers: new Set<Subscriber>(),
+        latest: miniLilacCompactionEventSchema.parse({
+          source: "manual",
+          reason: "manual",
+          phase: "started",
+          messageCountBefore: messages.length,
+          modelCalls: 0,
+          elapsedMs: 0,
+        }),
+        finished: false,
+      };
+      // Installed before the admission lock releases: an explicit cancel or a
+      // shutdown that takes the lock next must always see the operation, or it
+      // would answer `inactive` while the compaction proceeds regardless.
+      this.manualCompaction = live;
+      return { kind: "admitted", id, command, messages, live } as const;
+    });
+
+    if (admitted.kind === "replay") {
+      return { stream: singleCompactionEventStream(compactionEventFor(admitted.result)) };
+    }
+
+    // Tracked as runtime work rather than as part of the caller's promise: the
+    // store must stay open, and shutdown must wait, even with no client attached.
+    void this.trackExecution(this.runCompaction(admitted, admitted.live));
+    return { stream: this.subscribeCompaction(admitted.live) };
+  }
+
+  /**
+   * Stop the running compaction.
+   *
+   * Separate from `cancel()` because compaction owns no run, and separate from
+   * the request that started it because detaching a client must not stop work
+   * that other clients (and the session itself) still depend on.
+   */
+  cancelCompaction(
+    request: MiniLilacCancelCompactionRequest,
+  ): Promise<MiniLilacCancelCompactionResult> {
+    return this.withLock(async () => {
+      const live = this.manualCompaction;
+      if (live === undefined || live.finished) return { status: "inactive" as const };
+      // A cancel aimed at a compaction that finished, with a successor already
+      // admitted, must not stop the newer operation. Callers that know their
+      // target name it; a session-scoped cancel still stops whatever runs.
+      if (request.clientCommandId !== undefined && request.clientCommandId !== live.id) {
+        return { status: "inactive" as const };
+      }
+      live.controller.abort();
+      return { status: "cancelling" as const };
+    });
+  }
+
+  /**
+   * Attach a client to the running compaction.
+   *
+   * The last event is replayed on attach so a stream opened after `started` (or
+   * after the whole compaction finished) still sees a coherent lifecycle.
+   */
+  private subscribeCompaction(live: ManualCompaction): ReadableStream<MiniLilacRuntimeChunk> {
+    let subscriber: Subscriber | undefined;
+    return new ReadableStream<MiniLilacRuntimeChunk>({
+      start: (controller) => {
+        controller.enqueue({ type: "data-compaction", id: live.chunkId, data: live.latest });
+        if (live.finished) {
+          controller.close();
+          return;
+        }
+        subscriber = controller;
+        live.subscribers.add(controller);
+      },
+      cancel: () => {
+        // Detaching never cancels: compaction keeps running and still commits.
+        // Stopping it is `cancelCompaction`, an explicit operation.
+        if (subscriber) live.subscribers.delete(subscriber);
+      },
+    });
+  }
+
+  private publishCompaction(live: ManualCompaction, data: MiniLilacCompactionEvent): void {
+    live.latest = data;
+    this.broadcastCompaction(live, { type: "data-compaction", id: live.chunkId, data });
+  }
+
+  private broadcastCompaction(live: ManualCompaction, chunk: MiniLilacRuntimeChunk): void {
+    for (const subscriber of live.subscribers) {
       try {
-        if (messages.length === 0) {
-          const empty = miniLilacCompactResultSchema.parse({
-            status: "empty",
-            clientCommandId: id,
-            messageCountBefore: 0,
-            messageCountAfter: 0,
-            estimatedInputTokensBefore: 0,
-            estimatedInputTokensAfter: 0,
-          });
-          return this.store.commitCompaction(this.snapshot.id, id, command, messages, empty);
-        }
-        const modelSpecifier = this.snapshot.model;
-        if (modelSpecifier === null) throw new Error("Session model is required for compaction");
-        const limits = await this.resolveModelLimits(modelSpecifier);
-        if (limits === undefined || limits.context <= 0) {
-          throw new Error(`Context window is unavailable for model '${modelSpecifier}'`);
-        }
-        const configuredSummaryModel = this.config.agent.compaction.model;
-        const summaryModelSpecifier =
-          configuredSummaryModel === "inherit" ? modelSpecifier : configuredSummaryModel;
-        const compacted = await compactMessages({
-          messages,
-          currentModel: this.resolveModel(modelSpecifier),
-          contextLimit: limits.context,
-          outputLimit: limits.output,
-          thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
-          summaryModel:
-            configuredSummaryModel === "inherit"
-              ? "current"
-              : this.resolveModel(configuredSummaryModel),
-          providerOptions: this.supersededProviderIds.has(
-            parseModelRef(summaryModelSpecifier).providerId,
-          )
-            ? { openai: { store: false, include: ["reasoning.encrypted_content"] } }
-            : undefined,
-        });
-        const result = miniLilacCompactResultSchema.parse({
-          status:
-            compacted.status === "compacted"
-              ? "compacted"
-              : compacted.reason === "empty"
-                ? "empty"
-                : "noop",
-          clientCommandId: id,
-          messageCountBefore: compacted.messageCountBefore,
-          messageCountAfter: compacted.messageCountAfter,
-          estimatedInputTokensBefore: compacted.estimatedTokensBefore,
-          estimatedInputTokensAfter: compacted.estimatedTokensAfter,
-        });
-        const committed = this.store.commitCompaction(
-          this.snapshot.id,
+        subscriber.enqueue(chunk);
+      } catch {
+        // The client went away mid-write; the next detach cleans it up.
+      }
+    }
+  }
+
+  private async runCompaction(
+    admitted: {
+      readonly id: string;
+      readonly command: StoredCommandRequest;
+      readonly messages: readonly ModelMessage[];
+    },
+    live: ManualCompaction,
+  ): Promise<void> {
+    const sessionId = this.snapshot.id;
+    const { id, command, messages } = admitted;
+    const messageCountBefore = messages.length;
+
+    let modelCalls = 0;
+    let lastPublishedAt = 0;
+    // History and split-turn prefixes summarize concurrently, so their deltas
+    // interleave; keeping one buffer per stage is what lets the live text be
+    // assembled the same way the engine assembles the persisted summary.
+    const stageSummaries: Record<CompactionProgress["stage"], string> = {
+      history: "",
+      "split-turn": "",
+    };
+    const combinedSummary = (): string =>
+      combineCompactionSummaryParts(stageSummaries.history, stageSummaries["split-turn"]);
+
+    const event = (
+      phase: MiniLilacCompactionPhase,
+      extra: Partial<MiniLilacCompactionEvent> = {},
+    ): MiniLilacCompactionEvent => {
+      const summary = combinedSummary();
+      return miniLilacCompactionEventSchema.parse({
+        source: "manual",
+        reason: "manual",
+        phase,
+        messageCountBefore,
+        modelCalls,
+        elapsedMs: Math.max(0, Date.now() - live.startedAt),
+        ...(summary.length > 0 ? { summary } : {}),
+        ...extra,
+      });
+    };
+    const publish = (data: MiniLilacCompactionEvent): void => this.publishCompaction(live, data);
+    const publishSession = (): void =>
+      this.broadcastCompaction(live, {
+        type: "data-session",
+        data: this.describe(this.snapshot),
+      });
+
+    publishSession();
+
+    try {
+      const result = await this.summarizeForCompaction({
+        messages,
+        clientCommandId: id,
+        abortSignal: live.controller.signal,
+        onProgress: (progress) => {
+          modelCalls += 1;
+          // Each step rewrites its stage's summary rather than extending it.
+          stageSummaries[progress.stage] = "";
+          publish(event("progress", { progress }));
+        },
+        onSummaryDelta: (delta, progress) => {
+          stageSummaries[progress.stage] += delta;
+          const now = Date.now();
+          if (now - lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
+          lastPublishedAt = now;
+          publish(event("progress", { progress }));
+        },
+      });
+
+      // Validate the terminal payload before committing. Once the transaction
+      // below returns, no failure may be reported as if the transcript were
+      // unchanged.
+      const completedEvent = event("completed", {
+        outcome: result.result.status,
+        messageCountAfter: result.result.messageCountAfter,
+        estimatedInputTokensBefore: result.result.estimatedInputTokensBefore,
+        estimatedInputTokensAfter: result.result.estimatedInputTokensAfter,
+        durationMs: Math.max(0, Date.now() - live.startedAt),
+        ...(result.summary === undefined ? {} : { summary: result.summary }),
+      });
+
+      await this.withLock(async () => {
+        // A cancel that lands while summarization is finishing must still stop
+        // the commit; the transcript is only rewritten here.
+        live.controller.signal.throwIfAborted();
+        const saved = this.store.commitCompaction(
+          sessionId,
           id,
           command,
-          compacted.messages,
-          result,
+          result.messages,
+          result.result,
+          {
+            // Prefer the engine's own summary: it is post-truncation and covers
+            // every stage, which a live delta buffer cannot guarantee.
+            summary: result.summary ?? combinedSummary(),
+            durationMs: Math.max(0, Date.now() - live.startedAt),
+            modelCalls,
+          },
         );
-        this.snapshot = this.store.getSession(this.snapshot.id);
-        return committed;
-      } catch (error) {
-        this.store.releaseCommand(this.snapshot.id, id, command);
-        throw error;
+        live.finished = true;
+        this.snapshot = saved.snapshot;
+      });
+
+      // The session snapshot precedes the terminal event: the terminal event is
+      // where clients stop reading, so anything after it would never arrive.
+      publishSession();
+      publish(completedEvent);
+    } catch (error) {
+      await this.withLock(async () => {
+        this.store.releaseCommand(sessionId, id, command);
+        this.snapshot = this.store.updateSessionState(sessionId, "idle", 0, null);
+      });
+      const cancelled = live.controller.signal.aborted || isAbortError(error);
+      // Snapshot before the terminal event, for the same reason as on success.
+      publishSession();
+      publish(
+        event(cancelled ? "cancelled" : "failed", {
+          durationMs: Math.max(0, Date.now() - live.startedAt),
+          ...(cancelled ? {} : { error: error instanceof Error ? error.message : String(error) }),
+        }),
+      );
+    } finally {
+      live.finished = true;
+      if (this.manualCompaction === live) this.manualCompaction = undefined;
+      for (const subscriber of live.subscribers) {
+        try {
+          subscriber.close();
+        } catch {
+          // Already closed by the client.
+        }
       }
+      live.subscribers.clear();
+    }
+  }
+
+  private async summarizeForCompaction(params: {
+    readonly messages: readonly ModelMessage[];
+    readonly clientCommandId: string;
+    readonly abortSignal: AbortSignal;
+    readonly onProgress: (progress: CompactionProgress) => void;
+    readonly onSummaryDelta: (delta: string, progress: CompactionProgress) => void;
+  }): Promise<{
+    messages: readonly ModelMessage[];
+    result: MiniLilacCompactResult;
+    summary?: string;
+  }> {
+    const id = params.clientCommandId;
+    if (params.messages.length === 0) {
+      return {
+        messages: params.messages,
+        result: miniLilacCompactResultSchema.parse({
+          status: "empty",
+          clientCommandId: id,
+          messageCountBefore: 0,
+          messageCountAfter: 0,
+          estimatedInputTokensBefore: 0,
+          estimatedInputTokensAfter: 0,
+        }),
+      };
+    }
+    const modelSpecifier = this.snapshot.model;
+    if (modelSpecifier === null) throw new Error("Session model is required for compaction");
+    const limits = await this.resolveModelLimits(modelSpecifier);
+    if (limits === undefined || limits.context <= 0) {
+      throw new Error(`Context window is unavailable for model '${modelSpecifier}'`);
+    }
+    const configuredSummaryModel = this.config.agent.compaction.model;
+    const summaryModelSpecifier =
+      configuredSummaryModel === "inherit" ? modelSpecifier : configuredSummaryModel;
+    // A configured summary model can be far smaller than the session model, so
+    // size chunk budgets against its own window rather than the session's.
+    const summaryLimits =
+      summaryModelSpecifier === modelSpecifier
+        ? limits
+        : await this.resolveModelLimits(summaryModelSpecifier);
+    const compacted = await compactMessages({
+      messages: params.messages,
+      currentModel: this.resolveModel(modelSpecifier),
+      contextLimit: limits.context,
+      outputLimit: limits.output,
+      summaryContextLimit: summaryLimits?.context,
+      thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
+      summaryModel:
+        configuredSummaryModel === "inherit"
+          ? "current"
+          : this.resolveModel(configuredSummaryModel),
+      providerOptions: this.supersededProviderIds.has(
+        parseModelRef(summaryModelSpecifier).providerId,
+      )
+        ? { openai: { store: false, include: ["reasoning.encrypted_content"] } }
+        : undefined,
+      abortSignal: params.abortSignal,
+      onProgress: params.onProgress,
+      onSummaryDelta: params.onSummaryDelta,
     });
+    return {
+      messages: compacted.messages,
+      ...(compacted.status === "compacted" && compacted.summary !== undefined
+        ? { summary: compacted.summary }
+        : {}),
+      result: miniLilacCompactResultSchema.parse({
+        status:
+          compacted.status === "compacted"
+            ? "compacted"
+            : compacted.reason === "empty"
+              ? "empty"
+              : "noop",
+        clientCommandId: id,
+        messageCountBefore: compacted.messageCountBefore,
+        messageCountAfter: compacted.messageCountAfter,
+        estimatedInputTokensBefore: compacted.estimatedTokensBefore,
+        estimatedInputTokensAfter: compacted.estimatedTokensAfter,
+      }),
+    };
   }
 
   updateBindings(
@@ -2636,7 +3414,9 @@ class SessionActor {
         request.clientCommandId,
         command,
       );
-      if (stored !== undefined) return miniLilacSessionSnapshotSchema.parse(stored);
+      if (stored !== undefined) {
+        return this.describe(miniLilacSessionSnapshotSchema.parse(stored));
+      }
       this.snapshot = this.store.getSession(this.snapshot.id);
       if (
         this.active ||
@@ -2671,7 +3451,7 @@ class SessionActor {
           contextWindow: limits?.context,
         },
       );
-      return this.snapshot;
+      return this.describe(this.snapshot);
     });
   }
 
@@ -2695,7 +3475,10 @@ class SessionActor {
         this.snapshot.status,
         this.queuedSteeringCount(),
       );
-      await this.appendChunk(active.runId, { type: "data-session", data: this.snapshot });
+      await this.appendChunk(active.runId, {
+        type: "data-session",
+        data: this.describe(this.snapshot),
+      });
     });
   }
 }
@@ -2858,7 +3641,8 @@ export class SessionService {
   }
 
   getRunChunks(runId: string, afterSeq = 0): StoredRunChunk[] {
-    return this.store.getChunks(runId, afterSeq);
+    const run = this.store.getRun(runId);
+    return this.actors.get(run.sessionId)?.getRunChunks(runId, afterSeq) ?? [];
   }
 
   async listSkills(cwdValue: string, profileId?: string): Promise<MiniLilacSkillSummary[]> {
@@ -3003,10 +3787,11 @@ export class SessionService {
     options: { afterSeq?: number; tail?: boolean } = {},
   ): ReadableStream<MiniLilacRuntimeChunk> {
     const run = this.store.getRun(runId);
-    if (options.tail !== false && run.status === "active") {
-      return this.actor(run.sessionId).streamRun(runId, options.afterSeq);
+    const actor = this.actors.get(run.sessionId);
+    if (options.tail !== false && run.status === "active" && actor !== undefined) {
+      return actor.streamRun(runId, options.afterSeq);
     }
-    const chunks = this.store.getChunks(runId, options.afterSeq);
+    const chunks = actor?.getRunChunks(runId, options.afterSeq) ?? [];
     return new ReadableStream<MiniLilacRuntimeChunk>({
       start(controller) {
         chunks.forEach((entry) => enqueueStoredChunk(controller, runId, entry));
@@ -3038,9 +3823,21 @@ export class SessionService {
     return this.trackOperation(this.actor(request.sessionId).undo(request));
   }
 
-  compact(request: MiniLilacCompactRequest): Promise<MiniLilacCompactResult> {
+  compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
     this.assertAcceptingAdmissions();
     return this.trackOperation(this.actor(request.sessionId).compact(request));
+  }
+
+  cancelCompaction(
+    request: MiniLilacCancelCompactionRequest,
+  ): Promise<MiniLilacCancelCompactionResult> {
+    this.assertAcceptingAdmissions();
+    return this.trackOperation(this.actor(request.sessionId).cancelCompaction(request));
+  }
+
+  /** Decorate a store snapshot with the server-side config clients need. */
+  describeSession(snapshot: MiniLilacSessionSnapshot): MiniLilacSessionSnapshot {
+    return describeSessionSnapshot(snapshot, this.options.config);
   }
 
   updateSessionBindings(
@@ -3077,6 +3874,13 @@ export class SessionService {
     });
     this.shutdownAttempt = attempt;
     return attempt;
+  }
+
+  /** Stop admissions and ask actor-owned work to cancel without closing the store. */
+  async requestShutdown(): Promise<void> {
+    if (this.closed) return;
+    this.acceptingAdmissions = false;
+    await Promise.all([...this.actors.values()].map((actor) => actor.requestShutdown()));
   }
 
   private actor(sessionId: string): SessionActor {

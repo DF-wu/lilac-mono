@@ -132,8 +132,6 @@ export async function seedCoreConfig(options?: { dataDir?: string; overwrite?: b
   const overwrite = options?.overwrite ?? false;
 
   await fs.mkdir(dataDir, { recursive: true });
-  // Keep: helps empty dirs survive in git checkouts; harmless in docker.
-  await Bun.write(path.join(dataDir, ".gitkeep"), "");
 
   const configPath = resolveCoreConfigPath({ dataDir });
   const existed = await Bun.file(configPath).exists();

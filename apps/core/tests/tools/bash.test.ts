@@ -10,6 +10,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { executeBash, withLimitedBashOutput } from "../../src/tools/bash-impl";
+import { getPreOverflowRawByteLimit } from "../../src/tools/bash-output-sanitizer";
 import { bashToolWithCwd } from "../../src/tools/bash";
 import { executeRestrictedBash } from "../../src/tools/restricted-bash";
 import { resolveRestrictedSessionTmpDir } from "../../src/shared/attachment-utils";
@@ -371,6 +372,45 @@ rmdir "$media_dir"`,
     expect(res.truncation?.message).toContain("could not be retained");
     const tmpEntries = await fs.readdir(await fs.realpath("/tmp"));
     expect(tmpEntries.some((entry) => entry.startsWith(`${requestId}-${toolCallId}-`))).toBe(false);
+  });
+
+  it("reports incomplete retention after bounded pre-cap ANSI output", async () => {
+    const artifactDir = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-bash-bounded-spill-"),
+    );
+    const artifacts = createToolResultArtifactStore(path.join(artifactDir, "tool-results"));
+    await artifacts.init();
+
+    try {
+      const result = await executeBash(
+        {
+          command: `printf '\\x1b]0;API_TOKEN=hidden-secret'; head -c ${getPreOverflowRawByteLimit(4)} /dev/zero | tr '\\0' x; printf '\\x07API_TOKEN=visible-secret done'`,
+        },
+        {
+          context: {
+            requestId: "bash-bounded-spill-request",
+            sessionId: "bash-bounded-spill-session",
+            requestClient: "test",
+          },
+          toolCallId: "bash-bounded-spill-call",
+          artifacts,
+          outputConfig: {
+            maxPreviewBytes: 4,
+            artifactTtlMs: 60_000,
+            artifactMaxBytesPerSession: 2 * 1024 * 1024,
+          },
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.truncation?.completeOutputRetained).toBe(false);
+      expect(result.truncation?.artifactUri).toBeUndefined();
+      expect(result.truncation?.message).toContain("complete output could not be retained");
+      expect(result.stdout).not.toContain("hidden-secret");
+      expect(result.stdout).not.toContain("visible-secret");
+    } finally {
+      await fs.rm(artifactDir, { recursive: true, force: true });
+    }
   });
 
   it("forwards generic control capability and profile context through ordinary Bash", async () => {

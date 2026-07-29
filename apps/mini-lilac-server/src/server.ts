@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import {
   MINI_LILAC_REASONING_LEVELS,
   miniLilacCancelRequestSchema,
+  miniLilacCancelCompactionRequestSchema,
   miniLilacCompactRequestSchema,
   miniLilacInterruptQueuedSteeringRequestSchema,
   miniLilacMessagesSchema,
@@ -186,6 +187,9 @@ function errorResponse(error: unknown): Response {
     message.includes("was already used") ||
     message.includes("must be quiescent to undo") ||
     message.includes("must be quiescent to compact") ||
+    // A prompt refused because the session is compacting is an admission
+    // conflict, not a server fault.
+    message.includes("cannot accept a prompt") ||
     message.includes("must be quiescent to update bindings") ||
     message.includes("has no durable checkpoint") ||
     message.includes("has no exact UI prefix") ||
@@ -444,7 +448,7 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
           );
           return timestamp === 0 ? left.id.localeCompare(right.id) : timestamp;
         });
-      return jsonResponse(sessions);
+      return jsonResponse(sessions.map((session) => sessionService.describeSession(session)));
     }),
   );
 
@@ -550,9 +554,28 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       if (request.sessionId !== sessionId) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
-      return withSessionLock(sessionId, async () =>
-        jsonResponse(await sessionService.compact(request)),
-      );
+      // Compaction answers with an event stream, not a JSON body: it is
+      // long-running, and progress plus the generated summary have to reach the
+      // client while it runs. Admission still happens before the stream opens,
+      // so a non-quiescent session is still a 409 rather than a stream error.
+      //
+      // The request signal is deliberately not forwarded: the response stream is
+      // a view of the compaction, not its owner. Disconnecting detaches the
+      // client and compaction still commits; stopping it is an explicit call to
+      // the cancel endpoint below.
+      const started = await withSessionLock(sessionId, () => sessionService.compact(request));
+      return uiMessageStreamResponse(started.stream);
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/compact/cancel`, ({ body, params }) =>
+    safely(async () => {
+      const { sessionId } = sessionParamsSchema.parse(params);
+      const request = miniLilacCancelCompactionRequestSchema.parse(body);
+      if (request.sessionId !== sessionId) {
+        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
+      }
+      return jsonResponse(await sessionService.cancelCompaction(request));
     }),
   );
 

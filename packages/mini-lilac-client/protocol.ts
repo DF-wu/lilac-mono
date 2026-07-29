@@ -80,13 +80,21 @@ export const miniLilacModelSummarySchema = z.object({
 });
 export type MiniLilacModelSummary = z.infer<typeof miniLilacModelSummarySchema>;
 
-export const miniLilacSessionStatusSchema = z.enum(["idle", "streaming", "cancelling", "error"]);
+export const miniLilacSessionStatusSchema = z.enum([
+  "idle",
+  "streaming",
+  "compacting",
+  "cancelling",
+  "error",
+]);
 export type MiniLilacSessionStatus = z.infer<typeof miniLilacSessionStatusSchema>;
 
 export const miniLilacSessionSnapshotSchema = z
   .object({
     id: identifierSchema,
     activeRunId: identifierSchema.nullable(),
+    /** Active manual compaction command, used to make cancellation generation-safe. */
+    activeCompactionCommandId: identifierSchema.nullable().optional(),
     status: miniLilacSessionStatusSchema,
     cwd: z.string().min(1),
     model: identifierSchema.nullable(),
@@ -94,7 +102,14 @@ export const miniLilacSessionSnapshotSchema = z
     reasoning: miniLilacReasoningSchema.nullable(),
     title: z.string().max(100).optional(),
     inputTokens: z.number().int().nonnegative().nullable().optional(),
+    /** True when `inputTokens` is a post-compaction estimate rather than reported usage. */
+    inputTokensEstimated: z.boolean().optional(),
     contextWindow: z.number().int().positive().nullable().optional(),
+    /**
+     * Context fraction at which automatic compaction triggers. Server-side config,
+     * mirrored here because the client cannot otherwise render "compacts at 80%".
+     */
+    compactionThreshold: z.number().positive().max(1).optional(),
     queuedSteeringCount: z.number().int().nonnegative(),
     createdAt: timestampSchema.optional(),
     updatedAt: timestampSchema.optional(),
@@ -180,6 +195,27 @@ export type MiniLilacCompactInput = Omit<MiniLilacCompactRequest, "clientCommand
   readonly clientCommandId?: string;
 };
 
+/**
+ * Explicit cancellation of a running compaction.
+ *
+ * Compaction outlives the request that started it, so it cannot be cancelled by
+ * abandoning that request; stopping it is its own operation.
+ */
+export const miniLilacCancelCompactionRequestSchema = z.strictObject({
+  sessionId: identifierSchema,
+  /**
+   * The compact command this cancel is aimed at. When present, a cancel that
+   * arrives after its target finished (with a successor already admitted) is
+   * answered `inactive` instead of stopping the newer operation. Omitted when
+   * the caller does not know the running compaction's command id (for example
+   * after reopening a session mid-compaction).
+   */
+  clientCommandId: identifierSchema.optional(),
+});
+export type MiniLilacCancelCompactionRequest = z.infer<
+  typeof miniLilacCancelCompactionRequestSchema
+>;
+
 const resultCommandIdField = {
   clientCommandId: identifierSchema.optional(),
 };
@@ -229,6 +265,15 @@ export const miniLilacCompactResultSchema = z.discriminatedUnion("status", [
 ]);
 export type MiniLilacCompactResult = z.infer<typeof miniLilacCompactResultSchema>;
 
+export const miniLilacCancelCompactionResultSchema = z
+  .object({
+    // `cancelling` rather than `cancelled`: the engine stops at the next
+    // summarization boundary, so the terminal event still arrives on the stream.
+    status: z.enum(["cancelling", "inactive"]),
+  })
+  .strict();
+export type MiniLilacCancelCompactionResult = z.infer<typeof miniLilacCancelCompactionResultSchema>;
+
 export const miniLilacControlResultSchema = z.union([
   miniLilacSteerResultSchema,
   miniLilacInterruptQueuedSteeringResultSchema,
@@ -252,6 +297,14 @@ export const miniLilacTranscriptResetSchema = z
   .strict();
 export type MiniLilacTranscriptReset = z.infer<typeof miniLilacTranscriptResetSchema>;
 
+export const miniLilacOutputRollbackSchema = z.strictObject({
+  reason: z.enum(["cancel", "interrupt"]),
+  reasoningIds: z.array(identifierSchema),
+  textIds: z.array(identifierSchema),
+  toolCallIds: z.array(identifierSchema),
+});
+export type MiniLilacOutputRollback = z.infer<typeof miniLilacOutputRollbackSchema>;
+
 export const miniLilacSubagentStatusSchema = z
   .object({
     toolCallId: identifierSchema,
@@ -270,31 +323,88 @@ export const miniLilacSubagentStatusSchema = z
   .strict();
 export type MiniLilacSubagentStatus = z.infer<typeof miniLilacSubagentStatusSchema>;
 
+/**
+ * Compaction is a lifecycle, not a terminal event. Every phase reuses one chunk
+ * `id` so renderers update a single entry in place instead of appending a line
+ * per update.
+ */
+export const miniLilacCompactionPhaseSchema = z.enum([
+  "started",
+  "progress",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+export type MiniLilacCompactionPhase = z.infer<typeof miniLilacCompactionPhaseSchema>;
+
+export const miniLilacCompactionProgressSchema = z
+  .object({
+    /** History and split-turn prefixes summarize concurrently; their deltas interleave. */
+    stage: z.enum(["history", "split-turn"]),
+    step: z.number().int().positive(),
+    stepCount: z.number().int().positive(),
+    /** Above 1 means the provider rejected a larger attempt and the transcript was resplit. */
+    pass: z.number().int().positive(),
+  })
+  .strict();
+export type MiniLilacCompactionProgress = z.infer<typeof miniLilacCompactionProgressSchema>;
+
 const miniLilacCompactionMetricsSchema = {
-  status: z.enum(["completed", "failed"]),
+  phase: miniLilacCompactionPhaseSchema,
   messageCountBefore: z.number().int().nonnegative(),
   messageCountAfter: z.number().int().nonnegative().optional(),
   estimatedInputTokensBefore: z.number().int().nonnegative().optional(),
   estimatedInputTokensAfter: z.number().int().nonnegative().optional(),
+  progress: miniLilacCompactionProgressSchema.optional(),
+  /** Summary text so far; the complete summary once the phase is `completed`. */
+  summary: z.string().optional(),
+  /** Elapsed time so far, so a reconnecting renderer does not restart the clock. */
+  elapsedMs: z.number().int().nonnegative().optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+  /** Cumulative summarization requests, which makes compaction cost visible. */
+  modelCalls: z.number().int().nonnegative().optional(),
+  /**
+   * Outcome once `phase` is `completed`. `empty`/`noop` mean nothing was
+   * compacted, which renderers must distinguish so they do not claim a saving.
+   */
+  outcome: z.enum(["compacted", "empty", "noop"]).optional(),
   error: z.string().optional(),
 } as const;
 
-export const miniLilacCompactionEventSchema = z.discriminatedUnion("source", [
-  z
-    .object({
-      source: z.literal("automatic"),
-      reason: z.enum(["threshold", "overflow"]),
-      ...miniLilacCompactionMetricsSchema,
-    })
-    .strict(),
-  z
-    .object({
-      source: z.literal("manual"),
-      reason: z.literal("manual"),
-      ...miniLilacCompactionMetricsSchema,
-    })
-    .strict(),
-]);
+export const miniLilacCompactionEventSchema = z
+  .discriminatedUnion("source", [
+    z
+      .object({
+        source: z.literal("automatic"),
+        reason: z.enum(["threshold", "overflow"]),
+        ...miniLilacCompactionMetricsSchema,
+      })
+      .strict(),
+    z
+      .object({
+        source: z.literal("manual"),
+        reason: z.literal("manual"),
+        ...miniLilacCompactionMetricsSchema,
+      })
+      .strict(),
+  ])
+  .superRefine((event, context) => {
+    if (event.phase !== "completed") return;
+    if (event.outcome === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["outcome"],
+        message: "A completed compaction event requires an outcome",
+      });
+    }
+    if (event.messageCountAfter === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["messageCountAfter"],
+        message: "A completed compaction event requires messageCountAfter",
+      });
+    }
+  });
 export type MiniLilacCompactionEvent = z.infer<typeof miniLilacCompactionEventSchema>;
 
 export const miniLilacStreamCursorSchema = z
@@ -388,6 +498,7 @@ export type MiniLilacUIMessageDataParts = {
   session: MiniLilacSessionSnapshot;
   control: MiniLilacControlResult;
   transcriptReset: MiniLilacTranscriptReset;
+  outputRollback: MiniLilacOutputRollback;
   subagentStatus: MiniLilacSubagentStatus;
   compaction: MiniLilacCompactionEvent;
   streamCursor: MiniLilacStreamCursor;
@@ -409,6 +520,11 @@ export const miniLilacUIMessageDataPartSchema = z.discriminatedUnion("type", [
     type: z.literal("data-transcriptReset"),
     id: identifierSchema.optional(),
     data: miniLilacTranscriptResetSchema,
+  }),
+  z.strictObject({
+    type: z.literal("data-outputRollback"),
+    id: identifierSchema.optional(),
+    data: miniLilacOutputRollbackSchema,
   }),
   z.strictObject({
     type: z.literal("data-subagentStatus"),

@@ -51,6 +51,7 @@ import {
 } from "./workflow-operation-policy";
 
 const WORKFLOW_LEASE_STALE_MS = 60_000;
+const WORKFLOW_LEASE_HEARTBEAT_MS = 20_000;
 const WORKFLOW_REQUEST_LEASE_STALE_MS = 30_000;
 
 const phaseInputSchema = z.strictObject({ name: z.string().min(1).max(200) });
@@ -84,6 +85,7 @@ type ActiveRun = {
   controller: AbortController;
   sandbox: WorkflowSandboxRun;
   promise: Promise<void>;
+  nextHeartbeatAt: number;
 };
 
 class Semaphore {
@@ -141,6 +143,7 @@ export class WorkflowEngine {
       subscriptionId: string;
       now?: () => number;
       pollMs?: number;
+      runClaimHeartbeatMs?: number;
       receiptPollMs?: number;
       loadSnapshot?: (revision: WorkflowRevision) => Promise<string>;
       compileSource?: (source: string, sourceSha256: string) => string;
@@ -189,7 +192,7 @@ export class WorkflowEngine {
         batch: { maxWaitMs: 500 },
       },
       async (_message, context) => {
-        void this.requestTick();
+        await this.requestTick();
         await context.commit();
       },
     );
@@ -207,7 +210,11 @@ export class WorkflowEngine {
       });
     }
     await this.requestTick();
-    this.timer = setInterval(() => void this.requestTick(), this.input.pollMs ?? 250);
+    this.timer = setInterval(() => {
+      void this.requestTick().catch((error: unknown) => {
+        this.logger.error("Workflow timer tick failed", error);
+      });
+    }, this.input.pollMs ?? 250);
     this.timer.unref?.();
   }
 
@@ -269,11 +276,19 @@ export class WorkflowEngine {
           Promise.resolve().then(() => active.sandbox.cancel()),
           Promise.resolve().then(() => this.stopAgentRequests(runId)),
         );
+      } else if (run.state !== "running" || run.claimedBy !== this.workerId) {
+        active.controller.abort("workflow lease lost");
+        cancellations.push(Promise.resolve().then(() => active.sandbox.cancel()));
       } else {
-        if (!this.input.store.refreshRunClaim(runId, this.workerId, this.now())) {
+        const now = this.now();
+        if (now < active.nextHeartbeatAt) continue;
+        if (!this.input.store.refreshRunClaim(runId, this.workerId, now)) {
           active.controller.abort("workflow lease lost");
           cancellations.push(Promise.resolve().then(() => active.sandbox.cancel()));
+          continue;
         }
+        active.nextHeartbeatAt =
+          now + (this.input.runClaimHeartbeatMs ?? WORKFLOW_LEASE_HEARTBEAT_MS);
       }
     }
     const settledCancellations = await Promise.allSettled(cancellations);
@@ -293,10 +308,11 @@ export class WorkflowEngine {
 
   private async claimAndLaunch(run: WorkflowRun, staleAfterMs?: number): Promise<void> {
     if (this.active.has(run.runId) || this.stopping) return;
+    const claimedAt = this.now();
     const claimed = this.input.store.tryClaimRun({
       runId: run.runId,
       claimerId: this.workerId,
-      now: this.now(),
+      now: claimedAt,
       staleAfterMs,
     });
     if (!claimed) return;
@@ -308,10 +324,19 @@ export class WorkflowEngine {
       await this.finishRun(claimed, "failed", null, boundedError(error));
       return;
     }
-    const promise = this.runSandbox(claimed, sandbox, controller.signal).finally(() => {
-      this.active.delete(claimed.runId);
+    const promise = this.runSandbox(claimed, sandbox, controller.signal)
+      .catch((error: unknown) => {
+        this.logger.error("Workflow sandbox run failed", { runId: claimed.runId }, error);
+      })
+      .finally(() => {
+        this.active.delete(claimed.runId);
+      });
+    this.active.set(claimed.runId, {
+      controller,
+      sandbox,
+      promise,
+      nextHeartbeatAt: claimedAt + (this.input.runClaimHeartbeatMs ?? WORKFLOW_LEASE_HEARTBEAT_MS),
     });
-    this.active.set(claimed.runId, { controller, sandbox, promise });
   }
 
   private async loadSnapshot(revision: WorkflowRevision): Promise<string> {
@@ -407,8 +432,8 @@ export class WorkflowEngine {
     sandbox: WorkflowSandboxRun,
     signal: AbortSignal,
   ): Promise<void> {
-    await this.publishRun(run, "running", "queued");
     try {
+      await this.publishRun(run, "running", "queued");
       const result = await sandbox.result;
       if (signal.aborted || this.stopping) return;
       const revision = this.input.store.getRevision(run.revisionId);

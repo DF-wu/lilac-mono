@@ -124,6 +124,9 @@ export class Skills implements ServerTool {
         description: "List and search skills discovered from common directories.",
         shortInput: zodObjectToCliLines(listInputSchema, { mode: "required" }),
         input: zodObjectToCliLines(listInputSchema),
+        primaryPositional: {
+          field: "query",
+        },
       },
       {
         callableId: "skills.brief",

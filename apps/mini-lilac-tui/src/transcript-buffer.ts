@@ -45,6 +45,17 @@ export function createBufferedChunkOutput(
         return id;
       },
       update: (id, entry) => replace(id, () => ({ id, ...entry })),
+      remove: (id) => {
+        const index = indexes.get(id);
+        if (index === undefined) return;
+        entries.splice(index, 1);
+        indexes.delete(id);
+        for (let next = index; next < entries.length; next += 1) {
+          const entry = entries[next];
+          if (entry !== undefined) indexes.set(entry.id, next);
+        }
+        schedulePublish();
+      },
       appendText: (id, delta) => replace(id, (entry) => ({ ...entry, text: entry.text + delta })),
       finish: (id) => replace(id, (entry) => ({ ...entry, streaming: false })),
     },

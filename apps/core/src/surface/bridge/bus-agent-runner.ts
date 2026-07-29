@@ -51,7 +51,6 @@ import {
   buildSyntheticToolCallId,
   createAgentRunIdleWatchdog,
   type AiSdkPiAgentEvent,
-  type NormalizeToolResultOutputFn,
   type TransformMessagesFn,
 } from "@stanley2058/lilac-agent";
 
@@ -132,6 +131,7 @@ import {
   type AgentRunProfile,
   type ParsedSubagentMeta,
 } from "./bus-agent-runner/raw";
+import { createAgentOutputPublisher } from "./bus-agent-runner/output-publisher";
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
 import {
@@ -1264,6 +1264,7 @@ class PreAgentRunCancelledError extends Error {
 const AGENT_TIMEOUT_ABORT_GRACE_MS = 5_000;
 const LIVE_PARENT_RECONCILE_MS = 1_000;
 const SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS = 3;
+export const WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS = 10_000;
 
 function isCancelControlEntry(entry: Enqueued): boolean {
   const raw = entry.raw;
@@ -1521,6 +1522,7 @@ type SessionQueue = {
     liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
     claudeCodeControl: ClaudeCodeRunControl | null;
     notifyWaiters: () => void;
+    flushOutput: () => void;
     cancel: () => void;
     started: boolean;
     startedAt: number;
@@ -2286,12 +2288,28 @@ export async function startBusAgentRunner(params: {
       ...(workflowDispatchEpoch ? { workflow_dispatch_epoch: workflowDispatchEpoch } : {}),
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
     };
+    const outputPublisher = createAgentOutputPublisher({
+      bus,
+      headers,
+      onError: (label, error) => {
+        logger.error(
+          `failed to publish ${label}`,
+          { requestId: headers.request_id, sessionId: headers.session_id },
+          error,
+        );
+      },
+    });
+    let auxiliaryOutputTail = Promise.resolve();
     const publishCurrentLifecycle = async (input: {
       state: RequestLifecycleState;
       detail?: string;
       output?: string;
       usage?: WorkflowUsage;
     }): Promise<void> => {
+      if (input.state === "resolved" || input.state === "failed" || input.state === "cancelled") {
+        await auxiliaryOutputTail;
+        await outputPublisher.drain();
+      }
       if (
         workflowPolicy &&
         workflowRequestClaimed &&
@@ -2317,8 +2335,9 @@ export async function startBusAgentRunner(params: {
       await publishLifecycle({ bus, headers, ...input });
     };
     const publishAgentActivity = createAgentOutputActivityPublisher({
-      bus,
-      headers,
+      publish: async (source) => {
+        await outputPublisher.publishActivity({ source });
+      },
       onError: (error) => {
         logger.debug("agent activity publish failed", {
           requestId: next.requestId,
@@ -2358,20 +2377,21 @@ export async function startBusAgentRunner(params: {
       runIdleWatchdog?.reset();
     };
 
-    const normalizeToolResultOutput: NormalizeToolResultOutputFn = createToolResultOutputNormalizer(
-      {
-        artifacts: params.toolResultArtifacts,
-        owner: {
-          requestId: next.requestId,
-          sessionId: next.sessionId,
-        },
-        getOutputConfig: () => cfg.tools.output,
+    const normalizeToolResultOutput = createToolResultOutputNormalizer({
+      artifacts: params.toolResultArtifacts,
+      owner: {
+        requestId: next.requestId,
+        sessionId: next.sessionId,
       },
-    );
+      getOutputConfig: () => cfg.tools.output,
+    });
 
     const liveParentSession = params.workflowLiveParentBridge?.registerParent({
       parentRequestId: next.requestId,
       onActivity: () => markRunActivity("subagent"),
+      publishToolStatus: async (update) => {
+        await outputPublisher.publishToolCall(update);
+      },
       recoverSynchronousDeliveries: next.recovery !== undefined,
     });
     await liveParentSession?.ready;
@@ -2432,6 +2452,7 @@ export async function startBusAgentRunner(params: {
       liveParent: liveParentSession,
       claudeCodeControl: null,
       notifyWaiters: notifyContinuationWaiters,
+      flushOutput: outputPublisher.flush,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -2523,7 +2544,7 @@ export async function startBusAgentRunner(params: {
             activeAgent?.abort();
             rejectPreAgentCancellation?.(new PreAgentRunCancelledError());
           }
-        }, 5_000);
+        }, WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS);
         workflowClaimTimer.unref?.();
       }
       if (workflowPolicy) assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
@@ -2535,11 +2556,7 @@ export async function startBusAgentRunner(params: {
           detail,
           output: `Error: ${detail}`,
         });
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputResponseText,
-          { finalText: `Error: ${detail}` },
-          { headers },
-        );
+        await outputPublisher.publishResponseText({ finalText: `Error: ${detail}` });
         return;
       }
 
@@ -2558,15 +2575,11 @@ export async function startBusAgentRunner(params: {
         const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
         activeCustomCommandTool = { toolCallId, display };
 
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputToolCall,
-          {
-            toolCallId,
-            status: "start",
-            display,
-          },
-          { headers },
-        );
+        await outputPublisher.publishToolCall({
+          toolCallId,
+          status: "start",
+          display,
+        });
 
         let output: CustomCommandResult = { type: "json", value: null };
         let customError = parsedCustomCommand.error ?? null;
@@ -2622,24 +2635,20 @@ export async function startBusAgentRunner(params: {
 
         if (customCancelled) {
           const finalText = "Cancelled.";
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            {
-              toolCallId,
-              status: "end",
-              display,
-              ok: false,
-              error: "cancelled by interrupt",
-            },
-            { headers },
-          );
+          await outputPublisher.publishToolCall({
+            toolCallId,
+            status: "end",
+            display,
+            ok: false,
+            error: "cancelled by interrupt",
+          });
           activeCustomCommandTool = null;
           await publishCurrentLifecycle({
             state: "cancelled",
             detail: "cancelled by interrupt",
             output: finalText,
           });
-          await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+          await outputPublisher.publishResponseText({ finalText });
           return;
         }
 
@@ -2666,17 +2675,13 @@ export async function startBusAgentRunner(params: {
           output,
         });
 
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputToolCall,
-          {
-            toolCallId,
-            status: "end",
-            display,
-            ok: !customError,
-            error: customError ?? undefined,
-          },
-          { headers },
-        );
+        await outputPublisher.publishToolCall({
+          toolCallId,
+          status: "end",
+          display,
+          ok: !customError,
+          error: customError ?? undefined,
+        });
         activeCustomCommandTool = null;
 
         if (customError) {
@@ -2713,7 +2718,7 @@ export async function startBusAgentRunner(params: {
             detail: customError,
             output: finalText,
           });
-          await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+          await outputPublisher.publishResponseText({ finalText });
 
           logger.warn("custom command failed", {
             requestId: headers.request_id,
@@ -3044,21 +3049,17 @@ export async function startBusAgentRunner(params: {
             },
           },
           reportToolStatus: (update) => {
-            bus
-              .publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
-                headers,
-              })
-              .catch((e: unknown) => {
-                logger.error(
-                  "failed to publish batch tool status",
-                  {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    toolCallId: update.toolCallId,
-                  },
-                  e,
-                );
-              });
+            outputPublisher.publishToolCall(update).catch((e: unknown) => {
+              logger.error(
+                "failed to publish batch tool status",
+                {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  toolCallId: update.toolCallId,
+                },
+                e,
+              );
+            });
           },
         }),
       );
@@ -3128,6 +3129,7 @@ export async function startBusAgentRunner(params: {
               }
             : undefined,
         normalizeToolResultOutput,
+        normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
         genericOutputNormalizerBypassTools,
         experimentalDownload: experimentalDownloadForAgent,
         sendToolsToModel: claudeCodeRun === null,
@@ -3192,7 +3194,6 @@ export async function startBusAgentRunner(params: {
 
       let autoCompactionSeq = 0;
       let activeAutoCompactionToolCallId: string | null = null;
-      let autoCompactionPublishChain = Promise.resolve();
       const publishAutoCompactionToolStatus = (update: {
         toolCallId: string;
         status: "start" | "end";
@@ -3202,9 +3203,7 @@ export async function startBusAgentRunner(params: {
       }) => {
         const publishOne = async () => {
           try {
-            await bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
-              headers,
-            });
+            await outputPublisher.publishToolCall(update);
           } catch (e: unknown) {
             logger.error(
               "failed to publish auto-compaction tool status",
@@ -3219,7 +3218,7 @@ export async function startBusAgentRunner(params: {
           }
         };
 
-        autoCompactionPublishChain = autoCompactionPublishChain.then(publishOne, publishOne);
+        auxiliaryOutputTail = auxiliaryOutputTail.then(publishOne, publishOne);
       };
 
       unsubscribeCompaction = await waitForPreAgent(
@@ -3456,19 +3455,15 @@ export async function startBusAgentRunner(params: {
         for (const completion of completions) {
           if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
           try {
-            await bus.publish(
-              lilacEventTypes.EvtAgentOutputToolCall,
-              {
-                toolCallId: completion.parentToolCallId,
-                status: "end",
-                display: buildDeferredSubagentDisplay(completion),
-                ok: completion.ok,
-                error: completion.ok
-                  ? undefined
-                  : (completion.detail ?? `subagent ${completion.status}`),
-              },
-              { headers },
-            );
+            await outputPublisher.publishToolCall({
+              toolCallId: completion.parentToolCallId,
+              status: "end",
+              display: buildDeferredSubagentDisplay(completion),
+              ok: completion.ok,
+              error: completion.ok
+                ? undefined
+                : (completion.detail ?? `subagent ${completion.status}`),
+            });
             publishedDeferredCompletionRunIds.add(completion.runId);
           } catch (error) {
             logger.warn(
@@ -3638,6 +3633,7 @@ export async function startBusAgentRunner(params: {
         }
 
         if (event.type === "turn_retry") {
+          outputPublisher.flush();
           assistantTextPartBoundaryState.lastTextPartId = null;
           assistantTextPartBoundaryState.pendingTextPartStartIds.clear();
           assistantTextPartBoundaryState.pendingRecoveryTextBoundary = event.hadPartialOutput;
@@ -3646,12 +3642,8 @@ export async function startBusAgentRunner(params: {
           if (retryAttemptHadReasoning) {
             reasoningChunkState.chunks.clear();
             reasoningChunkState.seq += 1;
-            bus
-              .publish(
-                lilacEventTypes.EvtAgentOutputDeltaReasoning,
-                { delta: "", seq: reasoningChunkState.seq },
-                { headers },
-              )
+            outputPublisher
+              .publishReasoningBoundary({ delta: "", seq: reasoningChunkState.seq })
               .catch((e: unknown) => {
                 logger.error(
                   "failed to clear reasoning after model retry",
@@ -3697,15 +3689,7 @@ export async function startBusAgentRunner(params: {
             state.activeRun.partialText += delta;
           }
 
-          bus
-            .publish(lilacEventTypes.EvtAgentOutputDeltaText, { delta }, { headers })
-            .catch((e: unknown) => {
-              logger.error(
-                "failed to publish output delta",
-                { requestId: headers.request_id, sessionId: headers.session_id },
-                e,
-              );
-            });
+          outputPublisher.publishText(delta);
         }
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_end") {
@@ -3723,15 +3707,13 @@ export async function startBusAgentRunner(params: {
           retryAttemptHadReasoning = true;
           consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
 
-          bus
-            .publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, { delta: "" }, { headers })
-            .catch((e: unknown) => {
-              logger.error(
-                "failed to publish reasoning start",
-                { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                e,
-              );
-            });
+          outputPublisher.publishReasoningBoundary({ delta: "" }).catch((e: unknown) => {
+            logger.error(
+              "failed to publish reasoning start",
+              { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
+              e,
+            );
+          });
         }
 
         if (
@@ -3747,27 +3729,17 @@ export async function startBusAgentRunner(params: {
             delta,
           });
           if (update.publishStart) {
-            bus
-              .publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, { delta: "" }, { headers })
-              .catch((e: unknown) => {
-                logger.error(
-                  "failed to publish implicit reasoning start",
-                  { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                  e,
-                );
-              });
+            outputPublisher.publishReasoningBoundary({ delta: "" }).catch((e: unknown) => {
+              logger.error(
+                "failed to publish implicit reasoning start",
+                { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
+                e,
+              );
+            });
           }
 
           if (update.snapshot) {
-            bus
-              .publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, update.snapshot, { headers })
-              .catch((e: unknown) => {
-                logger.error(
-                  "failed to publish reasoning chunk",
-                  { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                  e,
-                );
-              });
+            outputPublisher.publishReasoningSnapshot(update.snapshot, Buffer.byteLength(delta));
           }
         }
 
@@ -3777,6 +3749,7 @@ export async function startBusAgentRunner(params: {
         ) {
           const chunkId = event.assistantMessageEvent.id;
           consumeReasoningChunkEvent(reasoningChunkState, { type: "end", chunkId });
+          outputPublisher.flush();
         }
 
         if (event.type === "tool_execution_start") {
@@ -3788,16 +3761,12 @@ export async function startBusAgentRunner(params: {
           });
 
           if (event.toolName !== "batch") {
-            bus
-              .publish(
-                lilacEventTypes.EvtAgentOutputToolCall,
-                {
-                  toolCallId: event.toolCallId,
-                  status: "start",
-                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
-                },
-                { headers },
-              )
+            outputPublisher
+              .publishToolCall({
+                toolCallId: event.toolCallId,
+                status: "start",
+                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
+              })
               .catch((e: unknown) => {
                 logger.error(
                   "failed to publish tool start",
@@ -3871,22 +3840,14 @@ export async function startBusAgentRunner(params: {
             return;
           }
 
-          bus
-            .publish(
-              lilacEventTypes.EvtAgentOutputToolCall,
-              {
-                toolCallId: event.toolCallId,
-                status: "end",
-                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
-                ok,
-                error: ok
-                  ? undefined
-                  : interruptedForRestart
-                    ? "server restarted"
-                    : toolFailureError,
-              },
-              { headers },
-            )
+          outputPublisher
+            .publishToolCall({
+              toolCallId: event.toolCallId,
+              status: "end",
+              display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
+              ok,
+              error: ok ? undefined : interruptedForRestart ? "server restarted" : toolFailureError,
+            })
             .catch((e: unknown) => {
               logger.error(
                 "failed to publish tool end",
@@ -3949,7 +3910,7 @@ export async function startBusAgentRunner(params: {
                   previousMessages: agent.state.messages,
                   userMessages: mergedInitial,
                   publishToolStatus: async (update) => {
-                    await bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, { headers });
+                    await outputPublisher.publishToolCall(update);
                   },
                   onError: (message, error) => {
                     logger.warn(
@@ -3992,7 +3953,7 @@ export async function startBusAgentRunner(params: {
           detail: "cancelled by interrupt",
           output: finalText,
         });
-        await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+        await outputPublisher.publishResponseText({ finalText });
         return;
       }
 
@@ -4214,22 +4175,18 @@ export async function startBusAgentRunner(params: {
           : undefined,
       });
 
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputResponseText,
-        {
-          finalText,
-          delivery,
-          statsForNerdsLine,
-          usage: runStats.totalUsage
-            ? {
-                inputTokens: runStats.totalUsage.inputTokens ?? 0,
-                outputTokens: runStats.totalUsage.outputTokens ?? 0,
-                totalTokens: runStats.totalUsage.totalTokens ?? 0,
-              }
-            : undefined,
-        },
-        { headers },
-      );
+      await outputPublisher.publishResponseText({
+        finalText,
+        delivery,
+        statsForNerdsLine,
+        usage: runStats.totalUsage
+          ? {
+              inputTokens: runStats.totalUsage.inputTokens ?? 0,
+              outputTokens: runStats.totalUsage.outputTokens ?? 0,
+              totalTokens: runStats.totalUsage.totalTokens ?? 0,
+            }
+          : undefined,
+      });
 
       logger.info(statsLine, {
         requestId: headers.request_id,
@@ -4258,23 +4215,19 @@ export async function startBusAgentRunner(params: {
       if (activeCustomCommandTool) {
         const { toolCallId, display } = activeCustomCommandTool;
         activeCustomCommandTool = null;
-        await bus
-          .publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            {
-              toolCallId,
-              status: "end",
-              display,
-              ok: false,
-              error:
-                e instanceof PreAgentRunCancelledError
-                  ? "cancelled by interrupt"
-                  : e instanceof Error
-                    ? e.message
-                    : String(e),
-            },
-            { headers },
-          )
+        await outputPublisher
+          .publishToolCall({
+            toolCallId,
+            status: "end",
+            display,
+            ok: false,
+            error:
+              e instanceof PreAgentRunCancelledError
+                ? "cancelled by interrupt"
+                : e instanceof Error
+                  ? e.message
+                  : String(e),
+          })
           .catch(() => undefined);
       }
 
@@ -4325,7 +4278,7 @@ export async function startBusAgentRunner(params: {
           detail: "cancelled by interrupt",
           output: finalText,
         });
-        await bus.publish(lilacEventTypes.EvtAgentOutputResponseText, { finalText }, { headers });
+        await outputPublisher.publishResponseText({ finalText });
         return;
       }
 
@@ -4415,11 +4368,7 @@ export async function startBusAgentRunner(params: {
             }
           : undefined,
       });
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputResponseText,
-        { finalText: `Error: ${msg}` },
-        { headers },
-      );
+      await outputPublisher.publishResponseText({ finalText: `Error: ${msg}` });
 
       logger.error(
         "agent run failed",
@@ -4446,6 +4395,7 @@ export async function startBusAgentRunner(params: {
       rejectPreAgentCancellation = null;
       unsubscribe();
       unsubscribeCompaction();
+      await outputPublisher.drain();
       await claudeCodeRun?.dispose().catch((e: unknown) => {
         logger.warn(
           "failed to dispose Claude Code run resources",
@@ -4566,6 +4516,7 @@ async function applyToRunningAgent(
   cancelledByRequestId: Set<string>,
   activeRun: SessionQueue["activeRun"],
 ) {
+  activeRun?.flushOutput();
   const merged = mergeToSingleUserMessage(entry.messages);
   const liveParent = activeRun?.liveParent;
   const claudeCodeControl = activeRun?.claudeCodeControl;

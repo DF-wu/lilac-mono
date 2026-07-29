@@ -43,7 +43,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Build script: `apps/acp-controller/build.ts` (produces `dist/index.js`).
 
 - `apps/mini-lilac-server/`
-  - Redis-free coding-agent HTTP/SSE server with durable local sessions.
+  - Redis-free coding-agent HTTP/SSE server with durable local sessions and process-local active-run replay.
   - Entry: `apps/mini-lilac-server/src/main.ts`; API wiring: `apps/mini-lilac-server/src/server.ts`.
 
 - `apps/mini-lilac-tui/`
@@ -77,7 +77,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - Strict Mini Lilac wire protocol and reconnectable HTTP/SSE transport shared by clients and the server.
 
 - `packages/mini-lilac-runtime/`
-  - Standalone session actors, SQLite persistence, provider/model catalogs, and product-specific tools.
+  - Standalone session actors, immutable SQLite transcript chains, live active-run logs, provider/model catalogs, and product-specific tools.
   - Uses the shared agent, coding-tool, filesystem, OAuth, and skill primitives without depending on Core.
 
 - `data/`
@@ -87,7 +87,7 @@ Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains ven
   - In docker compose this directory is bind-mounted for persistence.
 
 - `__tests__/`
-  - Root harness that runs workspace tests: `__tests__/workspaces.test.ts`.
+  - Root-level repository tests and shared test preloads.
 
 - `compose.yaml` and `Dockerfile`
   - A container that starts Core; Compose includes Redis.
@@ -484,8 +484,8 @@ Shutdown happens in reverse (best-effort).
   - `cd apps/acp-controller && bun run build`
 
 - Run tests:
-  - Root harness: `bun test`
-  - Per workspace: `cd apps/core && bun test` (and similarly for `packages/*` that have tests)
+  - All root and workspace tests: `bun run test:all`
+  - Per workspace: `cd apps/core && bun run test` (and similarly for other workspaces)
 
 - Docker (includes Redis):
   - `docker compose up --build -d`

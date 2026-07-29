@@ -7,15 +7,19 @@ import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lila
 
 import {
   buildThreadSummaryInstructions,
-  ConversationThreadService,
+  ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
 } from "../../src/conversation/thread-service";
 import type { ConversationThreadEmbeddingAdapter } from "../../src/conversation/thread-embedding";
 import {
+  classifyConversationThreadMessageUpdate,
   CONVERSATION_THREAD_SUMMARY_VERSION,
   ConversationThreadStore,
 } from "../../src/conversation/thread-store";
-import { DiscordSearchStore } from "../../src/surface/store/discord-search-store";
+import {
+  DiscordSearchStore,
+  type DiscordSearchIndexedMessage,
+} from "../../src/surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../../src/surface/store/discord-surface-store";
 import type { SurfaceMessage } from "../../src/surface/types";
 import { ConversationThread } from "../../src/tool-server/tools/conversation-thread";
@@ -30,6 +34,14 @@ async function createDbPath(): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-thread-test-"));
   tmpDirs.push(dir);
   return path.join(dir, "discord-search.db");
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 function testConfig(): CoreConfig {
@@ -104,6 +116,7 @@ function msg(input: {
   userName?: string;
   text: string;
   ts: number;
+  editedTs?: number;
 }): SurfaceMessage {
   return {
     ref: { platform: "discord", channelId: input.channelId, messageId: input.messageId },
@@ -117,6 +130,45 @@ function msg(input: {
     userName: input.userName ?? `user-${input.userId}`,
     text: input.text,
     ts: input.ts,
+    editedTs: input.editedTs,
+  };
+}
+
+function indexedMessage(
+  input: {
+    channelId?: string;
+    guildId?: string;
+    parentChannelId?: string;
+    messageId?: string;
+    userId?: string;
+    userName?: string;
+    text?: string;
+    ts?: number;
+    editedTs?: number;
+    deleted?: boolean;
+    updatedTs?: number;
+  } = {},
+): DiscordSearchIndexedMessage {
+  const channelId = input.channelId ?? "c1";
+  return {
+    ref: {
+      platform: "discord",
+      channelId,
+      messageId: input.messageId ?? "m1",
+    },
+    session: {
+      platform: "discord",
+      channelId,
+      guildId: input.guildId,
+      parentChannelId: input.parentChannelId,
+    },
+    userId: input.userId ?? "u1",
+    userName: input.userName ?? "user-u1",
+    text: input.text ?? "hello",
+    ts: input.ts ?? 1,
+    editedTs: input.editedTs,
+    deleted: input.deleted ?? false,
+    updatedTs: input.updatedTs ?? 1,
   };
 }
 
@@ -157,7 +209,69 @@ const fakeEmbeddingAdapter: ConversationThreadEmbeddingAdapter = {
   },
 };
 
+class ConversationThreadService extends RuntimeConversationThreadService {
+  private readonly materializeForTest: () => Promise<void>;
+
+  constructor(params: ConstructorParameters<typeof RuntimeConversationThreadService>[0]) {
+    super(params);
+    this.materializeForTest = async () => {
+      const cfg = await params.getConfig();
+      params.store.refreshInferredThreads({ cfg });
+    };
+  }
+
+  override async runSummarization(
+    input: Parameters<RuntimeConversationThreadService["runSummarization"]>[0] = {},
+  ) {
+    await this.materializeForTest();
+    return await super.runSummarization(input);
+  }
+}
+
 describe("conversation thread store", () => {
+  it("classifies indexed message updates by required repair scope", () => {
+    const cfg = testConfig();
+    const before = indexedMessage();
+
+    expect(classifyConversationThreadMessageUpdate(undefined, before, cfg)).toBe("topology");
+    expect(
+      classifyConversationThreadMessageUpdate(
+        before,
+        { ...before, updatedTs: before.updatedTs + 1 },
+        cfg,
+      ),
+    ).toBeNull();
+    expect(
+      classifyConversationThreadMessageUpdate(before, { ...before, text: "edited text" }, cfg),
+    ).toBe("content");
+    expect(classifyConversationThreadMessageUpdate(before, { ...before, editedTs: 2 }, cfg)).toBe(
+      "content",
+    );
+    expect(classifyConversationThreadMessageUpdate(before, { ...before, text: " " }, cfg)).toBe(
+      "topology",
+    );
+    expect(classifyConversationThreadMessageUpdate(before, { ...before, ts: 2 }, cfg)).toBe(
+      "topology",
+    );
+    expect(classifyConversationThreadMessageUpdate(before, { ...before, deleted: true }, cfg)).toBe(
+      "topology",
+    );
+    expect(
+      classifyConversationThreadMessageUpdate(
+        { ...before, text: "ordinary text" },
+        { ...before, text: "[LILAC_SESSION_DIVIDER] (by user)" },
+        cfg,
+      ),
+    ).toBe("topology");
+    expect(
+      classifyConversationThreadMessageUpdate(
+        { ...before, text: "@lilac !cont=2 resume" },
+        { ...before, text: "@lilac !cont=3 resume" },
+        cfg,
+      ),
+    ).toBe("topology");
+  });
+
   it("instructs summaries to use broad natural retrieval hints", () => {
     const instructions = buildThreadSummaryInstructions();
     expect(instructions).toContain("Never use first-person pronouns");
@@ -198,6 +312,181 @@ describe("conversation thread store", () => {
 
     const second = threadStore.readThread("discord:channel:c1:m3", 0, 10);
     expect(second?.messages.map((item) => item.messageId)).toEqual(["m3"]);
+
+    searchStore.close();
+    threadStore.close();
+  });
+
+  it("refreshes and cleans only the requested inferred channel", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "c1-1", userId: "u1", text: "channel one", ts: 1 }),
+      msg({ channelId: "c2", messageId: "c2-1", userId: "u2", text: "channel two", ts: 1 }),
+    ]);
+    threadStore.refreshInferredThreads();
+    searchStore.upsertMessages([
+      msg({ channelId: "c2", messageId: "c2-2", userId: "u3", text: "new reply", ts: 2 }),
+    ]);
+    searchStore.markDeleted({ channelId: "c1", messageId: "c1-1" });
+
+    expect(threadStore.listMaterializationChannelIds()).toEqual(["c1", "c2"]);
+    expect(threadStore.refreshInferredChannel({ channelId: "c1" })).toEqual({
+      channels: 0,
+      threads: 0,
+      messages: 0,
+    });
+    expect(threadStore.getThread("discord:channel:c1:c1-1")).toBeNull();
+    expect(
+      threadStore
+        .readThread("discord:channel:c2:c2-1")
+        ?.messages.map((message) => message.messageId),
+    ).toEqual(["c2-1"]);
+
+    searchStore.close();
+    threadStore.close();
+  });
+
+  it("invalidates edited materialized messages without rewriting thread membership", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    const threadId = "discord:channel:c1:m1";
+
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m1", userId: "u1", text: "original", ts: 1 }),
+      msg({ channelId: "c1", messageId: "m2", userId: "u2", text: "reply", ts: 2 }),
+    ]);
+    threadStore.refreshInferredThreads();
+    const before = threadStore.getThread(threadId);
+    expect(before).not.toBeNull();
+    threadStore.upsertSummary(
+      threadId,
+      before!.summary_input_hash!,
+      { title: "Current summary", brief: "Current summary", topics: [] },
+      "prompt-context",
+    );
+    threadStore.upsertEmbeddings({
+      threadId,
+      embeddingInputHash: "embedding-input",
+      modelId: "test-model",
+      dimensions: 2,
+      embeddings: [{ facet: "title", embedding: new Float32Array([1, 0]) }],
+    });
+    const membershipBefore = threadStore
+      .readThread(threadId)!
+      .messages.map((message) => message.messageId);
+
+    searchStore.upsertMessages([
+      msg({
+        channelId: "c1",
+        messageId: "m2",
+        userId: "u2",
+        text: "edited reply",
+        ts: 2,
+        editedTs: 3,
+      }),
+    ]);
+    expect(
+      threadStore.invalidateMaterializedMessages({ channelId: "c1", messageIds: ["m2"] }),
+    ).toEqual({ messages: 1, threads: 1 });
+
+    const after = threadStore.getThread(threadId);
+    expect(after).toMatchObject({
+      start_message_id: before!.start_message_id,
+      end_message_id: before!.end_message_id,
+      start_ts: before!.start_ts,
+      end_ts: before!.end_ts,
+      message_count: before!.message_count,
+      last_summarized_at: null,
+      last_embedded_at: null,
+      summary_prompt_context_hash: null,
+      embedding_input_hash: null,
+    });
+    expect(after?.summary_input_hash).toStartWith("dirty:");
+    expect(threadStore.readThread(threadId)!.messages.map((message) => message.messageId)).toEqual(
+      membershipBefore,
+    );
+    expect(threadStore.getSummary(threadId)?.title).toBe("Current summary");
+
+    searchStore.close();
+    threadStore.close();
+  });
+
+  it("serves the last materialized membership without refreshing on reads", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    const threadId = "discord:channel:c1:m1";
+    const service = new ConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+    });
+
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m1", userId: "u1", text: "first", ts: 1 }),
+      msg({ channelId: "c1", messageId: "m2", userId: "u2", text: "second", ts: 2 }),
+    ]);
+    threadStore.refreshInferredThreads();
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m3", userId: "u1", text: "not materialized", ts: 3 }),
+    ]);
+
+    const read = await service.read({ threadId });
+    expect(read.messages.map((message) => message.messageId)).toEqual(["m1", "m2"]);
+    const metadata = await service.metadata({ threadIds: [threadId] });
+    expect(metadata.threads[0]?.messageCount).toBe(2);
+    expect(threadStore.getThread(threadId)?.message_count).toBe(2);
+
+    searchStore.close();
+    threadStore.close();
+  });
+
+  it("discards a summary completed after a content revision changed", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    const summaryStarted = deferred<void>();
+    const releaseSummary = deferred<void>();
+    const threadId = "discord:channel:c1:m1";
+
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m1", userId: "u1", text: "first", ts: 1 }),
+      msg({ channelId: "c1", messageId: "m2", userId: "u2", text: "second", ts: 2 }),
+    ]);
+    threadStore.refreshInferredThreads({ cfg: testConfig() });
+    const service = new RuntimeConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+      summarizer: async () => {
+        summaryStarted.resolve();
+        await releaseSummary.promise;
+        return { title: "Stale summary", brief: "Stale summary", topics: [] };
+      },
+    });
+
+    const running = service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
+    await summaryStarted.promise;
+    searchStore.upsertMessages([
+      msg({
+        channelId: "c1",
+        messageId: "m2",
+        userId: "u2",
+        text: "edited while summarizing",
+        ts: 2,
+        editedTs: 3,
+      }),
+    ]);
+    threadStore.invalidateMaterializedMessages({ channelId: "c1", messageIds: ["m2"] });
+    releaseSummary.resolve();
+
+    const result = await running;
+    expect(result.summarized).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(threadStore.getSummary(threadId)).toBeNull();
+    expect(threadStore.getThread(threadId)?.summary_input_hash).toStartWith("dirty:");
 
     searchStore.close();
     threadStore.close();

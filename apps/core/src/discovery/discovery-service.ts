@@ -737,9 +737,22 @@ class SqliteDiscoveryStore {
       END;
     `);
 
+    const existingFtsUpdateTrigger = this.db
+      .query("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+      .get("discovery_documents_au") as { sql: string } | null;
+    const hasContentSensitiveFtsUpdateTrigger =
+      existingFtsUpdateTrigger?.sql.includes("AFTER UPDATE OF title, text") === true &&
+      existingFtsUpdateTrigger.sql.includes(
+        "WHEN old.title IS NOT new.title OR old.text IS NOT new.text",
+      );
+    if (!hasContentSensitiveFtsUpdateTrigger) {
+      this.db.run("DROP TRIGGER IF EXISTS discovery_documents_au");
+    }
+
     this.db.run(`
       CREATE TRIGGER IF NOT EXISTS discovery_documents_au
-      AFTER UPDATE ON discovery_documents
+      AFTER UPDATE OF title, text ON discovery_documents
+      WHEN old.title IS NOT new.title OR old.text IS NOT new.text
       BEGIN
         INSERT INTO discovery_documents_fts(discovery_documents_fts, rowid, title, text)
         VALUES ('delete', old.rowid, coalesce(old.title, ''), old.text);
@@ -749,11 +762,10 @@ class SqliteDiscoveryStore {
     `);
   }
 
-  upsertDocuments(documents: readonly IndexedDocument[]): void {
-    const tx = this.db.transaction((docs: readonly IndexedDocument[]) => {
-      for (const doc of docs) {
-        this.db.run(
-          `
+  private upsertDocumentsInTransaction(documents: readonly IndexedDocument[]): void {
+    for (const doc of documents) {
+      this.db.run(
+        `
           INSERT INTO discovery_documents (
             doc_key,
             source,
@@ -790,53 +802,82 @@ class SqliteDiscoveryStore {
             start_line=excluded.start_line,
             end_line=excluded.end_line,
             deleted=excluded.deleted
+          WHERE
+            discovery_documents.source IS NOT excluded.source OR
+            discovery_documents.kind IS NOT excluded.kind OR
+            discovery_documents.platform IS NOT excluded.platform OR
+            discovery_documents.session_id IS NOT excluded.session_id OR
+            discovery_documents.message_id IS NOT excluded.message_id OR
+            discovery_documents.request_id IS NOT excluded.request_id OR
+            discovery_documents.file_path IS NOT excluded.file_path OR
+            discovery_documents.title IS NOT excluded.title OR
+            discovery_documents.author_id IS NOT excluded.author_id OR
+            discovery_documents.author_name IS NOT excluded.author_name OR
+            discovery_documents.text IS NOT excluded.text OR
+            discovery_documents.ts IS NOT excluded.ts OR
+            discovery_documents.updated_ts IS NOT excluded.updated_ts OR
+            discovery_documents.start_line IS NOT excluded.start_line OR
+            discovery_documents.end_line IS NOT excluded.end_line OR
+            discovery_documents.deleted IS NOT excluded.deleted
           `,
-          [
-            doc.docKey,
-            doc.source,
-            doc.kind,
-            doc.platform ?? null,
-            doc.sessionId ?? null,
-            doc.messageId ?? null,
-            doc.requestId ?? null,
-            doc.filePath ?? null,
-            doc.title ?? null,
-            doc.authorId ?? null,
-            doc.authorName ?? null,
-            doc.text,
-            doc.ts,
-            doc.updatedTs,
-            doc.startLine ?? null,
-            doc.endLine ?? null,
-            doc.deleted ? 1 : 0,
-          ],
-        );
-      }
+        [
+          doc.docKey,
+          doc.source,
+          doc.kind,
+          doc.platform ?? null,
+          doc.sessionId ?? null,
+          doc.messageId ?? null,
+          doc.requestId ?? null,
+          doc.filePath ?? null,
+          doc.title ?? null,
+          doc.authorId ?? null,
+          doc.authorName ?? null,
+          doc.text,
+          doc.ts,
+          doc.updatedTs,
+          doc.startLine ?? null,
+          doc.endLine ?? null,
+          doc.deleted ? 1 : 0,
+        ],
+      );
+    }
+  }
+
+  upsertDocuments(documents: readonly IndexedDocument[]): void {
+    const tx = this.db.transaction((docs: readonly IndexedDocument[]) => {
+      this.upsertDocumentsInTransaction(docs);
     });
 
     tx(documents);
   }
 
   replaceDocumentsWhere(params: {
-    source?: DiscoverySource;
+    source: DiscoverySource;
     kind?: IndexedDocument["kind"];
     documents: readonly IndexedDocument[];
   }): void {
     const clauses: string[] = [];
     const values: string[] = [];
-    if (params.source) {
-      clauses.push("source = ?");
-      values.push(params.source);
-    }
+    clauses.push("source = ?");
+    values.push(params.source);
     if (params.kind) {
       clauses.push("kind = ?");
       values.push(params.kind);
     }
-    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    const where = ` WHERE ${clauses.join(" AND ")}`;
 
     const tx = this.db.transaction((docs: readonly IndexedDocument[]) => {
-      this.db.run(`DELETE FROM discovery_documents${where}`, values);
-      this.upsertDocuments(docs);
+      const existingRows = this.db
+        .query(`SELECT doc_key FROM discovery_documents${where}`)
+        .all(...values) as Array<{ doc_key: string }>;
+      const documentKeys = new Set(docs.map((doc) => doc.docKey));
+
+      this.upsertDocumentsInTransaction(docs);
+      for (const row of existingRows) {
+        if (!documentKeys.has(row.doc_key)) {
+          this.db.run("DELETE FROM discovery_documents WHERE doc_key = ?", [row.doc_key]);
+        }
+      }
     });
 
     tx(params.documents);
@@ -952,6 +993,7 @@ class SqliteDiscoveryStore {
 export class DiscoveryService {
   private readonly store: SqliteDiscoveryStore;
   private lastDiscordUpdatedTs: number | undefined;
+  private sourceSyncPromise: Promise<void> | undefined;
 
   constructor(
     private readonly params: {
@@ -1029,7 +1071,6 @@ export class DiscoveryService {
   }
 
   private async buildPromptDocuments(): Promise<IndexedDocument[]> {
-    await ensurePromptWorkspace({ dataDir: this.params.dataDir });
     const promptDir = resolvePromptDir({ dataDir: this.params.dataDir });
     const documents: IndexedDocument[] = [];
 
@@ -1065,7 +1106,6 @@ export class DiscoveryService {
   }
 
   private async buildHeartbeatDocuments(): Promise<IndexedDocument[]> {
-    await ensurePromptWorkspace({ dataDir: this.params.dataDir });
     const paths = resolveHeartbeatPromptPaths({ dataDir: this.params.dataDir });
     const filePaths = [
       paths.heartbeatFilePath,
@@ -1106,6 +1146,7 @@ export class DiscoveryService {
   }
 
   private async syncFileSources(): Promise<void> {
+    await ensurePromptWorkspace({ dataDir: this.params.dataDir });
     const [promptDocuments, heartbeatDocuments] = await Promise.all([
       this.buildPromptDocuments(),
       this.buildHeartbeatDocuments(),
@@ -1116,9 +1157,25 @@ export class DiscoveryService {
   }
 
   private async syncAllSources(): Promise<void> {
-    await this.syncConversationFromDiscord();
-    await this.syncConversationFromTranscripts();
-    await this.syncFileSources();
+    if (this.sourceSyncPromise) {
+      await this.sourceSyncPromise;
+      return;
+    }
+
+    const syncPromise = (async () => {
+      await this.syncConversationFromDiscord();
+      await this.syncConversationFromTranscripts();
+      await this.syncFileSources();
+    })();
+    this.sourceSyncPromise = syncPromise;
+
+    try {
+      await syncPromise;
+    } finally {
+      if (this.sourceSyncPromise === syncPromise) {
+        this.sourceSyncPromise = undefined;
+      }
+    }
   }
 
   private async buildOriginGroups(params: {

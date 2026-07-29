@@ -25,6 +25,13 @@ describe("tool result output normalizer", () => {
     };
   }
 
+  function settledTextEntries(values: readonly string[]) {
+    return values.map((value, index) => ({
+      output: { type: "text" as const, value },
+      context: { toolCallId: `call-${index}`, toolName: "plugin" },
+    }));
+  }
+
   it("preserves small output and replaces large output with an idempotent reference", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
@@ -54,6 +61,162 @@ describe("tool result output normalizer", () => {
     expect(await normalize(normalized, { toolCallId: "b", toolName: "plugin" })).toEqual(
       normalized,
     );
+  });
+
+  it("greedily spills the largest settled payload for a shared budget", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(70), "b".repeat(20), "c".repeat(10)]),
+    );
+
+    expect(normalized.map((output) => output.type)).toEqual(["error-text", "text", "text"]);
+  });
+
+  it("repeats settled spill selection after decrementing the active count", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(70), "b".repeat(40), "c".repeat(10)]),
+    );
+
+    expect(normalized.map((output) => output.type)).toEqual(["error-text", "error-text", "text"]);
+  });
+
+  it("does not spill when payload size times the active count equals the budget", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(30), "b".repeat(30)]),
+    );
+
+    expect(normalized).toEqual([
+      { type: "text", value: "a".repeat(30) },
+      { type: "text", value: "b".repeat(30) },
+    ]);
+  });
+
+  it("breaks equal-size settled spill ties by input order", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(40), "b".repeat(40)]),
+    );
+
+    expect(normalized.map((output) => output.type)).toEqual(["error-text", "text"]);
+  });
+
+  it("measures settled payloads in UTF-8 bytes", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 70 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["\u{1f642}".repeat(11), "x".repeat(30)]),
+    );
+
+    expect(normalized.map((output) => output.type)).toEqual(["error-text", "text"]);
+  });
+
+  it("excludes generated overflow references from the settled active count", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+    const spilled = await normalize(
+      { type: "text", value: "a".repeat(61) },
+      { toolCallId: "spilled", toolName: "plugin" },
+    );
+    if (spilled.type !== "error-text") throw new Error("expected an overflow reference");
+
+    const normalized = await normalize.normalizeSettled([
+      {
+        output: spilled,
+        context: { toolCallId: "spilled", toolName: "plugin" },
+      },
+      ...settledTextEntries(["b".repeat(40)]),
+    ]);
+
+    expect(normalized).toEqual([spilled, { type: "text", value: "b".repeat(40) }]);
+  });
+
+  it("force-spills selected bypass outputs and normalizes each unselected output once", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+    const unspilledCalls: string[] = [];
+
+    const normalized = await normalize.normalizeSettled(
+      [
+        {
+          output: { type: "text", value: "a".repeat(40) },
+          context: {
+            toolCallId: "selected",
+            toolName: "plugin",
+            bypassGenericOutputNormalizer: true,
+          },
+        },
+        {
+          output: { type: "text", value: "b".repeat(20) },
+          context: { toolCallId: "unspilled", toolName: "plugin" },
+        },
+      ],
+      (output, context) => {
+        unspilledCalls.push(context.toolCallId);
+        return output.type === "text" ? { ...output, value: `${output.value}!` } : output;
+      },
+    );
+
+    expect(normalized[0]?.type).toBe("error-text");
+    expect(normalized[1]).toEqual({ type: "text", value: `${"b".repeat(20)}!` });
+    expect(unspilledCalls).toEqual(["unspilled"]);
+  });
+
+  it("returns the bounded no-URI reference when a settled forced spill artifact fails", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      artifacts: {
+        rootDir: baseDir,
+        init: async () => undefined,
+        create: async () => {
+          throw new Error("disk full");
+        },
+        createFromFile: async () => {
+          throw new Error("disk full");
+        },
+        createFromStream: async () => {
+          throw new Error("disk full");
+        },
+        read: async () => ({ ok: false }),
+        readWindow: async () => ({ ok: false }),
+      },
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(40), "b".repeat(20)]),
+    );
+
+    expect(normalized[0]).toEqual({
+      type: "error-text",
+      value:
+        "[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nThe complete output could not be retained. Narrow the request or re-run the tool.",
+    });
+    expect(normalized[1]).toEqual({ type: "text", value: "b".repeat(20) });
   });
 
   it("does not trust an overflow marker substring in untrusted output", async () => {

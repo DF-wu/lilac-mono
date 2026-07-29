@@ -12,6 +12,9 @@
   "type": "module",
   "private": true,
   "license": "MIT",
+  "scripts": {
+    "test": "bun test"
+  },
   "dependencies": {
     "just-bash": "^3.0.1"
   },

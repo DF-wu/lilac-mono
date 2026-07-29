@@ -68,6 +68,7 @@ import {
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
   withReasoningSummaryDefaultForOpenAIModels,
+  WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS,
 } from "../../../src/surface/bridge/bus-agent-runner";
 import type { BuiltLevel1Toolset } from "../../../src/plugins";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
@@ -907,8 +908,13 @@ describe("agent run activity", () => {
       },
     );
     const publishActivity = createAgentOutputActivityPublisher({
-      bus,
-      headers: { request_id: requestId },
+      publish: async (source) => {
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputActivity,
+          { source },
+          { headers: { request_id: requestId } },
+        );
+      },
       intervalMs: 25,
     });
 
@@ -922,6 +928,12 @@ describe("agent run activity", () => {
 
     expect(sources).toEqual(["model", "subagent"]);
     await sub.stop();
+  });
+});
+
+describe("workflow request claim pacing", () => {
+  it("refreshes at one third of the engine's 30s stale-owner threshold", () => {
+    expect(WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS).toBe(10_000);
   });
 });
 

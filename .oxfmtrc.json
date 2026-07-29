@@ -9,6 +9,7 @@
     "ref/**",
     "node_modules/**",
     "data/**",
+    ".omo/**",
     "**/dist/**",
     "apps/core/src/ssh/remote-js/remote-runner.cjs"
   ]

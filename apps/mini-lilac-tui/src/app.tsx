@@ -569,6 +569,9 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   );
   const [state, setState] = createSignal(initialInputState());
   const active = createMemo(() => state().phase === "active");
+  const compacting = createMemo(() => state().phase === "compacting");
+  /** Any long-running server operation that should show a live elapsed timer. */
+  const busy = createMemo(() => active() || compacting());
   const [entries, setEntries] = createSignal<readonly TranscriptEntry[]>([]);
   const [steering, setSteering] = createSignal<readonly MiniLilacUserUIMessage[]>([]);
   const steeringQueueItemHeight = createMemo(() => (narrow() || steeringQueueHeight() < 4 ? 1 : 2));
@@ -678,6 +681,9 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     if (notice() !== undefined) return notice() ?? "";
     if (current.exitArmed) return "ctrl+c again to exit";
     if (current.phase === "active") return "";
+    // `workingStatus` already names compaction, so repeating a phase word here
+    // is what produced the old "Ready · submitting" composite.
+    if (current.phase === "compacting") return "";
     if (profileCycleBusy()) return profileHint();
     if (current.phase === "submitting") return "submitting";
     if (current.phase === "disconnected") return "disconnected / esc cancel";
@@ -688,32 +694,37 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     if (notice() !== undefined || state().phase === "disconnected") return colors.danger;
     if (profileCycleBusy()) return colors.muted;
     if (state().phase === "active") return colors.success;
+    if (state().phase === "compacting") return colors.warning;
     if (state().phase === "submitting") return colors.warning;
     return colors.muted;
   });
 
   const workingStatus = createMemo(() => {
-    if (active()) {
+    if (busy()) {
       const elapsedSeconds = Math.floor(Math.max(0, workingNowMs() - workingStartedAtMs()) / 1_000);
-      return `${workingIndicator()}... ${elapsedSeconds}s`;
+      // Compaction is not a prompt run, so it names itself rather than borrowing
+      // the rotating "Working…" indicator.
+      const label = compacting() ? "Compacting" : workingIndicator();
+      return `${label}... ${elapsedSeconds}s`;
     }
     const durationMs = lastRunDurationMs();
     return durationMs === undefined ? "Ready" : `Ready · Ran for ${formatRunDuration(durationMs)}`;
   });
   const workingStatusFrame = createMemo(() => {
-    if (!active()) return { glyph: "▣", color: colors.accent };
+    if (!busy()) return { glyph: "▣", color: colors.accent };
     const elapsedMs = Math.max(0, workingNowMs() - workingStartedAtMs());
     const index = Math.floor(elapsedMs / WORKING_STATUS_TICK_MS) % PULSING_SQUARE_FRAMES.length;
     const frame = PULSING_SQUARE_FRAMES[index] ?? PULSING_SQUARE_FRAMES[0];
     return { glyph: frame.glyph, color: colors[frame.color] };
   });
   const workingHint = createMemo(() => {
+    if (compacting()) return "esc cancel";
     const queued = state().queuedSteeringCount;
     return queued > 0 ? `${queued} queued / esc interrupt` : "esc interrupt";
   });
 
   createEffect(() => {
-    if (!active()) return;
+    if (!busy()) return;
 
     const queue = createWorkingIndicatorQueue(DEFAULT_WORKING_INDICATORS);
     const startedAtMs = Date.now();
@@ -735,9 +746,12 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       setWorkingNowMs(nowMs);
       if (nowMs >= nextRotationAtMs) rotate(nowMs);
     }, WORKING_STATUS_TICK_MS);
+    const wasRun = active();
     onCleanup(() => {
       clearInterval(interval);
-      setLastRunDurationMs(Date.now() - startedAtMs);
+      // "Ran for" describes a prompt run; a compaction reports its own duration
+      // on its transcript entry instead.
+      if (wasRun) setLastRunDurationMs(Date.now() - startedAtMs);
     });
   });
 
@@ -767,6 +781,10 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     formatTokenUsage(
       session().inputTokens,
       resolveContextWindow(session().contextWindow, currentModel()?.contextWindow),
+      {
+        estimated: session().inputTokensEstimated,
+        compactionThreshold: session().compactionThreshold,
+      },
     ),
   );
 
@@ -1937,7 +1955,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
                 controller.submit();
               }}
             />
-            <Show when={active()}>
+            <Show when={busy()}>
               <text
                 position="absolute"
                 top={1}

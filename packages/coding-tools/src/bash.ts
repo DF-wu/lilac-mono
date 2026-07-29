@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import fs, { type FileHandle } from "node:fs/promises";
+import fs from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -16,6 +16,7 @@ import {
   type CodingToolArtifactIntegration,
 } from "./artifact-integration";
 import { createBashOutputSanitizer, sanitizeBashOutputText } from "./bash-output-sanitizer";
+import { BufferedFileSink } from "./buffered-file-sink";
 import {
   assertCanonicalPathAllowed,
   assertGuardrailBypassAllowed,
@@ -72,8 +73,8 @@ const STREAM_FLUSH_BYTES = 4 * 1024;
 type BoundedStreamCapture = { head: Buffer; tail: Buffer; totalBytes: number };
 
 type BashSpool = {
-  stdoutPath: string;
-  stderrPath: string;
+  stdoutPath?: string;
+  stderrPath?: string;
   complete: boolean;
   limitExceeded: boolean;
   write(kind: "stdout" | "stderr", chunk: Uint8Array): Promise<void>;
@@ -97,60 +98,98 @@ function normalizedNonnegativeInteger(
   return Math.floor(resolved);
 }
 
-async function createBashSpool(maxBytes: number): Promise<BashSpool> {
-  const directory = await fs.mkdtemp(path.join(tmpdir(), BASH_SPOOL_DIRECTORY_PREFIX));
-  const stdoutPath = path.join(directory, `${randomUUID()}.stdout.raw`);
-  const stderrPath = path.join(directory, `${randomUUID()}.stderr.raw`);
-  let stdoutHandle: FileHandle | undefined;
-  let stderrHandle: FileHandle | undefined;
-  try {
-    await fs.chmod(directory, 0o700);
-    stdoutHandle = await fs.open(stdoutPath, "wx", 0o600);
-    stderrHandle = await fs.open(stderrPath, "wx", 0o600);
-  } catch (error) {
-    await Promise.all([
-      stdoutHandle?.close().catch(() => undefined),
-      stderrHandle?.close().catch(() => undefined),
-    ]);
-    await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
-    throw error;
-  }
-
-  const handles = { stdout: stdoutHandle, stderr: stderrHandle };
+function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
+  let directory: string | undefined;
+  let sinks: { stdout: BufferedFileSink; stderr: BufferedFileSink } | undefined;
+  const buffered = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+  let totalBytes = 0;
   let retainedBytes = 0;
   let closed = false;
+  let operation = Promise.resolve();
+
+  const removeStorage = async () => {
+    const currentSinks = sinks;
+    sinks = undefined;
+    await Promise.all([currentSinks?.stdout.abort(), currentSinks?.stderr.abort()]).catch(
+      () => undefined,
+    );
+    if (directory) await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    directory = undefined;
+    spool.stdoutPath = undefined;
+    spool.stderrPath = undefined;
+  };
+
+  const activate = async () => {
+    if (sinks || !spool.complete) return;
+    let stdoutSink: BufferedFileSink | undefined;
+    let stderrSink: BufferedFileSink | undefined;
+    try {
+      directory = await fs.mkdtemp(path.join(tmpdir(), BASH_SPOOL_DIRECTORY_PREFIX));
+      await fs.chmod(directory, 0o700);
+      const stdoutPath = path.join(directory, `${randomUUID()}.stdout.raw`);
+      const stderrPath = path.join(directory, `${randomUUID()}.stderr.raw`);
+      stdoutSink = await BufferedFileSink.open(stdoutPath, { flags: "wx", mode: 0o600 });
+      stderrSink = await BufferedFileSink.open(stderrPath, { flags: "wx", mode: 0o600 });
+      sinks = { stdout: stdoutSink, stderr: stderrSink };
+      spool.stdoutPath = stdoutPath;
+      spool.stderrPath = stderrPath;
+      for (const kind of ["stdout", "stderr"] as const) {
+        for (const chunk of buffered[kind]) await sinks[kind].write(chunk);
+        buffered[kind].length = 0;
+      }
+    } catch {
+      await Promise.all([stdoutSink?.abort(), stderrSink?.abort()]).catch(() => undefined);
+      spool.complete = false;
+      await removeStorage();
+    }
+  };
+
   const spool: BashSpool = {
-    stdoutPath,
-    stderrPath,
     complete: true,
     limitExceeded: false,
     async write(kind, chunk) {
-      if (!spool.complete || chunk.byteLength === 0) return;
-      const remaining = Math.max(0, maxBytes - retainedBytes);
-      const retained = chunk.subarray(0, remaining);
-      retainedBytes += retained.byteLength;
-      if (retained.byteLength < chunk.byteLength) {
-        spool.complete = false;
-        spool.limitExceeded = true;
-      }
-      if (retained.byteLength === 0) return;
-      try {
-        await handles[kind].write(retained);
-      } catch {
-        spool.complete = false;
-      }
+      operation = operation.then(async () => {
+        if (closed || chunk.byteLength === 0) return;
+        totalBytes += chunk.byteLength;
+        if (!spool.complete) return;
+
+        const remaining = Math.max(0, maxBytes - retainedBytes);
+        const retained = Buffer.from(chunk.subarray(0, remaining));
+        retainedBytes += retained.byteLength;
+        if (retained.byteLength < chunk.byteLength) {
+          spool.complete = false;
+          spool.limitExceeded = true;
+          buffered.stdout.length = 0;
+          buffered.stderr.length = 0;
+          await removeStorage();
+          return;
+        }
+
+        try {
+          if (sinks) await sinks[kind].write(retained);
+          else buffered[kind].push(retained);
+          if (totalBytes > outputCapBytes) await activate();
+        } catch {
+          spool.complete = false;
+          await removeStorage();
+        }
+      });
+      await operation;
     },
     async close() {
+      await operation;
       if (closed) return;
       closed = true;
-      await Promise.all([
-        handles.stdout.close().catch(() => undefined),
-        handles.stderr.close().catch(() => undefined),
-      ]);
+      if (!sinks || !spool.complete) return;
+      const results = await Promise.allSettled([sinks.stdout.close(), sinks.stderr.close()]);
+      if (results.some((result) => result.status === "rejected")) {
+        spool.complete = false;
+        await removeStorage();
+      }
     },
     async cleanup() {
       await spool.close();
-      await fs.rm(directory, { recursive: true, force: true }).catch(() => undefined);
+      await removeStorage();
     },
   };
   return spool;
@@ -271,11 +310,16 @@ function sensitiveEnvironmentValues(
 }
 
 function createBashArtifactSource(spool: BashSpool, literalSecrets: readonly string[]): Readable {
+  if (!spool.stdoutPath || !spool.stderrPath) {
+    throw new Error("Bash spool was not activated");
+  }
+  const stdoutPath = spool.stdoutPath;
+  const stderrPath = spool.stderrPath;
   async function* rawContent() {
     yield "<bash_tool_full_output>\n--- stdout ---\n";
-    yield* createReadStream(spool.stdoutPath);
+    yield* createReadStream(stdoutPath);
     yield "\n\n--- stderr ---\n";
-    yield* createReadStream(spool.stderrPath);
+    yield* createReadStream(stderrPath);
     yield "\n</bash_tool_full_output>\n";
   }
   async function* sanitizedContent() {
@@ -423,19 +467,15 @@ export async function executeLocalBash(
   const environment = options.env ?? process.env;
   const literalSecrets = sensitiveEnvironmentValues(environment);
   let spool: BashSpool | undefined;
-  let spoolUnavailable = false;
   if (options.artifactIntegration) {
-    try {
-      spool = await createBashSpool(
-        normalizedNonnegativeInteger(
-          options.artifactIntegration.maxSpoolBytes,
-          DEFAULT_BASH_SPOOL_MAX_BYTES,
-          "artifactIntegration.maxSpoolBytes",
-        ),
-      );
-    } catch {
-      spoolUnavailable = true;
-    }
+    spool = createBashSpool(
+      normalizedNonnegativeInteger(
+        options.artifactIntegration.maxSpoolBytes,
+        DEFAULT_BASH_SPOOL_MAX_BYTES,
+        "artifactIntegration.maxSpoolBytes",
+      ),
+      maxOutputBytes,
+    );
   }
 
   let child: ReturnType<typeof Bun.spawn>;
@@ -550,7 +590,7 @@ export async function executeLocalBash(
       let retentionStatus: BashTruncationRetentionStatus;
       let artifactUri: string | undefined;
       let artifactBytes: number | undefined;
-      if (!spool || spoolUnavailable) {
+      if (!spool) {
         retentionStatus = "spool-unavailable";
       } else if (!spool.complete) {
         retentionStatus = spool.limitExceeded ? "spool-limit-exceeded" : "spool-unavailable";

@@ -26,6 +26,16 @@ export type NormalizeToolResultOutputFn = (
   },
 ) => ToolResultOutput | Promise<ToolResultOutput>;
 
+export type SettledToolResultOutputEntry = {
+  output: ToolResultOutput;
+  context: Parameters<NormalizeToolResultOutputFn>[1];
+};
+
+export type NormalizeSettledToolResultOutputsFn = (
+  entries: readonly SettledToolResultOutputEntry[],
+  normalizeUnspilled?: NormalizeToolResultOutputFn,
+) => Promise<ToolResultOutput[]>;
+
 export type AtomicToolInputValidation =
   | { type: "prevalidated" }
   | { type: "invalid"; error?: unknown }
@@ -221,7 +231,7 @@ export async function normalizeToolResultOutput(
   }
 }
 
-async function executeAtomicToolCallImpl(
+async function settleAtomicToolCallImpl(
   options: ExecuteAtomicToolCallOptions,
 ): Promise<AtomicToolExecutionOutcome> {
   const { call } = options;
@@ -362,31 +372,6 @@ async function executeAtomicToolCallImpl(
   }
 
   assertNotAborted();
-  toolOutput = await normalizeToolResultOutput(
-    toolOutput,
-    {
-      toolCallId: call.toolCallId,
-      toolName: call.toolName,
-      ...(options.bypassGenericOutputNormalizer === undefined
-        ? {}
-        : { bypassGenericOutputNormalizer: options.bypassGenericOutputNormalizer }),
-    },
-    options.normalizeToolResultOutput,
-  );
-  assertNotAborted();
-
-  options.pendingToolCalls.delete(call.toolCallId);
-  options.onEvent?.({
-    type: "tool_execution_end",
-    toolCallId: call.toolCallId,
-    toolName: call.toolName,
-    args: call.input,
-    result,
-    isError,
-    output: toolOutput,
-    outcome,
-  });
-
   return {
     result,
     isError,
@@ -396,25 +381,75 @@ async function executeAtomicToolCallImpl(
   };
 }
 
+function cleanupFailedAtomicToolCall(options: ExecuteAtomicToolCallOptions, error: unknown): void {
+  if (!options.pendingToolCalls.delete(options.call.toolCallId)) return;
+
+  const message = errorMessage(error);
+  options.onEvent?.({
+    type: "tool_execution_end",
+    toolCallId: options.call.toolCallId,
+    toolName: options.call.toolName,
+    args: options.call.input,
+    result: message,
+    isError: true,
+    output: { type: "error-text", value: message },
+    outcome: "error",
+  });
+}
+
+/** Execute through raw output conversion, leaving normalization and the terminal event deferred. */
+export async function settleAtomicToolCall(
+  options: ExecuteAtomicToolCallOptions,
+): Promise<AtomicToolExecutionOutcome> {
+  try {
+    return await settleAtomicToolCallImpl(options);
+  } catch (error) {
+    cleanupFailedAtomicToolCall(options, error);
+    throw error;
+  }
+}
+
+/** Complete a settled call with its chosen model-facing output. */
+export function finalizeSettledAtomicToolCall(
+  options: ExecuteAtomicToolCallOptions,
+  settled: AtomicToolExecutionOutcome,
+  toolOutput: ToolResultOutput,
+): AtomicToolExecutionOutcome {
+  options.pendingToolCalls.delete(options.call.toolCallId);
+  options.onEvent?.({
+    type: "tool_execution_end",
+    toolCallId: options.call.toolCallId,
+    toolName: options.call.toolName,
+    args: options.call.input,
+    result: settled.result,
+    isError: settled.isError,
+    output: toolOutput,
+    outcome: settled.outcome,
+  });
+
+  return { ...settled, toolOutput };
+}
+
 export async function executeAtomicToolCall(
   options: ExecuteAtomicToolCallOptions,
 ): Promise<AtomicToolExecutionOutcome> {
   try {
-    return await executeAtomicToolCallImpl(options);
-  } catch (error) {
-    if (options.pendingToolCalls.delete(options.call.toolCallId)) {
-      const message = errorMessage(error);
-      options.onEvent?.({
-        type: "tool_execution_end",
+    const settled = await settleAtomicToolCall(options);
+    const toolOutput = await normalizeToolResultOutput(
+      settled.toolOutput,
+      {
         toolCallId: options.call.toolCallId,
         toolName: options.call.toolName,
-        args: options.call.input,
-        result: message,
-        isError: true,
-        output: { type: "error-text", value: message },
-        outcome: "error",
-      });
-    }
+        ...(options.bypassGenericOutputNormalizer === undefined
+          ? {}
+          : { bypassGenericOutputNormalizer: options.bypassGenericOutputNormalizer }),
+      },
+      options.normalizeToolResultOutput,
+    );
+    (options.assertNotAborted ?? (() => options.abortSignal?.throwIfAborted()))();
+    return finalizeSettledAtomicToolCall(options, settled, toolOutput);
+  } catch (error) {
+    cleanupFailedAtomicToolCall(options, error);
     throw error;
   }
 }

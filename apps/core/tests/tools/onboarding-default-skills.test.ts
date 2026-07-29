@@ -14,7 +14,7 @@ describe("onboarding default skills", () => {
     dataDir = undefined;
   });
 
-  it("seeds the MCP management skill without network access", async () => {
+  it("seeds only setup-dependent skill templates without network access", async () => {
     dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-onboarding-skills-"));
     const result = z
       .object({
@@ -27,10 +27,12 @@ describe("onboarding default skills", () => {
           network: false,
         }),
       );
-    const skillPath = path.join(dataDir, "skills", "mcp-management", "SKILL.md");
+    const skillPath = path.join(dataDir, "skills", "mcporter", "SKILL.md");
 
-    expect(result.steps).toContainEqual({ id: "skills.mcp-management", status: "installed" });
-    expect(await fs.readFile(skillPath, "utf8")).toContain("name: mcp-management");
+    expect(result.steps).toContainEqual({ id: "skills.mcporter", status: "installed" });
+    expect(result.steps.some((step) => step.id === "skills.coding-agent")).toBe(false);
+    expect(result.steps.some((step) => step.id === "skills.mcp-management")).toBe(false);
+    expect(await fs.readFile(skillPath, "utf8")).toContain("name: mcporter");
   });
 
   it("reports each bundled skill failure outside a workspace in non-strict mode", async () => {
@@ -63,8 +65,6 @@ describe("onboarding default skills", () => {
     const bundledSkillSteps = parsed.steps.filter((step) => step.id.startsWith("skills."));
 
     expect(bundledSkillSteps.map(({ id, status }) => ({ id, status }))).toEqual([
-      { id: "skills.coding-agent", status: "failed" },
-      { id: "skills.mcp-management", status: "failed" },
       { id: "skills.mcporter", status: "failed" },
       { id: "skills.gog", status: "failed" },
     ]);

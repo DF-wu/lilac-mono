@@ -88,16 +88,47 @@ describe("RedisStreamsBus", () => {
       { mode: "tail", offset: { type: "now" }, batch: { maxWaitMs: 5000 } },
       async () => {},
     );
+    const done = sub.done;
+    if (!done) throw new Error("Redis subscription did not expose completion");
 
     // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK before stop() is timed.
     await new Promise((r) => setTimeout(r, 50));
 
     const startedAt = Date.now();
     await sub.stop();
+    await done;
     const stopMs = Date.now() - startedAt;
 
     expect(stopMs).toBeLessThan(600);
     await raw.close();
+  });
+
+  it("exposes tail subscription loop failures through done", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const raw = createRedisStreamsBus({
+      redis,
+      keyPrefix: `test:lilac-event-bus:${randomId("done-failure")}`,
+      ownsRedis: true,
+    });
+    const sub = await raw.subscribe(
+      "topic",
+      { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
+      async () => {
+        throw new Error("tail handler failed");
+      },
+    );
+    const done = sub.done;
+    if (!done) throw new Error("Redis subscription did not expose completion");
+    try {
+      await raw.publish(
+        { topic: "topic", type: "test.failure", data: {} },
+        { topic: "topic", type: "test.failure" },
+      );
+      await expect(done).rejects.toThrow("tail handler failed");
+    } finally {
+      await sub.stop().catch(() => undefined);
+      await raw.close();
+    }
   });
 
   it("publishes and tails output stream events", async () => {
