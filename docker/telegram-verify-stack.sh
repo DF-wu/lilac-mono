@@ -94,44 +94,12 @@ build_env_args() {
 
 seed_config() {
   local chat_id="$1"
-  local status_message
-  status_message="$(
-    docker exec "${REF_CONTAINER}" sh -c 'cat /data/core-config.yaml' 2>/dev/null |
-      sed -n 's/^[[:space:]]*statusMessage:[[:space:]]*//p' | head -1
-  )"
-
-  # A minimal config: Discord present but inert, Telegram enabled.
-  cat <<EOF
-configVersion: 2
-
-surface:
-  router:
-    defaultMode: active
-    sessionModes: {}
-    activeDebounceMs: 3000
-    activeGate:
-      enabled: false
-      timeoutMs: 2500
-
-  discord:
-    tokenEnv: "DISCORD_TOKEN"
-    # Empty on purpose: this instance must ignore every Discord message.
-    allowedChannelIds: []
-    allowedGuildIds: []
-    botName: "lilac"
-$([ -n "${status_message}" ] && echo "    statusMessage: ${status_message}")
-
-  telegram:
-    enabled: true
-    tokenEnv: "TELEGRAM_BOT_TOKEN"
-    botName: "lilac"
-    allowedChatIds: ["${chat_id}"]
-    allowedUserIds: []
-    outputMode: preview
-    parseMode: html
-    streamEditIntervalMs: 1500
-    commandMenu: true
-EOF
+  # Copy the live config verbatim and override only what would make the
+  # parallel instance act twice. Everything else — prompts, models, tools,
+  # entity aliases — is preserved so the verification run behaves like the
+  # real deployment.
+  docker exec "${REF_CONTAINER}" sh -c 'cat /data/core-config.yaml' |
+    bun "$(dirname "${BASH_SOURCE[0]}")/telegram-verify-config.ts" "${chat_id}"
 }
 
 cmd_start() {
