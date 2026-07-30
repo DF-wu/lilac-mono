@@ -12,9 +12,12 @@ import {
   type MiniLilacCompactOptions,
   type MiniLilacCompactResult,
   type MiniLilacInterruptQueuedSteeringResult,
+  type MiniLilacRedoRequest,
+  type MiniLilacRedoResult,
   type MiniLilacSteerRequest,
   type MiniLilacSteerResult,
   type MiniLilacSessionSnapshot,
+  type MiniLilacSessionResume,
   type MiniLilacTodoState,
   type MiniLilacUndoRequest,
   type MiniLilacUndoResult,
@@ -32,7 +35,32 @@ const SESSION_PRESENTATION = {
   title: "Test session",
   inputTokens: null,
   contextWindow: null,
+  historyStateId: "history-1",
+  canUndo: true,
+  canRedo: false,
 } as const;
+
+function idleSnapshot(
+  historyStateId: string,
+  flags: { readonly canUndo: boolean; readonly canRedo: boolean } = {
+    canUndo: true,
+    canRedo: true,
+  },
+): MiniLilacSessionSnapshot {
+  return {
+    ...SESSION_PRESENTATION,
+    id: "session-1",
+    activeRunId: null,
+    status: "idle",
+    cwd: process.cwd(),
+    model: "provider/model",
+    profile: "coding",
+    reasoning: "low",
+    historyStateId,
+    ...flags,
+    queuedSteeringCount: 0,
+  };
+}
 
 function flush(): Promise<void> {
   // test-wait-justification: drains controller work queued onto the next timer turn by fake transport actions
@@ -57,6 +85,27 @@ function silentUI(): ControllerUISink {
   return { onState: () => {}, onOutput: () => {} };
 }
 
+function operationTracker(): {
+  readonly ui: ControllerUISink;
+  readonly next: () => Promise<void>;
+} {
+  let running = false;
+  const waiters: Array<() => void> = [];
+  return {
+    ui: {
+      onState: (state) => {
+        if (state.phase === "submitting") running = true;
+        else if (running && state.phase === "idle") {
+          running = false;
+          waiters.shift()?.();
+        }
+      },
+      onOutput: () => {},
+    },
+    next: () => new Promise((resolve) => waiters.push(resolve)),
+  };
+}
+
 function submitText(controller: Controller, text: string): void {
   controller.setEditor(text);
   controller.submit();
@@ -75,9 +124,11 @@ class FakeTransport extends MiniLilacTransport {
   private streamController: ReadableStreamDefaultController<UIMessageChunk> | undefined;
   reconnectCount = 0;
   getMessagesCount = 0;
+  getSessionResumeCount = 0;
   sendMessagesCount = 0;
   streamCancelCount = 0;
   undoRequests: MiniLilacUndoRequest[] = [];
+  redoRequests: MiniLilacRedoRequest[] = [];
   compactRequests: MiniLilacCompactInput[] = [];
   cancelCompactionRequests: MiniLilacCancelCompactionRequest[] = [];
   bindingRequests: MiniLilacUpdateSessionBindingsInput[] = [];
@@ -89,6 +140,7 @@ class FakeTransport extends MiniLilacTransport {
   cancelAbortSignals: Array<AbortSignal | undefined> = [];
   sentMessages: MiniLilacUIMessage[] = [];
   canonicalMessages: MiniLilacUIMessage[] = [];
+  canonicalHistoryStateId = "history-1";
 
   constructor(
     private readonly behavior: {
@@ -100,8 +152,10 @@ class FakeTransport extends MiniLilacTransport {
       readonly interrupt?: () => Promise<MiniLilacInterruptQueuedSteeringResult>;
       readonly messagesError?: Error;
       readonly getMessages?: () => Promise<MiniLilacUIMessage[]>;
+      readonly resume?: () => Promise<MiniLilacSessionResume>;
       readonly cancel?: () => Promise<MiniLilacCancelResult>;
       readonly undo?: (request: MiniLilacUndoRequest) => Promise<MiniLilacUndoResult>;
+      readonly redo?: (request: MiniLilacRedoRequest) => Promise<MiniLilacRedoResult>;
       readonly compact?: (
         request: MiniLilacCompactInput,
         options: MiniLilacCompactOptions,
@@ -196,11 +250,22 @@ class FakeTransport extends MiniLilacTransport {
     return Promise.resolve({ status: "cancelled" });
   }
 
-  override undo(request: MiniLilacUndoRequest): Promise<MiniLilacUndoResult> {
+  override async undo(request: MiniLilacUndoRequest): Promise<MiniLilacUndoResult> {
     this.calls.push("undo");
     this.undoRequests.push(request);
-    if (this.behavior.undo !== undefined) return this.behavior.undo(request);
-    return Promise.reject(new Error("undo not configured"));
+    if (this.behavior.undo === undefined) throw new Error("undo not configured");
+    const result = await this.behavior.undo(request);
+    if (result.status === "undone") this.canonicalHistoryStateId = result.historyStateId;
+    return result;
+  }
+
+  override async redo(request: MiniLilacRedoRequest): Promise<MiniLilacRedoResult> {
+    this.calls.push("redo");
+    this.redoRequests.push(request);
+    if (this.behavior.redo === undefined) throw new Error("redo not configured");
+    const result = await this.behavior.redo(request);
+    if (result.status === "redone") this.canonicalHistoryStateId = result.historyStateId;
+    return result;
   }
 
   override compact(
@@ -251,6 +316,31 @@ class FakeTransport extends MiniLilacTransport {
     if (this.behavior.messagesError !== undefined)
       return Promise.reject(this.behavior.messagesError);
     return Promise.resolve(this.canonicalMessages);
+  }
+
+  override async getSessionResume(): Promise<MiniLilacSessionResume> {
+    this.getSessionResumeCount += 1;
+    if (this.behavior.resume !== undefined) return this.behavior.resume();
+    const messages = await this.getMessages();
+    return {
+      snapshot: {
+        ...SESSION_PRESENTATION,
+        id: "session-1",
+        activeRunId: null,
+        status: "idle",
+        cwd: process.cwd(),
+        model: "provider/model",
+        profile: "coding",
+        reasoning: "low",
+        historyStateId: this.canonicalHistoryStateId,
+        canUndo: true,
+        canRedo: true,
+        queuedSteeringCount: 0,
+      },
+      messages,
+      todos: { revision: 0, todos: [] },
+      replayCursor: null,
+    };
   }
 
   override getSession(): Promise<MiniLilacSessionSnapshot> {
@@ -783,7 +873,13 @@ describe("Controller effect wiring", () => {
     ];
     const transport = new FakeTransport({
       undo: () =>
-        Promise.resolve({ status: "undone", clientCommandId: "undo-1", message: removed }),
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: "undo-1",
+          message: removed,
+          historyStateId: "history-1",
+          filesystem: { status: "restored" },
+        }),
       getMessages: () => Promise.resolve(remaining),
     });
     const controller = new Controller({
@@ -1519,6 +1615,9 @@ describe("Controller effect wiring", () => {
       profile: "coding",
       reasoning: "low" as const,
       queuedSteeringCount: 0,
+      historyStateId: "history-1",
+      canUndo: true,
+      canRedo: false,
       title: "Initial title",
       inputTokens: 1_000,
       contextWindow: 10_000,
@@ -1593,6 +1692,8 @@ describe("Controller effect wiring", () => {
           status: "undone",
           clientCommandId: request.clientCommandId ?? "missing",
           message: removed,
+          historyStateId: "history-1",
+          filesystem: { status: "restored" },
         });
       },
       getMessages: () => Promise.resolve([]),
@@ -1630,6 +1731,8 @@ describe("Controller effect wiring", () => {
           status: "undone",
           clientCommandId: request.clientCommandId ?? "missing",
           message: removed,
+          historyStateId: "history-1",
+          filesystem: { status: "restored" },
         });
       },
       getMessages: () => Promise.resolve([]),
@@ -1668,6 +1771,8 @@ describe("Controller effect wiring", () => {
           status: "undone",
           clientCommandId: request.clientCommandId ?? "missing",
           message: removed,
+          historyStateId: "history-1",
+          filesystem: { status: "restored" },
         });
       },
       getMessages: () => Promise.resolve([]),
@@ -1695,6 +1800,155 @@ describe("Controller effect wiring", () => {
     expect(transport.undoRequests[2]?.clientCommandId).not.toBe(uncertainId);
   });
 
+  it("supersedes an uncertain redo key only after a new prompt is admitted", async () => {
+    const redone: MiniLilacUserUIMessage = {
+      id: "user-redo-after-prompt",
+      role: "user",
+      parts: [{ type: "text", text: "redo after prompt" }],
+    };
+    let attempt = 0;
+    const transport = new FakeTransport({
+      redo: (request) => {
+        attempt += 1;
+        if (attempt <= 2) return Promise.reject(new Error("response lost"));
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message: redone,
+          historyStateId: "history-redone",
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve([redone]),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-before", role: "assistant", parts: [{ type: "text", text: "before" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+    const uncertain = operations.next();
+    controller.redo();
+    await uncertain;
+    const uncertainId = transport.redoRequests[0]?.clientCommandId;
+
+    const promptCompleted = operations.next();
+    submitText(controller, "admitted prompt");
+    await Promise.resolve();
+    await Promise.resolve();
+    transport.closeStream();
+    await promptCompleted;
+    const retried = operations.next();
+    controller.redo();
+    await retried;
+
+    expect(transport.redoRequests).toHaveLength(3);
+    expect(transport.redoRequests[2]?.clientCommandId).not.toBe(uncertainId);
+  });
+
+  it("keeps an uncertain undo key when the superseding prompt fails admission", async () => {
+    const removed: MiniLilacUserUIMessage = {
+      id: "user-undo-failed-prompt",
+      role: "user",
+      parts: [{ type: "text", text: "restore me" }],
+    };
+    let attempt = 0;
+    const transport = new FakeTransport({
+      admissionError: new Error("prompt rejected"),
+      undo: (request) => {
+        attempt += 1;
+        if (attempt <= 2) return Promise.reject(new Error("undo response lost"));
+        return Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-undone",
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve([]),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [removed],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const uncertain = operations.next();
+    controller.undo();
+    await uncertain;
+    const uncertainId = transport.undoRequests[0]?.clientCommandId;
+
+    const failedPrompt = operations.next();
+    submitText(controller, "not admitted");
+    await failedPrompt;
+
+    const retried = operations.next();
+    controller.undo();
+    await retried;
+    expect(transport.undoRequests).toHaveLength(3);
+    expect(transport.undoRequests[2]?.clientCommandId).toBe(uncertainId);
+  });
+
+  it("keeps an uncertain redo key when the superseding prompt fails admission", async () => {
+    const redone: MiniLilacUserUIMessage = {
+      id: "user-redo-failed-prompt",
+      role: "user",
+      parts: [{ type: "text", text: "redo me" }],
+    };
+    let attempt = 0;
+    const transport = new FakeTransport({
+      admissionError: new Error("prompt rejected"),
+      redo: (request) => {
+        attempt += 1;
+        if (attempt <= 2) return Promise.reject(new Error("redo response lost"));
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message: redone,
+          historyStateId: "history-redone",
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve([redone]),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "before" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const uncertain = operations.next();
+    controller.redo();
+    await uncertain;
+    const uncertainId = transport.redoRequests[0]?.clientCommandId;
+
+    const failedPrompt = operations.next();
+    submitText(controller, "not admitted");
+    await failedPrompt;
+
+    const retried = operations.next();
+    controller.redo();
+    await retried;
+    expect(transport.redoRequests).toHaveLength(3);
+    expect(transport.redoRequests[2]?.clientCommandId).toBe(uncertainId);
+  });
+
   it("restores the draft when canonical refresh fails after undo commits", async () => {
     const removed: MiniLilacUserUIMessage = {
       id: "user-1",
@@ -1707,6 +1961,8 @@ describe("Controller effect wiring", () => {
           status: "undone",
           clientCommandId: request.clientCommandId ?? "missing",
           message: removed,
+          historyStateId: "history-1",
+          filesystem: { status: "restored" },
         }),
       messagesError: new Error("offline"),
     });
@@ -1723,7 +1979,9 @@ describe("Controller effect wiring", () => {
 
     expect(controller.inputState.editor).toBe("restore me");
     expect(controller.inputState.phase).toBe("idle");
-    expect(controller.transcript.at(-1)?.text).toContain("undo saved; transcript refresh failed");
+    expect(controller.transcript.at(-1)?.text).toContain(
+      "undo committed on server; transcript refresh failed",
+    );
   });
 
   it("preserves text entered while undo is in flight", async () => {
@@ -1747,7 +2005,13 @@ describe("Controller effect wiring", () => {
     controller.start();
     submitText(controller, "/undo");
     controller.setEditor("new draft text");
-    undo.resolve({ status: "undone", clientCommandId: "undo-1", message: removed });
+    undo.resolve({
+      status: "undone",
+      clientCommandId: "undo-1",
+      message: removed,
+      historyStateId: "history-1",
+      filesystem: { status: "restored" },
+    });
     await flush();
 
     expect(controller.inputState.editor).toBe("restored prompt\nnew draft text");
@@ -1781,7 +2045,13 @@ describe("Controller effect wiring", () => {
       end: 17,
       text: "one\ntwo\nthree",
     });
-    undo.resolve({ status: "undone", clientCommandId: "undo-1", message: removed });
+    undo.resolve({
+      status: "undone",
+      clientCommandId: "undo-1",
+      message: removed,
+      historyStateId: "history-1",
+      filesystem: { status: "restored" },
+    });
     await flush();
 
     expect(controller.inputState.editor).toBe("restored prompt\n[Pasted ~3 lines]");
@@ -1795,6 +2065,899 @@ describe("Controller effect wiring", () => {
         controller.inputState.pastedTexts,
       ),
     ).toBe("restored prompt\none\ntwo\nthree");
+  });
+
+  it("redoes canonical history and clears an unchanged automatically restored draft", async () => {
+    const message: MiniLilacUserUIMessage = {
+      id: "user-redo",
+      role: "user",
+      parts: [
+        { type: "text", text: "restore this" },
+        {
+          type: "file",
+          mediaType: "image/png",
+          filename: "diagram.png",
+          url: "data:image/png;base64,AA==",
+        },
+      ],
+    };
+    let canonical: MiniLilacUIMessage[] = [];
+    const transport = new FakeTransport({
+      undo: (request) =>
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-root",
+          filesystem: { status: "restored" },
+        }),
+      redo: (request) => {
+        canonical = [
+          message,
+          { id: "assistant-redo", role: "assistant", parts: [{ type: "text", text: "answer" }] },
+        ];
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-redone",
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve(canonical),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [message],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const undoCompleted = operations.next();
+    controller.undo();
+    await undoCompleted;
+    expect(controller.inputState).toMatchObject({
+      editor: "restore this\n[Image 1]",
+      phase: "idle",
+    });
+    expect(controller.inputState.files).toHaveLength(1);
+
+    const redoCompleted = operations.next();
+    controller.redo();
+    await redoCompleted;
+    expect(transport.calls).toEqual(["undo", "redo"]);
+    expect(controller.inputState).toMatchObject({
+      editor: "",
+      files: [],
+      pastedTexts: [],
+      phase: "idle",
+    });
+    expect(controller.transcript.map((entry) => entry.text)).toEqual([
+      "restore this",
+      "Image: diagram.png",
+      "answer",
+    ]);
+  });
+
+  it("restores the exact pre-existing multipart draft after undo then redo", async () => {
+    const removed: MiniLilacUserUIMessage = {
+      id: "user-preexisting-draft",
+      role: "user",
+      parts: [{ type: "text", text: "removed prompt" }],
+    };
+    const pastedText = {
+      id: "paste-existing",
+      placeholder: "[Pasted ~3 lines]",
+      start: 6,
+      end: 23,
+      text: "one\ntwo\nthree",
+    };
+    const file = {
+      id: "file-existing",
+      placeholder: "[Image 9]",
+      start: 24,
+      end: 33,
+      file: {
+        type: "file" as const,
+        mediaType: "image/png",
+        filename: "existing.png",
+        url: "data:image/png;base64,AA==",
+      },
+    };
+    let canonical: MiniLilacUIMessage[] = [];
+    const transport = new FakeTransport({
+      undo: (request) =>
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-before",
+          filesystem: { status: "restored" },
+        }),
+      redo: (request) => {
+        canonical = [removed];
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-after",
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve(canonical),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [removed],
+      onExit: () => {},
+    });
+    controller.start();
+    controller.setEditor("notes\n[Pasted ~3 lines]\n[Image 9]");
+    controller.addPastedText(pastedText);
+    controller.addFile(file);
+    const before = {
+      editor: controller.inputState.editor,
+      files: controller.inputState.files,
+      pastedTexts: controller.inputState.pastedTexts,
+    };
+
+    const undoCompleted = operations.next();
+    controller.undo();
+    await undoCompleted;
+    expect(controller.inputState.editor).toBe(
+      "removed prompt\nnotes\n[Pasted ~3 lines]\n[Image 9]",
+    );
+
+    const redoCompleted = operations.next();
+    controller.redo();
+    await redoCompleted;
+    expect(controller.inputState.editor).toBe(before.editor);
+    expect(controller.inputState.files).toEqual(before.files);
+    expect(controller.inputState.pastedTexts).toEqual(before.pastedTexts);
+  });
+
+  it("unwinds repeated undo draft injections one level per redo", async () => {
+    const first: MiniLilacUserUIMessage = {
+      id: "user-first-history",
+      role: "user",
+      parts: [{ type: "text", text: "first" }],
+    };
+    const second: MiniLilacUserUIMessage = {
+      id: "user-second-history",
+      role: "user",
+      parts: [{ type: "text", text: "second" }],
+    };
+    const undoTargets = [second, first];
+    const redoTargets = [first, second];
+    let canonical: MiniLilacUIMessage[] = [first, second];
+    const transport = new FakeTransport({
+      undo: (request) => {
+        const message = undoTargets.shift();
+        if (message === undefined) throw new Error("missing undo target");
+        canonical = message.id === second.id ? [first] : [];
+        return Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: `undo-${message.id}`,
+          filesystem: { status: "restored" },
+        });
+      },
+      redo: (request) => {
+        const message = redoTargets.shift();
+        if (message === undefined) throw new Error("missing redo target");
+        canonical = message.id === first.id ? [first] : [first, second];
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: `redo-${message.id}`,
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve(canonical),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: canonical,
+      onExit: () => {},
+    });
+    controller.start();
+
+    for (const expected of ["second", "first\nsecond"]) {
+      const completed = operations.next();
+      controller.undo();
+      await completed;
+      expect(controller.inputState.editor).toBe(expected);
+    }
+    for (const expected of ["second", ""]) {
+      const completed = operations.next();
+      controller.redo();
+      await completed;
+      expect(controller.inputState.editor).toBe(expected);
+    }
+  });
+
+  it("keeps typed, pasted, and attached drafts after redo", async () => {
+    for (const mutation of ["typed", "pasted", "attached"] as const) {
+      const message: MiniLilacUserUIMessage = {
+        id: `user-${mutation}`,
+        role: "user",
+        parts: [{ type: "text", text: "automatic draft" }],
+      };
+      let canonical: MiniLilacUIMessage[] = [];
+      const transport = new FakeTransport({
+        undo: (request) =>
+          Promise.resolve({
+            status: "undone",
+            clientCommandId: request.clientCommandId,
+            message,
+            historyStateId: `history-${mutation}-undo`,
+            filesystem: { status: "restored" },
+          }),
+        redo: (request) => {
+          canonical = [message];
+          return Promise.resolve({
+            status: "redone",
+            clientCommandId: request.clientCommandId,
+            message,
+            historyStateId: `history-${mutation}-redo`,
+            filesystem: { status: "restored" },
+          });
+        },
+        getMessages: () => Promise.resolve(canonical),
+      });
+      const operations = operationTracker();
+      const controller = new Controller({
+        transport,
+        ui: operations.ui,
+        sessionId: `session-${mutation}`,
+        initialMessages: [message],
+        onExit: () => {},
+      });
+      controller.start();
+      const undoCompleted = operations.next();
+      controller.undo();
+      await undoCompleted;
+
+      if (mutation === "typed") controller.setEditor("automatic draft\nuser text");
+      if (mutation === "pasted") {
+        controller.setEditor("automatic draft\n[Pasted ~3 lines]");
+        controller.addPastedText({
+          id: "paste-user",
+          placeholder: "[Pasted ~3 lines]",
+          start: 16,
+          end: 33,
+          text: "one\ntwo\nthree",
+        });
+      }
+      if (mutation === "attached") {
+        controller.setEditor("automatic draft\n[Image 1]");
+        controller.addFile({
+          id: "image-user",
+          placeholder: "[Image 1]",
+          start: 16,
+          end: 25,
+          file: { type: "file", mediaType: "image/png", url: "data:image/png;base64,AA==" },
+        });
+      }
+      const beforeRedo = controller.inputState;
+      const redoCompleted = operations.next();
+      controller.redo();
+      await redoCompleted;
+      expect(controller.inputState.editor).toBe(beforeRedo.editor);
+      expect(controller.inputState.files).toEqual(beforeRedo.files);
+      expect(controller.inputState.pastedTexts).toEqual(beforeRedo.pastedTexts);
+      controller.dispose();
+    }
+  });
+
+  it("keeps a matching draft after process-local undo provenance is lost", async () => {
+    const message: MiniLilacUserUIMessage = {
+      id: "user-restarted",
+      role: "user",
+      parts: [{ type: "text", text: "automatic draft" }],
+    };
+    const transport = new FakeTransport({
+      redo: (request) =>
+        Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-redone",
+          filesystem: { status: "restored" },
+        }),
+      getMessages: () => Promise.resolve([message]),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [message],
+      onExit: () => {},
+    });
+    controller.start();
+    controller.setEditor("automatic draft");
+
+    const redoCompleted = operations.next();
+    controller.redo();
+    await redoCompleted;
+    expect(controller.inputState.editor).toBe("automatic draft");
+  });
+
+  it("treats empty redo as a successful no-op", async () => {
+    const transport = new FakeTransport({
+      redo: (request) =>
+        Promise.resolve({ status: "empty", clientCommandId: request.clientCommandId }),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(controller.inputState.phase).toBe("idle");
+    expect(transport.redoRequests).toHaveLength(1);
+    expect(transport.getMessagesCount).toBe(0);
+  });
+
+  it("reuses the redo command id after both retry responses are uncertain", async () => {
+    const message: MiniLilacUserUIMessage = {
+      id: "user-retry-redo",
+      role: "user",
+      parts: [{ type: "text", text: "retry redo" }],
+    };
+    let attempt = 0;
+    const transport = new FakeTransport({
+      redo: (request) => {
+        attempt += 1;
+        if (attempt <= 2) return Promise.reject(new Error("response lost"));
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-redone",
+          filesystem: { status: "restored" },
+        });
+      },
+      getMessages: () => Promise.resolve([message]),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const uncertain = operations.next();
+    controller.redo();
+    await uncertain;
+    expect(transport.redoRequests).toHaveLength(2);
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(transport.redoRequests).toHaveLength(3);
+    expect(new Set(transport.redoRequests.map((request) => request.clientCommandId)).size).toBe(1);
+  });
+
+  it("leaves assistant/tool transcript untouched when a steering redo needs refresh", async () => {
+    const message: MiniLilacUserUIMessage = {
+      id: "user-fallback-redo",
+      role: "user",
+      parts: [{ type: "text", text: "steering target" }],
+    };
+    const transport = new FakeTransport({
+      redo: (request) =>
+        Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-redone",
+          filesystem: { status: "restored" },
+        }),
+      messagesError: new Error("offline"),
+    });
+    const operations = operationTracker();
+    const notices: string[] = [];
+    const controller = new Controller({
+      transport,
+      ui: { ...operations.ui, onNotice: (notice) => notices.push(notice) },
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+        {
+          id: "assistant-tool",
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolName: "read_file",
+              toolCallId: "read-1",
+              state: "output-available",
+              input: { path: "src/index.ts" },
+              output: "contents",
+            },
+          ],
+        },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+    const transcriptBefore = controller.transcript;
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(controller.transcript).toEqual(transcriptBefore);
+    expect(notices).toEqual(["Redo committed; transcript refresh required: offline"]);
+    expect(controller.inputState.phase).toBe("idle");
+  });
+
+  it("reports redo refresh failure and skipped filesystem restoration without transcript mutation", async () => {
+    const message: MiniLilacUserUIMessage = {
+      id: "user-refresh-and-filesystem-warning",
+      role: "user",
+      parts: [{ type: "text", text: "redo target" }],
+    };
+    const notices: string[] = [];
+    const transport = new FakeTransport({
+      redo: (request) =>
+        Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-redone-warning",
+          filesystem: { status: "skipped", reason: "snapshot-unavailable" },
+        }),
+      messagesError: new Error("resume unavailable"),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: { ...operations.ui, onNotice: (notice) => notices.push(notice) },
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-existing", role: "assistant", parts: [{ type: "text", text: "keep" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+    const transcriptBefore = controller.transcript;
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(controller.transcript).toEqual(transcriptBefore);
+    expect(notices).toEqual([
+      "Redo committed; transcript refresh required: resume unavailable. Managed worktree unchanged because no worktree snapshot is available.",
+    ]);
+  });
+
+  it("renders a newer authoritative history race without applying stale undo draft effects", async () => {
+    const removed: MiniLilacUserUIMessage = {
+      id: "user-stale-undo",
+      role: "user",
+      parts: [{ type: "text", text: "stale undo draft" }],
+    };
+    const authoritative: MiniLilacUIMessage[] = [
+      { id: "user-latest", role: "user", parts: [{ type: "text", text: "latest prompt" }] },
+      {
+        id: "assistant-latest",
+        role: "assistant",
+        parts: [{ type: "text", text: "latest answer" }],
+      },
+    ];
+    const notices: string[] = [];
+    const transport = new FakeTransport({
+      undo: (request) =>
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-undone",
+          filesystem: { status: "restored" },
+        }),
+      resume: () =>
+        Promise.resolve({
+          snapshot: idleSnapshot("history-newer", { canUndo: false, canRedo: true }),
+          messages: authoritative,
+          todos: { revision: 0, todos: [] },
+          replayCursor: null,
+        }),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: { ...operations.ui, onNotice: (notice) => notices.push(notice) },
+      sessionId: "session-1",
+      initialMessages: [removed],
+      onExit: () => {},
+    });
+    controller.start();
+    controller.setEditor("keep this draft");
+
+    const completed = operations.next();
+    controller.undo();
+    await completed;
+    expect(controller.transcript.map((entry) => entry.text)).toEqual([
+      "latest prompt",
+      "latest answer",
+    ]);
+    expect(controller.inputState.editor).toBe("keep this draft");
+    expect(controller.historyNavigation).toEqual({
+      historyStateId: "history-newer",
+      canUndo: false,
+      canRedo: true,
+    });
+    expect(notices).toEqual(["History changed again; showing latest server state."]);
+  });
+
+  it("ignores a replayed old redo result when resume points at a newer state", async () => {
+    const staleTarget: MiniLilacUserUIMessage = {
+      id: "user-old-redo",
+      role: "user",
+      parts: [{ type: "text", text: "old redo target" }],
+    };
+    const authoritative: MiniLilacUIMessage[] = [
+      { id: "user-current", role: "user", parts: [{ type: "text", text: "current branch" }] },
+    ];
+    const transport = new FakeTransport({
+      redo: (request) =>
+        Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message: staleTarget,
+          historyStateId: "history-old-command",
+          filesystem: { status: "restored" },
+        }),
+      resume: () =>
+        Promise.resolve({
+          snapshot: idleSnapshot("history-current", { canUndo: true, canRedo: false }),
+          messages: authoritative,
+          todos: { revision: 0, todos: [] },
+          replayCursor: null,
+        }),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      initialMessages: authoritative,
+      onExit: () => {},
+    });
+    controller.start();
+    controller.setEditor("local draft survives");
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["current branch"]);
+    expect(controller.inputState.editor).toBe("local draft survives");
+    expect(controller.historyNavigation).toEqual({
+      historyStateId: "history-current",
+      canUndo: true,
+      canRedo: false,
+    });
+  });
+
+  it("treats a same-state active prompt as authoritative after undo", async () => {
+    const removed: MiniLilacUserUIMessage = {
+      id: "user-same-state-undo",
+      role: "user",
+      parts: [{ type: "text", text: "must not become a draft" }],
+    };
+    const resumeObserved = deferred<void>();
+    const activeObserved = deferred<void>();
+    const cancelObserved = deferred<void>();
+    const reconnect = deferred<ReadableStream<UIMessageChunk> | null>();
+    const activeSnapshot: MiniLilacSessionSnapshot = {
+      ...idleSnapshot("history-same-undo"),
+      activeRunId: "run-successor",
+      status: "streaming",
+    };
+    const transport = new FakeTransport({
+      undo: (request) =>
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-same-undo",
+          filesystem: { status: "restored" },
+        }),
+      resume: () => {
+        resumeObserved.resolve(undefined);
+        return Promise.resolve({
+          snapshot: activeSnapshot,
+          messages: [
+            { id: "user-successor", role: "user", parts: [{ type: "text", text: "successor" }] },
+          ],
+          todos: { revision: 0, todos: [] },
+          replayCursor: { runId: "run-successor", afterSeq: 4 },
+        });
+      },
+      cancel: () => {
+        cancelObserved.resolve(undefined);
+        return Promise.resolve({ status: "cancelled" });
+      },
+      reconnectPromise: reconnect.promise,
+    });
+    const controller = new Controller({
+      transport,
+      ui: {
+        onState: (state) => {
+          if (state.phase === "active") activeObserved.resolve(undefined);
+        },
+        onOutput: () => {},
+      },
+      sessionId: "session-1",
+      initialMessages: [removed],
+      onExit: () => {},
+    });
+    controller.start();
+    controller.setEditor("local draft");
+    controller.undo();
+    await resumeObserved.promise;
+    await activeObserved.promise;
+
+    expect(controller.inputState.phase).toBe("active");
+    expect(controller.inputState.editor).toBe("local draft");
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["successor"]);
+    controller.escape();
+    await cancelObserved.promise;
+    expect(transport.calls).toContain("cancel");
+    controller.dispose();
+  });
+
+  it("treats a same-state active compaction as authoritative after redo", async () => {
+    const removed: MiniLilacUserUIMessage = {
+      id: "user-same-state-redo",
+      role: "user",
+      parts: [{ type: "text", text: "automatic undo draft" }],
+    };
+    const redoResumeObserved = deferred<void>();
+    const compactingObserved = deferred<void>();
+    const watch = deferred<void>();
+    const compactingSnapshot: MiniLilacSessionSnapshot = {
+      ...idleSnapshot("history-same-redo"),
+      activeCompactionCommandId: "compact-successor",
+      status: "compacting",
+    };
+    let resumeCount = 0;
+    const transport = new FakeTransport({
+      undo: (request) =>
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-before-redo",
+          filesystem: { status: "restored" },
+        }),
+      redo: (request) =>
+        Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-same-redo",
+          filesystem: { status: "restored" },
+        }),
+      resume: () => {
+        resumeCount += 1;
+        if (resumeCount === 1) {
+          return Promise.resolve({
+            snapshot: idleSnapshot("history-before-redo"),
+            messages: [],
+            todos: { revision: 0, todos: [] },
+            replayCursor: null,
+          });
+        }
+        redoResumeObserved.resolve(undefined);
+        return Promise.resolve({
+          snapshot: compactingSnapshot,
+          messages: [removed],
+          todos: { revision: 0, todos: [] },
+          replayCursor: null,
+        });
+      },
+      getSession: () => Promise.resolve(compactingSnapshot),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: {
+        ...operations.ui,
+        onState: (state) => {
+          operations.ui.onState(state);
+          if (state.phase === "compacting") compactingObserved.resolve(undefined);
+        },
+      },
+      sessionId: "session-1",
+      initialMessages: [removed],
+      compactionWatchDelay: () => watch.promise,
+      onExit: () => {},
+    });
+    controller.start();
+    const undoCompleted = operations.next();
+    controller.undo();
+    await undoCompleted;
+    expect(controller.inputState.editor).toBe("automatic undo draft");
+
+    controller.redo();
+    await redoResumeObserved.promise;
+    await compactingObserved.promise;
+    expect(controller.inputState.phase).toBe("compacting");
+    expect(controller.inputState.editor).toBe("automatic undo draft");
+    controller.escape();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(transport.cancelCompactionRequests).toEqual([
+      { sessionId: "session-1", clientCommandId: "compact-successor" },
+    ]);
+    controller.dispose();
+  });
+
+  it("reports filesystem skips as noncanonical warnings without failing history commands", async () => {
+    const reasons = [
+      ["git-unavailable", "Git is unavailable"],
+      ["snapshot-unavailable", "no worktree snapshot is available"],
+      ["platform-unsupported", "worktree restore is unsupported on this platform"],
+    ] as const;
+    for (const [reason, expected] of reasons) {
+      const message: MiniLilacUserUIMessage = {
+        id: `user-${reason}`,
+        role: "user",
+        parts: [{ type: "text", text: reason }],
+      };
+      const notices: Array<{ message: string; tone: string }> = [];
+      const operations = operationTracker();
+      const transport = new FakeTransport({
+        redo: (request) =>
+          Promise.resolve({
+            status: "redone",
+            clientCommandId: request.clientCommandId,
+            message,
+            historyStateId: `history-${reason}`,
+            filesystem: { status: "skipped", reason },
+          }),
+        getMessages: () => Promise.resolve([message]),
+      });
+      const controller = new Controller({
+        transport,
+        ui: {
+          ...operations.ui,
+          onNotice: (notice, tone) => notices.push({ message: notice, tone }),
+        },
+        sessionId: `session-${reason}`,
+        initialMessages: [
+          { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hello" }] },
+        ],
+        onExit: () => {},
+      });
+      controller.start();
+
+      const completed = operations.next();
+      controller.redo();
+      await completed;
+      expect(notices).toEqual([
+        {
+          message: `Transcript redone; managed worktree unchanged because ${expected}.`,
+          tone: "warning",
+        },
+      ]);
+      expect(controller.transcript.some((entry) => entry.text.includes("worktree unchanged"))).toBe(
+        false,
+      );
+      expect(controller.transcript.some((entry) => entry.kind === "error")).toBe(false);
+      controller.dispose();
+    }
+  });
+
+  it("reports an undo filesystem skip after restoring the draft and returning idle", async () => {
+    const removed: MiniLilacUserUIMessage = {
+      id: "user-skipped-undo",
+      role: "user",
+      parts: [{ type: "text", text: "restore after skipped filesystem" }],
+    };
+    const notices: string[] = [];
+    const transport = new FakeTransport({
+      undo: (request) =>
+        Promise.resolve({
+          status: "undone",
+          clientCommandId: request.clientCommandId,
+          message: removed,
+          historyStateId: "history-skipped-undo",
+          filesystem: { status: "skipped", reason: "git-unavailable" },
+        }),
+      getMessages: () => Promise.resolve([]),
+    });
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: { ...operations.ui, onNotice: (notice) => notices.push(notice) },
+      sessionId: "session-1",
+      initialMessages: [removed],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const completed = operations.next();
+    controller.undo();
+    await completed;
+    expect(controller.inputState).toMatchObject({
+      editor: "restore after skipped filesystem",
+      phase: "idle",
+    });
+    expect(notices).toEqual([
+      "Transcript undone; managed worktree unchanged because Git is unavailable.",
+    ]);
+    expect(controller.transcript).toEqual([]);
+  });
+
+  it("gates direct undo and redo controller actions while work is active", async () => {
+    const transport = new FakeTransport();
+    const controller = new Controller({
+      transport,
+      ui: silentUI(),
+      sessionId: "session-1",
+      initialMessages: [
+        { id: "assistant-existing", role: "assistant", parts: [{ type: "text", text: "ready" }] },
+      ],
+      onExit: () => {},
+    });
+    controller.start();
+    submitText(controller, "active prompt");
+    await Promise.resolve();
+    expect(controller.inputState.phase).toBe("active");
+
+    controller.undo();
+    controller.redo();
+    expect(transport.undoRequests).toEqual([]);
+    expect(transport.redoRequests).toEqual([]);
+    expect(controller.inputState.phase).toBe("active");
+    controller.dispose();
+  });
+
+  it("does not call the server when redoing before session creation", async () => {
+    const transport = new FakeTransport();
+    const operations = operationTracker();
+    const controller = new Controller({
+      transport,
+      ui: operations.ui,
+      sessionId: "session-1",
+      onExit: () => {},
+    });
+    controller.start();
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(transport.redoRequests).toEqual([]);
+    expect(controller.inputState.phase).toBe("idle");
   });
 
   it("interrupts pending steer admissions atomically, then cancels on Esc", async () => {
@@ -2126,6 +3289,9 @@ describe("Controller effect wiring", () => {
         model: "provider/model",
         profile: "general",
         reasoning: null,
+        historyStateId: "history-streaming",
+        canUndo: true,
+        canRedo: false,
         queuedSteeringCount: 1,
       },
     });
@@ -2156,6 +3322,9 @@ describe("Controller effect wiring", () => {
         model: "provider/model",
         profile: "general",
         reasoning: null,
+        historyStateId: "history-streaming",
+        canUndo: true,
+        canRedo: false,
         queuedSteeringCount: 0,
       },
     });

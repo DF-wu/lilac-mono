@@ -63,6 +63,7 @@ export type InputEvent =
   | { readonly type: "backspace" }
   | { readonly type: "submit" }
   | { readonly type: "request-undo" }
+  | { readonly type: "request-redo" }
   | { readonly type: "request-compact" }
   | { readonly type: "compaction-observed" }
   | { readonly type: "escape" }
@@ -99,6 +100,7 @@ export type InputEffect =
       readonly pastedTexts: readonly DraftPastedText[];
     }
   | { readonly type: "undo" }
+  | { readonly type: "redo" }
   | { readonly type: "compact" }
   | { readonly type: "interrupt-queued-steering" }
   | { readonly type: "cancel" }
@@ -165,6 +167,9 @@ export function reduceInput(state: InputState, event: InputEvent): InputTransiti
     case "request-undo":
       if (state.phase !== "idle") return commit(state);
       return commit({ ...state, phase: "submitting" }, { type: "undo" });
+    case "request-redo":
+      if (state.phase !== "idle") return commit(state);
+      return commit({ ...state, phase: "submitting" }, { type: "redo" });
     case "request-compact":
       if (state.phase !== "idle" || state.files.length > 0 || state.pastedTexts.length > 0) {
         return commit(state);
@@ -234,6 +239,12 @@ function onSubmit(state: InputState): InputTransition {
         { type: "undo" },
       );
     }
+    if (state.files.length === 0 && slash === "/redo") {
+      return commit(
+        { ...state, editor: "", phase: "submitting", exitArmed: false },
+        { type: "redo" },
+      );
+    }
     if (slash === "/compact") {
       if (state.files.length > 0 || state.pastedTexts.length > 0) return commit(state);
       return commit(
@@ -259,10 +270,7 @@ function onSubmit(state: InputState): InputTransition {
   if (state.phase !== "active") return commit(state);
 
   // Session commands mutate canonical history and are never steering messages.
-  if (
-    slash === "/compact" ||
-    (state.files.length === 0 && (slash === "/undo" || slash === "/rollback"))
-  ) {
+  if (slash === "/compact" || slash === "/redo" || slash === "/undo" || slash === "/rollback") {
     return commit(state);
   }
 

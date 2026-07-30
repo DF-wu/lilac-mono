@@ -113,6 +113,7 @@ Commands:
   /todo       view all session todos
   /undo       remove the latest user message and following transcript
   /rollback   alias for /undo
+  /redo       restore the latest undone turn
   /model      choose a configured model
   /reasoning  choose reasoning effort
 `;

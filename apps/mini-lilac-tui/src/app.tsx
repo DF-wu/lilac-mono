@@ -597,6 +597,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   const floatingTodo = createMemo(() => todoFloatingSummary(todos()));
   const [todoExpanded, setTodoExpanded] = createSignal(false);
   const [notice, setNotice] = createSignal<string | undefined>();
+  const [noticeTone, setNoticeTone] = createSignal<"warning" | "danger">("danger");
   const [palette, setPalette] = createSignal<PaletteState | undefined>();
   const [availableSessions, setAvailableSessions] = createSignal<
     readonly MiniLilacSessionSnapshot[]
@@ -630,6 +631,11 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   let draftExtmarkGeneration = 0;
   const draftParts = new Map<string, DraftFile | DraftPastedText>();
 
+  function showNotice(message: string | undefined, tone: "warning" | "danger" = "danger"): void {
+    setNoticeTone(tone);
+    setNotice(message);
+  }
+
   useSelectionHandler((selection) => {
     const text = selection.getSelectedText();
     if (text.length > 0) terminalRenderer.copyToClipboardOSC52(text);
@@ -649,6 +655,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       onOutput: (next) => setEntries([...next]),
       onSteering: (next) => setSteering([...next]),
       onSession: setSession,
+      onNotice: showNotice,
       onTodos: (next) => {
         setTodos(next);
         const summary = todoFloatingSummary(next);
@@ -691,7 +698,8 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   });
 
   const phaseColor = createMemo(() => {
-    if (notice() !== undefined || state().phase === "disconnected") return colors.danger;
+    if (notice() !== undefined) return noticeTone() === "warning" ? colors.warning : colors.danger;
+    if (state().phase === "disconnected") return colors.danger;
     if (profileCycleBusy()) return colors.muted;
     if (state().phase === "active") return colors.success;
     if (state().phase === "compacting") return colors.warning;
@@ -841,7 +849,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     }
     if (item.id === "model") return colors.model;
     if (item.id === "reasoning" || item.id === "compact") return colors.warning;
-    if (item.id === "undo") return colors.danger;
+    if (item.id === "undo" || item.id === "redo") return colors.danger;
     if (item.id === "skills") return colors.success;
     return colors.accent;
   }
@@ -884,7 +892,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       0,
       items.findIndex((item) => item.id === currentId),
     );
-    setNotice(undefined);
+    showNotice(undefined);
     setPalette({ kind, selected, query: "" });
     composer?.blur();
   }
@@ -1088,19 +1096,19 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
 
   async function openSessionPalette(): Promise<void> {
     closePalette();
-    setNotice("loading sessions");
+    showNotice("loading sessions");
     try {
       const sessions = (await props.transport.listSessions(props.cwd)).filter(
         (candidate) => candidate.id !== props.sessionId,
       );
       if (sessions.length === 0) {
-        setNotice("no other sessions in this directory");
+        showNotice("no other sessions in this directory");
         return;
       }
       setAvailableSessions(sessions);
       openPalette("sessions");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      showNotice(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -1110,36 +1118,36 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     try {
       await props.onNewSession(bindings());
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      showNotice(error instanceof Error ? error.message : String(error));
       setBindingBusy(false);
     }
   }
 
   async function openSkillsPalette(): Promise<void> {
     closePalette();
-    setNotice("loading skills");
+    showNotice("loading skills");
     const requestedProfile = bindings().profile;
     try {
       const skills = await props.transport.listSkills(props.cwd, requestedProfile);
       if (bindings().profile !== requestedProfile) {
-        setNotice("profile changed; reopen skills");
+        showNotice("profile changed; reopen skills");
         return;
       }
       if (skills.length === 0) {
-        setNotice("no skills available for this profile");
+        showNotice("no skills available for this profile");
         return;
       }
       setAvailableSkills(skills);
       openPalette("skills");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      showNotice(error instanceof Error ? error.message : String(error));
     }
   }
 
   function openTodoPalette(): void {
     if (todos().todos.length === 0) {
       closePalette();
-      setNotice("no todos for this session");
+      showNotice("no todos for this session");
       return;
     }
     openPalette("todos");
@@ -1169,6 +1177,11 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
         controller.undo();
         return;
       }
+      if (item.id === "redo") {
+        closePalette();
+        controller.redo();
+        return;
+      }
       if (item.id === "session") {
         await openSessionPalette();
         return;
@@ -1188,7 +1201,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       try {
         await props.onSessionSelect(item.id);
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : String(error));
+        showNotice(error instanceof Error ? error.message : String(error));
         setBindingBusy(false);
       }
       return;
@@ -1296,11 +1309,11 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   function attachImage(bytes: Uint8Array, hintedMediaType?: string): void {
     const mediaType = imageMediaType(bytes, hintedMediaType);
     if (mediaType === undefined) {
-      setNotice("unsupported clipboard image");
+      showNotice("unsupported clipboard image");
       return;
     }
     if (bytes.length > MAX_CLIPBOARD_IMAGE_BYTES) {
-      setNotice("image exceeds 10 MB");
+      showNotice("image exceeds 10 MB");
       return;
     }
     nextImageNumber += 1;
@@ -1319,7 +1332,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
         url: `data:${mediaType};base64,${Buffer.from(bytes).toString("base64")}`,
       },
     };
-    setNotice(undefined);
+    showNotice(undefined);
     draftParts.set(file.id, file);
     batch(() => {
       if (composer !== undefined) controller.setEditor(composer.plainText);
@@ -1378,7 +1391,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       }
     } catch (error) {
       if (error instanceof ClipboardImageTooLargeError && generation === draftGeneration) {
-        setNotice("image exceeds 10 MB");
+        showNotice("image exceeds 10 MB");
       }
     }
   }
@@ -1910,14 +1923,14 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
               onPaste={onPaste}
               onContentChange={() => {
                 if (composer !== undefined) {
-                  setNotice(undefined);
+                  showNotice(undefined);
                   controller.setEditor(composer.plainText);
                   if (!restoringDraft) syncExtmarkedDraftParts();
                 }
               }}
               onSubmit={() => {
                 if (bindingBusy()) {
-                  setNotice("switching session");
+                  showNotice("switching session");
                   return;
                 }
                 const value = composer?.plainText ?? "";
@@ -1935,7 +1948,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
                   command === "/skills"
                 ) {
                   if (state().phase !== "idle") {
-                    setNotice("interrupt active work before switching");
+                    showNotice("interrupt active work before switching");
                     return;
                   }
                   controller.setEditor("");

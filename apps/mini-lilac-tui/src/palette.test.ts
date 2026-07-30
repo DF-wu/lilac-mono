@@ -23,6 +23,7 @@ describe("palette helpers", () => {
   it("fuzzy-filters commands and model-like labels", () => {
     expect(filterPaletteItems(COMMAND_PALETTE_ITEMS, "un").map((item) => item.id)).toEqual([
       "undo",
+      "redo",
     ]);
     expect(
       filterPaletteItems(
@@ -47,6 +48,8 @@ describe("palette helpers", () => {
     expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("new");
     expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("todo");
     expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("compact");
+    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("undo");
+    expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("redo");
     expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("session");
     expect(COMMAND_PALETTE_ITEMS.map((item) => item.id)).toContain("skills");
   });
@@ -130,6 +133,9 @@ describe("palette helpers", () => {
         model: "test/model",
         profile: "coding",
         reasoning: "low",
+        historyStateId: "history-1",
+        canUndo: true,
+        canRedo: false,
         title: "Fix reconnect handling",
         queuedSteeringCount: 0,
         updatedAt: "2026-07-22T12:00:00.000Z",
