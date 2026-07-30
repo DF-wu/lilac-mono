@@ -1109,6 +1109,35 @@ describe("auto-compaction internals", () => {
     detach();
   });
 
+  it("forwards turn error provenance to the wrapped base handler", async () => {
+    const transformError = new Error("base transform failed");
+    const phases: Array<string | undefined> = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      modelSpecifier: "test/main",
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      resolveContextLimit: async () => ({ context: 100_000, output: 10_000 }),
+      baseTransformMessages: () => {
+        throw transformError;
+      },
+      baseTurnErrorHandler: (_error, context) => {
+        phases.push(context.phase);
+        return "fail";
+      },
+    });
+
+    try {
+      await expect(agent.prompt("fail before model call")).rejects.toBe(transformError);
+      expect(phases).toEqual(["transform-messages"]);
+    } finally {
+      detach();
+    }
+  });
+
   it("does not compact or auto-continue a terminal stop turn", async () => {
     const mainModel = new MockLanguageModelV4({
       doStream: async () => ({

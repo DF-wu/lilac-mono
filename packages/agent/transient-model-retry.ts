@@ -3,7 +3,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { createLogger, extractAiErrorLogDetails, isRecord } from "@stanley2058/lilac-utils";
 
 import { isLikelyContextOverflowError } from "./context-overflow";
-import type { TurnErrorHandler } from "./ai-sdk-pi-agent";
+import type { TurnErrorHandler, TurnErrorHandlerDecision } from "./ai-sdk-pi-agent";
 
 const TRANSIENT_MODEL_ERROR_PATTERN =
   /overloaded|server_is_overloaded|service[_\s-]*unavailable|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|socket connection was closed unexpectedly|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
@@ -23,6 +23,10 @@ export type TransientModelRetryController = {
   reset: () => void;
 };
 
+export type AdvanceModelResult = { ok: true; modelSpec: string } | { ok: false; reason: string };
+
+export type AdvanceModel = () => Promise<AdvanceModelResult>;
+
 function readNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && /^\d+$/u.test(value.trim())) return Number(value.trim());
@@ -32,6 +36,11 @@ function readNumber(value: unknown): number | undefined {
 function hasRetryErrorExhausted(error: unknown): boolean {
   if (!isRecord(error)) return false;
   return error.name === "AI_RetryError" && error.reason === "maxRetriesExceeded";
+}
+
+function hasTransientRetryErrorExhausted(error: unknown): boolean {
+  if (!hasRetryErrorExhausted(error) || !isRecord(error)) return false;
+  return isRetryableTransientModelError(error.lastError);
 }
 
 function hasTransientModelErrorHint(value: unknown, seen: Set<unknown>, depth: number): boolean {
@@ -126,8 +135,10 @@ export function createTransientModelRetryController(params: {
   sessionId: string;
   modelSpec: string;
   formatError?: (error: unknown) => string;
+  advanceModel?: AdvanceModel;
 }): TransientModelRetryController {
   let attempts = 0;
+  let modelSpec = params.modelSpec;
   const summarizeError = params.formatError ?? defaultErrorSummary;
 
   return {
@@ -139,22 +150,27 @@ export function createTransientModelRetryController(params: {
         params.logger.debug("transient model retry skipped", {
           requestId: params.requestId,
           sessionId: params.sessionId,
-          modelSpec: params.modelSpec,
+          modelSpec,
           reason,
           error: summarizeError(error),
           ...extractAiErrorLogDetails(error),
         });
       };
 
-      if (!params.retry.enabled || params.retry.maxRetries <= 0) {
+      const advanceModel = params.advanceModel;
+      if (!advanceModel && (!params.retry.enabled || params.retry.maxRetries <= 0)) {
         logSkipped("disabled");
         return "fail";
       }
+
       if (context.abortSignal?.aborted === true) {
         logSkipped("aborted");
         return "fail";
       }
-      if (!isRetryableTransientModelError(error)) {
+
+      const aiSdkRetriesExhausted =
+        advanceModel !== undefined && hasTransientRetryErrorExhausted(error);
+      if (!aiSdkRetriesExhausted && !isRetryableTransientModelError(error)) {
         logSkipped("not-transient");
         return "fail";
       }
@@ -162,24 +178,73 @@ export function createTransientModelRetryController(params: {
         params.logger.warn("transient model retry skipped; unsafe transcript boundary", {
           requestId: params.requestId,
           sessionId: params.sessionId,
-          modelSpec: params.modelSpec,
+          modelSpec,
           reason: context.retrySafety.reason,
           error: summarizeError(error),
           ...extractAiErrorLogDetails(error),
         });
         return "fail";
       }
+      if (advanceModel && context.phase !== "model-call") {
+        logSkipped("not-model-call");
+        return "fail";
+      }
+
+      const advance = async (callback: AdvanceModel): Promise<TurnErrorHandlerDecision> => {
+        const previousModelSpec = modelSpec;
+        const result = await callback();
+        if (!result.ok) {
+          params.logger.warn("model fallback skipped", {
+            requestId: params.requestId,
+            sessionId: params.sessionId,
+            modelSpec: previousModelSpec,
+            reason: result.reason,
+            attempts,
+            error: summarizeError(error),
+            ...extractAiErrorLogDetails(error),
+          });
+          return "fail";
+        }
+
+        attempts = 0;
+        modelSpec = result.modelSpec;
+        params.logger.warn("transient model error; advanced model", {
+          requestId: params.requestId,
+          sessionId: params.sessionId,
+          fromModelSpec: previousModelSpec,
+          modelSpec,
+          error: summarizeError(error),
+          ...extractAiErrorLogDetails(error),
+        });
+        return "retry";
+      };
+
+      if (aiSdkRetriesExhausted && advanceModel) {
+        params.logger.warn("AI SDK transient model retries exhausted", {
+          requestId: params.requestId,
+          sessionId: params.sessionId,
+          modelSpec,
+          error: summarizeError(error),
+          ...extractAiErrorLogDetails(error),
+        });
+        return await advance(advanceModel);
+      }
+
+      if (!params.retry.enabled || params.retry.maxRetries <= 0) {
+        logSkipped("disabled");
+        return advanceModel ? await advance(advanceModel) : "fail";
+      }
       if (attempts >= params.retry.maxRetries) {
         params.logger.warn("transient model retry exhausted", {
           requestId: params.requestId,
           sessionId: params.sessionId,
-          modelSpec: params.modelSpec,
+          modelSpec,
           attempts,
           maxRetries: params.retry.maxRetries,
           error: summarizeError(error),
           ...extractAiErrorLogDetails(error),
         });
-        return "fail";
+        return advanceModel ? await advance(advanceModel) : "fail";
       }
 
       attempts += 1;
@@ -192,7 +257,7 @@ export function createTransientModelRetryController(params: {
       params.logger.warn("transient model error; retrying", {
         requestId: params.requestId,
         sessionId: params.sessionId,
-        modelSpec: params.modelSpec,
+        modelSpec,
         attempt: attempts,
         maxRetries: params.retry.maxRetries,
         delayMs,

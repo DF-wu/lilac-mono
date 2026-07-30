@@ -385,6 +385,8 @@ export type TransformMessagesFn = (
 
 export type TurnErrorHandlerDecision = "retry" | "fail";
 
+export type TurnErrorPhase = "before-step" | "transform-messages" | "model-call" | "post-model";
+
 export type TurnRetrySafety =
   | { canRetry: true }
   | {
@@ -397,6 +399,8 @@ export type TurnErrorHandler = (
   context: {
     abortSignal?: AbortSignal;
     retrySafety: TurnRetrySafety;
+    /** Origin of the error. Optional for compatibility with direct handler callers. */
+    phase?: TurnErrorPhase;
   },
 ) => TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
 
@@ -444,6 +448,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   system: SystemPrompt;
   /** AI SDK model instance used for `streamText()`. */
   model: LanguageModel;
+  /** Optional retry limit forwarded to each AI SDK `streamText()` call. */
+  streamTextMaxRetries?: number;
   /** Optional canonical model spec (`provider/model`). */
   modelSpecifier?: string;
   /** Optional toolset (defaults to empty). */
@@ -968,6 +974,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private turnCounter = 0;
   private readonly captureModelViewMessages: boolean;
   private readonly sendToolsToModel: boolean;
+  private readonly streamTextMaxRetries: number | undefined;
 
   /** `null` authorizes every tool in the current toolset. */
   private activeToolNames: ReadonlySet<string> | null = null;
@@ -1018,6 +1025,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       options.genericOutputNormalizerBypassTools ?? new Set<string>();
     this.exclusiveToolNames = options.exclusiveToolNames ?? new Set<string>();
     this.sendToolsToModel = options.sendToolsToModel !== false;
+    this.streamTextMaxRetries = options.streamTextMaxRetries;
 
     this.captureModelViewMessages = options.debug?.captureModelViewMessages === true;
 
@@ -1240,6 +1248,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   /** Replace the turn-error recovery hook. */
   setTurnErrorHandler(turnErrorHandler: TurnErrorHandler | undefined) {
     this.turnErrorHandler = turnErrorHandler;
+  }
+
+  /** Replace the custom URL download hook used by subsequent model calls. */
+  setExperimentalDownload(experimentalDownload: DownloadFunction | undefined) {
+    this.experimentalDownload = experimentalDownload;
+  }
+
+  /** Replace tool names whose outputs bypass the generic output normalizer. */
+  setGenericOutputNormalizerBypassTools(toolNames: ReadonlySet<string>) {
+    this.genericOutputNormalizerBypassTools = new Set(toolNames);
   }
 
   /** Replace the post-tool, pre-model turn-boundary hook. */
@@ -1951,10 +1969,15 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
           let modelTurnCompleted = false;
           let providerExecutedToolObserved = false;
+          let turnErrorPhase: TurnErrorPhase = "before-step";
           const localToolDraftIds = new Set<string>();
 
           try {
             const turn = await this.runTurn({
+              onErrorPhase: (phase) => {
+                turnErrorPhase = phase;
+                if (phase === "post-model") modelTurnCompleted = true;
+              },
               onProviderExecutedTool: () => {
                 providerExecutedToolObserved = true;
               },
@@ -1963,6 +1986,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               },
             });
             modelTurnCompleted = true;
+            turnErrorPhase = "post-model";
             if (this.cancelResetPending) {
               throw new TurnAbortedError({ reason: "cancel", phase: "model" });
             }
@@ -2162,6 +2186,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                 decision = await this.turnErrorHandler(err, {
                   abortSignal: this.abortController?.signal,
                   retrySafety,
+                  phase: turnErrorPhase,
                 });
               } catch (handlerError) {
                 if (
@@ -2239,6 +2264,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   private async runTurn(params: {
+    onErrorPhase: (phase: TurnErrorPhase) => void;
     onProviderExecutedTool: () => void;
     onLocalToolDraft: (toolCallId: string) => void;
   }): Promise<{
@@ -2256,6 +2282,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     modelInputMessages: ModelMessage[];
     toolSnapshot: StepToolSnapshot<TOOLS>;
   }> {
+    params.onErrorPhase("before-step");
     this.emit({ type: "turn_start" });
 
     const turnIndex = ++this.turnCounter;
@@ -2291,6 +2318,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     let messagesForModel = normalizeReplayMessages(this.state.messages.map(cloneMessage));
     if (this.transformMessages) {
+      params.onErrorPhase("transform-messages");
       if (abortSignal?.aborted) {
         throw new TurnAbortedError({
           reason: getAbortReason(),
@@ -2335,6 +2363,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       );
     }
 
+    params.onErrorPhase("model-call");
     const result = streamText({
       model: this.state.model,
       instructions: this.state.system,
@@ -2343,6 +2372,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
+      ...(this.streamTextMaxRetries === undefined ? {} : { maxRetries: this.streamTextMaxRetries }),
       abortSignal,
       onError: () => {},
     });
@@ -2691,6 +2721,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       }
       throw e;
     }
+    params.onErrorPhase("post-model");
 
     if (warnings && warnings.length > 0) {
       this.emit({
