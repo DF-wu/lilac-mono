@@ -191,9 +191,7 @@ function config(profileTools: readonly string[] = ["read_file", "websearch"]): R
       compaction: { model: "inherit", earlyCompactionPoint: 0.8 },
       subagents: {
         enabled: true,
-        maxDepth: 3,
-        maxChildrenPerRun: 16,
-        maxConcurrent: 4,
+        maxDepth: 1,
         idleTimeoutMs: 300_000,
       },
       profiles: {

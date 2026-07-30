@@ -399,7 +399,6 @@ type ManualCompaction = {
 type StartPromptOptions = {
   depth?: number;
   profileId?: string;
-  overrides?: SubagentOverrides;
   idleTimeoutMs?: number;
 };
 
@@ -435,7 +434,6 @@ type RunContext = {
   depth: number;
   profileId: string;
   deferred: DeferredChild[];
-  childrenStarted: number;
   idleTimeoutMs?: number;
   reportActivity?: () => void;
 };
@@ -485,11 +483,6 @@ type TerminalReplayProjection = {
   uiChunkCursor: number;
   chronologicalUiPrefix: MiniLilacUIMessage[];
   liveLog: StoredRunChunk[];
-};
-
-type SubagentCapacity = {
-  tryAcquire(): boolean;
-  release(): void;
 };
 
 type SubagentOverrides = {
@@ -998,7 +991,6 @@ class SessionActor {
       agent: AiSdkPiAgent<ToolSet>,
       options: AutoCompactionOptions,
     ) => Promise<() => void>,
-    private readonly subagentCapacity: SubagentCapacity,
     private readonly promptDelegatedSession: (
       request: DelegatedSessionRequest,
     ) => Promise<DelegatedSessionHandle>,
@@ -1315,7 +1307,6 @@ class SessionActor {
         depth: options.depth ?? 0,
         profileId,
         deferred: [],
-        childrenStarted: 0,
         idleTimeoutMs: options.idleTimeoutMs,
       };
       this.store.reserveCommand(this.snapshot.id, clientCommandId, command);
@@ -1325,12 +1316,7 @@ class SessionActor {
       let pendingClaudeCodeRun: MaterializedClaudeCodeRun | null = null;
       let started = false;
       try {
-        const created = await this.createAgent(
-          profileId,
-          context,
-          priorModelMessages,
-          options.overrides,
-        );
+        const created = await this.createAgent(profileId, context, priorModelMessages);
         const { agent, claudeCodeRun } = created;
         pendingClaudeCodeRun = claudeCodeRun;
         const admittedHistory = await this.workspaceHistory.withWorkspaceLock(
@@ -1485,12 +1471,11 @@ class SessionActor {
     profileId: string,
     context: RunContext,
     messages: ModelMessage[],
-    overrides: SubagentOverrides = {},
   ): Promise<CreatedAgent> {
     const profile = this.config.agent.profiles[profileId];
     if (!profile) throw new Error(`Unknown profile '${profileId}'`);
-    const modelSpecifier = overrides.model ?? this.snapshot.model;
-    const reasoning = overrides.effort ?? this.snapshot.reasoning;
+    const modelSpecifier = this.snapshot.model;
+    const reasoning = this.snapshot.reasoning;
     if (!modelSpecifier || !reasoning) throw new Error("Session model and reasoning are required");
 
     const skills =
@@ -2151,9 +2136,6 @@ class SessionActor {
     if (parent.depth >= this.config.agent.subagents.maxDepth) {
       return { status: "rejected", reason: "maximum subagent depth reached" };
     }
-    if (parent.childrenStarted >= this.config.agent.subagents.maxChildrenPerRun) {
-      return { status: "rejected", reason: "maximum children per run reached" };
-    }
     if (!this.config.agent.profiles[profileId]) {
       return { status: "rejected", reason: `unknown profile '${profileId}'` };
     }
@@ -2172,11 +2154,6 @@ class SessionActor {
     } catch {
       // The session will be created during delegated admission.
     }
-    if (!this.subagentCapacity.tryAcquire()) {
-      return { status: "rejected", reason: "maximum concurrent subagents reached" };
-    }
-
-    parent.childrenStarted += 1;
     let toolCount = 0;
     let activity: string | undefined;
     let handle: DelegatedSessionHandle | undefined;
@@ -2214,7 +2191,6 @@ class SessionActor {
         },
       });
     } catch (error) {
-      this.subagentCapacity.release();
       const message = error instanceof Error ? error.message : String(error);
       return {
         status: "error",
@@ -2262,7 +2238,6 @@ class SessionActor {
         return result;
       })
       .finally(() => {
-        this.subagentCapacity.release();
         this.delegatedCancels.delete(childRunId);
       });
     const abortChild = () => handle.cancel();
@@ -4019,7 +3994,6 @@ export class SessionService {
     agent: AiSdkPiAgent<ToolSet>,
     options: AutoCompactionOptions,
   ) => Promise<() => void>;
-  private readonly subagentCapacity: SubagentCapacity;
   private readonly supersededProviderIds: ReadonlySet<string>;
   private readonly resolveProviderType: (providerId: string) => ProviderType | undefined;
   private readonly resolveWebSearchProvider: WebSearchProviderResolver;
@@ -4036,7 +4010,6 @@ export class SessionService {
   private initializationBlocksClose: boolean;
   private workspaceSnapshotReconciliation: readonly SessionWorkspaceSnapshotReconciliation[] = [];
   private readonly activeTasks = new Set<Promise<void>>();
-  private concurrentSubagents = 0;
   private acceptingAdmissions = true;
   private closed = false;
   private shutdownAttempt: Promise<void> | undefined;
@@ -4134,18 +4107,6 @@ export class SessionService {
     this.resolveProviderType = (providerId) => providers?.config.providers[providerId]?.type;
     this.resolveWebSearchProvider =
       this.options.webSearchProviderResolver ?? createWebSearchProviderResolver(providers);
-    this.subagentCapacity = {
-      tryAcquire: () => {
-        if (this.concurrentSubagents >= this.options.config.agent.subagents.maxConcurrent) {
-          return false;
-        }
-        this.concurrentSubagents += 1;
-        return true;
-      },
-      release: () => {
-        this.concurrentSubagents = Math.max(0, this.concurrentSubagents - 1);
-      },
-    };
     this.initializationBlocksClose =
       this.store.listWorkspaces().length > 0 ||
       this.store.listHistoryOperations().length > 0 ||
@@ -4816,6 +4777,7 @@ export class SessionService {
     const childSessionId = delegatedSessionId(request.parentSessionId, request.sessionName);
     return this.withDelegatedSessionLock(childSessionId, async () => {
       let snapshot: MiniLilacSessionSnapshot;
+      let created = false;
       try {
         snapshot = this.store.getSession(childSessionId);
       } catch {
@@ -4834,6 +4796,7 @@ export class SessionService {
           reasoning,
           contextWindow: limits?.context,
         });
+        created = true;
       }
       if (snapshot.cwd !== this.store.getSession(request.parentSessionId).cwd) {
         throw new Error(
@@ -4845,18 +4808,31 @@ export class SessionService {
           `Subagent session '${request.sessionName}' uses profile '${snapshot.profile}', not '${request.profileId}'`,
         );
       }
-      if (request.overrides.model !== undefined && request.overrides.model !== snapshot.model) {
-        throw new Error(
-          `Subagent session '${request.sessionName}' uses model '${snapshot.model}', not '${request.overrides.model}'`,
-        );
-      }
       if (
-        request.overrides.effort !== undefined &&
-        request.overrides.effort !== snapshot.reasoning
+        !created &&
+        (request.overrides.model !== undefined || request.overrides.effort !== undefined)
       ) {
-        throw new Error(
-          `Subagent session '${request.sessionName}' uses reasoning '${snapshot.reasoning}', not '${request.overrides.effort}'`,
-        );
+        const clientCommandId = `subagent-bindings:${request.parentRunId}:${request.parentToolCallId}`;
+        if (request.overrides.model !== undefined && request.overrides.effort !== undefined) {
+          await this.actor(childSessionId).updateBindings({
+            sessionId: childSessionId,
+            clientCommandId,
+            model: request.overrides.model,
+            reasoning: request.overrides.effort,
+          });
+        } else if (request.overrides.model !== undefined) {
+          await this.actor(childSessionId).updateBindings({
+            sessionId: childSessionId,
+            clientCommandId,
+            model: request.overrides.model,
+          });
+        } else if (request.overrides.effort !== undefined) {
+          await this.actor(childSessionId).updateBindings({
+            sessionId: childSessionId,
+            clientCommandId,
+            reasoning: request.overrides.effort,
+          });
+        }
       }
       const userMessage: MiniLilacUserUIMessage = {
         id: `subagent:${request.parentRunId}:${request.parentToolCallId}`,
@@ -4869,7 +4845,6 @@ export class SessionService {
         {
           depth: request.depth,
           profileId: request.profileId,
-          overrides: request.overrides,
           idleTimeoutMs: this.options.config.agent.subagents.idleTimeoutMs,
         },
       );
@@ -5118,7 +5093,6 @@ export class SessionService {
       this.modelCapability,
       this.resolveModelLimits,
       this.attachCompaction,
-      this.subagentCapacity,
       (request) => this.promptDelegatedSession(request),
       this.supersededProviderIds,
       this.resolveProviderType,

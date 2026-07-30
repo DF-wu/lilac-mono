@@ -47,9 +47,8 @@ agent:
     earlyCompactionPoint: 0.8
   subagents:
     enabled: true
-    maxDepth: 2
-    maxChildrenPerRun: 8
-    maxConcurrent: 4
+    # 1 permits Primary -> Subagent only. Distinct sibling sessions are uncapped.
+    maxDepth: 1
     idleTimeoutMs: 360000
   profiles:
     # "*" includes todowrite. Profiles with explicit tool lists must name todowrite to manage

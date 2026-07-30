@@ -80,17 +80,13 @@ export const runtimeConfigSchema = z
         subagents: z
           .object({
             enabled: z.boolean().default(true),
-            maxDepth: z.number().int().min(0).max(16).default(2),
-            maxChildrenPerRun: z.number().int().positive().max(10_000).default(8),
-            maxConcurrent: z.number().int().positive().max(256).default(4),
+            maxDepth: z.number().int().min(0).max(16).default(1),
             idleTimeoutMs: z.number().int().positive().max(86_400_000).default(360_000),
           })
           .strict()
           .default({
             enabled: true,
-            maxDepth: 2,
-            maxChildrenPerRun: 8,
-            maxConcurrent: 4,
+            maxDepth: 1,
             idleTimeoutMs: 360_000,
           }),
         profiles: z

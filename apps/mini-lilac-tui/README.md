@@ -122,7 +122,8 @@ Each `subagent_delegate` call renders as one self-updating task block rather tha
 result rows. The block tracks its stable `sessionName`, running activity, tool-call count, and
 terminal state. Reusing the name continues the same ordinary child session. Clicking a block opens
 that session's canonical transcript and active stream in the normal transcript renderer with the
-composer removed; `Esc` returns to the parent session.
+composer removed; explicit model and effort selections become the named session's new defaults,
+and `Esc` returns to the parent session.
 
 The one-line header shows the live session title and, when both values are
 available, compact input-token and context-usage figures. `/compact` is available

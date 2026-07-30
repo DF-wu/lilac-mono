@@ -88,9 +88,7 @@ function runtimeConfig(authTokenEnv?: string): RuntimeConfig {
       compaction: { model: "inherit", earlyCompactionPoint: 0.8 },
       subagents: {
         enabled: true,
-        maxDepth: 2,
-        maxChildrenPerRun: 16,
-        maxConcurrent: 2,
+        maxDepth: 1,
         idleTimeoutMs: 300_000,
       },
       profiles: {

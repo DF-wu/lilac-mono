@@ -207,7 +207,9 @@ quiet so long-running deferred subagents do not lose their parent connection to 
 timeouts.
 
 Subagents are ordinary sessions. `subagent_delegate` returns a stable `sessionName`; reusing it from
-the same parent session continues that child session with its canonical model transcript. Child
+the same parent session continues that child session with its canonical model transcript. Explicit
+model and effort selections become that named session's new defaults. Distinct child sessions have
+no sibling-count or concurrency cap; by default, depth permits `Primary -> Subagent` only. Child
 transcripts use the normal session message and active-stream endpoints.
 
 This distinction also applies to AI SDK's generic `AbstractChat` state machine and framework hooks:

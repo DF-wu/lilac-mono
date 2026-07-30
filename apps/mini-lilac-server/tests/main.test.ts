@@ -78,8 +78,6 @@ function historyRuntimeConfig(): RuntimeConfig {
       subagents: {
         enabled: false,
         maxDepth: 1,
-        maxChildrenPerRun: 1,
-        maxConcurrent: 1,
         idleTimeoutMs: 300_000,
       },
       profiles: {

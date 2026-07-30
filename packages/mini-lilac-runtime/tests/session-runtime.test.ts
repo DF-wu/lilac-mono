@@ -40,7 +40,11 @@ import {
   type ProviderAuth,
   type ProviderConfig,
 } from "../src/providers";
-import { SessionService, type MiniLilacRuntimeChunk } from "../src/session-service";
+import {
+  SessionService,
+  type MiniLilacRuntimeChunk,
+  type SessionServiceOptions,
+} from "../src/session-service";
 import { MiniLilacSkillCatalog } from "../src/skills";
 import { MiniLilacDatabaseVersionError, MiniLilacSqliteStore } from "../src/sqlite-store";
 import {
@@ -188,7 +192,11 @@ function webfetchToolResult(url: string) {
 function delegateResult(
   mode: "sync" | "deferred",
   prompt = "investigate",
-  overrides: { readonly model?: string; readonly effort?: string } = {},
+  overrides: {
+    readonly model?: string;
+    readonly effort?: string;
+    readonly sessionName?: string;
+  } = {},
 ) {
   return {
     stream: simulateReadableStream({
@@ -634,9 +642,7 @@ function config(): RuntimeConfig {
       compaction: { model: "inherit", earlyCompactionPoint: 0.8 },
       subagents: {
         enabled: true,
-        maxDepth: 3,
-        maxChildrenPerRun: 16,
-        maxConcurrent: 4,
+        maxDepth: 1,
         idleTimeoutMs: 300_000,
       },
       profiles: {
@@ -6236,98 +6242,100 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("limits total children per parent rather than only concurrent children", async () => {
-    const runtimeConfig = config();
-    runtimeConfig.agent.subagents.maxChildrenPerRun = 1;
+  it("allows more than eight children in one parent run", async () => {
+    const responses = Array.from({ length: 9 }, (_, index) => [
+      delegateResult("sync", `child-${index}`),
+      textResult(`child-${index}`, `result-${index}`),
+    ]).flat();
     const model = new MockLanguageModelV4({
-      doStream: [
-        delegateResult("sync", "first-child"),
-        textResult("child", "first result"),
-        delegateResult("sync", "second-child"),
-        textResult("root", "done"),
-      ],
+      doStream: [...responses, textResult("root", "done")],
     });
-    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-limit-"));
-    temporaryDirectories.push(directory);
-    const service = new SessionService({
-      config: runtimeConfig,
-      databasePath: path.join(directory, "runtime.sqlite"),
-      modelResolver: () => model,
-    });
-    const session = await service.createSession({
-      cwd: directory,
-      model: "test/mock",
-      profile: "delegate",
-    });
-    const started = await service.startPrompt(session.id, userMessage("delegate twice"));
+    const { service, session } = await temporaryRuntime(model, "delegate");
+    const started = await service.startPrompt(session.id, userMessage("delegate repeatedly"));
     await collect(started.stream);
 
-    expect(delegatedRuns(service, session.id)).toHaveLength(1);
-    expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain(
-      "maximum children per run reached",
-    );
+    expect(delegatedRuns(service, session.id)).toHaveLength(9);
+    expect(JSON.stringify(model.doStreamCalls)).not.toContain("maximum children per run reached");
     service.close();
   });
 
-  it("enforces maxConcurrent across sessions in one runtime", async () => {
-    const runtimeConfig = config();
-    runtimeConfig.agent.subagents.maxConcurrent = 1;
-    let childStarted = () => {};
-    const childStart = new Promise<void>((resolve) => {
-      childStarted = resolve;
-    });
-    let releaseChild = () => {};
-    const childGate = new Promise<void>((resolve) => {
-      releaseChild = resolve;
-    });
+  it("allows more than four child runs concurrently", async () => {
+    const allChildrenStarted = Promise.withResolvers<void>();
+    const releaseChildren = Promise.withResolvers<void>();
+    const delegatedRoots = new Set<string>();
+    let childCount = 0;
     const model = new MockLanguageModelV4({
       doStream: async (options) => {
-        const prompt = JSON.stringify(options.prompt);
         const latestUser = JSON.stringify(
           options.prompt.filter((message) => message.role === "user").at(-1),
         );
-        if (latestUser.includes("first root")) return delegateResult("sync", "held-child");
-        if (latestUser.includes("second root")) return delegateResult("sync", "blocked-child");
-        if (latestUser.includes("held-child")) {
-          childStarted();
-          await childGate;
-          return textResult("held-child", "child complete");
+        const childMatch = /child-(\d+)/u.exec(latestUser);
+        if (childMatch !== null) {
+          childCount += 1;
+          if (childCount === 5) allChildrenStarted.resolve();
+          await releaseChildren.promise;
+          return textResult(`child-${childMatch[1]}`, "child complete");
         }
-        if (prompt.includes("maximum concurrent subagents reached")) {
-          return textResult("blocked-root", "capacity respected");
+        const rootMatch = /root-(\d+)/u.exec(latestUser);
+        if (rootMatch !== null && !delegatedRoots.has(rootMatch[0])) {
+          delegatedRoots.add(rootMatch[0]);
+          return delegateResult("sync", `child-${rootMatch[1]}`);
         }
         return textResult("root", "done");
       },
     });
-    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-global-capacity-"));
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unbounded-concurrency-"));
     temporaryDirectories.push(directory);
     const service = new SessionService({
-      config: runtimeConfig,
+      config: config(),
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
     });
-    const firstSession = await service.createSession({
-      cwd: directory,
-      model: "test/mock",
-      profile: "delegate",
-    });
-    const secondSession = await service.createSession({
-      cwd: directory,
-      model: "test/mock",
-      profile: "delegate",
-    });
-    const first = await service.startPrompt(firstSession.id, userMessage("first root"));
-    const firstCompletion = collect(first.stream);
-    await childStart;
+    const sessions = await Promise.all(
+      Array.from({ length: 5 }, (_, index) =>
+        service.createSession({
+          id: `concurrent-${index}`,
+          cwd: directory,
+          model: "test/mock",
+          profile: "delegate",
+        }),
+      ),
+    );
+    const started = await Promise.all(
+      sessions.map((session, index) =>
+        service.startPrompt(session.id, userMessage(`root-${index}`)),
+      ),
+    );
+    const completions = started.map((run) => collect(run.stream));
 
-    const second = await service.startPrompt(secondSession.id, userMessage("second root"));
-    await collect(second.stream);
-    expect(delegatedRuns(service, secondSession.id)).toEqual([]);
-    expect(JSON.stringify(model.doStreamCalls)).toContain("maximum concurrent subagents reached");
+    await allChildrenStarted.promise;
+    expect(sessions.flatMap((session) => delegatedRuns(service, session.id))).toHaveLength(5);
+    releaseChildren.resolve();
+    await Promise.all(completions);
 
-    releaseChild();
-    await firstCompletion;
-    expect(delegatedRuns(service, firstSession.id)[0]?.status).toBe("completed");
+    expect(
+      sessions.flatMap((session) => delegatedRuns(service, session.id)).map((run) => run.status),
+    ).toEqual(Array.from({ length: 5 }, () => "completed"));
+    service.close();
+  });
+
+  it("allows only one delegation edge by default", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("sync", "child"),
+        delegateResult("sync", "grandchild"),
+        textResult("child", "child recovered"),
+        textResult("root", "done"),
+      ],
+    });
+    const { service, session } = await temporaryRuntime(model, "delegate");
+    const started = await service.startPrompt(session.id, userMessage("delegate once"));
+    await collect(started.stream);
+
+    expect(delegatedRuns(service, session.id)).toHaveLength(1);
+    expect(JSON.stringify(model.doStreamCalls[2]?.prompt)).toContain(
+      "maximum subagent depth reached",
+    );
     service.close();
   });
 
@@ -6800,6 +6808,88 @@ describe("SessionService", () => {
     expect(childToolNames).toContain("apply_patch");
     expect(childToolNames).not.toContain("edit_file");
     service.close();
+  });
+
+  it("persists model and effort changes for a reused named subagent", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("sync", "first child", { sessionName: "research" }),
+        textResult("child-1", "first result"),
+        textResult("root-1", "first done"),
+        delegateResult("sync", "second child", {
+          sessionName: "research",
+          model: "openai/child",
+          effort: "low",
+        }),
+        textResult("child-2", "second result"),
+        textResult("root-2", "second done"),
+        delegateResult("sync", "third child", { sessionName: "research" }),
+        textResult("child-3", "third result"),
+        textResult("root-3", "third done"),
+      ],
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-bindings-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const attachments: Array<{
+      modelSpecifier: string | undefined;
+      reasoning: string | undefined;
+    }> = [];
+    const options = {
+      config: config(),
+      databasePath,
+      modelResolver: () => model,
+      attachCompaction: async (agent) => {
+        attachments.push({
+          modelSpecifier: agent.state.modelSpecifier,
+          reasoning: agent.state.reasoning,
+        });
+        return () => {};
+      },
+    } satisfies SessionServiceOptions;
+    const service = new SessionService(options);
+    const session = await service.createSession({
+      cwd: directory,
+      model: "test/mock",
+      profile: "delegate",
+      reasoning: "high",
+    });
+
+    await collect((await service.startPrompt(session.id, userMessage("first"))).stream);
+    await collect((await service.startPrompt(session.id, userMessage("second"))).stream);
+    const childSessionId = `sub:${session.id}:named:research`;
+    expect(service.store.getSession(childSessionId)).toMatchObject({
+      model: "openai/child",
+      reasoning: "low",
+    });
+    service.close();
+
+    const resumed = new SessionService(options);
+    await resumed.initialize();
+    await collect((await resumed.startPrompt(session.id, userMessage("third"))).stream);
+
+    expect(resumed.store.getSession(childSessionId)).toMatchObject({
+      model: "openai/child",
+      reasoning: "low",
+    });
+    expect(attachments).toEqual([
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "openai/child", reasoning: "low" },
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "openai/child", reasoning: "low" },
+    ]);
+    const childAssistantMetadata = resumed
+      .getMessages(childSessionId)
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.metadata);
+    expect(childAssistantMetadata).toEqual([
+      expect.objectContaining({ model: "test/mock", reasoning: "high" }),
+      expect.objectContaining({ model: "openai/child", reasoning: "low" }),
+      expect.objectContaining({ model: "openai/child", reasoning: "low" }),
+    ]);
+    resumed.close();
   });
 
   it("delivers an eligible completed child before waiting for a newly launched child", async () => {
