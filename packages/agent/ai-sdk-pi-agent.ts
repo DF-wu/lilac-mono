@@ -479,6 +479,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   normalizeSettledToolResultOutputs?: NormalizeSettledToolResultOutputsFn;
   /** Tool names whose specs guarantee already-bounded model output. */
   genericOutputNormalizerBypassTools?: ReadonlySet<string>;
+  /** Trusted tool names excluded from the settled cohort's aggregate output budget. */
+  aggregateOutputBudgetExemptTools?: ReadonlySet<string>;
   /** When any of these tools are called, other tools in the same model turn are rejected. */
   exclusiveToolNames?: ReadonlySet<string>;
   /** Optional provider-specific options. */
@@ -1003,6 +1005,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private normalizeToolResultOutput: NormalizeToolResultOutputFn | undefined;
   private normalizeSettledToolResultOutputs: NormalizeSettledToolResultOutputsFn | undefined;
   private genericOutputNormalizerBypassTools: ReadonlySet<string>;
+  private aggregateOutputBudgetExemptTools: ReadonlySet<string>;
   private exclusiveToolNames: ReadonlySet<string>;
   private alreadyNormalizedExternalToolCallIds = new Set<string>();
 
@@ -1023,6 +1026,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.normalizeSettledToolResultOutputs = options.normalizeSettledToolResultOutputs;
     this.genericOutputNormalizerBypassTools =
       options.genericOutputNormalizerBypassTools ?? new Set<string>();
+    this.aggregateOutputBudgetExemptTools =
+      options.aggregateOutputBudgetExemptTools ?? new Set<string>();
     this.exclusiveToolNames = options.exclusiveToolNames ?? new Set<string>();
     this.sendToolsToModel = options.sendToolsToModel !== false;
     this.streamTextMaxRetries = options.streamTextMaxRetries;
@@ -1189,6 +1194,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         expansionHandling: { type: "capture" },
         normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(input.toolName),
+        aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(input.toolName),
         onEvent: (event) => this.emit(event),
       });
     } catch (error) {
@@ -1258,6 +1264,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   /** Replace tool names whose outputs bypass the generic output normalizer. */
   setGenericOutputNormalizerBypassTools(toolNames: ReadonlySet<string>) {
     this.genericOutputNormalizerBypassTools = new Set(toolNames);
+  }
+
+  /** Replace trusted tool names excluded from settled aggregate output budgeting. */
+  setAggregateOutputBudgetExemptTools(toolNames: ReadonlySet<string>) {
+    this.aggregateOutputBudgetExemptTools = new Set(toolNames);
   }
 
   /** Replace the post-tool, pre-model turn-boundary hook. */
@@ -2850,6 +2861,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           message: "Nested tool-call expansions are not supported.",
         },
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
+        aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
         executionRejection:
           snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
             ? hiddenToolRejection(call.toolName)
@@ -2897,6 +2909,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             ? {}
             : {
                 bypassGenericOutputNormalizer: callOptions.bypassGenericOutputNormalizer,
+              }),
+          ...(callOptions.aggregateOutputBudgetExempt === undefined
+            ? {}
+            : {
+                aggregateOutputBudgetExempt: callOptions.aggregateOutputBudgetExempt,
               }),
         },
       };
@@ -3059,6 +3076,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         expansionHandling: { type: "capture" },
         normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
+        aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
         executionRejection:
           snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
             ? hiddenToolRejection(call.toolName)

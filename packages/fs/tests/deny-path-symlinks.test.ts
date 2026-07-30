@@ -63,6 +63,17 @@ describe("filesystem deny paths through symlinks", () => {
     expect(fuzzyResult.error).toContain("Access denied");
   });
 
+  it("blocks grep when a selected file aliases a denied target", async () => {
+    const aliasFile = path.join(baseDir, "secret-alias.txt");
+    await symlink(protectedFile, aliasFile);
+    const fileSystem = new FileSystem(baseDir, { denyPaths: [protectedFile] });
+
+    const result = await fileSystem.grep({ pattern: "secret", baseDir: aliasFile });
+
+    expect(result.error).toContain("Access denied");
+    expect(result.results).toEqual([]);
+  });
+
   it("does not prewarm an FFF finder through an alias into a denied directory", async () => {
     const aliasDir = path.join(baseDir, "prewarm-alias");
     await symlink(protectedDir, aliasDir);

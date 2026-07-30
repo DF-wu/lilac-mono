@@ -207,6 +207,38 @@ describe("tool result output normalizer", () => {
     expect(unspilledCalls).toEqual(["unspilled"]);
   });
 
+  it("exempts trusted outputs from the settled budget while budgeting nonexempt siblings", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+    const exempt = "r".repeat(100);
+
+    const normalized = await normalize.normalizeSettled(
+      [
+        {
+          output: { type: "text", value: exempt },
+          context: {
+            toolCallId: "trusted-read",
+            toolName: "read_file",
+            bypassGenericOutputNormalizer: true,
+            aggregateOutputBudgetExempt: true,
+          },
+        },
+        ...settledTextEntries(["a".repeat(41), "b".repeat(20)]),
+      ],
+      (output, context) =>
+        context.bypassGenericOutputNormalizer === true ? output : normalize(output, context),
+    );
+
+    expect(normalized[0]).toEqual({ type: "text", value: exempt });
+    expect(normalized[1]?.type).toBe("text");
+    if (normalized[1]?.type === "text") {
+      expect(normalized[1].value).toContain("[tool result overflow]");
+    }
+    expect(normalized[2]).toEqual({ type: "text", value: "b".repeat(20) });
+  });
+
   it("returns the bounded no-URI reference when a settled forced spill artifact fails", async () => {
     const normalize = createToolResultOutputNormalizer({
       artifacts: {

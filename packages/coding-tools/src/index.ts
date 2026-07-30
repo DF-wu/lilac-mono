@@ -31,6 +31,8 @@ export type CodingToolsetOptions = {
   extraTools?: ToolSet;
   bashTimeoutMs?: number;
   bashMaxOutputBytes?: number;
+  /** Maximum UTF-8 bytes in a read_file textual payload. */
+  maxOutputBytes?: number;
   bashStreamOutput?: boolean;
   bashMergeOutput?: boolean;
   /** Complete environment exposed to Bash. Defaults to the parent process environment. */
@@ -104,6 +106,7 @@ export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
       artifactIntegration,
       readFileDirectAttachmentSupported: options.readFileDirectAttachmentSupported,
       maxInlineMediaBytesPerPart: options.maxInlineMediaBytesPerPart,
+      maxOutputBytes: options.maxOutputBytes,
     }),
     ...createApplyPatchTool({ cwd, denyPaths, allowGuardrailBypass }),
     ...options.extraTools,

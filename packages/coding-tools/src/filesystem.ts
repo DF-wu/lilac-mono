@@ -24,6 +24,7 @@ import {
 } from "./schemas";
 
 export const DEFAULT_MAX_INLINE_MEDIA_BYTES_PER_PART = 10 * 1024 * 1024;
+export const DEFAULT_MAX_READ_FILE_OUTPUT_BYTES = 40 * 1024;
 
 const ATTACHMENT_MIME_TYPES: ReadonlyMap<string, string> = new Map([
   [".png", "image/png"],
@@ -96,6 +97,7 @@ export function createFilesystemTools(params: {
   artifactIntegration?: CodingToolArtifactIntegration;
   readFileDirectAttachmentSupported?: boolean;
   maxInlineMediaBytesPerPart?: number;
+  maxOutputBytes?: number;
 }): ToolSet {
   const {
     fileSystem,
@@ -108,6 +110,7 @@ export function createFilesystemTools(params: {
     artifactIntegration,
     readFileDirectAttachmentSupported = false,
     maxInlineMediaBytesPerPart = DEFAULT_MAX_INLINE_MEDIA_BYTES_PER_PART,
+    maxOutputBytes = DEFAULT_MAX_READ_FILE_OUTPUT_BYTES,
   } = params;
   const readFileInputSchema = createReadFileInputSchema({
     directAttachmentSupported: readFileDirectAttachmentSupported,
@@ -128,6 +131,7 @@ export function createFilesystemTools(params: {
                   start: input.start ?? { type: "offset", offset: 0 },
                   maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
                   maxLines: Math.max(1, input.maxLines ?? 2_000),
+                  maxOutputBytes,
                 },
               )
             : { ok: false as const };
@@ -228,7 +232,10 @@ export function createFilesystemTools(params: {
           };
         }
 
-        const output = await fileSystem.readFile(input, effectiveCwd);
+        const output = await fileSystem.readFile(
+          { ...input, maxBytes: maxOutputBytes },
+          effectiveCwd,
+        );
         if (!output.success || !loadInstructions) return output;
 
         const instructions = await loadReadFileInstructions({

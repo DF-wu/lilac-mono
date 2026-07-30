@@ -23,6 +23,7 @@ export type NormalizeToolResultOutputFn = (
     toolCallId: string;
     toolName: string;
     bypassGenericOutputNormalizer?: boolean;
+    aggregateOutputBudgetExempt?: boolean;
   },
 ) => ToolResultOutput | Promise<ToolResultOutput>;
 
@@ -91,6 +92,7 @@ export type ExecuteAtomicToolCallOptions = {
   expansionHandling: AtomicToolExpansionHandling;
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
   bypassGenericOutputNormalizer?: boolean;
+  aggregateOutputBudgetExempt?: boolean;
   executionRejection?: string;
   assertNotAborted?: () => void;
   onEvent?: (event: AtomicToolExecutionEvent) => void;
@@ -443,6 +445,9 @@ export async function executeAtomicToolCall(
         ...(options.bypassGenericOutputNormalizer === undefined
           ? {}
           : { bypassGenericOutputNormalizer: options.bypassGenericOutputNormalizer }),
+        ...(options.aggregateOutputBudgetExempt === undefined
+          ? {}
+          : { aggregateOutputBudgetExempt: options.aggregateOutputBudgetExempt }),
       },
       options.normalizeToolResultOutput,
     );

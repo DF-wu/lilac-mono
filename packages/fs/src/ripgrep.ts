@@ -22,6 +22,10 @@ export type GrepOptions = {
    */
   cwd: string;
   /**
+   * Explicit file or directory to search relative to cwd. Defaults to cwd itself.
+   */
+  searchPath?: string;
+  /**
    * The pattern to search for (literal by default)
    */
   pattern: string;
@@ -97,7 +101,15 @@ function parseMatchEvent(event: unknown): GrepMatch | null {
 }
 
 export async function ripgrep(options: GrepOptions): Promise<RipgrepResult> {
-  const { cwd, pattern, globs = [], extraArgs = [], regex = false, maxMatches = 200 } = options;
+  const {
+    cwd,
+    searchPath = ".",
+    pattern,
+    globs = [],
+    extraArgs = [],
+    regex = false,
+    maxMatches = 200,
+  } = options;
   const limit = Math.max(1, maxMatches);
 
   return new Promise<RipgrepResult>((resolve, reject) => {
@@ -110,9 +122,9 @@ export async function ripgrep(options: GrepOptions): Promise<RipgrepResult> {
 
     for (const glob of globs) args.push("--glob", glob);
 
-    args.push(pattern);
+    args.push("--", pattern);
 
-    const child = spawn("rg", [...args, "."], {
+    const child = spawn("rg", [...args, searchPath], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
     });

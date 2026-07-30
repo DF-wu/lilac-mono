@@ -3714,7 +3714,9 @@ describe("AiSdkPiAgent tool-call expansion", () => {
     let started = 0;
     let cohortCalls = 0;
     const ordinaryNormalizedNames: string[] = [];
-    const cohortEntries: Array<Array<{ toolCallId: string; output: unknown }>> = [];
+    const cohortEntries: Array<
+      Array<{ toolCallId: string; output: unknown; aggregateOutputBudgetExempt?: boolean }>
+    > = [];
     const childEndIds: string[] = [];
     const agent = new AiSdkPiAgent({
       system: "test",
@@ -3755,12 +3757,16 @@ describe("AiSdkPiAgent tool-call expansion", () => {
         ordinaryNormalizedNames.push(context.toolName);
         return output;
       },
+      aggregateOutputBudgetExemptTools: new Set(["first_child"]),
       normalizeSettledToolResultOutputs: async (entries) => {
         cohortCalls += 1;
         cohortEntries.push(
           entries.map((entry) => ({
             toolCallId: entry.context.toolCallId,
             output: entry.output,
+            ...(entry.context.aggregateOutputBudgetExempt === true
+              ? { aggregateOutputBudgetExempt: true }
+              : {}),
           })),
         );
         return entries.map((entry) => ({
@@ -3804,7 +3810,11 @@ describe("AiSdkPiAgent tool-call expansion", () => {
     expect(cohortCalls).toBe(1);
     expect(cohortEntries).toEqual([
       [
-        { toolCallId: "child-first", output: { type: "json", value: { raw: "first" } } },
+        {
+          toolCallId: "child-first",
+          output: { type: "json", value: { raw: "first" } },
+          aggregateOutputBudgetExempt: true,
+        },
         { toolCallId: "child-second", output: { type: "json", value: { raw: "second" } } },
       ],
     ]);
