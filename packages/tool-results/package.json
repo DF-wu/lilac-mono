@@ -15,6 +15,10 @@
     "./tool-result-output-normalizer": {
       "import": "./src/tool-result-output-normalizer.ts",
       "types": "./src/tool-result-output-normalizer.ts"
+    },
+    "./tool-result-media": {
+      "import": "./src/tool-result-media.ts",
+      "types": "./src/tool-result-media.ts"
     }
   },
   "type": "module",
