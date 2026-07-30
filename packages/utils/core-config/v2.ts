@@ -46,6 +46,17 @@ const reasoningDisplaySchema = z.enum(["none", "simple", "detailed"]).default("d
 
 const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS);
 
+const configuredModelChainEntrySchemaV2 = z.union([
+  z.string().min(1),
+  z.object({
+    model: z.string().min(1),
+    reasoning: modelReasoningEffortSchema.optional(),
+    options: jsonObjectSchema.optional(),
+  }),
+]);
+
+const modelFallbackSchemaV2 = z.array(configuredModelChainEntrySchemaV2).optional();
+
 const profileNamesSchema = z.array(z.string().trim().min(1)).default([]);
 
 const profileLevel1Schema = z.object({
@@ -115,6 +126,8 @@ function subagentProfileSchemaV2(defaults: SubagentProfileConfig) {
       reasoning: modelReasoningEffortSchema.optional(),
       /** Optional providerOptions override merged onto models.def.<alias>.options. */
       options: jsonObjectSchema.optional(),
+      /** Optional ordered model fallback chain. */
+      fallback: modelFallbackSchemaV2,
       promptOverlay: z.string().min(1).optional(),
       level1: profileLevel1Schema.default(defaults.level1),
       level2: profileLevel2Schema.default(defaults.level2),
@@ -470,6 +483,8 @@ const modelsSchemaV2 = z
           reasoning: modelReasoningEffortSchema.optional(),
           /** AI SDK providerOptions-style object (nested JSON allowed). */
           options: jsonObjectSchema.optional(),
+          /** Optional ordered model fallback chain. */
+          fallback: modelFallbackSchemaV2,
           /** Optional parent-agent guidance shown alongside this model alias. */
           comment: z.string().trim().min(1).optional(),
           /** Whether subagent_delegate may dynamically select this alias. */
@@ -486,6 +501,8 @@ const modelsSchemaV2 = z
         reasoning: modelReasoningEffortSchema.optional(),
         /** Provider-specific model options. */
         options: jsonObjectSchema.optional(),
+        /** Optional ordered model fallback chain. */
+        fallback: modelFallbackSchemaV2,
       })
       .default({
         model: "openrouter/openai/gpt-4o",
@@ -497,6 +514,7 @@ const modelsSchemaV2 = z
         model: z.string().min(1).default("openrouter/openai/gpt-4o-mini"),
         reasoning: modelReasoningEffortSchema.optional(),
         options: jsonObjectSchema.optional(),
+        fallback: modelFallbackSchemaV2,
       })
       .default({
         model: "openrouter/openai/gpt-4o-mini",
