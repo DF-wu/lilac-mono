@@ -11,10 +11,14 @@ import {
 } from "ai";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type {
+  ConfiguredModelChainEntry,
   CoreConfig,
   CustomCommandResult,
+  DurableResolvedModelRequest,
   ModelCapabilityInfo,
   ModelReasoningEffort,
+  ResolvedModelPlan,
+  ResolvedModelRef,
 } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_TOOL_NAME,
@@ -29,10 +33,11 @@ import {
   resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
-  fromDurableResolvedModelRequest,
-  resolveModelRef,
-  resolveModelSlot,
+  fromDurableResolvedModelPlan,
+  resolveModelChain,
+  resolveModelPlan,
   resolveNativeSubagentProfile,
+  withModelPlanReasoning,
 } from "@stanley2058/lilac-utils";
 import {
   lilacEventTypes,
@@ -1301,15 +1306,16 @@ export function resolveAgentRunModel(params: {
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
-  resolvedModelRequest?: WorkflowRequestPolicy["resolvedModelRequest"];
-}) {
+  resolvedModelRequest?: DurableResolvedModelRequest;
+}): ResolvedModelPlan {
   const subagentProfileConfig =
     params.runProfile === "primary"
       ? null
       : resolveNativeSubagentProfile(params.cfg, params.runProfile);
 
   if (params.resolvedModelRequest) {
-    return fromDurableResolvedModelRequest(params.resolvedModelRequest);
+    const plan = fromDurableResolvedModelPlan(params.resolvedModelRequest);
+    return params.reasoningOverride ? withModelPlanReasoning(plan, params.reasoningOverride) : plan;
   }
 
   if (params.runProfile !== "primary" && params.requestModelOverride) {
@@ -1326,32 +1332,163 @@ export function resolveAgentRunModel(params: {
     }
   }
 
+  const applyHeadReasoning = (head: ResolvedModelRef): ResolvedModelRef => {
+    const profileHead = subagentProfileConfig?.reasoning
+      ? { ...head, reasoning: subagentProfileConfig.reasoning }
+      : head;
+    return params.reasoningOverride
+      ? { ...profileHead, reasoning: params.reasoningOverride }
+      : profileHead;
+  };
+
   if (params.requestModelOverride) {
-    return resolveModelRef(
-      params.cfg,
-      {
-        model: params.requestModelOverride,
-        reasoning: params.runProfile === "primary" ? undefined : params.reasoningOverride,
-      },
-      "cmd.request.message.modelOverride",
-    );
+    const head = resolveModelPlan(params.cfg, {
+      head: { model: params.requestModelOverride },
+      fallback: [],
+      headSource: "cmd.request.message.modelOverride",
+      fallbackSource: "cmd.request.message.modelOverride.fallback",
+    }).head;
+    return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
   }
 
   if (subagentProfileConfig?.model) {
-    return resolveModelRef(
-      params.cfg,
-      {
+    const head = resolveModelPlan(params.cfg, {
+      head: {
         model: subagentProfileConfig.model,
-        reasoning: params.reasoningOverride ?? subagentProfileConfig.reasoning,
+        reasoning: subagentProfileConfig.reasoning,
         options: subagentProfileConfig.options,
       },
-      `agent.subagents.profiles.${params.runProfile}.model`,
-    );
+      fallback: [],
+      headSource: `agent.subagents.profiles.${params.runProfile}.model`,
+      fallbackSource: `agent.subagents.profiles.${params.runProfile}.fallback`,
+    }).head;
+    return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
   }
 
-  const slotResolved = resolveModelSlot(params.cfg, subagentProfileConfig?.modelSlot ?? "main");
-  const reasoning = params.reasoningOverride ?? subagentProfileConfig?.reasoning;
-  return reasoning ? { ...slotResolved, reasoning } : slotResolved;
+  const slot = subagentProfileConfig?.modelSlot ?? "main";
+  const head = resolveModelPlan(params.cfg, {
+    head: params.cfg.models[slot],
+    fallback: [],
+    headSource: `models.${slot}.model`,
+    fallbackSource: `models.${slot}.fallback`,
+  }).head;
+  return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
+}
+
+type AgentRunFallbackSource = {
+  entries: readonly ConfiguredModelChainEntry[];
+  source: string;
+  profileReasoning?: ModelReasoningEffort;
+};
+
+function resolveAgentRunFallbackSource(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+}): AgentRunFallbackSource | null {
+  const profile =
+    params.runProfile === "primary"
+      ? null
+      : resolveNativeSubagentProfile(params.cfg, params.runProfile);
+
+  if (params.requestModelOverride) {
+    if (params.requestModelOverride.includes("/")) {
+      return { entries: [], source: "cmd.request.message.modelOverride.fallback" };
+    }
+    const preset = params.cfg.models.def[params.requestModelOverride];
+    if (!preset) return null;
+    return {
+      entries: preset.fallback ?? [],
+      source: `models.def.${params.requestModelOverride}.fallback`,
+      ...(profile?.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+
+  if (profile?.model) {
+    if (profile.fallback !== undefined) {
+      return {
+        entries: profile.fallback,
+        source: `agent.subagents.profiles.${params.runProfile}.fallback`,
+        ...(profile.reasoning ? { profileReasoning: profile.reasoning } : {}),
+      };
+    }
+    const preset = profile.model.includes("/") ? undefined : params.cfg.models.def[profile.model];
+    if (!profile.model.includes("/") && !preset) return null;
+    return {
+      entries: preset?.fallback ?? [],
+      source: `models.def.${profile.model}.fallback`,
+      ...(profile.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+
+  const slot = profile?.modelSlot ?? "main";
+  const slotConfig = params.cfg.models[slot];
+  if (profile?.fallback !== undefined) {
+    return {
+      entries: profile.fallback,
+      source: `agent.subagents.profiles.${params.runProfile}.fallback`,
+      ...(profile.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+  if (slotConfig.fallback !== undefined) {
+    return {
+      entries: slotConfig.fallback,
+      source: `models.${slot}.fallback`,
+      ...(profile?.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+  const preset = slotConfig.model.includes("/")
+    ? undefined
+    : params.cfg.models.def[slotConfig.model];
+  if (!slotConfig.model.includes("/") && !preset) return null;
+  return {
+    entries: preset?.fallback ?? [],
+    source: `models.def.${slotConfig.model}.fallback`,
+    ...(profile?.reasoning ? { profileReasoning: profile.reasoning } : {}),
+  };
+}
+
+export function resolveAgentRunModelFallbacks(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+  reasoningOverride?: ModelReasoningEffort;
+}): readonly ResolvedModelRef[] {
+  const fallbackSource = resolveAgentRunFallbackSource(params);
+  if (!fallbackSource) return [];
+  let fallbacks = resolveModelChain(params.cfg, fallbackSource.entries, fallbackSource.source);
+  if (fallbackSource.profileReasoning) {
+    fallbacks = fallbacks.map((candidate, index) => {
+      const configured = fallbackSource.entries[index];
+      return typeof configured === "object" && configured.reasoning !== undefined
+        ? candidate
+        : { ...candidate, reasoning: fallbackSource.profileReasoning };
+    });
+  }
+  return params.reasoningOverride
+    ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
+    : fallbacks;
+}
+
+export function selectNextNativeModelFallback(params: {
+  plan: ResolvedModelPlan;
+  activeIndex: number;
+  onSkipClaudeCode?: (candidate: ResolvedModelRef, index: number) => void;
+}): { candidate: ResolvedModelRef; index: number } | null {
+  const candidates = [params.plan.head, ...params.plan.fallbacks];
+  const current = candidates[params.activeIndex];
+  if (!current || current.provider === "claude-code") return null;
+
+  for (let index = params.activeIndex + 1; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (!candidate) continue;
+    if (candidate.provider === "claude-code") {
+      params.onSkipClaudeCode?.(candidate, index);
+      continue;
+    }
+    return { candidate, index };
+  }
+  return null;
 }
 
 export function assertWorkflowDispatchPolicy(
@@ -2653,111 +2790,20 @@ export async function startBusAgentRunner(params: {
       ) {
         throw new Error("Workflow request model does not match the approved operation policy");
       }
-      const resolved = resolveAgentRunModel({
+      const modelPlan = resolveAgentRunModel({
         cfg,
         runProfile,
         requestModelOverride,
         reasoningOverride: subagentMeta.reasoning,
         resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
       });
-      resolvedModelLabel = resolved.modelId;
-      try {
-        modelCapabilityInfo = await waitForPreAgent(modelCapability.resolve(resolved.spec));
-        if (modelCapabilityInfo.cost) {
-          costEstimateStatus = "estimated";
-        } else {
-          costEstimateReason = "model_cost_missing";
-        }
-      } catch (error) {
-        if (error instanceof PreAgentRunCancelledError) throw error;
-        costEstimateReason =
-          error instanceof Error
-            ? `capability_resolve_failed:${error.message}`
-            : `capability_resolve_failed:${String(error)}`;
-      }
+      const initialResolvedModel = modelPlan.head;
+      resolvedModelLabel = initialResolvedModel.modelId;
 
-      const editingToolMode = resolveEditingToolMode({
-        provider: resolved.provider,
-        modelId: resolved.modelId,
-      });
-      const activeEditingToolMode = editingToolMode;
-
-      const anthropicModel = isAnthropicModelSpec(resolved.spec);
-      const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
-        spec: resolved.spec,
-        anthropicPromptCache: resolved.anthropicPromptCache,
-      });
-
-      // Improve prompt caching stability by providing a session-scoped cache key.
-      // This helps when many requests share a large common prefix (e.g. a long system prompt).
-      // Also, when reasoning display is enabled, request detailed reasoning summaries
-      // for OpenAI-backed models (including gateway/openrouter openai/* model IDs).
-      const providerOptionsWithOpenAIReasoningSummary = withReasoningSummaryDefaultForOpenAIModels({
-        reasoningDisplay:
-          workflowPolicy?.resolvedModelRequest.reasoningDisplay ?? cfg.agent.reasoningDisplay,
-        provider: resolved.provider,
-        modelId: resolved.modelId,
-        providerOptions: resolved.providerOptions,
-      });
-
-      // Newer Anthropic models can default to omitting thinking text unless
-      // anthropic.thinking.display="summarized" is set. When the user wants a
-      // reasoning lane and has thinking enabled, request summarized thinking text.
-      const providerOptionsWithReasoningDisplay = withReasoningDisplayDefaultForAnthropicModels({
-        reasoningDisplay:
-          workflowPolicy?.resolvedModelRequest.reasoningDisplay ?? cfg.agent.reasoningDisplay,
-        provider: resolved.provider,
-        modelId: resolved.modelId,
-        providerOptions: providerOptionsWithOpenAIReasoningSummary,
-      });
-
-      // Prompt cache key only applies for direct OpenAI/Codex providers.
-      const providerOptionsWithPromptCacheKey = (() => {
-        const provider = resolved.provider;
-        const supports = provider === "openai" || provider === "codex";
-        if (!supports) return providerOptionsWithReasoningDisplay;
-
-        const base = providerOptionsWithReasoningDisplay ?? {};
-        const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
-
-        return {
-          ...base,
-          openai: {
-            ...existingOpenAI,
-            promptCacheKey: toOpenAIPromptCacheKey(sessionId),
-          },
-        };
-      })();
-
-      const providerOptionsForAgent = anthropicModel
-        ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithPromptCacheKey)
-        : providerOptionsWithPromptCacheKey;
-      const experimentalDownloadForAgent = buildExperimentalDownloadForAnthropicFallback({
-        spec: resolved.spec,
-        provider: resolved.provider,
-        providerOptions: providerOptionsForAgent,
-      });
-
-      const baseSystemPrompt = buildSystemPromptForProfile({
-        baseSystemPrompt: cfg.agent.systemPrompt,
-        profile: runProfile,
-        profileConfig:
-          runProfile === "primary" ? undefined : resolveNativeSubagentProfile(cfg, runProfile),
-        activeEditingTool: runProfile === "explore" ? null : activeEditingToolMode,
-        exploreOverlay: subagents.profiles.explore.promptOverlay,
-        generalOverlay: subagents.profiles.general.promptOverlay,
-        selfOverlay: subagents.profiles.self.promptOverlay,
-        skillsSection:
-          runProfile === "explore"
-            ? null
-            : await waitForPreAgent(maybeBuildSkillsSectionForPrimary()),
-      });
-
-      const baseSystemPromptWithAliases = appendConfiguredAliasPromptBlock({
-        baseSystemPrompt,
-        cfg,
-        coreConfigPath: resolveCoreConfigPath(),
-      });
+      const skillsSection =
+        runProfile === "explore"
+          ? null
+          : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
 
       const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
       const parentChannelResolution =
@@ -2832,11 +2878,6 @@ export async function startBusAgentRunner(params: {
         }),
       );
 
-      const systemPromptWithSessionMemo = appendAdditionalSessionMemoBlock(
-        baseSystemPromptWithAliases,
-        additionalSessionPrompts,
-      );
-
       const heartbeatOverlay = buildHeartbeatOverlayForRequest({
         cfg,
         requestId: next.requestId,
@@ -2845,42 +2886,53 @@ export async function startBusAgentRunner(params: {
         nowMs: Date.now(),
       });
 
-      const systemPromptWithHeartbeatOverlay =
-        heartbeatOverlay && heartbeatOverlay.trim().length > 0
-          ? `${systemPromptWithSessionMemo}\n\n${heartbeatOverlay}`
-          : systemPromptWithSessionMemo;
-
       const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
         cfg,
         runProfile,
       });
 
-      const systemPromptWithAutoInjectedThreadSearchOverlay =
-        autoInjectedThreadSearchOverlay && autoInjectedThreadSearchOverlay.trim().length > 0
-          ? `${systemPromptWithHeartbeatOverlay}\n\n${autoInjectedThreadSearchOverlay}`
-          : systemPromptWithHeartbeatOverlay;
-
       const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
-
-      const systemPromptWithSurfaceMetadataOverlay =
-        surfaceMetadataOverlay && surfaceMetadataOverlay.trim().length > 0
-          ? `${systemPromptWithAutoInjectedThreadSearchOverlay}\n\n${surfaceMetadataOverlay}`
-          : systemPromptWithAutoInjectedThreadSearchOverlay;
 
       const restrictedSessionOverlay =
         safetyMode === "restricted"
           ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
           : null;
 
-      const systemPromptWithSafetyOverlay = restrictedSessionOverlay
-        ? `${systemPromptWithSurfaceMetadataOverlay}\n\n${restrictedSessionOverlay}`
-        : systemPromptWithSurfaceMetadataOverlay;
-
-      const systemPrompt = maybeAppendResponseCommentaryPrompt({
-        baseSystemPrompt: systemPromptWithSafetyOverlay,
-        provider: resolved.provider,
-        responseCommentary: resolved.responseCommentary,
-      });
+      const buildSystemPrompt = (
+        resolved: ResolvedModelRef,
+        editingToolMode: ReturnType<typeof resolveEditingToolMode>,
+      ): string => {
+        const baseSystemPrompt = buildSystemPromptForProfile({
+          baseSystemPrompt: cfg.agent.systemPrompt,
+          profile: runProfile,
+          profileConfig:
+            runProfile === "primary" ? undefined : resolveNativeSubagentProfile(cfg, runProfile),
+          activeEditingTool: runProfile === "explore" ? null : editingToolMode,
+          exploreOverlay: subagents.profiles.explore.promptOverlay,
+          generalOverlay: subagents.profiles.general.promptOverlay,
+          selfOverlay: subagents.profiles.self.promptOverlay,
+          skillsSection,
+        });
+        let prompt = appendConfiguredAliasPromptBlock({
+          baseSystemPrompt,
+          cfg,
+          coreConfigPath: resolveCoreConfigPath(),
+        });
+        prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
+        for (const overlay of [
+          heartbeatOverlay,
+          autoInjectedThreadSearchOverlay,
+          surfaceMetadataOverlay,
+          restrictedSessionOverlay,
+        ]) {
+          if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
+        }
+        return maybeAppendResponseCommentaryPrompt({
+          baseSystemPrompt: prompt,
+          provider: resolved.provider,
+          responseCommentary: resolved.responseCommentary,
+        });
+      };
 
       let seededSessionMessages: ModelMessage[] = [];
       if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
@@ -2909,6 +2961,157 @@ export async function startBusAgentRunner(params: {
         }
       }
 
+      const fallbackSurfaceForDelegation = trustedFallbackSurface;
+      const executionCwd = workflowPolicy?.cwd ?? cwd;
+      const listSelectedCatalogIds = () =>
+        params.transcriptStore?.listSessionToolIds?.({
+          requestClient: next.requestClient,
+          sessionId: next.sessionId,
+        }) ?? [];
+      const buildModelBinding = async (resolved: ResolvedModelRef) => {
+        let capabilityInfo: ModelCapabilityInfo | null = null;
+        let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
+        let bindingCostEstimateReason: string | undefined;
+        try {
+          capabilityInfo = await waitForPreAgent(modelCapability.resolve(resolved.spec));
+          if (capabilityInfo.cost) {
+            bindingCostEstimateStatus = "estimated";
+          } else {
+            bindingCostEstimateReason = "model_cost_missing";
+          }
+        } catch (error) {
+          if (error instanceof PreAgentRunCancelledError) throw error;
+          bindingCostEstimateReason =
+            error instanceof Error
+              ? `capability_resolve_failed:${error.message}`
+              : `capability_resolve_failed:${String(error)}`;
+        }
+
+        const editingToolMode = resolveEditingToolMode({
+          provider: resolved.provider,
+          modelId: resolved.modelId,
+        });
+        const anthropicModel = isAnthropicModelSpec(resolved.spec);
+        const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
+          spec: resolved.spec,
+          anthropicPromptCache: resolved.anthropicPromptCache,
+        });
+        const reasoningDisplay =
+          resolved.reasoningDisplay ??
+          workflowPolicy?.resolvedModelRequest.reasoningDisplay ??
+          cfg.agent.reasoningDisplay;
+        const providerOptionsWithOpenAIReasoningSummary =
+          withReasoningSummaryDefaultForOpenAIModels({
+            reasoningDisplay,
+            provider: resolved.provider,
+            modelId: resolved.modelId,
+            providerOptions: resolved.providerOptions,
+          });
+        const providerOptionsWithReasoningDisplay = withReasoningDisplayDefaultForAnthropicModels({
+          reasoningDisplay,
+          provider: resolved.provider,
+          modelId: resolved.modelId,
+          providerOptions: providerOptionsWithOpenAIReasoningSummary,
+        });
+        const providerOptionsWithPromptCacheKey = (() => {
+          if (resolved.provider !== "openai" && resolved.provider !== "codex") {
+            return providerOptionsWithReasoningDisplay;
+          }
+          const base = providerOptionsWithReasoningDisplay ?? {};
+          const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
+          return {
+            ...base,
+            openai: {
+              ...existingOpenAI,
+              promptCacheKey: toOpenAIPromptCacheKey(sessionId),
+            },
+          };
+        })();
+        const providerOptionsForAgent = anthropicModel
+          ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithPromptCacheKey)
+          : providerOptionsWithPromptCacheKey;
+        const systemPrompt = buildSystemPrompt(resolved, editingToolMode);
+        const agentSystem = anthropicPromptCachingEnabled
+          ? {
+              role: "system" as const,
+              content: systemPrompt,
+              providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+            }
+          : systemPrompt;
+        const experimentalDownload = buildExperimentalDownloadForAnthropicFallback({
+          spec: resolved.spec,
+          provider: resolved.provider,
+          providerOptions: providerOptionsForAgent,
+        });
+        const toolset = await waitForPreAgent(
+          params.pluginManager.buildLevel1Toolset({
+            cwd: executionCwd,
+            runProfile,
+            editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
+            subagentDepth: subagentMeta.depth,
+            subagentConfig: {
+              enabled: subagents.enabled,
+              idleTimeoutMs: subagents.idleTimeoutMs,
+              maxDepth: subagents.maxDepth,
+            },
+            requestContext: {
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              requestClient: next.requestClient,
+              subagentDepth: subagentMeta.depth,
+              subagentProfile: runProfile,
+              safetyMode,
+              metadata: {
+                controlCapability: controlCapability ?? undefined,
+                readFileDirectAttachmentSupported:
+                  supportsReadFileDirectAttachments(capabilityInfo),
+                onActivity: (source: "tool" | "subagent") => markRunActivity(source),
+                onSubagentDelegate:
+                  workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
+                    ? async (registration: SubagentDelegationRegistration) =>
+                        await workflowSubagentDispatcher.delegate({
+                          ...registration,
+                          projectRoot: executionCwd,
+                          fallbackSurface: fallbackSurfaceForDelegation,
+                        })
+                    : undefined,
+              },
+            },
+            reportToolStatus: (update) => {
+              outputPublisher.publishToolCall(update).catch((e: unknown) => {
+                logger.error(
+                  "failed to publish batch tool status",
+                  {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    toolCallId: update.toolCallId,
+                  },
+                  e,
+                );
+              });
+            },
+          }),
+        );
+        return {
+          resolved,
+          capabilityInfo,
+          costEstimateStatus: bindingCostEstimateStatus,
+          costEstimateReason: bindingCostEstimateReason,
+          editingToolMode,
+          anthropicPromptCachingEnabled,
+          providerOptionsForAgent,
+          agentSystem,
+          experimentalDownload,
+          toolset,
+          activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
+        };
+      };
+
+      let activeBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
+      modelCapabilityInfo = activeBinding.capabilityInfo;
+      costEstimateStatus = activeBinding.costEstimateStatus;
+      costEstimateReason = activeBinding.costEstimateReason;
+
       logger.info("agent run starting", {
         requestId: next.requestId,
         sessionId: next.sessionId,
@@ -2918,90 +3121,75 @@ export async function startBusAgentRunner(params: {
         sessionConfigId,
         safetyMode,
         requestModelOverride,
-        model: resolved.spec,
-        responseCommentary: resolved.responseCommentary === true,
-        editingToolMode: runProfile === "explore" ? "none" : activeEditingToolMode,
+        model: activeBinding.resolved.spec,
+        responseCommentary: activeBinding.resolved.responseCommentary === true,
+        editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
+        fallbackCount: modelPlan.fallbacks.length,
         isRecoveryResume: Boolean(next.recovery),
         messageCount: next.messages.length,
         recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
         queuedForSession: state.queue.length,
       });
 
-      const fallbackSurfaceForDelegation = trustedFallbackSurface;
-      const executionCwd = workflowPolicy?.cwd ?? cwd;
-      const initialLevel1Toolset = await waitForPreAgent(
-        params.pluginManager.buildLevel1Toolset({
-          cwd: executionCwd,
-          runProfile,
-          editingToolMode: runProfile === "explore" ? "none" : activeEditingToolMode,
-          subagentDepth: subagentMeta.depth,
-          subagentConfig: {
-            enabled: subagents.enabled,
-            idleTimeoutMs: subagents.idleTimeoutMs,
-            maxDepth: subagents.maxDepth,
-          },
-          requestContext: {
-            requestId: next.requestId,
-            sessionId: next.sessionId,
-            requestClient: next.requestClient,
-            subagentDepth: subagentMeta.depth,
-            subagentProfile: runProfile,
-            safetyMode,
-            metadata: {
-              controlCapability: controlCapability ?? undefined,
-              readFileDirectAttachmentSupported:
-                supportsReadFileDirectAttachments(modelCapabilityInfo),
-              onActivity: (source: "tool" | "subagent") => markRunActivity(source),
-              onSubagentDelegate:
-                workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
-                  ? async (registration: SubagentDelegationRegistration) =>
-                      await workflowSubagentDispatcher.delegate({
-                        ...registration,
-                        projectRoot: executionCwd,
-                        fallbackSurface: fallbackSurfaceForDelegation,
-                      })
-                  : undefined,
-            },
-          },
-          reportToolStatus: (update) => {
-            outputPublisher.publishToolCall(update).catch((e: unknown) => {
-              logger.error(
-                "failed to publish batch tool status",
-                {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: update.toolCallId,
-                },
-                e,
-              );
+      let agent: AiSdkPiAgent<ToolSet> | null = null;
+      let activeModelIndex = 0;
+      let didSwitchModel = false;
+      const advanceModel = async () => {
+        if (!agent) throw new Error("Model fallback started before the agent was ready");
+        const nextFallback = selectNextNativeModelFallback({
+          plan: modelPlan,
+          activeIndex: activeModelIndex,
+          onSkipClaudeCode: (candidate, index) => {
+            logger.warn("skipping claude-code model fallback for native agent run", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              modelSpec: candidate.spec,
+              fallbackIndex: index,
             });
           },
-        }),
-      );
-      const {
-        tools,
-        specs: level1ToolSpecs,
-        genericOutputNormalizerBypassTools,
-      } = initialLevel1Toolset;
-      const agentSystem = anthropicPromptCachingEnabled
-        ? {
-            role: "system" as const,
-            content: systemPrompt,
-            providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-          }
-        : systemPrompt;
+        });
+        if (!nextFallback) return { ok: false as const, reason: "model fallback exhausted" };
+
+        const nextBinding = await buildModelBinding(nextFallback.candidate);
+        nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
+        agent.setModel(
+          nextBinding.resolved.model,
+          nextBinding.providerOptionsForAgent,
+          nextBinding.resolved.spec,
+          nextBinding.resolved.reasoning,
+        );
+        agent.setSystem(nextBinding.agentSystem);
+        agent.setTools(nextBinding.toolset.tools);
+        agent.setActiveTools(nextBinding.activeToolNames);
+        agent.setExperimentalDownload(nextBinding.experimentalDownload);
+        agent.setGenericOutputNormalizerBypassTools(
+          nextBinding.toolset.genericOutputNormalizerBypassTools,
+        );
+
+        activeBinding = nextBinding;
+        activeModelIndex = nextFallback.index;
+        didSwitchModel = true;
+        modelCapabilityInfo = nextBinding.capabilityInfo;
+        costEstimateStatus = nextBinding.costEstimateStatus;
+        costEstimateReason = nextBinding.costEstimateReason;
+        resolvedModelLabel = nextBinding.resolved.modelId;
+        return { ok: true as const, modelSpec: nextBinding.resolved.spec };
+      };
+      const hasNativeModelFallback =
+        activeBinding.resolved.provider !== "claude-code" && modelPlan.fallbacks.length > 0;
       const transientRetryController = createTransientModelRetryController({
         retry: cfg.agent.retry,
         logger,
         requestId: headers.request_id,
         sessionId: headers.session_id,
-        modelSpec: resolved.spec,
+        modelSpec: activeBinding.resolved.spec,
+        ...(hasNativeModelFallback ? { advanceModel } : {}),
       });
-      if (resolved.provider === "claude-code") {
-        const claudeCodeToolMapping = completeLevel1ToolMapping(initialLevel1Toolset);
+      if (activeBinding.resolved.provider === "claude-code") {
+        const claudeCodeToolMapping = completeLevel1ToolMapping(activeBinding.toolset);
         claudeCodeRun = await waitForPreAgent(
           materializeClaudeCodeRun({
-            modelId: resolved.modelId,
+            modelId: activeBinding.resolved.modelId,
             cwd: executionCwd,
             tools: claudeCodeToolMapping.tools,
             catalogMetadata: claudeCodeToolMapping.catalogMetadata,
@@ -3018,15 +3206,15 @@ export async function startBusAgentRunner(params: {
         if (state.activeRun) state.activeRun.claudeCodeControl = claudeCodeRun.control;
       }
 
-      let agent: AiSdkPiAgent<ToolSet> | null = null;
       agent = new AiSdkPiAgent<ToolSet>({
-        system: agentSystem,
-        model: claudeCodeRun?.agentModel ?? resolved.model,
-        modelSpecifier: resolved.spec,
+        system: activeBinding.agentSystem,
+        model: claudeCodeRun?.agentModel ?? activeBinding.resolved.model,
+        modelSpecifier: activeBinding.resolved.spec,
         messages: next.recovery?.checkpointMessages ?? seededSessionMessages,
-        tools,
-        providerOptions: providerOptionsForAgent,
-        reasoning: resolved.reasoning,
+        tools: activeBinding.toolset.tools,
+        providerOptions: activeBinding.providerOptionsForAgent,
+        reasoning: activeBinding.resolved.reasoning,
+        ...(hasNativeModelFallback ? { streamTextMaxRetries: 0 } : {}),
         turnErrorHandler: transientRetryController.handler,
         beforeStep:
           claudeCodeRun === null
@@ -3034,25 +3222,22 @@ export async function startBusAgentRunner(params: {
                 if (!agent) throw new Error("Tool refresh started before the agent was ready");
                 await refreshSelectedLevel1Tools({
                   target: agent,
-                  toolset: initialLevel1Toolset,
-                  listSelectedCatalogIds: () =>
-                    params.transcriptStore?.listSessionToolIds?.({
-                      requestClient: next.requestClient,
-                      sessionId: next.sessionId,
-                    }) ?? [],
+                  toolset: activeBinding.toolset,
+                  listSelectedCatalogIds,
                 });
               }
             : undefined,
         normalizeToolResultOutput,
         normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
-        genericOutputNormalizerBypassTools,
-        experimentalDownload: experimentalDownloadForAgent,
+        genericOutputNormalizerBypassTools:
+          activeBinding.toolset.genericOutputNormalizerBypassTools,
+        experimentalDownload: activeBinding.experimentalDownload,
         sendToolsToModel: claudeCodeRun === null,
         debug: {
           captureModelViewMessages: env.debug.contextDump.enabled,
         },
       });
-      if (claudeCodeRun !== null) applyCompleteLevel1Tools(agent, initialLevel1Toolset);
+      if (claudeCodeRun !== null) applyCompleteLevel1Tools(agent, activeBinding.toolset);
       activeAgent = agent;
 
       agent.setContext({
@@ -3100,7 +3285,7 @@ export async function startBusAgentRunner(params: {
             })
           : scrubbed;
 
-        if (!anthropicPromptCachingEnabled) return compacted;
+        if (!activeBinding.anthropicPromptCachingEnabled) return compacted;
         return withProviderOptionsOnLastUserMessage(
           compacted,
           ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
@@ -3138,11 +3323,12 @@ export async function startBusAgentRunner(params: {
 
       unsubscribeCompaction = await waitForPreAgent(
         attachAutoCompaction(agent, {
-          model: resolved.spec,
+          model: activeBinding.resolved.spec,
           summaryModel: claudeCodeRun?.createUtilityModel ?? "current",
           modelCapability,
           thresholdInputSource: claudeCodeRun === null ? "usage" : "transcript-estimate",
-          resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
+          resolveCurrentModelSpecifier: () =>
+            agent.state.modelSpecifier ?? activeBinding.resolved.spec,
           baseTransformMessages: toolPruneTransform,
           baseTurnErrorHandler: transientRetryController.handler,
           onUnknownCapability: ({ spec, reason, error }) => {
@@ -3408,6 +3594,7 @@ export async function startBusAgentRunner(params: {
 
       let finalText = "";
       let stableFinalText = "";
+      let stablePartialText = state.activeRun?.partialText ?? "";
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
         next.recovery?.partialText,
       );
@@ -3446,8 +3633,8 @@ export async function startBusAgentRunner(params: {
             requestClient: headers.request_client,
             runProfile,
             subagentDepth: subagentMeta.depth,
-            modelSpec: resolved.spec,
-            modelId: resolved.modelId,
+            modelSpec: activeBinding.resolved.spec,
+            modelId: activeBinding.resolved.modelId,
             turnEndIndex: turnEndCount,
             modelViewTurn,
           },
@@ -3511,6 +3698,7 @@ export async function startBusAgentRunner(params: {
           transientRetryController.reset();
           retryAttemptHadReasoning = false;
           stableFinalText = finalText;
+          stablePartialText = state.activeRun?.partialText ?? stablePartialText;
 
           turnEndCount++;
           runStats.lastTurnFinishReason = event.finishReason;
@@ -3534,6 +3722,7 @@ export async function startBusAgentRunner(params: {
             cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
             estimatedCostUsd: roundEstimatedCostUsd,
             estimatedCostUsdTotal: roundEstimatedCostUsdTotal,
+            modelSpec: activeBinding.resolved.spec,
             costEstimateStatus:
               roundEstimatedCostUsd !== undefined ? "estimated" : costEstimateStatus,
             costEstimateReason:
@@ -3554,6 +3743,9 @@ export async function startBusAgentRunner(params: {
           assistantTextPartBoundaryState.pendingTextPartStartIds.clear();
           assistantTextPartBoundaryState.pendingRecoveryTextBoundary = event.hadPartialOutput;
           finalText = stableFinalText;
+          if (state.activeRun?.requestId === next.requestId) {
+            state.activeRun.partialText = stablePartialText;
+          }
 
           if (retryAttemptHadReasoning) {
             reasoningChunkState.chunks.clear();
@@ -3681,7 +3873,7 @@ export async function startBusAgentRunner(params: {
               .publishToolCall({
                 toolCallId: event.toolCallId,
                 status: "start",
-                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
+                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
               })
               .catch((e: unknown) => {
                 logger.error(
@@ -3706,7 +3898,7 @@ export async function startBusAgentRunner(params: {
             toolName: event.toolName,
             isError: event.isError,
             result: event.result,
-            toolSpecs: level1ToolSpecs,
+            toolSpecs: activeBinding.toolset.specs,
           });
           const deferredAccepted =
             event.toolName === "subagent_delegate" &&
@@ -3760,7 +3952,7 @@ export async function startBusAgentRunner(params: {
             .publishToolCall({
               toolCallId: event.toolCallId,
               status: "end",
-              display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
+              display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
               ok,
               error: ok ? undefined : interruptedForRestart ? "server restarted" : toolFailureError,
             })
@@ -3936,8 +4128,8 @@ export async function startBusAgentRunner(params: {
       if (!isCancelled && delivery !== "skip" && !isHeartbeatAckOnly && finalText.length === 0) {
         throw new Error(
           buildNoAssistantTextError({
-            provider: resolved.provider,
-            modelId: resolved.modelId,
+            provider: activeBinding.resolved.provider,
+            modelId: activeBinding.resolved.modelId,
             finishReason: runStats.lastTurnFinishReason,
             warningSummary: summarizeCallWarnings(streamWarnings) ?? undefined,
           }),
@@ -4051,7 +4243,7 @@ export async function startBusAgentRunner(params: {
         tools: agent.state.tools,
       });
 
-      const modelLabel = resolved.modelId;
+      const modelLabel = activeBinding.resolved.modelId;
       const statsLine = buildStatsLine({
         modelLabel,
         usage: runStats.totalUsage,
@@ -4071,7 +4263,9 @@ export async function startBusAgentRunner(params: {
           })
         : undefined;
 
-      const estimatedCostUsdFromTotalUsage = estimateUsageCostUsd(runStats.totalUsage);
+      const estimatedCostUsdFromTotalUsage = didSwitchModel
+        ? undefined
+        : estimateUsageCostUsd(runStats.totalUsage);
       const estimatedCostUsdTotal = estimatedCostUsdFromTotalUsage ?? roundEstimatedCostUsdTotal;
       const resolvedCostEstimateStatus =
         estimatedCostUsdTotal !== undefined ? "estimated" : costEstimateStatus;
@@ -4118,6 +4312,7 @@ export async function startBusAgentRunner(params: {
       logger.info("agent run resolved", {
         requestId: headers.request_id,
         sessionId: headers.session_id,
+        model: activeBinding.resolved.spec,
         durationMs: Date.now() - runStartedAt,
         finalTextChars: finalText.length,
         turns: turnEndCount,
