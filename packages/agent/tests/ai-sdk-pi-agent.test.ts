@@ -33,6 +33,23 @@ function deferred() {
   return { promise, resolve };
 }
 
+function textStream(id: string, text: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id },
+        { type: "text-delta" as const, id, delta: text },
+        { type: "text-end" as const, id },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 function syntheticResultMessages(toolCallId: string): ModelMessage[] {
   return [
     {
@@ -789,6 +806,876 @@ describe("AiSdkPiAgent provider stream parts", () => {
 });
 
 describe("AiSdkPiAgent queued steering and cancellation", () => {
+  it("awaits ordinary steering preparation before queue removal or the next provider call", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        textStream("first", "initial answer"),
+        textStream("second", "first steer"),
+        textStream("third", "second steer"),
+      ],
+    });
+    const hookEntered = deferred();
+    const releaseHook = deferred();
+    const preparedIds: string[][] = [];
+    const steeringMessageStarts: ModelMessage[] = [];
+    let hookCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: async ({ deliveryKind, batch }) => {
+        expect(deliveryKind).toBe("queued");
+        preparedIds.push(batch.map(({ id }) => id));
+        hookCalls += 1;
+        if (hookCalls === 1) {
+          hookEntered.resolve();
+          await releaseHook.promise;
+        }
+      },
+    });
+    agent.subscribe((event) => {
+      if (
+        event.type === "message_start" &&
+        event.message.role === "user" &&
+        event.message.content !== "start"
+      ) {
+        steeringMessageStarts.push(event.message);
+      }
+    });
+    const firstId = agent.steer("first steering");
+    const secondId = agent.steer("second steering");
+
+    const run = agent.prompt("start");
+    await hookEntered.promise;
+
+    expect(agent.getQueuedSteeringIds()).toEqual([firstId, secondId]);
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(steeringMessageStarts).toEqual([]);
+
+    releaseHook.resolve();
+    await run;
+
+    expect(preparedIds).toEqual([[firstId], [secondId]]);
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+  });
+
+  it("retains steering and emits no steering user message when preparation rejects", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: textStream("first", "initial answer"),
+    });
+    const preparationError = new Error("history capture failed");
+    const userMessageStarts: ModelMessage[] = [];
+    const failures: Array<{
+      deliveryKind: string;
+      steeringIds: string[];
+      error: string;
+    }> = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: () => {
+        throw preparationError;
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "message_start" && event.message.role === "user") {
+        userMessageStarts.push(event.message);
+      }
+      if (event.type === "steering_delivery_failed") {
+        failures.push({
+          deliveryKind: event.deliveryKind,
+          steeringIds: event.steeringIds,
+          error: event.error,
+        });
+      }
+    });
+    const steeringId = agent.steer("do not deliver");
+
+    await agent.prompt("start");
+
+    expect(agent.getQueuedSteeringIds()).toEqual([steeringId]);
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(agent.state.error).toBeUndefined();
+    expect(failures).toEqual([
+      {
+        deliveryKind: "queued",
+        steeringIds: [steeringId],
+        error: preparationError.message,
+      },
+    ]);
+    expect(userMessageStarts).toEqual([{ role: "user", content: "start" }]);
+    expect(
+      agent.state.messages.some(
+        (message) => message.role === "user" && message.content === "do not deliver",
+      ),
+    ).toBe(false);
+  });
+
+  it("exposes all-mode steering batches in FIFO order and preserves follow-up ordering", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        textStream("first", "initial answer"),
+        textStream("second", "steered answer"),
+        textStream("third", "late steered answer"),
+      ],
+    });
+    const firstHookEntered = deferred();
+    const releaseFirstHook = deferred();
+    const deliveries: Array<{
+      batch: readonly { readonly id: string; readonly message: ModelMessage }[];
+      canonicalMessages: readonly ModelMessage[];
+    }> = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: async ({ batch, canonicalMessages }) => {
+        expect(Object.isFrozen(batch)).toBe(true);
+        expect(batch.every((entry) => Object.isFrozen(entry))).toBe(true);
+        expect(Object.isFrozen(canonicalMessages)).toBe(true);
+        deliveries.push({ batch, canonicalMessages });
+        if (deliveries.length === 1) {
+          firstHookEntered.resolve();
+          await releaseFirstHook.promise;
+        }
+      },
+    });
+    agent.setSteeringMode("all");
+    agent.followUp("queued follow-up");
+    const firstId = agent.steer("first steering");
+    const secondId = agent.steer("second steering");
+
+    const run = agent.prompt("start");
+    await firstHookEntered.promise;
+
+    agent.followUp("late follow-up");
+    const lateId = agent.steer("late steering");
+    expect(agent.getQueuedSteeringIds()).toEqual([firstId, secondId, lateId]);
+
+    releaseFirstHook.resolve();
+    await run;
+
+    expect(deliveries).toEqual([
+      {
+        batch: [
+          { id: firstId, message: { role: "user", content: "first steering" } },
+          { id: secondId, message: { role: "user", content: "second steering" } },
+        ],
+        canonicalMessages: [
+          {
+            role: "user",
+            content: "queued follow-up\n\nfirst steering",
+          },
+          { role: "user", content: "second steering" },
+        ],
+      },
+      {
+        batch: [{ id: lateId, message: { role: "user", content: "late steering" } }],
+        canonicalMessages: [{ role: "user", content: "late follow-up\n\nlate steering" }],
+      },
+    ]);
+    expect(deliveries[0]?.canonicalMessages.slice(0, 1)).toEqual([
+      { role: "user", content: "queued follow-up\n\nfirst steering" },
+    ]);
+    expect(deliveries[0]?.canonicalMessages.slice(0, 2)).toEqual([
+      { role: "user", content: "queued follow-up\n\nfirst steering" },
+      { role: "user", content: "second steering" },
+    ]);
+    const firstCanonicalContent = "queued follow-up\n\nfirst steering";
+    const firstCanonicalIndex = agent.state.messages.findIndex(
+      (message) => message.role === "user" && message.content === firstCanonicalContent,
+    );
+    expect(agent.state.messages.slice(firstCanonicalIndex, firstCanonicalIndex + 2)).toEqual([
+      { role: "user", content: firstCanonicalContent },
+      { role: "user", content: "second steering" },
+    ]);
+    const providerPrefix = model.doStreamCalls[1]?.prompt.slice(-2);
+    expect(providerPrefix?.map((message) => message.role)).toEqual(["user", "user"]);
+    expect(providerPrefix?.[0]?.content).toEqual([{ type: "text", text: firstCanonicalContent }]);
+    expect(providerPrefix?.[1]?.content).toEqual([{ type: "text", text: "second steering" }]);
+    expect(
+      agent.state.messages.some(
+        (message) =>
+          message.role === "user" && message.content === "late follow-up\n\nlate steering",
+      ),
+    ).toBe(true);
+    expect(model.doStreamCalls).toHaveLength(3);
+  });
+
+  it("prepares steering only after local tool execution settles", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "lookup-1",
+                toolName: "lookup",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("second", "steered answer"),
+      ],
+    });
+    const toolEntered = deferred();
+    const releaseTool = deferred();
+    const hookEntered = deferred();
+    const order: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            toolEntered.resolve();
+            await releaseTool.promise;
+            order.push("tool-returned");
+            return "result";
+          },
+        }),
+      },
+      beforeSteeringDelivery: () => {
+        order.push("hook");
+        hookEntered.resolve();
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_end") order.push("tool-execution-end");
+    });
+    agent.steer("after tools");
+
+    const run = agent.prompt("start");
+    await toolEntered.promise;
+
+    expect(order).toEqual([]);
+    expect(model.doStreamCalls).toHaveLength(1);
+
+    releaseTool.resolve();
+    await hookEntered.promise;
+    await run;
+
+    expect(order).toEqual(["tool-returned", "tool-execution-end", "hook"]);
+    expect(model.doStreamCalls).toHaveLength(2);
+  });
+
+  it("does not prepare a successful steering batch again when the loop retries", async () => {
+    const retryError = new Error("retry second provider call");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        textStream("first", "initial answer"),
+        {
+          stream: simulateReadableStream({
+            chunks: [{ type: "error", error: retryError }],
+          }),
+        },
+        textStream("retry", "steered answer"),
+      ],
+    });
+    const preparedIds: string[][] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: ({ batch }) => {
+        preparedIds.push(batch.map(({ id }) => id));
+      },
+      turnErrorHandler: (_error, { retrySafety }) => (retrySafety.canRetry ? "retry" : "fail"),
+    });
+    const steeringId = agent.steer("prepare once");
+
+    await agent.prompt("start");
+
+    expect(preparedIds).toEqual([[steeringId]]);
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(model.doStreamCalls[2]?.prompt).toEqual(model.doStreamCalls[1]?.prompt);
+  });
+
+  it("retries failed queued preparation only after a naturally required tool continuation", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "lookup-retry",
+                toolName: "lookup",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("continued", "tool continuation"),
+        textStream("steered", "steered response"),
+      ],
+    });
+    let hookCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "result",
+        }),
+      },
+      beforeSteeringDelivery: () => {
+        hookCalls += 1;
+        if (hookCalls === 1) throw new Error("first preparation failed");
+      },
+    });
+    agent.steer("retry later");
+
+    await agent.prompt("start");
+
+    expect(hookCalls).toBe(2);
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain("retry later");
+    expect(JSON.stringify(model.doStreamCalls[2]?.prompt)).toContain("retry later");
+  });
+
+  it("rejects native acknowledgement while a durable delivery is being prepared", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [textStream("first", "initial answer"), textStream("second", "steered")],
+    });
+    const hookEntered = deferred();
+    const releaseHook = deferred();
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: async () => {
+        hookEntered.resolve();
+        await releaseHook.promise;
+      },
+    });
+    const steeringId = agent.steer("exactly once");
+
+    const run = agent.prompt("start");
+    await hookEntered.promise;
+
+    expect(() => agent.acknowledgeSteeringDelivery(steeringId)).toThrow(
+      "while its delivery is being prepared",
+    );
+    expect(agent.getQueuedSteeringIds()).toEqual([steeringId]);
+
+    releaseHook.resolve();
+    await run;
+
+    expect(
+      agent.state.messages.filter(
+        (message) => message.role === "user" && message.content === "exactly once",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("cooperatively aborts a blocked hook when cancellation happens before commit", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: textStream("first", "initial answer"),
+    });
+    const hookEntered = deferred();
+    const failures: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: async ({ abortSignal }) => {
+        hookEntered.resolve();
+        await new Promise<void>((_resolve, reject) => {
+          const rejectForAbort = () => reject(new Error("preparation aborted"));
+          if (abortSignal?.aborted) {
+            rejectForAbort();
+            return;
+          }
+          abortSignal?.addEventListener("abort", rejectForAbort, { once: true });
+        });
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "steering_delivery_failed") failures.push(event.error);
+    });
+    agent.steer("cancel before commit");
+
+    const run = agent.prompt("start");
+    await hookEntered.promise;
+    agent.cancel();
+    await run;
+
+    expect(failures).toEqual(["preparation aborted"]);
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+    expect(
+      agent.state.messages.some(
+        (message) => message.role === "user" && message.content === "cancel before commit",
+      ),
+    ).toBe(false);
+    expect(agent.state.error).toBeUndefined();
+  });
+
+  it("retains canonical steering when cancellation happens before a successful hook resolves", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: textStream("first", "initial answer"),
+    });
+    const hookEntered = deferred();
+    const releaseHook = deferred();
+    let hookSignal: AbortSignal | undefined;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: async ({ abortSignal }) => {
+        hookSignal = abortSignal;
+        hookEntered.resolve();
+        await releaseHook.promise;
+      },
+    });
+    agent.steer("committed before cancellation");
+
+    const run = agent.prompt("start");
+    await hookEntered.promise;
+    agent.cancel();
+    expect(hookSignal?.aborted).toBe(true);
+    releaseHook.resolve();
+    await run;
+
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+    expect(
+      agent.state.messages.some(
+        (message) => message.role === "user" && message.content === "committed before cancellation",
+      ),
+    ).toBe(true);
+    expect(model.doStreamCalls).toHaveLength(1);
+  });
+
+  it("deeply isolates queued messages from caller and hook mutations", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [textStream("first", "initial answer"), textStream("second", "steered")],
+    });
+    const steeringMessage = {
+      role: "user" as const,
+      content: [
+        {
+          type: "text" as const,
+          text: "original nested text",
+          providerOptions: { test: { label: "original" } },
+        },
+      ],
+    };
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: ({ batch, canonicalMessages }) => {
+        const batchMessage = batch[0]?.message;
+        if (batchMessage?.role === "user" && Array.isArray(batchMessage.content)) {
+          const textPart = batchMessage.content[0];
+          if (textPart?.type === "text") textPart.text = "hook-mutated batch";
+        }
+        const canonicalMessage = canonicalMessages[0];
+        if (canonicalMessage?.role === "user" && Array.isArray(canonicalMessage.content)) {
+          const textPart = canonicalMessage.content[0];
+          if (textPart?.type === "text") textPart.text = "hook-mutated canonical";
+        }
+      },
+    });
+    agent.steer(steeringMessage);
+    const callerPart = steeringMessage.content[0];
+    if (!callerPart) throw new Error("expected caller text part");
+    callerPart.text = "caller-mutated text";
+    callerPart.providerOptions.test.label = "caller-mutated provider options";
+
+    await agent.prompt("start");
+
+    const delivered = agent.state.messages.find(
+      (message) => message.role === "user" && Array.isArray(message.content),
+    );
+    expect(delivered).toEqual({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: "original nested text",
+          providerOptions: { test: { label: "original" } },
+        },
+      ],
+    });
+  });
+
+  it("clones AI SDK URL file data without retaining caller or hook aliases", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [textStream("first", "initial answer"), textStream("second", "steered")],
+    });
+    const originalUrl = new URL("data:text/plain;base64,b3JpZ2luYWw=");
+    const steeringMessage: ModelMessage = {
+      role: "user",
+      content: [
+        {
+          type: "file",
+          mediaType: "text/plain",
+          filename: "direction.txt",
+          data: { type: "url", url: originalUrl },
+        },
+      ],
+    };
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      beforeSteeringDelivery: ({ batch, canonicalMessages }) => {
+        for (const message of [batch[0]?.message, canonicalMessages[0]]) {
+          if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+          const part = message.content[0];
+          if (
+            part?.type === "file" &&
+            typeof part.data === "object" &&
+            part.data !== null &&
+            "type" in part.data &&
+            part.data.type === "url"
+          ) {
+            expect(part.data.url).toBeInstanceOf(URL);
+            part.data.url.hash = "hook-mutated";
+          }
+        }
+      },
+    });
+    agent.steer(steeringMessage);
+    originalUrl.hash = "caller-mutated";
+
+    await agent.prompt("start");
+
+    const delivered = agent.state.messages.find(
+      (message) =>
+        message.role === "user" &&
+        Array.isArray(message.content) &&
+        message.content.some((part) => part.type === "file"),
+    );
+    if (delivered?.role !== "user" || !Array.isArray(delivered.content)) {
+      throw new Error("expected delivered file message");
+    }
+    const deliveredPart = delivered.content[0];
+    if (
+      deliveredPart?.type !== "file" ||
+      typeof deliveredPart.data !== "object" ||
+      deliveredPart.data === null ||
+      !("type" in deliveredPart.data) ||
+      deliveredPart.data.type !== "url"
+    ) {
+      throw new Error("expected delivered URL file part");
+    }
+    expect(deliveredPart.data.url).toBeInstanceOf(URL);
+    expect(deliveredPart.data.url.href).toBe("data:text/plain;base64,b3JpZ2luYWw=");
+  });
+
+  it("fails clearly when a steering message is not safely cloneable", () => {
+    const agent = new AiSdkPiAgent({ system: "test", model: fakeModel() });
+    const unsupportedMessage = {
+      role: "user" as const,
+      content: "unsupported",
+      callback: () => {},
+    };
+
+    expect(() => agent.steer(unsupportedMessage)).toThrow(
+      "steering message: messages must be safely cloneable",
+    );
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+  });
+
+  it("prepares an awaited interrupt after local-tool settlement and delivers exactly once", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "interrupt-tool",
+                toolName: "lookup",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("interrupted", "after interrupt"),
+      ],
+    });
+    const toolEntered = deferred();
+    const releaseTool = deferred();
+    const hookEntered = deferred();
+    const order: string[] = [];
+    const interruptContexts: Array<{
+      ids: string[];
+      canonicalMessages: readonly ModelMessage[];
+    }> = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            toolEntered.resolve();
+            await releaseTool.promise;
+            order.push("tool-returned");
+            return "result";
+          },
+        }),
+      },
+      beforeSteeringDelivery: ({ deliveryKind, batch, canonicalMessages, abortSignal }) => {
+        if (deliveryKind !== "interrupt") return;
+        expect(abortSignal?.aborted).toBe(false);
+        order.push("hook");
+        interruptContexts.push({
+          ids: batch.map((entry) => entry.id),
+          canonicalMessages,
+        });
+        hookEntered.resolve();
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "tool_execution_end") order.push("tool-execution-end");
+    });
+
+    const run = agent.prompt("start");
+    await toolEntered.promise;
+    agent.followUp("interrupt follow-up");
+    const firstId = agent.steer("first interrupt steering");
+    const secondId = agent.steer("second interrupt steering");
+
+    const interrupt = agent.interruptQueuedSteeringAsync();
+    expect(order).toEqual([]);
+    expect(agent.getQueuedSteeringIds()).toEqual([firstId, secondId]);
+
+    releaseTool.resolve();
+    await hookEntered.promise;
+    await expect(interrupt).resolves.toEqual({
+      status: "interrupted",
+      steeringIds: [firstId, secondId],
+    });
+    await run;
+
+    expect(order).toEqual(["tool-returned", "tool-execution-end", "hook"]);
+    expect(interruptContexts).toEqual([
+      {
+        ids: [firstId, secondId],
+        canonicalMessages: [
+          {
+            role: "user",
+            content: "interrupt follow-up\n\nfirst interrupt steering",
+          },
+          { role: "user", content: "second interrupt steering" },
+        ],
+      },
+    ]);
+    expect(interruptContexts[0]?.canonicalMessages.slice(0, 1)).toEqual([
+      { role: "user", content: "interrupt follow-up\n\nfirst interrupt steering" },
+    ]);
+    expect(interruptContexts[0]?.canonicalMessages.slice(0, 2)).toEqual([
+      { role: "user", content: "interrupt follow-up\n\nfirst interrupt steering" },
+      { role: "user", content: "second interrupt steering" },
+    ]);
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+    const interruptPrefixStart = agent.state.messages.findIndex(
+      (message) =>
+        message.role === "user" &&
+        message.content === "interrupt follow-up\n\nfirst interrupt steering",
+    );
+    expect(agent.state.messages.slice(interruptPrefixStart, interruptPrefixStart + 2)).toEqual([
+      { role: "user", content: "interrupt follow-up\n\nfirst interrupt steering" },
+      { role: "user", content: "second interrupt steering" },
+    ]);
+    const providerPrefix = model.doStreamCalls[1]?.prompt.slice(-2);
+    expect(providerPrefix?.map((message) => message.role)).toEqual(["user", "user"]);
+    expect(providerPrefix?.[0]?.content).toEqual([
+      { type: "text", text: "interrupt follow-up\n\nfirst interrupt steering" },
+    ]);
+    expect(providerPrefix?.[1]?.content).toEqual([
+      { type: "text", text: "second interrupt steering" },
+    ]);
+  });
+
+  it("resumes without steering after stable-boundary interrupt preparation rejects", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "rejected-interrupt-tool",
+              toolName: "lookup",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const toolEntered = deferred();
+    const releaseTool = deferred();
+    const resumedTransformEntered = deferred();
+    const releaseResumedTransform = deferred();
+    const resumedInputs: ModelMessage[][] = [];
+    const failures: string[] = [];
+    let transformCalls = 0;
+    let interruptHookCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            toolEntered.resolve();
+            await releaseTool.promise;
+            return "result";
+          },
+        }),
+      },
+      transformMessages: async (messages) => {
+        transformCalls += 1;
+        if (transformCalls === 2) {
+          resumedInputs.push([...messages]);
+          resumedTransformEntered.resolve();
+          await releaseResumedTransform.promise;
+        }
+        return [...messages];
+      },
+      beforeSteeringDelivery: ({ deliveryKind }) => {
+        if (deliveryKind !== "interrupt") return;
+        interruptHookCalls += 1;
+        throw new Error("interrupt preparation failed");
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "steering_delivery_failed") failures.push(event.error);
+    });
+
+    const run = agent.prompt("start");
+    await toolEntered.promise;
+    agent.followUp("retained follow-up");
+    const steeringId = agent.steer("retained steering");
+    const interrupt = agent.interruptQueuedSteeringAsync();
+    expect(interruptHookCalls).toBe(0);
+
+    releaseTool.resolve();
+    await expect(interrupt).resolves.toEqual({
+      status: "failed",
+      steeringIds: [steeringId],
+      error: "interrupt preparation failed",
+    });
+    await resumedTransformEntered.promise;
+
+    expect(interruptHookCalls).toBe(1);
+    expect(agent.getQueuedSteeringIds()).toEqual([steeringId]);
+    expect(failures).toEqual(["interrupt preparation failed"]);
+    expect(JSON.stringify(resumedInputs[0])).not.toContain("retained steering");
+    expect(JSON.stringify(resumedInputs[0])).not.toContain("retained follow-up");
+
+    agent.abort();
+    releaseResumedTransform.resolve();
+    await run;
+    expect(agent.getQueuedSteeringIds()).toEqual([steeringId]);
+  });
+
+  it("settles an awaited interrupt when cancellation wins during local-tool settlement", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "cancelled-interrupt-tool",
+              toolName: "lookup",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const toolEntered = deferred();
+    const releaseTool = deferred();
+    let hookCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: async () => {
+            toolEntered.resolve();
+            await releaseTool.promise;
+            return "result";
+          },
+        }),
+      },
+      beforeSteeringDelivery: () => {
+        hookCalls += 1;
+      },
+    });
+
+    const run = agent.prompt("start");
+    await toolEntered.promise;
+    agent.steer("cancelled interrupt");
+    const interrupt = agent.interruptQueuedSteeringAsync();
+    agent.cancel();
+    releaseTool.resolve();
+
+    await expect(interrupt).resolves.toEqual({ status: "inactive" });
+    await run;
+    expect(hookCalls).toBe(0);
+    expect(agent.getQueuedSteeringIds()).toEqual([]);
+  });
+
+  it("settles an awaited interrupt when manual abort wins before the stable boundary", async () => {
+    const transformEntered = deferred();
+    const releaseTransform = deferred();
+    let hookCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      transformMessages: async (messages) => {
+        transformEntered.resolve();
+        await releaseTransform.promise;
+        return [...messages];
+      },
+      beforeSteeringDelivery: () => {
+        hookCalls += 1;
+      },
+    });
+
+    const run = agent.prompt("start");
+    await transformEntered.promise;
+    const steeringId = agent.steer("retained after manual abort");
+    const interrupt = agent.interruptQueuedSteeringAsync();
+    agent.abort();
+
+    await expect(interrupt).resolves.toEqual({ status: "inactive" });
+    releaseTransform.resolve();
+    await run;
+
+    expect(hookCalls).toBe(0);
+    expect(agent.getQueuedSteeringIds()).toEqual([steeringId]);
+  });
+
   it("records provider-delivered steering once without replaying it at a boundary", async () => {
     const model = new MockLanguageModelV4({
       doStream: {

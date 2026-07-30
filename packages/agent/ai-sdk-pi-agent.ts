@@ -87,11 +87,48 @@ export type FollowUpMode = "one-at-a-time" | "all";
 /** Stable identifier returned for an entry added to the steering queue. */
 export type SteeringQueueId = string;
 
+/** Agent path that will deliver a prepared steering batch. */
+export type SteeringDeliveryKind = "queued" | "interrupt";
+
+/** One stable queued steering entry exposed at the pre-delivery boundary. */
+export type SteeringDeliveryEntry = {
+  readonly id: SteeringQueueId;
+  readonly message: ModelMessage;
+};
+
+/** Context supplied immediately before a steering batch becomes canonical. */
+export type BeforeSteeringDeliveryContext = {
+  readonly deliveryKind: SteeringDeliveryKind;
+  /** Ordered snapshot of the exact steering entries selected for this delivery. */
+  readonly batch: readonly SteeringDeliveryEntry[];
+  /**
+   * Exact canonical messages that will be appended and made provider-visible.
+   * Every selected steering entry retains its own message boundary; selected follow-ups may
+   * precede or merge into the first steering message.
+   */
+  readonly canonicalMessages: readonly ModelMessage[];
+  /** Aborted when the active run is cancelled or interrupted while the hook is pending. */
+  readonly abortSignal?: AbortSignal;
+};
+
+/**
+ * Awaited hook that must finish before a selected steering batch is consumed or delivered.
+ * Ordinary delivery uses `queued`; `interruptQueuedSteeringAsync()` uses `interrupt`.
+ */
+export type BeforeSteeringDeliveryHandler = (
+  context: BeforeSteeringDeliveryContext,
+) => void | Promise<void>;
+
 /** Outcome of requesting an immediate interrupt from the current steering queue. */
 export type InterruptQueuedSteeringResult =
   | { status: "interrupted"; steeringIds: SteeringQueueId[] }
   | { status: "empty" }
   | { status: "inactive" };
+
+/** Outcome of the awaited, non-destructive-until-prepared interrupt path. */
+export type AsyncInterruptQueuedSteeringResult =
+  | InterruptQueuedSteeringResult
+  | { status: "failed"; steeringIds: SteeringQueueId[]; error: string };
 
 /**
  * Fine-grained events emitted while an assistant message is streaming.
@@ -209,6 +246,13 @@ export type AiSdkPiAgentEvent<TOOLS extends ToolSet> =
   | {
       type: "turn_warnings";
       warnings: CallWarning[];
+    }
+  /** A steering batch remained queued because its pre-delivery hook rejected. */
+  | {
+      type: "steering_delivery_failed";
+      deliveryKind: SteeringDeliveryKind;
+      steeringIds: SteeringQueueId[];
+      error: string;
     }
   /** A model request (turn) was aborted and will not emit `turn_end`. */
   | {
@@ -417,6 +461,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   turnErrorHandler?: TurnErrorHandler;
   /** Inject messages after tools finish and before the next model turn. */
   turnBoundaryHandler?: TurnBoundaryHandler;
+  /** Prepare selected steering entries before they are consumed or delivered. */
+  beforeSteeringDelivery?: BeforeSteeringDeliveryHandler;
   /** Refresh active tools and other per-step state before tool authority is frozen. */
   beforeStep?: BeforeStepHandler;
   /** Normalize model-facing tool output before it enters the canonical transcript. */
@@ -466,6 +512,81 @@ function cloneMessage(message: ModelMessage): ModelMessage {
     };
   }
   return { ...message };
+}
+
+function cloneSteeringValue(value: unknown, ancestors: ReadonlySet<object>): unknown {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "undefined" ||
+    typeof value === "bigint"
+  ) {
+    return value;
+  }
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new Error(`unsupported ${typeof value} value`);
+  }
+  if (value instanceof URL) return new URL(value.href);
+  if (value instanceof ArrayBuffer) return value.slice(0);
+  if (value instanceof Uint8Array) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    throw new Error(`unsupported buffer view '${value.constructor.name}'`);
+  }
+  if (ancestors.has(value)) throw new Error("cyclic values are unsupported");
+  const nestedAncestors = new Set(ancestors);
+  nestedAncestors.add(value);
+  if (Array.isArray(value)) {
+    return value.map((entry) => cloneSteeringValue(entry, nestedAncestors));
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error(`unsupported object prototype '${prototype?.constructor?.name ?? "unknown"}'`);
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new Error("symbol-keyed properties are unsupported");
+  }
+  const cloned: Record<string, unknown> = prototype === null ? { __proto__: null } : {};
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    if (!descriptor.enumerable) throw new Error(`non-enumerable property '${key}' is unsupported`);
+    if (!("value" in descriptor)) throw new Error(`accessor property '${key}' is unsupported`);
+    Object.defineProperty(cloned, key, {
+      value: cloneSteeringValue(descriptor.value, nestedAncestors),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return cloned;
+}
+
+function isClonedModelMessage(value: unknown): value is ModelMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "role" in value &&
+    typeof value.role === "string" &&
+    ["system", "user", "assistant", "tool"].includes(value.role)
+  );
+}
+
+function cloneQueuedMessageValue(message: ModelMessage): ModelMessage {
+  const cloned = cloneSteeringValue(message, new Set());
+  if (!isClonedModelMessage(cloned)) throw new Error("cloned message lost its valid role");
+  return cloned;
+}
+
+function cloneQueuedMessage(message: ModelMessage, operation: "queue" | "deliver"): ModelMessage {
+  try {
+    return cloneQueuedMessageValue(message);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Cannot ${operation} steering message: messages must be safely cloneable (${detail})`,
+      { cause: error },
+    );
+  }
 }
 
 function cloneAssistantMessage(message: AssistantModelMessage): AssistantModelMessage {
@@ -528,6 +649,37 @@ function takeQueued<T>(mode: "one-at-a-time" | "all", queue: T[]): T[] {
   return out;
 }
 
+function peekQueued<T>(mode: "one-at-a-time" | "all", queue: T[]): T[] {
+  if (queue.length === 0) return [];
+  return mode === "one-at-a-time" ? queue.slice(0, 1) : queue.slice();
+}
+
+type FollowUpQueueEntry = {
+  readonly message: ModelMessage;
+};
+
+type SteeringDeliverySelection = {
+  readonly deliveryKind: SteeringDeliveryKind;
+  readonly steeringEntries: readonly SteeringDeliveryEntry[];
+  readonly followUpEntries: readonly FollowUpQueueEntry[];
+  readonly canonicalMessages: readonly ModelMessage[];
+};
+
+type SteeringDeliveryHookResult =
+  | { readonly status: "prepared" }
+  | { readonly status: "failed"; readonly error: string };
+
+type SteeringDeliveryPreparation = SteeringDeliverySelection & {
+  readonly settled: Promise<void>;
+  readonly settle: () => void;
+  hookStatus: "pending" | "prepared";
+};
+
+type AwaitedSteeringInterruptRequest = {
+  settled: boolean;
+  readonly resolve: (result: AsyncInterruptQueuedSteeringResult) => void;
+};
+
 function takeAll<T>(queue: T[]): T[] {
   if (queue.length === 0) return [];
   const out = queue.slice();
@@ -566,6 +718,18 @@ function mergeUserMessages(messages: ModelMessage[]): ModelMessage[] {
   if (!merged) return messages;
 
   return [{ role: "user", content: merged }];
+}
+
+function canonicalSteeringMessages(
+  followUps: readonly FollowUpQueueEntry[],
+  steeringEntries: readonly SteeringDeliveryEntry[],
+): ModelMessage[] {
+  const firstSteering = steeringEntries[0];
+  if (!firstSteering) return [];
+  return [
+    ...mergeUserMessages([...followUps.map((entry) => entry.message), firstSteering.message]),
+    ...steeringEntries.slice(1).map((entry) => entry.message),
+  ];
 }
 
 function hiddenToolRejection(toolName: string): string {
@@ -810,18 +974,21 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private steeringMode: SteeringMode = "one-at-a-time";
   private followUpMode: FollowUpMode = "one-at-a-time";
   private nextSteeringId = 1;
-  private steeringQueue: Array<{ id: SteeringQueueId; message: ModelMessage }> = [];
+  private steeringQueue: SteeringDeliveryEntry[] = [];
+  private steeringDeliveryPreparation: SteeringDeliveryPreparation | undefined;
   private deliveredSteeringMessages: ModelMessage[] = [];
-  private followUpQueue: ModelMessage[] = [];
+  private followUpQueue: FollowUpQueueEntry[] = [];
   private recoveryCheckpoint: RecoveryCheckpoint | null = null;
 
   private pendingInterrupt: ModelMessage[] | null = null;
+  private awaitedSteeringInterrupt: AwaitedSteeringInterruptRequest | null = null;
   private cancelResetPending = false;
   private abortRequestedReason: TurnAbortReason | null = null;
 
   private transformMessages: TransformMessagesFn | undefined;
   private turnErrorHandler: TurnErrorHandler | undefined;
   private turnBoundaryHandler: TurnBoundaryHandler | undefined;
+  private beforeSteeringDelivery: BeforeSteeringDeliveryHandler | undefined;
   private beforeStep: BeforeStepHandler | undefined;
   private experimentalDownload: DownloadFunction | undefined;
   private normalizeToolResultOutput: NormalizeToolResultOutputFn | undefined;
@@ -840,6 +1007,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.transformMessages = options.transformMessages;
     this.turnErrorHandler = options.turnErrorHandler;
     this.turnBoundaryHandler = options.turnBoundaryHandler;
+    this.beforeSteeringDelivery = options.beforeSteeringDelivery;
     this.beforeStep = options.beforeStep;
     this.experimentalDownload = options.experimentalDownload;
     this.normalizeToolResultOutput = options.normalizeToolResultOutput;
@@ -1077,6 +1245,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.turnBoundaryHandler = turnBoundaryHandler;
   }
 
+  /** Replace the awaited pre-steering-delivery hook. */
+  setBeforeSteeringDeliveryHandler(
+    beforeSteeringDelivery: BeforeSteeringDeliveryHandler | undefined,
+  ) {
+    this.beforeSteeringDelivery = beforeSteeringDelivery;
+  }
+
   /** Replace the pre-model-step refresh hook. */
   setBeforeStep(beforeStep: BeforeStepHandler | undefined) {
     this.beforeStep = beforeStep;
@@ -1140,8 +1315,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * queued steering messages are injected after the current tool phase completes.
    */
   steer(message: string | ModelMessage): SteeringQueueId {
+    const queuedMessage = cloneQueuedMessage(makeUserMessage(message), "queue");
     const id = `steering-${this.nextSteeringId++}`;
-    this.steeringQueue.push({ id, message: makeUserMessage(message) });
+    this.steeringQueue.push({
+      id,
+      message: queuedMessage,
+    });
     return id;
   }
 
@@ -1152,6 +1331,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   /** Mark provider-injected steering as delivered and retain it in the canonical transcript. */
   acknowledgeSteeringDelivery(id: SteeringQueueId): boolean {
+    if (this.awaitedSteeringInterrupt && this.steeringQueue.some((entry) => entry.id === id)) {
+      throw new Error(`Cannot acknowledge steering '${id}' while an interrupt is pending`);
+    }
+    if (this.steeringDeliveryPreparation?.steeringEntries.some((entry) => entry.id === id)) {
+      throw new Error(`Cannot acknowledge steering '${id}' while its delivery is being prepared`);
+    }
     const index = this.steeringQueue.findIndex((entry) => entry.id === id);
     if (index < 0) return false;
     const [entry] = this.steeringQueue.splice(index, 1);
@@ -1166,7 +1351,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * Follow-ups are only injected when a turn finishes without tool calls.
    */
   followUp(message: string | ModelMessage) {
-    this.followUpQueue.push(makeUserMessage(message));
+    this.followUpQueue.push({
+      message: cloneQueuedMessage(makeUserMessage(message), "queue"),
+    });
   }
 
   /**
@@ -1174,17 +1361,26 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    *
    * Buffered follow-ups are included ahead of steering messages, matching normal
    * steering-boundary behavior. Queued steering is left untouched while idle.
+   *
+   * This legacy synchronous path cannot await `beforeSteeringDelivery` and therefore is
+   * not a durable pre-delivery boundary. It refuses to race an ordinary preparation.
+   * Durable integrations must use `interruptQueuedSteeringAsync()`, which passes the selected
+   * entries to the hook with `deliveryKind: "interrupt"`, awaits it, and only then removes
+   * them and requests the abort.
    */
   interruptQueuedSteering(): InterruptQueuedSteeringResult {
     if (this.steeringQueue.length === 0) return { status: "empty" };
     if (!this.state.isStreaming || this.cancelResetPending) return { status: "inactive" };
+    if (this.awaitedSteeringInterrupt || this.steeringDeliveryPreparation) {
+      return { status: "inactive" };
+    }
 
     const steering = takeAll(this.steeringQueue);
     const followUps = takeAll(this.followUpQueue);
     const pendingInterrupt = this.pendingInterrupt;
     this.pendingInterrupt = mergeUserMessages([
       ...(pendingInterrupt ?? []),
-      ...followUps,
+      ...followUps.map((entry) => entry.message),
       ...steering.map((entry) => entry.message),
     ]);
     if (!pendingInterrupt) this.requestAbort("interrupt");
@@ -1193,6 +1389,31 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       status: "interrupted",
       steeringIds: steering.map((entry) => entry.id),
     };
+  }
+
+  /**
+   * Request an awaited steering interrupt.
+   *
+   * The active model/tool phase is aborted and settled first. The run loop then rewinds to a
+   * valid boundary, creates a fresh abort controller, and only there selects and prepares the
+   * steering/follow-up prefixes. Selected entries remain queued until the hook succeeds.
+   */
+  async interruptQueuedSteeringAsync(): Promise<AsyncInterruptQueuedSteeringResult> {
+    if (this.steeringQueue.length === 0) return { status: "empty" };
+    if (
+      !this.state.isStreaming ||
+      this.cancelResetPending ||
+      this.pendingInterrupt ||
+      this.awaitedSteeringInterrupt ||
+      this.steeringDeliveryPreparation
+    ) {
+      return { status: "inactive" };
+    }
+
+    return new Promise<AsyncInterruptQueuedSteeringResult>((resolve) => {
+      this.awaitedSteeringInterrupt = { settled: false, resolve };
+      this.requestAbort("interrupt");
+    });
   }
 
   private requestAbort(reason: TurnAbortReason) {
@@ -1221,6 +1442,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    * rewinding the transcript.
    */
   abort() {
+    const awaitedInterrupt = this.awaitedSteeringInterrupt;
+    if (awaitedInterrupt && !this.steeringDeliveryPreparation) {
+      this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
+      this.abortRequestedReason = "manual";
+      this.abortController?.abort();
+      return;
+    }
     this.requestAbort("manual");
   }
 
@@ -1233,8 +1461,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   cancel() {
     // Queued (undelivered) work is discarded, but messages the model already
     // received are committed by `finishCancellation`.
-    this.steeringQueue.length = 0;
-    this.followUpQueue.length = 0;
+    if (!this.steeringDeliveryPreparation) {
+      this.steeringQueue.length = 0;
+      this.followUpQueue.length = 0;
+    }
     this.pendingInterrupt = null;
 
     if (!this.state.isStreaming) {
@@ -1263,6 +1493,12 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     if (this.pendingInterrupt) {
       throw new Error("Interrupt already pending");
+    }
+    if (this.awaitedSteeringInterrupt) {
+      throw new Error("Queued steering interrupt already pending");
+    }
+    if (this.steeringDeliveryPreparation) {
+      throw new Error("Cannot interrupt while steering delivery is being prepared");
     }
 
     this.pendingInterrupt = [makeUserMessage(message)];
@@ -1321,6 +1557,195 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     context: Parameters<NormalizeToolResultOutputFn>[1],
   ): Promise<ToolResultOutput> {
     return normalizeToolResultOutput(output, context, this.normalizeToolResultOutput);
+  }
+
+  private selectSteeringDelivery(
+    deliveryKind: SteeringDeliveryKind,
+    mode: SteeringMode,
+  ): SteeringDeliverySelection | undefined {
+    const steeringEntries = Object.freeze(peekQueued(mode, this.steeringQueue));
+    if (steeringEntries.length === 0) return undefined;
+    const followUpEntries = Object.freeze(this.followUpQueue.slice());
+    const canonicalMessages = Object.freeze(
+      canonicalSteeringMessages(followUpEntries, steeringEntries).map((message) =>
+        cloneQueuedMessage(normalizeAssistantToolCallInputMessage(message), "deliver"),
+      ),
+    );
+    return Object.freeze({
+      deliveryKind,
+      steeringEntries,
+      followUpEntries,
+      canonicalMessages,
+    });
+  }
+
+  private createSteeringDeliveryPreparation(
+    selection: SteeringDeliverySelection,
+  ): SteeringDeliveryPreparation {
+    let settle = () => {};
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    return {
+      ...selection,
+      hookStatus: "pending",
+      settled,
+      settle,
+    };
+  }
+
+  private steeringPreparationMatchesQueues(preparation: SteeringDeliveryPreparation): boolean {
+    return (
+      preparation.steeringEntries.every((entry, index) => this.steeringQueue[index] === entry) &&
+      preparation.followUpEntries.every((entry, index) => this.followUpQueue[index] === entry)
+    );
+  }
+
+  private async invokeSteeringDeliveryHook(
+    preparation: SteeringDeliveryPreparation,
+  ): Promise<SteeringDeliveryHookResult> {
+    try {
+      if (this.beforeSteeringDelivery) {
+        const batch = Object.freeze(
+          preparation.steeringEntries.map((entry) =>
+            Object.freeze({
+              id: entry.id,
+              message: cloneQueuedMessage(entry.message, "deliver"),
+            }),
+          ),
+        );
+        const canonicalMessages = Object.freeze(
+          preparation.canonicalMessages.map((message) => cloneQueuedMessage(message, "deliver")),
+        );
+        const abortSignal = this.abortController?.signal;
+        await this.beforeSteeringDelivery(
+          Object.freeze({
+            deliveryKind: preparation.deliveryKind,
+            batch,
+            canonicalMessages,
+            ...(abortSignal ? { abortSignal } : {}),
+          }),
+        );
+      }
+      preparation.hookStatus = "prepared";
+      return { status: "prepared" };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        type: "steering_delivery_failed",
+        deliveryKind: preparation.deliveryKind,
+        steeringIds: preparation.steeringEntries.map((entry) => entry.id),
+        error: message,
+      });
+      return { status: "failed", error: message };
+    }
+  }
+
+  private clearSteeringDeliveryPreparation(preparation: SteeringDeliveryPreparation): void {
+    if (this.steeringDeliveryPreparation === preparation) {
+      this.steeringDeliveryPreparation = undefined;
+    }
+    preparation.settle();
+  }
+
+  private consumeSteeringDelivery(preparation: SteeringDeliveryPreparation): ModelMessage[] {
+    if (
+      this.steeringDeliveryPreparation !== preparation ||
+      preparation.hookStatus !== "prepared" ||
+      !this.steeringPreparationMatchesQueues(preparation)
+    ) {
+      throw new Error("Cannot consume steering entries without their successful preparation");
+    }
+
+    this.steeringQueue.splice(0, preparation.steeringEntries.length);
+    this.followUpQueue.splice(0, preparation.followUpEntries.length);
+    const canonicalMessages = preparation.canonicalMessages.map((message) =>
+      cloneQueuedMessage(message, "deliver"),
+    );
+    this.clearSteeringDeliveryPreparation(preparation);
+    return canonicalMessages;
+  }
+
+  private settleAwaitedSteeringInterrupt(
+    request: AwaitedSteeringInterruptRequest,
+    result: AsyncInterruptQueuedSteeringResult,
+  ): void {
+    if (request.settled) return;
+    request.settled = true;
+    if (this.awaitedSteeringInterrupt === request) this.awaitedSteeringInterrupt = null;
+    request.resolve(result);
+  }
+
+  private async deliverAwaitedSteeringInterrupt(
+    request: AwaitedSteeringInterruptRequest,
+  ): Promise<void> {
+    if (request.settled || this.awaitedSteeringInterrupt !== request) return;
+    if (this.cancelResetPending) {
+      this.settleAwaitedSteeringInterrupt(request, { status: "inactive" });
+      return;
+    }
+
+    const selection = this.selectSteeringDelivery("interrupt", "all");
+    if (!selection) {
+      this.settleAwaitedSteeringInterrupt(request, { status: "empty" });
+      return;
+    }
+
+    const preparation = this.createSteeringDeliveryPreparation(selection);
+    this.steeringDeliveryPreparation = preparation;
+    const hookResult = await this.invokeSteeringDeliveryHook(preparation);
+    if (hookResult.status === "failed") {
+      this.clearSteeringDeliveryPreparation(preparation);
+      this.settleAwaitedSteeringInterrupt(request, {
+        status: "failed",
+        steeringIds: preparation.steeringEntries.map((entry) => entry.id),
+        error: hookResult.error,
+      });
+      return;
+    }
+
+    const canonicalMessages = this.consumeSteeringDelivery(preparation);
+    for (const message of canonicalMessages) this.appendMessage(message);
+    this.settleAwaitedSteeringInterrupt(request, {
+      status: "interrupted",
+      steeringIds: preparation.steeringEntries.map((entry) => entry.id),
+    });
+  }
+
+  private beginFreshPostInterruptPhase(): void {
+    this.abortController = new AbortController();
+    this.abortRequestedReason = null;
+  }
+
+  private async prepareQueuedSteeringDelivery(): Promise<
+    | { readonly status: "empty" | "failed" | "external-settled" }
+    | { readonly status: "prepared"; readonly preparation: SteeringDeliveryPreparation }
+  > {
+    const existing = this.steeringDeliveryPreparation;
+    if (existing) {
+      if (existing.deliveryKind === "interrupt") {
+        await existing.settled;
+        return { status: "external-settled" };
+      }
+      if (!this.steeringPreparationMatchesQueues(existing)) {
+        throw new Error("Prepared steering entries no longer match the queue prefixes");
+      }
+      if (existing.hookStatus === "prepared") {
+        return { status: "prepared", preparation: existing };
+      }
+      throw new Error("Queued steering preparation was re-entered while still pending");
+    }
+
+    const selection = this.selectSteeringDelivery("queued", this.steeringMode);
+    if (!selection) return { status: "empty" };
+    const preparation = this.createSteeringDeliveryPreparation(selection);
+    this.steeringDeliveryPreparation = preparation;
+    const hookResult = await this.invokeSteeringDeliveryHook(preparation);
+    if (hookResult.status === "failed") {
+      this.clearSteeringDeliveryPreparation(preparation);
+      return { status: "failed" };
+    }
+    return { status: "prepared", preparation };
   }
 
   private async normalizeNewToolMessage(message: ToolModelMessage): Promise<ToolModelMessage> {
@@ -1417,12 +1842,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   private finishCancellation() {
+    const awaitedInterrupt = this.awaitedSteeringInterrupt;
+    if (awaitedInterrupt) {
+      this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
+    }
     // Steering the model already received stays in the transcript even though
     // the run was cancelled. Provider-executed work it caused is preserved by
     // recovery, so dropping the message would leave an answer to a question no
     // user turn ever asked. Undelivered steering is still discarded.
     this.resetMessagesAfterAbort("cancel", takeAll(this.deliveredSteeringMessages));
     this.steeringQueue.length = 0;
+    this.steeringDeliveryPreparation = undefined;
     this.followUpQueue.length = 0;
     this.pendingInterrupt = null;
     this.cancelResetPending = false;
@@ -1457,7 +1887,30 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             break;
           }
 
-          // Handle "interrupt" that arrived between awaited operations.
+          // Awaited steering interrupts prepare only after the active phase has settled.
+          const awaitedInterrupt = this.awaitedSteeringInterrupt;
+          if (awaitedInterrupt) {
+            this.emit({
+              type: "turn_abort",
+              reason: "interrupt",
+              phase: "tools",
+            });
+            this.resetMessagesAfterAbort("interrupt");
+            this.beginFreshPostInterruptPhase();
+            await this.deliverAwaitedSteeringInterrupt(awaitedInterrupt);
+            if (this.cancelResetPending) {
+              this.finishCancellation();
+              break;
+            }
+            if (this.abortController?.signal.aborted) {
+              const reason = this.abortRequestedReason ?? "manual";
+              this.emit({ type: "turn_abort", reason, phase: "tools" });
+              break;
+            }
+            continue;
+          }
+
+          // Handle a legacy interrupt that arrived between awaited operations.
           if (this.pendingInterrupt) {
             const interruptMessages = this.takePendingInterrupt();
             if (!interruptMessages) continue;
@@ -1475,9 +1928,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             }
             for (const message of interruptMessages) this.appendMessage(message);
 
-            // The current abort signal is consumed; create a fresh one.
-            this.abortController = new AbortController();
-            this.abortRequestedReason = null;
+            this.beginFreshPostInterruptPhase();
           } else if (this.abortController?.signal.aborted) {
             // Manual abort between turns.
             const reason: TurnAbortReason = this.abortRequestedReason ?? "manual";
@@ -1559,27 +2010,42 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             if (this.cancelResetPending) {
               throw new TurnAbortedError({ reason: "cancel", phase: "tools" });
             }
+            if (this.awaitedSteeringInterrupt) continue;
             if (this.pendingInterrupt) continue;
 
             // Steering should pick up any buffered follow-ups and remains ahead of
             // the normal tool-result continuation decision.
-            const steeringNow = takeQueued(this.steeringMode, this.steeringQueue);
-            if (steeringNow.length > 0) {
-              const followUpsAll = takeAll(this.followUpQueue);
-              const merged = mergeUserMessages([
-                ...followUpsAll,
-                ...steeringNow.map((entry) => entry.message),
-              ]);
-              for (const msg of merged) {
+            const steeringPreparation = await this.prepareQueuedSteeringDelivery();
+            if (steeringPreparation.status === "prepared") {
+              const canonicalMessages = this.consumeSteeringDelivery(
+                steeringPreparation.preparation,
+              );
+              for (const msg of canonicalMessages) {
                 this.appendMessage(msg);
               }
               continue;
             }
 
+            if (this.cancelResetPending) {
+              throw new TurnAbortedError({ reason: "cancel", phase: "tools" });
+            }
+            if (this.pendingInterrupt || this.abortController?.signal.aborted) continue;
+
+            const naturallyRequiresNextTurn =
+              hasLocalToolCalls || hasCompletedToolExchange || boundaryDecision.requiresNextTurn;
+            if (
+              steeringPreparation.status === "failed" ||
+              steeringPreparation.status === "external-settled"
+            ) {
+              if (naturallyRequiresNextTurn) continue;
+              this.recoveryCheckpoint = null;
+              break;
+            }
+
             if (turn.finishReason !== "tool-calls") {
               const followUps = takeQueued(this.followUpMode, this.followUpQueue);
               if (followUps.length > 0) {
-                const merged = mergeUserMessages(followUps);
+                const merged = mergeUserMessages(followUps.map((entry) => entry.message));
                 for (const msg of merged) {
                   this.appendMessage(msg);
                 }
@@ -1587,11 +2053,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               }
             }
 
-            if (
-              hasLocalToolCalls ||
-              hasCompletedToolExchange ||
-              boundaryDecision.requiresNextTurn
-            ) {
+            if (naturallyRequiresNextTurn) {
               continue;
             }
 
@@ -1614,6 +2076,23 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               }
 
               if (err.reason === "interrupt") {
+                const awaitedInterrupt = this.awaitedSteeringInterrupt;
+                if (awaitedInterrupt) {
+                  this.resetMessagesAfterAbort("interrupt");
+                  this.beginFreshPostInterruptPhase();
+                  await this.deliverAwaitedSteeringInterrupt(awaitedInterrupt);
+                  if (this.cancelResetPending) {
+                    this.finishCancellation();
+                    break;
+                  }
+                  if (this.abortController?.signal.aborted) {
+                    const reason = this.abortRequestedReason ?? "manual";
+                    this.emit({ type: "turn_abort", reason, phase: "tools" });
+                    break;
+                  }
+                  continue;
+                }
+
                 const interruptMessages = this.takePendingInterrupt();
 
                 if (!interruptMessages) {
@@ -1627,9 +2106,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                 }
                 for (const message of interruptMessages) this.appendMessage(message);
 
-                // The current abort signal is consumed; create a fresh one.
-                this.abortController = new AbortController();
-                this.abortRequestedReason = null;
+                this.beginFreshPostInterruptPhase();
 
                 continue;
               }
@@ -1724,6 +2201,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         });
         throw err;
       } finally {
+        const awaitedInterrupt = this.awaitedSteeringInterrupt;
+        if (awaitedInterrupt) {
+          this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
+        }
         this.state.isStreaming = false;
         this.state.streamMessage = null;
         this.state.pendingToolCalls = new Set();
@@ -1733,6 +2214,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         this.alreadyNormalizedExternalToolCallIds.clear();
         if (this.cancelResetPending) {
           this.steeringQueue.length = 0;
+          this.steeringDeliveryPreparation = undefined;
           this.deliveredSteeringMessages.length = 0;
           this.followUpQueue.length = 0;
         }
