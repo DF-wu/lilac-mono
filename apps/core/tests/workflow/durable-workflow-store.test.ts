@@ -16,6 +16,7 @@ import {
   type WorkflowRun,
   type WorkflowTrigger,
 } from "../../src/workflow/workflow-domain";
+import { workflowResolvedModelRequestSchema } from "../../src/workflow/workflow-request-authority";
 
 function dbPath(label: string): string {
   return join(tmpdir(), `lilac-workflow-${label}-${crypto.randomUUID()}.sqlite`);
@@ -636,7 +637,7 @@ describe("durable workflow store minimal dispatch schema", () => {
     }
   });
 
-  it("pins the exact resolved model request across dispatch epochs", () => {
+  it("ignores fallbacks but pins every head field across dispatch epochs", () => {
     const file = dbPath("resolved-model-pinning");
     const store = new DurableWorkflowStore(file);
     try {
@@ -655,6 +656,14 @@ describe("durable workflow store minimal dispatch schema", () => {
           provider: "provider",
           modelId: "model-a",
           reasoningDisplay: "simple" as const,
+          fallbacks: [
+            {
+              spec: "provider/fallback-a",
+              provider: "provider",
+              modelId: "fallback-a",
+              reasoningDisplay: "simple" as const,
+            },
+          ],
         },
         cwd: "/workspace",
         originSession: {
@@ -678,6 +687,38 @@ describe("durable workflow store minimal dispatch schema", () => {
         }),
       ).toMatchObject({ state: "dispatched" });
       expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(policy);
+      const refreshedFallbackPolicy = {
+        ...policy,
+        dispatchEpoch: "b".repeat(32),
+        resolvedModelRequest: {
+          ...policy.resolvedModelRequest,
+          fallbacks: [
+            {
+              spec: "provider/fallback-b",
+              provider: "provider",
+              modelId: "fallback-b",
+              reasoning: "high" as const,
+              reasoningDisplay: "detailed" as const,
+            },
+          ],
+        },
+      };
+      expect(
+        store.authorizeAgentDispatch({
+          requestId: "agent-request",
+          runId: "run-1",
+          operationId: "operation-1",
+          runOwnerId: "worker-1",
+          sessionId: "workflow:run-1:operation-1",
+          platform: "unknown",
+          policy: refreshedFallbackPolicy,
+          now: 22,
+          staleOwnerBefore: 22,
+        }),
+      ).toMatchObject({ state: "dispatched" });
+      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(
+        refreshedFallbackPolicy,
+      );
       expect(
         store.authorizeAgentDispatch({
           requestId: "agent-request",
@@ -687,22 +728,55 @@ describe("durable workflow store minimal dispatch schema", () => {
           sessionId: "workflow:run-1:operation-1",
           platform: "unknown",
           policy: {
-            ...policy,
-            dispatchEpoch: "b".repeat(32),
+            ...refreshedFallbackPolicy,
+            dispatchEpoch: "c".repeat(32),
             resolvedModelRequest: {
-              ...policy.resolvedModelRequest,
+              ...refreshedFallbackPolicy.resolvedModelRequest,
               spec: "provider/model-b",
               modelId: "model-b",
             },
           },
-          now: 22,
-          staleOwnerBefore: 22,
+          now: 23,
+          staleOwnerBefore: 23,
         }),
       ).toBeNull();
-      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(policy);
+      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(
+        refreshedFallbackPolicy,
+      );
     } finally {
       store.close();
       rmSync(file, { force: true });
     }
+  });
+
+  it("decodes legacy and flat fallback model requests but rejects recursive fallbacks", () => {
+    const legacy = {
+      spec: "provider/model-a",
+      provider: "provider",
+      modelId: "model-a",
+      reasoningDisplay: "simple" as const,
+    };
+    expect(workflowResolvedModelRequestSchema.parse(legacy)).toEqual(legacy);
+    expect(
+      workflowResolvedModelRequestSchema.parse({
+        ...legacy,
+        fallbacks: [
+          {
+            ...legacy,
+            reasoning: "high",
+            reasoningDisplay: "detailed",
+          },
+        ],
+      }),
+    ).toEqual({
+      ...legacy,
+      fallbacks: [{ ...legacy, reasoning: "high", reasoningDisplay: "detailed" }],
+    });
+    expect(
+      workflowResolvedModelRequestSchema.safeParse({
+        ...legacy,
+        fallbacks: [{ ...legacy, fallbacks: [] }],
+      }).success,
+    ).toBe(false);
   });
 });

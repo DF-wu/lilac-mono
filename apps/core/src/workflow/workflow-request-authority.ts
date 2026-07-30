@@ -7,7 +7,7 @@ import {
   workflowReasoningSchema,
 } from "./workflow-domain";
 
-export const workflowResolvedModelRequestSchema = z.strictObject({
+const workflowResolvedModelRequestBaseSchema = z.strictObject({
   alias: z.string().min(1).max(200).optional(),
   spec: z.string().min(1).max(500),
   provider: z.string().min(1).max(200),
@@ -17,6 +17,10 @@ export const workflowResolvedModelRequestSchema = z.strictObject({
   responseCommentary: z.boolean().optional(),
   anthropicPromptCache: z.boolean().optional(),
   reasoningDisplay: z.enum(["none", "simple", "detailed"]),
+});
+
+export const workflowResolvedModelRequestSchema = workflowResolvedModelRequestBaseSchema.extend({
+  fallbacks: z.array(workflowResolvedModelRequestBaseSchema).optional(),
 });
 
 export const workflowRequestPolicySchema = z.strictObject({
@@ -32,6 +36,15 @@ export const workflowRequestPolicySchema = z.strictObject({
 });
 
 export type WorkflowRequestPolicy = z.infer<typeof workflowRequestPolicySchema>;
+
+export function workflowRequestPolicyIdentityProjection(policy: WorkflowRequestPolicy) {
+  return {
+    ...policy,
+    resolvedModelRequest: workflowResolvedModelRequestBaseSchema
+      .strip()
+      .parse(policy.resolvedModelRequest),
+  };
+}
 
 export type AuthorizedWorkflowRequest = {
   requestId: string;
