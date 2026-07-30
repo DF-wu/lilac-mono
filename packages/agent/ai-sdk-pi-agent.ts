@@ -366,6 +366,8 @@ type JSONObject = {
 export type TransformMessagesContext = {
   /** The system prompt that will be sent via `streamText({ system })`. */
   system: SystemPrompt;
+  /** Exact tool declarations that will be sent with this model request. */
+  tools: ToolSet;
   /** Abort signal for this turn (if present). */
   abortSignal?: AbortSignal;
 };
@@ -1258,7 +1260,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   /** Replace the entire transcript. Use with care. */
-  replaceMessages(messages: ModelMessage[], options?: { reason?: "replace" | "compaction" }) {
+  replaceMessages(
+    messages: ModelMessage[],
+    options?: {
+      reason?: "replace" | "compaction";
+      /** Rebuild an existing crash-recovery checkpoint against the replacement transcript. */
+      preserveRecoveryCheckpoint?: boolean;
+    },
+  ) {
     if (this.state.streamMessage || this.state.pendingToolCalls.size > 0) {
       throw new Error(
         "Cannot replace messages during a turn. Wait for the current model/tool step to finish.",
@@ -1266,10 +1275,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     }
 
     const previousMessageCount = this.state.messages.length;
+    const hadRecoveryCheckpoint = this.recoveryCheckpoint !== null;
     this.state.messages = normalizeReplayMessages(messages);
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
-    this.recoveryCheckpoint = null;
+    this.recoveryCheckpoint =
+      options?.preserveRecoveryCheckpoint && hadRecoveryCheckpoint
+        ? recoveryCheckpointForMessages(this.state.messages)
+        : null;
     this.alreadyNormalizedExternalToolCallIds.clear();
 
     this.emit({
@@ -2269,6 +2282,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     const toolSnapshot = this.createStepToolSnapshot(turnIndex);
     this.lastStepToolSnapshot = toolSnapshot;
+    const modelTools = this.sendToolsToModel ? stripToolExecuteForModel(toolSnapshot.tools) : {};
 
     const getAbortReason = (): TurnAbortReason =>
       this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual");
@@ -2286,6 +2300,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
       messagesForModel = await this.transformMessages(messagesForModel, {
         system: this.state.system,
+        tools: modelTools,
         abortSignal,
       });
 
@@ -2324,7 +2339,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       model: this.state.model,
       instructions: this.state.system,
       messages: messagesForModel,
-      ...(this.sendToolsToModel ? { tools: stripToolExecuteForModel(toolSnapshot.tools) } : {}),
+      ...(this.sendToolsToModel ? { tools: modelTools } : {}),
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
