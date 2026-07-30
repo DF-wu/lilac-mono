@@ -257,7 +257,7 @@ function grepToolResult(pattern: string) {
   };
 }
 
-function readToolResult(path: string) {
+function readToolResult(path: string, options?: { dangerouslyAllow?: boolean }) {
   return {
     stream: simulateReadableStream({
       chunks: [
@@ -265,7 +265,7 @@ function readToolResult(path: string) {
           type: "tool-call" as const,
           toolCallId: "direct-read",
           toolName: "read_file",
-          input: JSON.stringify({ path, maxCharacters: 20_000 }),
+          input: JSON.stringify({ path, maxCharacters: 20_000, ...options }),
         },
         {
           type: "finish" as const,
@@ -2330,7 +2330,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("shares the inline result budget across settled batch children", async () => {
+  it("exempts bounded read_file children from the settled aggregate budget", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
     temporaryDirectories.push(directory);
     const largePayload = `large:${"x".repeat(900)}\n`;
@@ -2362,14 +2362,10 @@ describe("SessionService", () => {
     await collect((await service.startPrompt(session.id, userMessage("read both"))).stream);
 
     const transcript = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(transcript.match(/\[tool result overflow\]/gu)).toHaveLength(1);
-    expect(transcript).not.toContain("x".repeat(500));
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(transcript).toContain("x".repeat(500));
     expect(transcript).toContain("y".repeat(300));
-    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(transcript)?.[0];
-    if (uri === undefined) throw new Error("batch overflow artifact URI was not persisted");
-    const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(artifact.content).toContain(largePayload.trim());
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
     service.close();
   });
 
@@ -2396,8 +2392,9 @@ describe("SessionService", () => {
     );
 
     const transcript = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(transcript).toContain("[tool result overflow]");
-    expect(transcript).not.toContain("😀".repeat(1_000));
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(transcript).toContain("😀".repeat(1_000));
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
     expect(chunks).toContainEqual(
       expect.objectContaining({ type: "tool-output-available", toolCallId: "direct-read" }),
     );
@@ -7912,12 +7909,6 @@ describe("SessionService", () => {
                 toolName: "read_file",
                 input: JSON.stringify({ path: protectedPath }),
               })),
-              ...protectedPaths.map((protectedPath, index) => ({
-                type: "tool-call" as const,
-                toolCallId: `read-protected-bypass-${index}`,
-                toolName: "read_file",
-                input: JSON.stringify({ path: protectedPath, dangerouslyAllow: true }),
-              })),
               {
                 type: "finish",
                 finishReason: { unified: "tool-calls", raw: "tool-calls" },
@@ -7946,7 +7937,31 @@ describe("SessionService", () => {
     expect(continuation).not.toContain("must-not-read");
     expect(continuation).not.toContain("provider-marker-must-not-read");
     expect(continuation).not.toContain("mini-lilac-token-must-not-read");
-    expect(continuation).toContain("dangerouslyAllow is disabled");
+    service.close();
+  });
+
+  it("permits an explicit filesystem dangerouslyAllow retry for an enabled profile tool", async () => {
+    const runtimeConfig = config();
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-filesystem-bypass-"));
+    temporaryDirectories.push(directory);
+    const protectedPath = path.join(directory, "protected.txt");
+    await Bun.write(protectedPath, "explicit-bypass-marker");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        readToolResult(protectedPath, { dangerouslyAllow: true }),
+        textResult("answer", "inspected"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      protectedToolPaths: [protectedPath],
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect((await service.startPrompt(session.id, userMessage("read protected"))).stream);
+
+    expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain("explicit-bypass-marker");
     service.close();
   });
 

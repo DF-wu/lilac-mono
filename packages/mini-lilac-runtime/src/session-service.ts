@@ -1669,7 +1669,8 @@ class SessionActor {
       normalizeToolResultOutput,
       normalizeSettledToolResultOutputs: (entries) =>
         normalizeOverflow.normalizeSettled(entries, normalizeToolResultOutput),
-      genericOutputNormalizerBypassTools: new Set(["bash"]),
+      genericOutputNormalizerBypassTools: new Set(["bash", "read_file"]),
+      aggregateOutputBudgetExemptTools: new Set(["read_file"]),
       providerOptions,
       turnErrorHandler: transientRetryController?.handler,
       turnBoundaryHandler: () => this.finishDeferredChildren(context),
@@ -2023,11 +2024,12 @@ class SessionActor {
       batchExcludedTools: ["todowrite", "websearch"],
       bashStreamOutput: true,
       bashMergeOutput: true,
-      allowBashGuardrailBypass: true,
+      allowGuardrailBypass: true,
       denyPaths: this.protectedToolPaths,
       preloadedInstructionPaths,
       readFileDirectAttachmentSupported: readFileMediaSupported,
       maxInlineMediaBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+      maxOutputBytes: this.toolResultOutputConfig.maxInlineBytes,
       ...(this.toolResultArtifacts
         ? {
             artifactIntegration: {
