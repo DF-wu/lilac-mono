@@ -3139,8 +3139,9 @@ export async function startBusAgentRunner(params: {
       unsubscribeCompaction = await waitForPreAgent(
         attachAutoCompaction(agent, {
           model: resolved.spec,
-          summaryModel: claudeCodeRun?.utilityModel ?? "current",
+          summaryModel: claudeCodeRun?.createUtilityModel ?? "current",
           modelCapability,
+          thresholdInputSource: claudeCodeRun === null ? "usage" : "transcript-estimate",
           resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
           baseTransformMessages: toolPruneTransform,
           baseTurnErrorHandler: transientRetryController.handler,

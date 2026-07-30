@@ -3980,12 +3980,42 @@ describe("SessionService", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-auto-compact-event-"));
     temporaryDirectories.push(directory);
     let resolvedLimits: number | { readonly context: number; readonly output: number } | undefined;
+    let thresholdInputSource: string | undefined;
+    let mediaScrubbed = false;
     const service = new SessionService({
       config: config(),
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       modelLimitsResolver: async () => ({ context: 32_000, output: 12_000 }),
       attachCompaction: async (agent, options) => {
+        thresholdInputSource = options.thresholdInputSource;
+        const encoded = Buffer.alloc(4, 7).toString("base64");
+        const transformed = await options.baseTransformMessages?.(
+          [
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "media",
+                  toolName: "read_file",
+                  output: {
+                    type: "content",
+                    value: [
+                      {
+                        type: "file",
+                        mediaType: "image/png",
+                        data: { type: "data", data: encoded },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+          { system: "test", tools: {} },
+        );
+        mediaScrubbed = transformed !== undefined && !JSON.stringify(transformed).includes(encoded);
         resolvedLimits = await options.resolveContextLimit?.({
           defaultModel: options.model,
           currentModelSpecifier: agent.state.modelSpecifier,
@@ -4012,11 +4042,7 @@ describe("SessionService", () => {
               stepCount: 1,
               pass: 1,
             };
-            const splitTurn = { ...progress, stage: "split-turn" as const };
             options.onCompactionStart?.(base);
-            // The split turn summarizes concurrently with history; its deltas
-            // must reach the summary rather than being dropped.
-            options.onSummaryDelta?.("Mid-turn state.", splitTurn);
             options.onProgress?.(progress);
             options.onSummaryDelta?.("Condensed prior context.", progress);
             options.onCompactionEnd?.({
@@ -4025,7 +4051,7 @@ describe("SessionService", () => {
               messageCountAfter: 4,
               estimatedInputTokensAfter: 2_000,
               durationMs: 20,
-              summary: "Engine summary covering both stages.",
+              summary: "Engine anchored summary.",
             });
           });
         });
@@ -4036,6 +4062,8 @@ describe("SessionService", () => {
     const streamed = await collect(started.stream);
 
     expect(resolvedLimits).toEqual({ context: 32_000, output: 12_000 });
+    expect(thresholdInputSource).toBe("usage");
+    expect(mediaScrubbed).toBe(true);
     const compactionChunks = streamed.filter((chunk) => chunk.type === "data-compaction");
     // One chunk id spans the lifecycle so the renderer updates a single entry.
     expect(new Set(compactionChunks.map((chunk) => chunk.id)).size).toBe(1);
@@ -4049,19 +4077,17 @@ describe("SessionService", () => {
     // carry the state captured when it was raised, not whatever came later.
     expect(compactionChunks.at(0)?.data).toMatchObject({ modelCalls: 0, elapsedMs: 0 });
     expect(compactionChunks.at(0)?.data.summary).toBeUndefined();
-    // Split-turn text is part of the summary, assembled the way the engine does.
-    expect(compactionChunks.at(1)?.data.summary).toBe(
-      "**Turn Context (split turn):**\n\nMid-turn state.",
-    );
+    expect(compactionChunks.at(1)?.data.summary).toBeUndefined();
     expect(compactionChunks.at(2)?.data.progress).toEqual({
       stage: "history",
       step: 1,
       stepCount: 1,
       pass: 1,
     });
+    expect(compactionChunks.at(2)?.data.summary).toBe("Condensed prior context.");
     // The engine's own summary wins at the terminal phase: it is post-truncation
     // and complete, which a throttled delta buffer cannot guarantee.
-    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine summary covering both stages.");
+    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine anchored summary.");
     expect(compactionChunks.at(-1)?.data).toMatchObject({
       source: "automatic",
       reason: "threshold",

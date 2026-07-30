@@ -351,7 +351,7 @@ export type MiniLilacCompactionPhase = z.infer<typeof miniLilacCompactionPhaseSc
 
 export const miniLilacCompactionProgressSchema = z
   .object({
-    /** History and split-turn prefixes summarize concurrently; their deltas interleave. */
+    /** `split-turn` is accepted only for replaying events persisted by older runtimes. */
     stage: z.enum(["history", "split-turn"]),
     step: z.number().int().positive(),
     stepCount: z.number().int().positive(),
