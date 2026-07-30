@@ -872,6 +872,7 @@ export function fsTool(
                   start: input.start ?? { type: "offset", offset: 0 },
                   maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
                   maxLines: Math.max(1, input.maxLines ?? 2_000),
+                  maxOutputBytes,
                 })
               : { ok: false as const };
           if (!artifact.ok) {
@@ -1086,6 +1087,7 @@ export function fsTool(
                   input: {
                     ...input,
                     start: input.start,
+                    maxBytes: maxOutputBytes,
                   },
                   denyPaths: remoteDenyPaths,
                 });
@@ -1104,6 +1106,7 @@ export function fsTool(
                 {
                   ...input,
                   start: input.start,
+                  maxBytes: maxOutputBytes,
                   dangerouslyAllow,
                 },
                 opCwd,

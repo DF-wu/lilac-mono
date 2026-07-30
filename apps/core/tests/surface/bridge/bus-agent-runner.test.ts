@@ -137,6 +137,7 @@ function level1TestToolset(params?: {
     },
     updateActiveBatchTools: (activeToolNames) => params?.onBatchUpdate?.(activeToolNames),
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
+    aggregateOutputBudgetExemptTools: new Set(),
   };
 }
 
@@ -313,6 +314,7 @@ describe("runner Level 1 catalog selection", () => {
       catalogMetadata: {},
       updateActiveBatchTools: () => {},
       genericOutputNormalizerBypassTools: new Set(),
+      aggregateOutputBudgetExemptTools: new Set(),
     };
     let calls = 0;
     const model = new MockLanguageModelV4({

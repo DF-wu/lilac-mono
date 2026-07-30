@@ -3165,6 +3165,9 @@ export async function startBusAgentRunner(params: {
         agent.setGenericOutputNormalizerBypassTools(
           nextBinding.toolset.genericOutputNormalizerBypassTools,
         );
+        agent.setAggregateOutputBudgetExemptTools(
+          nextBinding.toolset.aggregateOutputBudgetExemptTools,
+        );
 
         activeBinding = nextBinding;
         activeModelIndex = nextFallback.index;
@@ -3231,6 +3234,7 @@ export async function startBusAgentRunner(params: {
         normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
         genericOutputNormalizerBypassTools:
           activeBinding.toolset.genericOutputNormalizerBypassTools,
+        aggregateOutputBudgetExemptTools: activeBinding.toolset.aggregateOutputBudgetExemptTools,
         experimentalDownload: activeBinding.experimentalDownload,
         sendToolsToModel: claudeCodeRun === null,
         debug: {

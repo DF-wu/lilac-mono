@@ -30,6 +30,7 @@ import {
 } from "../mcp/catalog-identity";
 import {
   hasBoundedBuiltinOutput,
+  isAggregateOutputBudgetExempt,
   type CoreLevel1ToolSpec,
   type CoreToolPluginRuntime,
 } from "./types";
@@ -108,6 +109,7 @@ export type BuiltLevel1Toolset = {
   /** Refresh the run-scoped batch child mapping before freezing step authority. */
   updateActiveBatchTools(activeToolNames: ReadonlySet<string>): void;
   genericOutputNormalizerBypassTools: ReadonlySet<string>;
+  aggregateOutputBudgetExemptTools: ReadonlySet<string>;
 };
 
 export type CoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
@@ -359,6 +361,11 @@ export function createCoreToolPluginManager(params: {
         genericOutputNormalizerBypassTools: new Set(
           [...specs.entries()]
             .filter(([, spec]) => hasBoundedBuiltinOutput(spec))
+            .map(([modelName]) => modelName),
+        ),
+        aggregateOutputBudgetExemptTools: new Set(
+          [...specs.entries()]
+            .filter(([, spec]) => isAggregateOutputBudgetExempt(spec))
             .map(([modelName]) => modelName),
         ),
       };
