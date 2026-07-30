@@ -4,6 +4,7 @@ import type { UIMessage } from "ai";
 
 import {
   type MiniLilacCompactRequest,
+  type MiniLilacRedoRequest,
   type MiniLilacSessionSnapshot,
   type MiniLilacSteeringCommittedChunk,
   type MiniLilacSteerRequest,
@@ -18,7 +19,10 @@ import {
   miniLilacCompactionEventSchema,
   miniLilacCompactRequestSchema,
   miniLilacCompactResultSchema,
+  miniLilacHistoryFilesystemResultSchema,
   miniLilacReconnectQuerySchema,
+  miniLilacRedoRequestSchema,
+  miniLilacRedoResultSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSkillsSchema,
   miniLilacSteeringCommittedChunkSchema,
@@ -83,6 +87,9 @@ describe("miniLilacUIMessageSchema", () => {
       model: "openai/gpt-test",
       profile: "coding",
       reasoning: "high",
+      historyStateId: "history-1",
+      canUndo: true,
+      canRedo: false,
       title: "Implement context display",
       inputTokens: 12_500,
       contextWindow: 128_000,
@@ -95,6 +102,14 @@ describe("miniLilacUIMessageSchema", () => {
     expect(
       miniLilacSessionSnapshotSchema.safeParse({ ...snapshot, title: "x".repeat(101) }).success,
     ).toBe(false);
+    for (const malformed of [
+      { ...snapshot, historyStateId: undefined },
+      { ...snapshot, canUndo: undefined },
+      { ...snapshot, canRedo: undefined },
+      { ...snapshot, unexpected: true },
+    ]) {
+      expect(miniLilacSessionSnapshotSchema.safeParse(malformed).success).toBe(false);
+    }
   });
 
   it("strictly validates todo fields and bounds", () => {
@@ -241,24 +256,24 @@ describe("miniLilacUIMessageSchema", () => {
         { type: "file" as const, mediaType: "image/png", url: "data:image/png;base64,AA==" },
       ],
     };
+    const successfulResult = {
+      status: "undone" as const,
+      clientCommandId: "undo-1",
+      message,
+      historyStateId: "history-1",
+      filesystem: { status: "restored" as const },
+    };
 
     expect(miniLilacUndoRequestSchema.parse(request)).toEqual(request);
     expect(miniLilacUndoRequestSchema.safeParse({ sessionId: "session-1" }).success).toBe(false);
     expect(miniLilacUndoRequestSchema.safeParse({ ...request, runId: "run-1" }).success).toBe(
       false,
     );
-    expect(
-      miniLilacUndoResultSchema.parse({
-        status: "undone",
-        clientCommandId: "undo-1",
-        message,
-      }),
-    ).toEqual({ status: "undone", clientCommandId: "undo-1", message });
+    expect(miniLilacUndoResultSchema.parse(successfulResult)).toEqual(successfulResult);
     expect(
       miniLilacUndoResultSchema.safeParse({
-        status: "undone",
-        clientCommandId: "undo-1",
-        message: { ...message, role: "assistant" },
+        ...successfulResult,
+        message: { ...successfulResult.message, role: "assistant" },
       }).success,
     ).toBe(false);
     expect(
@@ -276,10 +291,93 @@ describe("miniLilacUIMessageSchema", () => {
     ).toBe(false);
     expect(
       miniLilacUndoResultSchema.safeParse({
-        status: "undone",
-        clientCommandId: "undo-1",
+        ...successfulResult,
+        historyStateId: undefined,
       }).success,
     ).toBe(false);
+    expect(
+      miniLilacUndoResultSchema.safeParse({ ...successfulResult, message: undefined }).success,
+    ).toBe(false);
+    expect(
+      miniLilacUndoResultSchema.safeParse({ ...successfulResult, filesystem: undefined }).success,
+    ).toBe(false);
+    expect(
+      miniLilacUndoResultSchema.safeParse({ ...successfulResult, unexpected: true }).success,
+    ).toBe(false);
+  });
+
+  it("strictly validates history filesystem outcomes", () => {
+    expect(miniLilacHistoryFilesystemResultSchema.parse({ status: "restored" })).toEqual({
+      status: "restored",
+    });
+
+    for (const reason of [
+      "git-unavailable",
+      "snapshot-unavailable",
+      "platform-unsupported",
+    ] as const) {
+      expect(miniLilacHistoryFilesystemResultSchema.parse({ status: "skipped", reason })).toEqual({
+        status: "skipped",
+        reason,
+      });
+    }
+
+    for (const malformed of [
+      { status: "restored", reason: "git-unavailable" },
+      { status: "restored", unexpected: true },
+      { status: "skipped" },
+      { status: "skipped", reason: "capture-failed" },
+      { status: "skipped", reason: "git-unavailable", unexpected: true },
+    ]) {
+      expect(miniLilacHistoryFilesystemResultSchema.safeParse(malformed).success).toBe(false);
+    }
+  });
+
+  it("strictly validates redo commands and their exact restored user message", () => {
+    const request = {
+      sessionId: "session-1",
+      clientCommandId: "redo-1",
+    } satisfies MiniLilacRedoRequest;
+    const message = {
+      id: "user-1",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "restore this" }],
+    };
+    const successfulResult = {
+      status: "redone" as const,
+      clientCommandId: "redo-1",
+      message,
+      historyStateId: "history-2",
+      filesystem: { status: "skipped" as const, reason: "snapshot-unavailable" as const },
+    };
+
+    expect(miniLilacRedoRequestSchema.parse(request)).toEqual(request);
+    expect(miniLilacRedoRequestSchema.safeParse({ sessionId: "session-1" }).success).toBe(false);
+    expect(miniLilacRedoRequestSchema.safeParse({ ...request, runId: "run-1" }).success).toBe(
+      false,
+    );
+    expect(miniLilacRedoResultSchema.parse(successfulResult)).toEqual(successfulResult);
+    expect(
+      miniLilacRedoResultSchema.safeParse({
+        ...successfulResult,
+        message: { ...message, role: "assistant" },
+      }).success,
+    ).toBe(false);
+    expect(
+      miniLilacRedoResultSchema.parse({ status: "empty", clientCommandId: "redo-empty" }),
+    ).toEqual({ status: "empty", clientCommandId: "redo-empty" });
+
+    for (const malformed of [
+      { ...successfulResult, message: undefined },
+      { ...successfulResult, historyStateId: undefined },
+      { ...successfulResult, filesystem: undefined },
+      { ...successfulResult, unexpected: true },
+      { status: "empty" },
+      { status: "empty", clientCommandId: "redo-empty", message },
+      { status: "empty", clientCommandId: "redo-empty", historyStateId: "history-2" },
+    ]) {
+      expect(miniLilacRedoResultSchema.safeParse(malformed).success).toBe(false);
+    }
   });
 
   it("strictly validates durable manual compaction commands and results", () => {
@@ -463,6 +561,9 @@ describe("miniLilacUIMessageSchema", () => {
           model: null,
           profile: null,
           reasoning: null,
+          historyStateId: "history-1",
+          canUndo: false,
+          canRedo: false,
           queuedSteeringCount: 0,
         },
       },

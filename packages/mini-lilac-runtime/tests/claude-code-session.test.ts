@@ -434,7 +434,7 @@ describe("claude-code sessions", () => {
     service.close();
   });
 
-  it("injects steering into the live query and consumes the queue entry once", async () => {
+  it("disables native steering injection and commits through the queued history hook", async () => {
     let releaseFirstTurn: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       releaseFirstTurn = resolve;
@@ -464,13 +464,12 @@ describe("claude-code sessions", () => {
       message: { id: "steer-1", role: "user", parts: [{ type: "text", text: "change course" }] },
     });
 
-    expect(runs[0]?.injected).toEqual(["change course"]);
-    // test-wait-justification: the delivery callback commits through the actor lock, so the queued count settles one microtask after inject()
-    await Bun.sleep(0);
-    expect(service.store.getSession(session.id).queuedSteeringCount).toBe(0);
+    expect(runs[0]?.injected).toEqual([]);
+    expect(service.store.getSession(session.id).queuedSteeringCount).toBe(1);
 
     releaseFirstTurn?.();
     await collected;
+    expect(service.store.getSession(session.id).queuedSteeringCount).toBe(0);
     service.close();
   });
 
@@ -503,12 +502,11 @@ describe("claude-code sessions", () => {
       message: { id: "steer-1", role: "user", parts: [{ type: "text", text: "change course" }] },
     });
 
-    // test-wait-justification: same microtask boundary as the delivered case, proving the entry stays queued rather than being consumed late
-    await Bun.sleep(0);
     expect(service.store.getSession(session.id).queuedSteeringCount).toBe(1);
 
     releaseFirstTurn?.();
     await collected;
+    expect(service.store.getSession(session.id).queuedSteeringCount).toBe(0);
     service.close();
   });
 
@@ -544,17 +542,18 @@ describe("claude-code sessions", () => {
       message: { id: "steer-1", role: "user", parts: [{ type: "text", text: "change course" }] },
     });
 
-    const result = await service.interruptQueuedSteering({
+    const resultPromise = service.interruptQueuedSteering({
       sessionId: session.id,
       runId,
       clientCommandId: crypto.randomUUID(),
       pendingSteerCommandIds: [],
     });
+    releaseFirstTurn?.();
+    const result = await resultPromise;
 
     expect(result.status).toBe("interrupted");
     expect(runs[0]?.interrupts).toBe(1);
 
-    releaseFirstTurn?.();
     await collected;
     service.close();
   });
@@ -673,6 +672,7 @@ describe("claude-code sessions", () => {
       modelResolver: () => new MockLanguageModelV4({}),
       materializeClaudeCodeRun: fakeClaudeCode({ agentModel: new MockLanguageModelV4({}) }),
     });
+    await reopened.initialize();
     expect(reopened.getMessages(session.id)).toEqual(messages);
     reopened.close();
   });
@@ -697,7 +697,7 @@ describe("claude-code sessions", () => {
     service.close();
   });
 
-  it("keeps steering the model accepted when the run is cancelled", async () => {
+  it("drops steering that was never durably delivered when the run is cancelled", async () => {
     let releaseFirstTurn: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       releaseFirstTurn = resolve;
@@ -708,7 +708,8 @@ describe("claude-code sessions", () => {
         return textResult("first", "done");
       },
     });
-    const { service, session } = await temporaryRuntime({ model });
+    const runs: FakeClaudeRun[] = [];
+    const { service, session } = await temporaryRuntime({ model, runs });
 
     const started = await service.startPrompt(session.id, userMessage("start"));
     const collected = collect(started.stream);
@@ -720,17 +721,14 @@ describe("claude-code sessions", () => {
       clientCommandId: crypto.randomUUID(),
       message: { id: "steer-1", role: "user", parts: [{ type: "text", text: "use typescript" }] },
     });
-    // test-wait-justification: the delivery callback commits through the actor lock, so the ack lands one microtask after inject()
-    await Bun.sleep(0);
     await service.cancel({ sessionId: session.id, runId, clientCommandId: crypto.randomUUID() });
 
     releaseFirstTurn?.();
     await collected;
 
-    // Claude saw the instruction, so the transcript has to record it even
-    // though the run was cancelled.
+    expect(runs[0]?.injected).toEqual([]);
     const messages = service.store.getModelMessages(session.id);
-    expect(JSON.stringify(messages)).toContain("use typescript");
+    expect(JSON.stringify(messages)).not.toContain("use typescript");
     service.close();
   });
 

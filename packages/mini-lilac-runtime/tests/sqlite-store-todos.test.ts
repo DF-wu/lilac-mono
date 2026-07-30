@@ -30,8 +30,60 @@ function createSession(store: MiniLilacSqliteStore, sessionId: string): void {
 }
 
 function createActiveRootRun(store: MiniLilacSqliteStore, sessionId: string, runId: string): void {
-  store.createRun({ id: runId, sessionId, profile: "reader", depth: 0 });
-  store.updateSessionState(sessionId, "streaming", 0, runId);
+  const message = {
+    id: `user:${runId}`,
+    role: "user" as const,
+    parts: [{ type: "text" as const, text: runId }],
+  };
+  const payload = { messageId: message.id };
+  store.reserveCommand(sessionId, `prompt:${runId}`, {
+    kind: "prompt",
+    runId: null,
+    payload,
+  });
+  store.admitRootPromptHistory({
+    run: { id: runId, sessionId, profile: "reader", depth: 0 },
+    commandId: `prompt:${runId}`,
+    commandPayload: payload,
+    transitionId: `transition:${runId}`,
+    expectedCurrentStateId: store.getCurrentHistoryState(sessionId).id,
+    modelMessages: [{ role: "user", content: runId }],
+    uiMessages: [message],
+    observation: {
+      stateId: `observation:${runId}`,
+      transitionId: `observation-transition:${runId}`,
+      workspaceSnapshotId: null,
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "git-unavailable",
+    },
+  });
+}
+
+function finishActiveRootRun(store: MiniLilacSqliteStore, sessionId: string, runId: string): void {
+  const message = {
+    id: `user:${runId}`,
+    role: "user" as const,
+    parts: [{ type: "text" as const, text: runId }],
+  };
+  store.reservePendingRunFinalization({
+    runId,
+    sessionId,
+    openTransitionId: `transition:${runId}`,
+    modelMessages: [{ role: "user", content: runId }],
+    uiMessages: [message],
+    runStatus: "completed",
+    sessionStatus: "idle",
+    error: null,
+    terminalResult: undefined,
+    inputTokens: null,
+  });
+  store.commitPendingRunFinalization({
+    runId,
+    destinationStateId: `destination:${runId}`,
+    workspaceSnapshotId: null,
+    workspaceStatus: "unavailable",
+    workspaceUnavailableReason: "git-unavailable",
+  });
 }
 
 describe("MiniLilacSqliteStore todos", () => {
@@ -171,7 +223,7 @@ describe("MiniLilacSqliteStore todos", () => {
       }),
     ).toThrow("Run 'child-1' is not active for session 'session-1'");
 
-    store.finishRun("run-1", "completed");
+    finishActiveRootRun(store, "session-1", "run-1");
     expect(() =>
       store.replaceTodosForRun({
         sessionId: "session-1",

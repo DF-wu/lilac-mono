@@ -20,6 +20,8 @@ import {
   type MiniLilacInterruptQueuedSteeringResult,
   type MiniLilacModelSummary,
   type MiniLilacProfileSummary,
+  type MiniLilacRedoInput,
+  type MiniLilacRedoResult,
   type MiniLilacSessionResume,
   type MiniLilacSessionSnapshot,
   type MiniLilacSkillSummary,
@@ -43,6 +45,8 @@ import {
   miniLilacMessagesSchema,
   miniLilacModelsSchema,
   miniLilacProfilesSchema,
+  miniLilacRedoRequestSchema,
+  miniLilacRedoResultSchema,
   miniLilacSessionResumeSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSessionsSchema,
@@ -416,6 +420,17 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
       clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
     });
     return this.postControl(payload.sessionId, "undo", payload, miniLilacUndoResultSchema, options);
+  }
+
+  redo(
+    request: MiniLilacRedoInput,
+    options: MiniLilacRequestOptions = {},
+  ): Promise<MiniLilacRedoResult> {
+    const payload = miniLilacRedoRequestSchema.parse({
+      ...request,
+      clientCommandId: request.clientCommandId ?? this.createClientCommandId(),
+    });
+    return this.postControl(payload.sessionId, "redo", payload, miniLilacRedoResultSchema, options);
   }
 
   /** Stop a running compaction. Detaching the stream does not; this does. */

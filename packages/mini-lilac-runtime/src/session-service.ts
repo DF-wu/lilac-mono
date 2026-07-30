@@ -1,4 +1,7 @@
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
+import path from "node:path";
 
 import {
   AgentIdleTimeoutError,
@@ -16,6 +19,7 @@ import {
   type NormalizeToolResultOutputFn,
   type TransientModelRetryConfig,
   type TurnBoundaryDecision,
+  type BeforeSteeringDeliveryContext,
 } from "@stanley2058/lilac-agent";
 import {
   displayClaudeCodeToolName,
@@ -44,6 +48,7 @@ import {
   miniLilacLanguageModelUsageSchema,
   miniLilacProviderMetadataSchema,
   miniLilacReasoningSchema,
+  miniLilacRedoResultSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSkillSummarySchema,
   miniLilacSteerResultSchema,
@@ -67,9 +72,12 @@ import {
   type MiniLilacInterruptQueuedSteeringRequest,
   type MiniLilacInterruptQueuedSteeringInput,
   type MiniLilacInterruptQueuedSteeringResult,
+  type MiniLilacHistoryFilesystemResult,
   type MiniLilacLanguageModelUsage,
   type MiniLilacOutputRollback,
   type MiniLilacReasoning,
+  type MiniLilacRedoRequest,
+  type MiniLilacRedoResult,
   type MiniLilacSessionSnapshot,
   type MiniLilacSkillSummary,
   type MiniLilacSteerRequest,
@@ -122,12 +130,33 @@ import { MiniLilacSkillCatalog, type MiniLilacSkillCatalogSnapshot } from "./ski
 import {
   MiniLilacSqliteStore,
   parseStoredUIMessageChunk,
+  storedHistoryCommandErrorSchema,
+  type AcknowledgeStoredHistoryNavigationAbandonment,
+  type PendingStoredRunFinalization,
   type StoredCommandRequest,
+  type StoredHistoryCommandError,
+  type StoredHistoryNavigationResult,
   type StoredRunChunk,
   type StoredSessionResume,
+  type StoredHistoryObservationInput,
+  type StoredHistoryOperation,
+  type StoredHistoryState,
+  type StoredHistoryTransition,
+  type StoredHistoryWorkspaceOutcome,
   type StoredUIMessageChunk,
-  type StoredUserCheckpoint,
+  type StoredWorkspace,
+  type WorkspaceHistoryAvailabilityOwner,
 } from "./sqlite-store";
+import {
+  WorkspaceHistoryStore,
+  WorkspaceHistoryStoreError,
+  type LockedWorkspaceHistoryStore,
+  type PreparedWorkspaceRestore,
+  type WorkspaceHistoryCaptureResult,
+  type WorkspaceHistoryExpectedCurrent,
+  type WorkspaceHistoryMetric,
+  type WorkspaceHistoryStoreOptions,
+} from "./workspace-history-store";
 import {
   createWebSearchProviderResolver,
   createWebsearchTool,
@@ -205,6 +234,9 @@ export type SessionServiceOptions = {
   skillCatalog?: MiniLilacSkillCatalog;
   webSearchProviderResolver?: WebSearchProviderResolver;
   protectedToolPaths?: readonly string[];
+  workspaceHistoryDirectory?: string;
+  /** Test seam for deterministic capture boundaries. */
+  workspaceHistoryStoreFactory?: (options: WorkspaceHistoryStoreOptions) => WorkspaceHistoryStore;
   toolResultArtifacts?: ToolResultArtifactStore;
   toolResultOutputConfig?: ToolResultOutputNormalizerConfig;
   transientModelRetry?: TransientModelRetryConfig;
@@ -216,6 +248,38 @@ export type SessionServiceShutdownOptions = {
 };
 
 export type SessionResumeProjection = StoredSessionResume;
+
+export class HistoryRecoveryAbandonedError extends Error {
+  readonly code = "history-recovery-abandoned";
+  readonly commandId: string;
+
+  constructor(error: StoredHistoryCommandError) {
+    super(error.message);
+    this.name = "HistoryRecoveryAbandonedError";
+    this.commandId = error.commandId;
+  }
+}
+
+export type SessionHistoryRecoveryStatus = {
+  readonly navigation: readonly StoredHistoryOperation[];
+  readonly pendingFinalizations: readonly PendingStoredRunFinalization[];
+  readonly workspaceSnapshots: readonly SessionWorkspaceSnapshotReconciliation[];
+};
+
+export type SessionWorkspaceSnapshotReconciliation =
+  | {
+      readonly workspaceId: string;
+      readonly canonicalCwd: string;
+      readonly status: "reconciled";
+      readonly orphanRefs: readonly string[];
+    }
+  | {
+      readonly workspaceId: string;
+      readonly canonicalCwd: string;
+      readonly status: "unavailable";
+      readonly reason: "git-unavailable" | "platform-unsupported";
+      readonly orphanRefs: readonly [];
+    };
 
 function parseSessionConfig(config: RuntimeConfig | LoadedRuntimeConfig): RuntimeConfig {
   if (!("configFile" in config)) return runtimeConfigSchema.parse(config);
@@ -248,6 +312,31 @@ export type StartedCompaction = {
  * any terminal redraws.
  */
 const COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS = 100;
+const RESTORE_PLAN_CLEANUP_GRACE_MS = 24 * 60 * 60 * 1_000;
+const WORKSPACE_HISTORY_ORPHAN_GRACE_MS = 24 * 60 * 60 * 1_000;
+
+function assertWorkspaceHistoryAvailable(
+  store: MiniLilacSqliteStore,
+  sessionId: string,
+  operation: string,
+  owner?: WorkspaceHistoryAvailabilityOwner,
+): void {
+  try {
+    store.assertWorkspaceHistoryAvailable(sessionId, owner);
+  } catch (error) {
+    const workspace = store.getWorkspaceForSession(sessionId);
+    const accounting = store.getHistoryAccounting(workspace.id);
+    logger.warn("workspace history operation blocked", {
+      workspaceId: workspace.id,
+      operation,
+      blockedOperationCount: 1,
+      snapshotCount: accounting.snapshotCount,
+      activeOperationCount: accounting.activeOperationCount,
+      pendingFinalizationCount: accounting.pendingFinalizationCount,
+    });
+    throw error;
+  }
+}
 
 /** Replay a previously committed compaction as a one-shot terminal event. */
 function compactionEventFor(result: MiniLilacCompactResult): MiniLilacCompactionEvent {
@@ -380,6 +469,7 @@ type ActiveRootRun = RunProjection & {
   liveLog: StoredRunChunk[];
   nextSeq: number;
   inputTokens: number | null;
+  openTransitionId: string;
 };
 
 type TerminalReplayProjection = {
@@ -556,8 +646,16 @@ function controlCommandRequest(
   return { kind, runId, payload };
 }
 
-function undoCommandRequest(): StoredCommandRequest {
-  return { kind: "undo", runId: null, payload: {} };
+function historyNavigationCommandRequest(action: "undo" | "redo"): StoredCommandRequest {
+  return { kind: action, runId: null, payload: {} };
+}
+
+function expectedWorkspaceCurrent(
+  capture: WorkspaceHistoryCaptureResult,
+): WorkspaceHistoryExpectedCurrent {
+  return capture.status === "captured"
+    ? { status: "captured", rootTreeOid: capture.rootTreeOid }
+    : { status: "unavailable", reason: capture.reason };
 }
 
 function compactCommandRequest(): StoredCommandRequest {
@@ -662,22 +760,6 @@ function systemPrompt(
   ]
     .filter((part): part is string => Boolean(part))
     .join("\n\n");
-}
-
-/**
- * Text of a steering message when it can be injected into a live Claude query.
- * Multipart or media steering has no injector representation and stays
- * boundary-based.
- */
-function plainTextSteering(message: ModelMessage): string | undefined {
-  if (typeof message.content === "string") return message.content;
-  if (!Array.isArray(message.content)) return undefined;
-  const texts: string[] = [];
-  for (const part of message.content) {
-    if (part.type !== "text") return undefined;
-    texts.push(part.text);
-  }
-  return texts.length > 0 ? texts.join("\n") : undefined;
 }
 
 function profileRequestsTool(profile: AgentProfile, name: string): boolean {
@@ -876,9 +958,8 @@ class SessionActor {
   private readonly titleControllers = new Map<string, AbortController>();
   private readonly steeringEntries: Array<{
     id: string;
+    commandId: string;
     message: MiniLilacUserUIMessage;
-    modelMessage: ModelMessage;
-    state: "queued" | "consumed";
   }> = [];
   private readonly interruptedSteerCommandIds = new Set<string>();
   private deferredCompletionOrder = 0;
@@ -904,6 +985,7 @@ class SessionActor {
     private readonly skillCatalog: MiniLilacSkillCatalog | undefined,
     private readonly resolveWebSearchProvider: WebSearchProviderResolver,
     private readonly protectedToolPaths: readonly string[],
+    private readonly workspaceHistory: WorkspaceHistoryStore,
     private readonly toolResultArtifacts: ToolResultArtifactStore | undefined,
     private readonly toolResultOutputConfig: ToolResultOutputNormalizerConfig,
     private readonly transientModelRetry: TransientModelRetryConfig,
@@ -928,6 +1010,80 @@ class SessionActor {
       this.store.releaseCommand(this.snapshot.id, commandIdValue, request);
       throw error;
     }
+  }
+
+  private async captureWorkspaceOutcome(
+    lockedStore: LockedWorkspaceHistoryStore,
+    abortSignal?: AbortSignal,
+  ): Promise<StoredHistoryWorkspaceOutcome> {
+    assertWorkspaceHistoryAvailable(this.store, this.snapshot.id, "capture");
+    abortSignal?.throwIfAborted();
+    const capture = await lockedStore.capture();
+    return this.recordWorkspaceCapture(capture);
+  }
+
+  private recordWorkspaceCapture(
+    capture: WorkspaceHistoryCaptureResult,
+  ): StoredHistoryWorkspaceOutcome {
+    if (capture.status === "skipped") {
+      return {
+        workspaceSnapshotId: null,
+        workspaceStatus: "unavailable",
+        workspaceUnavailableReason: capture.reason,
+      };
+    }
+    const workspace = this.store.getWorkspaceForSession(this.snapshot.id);
+    if (workspace.id !== capture.workspaceId) {
+      throw new Error(`Workspace capture '${capture.workspaceId}' does not belong to this session`);
+    }
+    const snapshot = this.store.createOrReuseWorkspaceSnapshot({
+      id: crypto.randomUUID(),
+      workspaceId: workspace.id,
+      rootTreeOid: capture.rootTreeOid,
+      gitRef: capture.gitRef,
+      formatVersion: capture.formatVersion,
+    });
+    return {
+      workspaceSnapshotId: snapshot.id,
+      workspaceStatus: "captured",
+      workspaceUnavailableReason: null,
+    };
+  }
+
+  private workspaceObservation(
+    current: StoredHistoryState,
+    outcome: StoredHistoryWorkspaceOutcome,
+  ): StoredHistoryObservationInput | undefined {
+    const currentRootTreeOid =
+      current.workspaceSnapshotId === null
+        ? null
+        : this.store.getWorkspaceSnapshot(current.workspaceSnapshotId)?.rootTreeOid;
+    const outcomeRootTreeOid =
+      outcome.workspaceSnapshotId === null
+        ? null
+        : this.store.getWorkspaceSnapshot(outcome.workspaceSnapshotId)?.rootTreeOid;
+    if (
+      currentRootTreeOid === outcomeRootTreeOid &&
+      current.workspaceStatus === outcome.workspaceStatus &&
+      current.workspaceUnavailableReason === outcome.workspaceUnavailableReason
+    ) {
+      return undefined;
+    }
+    return {
+      stateId: crypto.randomUUID(),
+      transitionId: crypto.randomUUID(),
+      ...outcome,
+    };
+  }
+
+  private deleteUnreferencedWorkspaceOutcome(outcome: StoredHistoryWorkspaceOutcome): void {
+    if (outcome.workspaceSnapshotId === null) return;
+    const snapshot = this.store.getWorkspaceSnapshot(outcome.workspaceSnapshotId);
+    if (snapshot === null) return;
+    this.store.deleteUnreferencedWorkspaceSnapshots({
+      workspaceId: snapshot.workspaceId,
+      snapshotIds: [snapshot.id],
+    });
   }
 
   private reconcileTerminalReplay(
@@ -1099,7 +1255,7 @@ class SessionActor {
         const runId = z.object({ runId: z.string().min(1) }).parse(previous).runId;
         return { runId, stream: this.streamRun(runId) };
       }
-      if (this.active || this.store.getLatestRun(this.snapshot.id)?.status === "active") {
+      if (this.active || this.store.getActiveRootRun(this.snapshot.id) !== null) {
         throw new Error(`Session '${this.snapshot.id}' already has an active run`);
       }
       // Compaction rewrites the whole transcript and holds no run, so an active
@@ -1155,19 +1311,34 @@ class SessionActor {
         );
         const { agent, claudeCodeRun } = created;
         pendingClaudeCodeRun = claudeCodeRun;
-        this.snapshot = this.store.beginRootRun({
-          run: {
-            id: runId,
-            sessionId: this.snapshot.id,
-            profile: profileId,
-            depth: context.depth,
+        const admittedHistory = await this.workspaceHistory.withWorkspaceLock(
+          async (lockedStore) => {
+            const current = this.store.getCurrentHistoryState(this.snapshot.id);
+            const outcome = await this.captureWorkspaceOutcome(lockedStore);
+            try {
+              return this.store.admitRootPromptHistory({
+                run: {
+                  id: runId,
+                  sessionId: this.snapshot.id,
+                  profile: profileId,
+                  depth: context.depth,
+                },
+                commandId: clientCommandId,
+                commandPayload: command.payload,
+                transitionId: crypto.randomUUID(),
+                expectedCurrentStateId: current.id,
+                modelMessages: [...priorModelMessages, userModelMessage],
+                uiMessages: [...priorUiMessages, userMessage],
+                observation: this.workspaceObservation(current, outcome),
+                title: initialTitle,
+              });
+            } catch (error) {
+              this.deleteUnreferencedWorkspaceOutcome(outcome);
+              throw error;
+            }
           },
-          commandId: clientCommandId,
-          commandPayload: command.payload,
-          modelMessages: [...priorModelMessages, userModelMessage],
-          uiMessages: [...priorUiMessages, userMessage],
-          title: initialTitle,
-        });
+        );
+        this.snapshot = admittedHistory.snapshot;
         this.terminalReplay = undefined;
         admitted = true;
         this.active = {
@@ -1186,6 +1357,7 @@ class SessionActor {
           liveLog: [],
           nextSeq: 1,
           inputTokens: this.snapshot.inputTokens ?? null,
+          openTransitionId: admittedHistory.transition.id,
           toolInputsAvailable: new Map(),
           streamedToolInputIds: new Set(),
           suppressedClaudeMcpToolInputIds: new Set(),
@@ -1473,6 +1645,7 @@ class SessionActor {
       providerOptions,
       turnErrorHandler: transientRetryController?.handler,
       turnBoundaryHandler: () => this.finishDeferredChildren(context),
+      beforeSteeringDelivery: (delivery) => this.commitSteeringBoundary(context, delivery),
     });
     input.onAgentReady(agent);
     if (transientRetryController) {
@@ -1573,6 +1746,115 @@ class SessionActor {
     }
     if (usesCodexOAuth) agent.appendTransformMessages(withoutOpenAIItemIds);
     return { agent, claudeCodeRun };
+  }
+
+  private async commitSteeringBoundary(
+    context: RunContext,
+    delivery: BeforeSteeringDeliveryContext,
+  ): Promise<void> {
+    const active = this.active;
+    if (
+      active === undefined ||
+      active.runId !== context.runId ||
+      active.phase !== "accepting-controls"
+    ) {
+      throw new Error(`Run '${context.runId}' is not accepting steering history boundaries`);
+    }
+
+    await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+      const scheduledProjection = active.eventQueue;
+      await scheduledProjection;
+      if (
+        this.active !== active ||
+        active.phase !== "accepting-controls" ||
+        this.store.getActiveRootRun(this.snapshot.id)?.id !== active.runId
+      ) {
+        throw new Error(`Run '${context.runId}' stopped before steering could be committed`);
+      }
+      delivery.abortSignal?.throwIfAborted();
+
+      if (delivery.canonicalMessages.length !== delivery.batch.length) {
+        throw new Error("Steering delivery must provide one canonical model message per entry");
+      }
+
+      const entries = delivery.batch.map((batchEntry, index) => {
+        const entry = this.steeringEntries.find((candidate) => candidate.id === batchEntry.id);
+        if (entry === undefined) {
+          throw new Error(`Steering '${batchEntry.id}' has no runtime command entry`);
+        }
+        const modelMessage = delivery.canonicalMessages[index];
+        if (modelMessage === undefined) {
+          throw new Error(`Steering '${batchEntry.id}' has no canonical model message`);
+        }
+        return {
+          commandId: entry.commandId,
+          transitionId: crypto.randomUUID(),
+          message: entry.message,
+          modelMessage,
+          replayAfterSeq: 0,
+          ...(index < delivery.batch.length - 1
+            ? { intermediateStateId: crypto.randomUUID() }
+            : {}),
+        };
+      });
+      const segment = await assistantMessageFromChunks(active.liveLog, active.uiChunkCursor);
+      const boundaryUiPrefix = [...active.chronologicalUiPrefix];
+      if (segment.message && segment.message.parts.length > 0) {
+        boundaryUiPrefix.push(segment.message);
+      }
+      entries.forEach((entry) => {
+        entry.replayAfterSeq = segment.throughSeq;
+      });
+      const uiMessages = [...boundaryUiPrefix, ...entries.map((entry) => entry.message)];
+      const mergedModelMessages = [...active.agent.state.messages, ...delivery.canonicalMessages];
+      delivery.abortSignal?.throwIfAborted();
+      const workspace = await this.captureWorkspaceOutcome(lockedStore, delivery.abortSignal);
+      const committed = (() => {
+        try {
+          delivery.abortSignal?.throwIfAborted();
+          return this.store.commitSteeringHistoryBoundary({
+            sessionId: this.snapshot.id,
+            rootRunId: active.runId,
+            previousOpenTransitionId: active.openTransitionId,
+            boundaryStateId: crypto.randomUUID(),
+            workspace,
+            mergedModelMessages,
+            uiMessages,
+            entries,
+          });
+        } catch (error) {
+          this.deleteUnreferencedWorkspaceOutcome(workspace);
+          throw error;
+        }
+      })();
+
+      active.openTransitionId = committed.openTransition.id;
+      active.chronologicalUiPrefix = uiMessages;
+      active.uiChunkCursor = segment.throughSeq;
+      const consumedIds = new Set(delivery.batch.map((entry) => entry.id));
+      const remaining = this.steeringEntries.filter((entry) => !consumedIds.has(entry.id));
+      this.steeringEntries.splice(0, this.steeringEntries.length, ...remaining);
+      this.snapshot = this.store.getSession(this.snapshot.id);
+      try {
+        for (const entry of entries) {
+          await this.appendChunk(active.runId, {
+            type: "data-steeringCommitted",
+            id: entry.message.id,
+            data: entry.message,
+          });
+        }
+        await this.appendChunk(active.runId, {
+          type: "data-session",
+          data: this.describe(this.snapshot),
+        });
+      } catch (error) {
+        logger.warn("failed to project committed steering boundary", {
+          requestId: active.runId,
+          sessionId: this.snapshot.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
   }
 
   private async generateSessionTitle(
@@ -2102,7 +2384,7 @@ class SessionActor {
         agent.getRecoverableMessages(),
         "run ended",
       );
-      this.snapshot = this.store.finalizeRootRun({
+      this.snapshot = await this.commitRunFinalization(active, {
         runId: context.runId,
         sessionId: this.snapshot.id,
         runStatus,
@@ -2119,7 +2401,7 @@ class SessionActor {
         finalizationError instanceof Error ? finalizationError.message : String(finalizationError);
       error ??= `Failed to persist final transcript: ${message}`;
       try {
-        this.snapshot = this.store.finalizeRootRun({
+        this.snapshot = await this.commitRunFinalization(active, {
           runId: context.runId,
           sessionId: this.snapshot.id,
           runStatus: "error",
@@ -2156,41 +2438,80 @@ class SessionActor {
     }
   }
 
+  private async commitRunFinalization(
+    active: ActiveRootRun,
+    input: {
+      readonly runId: string;
+      readonly sessionId: string;
+      readonly runStatus: "completed" | "cancelled" | "error";
+      readonly sessionStatus: "idle" | "error";
+      readonly error?: string;
+      readonly terminalResult?: unknown;
+      readonly modelMessages: readonly ModelMessage[];
+      readonly uiMessages: readonly MiniLilacUIMessage[];
+      readonly inputTokens: number | null;
+    },
+  ): Promise<MiniLilacSessionSnapshot> {
+    return await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+      if (this.store.getPendingRunFinalization(input.runId) === null) {
+        this.store.reservePendingRunFinalization({
+          runId: input.runId,
+          sessionId: input.sessionId,
+          openTransitionId: active.openTransitionId,
+          modelMessages: input.modelMessages,
+          uiMessages: input.uiMessages,
+          runStatus: input.runStatus,
+          sessionStatus: input.sessionStatus,
+          error: input.error ?? null,
+          terminalResult: input.terminalResult,
+          inputTokens: input.inputTokens,
+        });
+      }
+      assertWorkspaceHistoryAvailable(this.store, input.sessionId, "finalize-run", {
+        kind: "pending-run-finalization",
+        runId: input.runId,
+      });
+
+      let workspace: StoredHistoryWorkspaceOutcome = {
+        workspaceSnapshotId: null,
+        workspaceStatus: "unavailable",
+        workspaceUnavailableReason: "capture-failed",
+      };
+      let capture: WorkspaceHistoryCaptureResult | undefined;
+      try {
+        capture = await lockedStore.capture();
+      } catch (error) {
+        logger.warn("terminal workspace capture failed", {
+          requestId: input.runId,
+          sessionId: input.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (capture !== undefined) workspace = this.recordWorkspaceCapture(capture);
+      try {
+        return this.store.commitPendingRunFinalization({
+          runId: input.runId,
+          destinationStateId: crypto.randomUUID(),
+          ...workspace,
+        }).snapshot;
+      } catch (error) {
+        this.deleteUnreferencedWorkspaceOutcome(workspace);
+        throw error;
+      }
+    });
+  }
+
   private enqueueEvent(runId: string, event: AiSdkPiAgentEvent<ToolSet>): void {
     const projection = this.projection(runId);
     if (projection === undefined) return;
     const active = this.active?.runId === runId ? this.active : undefined;
     if (event.type === "agent_end" && active !== undefined) active.phase = "finalizing";
-    let consumedSteeringCheckpoints: Array<
-      Omit<StoredUserCheckpoint, "uiPrefix" | "replayAfterSeq">
-    > = [];
     if (active !== undefined && event.type === "message_start" && event.message.role === "user") {
       if (!active.initialUserSeen) {
         active.initialUserSeen = true;
-      } else {
-        const queuedIds = new Set(active.agent.getQueuedSteeringIds());
-        this.steeringEntries.forEach((entry) => {
-          if (entry.state === "queued" && !queuedIds.has(entry.id)) entry.state = "consumed";
-        });
-        const consumedEntries = this.steeringEntries.filter((entry) => entry.state === "consumed");
-        let modelPrefix = active.agent.state.messages.slice(0, -1);
-        consumedSteeringCheckpoints = consumedEntries.map((entry) => {
-          const checkpoint = { message: entry.message, modelPrefix };
-          modelPrefix = [...modelPrefix, entry.modelMessage];
-          return checkpoint;
-        });
-        const consumedIds = new Set(
-          this.steeringEntries
-            .filter((entry) => entry.state === "consumed")
-            .map((entry) => entry.id),
-        );
-        const remaining = this.steeringEntries.filter((entry) => !consumedIds.has(entry.id));
-        this.steeringEntries.splice(0, this.steeringEntries.length, ...remaining);
       }
     }
-    const operation = projection.eventQueue.then(() =>
-      this.handleAgentEvent(projection, event, consumedSteeringCheckpoints),
-    );
+    const operation = projection.eventQueue.then(() => this.handleAgentEvent(projection, event));
     projection.eventQueue = operation.catch((error) => {
       this.reportEventFailure(runId, error);
     });
@@ -2214,10 +2535,6 @@ class SessionActor {
   private async handleAgentEvent(
     projection: RunProjection,
     event: AiSdkPiAgentEvent<ToolSet>,
-    consumedSteeringCheckpoints: readonly Omit<
-      StoredUserCheckpoint,
-      "uiPrefix" | "replayAfterSeq"
-    >[],
   ): Promise<void> {
     const { runId } = projection;
     const active = this.active?.runId === runId ? this.active : undefined;
@@ -2310,41 +2627,7 @@ class SessionActor {
         return;
       case "message_start":
         if (event.message.role === "user") {
-          if (active === undefined || consumedSteeringCheckpoints.length === 0) return;
-          const runChunks = active.liveLog;
-          const segment = await assistantMessageFromChunks(runChunks, active.uiChunkCursor);
-          const chronologicalUiPrefix = [...active.chronologicalUiPrefix];
-          if (segment.message && segment.message.parts.length > 0) {
-            chronologicalUiPrefix.push(segment.message);
-          }
-          const checkpoints = consumedSteeringCheckpoints.map((checkpoint) => {
-            const storedCheckpoint: StoredUserCheckpoint = {
-              ...checkpoint,
-              uiPrefix: [...chronologicalUiPrefix],
-              replayAfterSeq: segment.throughSeq,
-            };
-            chronologicalUiPrefix.push(checkpoint.message);
-            return storedCheckpoint;
-          });
-          this.store.appendUserCheckpoints(this.snapshot.id, runId, checkpoints);
-          active.chronologicalUiPrefix = chronologicalUiPrefix;
-          active.uiChunkCursor = segment.throughSeq;
-          for (const checkpoint of consumedSteeringCheckpoints) {
-            await this.appendChunk(runId, {
-              type: "data-steeringCommitted",
-              id: checkpoint.message.id,
-              data: checkpoint.message,
-            });
-          }
-          this.snapshot = this.store.updateSessionState(
-            this.snapshot.id,
-            this.snapshot.status,
-            this.queuedSteeringCount(),
-          );
-          await this.appendChunk(runId, {
-            type: "data-session",
-            data: this.describe(this.snapshot),
-          });
+          return;
         } else if (event.message.role === "tool") {
           for (const part of event.message.content) {
             if (part.type !== "tool-result") continue;
@@ -2641,6 +2924,16 @@ class SessionActor {
         return;
       case "turn_warnings":
         return;
+      case "steering_delivery_failed":
+        logger.warn("steering history boundary failed", {
+          requestId: runId,
+          sessionId: this.snapshot.id,
+          deliveryKind: event.deliveryKind,
+          steeringIds: event.steeringIds,
+          error: event.error,
+        });
+        await this.appendChunk(runId, { type: "error", errorText: event.error });
+        return;
     }
   }
 
@@ -2905,20 +3198,9 @@ class SessionActor {
       const steeringId = active.agent.steer(userModelMessage);
       this.steeringEntries.push({
         id: steeringId,
+        commandId: id,
         message: request.message,
-        modelMessage: userModelMessage,
-        state: "queued",
       });
-      // One Claude-backed streamText() call spans many internal model and tool
-      // turns, so turn-boundary steering alone is not responsive enough. The
-      // queued entry stays as the fallback until delivery is confirmed.
-      const steeringText = plainTextSteering(userModelMessage);
-      if (active.claudeCodeRun && steeringText !== undefined) {
-        active.claudeCodeRun.control.inject(steeringText, (delivered) => {
-          if (delivered) this.acknowledgeClaudeCodeSteering(active, steeringId);
-        });
-      }
-      await this.queueSteeringChunk(active.runId, request.message);
       this.snapshot = this.store.updateSessionState(
         this.snapshot.id,
         this.snapshot.status,
@@ -2930,21 +3212,27 @@ class SessionActor {
         steeringId,
       };
       this.store.saveCommandResult(this.snapshot.id, id, command, result);
+      await this.queueSteeringChunk(active.runId, request.message);
       await this.queueControlChunks(active.runId, id, result);
       return result;
     });
   }
 
-  interruptQueuedSteering(
+  async interruptQueuedSteering(
     request: MiniLilacInterruptQueuedSteeringRequest,
   ): Promise<MiniLilacInterruptQueuedSteeringResult> {
-    return this.withLock(async () => {
+    const prepared = await this.withLock(() => {
       const id = commandId(request.clientCommandId);
       const command = controlCommandRequest("interrupt", request.runId, {
         pendingSteerCommandIds: request.pendingSteerCommandIds,
       });
       const stored = this.store.getCommandResult(this.snapshot.id, id, command);
-      if (stored !== undefined) return miniLilacInterruptQueuedSteeringResultSchema.parse(stored);
+      if (stored !== undefined) {
+        return {
+          kind: "replay" as const,
+          result: miniLilacInterruptQueuedSteeringResultSchema.parse(stored),
+        };
+      }
       const active = this.active;
       if (
         !active ||
@@ -2961,29 +3249,26 @@ class SessionActor {
       request.pendingSteerCommandIds.forEach((commandIdValue) =>
         this.interruptedSteerCommandIds.add(commandIdValue),
       );
-      const interrupted = active.agent.interruptQueuedSteering();
-      if (interrupted.status === "interrupted") {
-        // Steering only stays queued on a Claude run when the live query could
-        // not take it (multipart content, or an injector not yet installed), so
-        // the query has to be stopped for the next turn to pick it up.
-        this.requestClaudeCodeInterrupt(active.claudeCodeRun);
-        for (const cancel of this.delegatedCancels.values()) cancel();
-        const consumed = new Set(interrupted.steeringIds);
-        this.steeringEntries.forEach((entry) => {
-          if (consumed.has(entry.id)) entry.state = "consumed";
-        });
-      }
+      const operation = active.agent.interruptQueuedSteeringAsync();
+      this.requestClaudeCodeInterrupt(active.claudeCodeRun);
+      for (const cancel of this.delegatedCancels.values()) cancel();
+      return { kind: "pending" as const, id, command, active, operation };
+    });
+    if (prepared.kind === "replay") return prepared.result;
+
+    const interrupted = await prepared.operation;
+    return this.withLock(async () => {
+      const result = miniLilacInterruptQueuedSteeringResultSchema.parse({
+        ...(interrupted.status === "failed" ? { status: "inactive" as const } : interrupted),
+        clientCommandId: prepared.id,
+      });
       this.snapshot = this.store.updateSessionState(
         this.snapshot.id,
         this.snapshot.status,
         this.queuedSteeringCount(),
       );
-      const result = miniLilacInterruptQueuedSteeringResultSchema.parse({
-        ...interrupted,
-        clientCommandId: id,
-      });
-      this.store.saveCommandResult(this.snapshot.id, id, command, result);
-      await this.queueControlChunks(active.runId, id, result);
+      this.store.saveCommandResult(this.snapshot.id, prepared.id, prepared.command, result);
+      await this.queueControlChunks(prepared.active.runId, prepared.id, result);
       return result;
     });
   }
@@ -3029,23 +3314,226 @@ class SessionActor {
   }
 
   undo(request: MiniLilacUndoRequest): Promise<MiniLilacUndoResult> {
-    return this.withLock(() => {
-      const id = commandId(request.clientCommandId);
-      const command = undoCommandRequest();
-      const stored = this.store.getCommandResult(this.snapshot.id, id, command);
-      if (stored !== undefined) return miniLilacUndoResultSchema.parse(stored);
-      this.snapshot = this.store.getSession(this.snapshot.id);
-      if (
-        this.active ||
-        !["idle", "error"].includes(this.snapshot.status) ||
-        this.snapshot.activeRunId !== null
-      ) {
-        throw new Error(`Session '${this.snapshot.id}' must be quiescent to undo`);
+    return this.withLock(async () =>
+      miniLilacUndoResultSchema.parse(
+        await this.navigateHistory("undo", commandId(request.clientCommandId)),
+      ),
+    );
+  }
+
+  redo(request: MiniLilacRedoRequest): Promise<MiniLilacRedoResult> {
+    return this.withLock(async () =>
+      miniLilacRedoResultSchema.parse(
+        await this.navigateHistory("redo", commandId(request.clientCommandId)),
+      ),
+    );
+  }
+
+  private historyNavigationTarget(action: "undo" | "redo"): {
+    readonly target: StoredHistoryState;
+    readonly transitionId: string;
+    readonly message: MiniLilacUserUIMessage;
+  } | null {
+    let transition: StoredHistoryTransition;
+    let targetStateId: string;
+    if (action === "undo") {
+      const undoTransition = this.store.findLatestUndoableUserTransition(this.snapshot.id);
+      if (undoTransition === null) return null;
+      transition = undoTransition;
+      targetStateId = transition.fromStateId;
+    } else {
+      const redoEntry = this.store.peekHistoryRedo(this.snapshot.id);
+      if (redoEntry === null) return null;
+      transition = this.store.getHistoryTransition(redoEntry.userTransitionId);
+      targetStateId = redoEntry.targetStateId;
+    }
+    if (
+      transition.kind !== "user-message" ||
+      transition.toStateId === null ||
+      transition.userMessage === null
+    ) {
+      throw new Error(`History ${action} target is not a completed user transition`);
+    }
+    return {
+      target: this.store.getHistoryState(targetStateId),
+      transitionId: transition.id,
+      message: transition.userMessage,
+    };
+  }
+
+  private replayHistoryNavigation(
+    action: "undo" | "redo",
+    commandIdValue: string,
+    command: StoredCommandRequest,
+  ): StoredHistoryNavigationResult | undefined {
+    const stored = this.store.getCommandResult(this.snapshot.id, commandIdValue, command);
+    if (stored === undefined) return undefined;
+    const commandError = storedHistoryCommandErrorSchema.safeParse(stored);
+    if (commandError.success) throw new HistoryRecoveryAbandonedError(commandError.data);
+    return action === "undo"
+      ? miniLilacUndoResultSchema.parse(stored)
+      : miniLilacRedoResultSchema.parse(stored);
+  }
+
+  private assertHistoryNavigationQuiescent(action: "undo" | "redo"): void {
+    this.snapshot = this.store.getSession(this.snapshot.id);
+    if (
+      this.active ||
+      this.manualCompaction !== undefined ||
+      !["idle", "error"].includes(this.snapshot.status) ||
+      this.snapshot.activeRunId !== null
+    ) {
+      throw new Error(`Session '${this.snapshot.id}' must be quiescent to ${action}`);
+    }
+  }
+
+  private async navigateHistory(
+    action: "undo" | "redo",
+    commandIdValue: string,
+  ): Promise<StoredHistoryNavigationResult> {
+    const command = historyNavigationCommandRequest(action);
+    const replayed = this.replayHistoryNavigation(action, commandIdValue, command);
+    if (replayed !== undefined) return replayed;
+    this.assertHistoryNavigationQuiescent(action);
+
+    const initialTarget = this.historyNavigationTarget(action);
+    const operationId = crypto.randomUUID();
+    this.store.reserveCommand(this.snapshot.id, commandIdValue, command);
+    let operationReserved = false;
+    try {
+      if (initialTarget === null) {
+        const committed = this.store.commitEmptyHistoryNavigation({
+          sessionId: this.snapshot.id,
+          commandId: commandIdValue,
+          requestedAction: action,
+          request: command,
+          result: { status: "empty", clientCommandId: commandIdValue },
+        });
+        this.snapshot = this.store.getSession(this.snapshot.id);
+        return committed.result;
       }
-      const result = this.store.undoLatestUser(this.snapshot.id, id, command);
-      this.snapshot = this.store.getSession(this.snapshot.id);
-      return result;
-    });
+
+      return await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+        let capturedSource: StoredHistoryWorkspaceOutcome | undefined;
+        try {
+          assertWorkspaceHistoryAvailable(this.store, this.snapshot.id, `prepare-${action}`);
+          const source = this.store.getCurrentHistoryState(this.snapshot.id);
+          const sourceCapture = await lockedStore.capture();
+          capturedSource = this.recordWorkspaceCapture(sourceCapture);
+          const target = this.historyNavigationTarget(action);
+          if (
+            target === null ||
+            target.target.id !== initialTarget.target.id ||
+            target.transitionId !== initialTarget.transitionId
+          ) {
+            throw new Error(`History ${action} target changed during preparation`);
+          }
+
+          let filesystemMode: "restore" | "skip" = "skip";
+          let skipReason: "git-unavailable" | "snapshot-unavailable" | "platform-unsupported" =
+            "snapshot-unavailable";
+          let preparedRestore: PreparedWorkspaceRestore | undefined;
+          if (target.target.workspaceStatus === "captured") {
+            const snapshot =
+              target.target.workspaceSnapshotId === null
+                ? null
+                : this.store.getWorkspaceSnapshot(target.target.workspaceSnapshotId);
+            if (snapshot !== null && snapshot.availability === "available") {
+              try {
+                const prepared = await lockedStore.prepareRestore(
+                  snapshot.rootTreeOid,
+                  expectedWorkspaceCurrent(sourceCapture),
+                  operationId,
+                );
+                if (prepared.status === "prepared") {
+                  filesystemMode = "restore";
+                  preparedRestore = prepared.plan;
+                } else {
+                  skipReason = prepared.reason;
+                }
+              } catch (error) {
+                if (
+                  !(error instanceof WorkspaceHistoryStoreError) ||
+                  error.code !== "snapshot-invalid"
+                ) {
+                  throw error;
+                }
+                skipReason = "snapshot-unavailable";
+              }
+            }
+          } else if (sourceCapture.status === "skipped") {
+            skipReason = sourceCapture.reason;
+          }
+          if (filesystemMode === "skip") await this.workspaceHistory.deleteRestorePlan(operationId);
+
+          const reserved = this.store.reserveHistoryOperation({
+            id: operationId,
+            sessionId: this.snapshot.id,
+            commandId: commandIdValue,
+            requestedAction: action,
+            expectedSourceStateId: source.id,
+            targetStateId: target.target.id,
+            userTransitionId: target.transitionId,
+            filesystemMode,
+            skipReason: filesystemMode === "skip" ? skipReason : null,
+            observation: this.workspaceObservation(source, capturedSource),
+          });
+          operationReserved = true;
+
+          if (preparedRestore !== undefined) {
+            this.store.updateHistoryOperationPhase(reserved.operation.id, "restoring");
+            await preparedRestore.apply();
+            this.store.updateHistoryOperationPhase(reserved.operation.id, "verified");
+          }
+
+          const result = {
+            status: action === "undo" ? ("undone" as const) : ("redone" as const),
+            clientCommandId: commandIdValue,
+            message: target.message,
+            historyStateId: target.target.id,
+            filesystem:
+              filesystemMode === "restore"
+                ? ({ status: "restored" } as const)
+                : ({ status: "skipped", reason: skipReason } as const),
+          };
+          this.store.commitHistoryNavigation({ operationId: reserved.operation.id, result });
+          this.snapshot = this.store.getSession(this.snapshot.id);
+          if (filesystemMode === "restore") {
+            try {
+              await this.workspaceHistory.deleteRestorePlan(operationId);
+            } catch (error) {
+              logger.warn("committed history navigation retained its restore plan", {
+                requestId: commandIdValue,
+                sessionId: this.snapshot.id,
+                operationId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          return result;
+        } catch (error) {
+          if (!operationReserved) {
+            if (capturedSource !== undefined) {
+              this.deleteUnreferencedWorkspaceOutcome(capturedSource);
+            }
+            try {
+              await this.workspaceHistory.deleteRestorePlan(operationId);
+            } catch (cleanupError) {
+              throw new AggregateError(
+                [error, cleanupError],
+                `History ${action} preparation and restore-plan cleanup both failed`,
+              );
+            }
+          }
+          throw error;
+        }
+      });
+    } catch (error) {
+      if (!operationReserved) {
+        this.store.releaseCommand(this.snapshot.id, commandIdValue, command);
+      }
+      throw error;
+    }
   }
 
   /**
@@ -3272,20 +3760,31 @@ class SessionActor {
         // A cancel that lands while summarization is finishing must still stop
         // the commit; the transcript is only rewritten here.
         live.controller.signal.throwIfAborted();
-        const saved = this.store.commitCompaction(
-          sessionId,
-          id,
-          command,
-          result.messages,
-          result.result,
-          {
-            // Prefer the engine's own summary: it is post-truncation and covers
-            // every stage, which a live delta buffer cannot guarantee.
-            summary: result.summary ?? combinedSummary(),
-            durationMs: Math.max(0, Date.now() - live.startedAt),
-            modelCalls,
-          },
-        );
+        const saved = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+          live.controller.signal.throwIfAborted();
+          const current = this.store.getCurrentHistoryState(sessionId);
+          live.controller.signal.throwIfAborted();
+          const workspace = await this.captureWorkspaceOutcome(lockedStore, live.controller.signal);
+          try {
+            live.controller.signal.throwIfAborted();
+            return this.store.commitHistoryCompaction({
+              sessionId,
+              commandId: id,
+              request: command,
+              expectedCurrentStateId: current.id,
+              stateId: crypto.randomUUID(),
+              transitionId: crypto.randomUUID(),
+              modelMessages: result.messages,
+              compactionEvent: completedEvent,
+              result: result.result,
+              observation: this.workspaceObservation(current, workspace),
+              ...workspace,
+            });
+          } catch (error) {
+            this.deleteUnreferencedWorkspaceOutcome(workspace);
+            throw error;
+          }
+        });
         live.finished = true;
         this.snapshot = saved.snapshot;
       });
@@ -3456,30 +3955,7 @@ class SessionActor {
   }
 
   private queuedSteeringCount(): number {
-    return this.steeringEntries.filter((entry) => entry.state === "queued").length;
-  }
-
-  /**
-   * Commit a steering message the live Claude query accepted. Runs through the
-   * actor lock because delivery is confirmed asynchronously, and consumes the
-   * queue entry exactly once so the queued count cannot drift.
-   */
-  private acknowledgeClaudeCodeSteering(active: ActiveRootRun, steeringId: string): void {
-    void this.withLock(async () => {
-      if (this.active !== active || active.phase !== "accepting-controls") return;
-      if (!active.agent.acknowledgeSteeringDelivery(steeringId)) return;
-      const entry = this.steeringEntries.find((candidate) => candidate.id === steeringId);
-      if (entry?.state === "queued") entry.state = "consumed";
-      this.snapshot = this.store.updateSessionState(
-        this.snapshot.id,
-        this.snapshot.status,
-        this.queuedSteeringCount(),
-      );
-      await this.appendChunk(active.runId, {
-        type: "data-session",
-        data: this.describe(this.snapshot),
-      });
-    });
+    return this.steeringEntries.length;
   }
 }
 
@@ -3500,6 +3976,17 @@ export class SessionService {
   private readonly resolveProviderType: (providerId: string) => ProviderType | undefined;
   private readonly resolveWebSearchProvider: WebSearchProviderResolver;
   private readonly protectedToolPaths: readonly string[];
+  private readonly workspaceHistoryDirectory: string;
+  private readonly workspaceHistoryNamespaceDirectory: string;
+  private readonly workspaceHistoryStores = new Map<string, WorkspaceHistoryStore>();
+  private readonly workspaceHistoryStoreFactory: (
+    options: WorkspaceHistoryStoreOptions,
+  ) => WorkspaceHistoryStore;
+  private readonly historyNamespaceId: string;
+  private readonly databasePathHash: string;
+  private readonly initialization: Promise<void>;
+  private initializationBlocksClose: boolean;
+  private workspaceSnapshotReconciliation: readonly SessionWorkspaceSnapshotReconciliation[] = [];
   private readonly activeTasks = new Set<Promise<void>>();
   private concurrentSubagents = 0;
   private acceptingAdmissions = true;
@@ -3523,6 +4010,40 @@ export class SessionService {
     this.store = this.options.store
       ? this.options.store
       : new MiniLilacSqliteStore(this.options.databasePath ?? "mini-lilac.sqlite");
+    if (
+      this.store.filename === ":memory:" &&
+      this.options.workspaceHistoryDirectory === undefined
+    ) {
+      if (this.options.store === undefined) this.store.close();
+      throw new Error(
+        "SessionService with an in-memory database requires workspaceHistoryDirectory",
+      );
+    }
+    this.workspaceHistoryDirectory = path.resolve(
+      this.options.workspaceHistoryDirectory ??
+        path.join(
+          path.dirname(this.store.filename),
+          `${path.basename(this.store.filename)}.workspace-history`,
+        ),
+    );
+    this.workspaceHistoryStoreFactory =
+      this.options.workspaceHistoryStoreFactory ??
+      ((storeOptions) => new WorkspaceHistoryStore(storeOptions));
+    this.historyNamespaceId = this.store.getHistoryStoreMetadata().namespaceId;
+    const databaseIdentity =
+      this.store.filename === ":memory:"
+        ? `:memory:${this.historyNamespaceId}`
+        : realpathSync.native(this.store.filename);
+    this.databasePathHash = createHash("sha256").update(databaseIdentity).digest("hex");
+    const databaseNamespaceHash = createHash("sha256")
+      .update(this.historyNamespaceId)
+      .update("\0")
+      .update(this.databasePathHash)
+      .digest("hex");
+    this.workspaceHistoryNamespaceDirectory = path.join(
+      this.workspaceHistoryDirectory,
+      `database-${databaseNamespaceHash}`,
+    );
     const databasePaths =
       this.store.filename === ":memory:"
         ? []
@@ -3536,6 +4057,7 @@ export class SessionService {
       this.options.config.providerConfigFile,
       this.options.config.providerAuthFile,
       getCodexAuthStoragePath(),
+      this.workspaceHistoryDirectory,
       ...databasePaths,
       ...(this.options.protectedToolPaths ?? []),
     ];
@@ -3576,6 +4098,572 @@ export class SessionService {
         this.concurrentSubagents = Math.max(0, this.concurrentSubagents - 1);
       },
     };
+    this.initializationBlocksClose =
+      this.store.listWorkspaces().length > 0 ||
+      this.store.listHistoryOperations().length > 0 ||
+      this.store.listPendingRunFinalizations().length > 0 ||
+      this.store.listRecoverableOpenRootRuns().length > 0;
+    this.initialization = this.recoverHistory().finally(() => {
+      this.initializationBlocksClose = false;
+    });
+    void this.initialization.catch((error) => {
+      logger.error("session history recovery failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  initialize(): Promise<void> {
+    return this.initialization;
+  }
+
+  private workspaceHistoryForWorkspace(workspace: StoredWorkspace): WorkspaceHistoryStore {
+    const existing = this.workspaceHistoryStores.get(workspace.id);
+    if (existing !== undefined) {
+      if (existing.cwd !== workspace.canonicalCwd) {
+        throw new Error(`Workspace '${workspace.id}' changed its canonical directory`);
+      }
+      return existing;
+    }
+    const created = this.workspaceHistoryStoreFactory({
+      cwd: workspace.canonicalCwd,
+      historyRoot: this.workspaceHistoryNamespaceDirectory,
+      workspaceId: workspace.id,
+      namespaceId: this.historyNamespaceId,
+      databasePathHash: this.databasePathHash,
+      protectedPaths: this.protectedToolPaths,
+      onMetric: (metric) => this.logWorkspaceHistoryMetric(workspace.id, metric),
+    });
+    this.workspaceHistoryStores.set(workspace.id, created);
+    return created;
+  }
+
+  private workspaceHistoryForSession(sessionId: string): WorkspaceHistoryStore {
+    return this.workspaceHistoryForWorkspace(this.store.getWorkspaceForSession(sessionId));
+  }
+
+  private logWorkspaceHistoryMetric(workspaceId: string, metric: WorkspaceHistoryMetric): void {
+    const accounting = this.store.getHistoryAccounting(workspaceId);
+    const fields = {
+      workspaceId,
+      metricType: metric.type,
+      durationMs: metric.durationMs,
+      candidatePathCount: metric.candidatePathCount,
+      managedPathCount: metric.managedPathCount,
+      payloadBytes: metric.payloadBytes.toString(),
+      stateCount: accounting.stateCount,
+      transitionCount: accounting.transitionCount,
+      branchTipCount: accounting.branchTipCount,
+      snapshotCount: accounting.snapshotCount,
+      redoStackCount: accounting.redoStackCount,
+      activeOperationCount: accounting.activeOperationCount,
+      pendingFinalizationCount: accounting.pendingFinalizationCount,
+    };
+    switch (metric.type) {
+      case "capture":
+      case "restore":
+        logger.info("workspace history metric", {
+          ...fields,
+          outcome: metric.outcome,
+          changed: metric.changed,
+        });
+        return;
+      case "verify":
+        logger.info("workspace history metric", { ...fields, outcome: metric.outcome });
+        return;
+      case "maintenance":
+        logger.info("workspace history metric", {
+          ...fields,
+          outcome: metric.outcome,
+          removedOrphanRefCount: metric.removedOrphanRefCount,
+          preservedOrphanRefCount: metric.preservedOrphanRefCount,
+        });
+        return;
+      case "capability-unavailable":
+        logger.info("workspace history metric", { ...fields, reason: metric.reason });
+        return;
+      case "verification-failure":
+        logger.warn("workspace history metric", {
+          ...fields,
+          operation: metric.operation,
+          errorCode: metric.errorCode,
+          verificationFailureCount: 1,
+        });
+    }
+  }
+
+  private async captureWorkspaceForSession(
+    sessionId: string,
+    lockedStore: LockedWorkspaceHistoryStore,
+    owner?: { readonly kind: "pending-run-finalization"; readonly runId: string },
+  ): Promise<StoredHistoryWorkspaceOutcome> {
+    assertWorkspaceHistoryAvailable(this.store, sessionId, "capture", owner);
+    const capture = await lockedStore.capture();
+    return this.recordWorkspaceCaptureForSession(sessionId, capture);
+  }
+
+  private recordWorkspaceCaptureForSession(
+    sessionId: string,
+    capture: WorkspaceHistoryCaptureResult,
+  ): StoredHistoryWorkspaceOutcome {
+    if (capture.status === "skipped") {
+      return {
+        workspaceSnapshotId: null,
+        workspaceStatus: "unavailable",
+        workspaceUnavailableReason: capture.reason,
+      };
+    }
+    const workspace = this.store.getWorkspaceForSession(sessionId);
+    if (workspace.id !== capture.workspaceId) {
+      throw new Error(
+        `Workspace capture '${capture.workspaceId}' does not belong to '${sessionId}'`,
+      );
+    }
+    const snapshot = this.store.createOrReuseWorkspaceSnapshot({
+      id: crypto.randomUUID(),
+      workspaceId: workspace.id,
+      rootTreeOid: capture.rootTreeOid,
+      gitRef: capture.gitRef,
+      formatVersion: capture.formatVersion,
+    });
+    return {
+      workspaceSnapshotId: snapshot.id,
+      workspaceStatus: "captured",
+      workspaceUnavailableReason: null,
+    };
+  }
+
+  private deleteUnreferencedWorkspaceOutcomeForSession(
+    outcome: StoredHistoryWorkspaceOutcome,
+  ): void {
+    if (outcome.workspaceSnapshotId === null) return;
+    const snapshot = this.store.getWorkspaceSnapshot(outcome.workspaceSnapshotId);
+    if (snapshot === null) return;
+    this.store.deleteUnreferencedWorkspaceSnapshots({
+      workspaceId: snapshot.workspaceId,
+      snapshotIds: [snapshot.id],
+    });
+  }
+
+  private async recoverPendingFinalization(
+    pending: PendingStoredRunFinalization,
+    lockedStore: LockedWorkspaceHistoryStore,
+  ): Promise<void> {
+    assertWorkspaceHistoryAvailable(this.store, pending.sessionId, "recover-finalization", {
+      kind: "pending-run-finalization",
+      runId: pending.runId,
+    });
+    let workspace: StoredHistoryWorkspaceOutcome = {
+      workspaceSnapshotId: null,
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "capture-failed",
+    };
+    let capture: WorkspaceHistoryCaptureResult | undefined;
+    try {
+      capture = await lockedStore.capture();
+    } catch (error) {
+      logger.warn("recovery workspace capture failed", {
+        requestId: pending.runId,
+        sessionId: pending.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (capture !== undefined) {
+      workspace = this.recordWorkspaceCaptureForSession(pending.sessionId, capture);
+    }
+    try {
+      this.store.commitPendingRunFinalization({
+        runId: pending.runId,
+        destinationStateId: crypto.randomUUID(),
+        ...workspace,
+      });
+    } catch (error) {
+      this.deleteUnreferencedWorkspaceOutcomeForSession(workspace);
+      throw error;
+    }
+  }
+
+  private async recoverHistory(): Promise<void> {
+    await this.reconcileWorkspaceSnapshotRefs();
+    const retainedOperations = this.store.listHistoryOperations();
+    for (const retained of retainedOperations) {
+      if (retained.filesystemMode === "restore") {
+        logger.info("workspace history restore retry", {
+          workspaceId: retained.workspaceId,
+          phase: retained.phase,
+          retryCount: 1,
+        });
+      }
+      await this.workspaceHistoryForSession(retained.sessionId).withWorkspaceLock(
+        async (lockedStore) => {
+          const operation = this.store.getHistoryOperation(retained.id);
+          if (operation === null) return;
+          try {
+            await this.recoverHistoryNavigation(operation, lockedStore);
+          } catch (error) {
+            const accounting = this.store.getHistoryAccounting(operation.workspaceId);
+            logger.warn("workspace history navigation recovery failed", {
+              workspaceId: operation.workspaceId,
+              phase: operation.phase,
+              recoveryFailureCount: 1,
+              activeOperationCount: accounting.activeOperationCount,
+              pendingFinalizationCount: accounting.pendingFinalizationCount,
+              errorType: error instanceof WorkspaceHistoryStoreError ? error.code : "unexpected",
+            });
+            throw error;
+          }
+        },
+      );
+    }
+    await this.cleanupWorkspaceRestorePlans();
+    const pending = this.store.listPendingRunFinalizations();
+    for (const entry of pending) {
+      await this.workspaceHistoryForSession(entry.sessionId).withWorkspaceLock(
+        async (lockedStore) => {
+          const current = this.store.getPendingRunFinalization(entry.runId);
+          if (current !== null) await this.recoverPendingFinalization(current, lockedStore);
+        },
+      );
+    }
+
+    for (const open of this.store.listRecoverableOpenRootRuns()) {
+      await this.workspaceHistoryForSession(open.sessionId).withWorkspaceLock(
+        async (lockedStore) => {
+          let prepared = this.store.getPendingRunFinalization(open.runId);
+          if (prepared === null) {
+            assertWorkspaceHistoryAvailable(this.store, open.sessionId, "recover-open-run");
+            const modelMessages = this.store.getModelMessages(open.sessionId);
+            prepared = this.store.reservePendingRunFinalization({
+              runId: open.runId,
+              sessionId: open.sessionId,
+              openTransitionId: open.openTransitionId,
+              modelMessages,
+              uiMessages: this.store.getUiMessages(open.sessionId),
+              runStatus: "error",
+              sessionStatus: "error",
+              error: "Runtime process stopped while run was active",
+              terminalResult: { text: terminalText(modelMessages) },
+              inputTokens: open.inputTokens,
+            });
+          }
+          await this.recoverPendingFinalization(prepared, lockedStore);
+        },
+      );
+    }
+    this.store.recoverInterruptedRuntimeState();
+    await this.runWorkspaceHistoryMaintenance();
+  }
+
+  private async runWorkspaceHistoryMaintenance(): Promise<void> {
+    for (const workspace of this.store.listWorkspaces()) {
+      const startedAt = performance.now();
+      try {
+        const result = await this.workspaceHistoryForWorkspace(workspace).runMaintenance({
+          loadExpectedRootTreeOids: () =>
+            this.store.listWorkspaceSnapshots(workspace.id).map((snapshot) => snapshot.rootTreeOid),
+          orphanGracePeriodMs: WORKSPACE_HISTORY_ORPHAN_GRACE_MS,
+          removeStoreIfUnused: {
+            canRemoveStore: () => {
+              const accounting = this.store.getHistoryAccounting(workspace.id);
+              return (
+                accounting.snapshotCount === 0 &&
+                accounting.activeOperationCount === 0 &&
+                accounting.pendingFinalizationCount === 0
+              );
+            },
+          },
+        });
+        const accounting = this.store.getHistoryAccounting(workspace.id);
+        if (result.status === "unavailable") {
+          logger.info("workspace history maintenance completed", {
+            workspaceId: workspace.id,
+            status: result.status,
+            reason: result.reason,
+            durationMs: performance.now() - startedAt,
+            stateCount: accounting.stateCount,
+            transitionCount: accounting.transitionCount,
+            branchTipCount: accounting.branchTipCount,
+            snapshotCount: accounting.snapshotCount,
+            redoStackCount: accounting.redoStackCount,
+            activeOperationCount: accounting.activeOperationCount,
+            pendingFinalizationCount: accounting.pendingFinalizationCount,
+            removedOrphanRefCount: 0,
+            preservedOrphanRefCount: 0,
+          });
+          continue;
+        }
+
+        this.workspaceSnapshotReconciliation = this.workspaceSnapshotReconciliation.map((status) =>
+          status.workspaceId === workspace.id && status.status === "reconciled"
+            ? { ...status, orphanRefs: result.preservedOrphanRefs }
+            : status,
+        );
+        logger.info("workspace history maintenance completed", {
+          workspaceId: workspace.id,
+          status: result.status,
+          storeDisposition: result.storeDisposition,
+          removalRefusalReason:
+            result.status === "maintained" ? result.removalRefusalReason : undefined,
+          durationMs: performance.now() - startedAt,
+          stateCount: accounting.stateCount,
+          transitionCount: accounting.transitionCount,
+          branchTipCount: accounting.branchTipCount,
+          snapshotCount: accounting.snapshotCount,
+          redoStackCount: accounting.redoStackCount,
+          activeOperationCount: accounting.activeOperationCount,
+          pendingFinalizationCount: accounting.pendingFinalizationCount,
+          expectedSnapshotCount: result.expected.length,
+          removedOrphanRefCount: result.removedOrphanRefs.length,
+          preservedOrphanRefCount: result.preservedOrphanRefs.length,
+          looseObjectCount: result.accounting.looseObjectCount,
+          looseObjectBytes: result.accounting.looseObjectBytes.toString(),
+          inPackObjectCount: result.accounting.inPackObjectCount,
+          packCount: result.accounting.packCount,
+          packBytes: result.accounting.packBytes.toString(),
+          prunePackableObjectCount: result.accounting.prunePackableObjectCount,
+          garbageObjectCount: result.accounting.garbageObjectCount,
+          garbageBytes: result.accounting.garbageBytes.toString(),
+        });
+      } catch (error) {
+        try {
+          const accounting = this.store.getHistoryAccounting(workspace.id);
+          logger.warn("workspace history maintenance failed", {
+            workspaceId: workspace.id,
+            durationMs: performance.now() - startedAt,
+            maintenanceFailureCount: 1,
+            stateCount: accounting.stateCount,
+            transitionCount: accounting.transitionCount,
+            branchTipCount: accounting.branchTipCount,
+            snapshotCount: accounting.snapshotCount,
+            redoStackCount: accounting.redoStackCount,
+            activeOperationCount: accounting.activeOperationCount,
+            pendingFinalizationCount: accounting.pendingFinalizationCount,
+            errorType: error instanceof WorkspaceHistoryStoreError ? error.code : "unexpected",
+          });
+        } catch {
+          logger.warn("workspace history maintenance failed", {
+            workspaceId: workspace.id,
+            durationMs: performance.now() - startedAt,
+            maintenanceFailureCount: 1,
+            accountingUnavailableCount: 1,
+            errorType: error instanceof WorkspaceHistoryStoreError ? error.code : "unexpected",
+          });
+        }
+      }
+    }
+  }
+
+  private async reconcileWorkspaceSnapshotRefs(): Promise<void> {
+    const statuses: SessionWorkspaceSnapshotReconciliation[] = [];
+    for (const workspace of this.store.listWorkspaces()) {
+      const historyStore = this.workspaceHistoryForWorkspace(workspace);
+      const reconciliation = await historyStore.withWorkspaceLock(async () => {
+        this.store.deleteUnreferencedWorkspaceSnapshots({ workspaceId: workspace.id });
+        return await historyStore.reconcileExpectedSnapshotRefs(
+          this.store.listWorkspaceSnapshots(workspace.id).map((snapshot) => snapshot.rootTreeOid),
+        );
+      });
+      const snapshots = this.store.listWorkspaceSnapshots(workspace.id);
+      if (reconciliation.status === "unavailable") {
+        statuses.push({
+          workspaceId: workspace.id,
+          canonicalCwd: workspace.canonicalCwd,
+          status: "unavailable",
+          reason: reconciliation.reason,
+          orphanRefs: [],
+        });
+        continue;
+      }
+
+      const expectedByRoot = new Map(
+        reconciliation.expected.map((expected) => [expected.rootTreeOid, expected]),
+      );
+      this.store.setWorkspaceSnapshotAvailability({
+        workspaceId: workspace.id,
+        updates: snapshots.map((snapshot) => {
+          const expected = expectedByRoot.get(snapshot.rootTreeOid);
+          if (expected === undefined) {
+            throw new Error(
+              `Workspace '${workspace.id}' reconciliation omitted snapshot '${snapshot.id}'`,
+            );
+          }
+          if (expected.status === "missing") {
+            return {
+              snapshotId: snapshot.id,
+              availability: "missing" as const,
+              detail: `Private snapshot tree '${snapshot.rootTreeOid}' is missing after authoritative startup reconciliation`,
+            };
+          }
+          if (expected.status === "corrupt") {
+            return {
+              snapshotId: snapshot.id,
+              availability: "corrupt" as const,
+              detail: `Private snapshot tree '${snapshot.rootTreeOid}' is corrupt after authoritative startup reconciliation`,
+            };
+          }
+          return {
+            snapshotId: snapshot.id,
+            availability: "available" as const,
+            detail: null,
+          };
+        }),
+      });
+      statuses.push({
+        workspaceId: workspace.id,
+        canonicalCwd: workspace.canonicalCwd,
+        status: "reconciled",
+        orphanRefs: reconciliation.orphanRefs,
+      });
+      if (reconciliation.orphanRefs.length > 0) {
+        logger.warn("workspace history reconciliation retained orphan snapshot refs", {
+          workspaceId: workspace.id,
+          orphanRefCount: reconciliation.orphanRefs.length,
+        });
+      }
+    }
+    this.workspaceSnapshotReconciliation = statuses;
+  }
+
+  private async cleanupWorkspaceRestorePlans(): Promise<void> {
+    const activeByWorkspace = new Map<string, string[]>();
+    for (const operation of this.store.listHistoryOperations()) {
+      if (operation.filesystemMode !== "restore") continue;
+      const active = activeByWorkspace.get(operation.workspaceId) ?? [];
+      active.push(operation.id);
+      activeByWorkspace.set(operation.workspaceId, active);
+    }
+    for (const workspace of this.store.listWorkspaces()) {
+      try {
+        await this.workspaceHistoryForWorkspace(workspace).cleanupRestorePlans(
+          activeByWorkspace.get(workspace.id) ?? [],
+          RESTORE_PLAN_CLEANUP_GRACE_MS,
+        );
+      } catch (error) {
+        logger.warn("workspace restore-plan maintenance failed", {
+          workspaceId: workspace.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  private async recoverHistoryNavigation(
+    operation: StoredHistoryOperation,
+    lockedStore: LockedWorkspaceHistoryStore,
+  ): Promise<void> {
+    assertWorkspaceHistoryAvailable(this.store, operation.sessionId, "recover-navigation", {
+      kind: "history-operation",
+      operationId: operation.id,
+    });
+    const transition = this.store.getHistoryTransition(operation.userTransitionId);
+    if (
+      transition.kind !== "user-message" ||
+      transition.toStateId === null ||
+      transition.userMessage === null
+    ) {
+      throw new Error(`Retained history operation '${operation.id}' has no exact user message`);
+    }
+
+    if (operation.filesystemMode === "restore") {
+      await this.workspaceHistoryForSession(operation.sessionId).cleanupStaleRestoreArtifacts();
+      const target = this.store.getHistoryState(operation.targetStateId);
+      const snapshot =
+        target.workspaceSnapshotId === null
+          ? null
+          : this.store.getWorkspaceSnapshot(target.workspaceSnapshotId);
+      if (
+        target.workspaceStatus !== "captured" ||
+        snapshot === null ||
+        snapshot.availability !== "available"
+      ) {
+        throw new Error(
+          `Retained history operation '${operation.id}' target snapshot is unavailable`,
+        );
+      }
+      if (operation.phase === "verified") {
+        const verified = await this.workspaceHistoryForSession(operation.sessionId).verifySnapshot(
+          snapshot.rootTreeOid,
+        );
+        if (verified.status === "skipped") {
+          throw new Error(
+            `Retained history operation '${operation.id}' requires Git for verification (${verified.reason})`,
+          );
+        }
+      } else {
+        const sourceState = this.store.getHistoryState(
+          operation.observedSourceStateId ?? operation.sourceStateId,
+        );
+        const sourceSnapshot =
+          sourceState.workspaceSnapshotId === null
+            ? null
+            : this.store.getWorkspaceSnapshot(sourceState.workspaceSnapshotId);
+        if (
+          sourceState.workspaceStatus !== "captured" ||
+          sourceSnapshot === null ||
+          sourceSnapshot.availability !== "available"
+        ) {
+          throw new Error(
+            `Retained history operation '${operation.id}' source snapshot is unavailable`,
+          );
+        }
+        if (lockedStore.resumePreparedRestore === undefined) {
+          throw new Error("Workspace history store does not support durable restore resumption");
+        }
+        const prepared = await lockedStore.resumePreparedRestore({
+          operationId: operation.id,
+          targetRootTreeOid: snapshot.rootTreeOid,
+          sourceRootTreeOid: sourceSnapshot.rootTreeOid,
+        });
+        if (prepared.status === "skipped") {
+          throw new Error(
+            `Retained history operation '${operation.id}' requires Git for recovery (${prepared.reason})`,
+          );
+        }
+        if (operation.phase === "prepared") {
+          this.store.updateHistoryOperationPhase(operation.id, "restoring");
+        }
+        await prepared.plan.apply();
+        this.store.updateHistoryOperationPhase(operation.id, "verified");
+      }
+    }
+
+    let filesystem: MiniLilacHistoryFilesystemResult;
+    if (operation.filesystemMode === "restore") {
+      filesystem = { status: "restored" };
+    } else {
+      if (operation.skipReason === null) {
+        throw new Error(`Retained history operation '${operation.id}' has no skip reason`);
+      }
+      filesystem = { status: "skipped", reason: operation.skipReason };
+    }
+    const result: StoredHistoryNavigationResult =
+      operation.requestedAction === "undo"
+        ? {
+            status: "undone",
+            clientCommandId: operation.commandId,
+            message: transition.userMessage,
+            historyStateId: operation.targetStateId,
+            filesystem,
+          }
+        : {
+            status: "redone",
+            clientCommandId: operation.commandId,
+            message: transition.userMessage,
+            historyStateId: operation.targetStateId,
+            filesystem,
+          };
+    this.store.commitHistoryNavigation({ operationId: operation.id, result });
+    if (operation.filesystemMode === "restore") {
+      try {
+        await this.workspaceHistoryForSession(operation.sessionId).deleteRestorePlan(operation.id);
+      } catch (error) {
+        logger.warn("recovered history navigation retained its restore plan", {
+          sessionId: operation.sessionId,
+          operationId: operation.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   createSession(input: CreateSessionInput): Promise<MiniLilacSessionSnapshot> {
@@ -3586,6 +4674,7 @@ export class SessionService {
   private async createSessionInternal(
     input: CreateSessionInput,
   ): Promise<MiniLilacSessionSnapshot> {
+    await this.initialization;
     if (input.id?.startsWith("sub:")) {
       throw new Error("Session ids beginning with 'sub:' are reserved for delegated sessions");
     }
@@ -3633,7 +4722,9 @@ export class SessionService {
   }
 
   getSessionResume(sessionId: string): Promise<SessionResumeProjection> {
-    return this.trackOperation(this.actor(sessionId).getSessionResume());
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(sessionId).getSessionResume()),
+    );
   }
 
   getTodos(sessionId: string): MiniLilacTodoState {
@@ -3646,6 +4737,7 @@ export class SessionService {
   }
 
   async listSkills(cwdValue: string, profileId?: string): Promise<MiniLilacSkillSummary[]> {
+    await this.initialization;
     if (this.options.skillCatalog === undefined) return [];
     const cwd = await realpath(cwdValue);
     const cwdStat = await stat(cwd);
@@ -3663,7 +4755,11 @@ export class SessionService {
     clientCommandId?: string,
   ): Promise<StartedSessionRun> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(sessionId).startPrompt(userMessage, clientCommandId));
+    return this.trackOperation(
+      this.afterInitialization(() =>
+        this.actor(sessionId).startPrompt(userMessage, clientCommandId),
+      ),
+    );
   }
 
   private promptDelegatedSession(
@@ -3802,7 +4898,9 @@ export class SessionService {
 
   steer(request: MiniLilacSteerRequest): Promise<MiniLilacSteerResult> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(request.sessionId).steer(request));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).steer(request)),
+    );
   }
 
   interruptQueuedSteering(
@@ -3810,29 +4908,96 @@ export class SessionService {
   ): Promise<MiniLilacInterruptQueuedSteeringResult> {
     this.assertAcceptingAdmissions();
     const parsed = miniLilacInterruptQueuedSteeringRequestSchema.parse(request);
-    return this.trackOperation(this.actor(parsed.sessionId).interruptQueuedSteering(parsed));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(parsed.sessionId).interruptQueuedSteering(parsed)),
+    );
   }
 
   cancel(request: MiniLilacCancelRequest): Promise<MiniLilacCancelResult> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(request.sessionId).cancel(request));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).cancel(request)),
+    );
   }
 
   undo(request: MiniLilacUndoRequest): Promise<MiniLilacUndoResult> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(request.sessionId).undo(request));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).undo(request)),
+    );
+  }
+
+  redo(request: MiniLilacRedoRequest): Promise<MiniLilacRedoResult> {
+    this.assertAcceptingAdmissions();
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).redo(request)),
+    );
+  }
+
+  getHistoryRecoveryStatus(): SessionHistoryRecoveryStatus {
+    return {
+      navigation: this.store.listHistoryOperations(),
+      pendingFinalizations: this.store.listPendingRunFinalizations(),
+      workspaceSnapshots: this.workspaceSnapshotReconciliation,
+    };
+  }
+
+  abandonHistoryNavigation(
+    input: AcknowledgeStoredHistoryNavigationAbandonment,
+  ): Promise<StoredHistoryCommandError> {
+    return this.trackOperation(this.abandonHistoryNavigationInternal(input));
+  }
+
+  private async abandonHistoryNavigationInternal(
+    input: AcknowledgeStoredHistoryNavigationAbandonment,
+  ): Promise<StoredHistoryCommandError> {
+    try {
+      await this.initialization;
+    } catch {
+      // A retained restore can intentionally fail initialization; abandonment is its escape hatch.
+    }
+    const operation = this.store.getHistoryOperation(input.operationId);
+    if (operation === null)
+      throw new Error(`History operation '${input.operationId}' was not found`);
+    return await this.workspaceHistoryForSession(operation.sessionId).withWorkspaceLock(
+      async () => {
+        const retained = this.store.getHistoryOperation(input.operationId);
+        if (retained === null) {
+          throw new Error(`History operation '${input.operationId}' was not found`);
+        }
+        const abandoned = this.store.abandonHistoryNavigation(input);
+        if (retained.filesystemMode === "restore") {
+          try {
+            await this.workspaceHistoryForSession(retained.sessionId).deleteRestorePlan(
+              retained.id,
+            );
+          } catch (error) {
+            logger.warn("abandoned history navigation retained its restore plan", {
+              sessionId: retained.sessionId,
+              operationId: retained.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        return abandoned;
+      },
+    );
   }
 
   compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(request.sessionId).compact(request));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).compact(request)),
+    );
   }
 
   cancelCompaction(
     request: MiniLilacCancelCompactionRequest,
   ): Promise<MiniLilacCancelCompactionResult> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(request.sessionId).cancelCompaction(request));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).cancelCompaction(request)),
+    );
   }
 
   /** Decorate a store snapshot with the server-side config clients need. */
@@ -3844,13 +5009,16 @@ export class SessionService {
     request: MiniLilacUpdateSessionBindingsRequest,
   ): Promise<MiniLilacSessionSnapshot> {
     this.assertAcceptingAdmissions();
-    return this.trackOperation(this.actor(request.sessionId).updateBindings(request));
+    return this.trackOperation(
+      this.afterInitialization(() => this.actor(request.sessionId).updateBindings(request)),
+    );
   }
 
   close(): void {
     if (this.closed) return;
     if (
       this.activeTasks.size > 0 ||
+      this.initializationBlocksClose ||
       this.delegatedSessionLocks.size > 0 ||
       [...this.actors.values()].some((actor) => !actor.isQuiescent())
     ) {
@@ -3880,6 +5048,7 @@ export class SessionService {
   async requestShutdown(): Promise<void> {
     if (this.closed) return;
     this.acceptingAdmissions = false;
+    await this.initialization;
     await Promise.all([...this.actors.values()].map((actor) => actor.requestShutdown()));
   }
 
@@ -3908,6 +5077,7 @@ export class SessionService {
       this.options.skillCatalog,
       this.resolveWebSearchProvider,
       this.protectedToolPaths,
+      this.workspaceHistoryForSession(snapshot.id),
       this.options.toolResultArtifacts,
       this.options.toolResultOutputConfig ?? DEFAULT_TOOL_RESULT_OUTPUT_CONFIG,
       this.options.transientModelRetry ?? CODEX_TRANSIENT_RETRY,
@@ -3921,6 +5091,11 @@ export class SessionService {
     if (!this.acceptingAdmissions || this.closed) {
       throw new Error("SessionService is shutting down and is not accepting admissions");
     }
+  }
+
+  private async afterInitialization<T>(operation: () => Promise<T> | T): Promise<T> {
+    await this.initialization;
+    return await operation();
   }
 
   private trackOperation<T>(operation: Promise<T>): Promise<T> {
@@ -3957,6 +5132,7 @@ export class SessionService {
   }
 
   private async performShutdown(graceMs: number): Promise<void> {
+    await this.initialization;
     const deadline = Date.now() + graceMs;
     const requestedActors = new Set<SessionActor>();
     for (;;) {
