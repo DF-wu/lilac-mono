@@ -26,6 +26,7 @@ import {
   miniLilacOutputRollbackSchema,
   miniLilacProviderMetadataSchema,
   miniLilacRedoResultSchema,
+  miniLilacReasoningSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSessionStatusSchema,
   miniLilacSteeringCommittedChunkSchema,
@@ -323,6 +324,127 @@ const migrationRunRowSchema = z.object({
   status: runStatusSchema,
   parent_run_id: z.string().nullable(),
 });
+const migrationIdentifierSchema = z.string().trim().min(1);
+const migrationSessionSnapshotV4Schema = z.strictObject({
+  id: migrationIdentifierSchema,
+  activeRunId: migrationIdentifierSchema.nullable(),
+  activeCompactionCommandId: migrationIdentifierSchema.nullable().optional(),
+  status: z.enum(["idle", "streaming", "compacting", "cancelling", "error"]),
+  cwd: z.string().min(1),
+  model: migrationIdentifierSchema.nullable(),
+  profile: migrationIdentifierSchema.nullable(),
+  reasoning: miniLilacReasoningSchema.nullable(),
+  title: z.string().max(100).optional(),
+  inputTokens: z.number().int().nonnegative().nullable().optional(),
+  inputTokensEstimated: z.boolean().optional(),
+  contextWindow: z.number().int().positive().nullable().optional(),
+  compactionThreshold: z.number().positive().max(1).optional(),
+  queuedSteeringCount: z.number().int().nonnegative(),
+  createdAt: z.string().datetime({ offset: true }).optional(),
+  updatedAt: z.string().datetime({ offset: true }).optional(),
+});
+const migrationSessionDataPartV4Schema = z.strictObject({
+  type: z.literal("data-session"),
+  id: migrationIdentifierSchema.optional(),
+  data: migrationSessionSnapshotV4Schema,
+});
+const migrationCompactionMetricsV4Schema = {
+  status: z.enum(["completed", "failed"]),
+  messageCountBefore: z.number().int().nonnegative(),
+  messageCountAfter: z.number().int().nonnegative().optional(),
+  estimatedInputTokensBefore: z.number().int().nonnegative().optional(),
+  estimatedInputTokensAfter: z.number().int().nonnegative().optional(),
+  error: z.string().optional(),
+} as const;
+const migrationCompactionEventV4Schema = z.discriminatedUnion("source", [
+  z.strictObject({
+    source: z.literal("automatic"),
+    reason: z.enum(["threshold", "overflow"]),
+    ...migrationCompactionMetricsV4Schema,
+  }),
+  z.strictObject({
+    source: z.literal("manual"),
+    reason: z.literal("manual"),
+    ...migrationCompactionMetricsV4Schema,
+  }),
+]);
+const migrationCompactionDataPartV4Schema = z.strictObject({
+  type: z.literal("data-compaction"),
+  id: migrationIdentifierSchema.optional(),
+  data: migrationCompactionEventV4Schema,
+});
+const migrationUiMessageEnvelopeSchema = z.looseObject({
+  role: z.enum(["system", "user", "assistant"]),
+  parts: z.array(z.unknown()),
+});
+
+type MigratedUiMessages = {
+  readonly messages: MiniLilacUIMessage[];
+  readonly changed: boolean;
+};
+
+function parseMigratedUiMessage(value: unknown): {
+  readonly message: MiniLilacUIMessage | null;
+  readonly changed: boolean;
+} {
+  const envelope = migrationUiMessageEnvelopeSchema.parse(value);
+  const parts: unknown[] = [];
+  let changed = false;
+  for (const part of envelope.parts) {
+    if (migrationSessionDataPartV4Schema.safeParse(part).success) {
+      changed = true;
+      continue;
+    }
+    const legacyCompaction = migrationCompactionDataPartV4Schema.safeParse(part);
+    if (legacyCompaction.success) {
+      const { status, ...data } = legacyCompaction.data.data;
+      parts.push({
+        type: legacyCompaction.data.type,
+        ...(legacyCompaction.data.id === undefined ? {} : { id: legacyCompaction.data.id }),
+        data: {
+          ...data,
+          phase: status,
+          ...(status === "completed" ? { outcome: "compacted" as const } : {}),
+        },
+      });
+      changed = true;
+      continue;
+    }
+    parts.push(part);
+  }
+  if (!changed) {
+    return { message: miniLilacMessagesSchema.element.parse(value), changed: false };
+  }
+  if (parts.length === 0) {
+    if (envelope.role === "user") {
+      throw new Error("Legacy user UI message contains only session snapshot parts");
+    }
+    return { message: null, changed: true };
+  }
+  return {
+    message: miniLilacMessagesSchema.element.parse({ ...envelope, parts }),
+    changed: true,
+  };
+}
+
+function parseMigratedUiMessages(values: readonly unknown[]): MigratedUiMessages {
+  const messages: MiniLilacUIMessage[] = [];
+  let changed = false;
+  for (const value of values) {
+    const migrated = parseMigratedUiMessage(value);
+    changed ||= migrated.changed;
+    if (migrated.message !== null) messages.push(migrated.message);
+  }
+  return { messages, changed };
+}
+
+function parseMigratedUserUiMessage(value: unknown): MiniLilacUserUIMessage {
+  const migrated = parseMigratedUiMessage(value);
+  if (migrated.message === null) {
+    throw new Error("Legacy user UI message cannot be empty after migration");
+  }
+  return miniLilacUserUIMessageSchema.parse(migrated.message);
+}
 export const storedHistoryCommandErrorSchema = z.strictObject({
   type: z.literal("history-command-error"),
   code: z.literal("history-recovery-abandoned"),
@@ -1742,13 +1864,19 @@ export class MiniLilacSqliteStore {
           )
           .get(sessionId),
       );
-    const currentHeads = this.getTranscriptHeads(sessionId);
+    let currentHeads = this.getTranscriptHeads(sessionId);
     modelMessagesSchema.parse(
       this.readSerializedChain(sessionId, "model", currentHeads.model_head_id).map(deserialize),
     );
-    const currentUi = miniLilacMessagesSchema.parse(
+    const migratedCurrentUi = parseMigratedUiMessages(
       this.readSerializedChain(sessionId, "ui", currentHeads.ui_head_id).map(deserialize),
     );
+    const currentUi = migratedCurrentUi.messages;
+    if (migratedCurrentUi.changed) {
+      const uiHeadId = this.internChain(sessionId, "ui", currentUi);
+      this.setTranscriptHeads(sessionId, currentHeads.model_head_id, uiHeadId);
+      currentHeads = { ...currentHeads, ui_head_id: uiHeadId };
+    }
     const checkpoints = z.array(migrationCheckpointRowSchema).parse(
       this.database
         .query(
@@ -1792,13 +1920,17 @@ export class MiniLilacSqliteStore {
       modelMessagesSchema.parse(
         this.readSerializedChain(sessionId, "model", checkpoint.model_head_id).map(deserialize),
       );
+      const migratedUiPrefix = parseMigratedUiMessages(
+        this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id).map(deserialize),
+      );
+      const uiHeadId = migratedUiPrefix.changed
+        ? this.internChain(sessionId, "ui", migratedUiPrefix.messages)
+        : checkpoint.ui_head_id;
       return {
-        row: checkpoint,
+        row: { ...checkpoint, ui_head_id: uiHeadId },
         run,
-        message: miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json)),
-        uiPrefix: miniLilacMessagesSchema.parse(
-          this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id).map(deserialize),
-        ),
+        message: parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json)),
+        uiPrefix: migratedUiPrefix.messages,
       };
     });
     if (hasActiveLifecycle) {
@@ -2071,9 +2203,11 @@ export class MiniLilacSqliteStore {
         .all(sessionId)
         .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
       modelMessagesSchema.parse(modelValues.map(deserialize));
-      miniLilacMessagesSchema.parse(uiValues.map(deserialize));
+      const migratedUi = parseMigratedUiMessages(uiValues.map(deserialize));
       const modelHeadId = this.internSerializedChain(sessionId, "model", modelValues);
-      const uiHeadId = this.internSerializedChain(sessionId, "ui", uiValues);
+      const uiHeadId = migratedUi.changed
+        ? this.internChain(sessionId, "ui", migratedUi.messages)
+        : this.internSerializedChain(sessionId, "ui", uiValues);
       this.setTranscriptHeads(sessionId, modelHeadId, uiHeadId);
     }
 
@@ -2091,9 +2225,11 @@ export class MiniLilacSqliteStore {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const checkpoint of checkpoints) {
-      const message = miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json));
+      const message = parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json));
       const modelPrefix = modelMessagesSchema.parse(deserialize(checkpoint.model_prefix_json));
-      const uiPrefix = miniLilacMessagesSchema.parse(deserialize(checkpoint.ui_prefix_json));
+      const uiPrefix = parseMigratedUiMessages(
+        z.array(z.unknown()).parse(deserialize(checkpoint.ui_prefix_json)),
+      ).messages;
       const modelHeadId = this.internChain(checkpoint.session_id, "model", modelPrefix);
       const uiHeadId = this.internChain(checkpoint.session_id, "ui", uiPrefix);
       insertCheckpoint.run(

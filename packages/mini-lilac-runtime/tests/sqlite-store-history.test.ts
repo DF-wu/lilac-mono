@@ -137,7 +137,15 @@ function finalizePrompt(
   });
 }
 
-async function createV4Database(options: { unusual?: boolean; active?: boolean } = {}): Promise<{
+async function createV4Database(
+  options: {
+    unusual?: boolean;
+    active?: boolean;
+    legacySessionParts?: boolean;
+    legacyCompactionParts?: boolean;
+    legacySessionOnlySuffix?: boolean;
+  } = {},
+): Promise<{
   databasePath: string;
   directory: string;
 }> {
@@ -221,6 +229,46 @@ async function createV4Database(options: { unusual?: boolean; active?: boolean }
   `);
   const firstUser = userMessage("user-1");
   const secondUser = userMessage("user-2");
+  const legacySessionParts = options.legacySessionParts
+    ? [
+        {
+          type: "data-session",
+          data: {
+            id: "session-1",
+            activeRunId: null,
+            status: "idle",
+            cwd: directory,
+            model: "test/mock",
+            profile: "reader",
+            reasoning: "high",
+            title: "Migrated",
+            inputTokens: null,
+            inputTokensEstimated: false,
+            contextWindow: null,
+            queuedSteeringCount: 0,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        },
+      ]
+    : [];
+  const legacyCompactionParts = options.legacyCompactionParts
+    ? [
+        {
+          type: "data-compaction",
+          id: "compaction-1",
+          data: {
+            source: "manual",
+            reason: "manual",
+            status: "completed",
+            messageCountBefore: 20,
+            messageCountAfter: 5,
+            estimatedInputTokensBefore: 2_000,
+            estimatedInputTokensAfter: 500,
+          },
+        },
+      ]
+    : [];
   const model: ModelMessage[] = [
     { role: "user", content: "user-1" },
     { role: "assistant", content: "answer-1" },
@@ -232,13 +280,17 @@ async function createV4Database(options: { unusual?: boolean; active?: boolean }
     {
       id: "assistant-1",
       role: "assistant" as const,
-      parts: [{ type: "text" as const, text: "answer-1" }],
+      parts: [...legacySessionParts, { type: "text" as const, text: "answer-1" }],
     },
     secondUser,
     {
       id: "assistant-2",
       role: "assistant" as const,
-      parts: [{ type: "text" as const, text: "answer-2" }],
+      parts: [
+        ...legacySessionParts,
+        ...legacyCompactionParts,
+        { type: "text" as const, text: "answer-2" },
+      ],
     },
   ];
   const insertNode = database.query(
@@ -258,6 +310,22 @@ async function createV4Database(options: { unusual?: boolean; active?: boolean }
     insertNode.run(id, "ui", uiParent, index + 1, serialize(message), `ui-${id}`);
     uiParent = id;
   });
+  let currentUiHead = 13;
+  if (options.legacySessionOnlySuffix) {
+    insertNode.run(
+      30,
+      "ui",
+      currentUiHead,
+      5,
+      serialize({
+        id: "assistant-session-only",
+        role: "assistant",
+        parts: legacySessionParts,
+      }),
+      "ui-session-only",
+    );
+    currentUiHead = 30;
+  }
   let secondUiHead = 11;
   if (options.unusual) {
     insertNode.run(
@@ -277,9 +345,9 @@ async function createV4Database(options: { unusual?: boolean; active?: boolean }
   database
     .query(
       `INSERT INTO session_transcript_heads (session_id, model_head_id, ui_head_id)
-       VALUES ('session-1', 4, 13)`,
+       VALUES ('session-1', 4, ?)`,
     )
-    .run();
+    .run(currentUiHead);
   const insertCheckpoint = database.query(
     `INSERT INTO user_checkpoints
       (session_id, ui_position, user_message_json, model_head_id, ui_head_id,
@@ -519,6 +587,71 @@ describe("MiniLilacSqliteStore history schema", () => {
         .get(),
     ).toBeNull();
     expect(store.database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    store.close();
+  });
+
+  it("normalizes legacy data parts while migrating v4 transcript chains", async () => {
+    const { databasePath } = await createV4Database({
+      legacySessionParts: true,
+      legacyCompactionParts: true,
+      legacySessionOnlySuffix: true,
+    });
+
+    const store = new MiniLilacSqliteStore(databasePath);
+
+    expect(store.database.query("PRAGMA user_version").get()).toEqual({
+      user_version: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
+    expect(store.getUiMessages("session-1")).toEqual([
+      userMessage("user-1"),
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "answer-1" }],
+      },
+      userMessage("user-2"),
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [
+          {
+            type: "data-compaction",
+            id: "compaction-1",
+            data: {
+              source: "manual",
+              reason: "manual",
+              phase: "completed",
+              outcome: "compacted",
+              messageCountBefore: 20,
+              messageCountAfter: 5,
+              estimatedInputTokensBefore: 2_000,
+              estimatedInputTokensAfter: 500,
+            },
+          },
+          { type: "text", text: "answer-2" },
+        ],
+      },
+    ]);
+    const topology = store.listHistoryTopology("session-1");
+    expect(topology.transitions.map((transition) => transition.userMessage?.id)).toEqual([
+      "user-1",
+      "user-2",
+    ]);
+    expect(
+      topology.states
+        .flatMap((state) => store.getHistoryStateUiMessages(state.id))
+        .flatMap((message) => message.parts)
+        .some((part) => part.type === "data-session"),
+    ).toBe(false);
+    expect(store.database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(
+      store.database.query("SELECT value_json FROM transcript_nodes WHERE id = 30").get(),
+    ).not.toBeNull();
+    expect(
+      store.database
+        .query("SELECT ui_head_id FROM session_transcript_heads WHERE session_id = 'session-1'")
+        .get(),
+    ).not.toEqual({ ui_head_id: 30 });
     store.close();
   });
 
