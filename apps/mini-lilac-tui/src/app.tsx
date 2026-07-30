@@ -86,6 +86,7 @@ import {
   shellTranscriptPreview,
   type EditOperation,
   type EditTranscript,
+  type ExplorationOperation,
   type ExplorationTranscript,
   type ShellTranscript,
   type SubagentTranscript,
@@ -285,6 +286,14 @@ function ExplorationView(props: {
     ].filter((value) => value !== undefined),
   );
 
+  const operationStatusColor = (operation: ExplorationOperation) => {
+    if (operation.status === "error") return props.colors.danger;
+    if (operation.status === "denied") return props.colors.warning;
+    if (operation.status === "cancelled") return props.colors.muted;
+    if (operation.status === "pending") return props.colors.accent;
+    return props.colors.success;
+  };
+
   return (
     <box width="100%">
       <box width="100%" flexDirection="row">
@@ -323,6 +332,21 @@ function ExplorationView(props: {
                 <text flexGrow={1} wrapMode="word" fg={props.colors.text} selectable={true}>
                   {truncateEnd(operation.detail, 240)}
                 </text>
+                <text flexShrink={0} paddingLeft={1} fg={operationStatusColor(operation)}>
+                  {operation.status.toUpperCase()}
+                </text>
+                <Show when={operation.error !== undefined}>
+                  <text
+                    flexGrow={1}
+                    minWidth={0}
+                    paddingLeft={1}
+                    wrapMode="word"
+                    fg={props.colors.danger}
+                    selectable={true}
+                  >
+                    {operation.error ?? ""}
+                  </text>
+                </Show>
               </box>
             )}
           </For>

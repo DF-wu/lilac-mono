@@ -1701,6 +1701,44 @@ describe("MiniLilacApp tool interactions", () => {
     }
   });
 
+  it("keeps failed exploration details collapsed and renders status and error on expansion", async () => {
+    const app = await renderApp([
+      {
+        id: "assistant-failed-exploration",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "read_file",
+            toolCallId: "read-failed",
+            state: "output-error",
+            input: { path: "src/missing.ts" },
+            errorText: "permission check failed",
+          },
+        ],
+      },
+    ]);
+    try {
+      await app.flush();
+      const collapsed = app.captureCharFrame();
+      expect(collapsed).toContain("Explored · 1 read · 1 failed");
+      expect(collapsed).not.toContain("src/missing.ts");
+      expect(collapsed).not.toContain("permission check failed");
+
+      await clickRenderedText(app, "Explored");
+      const expanded = app.captureCharFrame();
+      expect(expanded).toContain("src/missing.ts");
+      expect(expanded).toContain("ERROR");
+      expect(expanded).toContain("permission check failed");
+      expect(renderedSpan(app, "ERROR").fg.equals(RGBA.fromHex(COLORS.danger))).toBe(true);
+      expect(
+        renderedSpan(app, "permission check failed").fg.equals(RGBA.fromHex(COLORS.danger)),
+      ).toBe(true);
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
   it("does not expand a shell block when its text is selected", async () => {
     const output = Array.from({ length: 10 }, (_, index) => `line ${index + 1}`).join("\n");
     const app = await renderApp([
