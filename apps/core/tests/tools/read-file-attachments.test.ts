@@ -7,6 +7,7 @@ import { asSchema, type ToolModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
 
+import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-result-output-normalizer";
 import { batchTool } from "../../src/tools/batch";
 import { fsTool } from "../../src/tools/fs/fs";
 
@@ -133,6 +134,43 @@ describe("read_file attachments", () => {
     expect(supported.format).toStartWith("Text files only.");
   });
 
+  it("does not emit attachment output when the model lacks direct media support", async () => {
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    await writeFile(path.join(baseDir, "unsupported.png"), png);
+    const readFile = fsTool(baseDir).read_file;
+    const output = await resolveExecuteResult(
+      readFile.execute!(
+        { path: "unsupported.png" },
+        { toolCallId: "unsupported", messages: [], context: {} },
+      ),
+    );
+
+    expect(isAttachmentResult(output)).toBe(false);
+  });
+
+  it("rejects mislabeled attachment content and preserves failure semantics", async () => {
+    await writeFile(path.join(baseDir, "fake.png"), "not an image");
+    const readFile = fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read_file;
+    const output = await resolveExecuteResult(
+      readFile.execute!(
+        { path: "fake.png" },
+        { toolCallId: "fake-image", messages: [], context: {} },
+      ),
+    );
+    expect(output).toMatchObject({ success: false });
+    expect(JSON.stringify(output)).toContain("not a supported image or PDF");
+
+    const modelOutput = await readFile.toModelOutput!({
+      toolCallId: "fake-image",
+      input: { path: "fake.png" },
+      output,
+    });
+    expect(modelOutput).toMatchObject({ type: "error-json", value: { success: false } });
+  });
+
   it("returns images as file tool-result content", async () => {
     const pngBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=";
@@ -140,7 +178,7 @@ describe("read_file attachments", () => {
 
     await writeFile(path.join(baseDir, "img.png"), pngBytes);
 
-    const tools = fsTool(baseDir);
+    const tools = fsTool(baseDir, { readFileDirectAttachmentSupported: true });
     const readFile = tools.read_file;
 
     expect(readFile.execute).toBeDefined();
@@ -178,7 +216,7 @@ describe("read_file attachments", () => {
     );
     await writeFile(path.join(baseDir, "doc.pdf"), pdf);
 
-    const tools = fsTool(baseDir);
+    const tools = fsTool(baseDir, { readFileDirectAttachmentSupported: true });
     const readFile = tools.read_file;
 
     expect(readFile.execute).toBeDefined();
@@ -213,9 +251,10 @@ describe("read_file attachments", () => {
   it("returns image content through an expanded batch child result", async () => {
     const pngBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=";
-    await writeFile(path.join(baseDir, "batched.png"), Buffer.from(pngBase64, "base64"));
+    const pngBytes = Buffer.concat([Buffer.from(pngBase64, "base64"), Buffer.alloc(50 * 1024)]);
+    await writeFile(path.join(baseDir, "batched.png"), pngBytes);
     const tools: ToolSet = {} as ToolSet;
-    Object.assign(tools, fsTool(baseDir));
+    Object.assign(tools, fsTool(baseDir, { readFileDirectAttachmentSupported: true }));
     Object.assign(
       tools,
       batchTool({ defaultCwd: baseDir, getTools: () => tools, editingMode: "none" }),
@@ -254,7 +293,21 @@ describe("read_file attachments", () => {
         },
       ],
     });
-    const agent = new AiSdkPiAgent({ system: "test", model, tools });
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "batch-media-request", scopeId: "batch-media-session" },
+      getOutputConfig: () => ({
+        maxPreviewBytes: 40 * 1024,
+        artifactTtlMs: 60_000,
+        artifactMaxBytesPerSession: 1024 * 1024,
+      }),
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools,
+      normalizeToolResultOutput: normalize,
+      normalizeSettledToolResultOutputs: normalize.normalizeSettled,
+    });
 
     await agent.prompt("read the image in a batch");
 
@@ -280,7 +333,7 @@ describe("read_file attachments", () => {
           type: "file",
           mediaType: "image/png",
           filename: "batched.png",
-          data: { type: "data", data: pngBase64 },
+          data: { type: "data", data: pngBytes.toString("base64") },
         }),
       ]),
     );
@@ -288,7 +341,10 @@ describe("read_file attachments", () => {
 
   it("rejects oversized images before attachment caching with resize guidance", async () => {
     await writeFile(path.join(baseDir, "large.png"), Buffer.alloc(32));
-    const readFile = fsTool(baseDir, { maxInlineMediaBytesPerPart: 16 }).read_file;
+    const readFile = fsTool(baseDir, {
+      readFileDirectAttachmentSupported: true,
+      maxInlineMediaBytesPerPart: 16,
+    }).read_file;
 
     const output = await resolveExecuteResult(
       readFile.execute!(
@@ -306,7 +362,10 @@ describe("read_file attachments", () => {
 
   it("rejects oversized PDFs with file-reduction guidance", async () => {
     await writeFile(path.join(baseDir, "large.pdf"), Buffer.alloc(32));
-    const readFile = fsTool(baseDir, { maxInlineMediaBytesPerPart: 16 }).read_file;
+    const readFile = fsTool(baseDir, {
+      readFileDirectAttachmentSupported: true,
+      maxInlineMediaBytesPerPart: 16,
+    }).read_file;
 
     const output = await resolveExecuteResult(
       readFile.execute!(

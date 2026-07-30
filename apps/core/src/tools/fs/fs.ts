@@ -37,6 +37,7 @@ import {
   TOOL_RESULT_URI_PREFIX,
   type ToolResultArtifactStore,
 } from "../../artifacts/tool-result-artifact-store";
+import type { ToolResultOutput } from "../../artifacts/tool-result-output-normalizer";
 import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import {
@@ -51,6 +52,7 @@ import {
 
 const readErrorCodeSchema = z.enum(READ_ERROR_CODES);
 const editErrorCodeSchema = z.enum(EDIT_ERROR_CODES);
+const searchFailureOutputZod = z.object({ error: z.string() }).passthrough();
 const warningZod = z.object({
   code: z.literal("LINE_TOO_LONG_FOR_HASHLINE"),
   message: z.string(),
@@ -734,6 +736,7 @@ export function fsTool(
   const attachmentExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"]);
 
   const imageMimeTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+  const attachmentMimeTypes = new Set([...imageMimeTypes, "application/pdf"]);
 
   const binaryCacheByToolCallId = new Map<
     string,
@@ -921,7 +924,7 @@ export function fsTool(
         });
 
         const ext = path.extname(input.path).toLowerCase();
-        const wantsAttachment = attachmentExts.has(ext);
+        const wantsAttachment = readFileDirectAttachmentSupported && attachmentExts.has(ext);
 
         const res = wantsAttachment
           ? await (async () => {
@@ -967,7 +970,17 @@ export function fsTool(
                 const filename = path.basename(bytesRes.resolvedPath);
 
                 const detected = await fileTypeFromBuffer(bytes);
-                const mimeType = detected?.mime || inferMimeTypeFromFilename(filename);
+                if (!detected || !attachmentMimeTypes.has(detected.mime)) {
+                  return {
+                    success: false as const,
+                    resolvedPath: remoteResolvedPath,
+                    error: {
+                      code: "UNKNOWN" as const,
+                      message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
+                    },
+                  };
+                }
+                const mimeType = detected.mime;
 
                 binaryCacheByToolCallId.set(options.toolCallId, {
                   resolvedPath: remoteResolvedPath,
@@ -1020,7 +1033,17 @@ export function fsTool(
               const filename = path.basename(resolvedPath);
 
               const detected = await fileTypeFromBuffer(bytesRes.bytes);
-              const mimeType = detected?.mime || inferMimeTypeFromFilename(filename);
+              if (!detected || !attachmentMimeTypes.has(detected.mime)) {
+                return {
+                  success: false as const,
+                  resolvedPath,
+                  error: {
+                    code: "UNKNOWN" as const,
+                    message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
+                  },
+                };
+              }
+              const mimeType = detected.mime;
 
               binaryCacheByToolCallId.set(options.toolCallId, {
                 resolvedPath,
@@ -1166,6 +1189,7 @@ export function fsTool(
         return withInstructions;
       },
       toModelOutput: async ({ toolCallId, output }) => {
+        if (!output.success) return { type: "error-json", value: output };
         if (!isAttachmentOutput(output)) {
           // Preserve existing behavior for text reads and errors.
           return { type: "json", value: output };
@@ -1313,6 +1337,10 @@ export function fsTool(
           maxOutputBytes,
         );
       },
+      toModelOutput: ({ output }): ToolResultOutput =>
+        searchFailureOutputZod.safeParse(output).success
+          ? { type: "error-json", value: output }
+          : { type: "json", value: output },
     }),
 
     ...(fsBackend === "fff"
@@ -1374,6 +1402,10 @@ export function fsTool(
 
               return boundSearchOutput(stripFuzzySearchMetadata(res), "results", maxOutputBytes);
             },
+            toModelOutput: ({ output }): ToolResultOutput =>
+              searchFailureOutputZod.safeParse(output).success
+                ? { type: "error-json", value: output }
+                : { type: "json", value: output },
           }),
         }
       : {}),
@@ -1462,6 +1494,10 @@ export function fsTool(
 
         return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
       },
+      toModelOutput: ({ output }): ToolResultOutput =>
+        searchFailureOutputZod.safeParse(output).success
+          ? { type: "error-json", value: output }
+          : { type: "json", value: output },
     }),
   };
 
