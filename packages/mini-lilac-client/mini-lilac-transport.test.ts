@@ -105,6 +105,9 @@ describe("MiniLilacTransport", () => {
         model: "test/model",
         profile: "coding",
         reasoning: "high" as const,
+        historyStateId: "history-1",
+        canUndo: true,
+        canRedo: false,
         queuedSteeringCount: 0,
       },
       messages: [],
@@ -180,6 +183,9 @@ describe("MiniLilacTransport", () => {
       model: "test/model",
       profile: "coding",
       reasoning: "low" as const,
+      historyStateId: "history-1",
+      canUndo: false,
+      canRedo: false,
       queuedSteeringCount: 0,
     };
     const transport = new MiniLilacTransport({
@@ -300,6 +306,9 @@ describe("MiniLilacTransport", () => {
             model: "test/new",
             profile: "coding",
             reasoning: "high",
+            historyStateId: "history-2",
+            canUndo: true,
+            canRedo: false,
             queuedSteeringCount: 0,
           });
         }
@@ -365,6 +374,9 @@ describe("MiniLilacTransport", () => {
           model: "test/newer",
           profile: "coding",
           reasoning: "high",
+          historyStateId: "history-3",
+          canUndo: true,
+          canRedo: false,
           queuedSteeringCount: 0,
         });
       }),
@@ -389,6 +401,9 @@ describe("MiniLilacTransport", () => {
         model: "test/older",
         profile: "coding",
         reasoning: "low",
+        historyStateId: "history-2",
+        canUndo: true,
+        canRedo: false,
         queuedSteeringCount: 0,
       }),
     );
@@ -603,7 +618,13 @@ describe("MiniLilacTransport", () => {
       createClientCommandId: () => "undo-command",
       fetch: mockFetch(async (input, init) => {
         calls.push({ input, init });
-        return jsonResponse({ status: "undone", clientCommandId: "undo-command", message });
+        return jsonResponse({
+          status: "undone",
+          clientCommandId: "undo-command",
+          message,
+          historyStateId: "history-1",
+          filesystem: { status: "restored" },
+        });
       }),
     });
 
@@ -611,6 +632,8 @@ describe("MiniLilacTransport", () => {
       status: "undone",
       clientCommandId: "undo-command",
       message,
+      historyStateId: "history-1",
+      filesystem: { status: "restored" },
     });
     expect(String(calls[0]?.input)).toBe("/mini/sessions/session%20%2F%20one/undo");
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
@@ -629,6 +652,44 @@ describe("MiniLilacTransport", () => {
     expect(
       await transport.undo({ sessionId: "session-1", clientCommandId: "empty-command" }),
     ).toEqual({ status: "empty", clientCommandId: "empty-command" });
+  });
+
+  it("posts idempotent redo commands with generated and reused command IDs", async () => {
+    const calls: FetchCall[] = [];
+    const message = {
+      id: "user-1",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "redo me" }],
+    };
+    const redone = {
+      status: "redone" as const,
+      clientCommandId: "redo-generated",
+      message,
+      historyStateId: "history-2",
+      filesystem: { status: "skipped" as const, reason: "git-unavailable" as const },
+    };
+    const responses = [redone, { status: "empty", clientCommandId: "redo-explicit" }];
+    const transport = new MiniLilacTransport({
+      baseUrl: "/mini",
+      createClientCommandId: () => "redo-generated",
+      fetch: mockFetch(async (input, init) => {
+        calls.push({ input, init });
+        return jsonResponse(responses.shift());
+      }),
+    });
+
+    expect(await transport.redo({ sessionId: "session / one" })).toEqual(redone);
+    expect(
+      await transport.redo({ sessionId: "session / one", clientCommandId: "redo-explicit" }),
+    ).toEqual({ status: "empty", clientCommandId: "redo-explicit" });
+    expect(calls.map((call) => String(call.input))).toEqual([
+      "/mini/sessions/session%20%2F%20one/redo",
+      "/mini/sessions/session%20%2F%20one/redo",
+    ]);
+    expect(calls.map((call) => JSON.parse(String(call.init?.body)))).toEqual([
+      { sessionId: "session / one", clientCommandId: "redo-generated" },
+      { sessionId: "session / one", clientCommandId: "redo-explicit" },
+    ]);
   });
 
   it("streams compaction lifecycle events and resolves with the terminal result", async () => {

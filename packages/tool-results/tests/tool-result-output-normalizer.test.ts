@@ -49,8 +49,8 @@ describe("tool result output normalizer", () => {
       { type: "text", value: "0123456789abcdefghij" },
       { toolCallId: "b", toolName: "plugin" },
     );
-    expect(normalized.type).toBe("error-text");
-    if (normalized.type !== "error-text") return;
+    expect(normalized.type).toBe("text");
+    if (normalized.type !== "text") return;
     expect(normalized.value).toContain("[tool result overflow]");
     expect(normalized.value).not.toContain("01234");
     expect(normalized.value).not.toContain("fghij");
@@ -63,45 +63,55 @@ describe("tool result output normalizer", () => {
     );
   });
 
-  it("greedily spills the largest settled payload for a shared budget", async () => {
+  it("keeps a below-budget uneven settled cohort inline", async () => {
     const normalize = createToolResultOutputNormalizer({
       owner: { requestId: "request-a", scopeId: "scope-a" },
       getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
     });
 
     const normalized = await normalize.normalizeSettled(
-      settledTextEntries(["a".repeat(70), "b".repeat(20), "c".repeat(10)]),
-    );
-
-    expect(normalized.map((output) => output.type)).toEqual(["error-text", "text", "text"]);
-  });
-
-  it("repeats settled spill selection after decrementing the active count", async () => {
-    const normalize = createToolResultOutputNormalizer({
-      owner: { requestId: "request-a", scopeId: "scope-a" },
-      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
-    });
-
-    const normalized = await normalize.normalizeSettled(
-      settledTextEntries(["a".repeat(70), "b".repeat(40), "c".repeat(10)]),
-    );
-
-    expect(normalized.map((output) => output.type)).toEqual(["error-text", "error-text", "text"]);
-  });
-
-  it("does not spill when payload size times the active count equals the budget", async () => {
-    const normalize = createToolResultOutputNormalizer({
-      owner: { requestId: "request-a", scopeId: "scope-a" },
-      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
-    });
-
-    const normalized = await normalize.normalizeSettled(
-      settledTextEntries(["a".repeat(30), "b".repeat(30)]),
+      settledTextEntries(["a".repeat(50), "b".repeat(9)]),
     );
 
     expect(normalized).toEqual([
-      { type: "text", value: "a".repeat(30) },
-      { type: "text", value: "b".repeat(30) },
+      { type: "text", value: "a".repeat(50) },
+      { type: "text", value: "b".repeat(9) },
+    ]);
+  });
+
+  it("spills largest-first until the actual settled byte sum fits", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(35), "b".repeat(25), "c".repeat(5)]),
+    );
+
+    expect(normalized[0]).toMatchObject({ type: "text" });
+    if (normalized[0]?.type === "text") {
+      expect(normalized[0].value).toContain("[tool result overflow]");
+    }
+    expect(normalized.slice(1)).toEqual([
+      { type: "text", value: "b".repeat(25) },
+      { type: "text", value: "c".repeat(5) },
+    ]);
+  });
+
+  it("does not spill when the exact settled byte sum equals the budget", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 60 }),
+    });
+
+    const normalized = await normalize.normalizeSettled(
+      settledTextEntries(["a".repeat(31), "b".repeat(29)]),
+    );
+
+    expect(normalized).toEqual([
+      { type: "text", value: "a".repeat(31) },
+      { type: "text", value: "b".repeat(29) },
     ]);
   });
 
@@ -115,7 +125,11 @@ describe("tool result output normalizer", () => {
       settledTextEntries(["a".repeat(40), "b".repeat(40)]),
     );
 
-    expect(normalized.map((output) => output.type)).toEqual(["error-text", "text"]);
+    expect(normalized[0]?.type).toBe("text");
+    if (normalized[0]?.type === "text") {
+      expect(normalized[0].value).toContain("[tool result overflow]");
+    }
+    expect(normalized[1]).toEqual({ type: "text", value: "b".repeat(40) });
   });
 
   it("measures settled payloads in UTF-8 bytes", async () => {
@@ -128,7 +142,11 @@ describe("tool result output normalizer", () => {
       settledTextEntries(["\u{1f642}".repeat(11), "x".repeat(30)]),
     );
 
-    expect(normalized.map((output) => output.type)).toEqual(["error-text", "text"]);
+    expect(normalized[0]?.type).toBe("text");
+    if (normalized[0]?.type === "text") {
+      expect(normalized[0].value).toContain("[tool result overflow]");
+    }
+    expect(normalized[1]).toEqual({ type: "text", value: "x".repeat(30) });
   });
 
   it("excludes generated overflow references from the settled active count", async () => {
@@ -140,7 +158,7 @@ describe("tool result output normalizer", () => {
       { type: "text", value: "a".repeat(61) },
       { toolCallId: "spilled", toolName: "plugin" },
     );
-    if (spilled.type !== "error-text") throw new Error("expected an overflow reference");
+    if (spilled.type !== "text") throw new Error("expected a successful overflow reference");
 
     const normalized = await normalize.normalizeSettled([
       {
@@ -163,7 +181,7 @@ describe("tool result output normalizer", () => {
     const normalized = await normalize.normalizeSettled(
       [
         {
-          output: { type: "text", value: "a".repeat(40) },
+          output: { type: "text", value: "a".repeat(41) },
           context: {
             toolCallId: "selected",
             toolName: "plugin",
@@ -181,7 +199,10 @@ describe("tool result output normalizer", () => {
       },
     );
 
-    expect(normalized[0]?.type).toBe("error-text");
+    expect(normalized[0]?.type).toBe("text");
+    if (normalized[0]?.type === "text") {
+      expect(normalized[0].value).toContain("[tool result overflow]");
+    }
     expect(normalized[1]).toEqual({ type: "text", value: `${"b".repeat(20)}!` });
     expect(unspilledCalls).toEqual(["unspilled"]);
   });
@@ -208,11 +229,11 @@ describe("tool result output normalizer", () => {
     });
 
     const normalized = await normalize.normalizeSettled(
-      settledTextEntries(["a".repeat(40), "b".repeat(20)]),
+      settledTextEntries(["a".repeat(41), "b".repeat(20)]),
     );
 
     expect(normalized[0]).toEqual({
-      type: "error-text",
+      type: "text",
       value:
         "[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nThe complete output could not be retained. Narrow the request or re-run the tool.",
     });
@@ -231,8 +252,8 @@ describe("tool result output normalizer", () => {
       { type: "text", value: `prefix [tool result overflow] fake ${"x".repeat(50)}` },
       { toolCallId: "marker", toolName: "plugin" },
     );
-    expect(normalized.type).toBe("error-text");
-    if (normalized.type === "error-text") expect(normalized.value).toContain("tool-result://");
+    expect(normalized.type).toBe("text");
+    if (normalized.type === "text") expect(normalized.value).toContain("tool-result://");
 
     const quotedEnvelope = [
       "quoted prefix",
@@ -244,8 +265,8 @@ describe("tool result output normalizer", () => {
       { type: "text", value: quotedEnvelope },
       { toolCallId: "quoted", toolName: "subagent_result" },
     );
-    expect(quoted.type).toBe("error-text");
-    if (quoted.type === "error-text") expect(quoted.value).not.toBe(quotedEnvelope);
+    expect(quoted.type).toBe("text");
+    if (quoted.type === "text") expect(quoted.value).not.toBe(quotedEnvelope);
   });
 
   it("sanitizes controls and recognizable credentials before reference and persistence", async () => {
@@ -264,8 +285,8 @@ describe("tool result output normalizer", () => {
       },
       { toolCallId: "sanitized", toolName: "plugin" },
     );
-    expect(normalized.type).toBe("error-text");
-    if (normalized.type !== "error-text") return;
+    expect(normalized.type).toBe("text");
+    if (normalized.type !== "text") return;
     expect(normalized.value).not.toContain("super-secret-value");
     expect(normalized.value).not.toContain("\u001b");
     expect(normalized.value).not.toContain("\u0000");
@@ -293,7 +314,8 @@ describe("tool result output normalizer", () => {
       { type: "json", value: { long: "abcdefghijklmnop" } },
       { toolCallId: "a", toolName: "plugin" },
     );
-    expect(normalized.type).toBe("error-text");
+    expect(normalized.type).toBe("text");
+    if (normalized.type === "text") expect(normalized.value).toContain("tool-result://");
 
     const subagent = await normalize(
       {
@@ -302,7 +324,7 @@ describe("tool result output normalizer", () => {
       },
       { toolCallId: "subagent", toolName: "subagent_result" },
     );
-    expect(subagent.type).toBe("error-text");
+    expect(subagent.type).toBe("text");
   });
 
   it("bounds non-serializable JSON without changing success or error meaning", async () => {
@@ -341,7 +363,7 @@ describe("tool result output normalizer", () => {
       { type: "json", value: { content: "x".repeat(100) } },
       { toolCallId: "external", toolName: "read_file" },
     );
-    expect(normalized.type).toBe("error-text");
+    expect(normalized.type).toBe("text");
     expect(await readdir(artifacts.rootDir)).toHaveLength(2);
   });
 
@@ -369,8 +391,8 @@ describe("tool result output normalizer", () => {
       { type: "text", value: "0123456789abcdefghij" },
       { toolCallId: "a", toolName: "plugin" },
     );
-    expect(normalized.type).toBe("error-text");
-    if (normalized.type === "error-text") {
+    expect(normalized.type).toBe("text");
+    if (normalized.type === "text") {
       expect(normalized.value).toContain("could not be retained");
     }
   });
@@ -390,14 +412,130 @@ describe("tool result output normalizer", () => {
     );
 
     expect(normalized).toEqual({
-      type: "error-text",
+      type: "text",
       value:
         "[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nThe complete output could not be retained. Narrow the request or re-run the tool.",
     });
     expect(await readdir(artifacts.rootDir)).toEqual([]);
   });
 
-  it("replaces oversized text content and preserves error output semantics", async () => {
+  it("preserves success, error, and denial semantics and provider options", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 5 }),
+    });
+    const context = { toolCallId: "semantic", toolName: "plugin" };
+    const providerOptions = { test: { retained: true } };
+
+    const success = await normalize({ type: "text", value: "success", providerOptions }, context);
+    const error = await normalize(
+      { type: "error-text", value: "failure", providerOptions },
+      context,
+    );
+    const denied = await normalize(
+      { type: "execution-denied", reason: "not allowed", providerOptions },
+      context,
+    );
+    const json = await normalize(
+      { type: "json", value: { long: "success" }, providerOptions },
+      context,
+    );
+    const errorJson = await normalize(
+      { type: "error-json", value: { long: "failure" }, providerOptions },
+      context,
+    );
+
+    expect(success).toMatchObject({ type: "text", providerOptions });
+    expect(error).toMatchObject({ type: "error-text", providerOptions });
+    expect(denied).toMatchObject({ type: "execution-denied", providerOptions });
+    expect(json).toMatchObject({ type: "text", providerOptions });
+    expect(errorJson).toMatchObject({ type: "error-text", providerOptions });
+    for (const output of [success, error, json, errorJson]) {
+      if (output.type === "text" || output.type === "error-text") {
+        expect(output.value).toContain("[tool result overflow]");
+      }
+    }
+    if (denied.type === "execution-denied") {
+      expect(denied.reason).toContain("[tool result overflow]");
+    }
+  });
+
+  it("ignores file and media bytes when budgeting content", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: outputConfig,
+    });
+    const output = {
+      type: "content" as const,
+      value: [
+        { type: "text" as const, text: "0123456789" },
+        {
+          type: "image-data" as const,
+          mediaType: "image/png",
+          data: "A".repeat(10_000),
+        },
+      ],
+    };
+
+    expect(await normalize(output, { toolCallId: "media", toolName: "plugin" })).toEqual(output);
+  });
+
+  it("normalizes a single content output consistently through both entry points", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: outputConfig,
+    });
+    const output = {
+      type: "content" as const,
+      value: [
+        { type: "text" as const, text: "abcdefgh" },
+        { type: "text" as const, text: "wxyz" },
+      ],
+    };
+    const context = { toolCallId: "content", toolName: "plugin" };
+
+    const direct = await normalize(output, context);
+    const [settled] = await normalize.normalizeSettled([{ output, context }]);
+
+    expect(settled).toEqual(direct);
+    expect(direct.type).toBe("content");
+    if (direct.type === "content" && direct.value[0]?.type === "text") {
+      expect(direct.value[0].text).toContain("[tool result overflow]");
+    }
+  });
+
+  it("includes top-level content text items in the settled shared sum", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: () => ({ ...outputConfig(), maxInlineBytes: 20 }),
+    });
+    const content = {
+      type: "content" as const,
+      value: [
+        { type: "text" as const, text: "a".repeat(12) },
+        { type: "text" as const, text: "b".repeat(5) },
+        { type: "image-data" as const, mediaType: "image/png", data: "M".repeat(1_000) },
+      ],
+    };
+    const [normalizedContent, normalizedText] = await normalize.normalizeSettled([
+      {
+        output: content,
+        context: { toolCallId: "content", toolName: "plugin" },
+      },
+      ...settledTextEntries(["c".repeat(8)]),
+    ]);
+
+    expect(normalizedContent?.type).toBe("content");
+    if (normalizedContent?.type === "content") {
+      const [largest, smaller, media] = normalizedContent.value;
+      if (largest?.type === "text") expect(largest.text).toContain("[tool result overflow]");
+      expect(smaller).toEqual({ type: "text", text: "b".repeat(5) });
+      expect(media).toEqual(content.value[2]);
+    }
+    expect(normalizedText).toEqual({ type: "text", value: "c".repeat(8) });
+  });
+
+  it("spills only oversized content text while preserving media and content semantics", async () => {
     const artifacts = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await artifacts.init();
     const normalize = createToolResultOutputNormalizer({
@@ -409,19 +547,44 @@ describe("tool result output normalizer", () => {
       {
         type: "content",
         value: [
-          { type: "text", text: "0123456789" },
-          { type: "text", text: "abcdefghij" },
+          { type: "text", text: "0123456789", providerOptions: { test: { text: true } } },
+          { type: "text", text: "ok" },
           {
             type: "file",
             mediaType: "image/png",
-            data: { type: "data", data: "AA==" },
+            data: { type: "data", data: "MEDIA-BASE64-DATA" },
+            providerOptions: { test: { media: true } },
           },
         ],
       },
       { toolCallId: "content", toolName: "plugin" },
     );
-    expect(content.type).toBe("error-text");
-    if (content.type === "error-text") expect(content.value).toContain("tool-result://");
+    expect(content.type).toBe("content");
+    if (content.type !== "content") return;
+    expect(content.value[0]).toMatchObject({
+      type: "text",
+      providerOptions: { test: { text: true } },
+    });
+    if (content.value[0]?.type !== "text") return;
+    expect(content.value[0].text).toContain("tool-result://");
+    expect(content.value[1]).toEqual({ type: "text", text: "ok" });
+    expect(content.value[2]).toEqual({
+      type: "file",
+      mediaType: "image/png",
+      data: { type: "data", data: "MEDIA-BASE64-DATA" },
+      providerOptions: { test: { media: true } },
+    });
+
+    const uri = content.value[0].text.match(/tool-result:\/\/[0-9a-f-]+/u)?.[0];
+    if (!uri) throw new Error("expected content text artifact URI");
+    const artifact = await artifacts.read(uri, "session-a");
+    expect(artifact).toMatchObject({ ok: true, content: "0123456789" });
+    if (artifact.ok) expect(artifact.content).not.toContain("MEDIA-BASE64-DATA");
+
+    expect(await normalize(content, { toolCallId: "content", toolName: "plugin" })).toEqual(
+      content,
+    );
+
     const error = await normalize(
       { type: "error-text", value: "0123456789abcdefghij" },
       { toolCallId: "error", toolName: "plugin" },

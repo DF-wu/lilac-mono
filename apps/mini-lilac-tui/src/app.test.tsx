@@ -32,6 +32,9 @@ const snapshot: MiniLilacSessionSnapshot = {
   model: "test/model",
   profile: "coding",
   reasoning: "low",
+  historyStateId: "history-1",
+  canUndo: false,
+  canRedo: false,
   title: "Click test",
   inputTokens: 23_700,
   contextWindow: 400_000,
@@ -699,9 +702,11 @@ describe("MiniLilacApp tool interactions", () => {
       await app.flush();
       expect(app.captureCharFrame()).toContain("start a new session");
       expect(app.captureCharFrame()).toContain("compact session context");
+      expect(app.captureCharFrame()).toContain("restore the latest undone turn");
       expect(app.captureCharFrame()).toContain("↑/↓ select | type search | enter confirm");
       expect(app.captureCharFrame()).not.toContain("ctrl-n/p");
       expect(renderedSpan(app, "/compact").fg.equals(RGBA.fromHex(COLORS.warning))).toBe(true);
+      expect(renderedSpan(app, "/redo").fg.equals(RGBA.fromHex(COLORS.danger))).toBe(true);
       expect(renderedSpan(app, "/model").fg.equals(RGBA.fromHex(COLORS.model))).toBe(true);
       expect(renderedSpan(app, "/todo").fg.equals(RGBA.fromHex(COLORS.accent))).toBe(true);
 
@@ -709,6 +714,50 @@ describe("MiniLilacApp tool interactions", () => {
       await app.flush();
       expect(app.captureCharFrame()).not.toContain("compact session context");
       expect(app.captureCharFrame()).toContain("Ask anything...");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("renders one combined redo refresh and filesystem warning without changing transcript", async () => {
+    class RedoRefreshFailureTransport extends MiniLilacTransport {
+      override redo(
+        request: Parameters<MiniLilacTransport["redo"]>[0],
+      ): ReturnType<MiniLilacTransport["redo"]> {
+        return Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId ?? "redo-command",
+          message: {
+            id: "user-redo-target",
+            role: "user",
+            parts: [{ type: "text", text: "must not be rendered" }],
+          },
+          historyStateId: "history-redone",
+          filesystem: { status: "skipped", reason: "snapshot-unavailable" },
+        });
+      }
+
+      override getSessionResume(): ReturnType<MiniLilacTransport["getSessionResume"]> {
+        return Promise.reject(new Error("resume offline"));
+      }
+    }
+
+    const combinedNotice =
+      "Redo committed; transcript refresh required: resume offline. Managed worktree unchanged because no worktree snapshot is available.";
+    const app = await renderApp([], new RedoRefreshFailureTransport({ cwd: "/workspace" }), 240);
+    try {
+      await app.flush();
+      app.mockInput.pressKey("/");
+      await app.mockInput.typeText("redo");
+      app.mockInput.pressEnter();
+      await app.waitForFrame((frame) => frame.includes(combinedNotice));
+
+      const frame = app.captureCharFrame();
+      expect(frame).not.toContain("must not be rendered");
+      expect(frame).toContain(combinedNotice);
+      expect(renderedSpan(app, "Redo committed").fg.equals(RGBA.fromHex(COLORS.warning))).toBe(
+        true,
+      );
     } finally {
       app.renderer.destroy();
     }
@@ -962,6 +1011,9 @@ describe("MiniLilacApp tool interactions", () => {
             model: "test/model",
             profile: "coding",
             reasoning: "low",
+            historyStateId: "history-1",
+            canUndo: true,
+            canRedo: false,
             title,
             queuedSteeringCount: 0,
             updatedAt: "2026-07-22T11:39:57.491Z",
@@ -1644,6 +1696,44 @@ describe("MiniLilacApp tool interactions", () => {
       expect(app.captureCharFrame()).not.toContain("src/app.ts · 12 lines");
       await clickRenderedText(app, "Explored");
       expect(app.captureCharFrame()).toContain("src/app.ts · 12 lines");
+    } finally {
+      app.renderer.destroy();
+    }
+  });
+
+  it("keeps failed exploration details collapsed and renders status and error on expansion", async () => {
+    const app = await renderApp([
+      {
+        id: "assistant-failed-exploration",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "read_file",
+            toolCallId: "read-failed",
+            state: "output-error",
+            input: { path: "src/missing.ts" },
+            errorText: "permission check failed",
+          },
+        ],
+      },
+    ]);
+    try {
+      await app.flush();
+      const collapsed = app.captureCharFrame();
+      expect(collapsed).toContain("Explored · 1 read · 1 failed");
+      expect(collapsed).not.toContain("src/missing.ts");
+      expect(collapsed).not.toContain("permission check failed");
+
+      await clickRenderedText(app, "Explored");
+      const expanded = app.captureCharFrame();
+      expect(expanded).toContain("src/missing.ts");
+      expect(expanded).toContain("ERROR");
+      expect(expanded).toContain("permission check failed");
+      expect(renderedSpan(app, "ERROR").fg.equals(RGBA.fromHex(COLORS.danger))).toBe(true);
+      expect(
+        renderedSpan(app, "permission check failed").fg.equals(RGBA.fromHex(COLORS.danger)),
+      ).toBe(true);
     } finally {
       app.renderer.destroy();
     }

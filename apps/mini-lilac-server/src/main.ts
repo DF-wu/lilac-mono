@@ -1,4 +1,4 @@
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
@@ -7,13 +7,19 @@ import {
   loadProviderRegistry,
   loadRuntimeConfig,
   ModelCatalog,
+  modelCapabilityOverrides,
   MiniLilacSkillCatalog,
+  MiniLilacSqliteStore,
+  readMiniLilacHistoryRecoveryStatus,
   SessionService,
+  type PendingStoredRunFinalization,
+  type StoredHistoryOperation,
 } from "@stanley2058/mini-lilac-runtime";
 import { createToolResultArtifactStore } from "@stanley2058/lilac-tool-results";
 import {
   clearCodexTokens,
   createCodexOAuthProvider,
+  ModelCapability,
   readCodexTokens,
   startCodexOAuthLogin,
   writeCodexTokens,
@@ -234,24 +240,48 @@ const initOptionsSchema = z.object({
   force: z.boolean(),
 });
 
+const historyRecoveryStatusOptionsSchema = z.object({
+  command: z.literal("history-recovery"),
+  action: z.literal("status"),
+  workspace: z.string().trim().min(1).optional(),
+  database: z.string().trim().min(1).optional(),
+});
+
+const historyRecoveryAbandonOptionsSchema = z.object({
+  command: z.literal("history-recovery"),
+  action: z.literal("abandon"),
+  workspace: z.string().trim().min(1),
+  acknowledgePartialWorktree: z.literal(true),
+  database: z.string().trim().min(1).optional(),
+});
+
+const historyRecoveryOptionsSchema = z.discriminatedUnion("action", [
+  historyRecoveryStatusOptionsSchema,
+  historyRecoveryAbandonOptionsSchema,
+]);
+
 const helpOptionsSchema = z.object({ command: z.literal("help") });
 
 export type MiniLilacServerCliOptions =
   | z.infer<typeof serveOptionsSchema>
   | z.infer<typeof authOptionsSchema>
   | z.infer<typeof initOptionsSchema>
+  | z.infer<typeof historyRecoveryOptionsSchema>
   | z.infer<typeof helpOptionsSchema>;
 
 export const MINI_LILAC_SERVER_HELP = `Usage:
   mini-lilac server [--config <file>] [--database <file>]
   mini-lilac server init [--force]
   mini-lilac server auth codex [--status | --logout]
+  mini-lilac history-recovery status [--workspace <cwd>] [--database <path>]
+  mini-lilac history-recovery abandon --workspace <cwd> --acknowledge-partial-worktree [--database <path>]
 
 Commands:
   init                 Create missing server configuration files in the state directory
   auth codex           Sign in with OpenAI Codex OAuth and store Lilac-owned tokens
   auth codex --status  Show Codex OAuth status without printing tokens
   auth codex --logout  Clear stored Lilac Codex OAuth tokens
+  history-recovery     Inspect or explicitly abandon blocked workspace history recovery
 
 Providers of type 'claude-code' need no Lilac auth command and no auth.json
 entry; authenticate with the official Claude CLI (claude auth login).
@@ -260,6 +290,7 @@ Options:
   --config <file>    Server config (default: $XDG_STATE_HOME/mini-lilac/config.yaml)
   --database <file>  SQLite database (default: $XDG_STATE_HOME/mini-lilac/mini-lilac.sqlite)
   --force            Replace existing files when running init
+  --workspace <cwd>  Filter recovery status or select the exact workspace to abandon
   --help             Show this help`;
 
 export function parseCliArgs(args: readonly string[]): MiniLilacServerCliOptions {
@@ -293,6 +324,32 @@ export function parseCliArgs(args: readonly string[]): MiniLilacServerCliOptions
     });
     return initOptionsSchema.parse({ command: "init", force: parsed.values.force });
   }
+  if (args[0] === "history-recovery") {
+    const action = args[1];
+    const parsed = parseArgs({
+      args: args.slice(2),
+      options: {
+        workspace: { type: "string" },
+        database: { type: "string" },
+        "acknowledge-partial-worktree": { type: "boolean", default: false },
+      },
+      allowPositionals: false,
+      strict: true,
+    });
+    if (action === "status" && parsed.values["acknowledge-partial-worktree"]) {
+      throw new Error("--acknowledge-partial-worktree is valid only with abandon");
+    }
+    if (action === "abandon" && !parsed.values["acknowledge-partial-worktree"]) {
+      throw new Error("history-recovery abandon requires --acknowledge-partial-worktree");
+    }
+    return historyRecoveryOptionsSchema.parse({
+      command: "history-recovery",
+      action,
+      workspace: parsed.values.workspace,
+      database: parsed.values.database,
+      acknowledgePartialWorktree: parsed.values["acknowledge-partial-worktree"],
+    });
+  }
 
   const parsed = parseArgs({
     args: [...args],
@@ -323,7 +380,157 @@ export type MiniLilacStatePaths = {
   readonly codexOAuthFile: string;
   readonly modelsDevCacheFile: string;
   readonly toolResultsDirectory: string;
+  readonly workspaceHistoryDirectory: string;
 };
+
+export type MiniLilacHistoryRecoveryReport = {
+  readonly navigation: readonly {
+    readonly workspace: string;
+    readonly session: string;
+    readonly command: string;
+    readonly source: string;
+    readonly target: string;
+    readonly phase: StoredHistoryOperation["phase"];
+    readonly update: string;
+  }[];
+  readonly pendingFinalizations: readonly {
+    readonly workspace: string;
+    readonly session: string;
+    readonly run: string;
+    readonly transition: string;
+    readonly status: PendingStoredRunFinalization["runStatus"];
+    readonly prepared: string;
+  }[];
+};
+
+export type MiniLilacHistoryRecoveryCommandResult =
+  | { readonly action: "status"; readonly report: MiniLilacHistoryRecoveryReport }
+  | {
+      readonly action: "abandon";
+      readonly workspace: string;
+      readonly session: string;
+      readonly command: string;
+      readonly code: "history-recovery-abandoned";
+    };
+
+async function canonicalWorkspace(workspace: string): Promise<string> {
+  try {
+    const canonical = await realpath(workspace);
+    if (!(await stat(canonical)).isDirectory()) {
+      throw new Error(`Workspace '${workspace}' is not a directory`);
+    }
+    return canonical;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      return path.resolve(workspace);
+    }
+    throw error;
+  }
+}
+
+function recoveryWorkspace(
+  store: MiniLilacSqliteStore,
+  entry: StoredHistoryOperation | PendingStoredRunFinalization,
+): string {
+  return store.getWorkspaceForSession(entry.sessionId).canonicalCwd;
+}
+
+export async function runHistoryRecoveryCommand(
+  cli: z.infer<typeof historyRecoveryOptionsSchema>,
+  options: {
+    readonly defaultDatabasePath: string;
+    readonly log?: (message: string) => void;
+  },
+): Promise<MiniLilacHistoryRecoveryCommandResult> {
+  const databasePath = path.resolve(cli.database ?? options.defaultDatabasePath);
+  const log = options.log ?? console.log;
+  const lock = await acquireDatabaseLock(databasePath);
+  let store: MiniLilacSqliteStore | undefined;
+  try {
+    const workspace =
+      cli.workspace === undefined ? undefined : await canonicalWorkspace(cli.workspace);
+    const databaseExists = await stat(databasePath)
+      .then((entry) => entry.isFile())
+      .catch(() => false);
+    if (!databaseExists) {
+      if (cli.action === "abandon") {
+        throw new Error(`No retained history navigation exists for workspace '${workspace}'`);
+      }
+      const report = { navigation: [], pendingFinalizations: [] };
+      log(JSON.stringify(report, null, 2));
+      return { action: "status", report };
+    }
+
+    if (cli.action === "status") {
+      const inspected = readMiniLilacHistoryRecoveryStatus(databasePath);
+      const report: MiniLilacHistoryRecoveryReport = {
+        navigation: inspected.navigation
+          .filter((entry) => workspace === undefined || entry.canonicalCwd === workspace)
+          .map(({ canonicalCwd, operation }) => ({
+            workspace: canonicalCwd,
+            session: operation.sessionId,
+            command: operation.commandId,
+            source: operation.sourceStateId,
+            target: operation.targetStateId,
+            phase: operation.phase,
+            update: operation.updatedAt,
+          })),
+        pendingFinalizations: inspected.pendingFinalizations
+          .filter((entry) => workspace === undefined || entry.canonicalCwd === workspace)
+          .map(({ canonicalCwd, finalization }) => ({
+            workspace: canonicalCwd,
+            session: finalization.sessionId,
+            run: finalization.runId,
+            transition: finalization.openTransitionId,
+            status: finalization.runStatus,
+            prepared: finalization.preparedAt,
+          })),
+      };
+      log(JSON.stringify(report, null, 2));
+      return { action: "status", report };
+    }
+
+    const openedStore = new MiniLilacSqliteStore(databasePath);
+    store = openedStore;
+    const navigation = openedStore.listHistoryOperations().filter((entry) => {
+      return workspace === undefined || recoveryWorkspace(openedStore, entry) === workspace;
+    });
+
+    if (navigation.length === 0) {
+      throw new Error(`No retained history navigation exists for workspace '${workspace}'`);
+    }
+    if (navigation.length !== 1) {
+      throw new Error(
+        `Workspace '${workspace}' has ${navigation.length} retained history navigation operations`,
+      );
+    }
+    if (workspace === undefined) {
+      throw new Error("history-recovery abandon requires an exact workspace");
+    }
+    const operation = navigation[0]!;
+    const abandoned = openedStore.abandonHistoryNavigation({
+      operationId: operation.id,
+      acknowledgePartialWorktree: true,
+      message: `Operator abandoned history recovery for '${workspace}' after acknowledging a potentially partial worktree; no worktree synchronization is claimed`,
+    });
+    const result = {
+      action: "abandon",
+      workspace,
+      session: operation.sessionId,
+      command: abandoned.commandId,
+      code: abandoned.code,
+    } as const;
+    log(JSON.stringify(result, null, 2));
+    return result;
+  } finally {
+    store?.close();
+    await lock.release();
+  }
+}
 
 export function miniLilacStatePaths(
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -339,6 +546,7 @@ export function miniLilacStatePaths(
     codexOAuthFile: path.join(directory, "codex.json"),
     modelsDevCacheFile: path.join(directory, "models-dev.json"),
     toolResultsDirectory: path.join(directory, "tool-results"),
+    workspaceHistoryDirectory: path.join(directory, "workspace-history"),
   };
 }
 
@@ -353,6 +561,8 @@ export async function initializeMiniLilacState(
 ): Promise<readonly MiniLilacInitFileResult[]> {
   await mkdir(paths.directory, { recursive: true, mode: 0o700 });
   await chmod(paths.directory, 0o700);
+  await mkdir(paths.workspaceHistoryDirectory, { recursive: true, mode: 0o700 });
+  await chmod(paths.workspaceHistoryDirectory, 0o700);
 
   const files = [
     { path: paths.configFile, contents: runtimeConfigTemplate },
@@ -431,9 +641,10 @@ export async function runAuthCommand(
 export async function main(
   args: readonly string[] = process.argv.slice(2),
   authDependencies?: MiniLilacAuthDependencies,
+  options: { readonly statePaths?: MiniLilacStatePaths } = {},
 ): Promise<void> {
   const cli = parseCliArgs(args);
-  const statePaths = miniLilacStatePaths();
+  const statePaths = options.statePaths ?? miniLilacStatePaths();
   if (cli.command === "help") {
     console.log(MINI_LILAC_SERVER_HELP);
     return;
@@ -453,6 +664,10 @@ export async function main(
     }
     return;
   }
+  if (cli.command === "history-recovery") {
+    await runHistoryRecoveryCommand(cli, { defaultDatabasePath: statePaths.databaseFile });
+    return;
+  }
   const databasePath = path.resolve(cli.database ?? statePaths.databaseFile);
   const databaseLock = await acquireDatabaseLock(databasePath);
   let sessionService: SessionService | undefined;
@@ -460,6 +675,8 @@ export async function main(
 
   try {
     await mkdir(statePaths.directory, { recursive: true, mode: 0o700 });
+    await mkdir(statePaths.workspaceHistoryDirectory, { recursive: true, mode: 0o700 });
+    await chmod(statePaths.workspaceHistoryDirectory, 0o700);
     const config = await loadRuntimeConfig(cli.config ?? statePaths.configFile);
     const providers = await loadProviderRegistry(config, {
       readCodexTokens: () => readCodexTokens(statePaths.codexOAuthFile),
@@ -474,7 +691,7 @@ export async function main(
       codexOAuthProviderIds: providers.supersededProviderIds,
       onWarning: (warning) => console.warn(`Model catalog warning: ${warning.message}`),
     });
-    await modelCatalog.get({ backgroundRefresh: true });
+    const initialModelCatalog = await modelCatalog.get();
     const toolResultArtifacts = createToolResultArtifactStore(statePaths.toolResultsDirectory);
     await toolResultArtifacts.init();
 
@@ -482,6 +699,9 @@ export async function main(
       config,
       databasePath,
       providers,
+      modelCapability: new ModelCapability({
+        overrides: modelCapabilityOverrides(initialModelCatalog),
+      }),
       modelLimitsResolver: async (specifier) => {
         const model = (await modelCatalog.get()).models.find(
           (entry) => entry.ref.value === specifier,
@@ -493,10 +713,16 @@ export async function main(
         onWarning: (warning) =>
           console.warn(`Skill warning (${warning.location}): ${warning.message}`),
       }),
-      protectedToolPaths: [statePaths.codexOAuthFile, statePaths.toolResultsDirectory],
+      protectedToolPaths: [
+        statePaths.codexOAuthFile,
+        statePaths.toolResultsDirectory,
+        statePaths.workspaceHistoryDirectory,
+      ],
+      workspaceHistoryDirectory: statePaths.workspaceHistoryDirectory,
       toolResultArtifacts,
     });
     sessionService = runtime;
+    await runtime.initialize();
     const authToken = config.server.authTokenEnv
       ? process.env[config.server.authTokenEnv]
       : undefined;
@@ -552,7 +778,13 @@ export async function main(
       await stopListener?.();
     } finally {
       try {
-        await sessionService?.shutdown({ graceMs: SHUTDOWN_GRACE_MS });
+        if (sessionService !== undefined) {
+          try {
+            await sessionService.shutdown({ graceMs: SHUTDOWN_GRACE_MS });
+          } catch {
+            sessionService.close();
+          }
+        }
       } finally {
         await databaseLock.release();
       }

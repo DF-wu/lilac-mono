@@ -100,6 +100,9 @@ export const miniLilacSessionSnapshotSchema = z
     model: identifierSchema.nullable(),
     profile: identifierSchema.nullable(),
     reasoning: miniLilacReasoningSchema.nullable(),
+    historyStateId: identifierSchema,
+    canUndo: z.boolean(),
+    canRedo: z.boolean(),
     title: z.string().max(100).optional(),
     inputTokens: z.number().int().nonnegative().nullable().optional(),
     /** True when `inputTokens` is a post-compaction estimate rather than reported usage. */
@@ -183,6 +186,15 @@ export const miniLilacUndoRequestSchema = z.strictObject({
 });
 export type MiniLilacUndoRequest = z.infer<typeof miniLilacUndoRequestSchema>;
 export type MiniLilacUndoInput = Omit<MiniLilacUndoRequest, "clientCommandId"> & {
+  readonly clientCommandId?: string;
+};
+
+export const miniLilacRedoRequestSchema = z.strictObject({
+  sessionId: identifierSchema,
+  clientCommandId: identifierSchema,
+});
+export type MiniLilacRedoRequest = z.infer<typeof miniLilacRedoRequestSchema>;
+export type MiniLilacRedoInput = Omit<MiniLilacRedoRequest, "clientCommandId"> & {
   readonly clientCommandId?: string;
 };
 
@@ -782,11 +794,24 @@ export const miniLilacSteeringCommittedChunkSchema = z.strictObject({
 });
 export type MiniLilacSteeringCommittedChunk = z.infer<typeof miniLilacSteeringCommittedChunkSchema>;
 
+export const miniLilacHistoryFilesystemResultSchema = z.discriminatedUnion("status", [
+  z.strictObject({ status: z.literal("restored") }),
+  z.strictObject({
+    status: z.literal("skipped"),
+    reason: z.enum(["git-unavailable", "snapshot-unavailable", "platform-unsupported"]),
+  }),
+]);
+export type MiniLilacHistoryFilesystemResult = z.infer<
+  typeof miniLilacHistoryFilesystemResultSchema
+>;
+
 export const miniLilacUndoResultSchema = z.discriminatedUnion("status", [
   z.strictObject({
     status: z.literal("undone"),
     clientCommandId: identifierSchema,
     message: miniLilacUserUIMessageSchema,
+    historyStateId: identifierSchema,
+    filesystem: miniLilacHistoryFilesystemResultSchema,
   }),
   z.strictObject({
     status: z.literal("empty"),
@@ -794,6 +819,21 @@ export const miniLilacUndoResultSchema = z.discriminatedUnion("status", [
   }),
 ]);
 export type MiniLilacUndoResult = z.infer<typeof miniLilacUndoResultSchema>;
+
+export const miniLilacRedoResultSchema = z.discriminatedUnion("status", [
+  z.strictObject({
+    status: z.literal("redone"),
+    clientCommandId: identifierSchema,
+    message: miniLilacUserUIMessageSchema,
+    historyStateId: identifierSchema,
+    filesystem: miniLilacHistoryFilesystemResultSchema,
+  }),
+  z.strictObject({
+    status: z.literal("empty"),
+    clientCommandId: identifierSchema,
+  }),
+]);
+export type MiniLilacRedoResult = z.infer<typeof miniLilacRedoResultSchema>;
 
 export const miniLilacSteerRequestSchema = z.strictObject({
   ...commandFields,

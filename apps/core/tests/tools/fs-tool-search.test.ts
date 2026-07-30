@@ -80,6 +80,54 @@ describe("fs tool search wrappers", () => {
     expect(out.paths.sort()).toEqual(["src/a.ts", "src/b.ts"]);
   });
 
+  it("projects structured search failures as errors", async () => {
+    const tools = fsTool(baseDir, { fsBackend: "fff" });
+    const globOutput = {
+      mode: "default" as const,
+      truncated: false,
+      paths: [],
+      error: "glob failed",
+    };
+    expect(
+      await tools.glob.toModelOutput!({
+        toolCallId: "glob-failure",
+        input: { patterns: ["**/*"] },
+        output: globOutput,
+      }),
+    ).toEqual({ type: "error-json", value: globOutput });
+
+    const grepOutput = {
+      mode: "default" as const,
+      truncated: false,
+      results: [],
+      error: "grep failed",
+    };
+    expect(
+      await tools.grep.toModelOutput!({
+        toolCallId: "grep-failure",
+        input: { pattern: "needle" },
+        output: grepOutput,
+      }),
+    ).toEqual({ type: "error-json", value: grepOutput });
+
+    const fuzzy = tools.fuzzy_search;
+    if (!fuzzy) throw new Error("missing fuzzy_search tool");
+    const fuzzyOutput = {
+      results: [],
+      totalMatched: 0,
+      totalFiles: 0,
+      truncated: false,
+      error: "fuzzy failed",
+    };
+    expect(
+      await fuzzy.toModelOutput!({
+        toolCallId: "fuzzy-failure",
+        input: { query: "file" },
+        output: fuzzyOutput,
+      }),
+    ).toEqual({ type: "error-json", value: fuzzyOutput });
+  });
+
   it("applies a serialized-size backstop without creating artifacts", async () => {
     await writeFile(path.join(baseDir, "src", "huge.ts"), `${"match ".repeat(2000)}\n`);
     const tools = fsTool(baseDir, { maxOutputBytes: 512 });

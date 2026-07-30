@@ -963,6 +963,15 @@ describe("renderInitialMessages", () => {
       { kind: "exploration", tone: "danger", text: "Explored · 1 read · 1 failure" },
       { kind: "exploration", tone: "warning", text: "Explored · 1 search · 1 failure" },
     ]);
+    expect(canonical[0]?.exploration?.operations).toEqual([
+      { action: "Read", detail: "missing.ts", status: "error", error: "file missing" },
+    ]);
+    expect(canonical[0]?.text).not.toContain("missing.ts");
+    const failedExploration = canonical[0]?.exploration;
+    if (failedExploration === undefined) throw new Error("missing failed exploration metadata");
+    expect(explorationTranscriptText(failedExploration, false, true)).toBe(
+      "Explored · 1 read · 1 failure\nRead missing.ts · error: file missing",
+    );
 
     const failed = createRendererHarness();
     failed.renderer.handle({
@@ -990,6 +999,164 @@ describe("renderInitialMessages", () => {
     });
     denied.renderer.handle({ type: "tool-output-denied", toolCallId: "grep-denied" });
     expect(denied.entries()[0]).toMatchObject({ kind: "exploration", tone: "warning" });
+  });
+
+  it("settles duplicate exploration errors once and retains the first bounded error", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "read-error",
+      toolName: "read_file",
+      input: { path: "missing.ts" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "read-error",
+      errorText: `first failure ${"x".repeat(300)}`,
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "read-error",
+      errorText: "late duplicate",
+      dynamic: true,
+    });
+
+    const exploration = entries()[0]?.exploration;
+    expect(exploration?.failures).toBe(1);
+    expect(exploration?.operations[0]).toMatchObject({
+      detail: "missing.ts",
+      status: "error",
+    });
+    expect(exploration?.operations[0]?.error).toStartWith("first failure");
+    expect(exploration?.operations[0]?.error).not.toContain("late duplicate");
+    expect(exploration?.operations[0]?.error?.length).toBeLessThanOrEqual(180);
+  });
+
+  it("keeps exploration success when a late error arrives", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "read-success",
+      toolName: "read_file",
+      input: { path: "present.ts" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "read-success",
+      output: {},
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "read-success",
+      errorText: "late failure",
+      dynamic: true,
+    });
+
+    expect(entries()[0]).toMatchObject({ tone: "normal", exploration: { failures: 0 } });
+    expect(entries()[0]?.exploration?.operations[0]).toEqual({
+      action: "Read",
+      detail: "present.ts",
+      status: "success",
+    });
+  });
+
+  it("uses bounded raw exploration input when arguments are malformed", () => {
+    const [entry] = renderInitialMessages([
+      {
+        id: "assistant-invalid-exploration",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "read_file",
+            toolCallId: "read-invalid",
+            state: "output-error",
+            input: { path: 42, unexpected: "x".repeat(400) },
+            errorText: "invalid read arguments",
+          },
+        ],
+      },
+    ]);
+
+    const operation = entry?.exploration?.operations[0];
+    expect(operation?.detail).toContain("path: 42");
+    expect(operation?.detail).not.toBe("file");
+    expect(operation?.detail.length).toBeLessThanOrEqual(180);
+    expect(operation).toMatchObject({ status: "error", error: "invalid read arguments" });
+  });
+
+  it("keeps canonical and live exploration operation outcomes in parity", () => {
+    const parts: MiniLilacUIMessage["parts"] = [
+      {
+        type: "dynamic-tool",
+        toolName: "read_file",
+        toolCallId: "read-success",
+        state: "output-available",
+        input: { path: "present.ts" },
+        output: {},
+      },
+      {
+        type: "dynamic-tool",
+        toolName: "grep",
+        toolCallId: "grep-error",
+        state: "output-error",
+        input: { pattern: "TODO" },
+        errorText: "search failed",
+      },
+      {
+        type: "dynamic-tool",
+        toolName: "glob",
+        toolCallId: "glob-denied",
+        state: "output-denied",
+        input: { patterns: ["**/*.secret"] },
+        approval: { id: "approval-exploration-parity", approved: false },
+      },
+    ];
+    const canonical = renderInitialMessages([
+      { id: "assistant-exploration-parity", role: "assistant", parts },
+    ])[0];
+    const { renderer, entries } = createRendererHarness();
+    for (const part of parts) {
+      if (part.type !== "dynamic-tool") continue;
+      renderer.handle({
+        type: "tool-input-available",
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        input: part.input,
+        dynamic: true,
+      });
+      if (part.state === "output-available") {
+        renderer.handle({
+          type: "tool-output-available",
+          toolCallId: part.toolCallId,
+          output: part.output,
+          dynamic: true,
+        });
+      } else if (part.state === "output-error") {
+        renderer.handle({
+          type: "tool-output-error",
+          toolCallId: part.toolCallId,
+          errorText: part.errorText,
+          dynamic: true,
+        });
+      } else if (part.state === "output-denied") {
+        renderer.handle({ type: "tool-output-denied", toolCallId: part.toolCallId });
+      }
+    }
+
+    const live = entries()[0];
+    expect(live?.tone).toBe(canonical?.tone);
+    expect(live?.exploration).toEqual(canonical?.exploration);
+    if (live?.exploration === undefined || canonical?.exploration === undefined) {
+      throw new Error("missing exploration parity metadata");
+    }
+    expect(explorationTranscriptText(live.exploration, false, true)).toBe(
+      explorationTranscriptText(canonical.exploration, false, true),
+    );
   });
 
   it("segments exploration around commentary and expands operation details", () => {
@@ -1033,10 +1200,10 @@ describe("renderInitialMessages", () => {
     expect(last).toBeDefined();
     if (first === undefined || last === undefined) throw new Error("missing exploration metadata");
     expect(explorationTranscriptText(first, false, true)).toBe(
-      "Explored · 1 read\nRead render.test.ts · offset 1 · 12 lines",
+      "Explored · 1 read\nRead render.test.ts · offset 1 · 12 lines · success",
     );
     expect(explorationTranscriptText(last, true, true)).toBe(
-      'Exploring · 1 search\nGrep src · "batch"',
+      'Exploring · 1 search\nGrep src · "batch" · success',
     );
 
     expect(
@@ -1045,7 +1212,7 @@ describe("renderInitialMessages", () => {
           reads: 0,
           searches: 1,
           failures: 0,
-          operations: [{ action: "Grep", detail: "x".repeat(300) }],
+          operations: [{ action: "Grep", detail: "x".repeat(300), status: "pending" }],
         },
         true,
         true,
@@ -1094,9 +1261,9 @@ describe("renderInitialMessages", () => {
     );
 
     expect(entry?.exploration?.operations).toEqual([
-      { action: "Glob", detail: "*, src/**/*, !**/node_modules/**" },
-      { action: "Find", detail: '"package config readme app"' },
-      { action: "Grep", detail: 'src · "TODO|FIXME"' },
+      { action: "Glob", detail: "*, src/**/*, !**/node_modules/**", status: "success" },
+      { action: "Find", detail: '"package config readme app"', status: "success" },
+      { action: "Grep", detail: 'src · "TODO|FIXME"', status: "success" },
     ]);
   });
 
@@ -1906,7 +2073,9 @@ describe("ChunkRenderer output rollback", () => {
 
     expect(entries()).toHaveLength(1);
     expect(entries()[0]?.text).toBe("Explored · 1 read");
-    expect(entries()[0]?.exploration?.operations).toEqual([{ action: "Read", detail: "kept.ts" }]);
+    expect(entries()[0]?.exploration?.operations).toEqual([
+      { action: "Read", detail: "kept.ts", status: "success" },
+    ]);
   });
 
   it("allows a replacement turn to reuse a rolled-back stream id", () => {

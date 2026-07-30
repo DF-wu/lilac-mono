@@ -115,12 +115,15 @@ active run; a disconnect alone never cancels the run or returns the editor to id
 `/new` starts an empty session in the current working directory while preserving
 the active profile, model, and reasoning effort.
 `/todo` opens a read-only view of the session's complete durable todo list.
+`/undo` (or `/rollback`) removes the latest turn and restores its prompt as a draft; `/redo`
+restores the latest undone turn and clears that draft only when it has not been edited.
 
 Each `subagent_delegate` call renders as one self-updating task block rather than separate call and
 result rows. The block tracks its stable `sessionName`, running activity, tool-call count, and
 terminal state. Reusing the name continues the same ordinary child session. Clicking a block opens
 that session's canonical transcript and active stream in the normal transcript renderer with the
-composer removed; `Esc` returns to the parent session.
+composer removed; explicit model and effort selections become the named session's new defaults,
+and `Esc` returns to the parent session.
 
 The one-line header shows the live session title and, when both values are
 available, compact input-token and context-usage figures. `/compact` is available

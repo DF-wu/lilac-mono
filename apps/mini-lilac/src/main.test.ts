@@ -45,6 +45,19 @@ describe("mini-lilac command", () => {
     expect(calls).toEqual(["server:auth|codex|--status"]);
   });
 
+  it("routes top-level history recovery to server maintenance without loading the TUI", async () => {
+    const calls: string[] = [];
+
+    expect(
+      await runMiniLilac(
+        ["history-recovery", "status", "--workspace", "/workspace"],
+        testRunners(calls),
+      ),
+    ).toBe(0);
+    expect(calls).toEqual(["server:history-recovery|status|--workspace|/workspace"]);
+    expect(HELP_TEXT).toContain("mini-lilac history-recovery status [--workspace <cwd>]");
+  });
+
   it("owns top-level help without loading a client", async () => {
     const calls: string[] = [];
     let output = "";

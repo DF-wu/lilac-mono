@@ -8,6 +8,7 @@ import {
   createToolResultArtifactStore,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
   type ToolResultArtifactStore,
+  type ToolResultOutput,
 } from "@stanley2058/lilac-tool-results";
 import { asSchema, tool, type ToolExecutionOptions, type ToolSet } from "ai";
 import { z } from "zod";
@@ -40,6 +41,22 @@ function executable(tools: ToolSet, name: string): ExecutableTool {
 
 function options(toolCallId: string, abortSignal?: AbortSignal): ToolOptions {
   return { toolCallId, messages: [], context: {}, abortSignal };
+}
+
+async function toModelOutput(
+  tools: ToolSet,
+  name: string,
+  toolCallId: string,
+  input: unknown,
+  output: unknown,
+): Promise<ToolResultOutput> {
+  const candidate = tools[name];
+  if (!candidate?.toModelOutput) throw new Error(`missing model output converter: ${name}`);
+  return await candidate.toModelOutput({
+    toolCallId,
+    input: input as never,
+    output: output as never,
+  });
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -619,6 +636,110 @@ describe("coding tools", () => {
         options("read-symlinked-deny-root"),
       ),
     ).toMatchObject({ success: false, error: { code: "PERMISSION" } });
+  });
+
+  it("read_file keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
+    const image = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    const pdf = Buffer.from("%PDF-1.4\n%%EOF\n");
+    await Promise.all([
+      writeFile(path.join(cwd, "pixel.png"), image),
+      writeFile(path.join(cwd, "notes.pdf"), pdf),
+    ]);
+    const tools = createCodingToolset({
+      cwd,
+      readFileDirectAttachmentSupported: true,
+      maxInlineMediaBytesPerPart: 128,
+    });
+    const read = executable(tools, "read_file");
+
+    const imageResult = await read.execute({ path: "pixel.png" }, options("image-read"));
+    expect(imageResult).toMatchObject({
+      success: true,
+      kind: "attachment",
+      filename: "pixel.png",
+      mimeType: "image/png",
+      bytes: image.byteLength,
+    });
+    expect(JSON.stringify(imageResult)).not.toContain(image.toString("base64"));
+    expect(
+      await toModelOutput(tools, "read_file", "image-read", { path: "pixel.png" }, imageResult),
+    ).toEqual({
+      type: "content",
+      value: [
+        {
+          type: "text",
+          text: `Attached file from read_file: pixel.png (image/png, ${image.byteLength} bytes).`,
+        },
+        {
+          type: "file",
+          mediaType: "image/png",
+          filename: "pixel.png",
+          data: { type: "data", data: image.toString("base64") },
+        },
+      ],
+    });
+
+    const pdfResult = await read.execute({ path: "notes.pdf" }, options("pdf-read"));
+    expect(
+      await toModelOutput(tools, "read_file", "pdf-read", { path: "notes.pdf" }, pdfResult),
+    ).toMatchObject({
+      type: "content",
+      value: [
+        expect.anything(),
+        {
+          type: "file",
+          mediaType: "application/pdf",
+          filename: "notes.pdf",
+          data: { type: "data", data: pdf.toString("base64") },
+        },
+      ],
+    });
+    expect(tools.read_file?.description).toContain("native visual or document analysis");
+  });
+
+  it("read_file rejects mislabeled attachments and projects structured failures as errors", async () => {
+    await writeFile(path.join(cwd, "fake.png"), "not an image");
+    const tools = createCodingToolset({ cwd, readFileDirectAttachmentSupported: true });
+    const read = executable(tools, "read_file");
+    const mislabeled = await read.execute({ path: "fake.png" }, options("fake-image"));
+    expect(mislabeled).toMatchObject({ success: false });
+    expect(JSON.stringify(mislabeled)).toContain("not a supported image or PDF");
+
+    const missing = await read.execute({ path: "missing.txt" }, options("missing-read"));
+    expect(
+      await toModelOutput(tools, "read_file", "missing-read", { path: "missing.txt" }, missing),
+    ).toMatchObject({ type: "error-json", value: { success: false } });
+  });
+
+  it("projects structured search failures as errors", async () => {
+    const tools = createCodingToolset({ cwd, fsBackend: "fff" });
+    for (const name of ["glob", "grep", "fuzzy_search"] as const) {
+      expect(
+        await toModelOutput(tools, name, `${name}-failure`, {}, { error: `${name} failed` }),
+      ).toEqual({ type: "error-json", value: { error: `${name} failed` } });
+    }
+  });
+
+  it("read_file enables media explicitly and enforces the decoded per-part byte limit", async () => {
+    await writeFile(path.join(cwd, "large.webp"), Buffer.alloc(17));
+    const textOnly = createCodingToolset({ cwd });
+    expect(textOnly.read_file?.description).not.toContain("native visual or document analysis");
+
+    const read = executable(
+      createCodingToolset({
+        cwd,
+        readFileDirectAttachmentSupported: true,
+        maxInlineMediaBytesPerPart: 16,
+      }),
+      "read_file",
+    );
+    const result = await read.execute({ path: "large.webp" }, options("large-image"));
+    expect(result).toMatchObject({ success: false });
+    expect(JSON.stringify(result)).toContain("16-byte media limit");
+    expect(JSON.stringify(result)).toContain("Resize or compress the image");
   });
 
   it("pages scoped artifact URIs before cwd checks or instruction loading", async () => {

@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -11,10 +21,16 @@ import type {
   MiniLilacTodoState,
   MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
+import { miniLilacUserUIMessageSchema } from "@stanley2058/mini-lilac-client";
 import { createToolResultArtifactStore } from "@stanley2058/lilac-tool-results";
-import { readUIMessageStream, type LanguageModel, type UIMessageChunk } from "ai";
+import {
+  readUIMessageStream,
+  type LanguageModel,
+  type ModelMessage,
+  type UIMessageChunk,
+} from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import { getCodexAuthStoragePath } from "@stanley2058/lilac-utils";
+import { getCodexAuthStoragePath, ModelCapability } from "@stanley2058/lilac-utils";
 import { z } from "zod";
 
 import type { RuntimeConfig } from "../src/config";
@@ -24,9 +40,23 @@ import {
   type ProviderAuth,
   type ProviderConfig,
 } from "../src/providers";
-import { SessionService, type MiniLilacRuntimeChunk } from "../src/session-service";
+import {
+  SessionService,
+  type MiniLilacRuntimeChunk,
+  type SessionServiceOptions,
+} from "../src/session-service";
 import { MiniLilacSkillCatalog } from "../src/skills";
 import { MiniLilacDatabaseVersionError, MiniLilacSqliteStore } from "../src/sqlite-store";
+import {
+  WorkspaceHistoryStore,
+  type LockedWorkspaceHistoryStore,
+  type WorkspaceHistoryCaptureResult,
+  type WorkspaceHistoryExpectedCurrent,
+  type WorkspaceHistoryMaintenanceOptions,
+  type WorkspaceHistoryMaintenanceResult,
+  type WorkspaceHistoryMetric,
+  type WorkspaceHistoryStoreOptions,
+} from "../src/workspace-history-store";
 
 const temporaryDirectories: string[] = [];
 
@@ -162,7 +192,11 @@ function webfetchToolResult(url: string) {
 function delegateResult(
   mode: "sync" | "deferred",
   prompt = "investigate",
-  overrides: { readonly model?: string; readonly effort?: string } = {},
+  overrides: {
+    readonly model?: string;
+    readonly effort?: string;
+    readonly sessionName?: string;
+  } = {},
 ) {
   return {
     stream: simulateReadableStream({
@@ -212,6 +246,26 @@ function grepToolResult(pattern: string) {
           toolCallId: "oversized-grep",
           toolName: "grep",
           input: JSON.stringify({ pattern }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function readToolResult(path: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        {
+          type: "tool-call" as const,
+          toolCallId: "direct-read",
+          toolName: "read_file",
+          input: JSON.stringify({ path, maxCharacters: 20_000 }),
         },
         {
           type: "finish" as const,
@@ -328,12 +382,251 @@ function todoAndReadResult(
   };
 }
 
-function userMessage(text: string): MiniLilacUIMessage {
+function userMessage(text: string): MiniLilacUIMessage & { role: "user" } {
   return { id: crypto.randomUUID(), role: "user", parts: [{ type: "text", text }] };
 }
 
 function steeringMessage(text: string): MiniLilacUIMessage & { role: "user" } {
   return { id: `steer-${text}`, role: "user", parts: [{ type: "text", text }] };
+}
+
+function seedCompletedHistory(
+  store: MiniLilacSqliteStore,
+  sessionId: string,
+  modelMessages: readonly ModelMessage[],
+  uiMessages: readonly MiniLilacUIMessage[],
+  todos?: readonly MiniLilacTodo[],
+  runId = `seed-run:${crypto.randomUUID()}`,
+): string {
+  const currentModelMessages = store.getModelMessages(sessionId);
+  const currentUiMessages = store.getUiMessages(sessionId);
+  const firstUser = miniLilacUserUIMessageSchema.parse(uiMessages[currentUiMessages.length]);
+  const admittedModelMessages = modelMessages.slice(0, currentModelMessages.length + 1);
+  if (admittedModelMessages.at(-1)?.role !== "user") {
+    throw new Error("Seed history requires one new user message after the current transcript");
+  }
+  const commandId = `seed-command:${crypto.randomUUID()}`;
+  const command = { kind: "prompt", runId: null, payload: { seed: commandId } } as const;
+  store.reserveCommand(sessionId, commandId, command);
+  const current = store.getCurrentHistoryState(sessionId);
+  const admitted = store.admitRootPromptHistory({
+    run: { id: runId, sessionId, profile: "reader", depth: 0 },
+    commandId,
+    commandPayload: command.payload,
+    transitionId: `seed-transition:${crypto.randomUUID()}`,
+    expectedCurrentStateId: current.id,
+    modelMessages: admittedModelMessages,
+    uiMessages: [...currentUiMessages, firstUser],
+    observation:
+      current.workspaceStatus === "capture-deferred"
+        ? {
+            stateId: `seed-observation:${crypto.randomUUID()}`,
+            transitionId: `seed-observation-transition:${crypto.randomUUID()}`,
+            workspaceSnapshotId: null,
+            workspaceStatus: "unavailable",
+            workspaceUnavailableReason: "git-unavailable",
+          }
+        : undefined,
+  });
+  if (todos !== undefined) store.replaceTodosForRun({ sessionId, runId, todos });
+  store.reservePendingRunFinalization({
+    runId,
+    sessionId,
+    openTransitionId: admitted.transition.id,
+    modelMessages,
+    uiMessages,
+    runStatus: "completed",
+    sessionStatus: "idle",
+    error: null,
+    terminalResult: undefined,
+    inputTokens: null,
+  });
+  store.commitPendingRunFinalization({
+    runId,
+    destinationStateId: `seed-final:${crypto.randomUUID()}`,
+    workspaceSnapshotId: null,
+    workspaceStatus: "unavailable",
+    workspaceUnavailableReason: "git-unavailable",
+  });
+  return runId;
+}
+
+function seedOpenHistory(
+  store: MiniLilacSqliteStore,
+  sessionId: string,
+  runId: string,
+  message: MiniLilacUIMessage & { role: "user" },
+): string {
+  const text = message.parts.find((part) => part.type === "text")?.text ?? "seed";
+  const commandId = `seed-command:${crypto.randomUUID()}`;
+  const command = { kind: "prompt", runId: null, payload: { message } } as const;
+  store.reserveCommand(sessionId, commandId, command);
+  const current = store.getCurrentHistoryState(sessionId);
+  const admitted = store.admitRootPromptHistory({
+    run: { id: runId, sessionId, profile: "reader", depth: 0 },
+    commandId,
+    commandPayload: command.payload,
+    transitionId: `seed-transition:${crypto.randomUUID()}`,
+    expectedCurrentStateId: current.id,
+    modelMessages: [...store.getModelMessages(sessionId), { role: "user", content: text }],
+    uiMessages: [...store.getUiMessages(sessionId), message],
+    observation:
+      current.workspaceStatus === "capture-deferred"
+        ? {
+            stateId: `seed-observation:${crypto.randomUUID()}`,
+            transitionId: `seed-observation-transition:${crypto.randomUUID()}`,
+            workspaceSnapshotId: null,
+            workspaceStatus: "unavailable",
+            workspaceUnavailableReason: "git-unavailable",
+          }
+        : undefined,
+  });
+  return admitted.transition.id;
+}
+
+function reserveRetainedHistoryOperation(
+  store: MiniLilacSqliteStore,
+  sessionId: string,
+  operationId: string,
+): void {
+  const transition = store.findLatestUndoableUserTransition(sessionId);
+  if (transition === null) throw new Error("Seeded session has no undoable transition");
+  const commandId = `undo:${operationId}`;
+  store.reserveCommand(sessionId, commandId, { kind: "undo", runId: null, payload: {} });
+  store.reserveHistoryOperation({
+    id: operationId,
+    sessionId,
+    commandId,
+    requestedAction: "undo",
+    expectedSourceStateId: store.getCurrentHistoryState(sessionId).id,
+    targetStateId: transition.fromStateId,
+    userTransitionId: transition.id,
+    filesystemMode: "skip",
+    skipReason: "git-unavailable",
+  });
+}
+
+class ScriptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
+  private captureCall = 0;
+
+  constructor(
+    options: WorkspaceHistoryStoreOptions,
+    private readonly captureScript: (
+      call: number,
+      workspaceId: string,
+    ) => Promise<WorkspaceHistoryCaptureResult>,
+  ) {
+    super(options);
+  }
+
+  override async withWorkspaceLock<T>(
+    callback: (lockedStore: LockedWorkspaceHistoryStore) => Promise<T>,
+  ): Promise<T> {
+    return await callback({
+      capture: async () => {
+        this.captureCall += 1;
+        return await this.captureScript(this.captureCall, this.workspaceId);
+      },
+      prepareRestore: async () => ({ status: "skipped", reason: "git-unavailable" }),
+    });
+  }
+}
+
+class InterceptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
+  constructor(
+    options: WorkspaceHistoryStoreOptions,
+    private readonly hooks: {
+      readonly beforePrepare?: (
+        expectedCurrent: WorkspaceHistoryExpectedCurrent | undefined,
+      ) => Promise<void> | void;
+      readonly onCapture?: () => void;
+      readonly onLockRequest?: () => void;
+    },
+  ) {
+    super(options);
+  }
+
+  override async withWorkspaceLock<T>(
+    callback: (lockedStore: LockedWorkspaceHistoryStore) => Promise<T>,
+  ): Promise<T> {
+    this.hooks.onLockRequest?.();
+    return await super.withWorkspaceLock(async (lockedStore) => {
+      const resumePreparedRestore = lockedStore.resumePreparedRestore;
+      return await callback({
+        capture: async () => {
+          this.hooks.onCapture?.();
+          return await lockedStore.capture();
+        },
+        prepareRestore: async (rootTreeOid, expectedCurrent, operationId) => {
+          await this.hooks.beforePrepare?.(expectedCurrent);
+          return await lockedStore.prepareRestore(rootTreeOid, expectedCurrent, operationId);
+        },
+        ...(resumePreparedRestore === undefined
+          ? {}
+          : {
+              resumePreparedRestore: async (input) => await resumePreparedRestore(input),
+            }),
+      });
+    });
+  }
+}
+
+class MaintenanceProbeWorkspaceHistoryStore extends WorkspaceHistoryStore {
+  constructor(
+    options: WorkspaceHistoryStoreOptions,
+    private readonly maintain: (
+      options: WorkspaceHistoryMaintenanceOptions,
+    ) => Promise<WorkspaceHistoryMaintenanceResult>,
+  ) {
+    super(options);
+  }
+
+  override async runMaintenance(
+    options: WorkspaceHistoryMaintenanceOptions,
+  ): Promise<WorkspaceHistoryMaintenanceResult> {
+    return await this.maintain(options);
+  }
+}
+
+function capturedWorkspace(call: number, workspaceId: string): WorkspaceHistoryCaptureResult {
+  const rootTreeOid = call.toString(16).padStart(40, "0");
+  return {
+    status: "captured",
+    workspaceId,
+    rootTreeOid,
+    workspaceTreeOid: rootTreeOid,
+    manifestBlobOid: rootTreeOid,
+    gitRef: `refs/mini-lilac/snapshots/${rootTreeOid}`,
+    formatVersion: 1,
+    managedPathCount: 0,
+  };
+}
+
+async function privateGit(store: WorkspaceHistoryStore, args: readonly string[]): Promise<string> {
+  const child = Bun.spawn(["git", "--git-dir", store.storeDirectory, ...args], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`Private Git command failed (${exitCode}): ${stderr}`);
+  }
+  return stdout.trim();
+}
+
+async function removeLoosePrivateObject(
+  store: WorkspaceHistoryStore,
+  rootTreeOid: string,
+): Promise<void> {
+  await rm(
+    path.join(store.storeDirectory, "objects", rootTreeOid.slice(0, 2), rootTreeOid.slice(2)),
+    { force: true },
+  );
 }
 
 function config(): RuntimeConfig {
@@ -349,9 +642,7 @@ function config(): RuntimeConfig {
       compaction: { model: "inherit", earlyCompactionPoint: 0.8 },
       subagents: {
         enabled: true,
-        maxDepth: 3,
-        maxChildrenPerRun: 16,
-        maxConcurrent: 4,
+        maxDepth: 1,
         idleTimeoutMs: 300_000,
       },
       profiles: {
@@ -415,7 +706,9 @@ function delegatedRuns(service: SessionService, parentSessionId: string) {
     .listSessions()
     .filter((session) => session.id.startsWith(`sub:${parentSessionId}:named:`))
     .flatMap((session) => {
-      const run = service.store.getLatestRun(session.id);
+      const run =
+        service.store.getActiveRootRun(session.id) ??
+        service.store.getLatestSelectedRootRun(session.id);
       return run === null ? [] : [run];
     });
 }
@@ -488,24 +781,48 @@ describe("MiniLilacSqliteStore", () => {
       profile: "reader",
       reasoning: "high",
     });
-    store.replaceMessages("session-1", [{ role: "user", content: "keep" }], [userMessage("keep")]);
+    seedCompletedHistory(
+      store,
+      "session-1",
+      [{ role: "user", content: "keep" }],
+      [userMessage("keep")],
+    );
     const command = { kind: "compact", runId: null, payload: {} } as const;
     const commit = (commandId: string): void => {
       store.reserveCommand("session-1", commandId, command);
-      store.commitCompaction(
-        "session-1",
+      const current = store.getCurrentHistoryState("session-1");
+      const result = {
+        status: "compacted",
+        clientCommandId: commandId,
+        messageCountBefore: 1,
+        messageCountAfter: 1,
+        estimatedInputTokensBefore: 9_000,
+        estimatedInputTokensAfter: 1_200,
+      } as const;
+      store.commitHistoryCompaction({
+        sessionId: "session-1",
         commandId,
-        command,
-        [{ role: "user", content: "summary" }],
-        {
-          status: "compacted",
-          clientCommandId: commandId,
-          messageCountBefore: 1,
-          messageCountAfter: 1,
-          estimatedInputTokensBefore: 9_000,
-          estimatedInputTokensAfter: 1_200,
+        request: command,
+        expectedCurrentStateId: current.id,
+        stateId: `compacted-state:${commandId}`,
+        transitionId: `compacted-transition:${commandId}`,
+        modelMessages: [{ role: "user", content: "summary" }],
+        compactionEvent: {
+          source: "manual",
+          reason: "manual",
+          phase: "completed",
+          outcome: "compacted",
+          messageCountBefore: result.messageCountBefore,
+          messageCountAfter: result.messageCountAfter,
+          estimatedInputTokensBefore: result.estimatedInputTokensBefore,
+          estimatedInputTokensAfter: result.estimatedInputTokensAfter,
+          summary: "summary",
         },
-      );
+        result,
+        workspaceSnapshotId: null,
+        workspaceStatus: "unavailable",
+        workspaceUnavailableReason: "git-unavailable",
+      });
     };
 
     commit("compact-1");
@@ -514,8 +831,12 @@ describe("MiniLilacSqliteStore", () => {
       inputTokensEstimated: true,
     });
 
-    store.createRun({ id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 });
-    store.updateSessionState("session-1", "streaming", 0, "run-1");
+    const transitionId = seedOpenHistory(
+      store,
+      "session-1",
+      "run-1",
+      userMessage("reported usage"),
+    );
     // Reported usage that happens to equal the estimate is still real usage, so
     // it has to clear the flag rather than read as "nothing changed".
     store.updateActiveRunInputTokens("session-1", "run-1", 1_200);
@@ -524,8 +845,25 @@ describe("MiniLilacSqliteStore", () => {
       inputTokensEstimated: false,
     });
 
-    store.finishRun("run-1", "completed");
-    store.updateSessionState("session-1", "idle", 0, null);
+    store.reservePendingRunFinalization({
+      runId: "run-1",
+      sessionId: "session-1",
+      openTransitionId: transitionId,
+      modelMessages: store.getModelMessages("session-1"),
+      uiMessages: store.getUiMessages("session-1"),
+      runStatus: "completed",
+      sessionStatus: "idle",
+      error: null,
+      terminalResult: undefined,
+      inputTokens: 1_200,
+    });
+    store.commitPendingRunFinalization({
+      runId: "run-1",
+      destinationStateId: "run-1-final",
+      workspaceSnapshotId: null,
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "git-unavailable",
+    });
     commit("compact-2");
     expect(store.getSession("session-1").inputTokensEstimated).toBe(true);
 
@@ -555,7 +893,7 @@ describe("MiniLilacSqliteStore", () => {
       profile: "reader",
       reasoning: "high",
     });
-    first.createRun({ id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 });
+    seedOpenHistory(first, "session-1", "run-1", userMessage("interrupted root"));
     first.createRun({
       id: "child-1",
       sessionId: "session-1",
@@ -563,18 +901,22 @@ describe("MiniLilacSqliteStore", () => {
       profile: "child",
       depth: 1,
     });
-    first.updateSessionState("session-1", "streaming", 2);
     first.close();
 
-    const recovered = new MiniLilacSqliteStore(databasePath);
-    expect(recovered.getRun("run-1").status).toBe("error");
-    expect(recovered.getRun("child-1").status).toBe("error");
+    const recovered = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    await recovered.initialize();
+    expect(recovered.store.getRun("run-1").status).toBe("error");
+    expect(recovered.store.getRun("child-1").status).toBe("error");
     expect(
-      recovered.database
+      recovered.store.database
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
         .get(),
     ).toBeNull();
-    expect(recovered.getSession("session-1")).toMatchObject({
+    expect(recovered.store.getSession("session-1")).toMatchObject({
       status: "error",
       queuedSteeringCount: 0,
     });
@@ -593,14 +935,18 @@ describe("MiniLilacSqliteStore", () => {
       profile: "reader",
       reasoning: "high",
     });
-    first.createRun({ id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 });
-    first.updateSessionState("session-1", "streaming", 0, "run-1");
+    seedOpenHistory(first, "session-1", "run-1", userMessage("interrupted root"));
     first.close();
 
-    const recovered = new MiniLilacSqliteStore(databasePath);
-    expect(recovered.getRun("run-1").status).toBe("error");
+    const recovered = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    await recovered.initialize();
+    expect(recovered.store.getRun("run-1").status).toBe("error");
     expect(
-      recovered.database
+      recovered.store.database
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_chunks'")
         .get(),
     ).toBeNull();
@@ -619,16 +965,7 @@ describe("MiniLilacSqliteStore", () => {
       profile: "reader",
       reasoning: "high",
     });
-    const message = userMessage("persist usage before the next turn");
-    const command = { kind: "prompt", runId: null, payload: { message } };
-    first.reserveCommand("session-1", "prompt-1", command);
-    first.beginRootRun({
-      run: { id: "run-1", sessionId: "session-1", profile: "reader", depth: 0 },
-      commandId: "prompt-1",
-      commandPayload: command.payload,
-      modelMessages: [{ role: "user", content: "persist usage before the next turn" }],
-      uiMessages: [message],
-    });
+    seedOpenHistory(first, "session-1", "run-1", userMessage("persist usage before the next turn"));
 
     first.updateActiveRunInputTokens("session-1", "run-1", 37);
     const changesAfterUsage = first.database.query("SELECT total_changes() AS changes").get();
@@ -638,13 +975,18 @@ describe("MiniLilacSqliteStore", () => {
     );
     first.close();
 
-    const recovered = new MiniLilacSqliteStore(databasePath);
-    expect(recovered.getSession("session-1")).toMatchObject({
+    const recovered = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    await recovered.initialize();
+    expect(recovered.store.getSession("session-1")).toMatchObject({
       status: "error",
       activeRunId: null,
       inputTokens: 37,
     });
-    expect(recovered.getRun("run-1").status).toBe("error");
+    expect(recovered.store.getRun("run-1").status).toBe("error");
     recovered.close();
   });
 
@@ -659,15 +1001,43 @@ describe("MiniLilacSqliteStore", () => {
       profile: "reader",
       reasoning: "high",
     });
-    store.createRun({ id: "older", sessionId: "session-1", profile: "reader", depth: 0 });
-    store.finishRun("older", "completed");
-    store.createRun({ id: "newer", sessionId: "session-1", profile: "reader", depth: 0 });
-    store.finishRun("newer", "completed");
+    const olderUser = userMessage("older");
+    seedCompletedHistory(
+      store,
+      "session-1",
+      [
+        { role: "user", content: "older" },
+        { role: "assistant", content: "older answer" },
+      ],
+      [
+        olderUser,
+        { id: "older-answer", role: "assistant", parts: [{ type: "text", text: "older answer" }] },
+      ],
+      undefined,
+      "older",
+    );
+    const newerUser = userMessage("newer");
+    seedCompletedHistory(
+      store,
+      "session-1",
+      [
+        ...store.getModelMessages("session-1"),
+        { role: "user", content: "newer" },
+        { role: "assistant", content: "newer answer" },
+      ],
+      [
+        ...store.getUiMessages("session-1"),
+        newerUser,
+        { id: "newer-answer", role: "assistant", parts: [{ type: "text", text: "newer answer" }] },
+      ],
+      undefined,
+      "newer",
+    );
     store.database
       .query("UPDATE runs SET started_at = ? WHERE session_id = ?")
       .run("2026-07-21T12:00:00.000Z", "session-1");
 
-    expect(store.getLatestRun("session-1")?.id).toBe("newer");
+    expect(store.getLatestSelectedRootRun("session-1")?.id).toBe("newer");
     store.close();
   });
 
@@ -690,6 +1060,7 @@ describe("MiniLilacSqliteStore", () => {
     first.close();
 
     const recovered = new MiniLilacSqliteStore(databasePath);
+    recovered.recoverInterruptedRuntimeState();
     expect(recovered.getCommandResult("session-1", "unstarted", request)).toBeUndefined();
     expect(() => recovered.getCommandResult("session-1", "indeterminate", request)).toThrow(
       "pending",
@@ -699,6 +1070,1266 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("runs workspace maintenance after retained history recovery", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-maintenance-order-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const sqlite = new MiniLilacSqliteStore(databasePath);
+    sqlite.createSession({
+      id: "maintenance-order-session",
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+    seedCompletedHistory(
+      sqlite,
+      "maintenance-order-session",
+      [{ role: "user", content: "seed" }],
+      [userMessage("seed")],
+    );
+    reserveRetainedHistoryOperation(sqlite, "maintenance-order-session", "retained-operation");
+
+    const order: string[] = [];
+    const service = new SessionService({
+      config: config(),
+      store: sqlite,
+      workspaceHistoryDirectory: path.join(directory, "history"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      workspaceHistoryStoreFactory: (options) =>
+        new MaintenanceProbeWorkspaceHistoryStore(options, async (maintenanceOptions) => {
+          order.push("maintenance");
+          expect(sqlite.listHistoryOperations()).toEqual([]);
+          expect(await maintenanceOptions.loadExpectedRootTreeOids()).toEqual([]);
+          expect(await maintenanceOptions.removeStoreIfUnused?.canRemoveStore()).toBe(true);
+          return { status: "unavailable", reason: "git-unavailable" };
+        }),
+    });
+
+    await service.initialize();
+    expect(order).toEqual(["maintenance"]);
+    service.close();
+  });
+
+  it("suppresses per-workspace maintenance failures during initialization", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-maintenance-failure-"));
+    temporaryDirectories.push(directory);
+    const sqlite = new MiniLilacSqliteStore(path.join(directory, "runtime.sqlite"));
+    sqlite.createSession({
+      id: "existing-session",
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+    let attempts = 0;
+    const service = new SessionService({
+      config: config(),
+      store: sqlite,
+      workspaceHistoryDirectory: path.join(directory, "history"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      workspaceHistoryStoreFactory: (options) =>
+        new MaintenanceProbeWorkspaceHistoryStore(options, async () => {
+          attempts += 1;
+          throw new Error("injected maintenance failure");
+        }),
+    });
+
+    await expect(service.initialize()).resolves.toBeUndefined();
+    expect(attempts).toBe(1);
+    expect(service.loadSession("existing-session").id).toBe("existing-session");
+    service.close();
+  });
+
+  for (const guard of ["active-operation", "pending-finalization"] as const) {
+    it(`uses SQLite ${guard} accounting to prevent store removal`, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), `mini-lilac-maintenance-${guard}-`));
+      temporaryDirectories.push(directory);
+      const sqlite = new MiniLilacSqliteStore(path.join(directory, "runtime.sqlite"));
+      const sessionId = `${guard}-session`;
+      sqlite.createSession({
+        id: sessionId,
+        cwd: directory,
+        model: "test/mock",
+        profile: "reader",
+        reasoning: "high",
+      });
+      if (guard === "active-operation") {
+        seedCompletedHistory(
+          sqlite,
+          sessionId,
+          [{ role: "user", content: "seed" }],
+          [userMessage("seed")],
+        );
+      }
+      let canRemove: boolean | undefined;
+      const service = new SessionService({
+        config: config(),
+        store: sqlite,
+        workspaceHistoryDirectory: path.join(directory, "history"),
+        modelResolver: () => new MockLanguageModelV4({}),
+        workspaceHistoryStoreFactory: (options) =>
+          new MaintenanceProbeWorkspaceHistoryStore(options, async (maintenanceOptions) => {
+            if (guard === "active-operation") {
+              reserveRetainedHistoryOperation(sqlite, sessionId, "maintenance-active-operation");
+            } else {
+              const runId = "maintenance-pending-run";
+              const transitionId = seedOpenHistory(
+                sqlite,
+                sessionId,
+                runId,
+                userMessage("pending during maintenance"),
+              );
+              sqlite.reservePendingRunFinalization({
+                runId,
+                sessionId,
+                openTransitionId: transitionId,
+                modelMessages: sqlite.getModelMessages(sessionId),
+                uiMessages: sqlite.getUiMessages(sessionId),
+                runStatus: "error",
+                sessionStatus: "error",
+                error: "test pending finalization",
+                terminalResult: undefined,
+                inputTokens: null,
+              });
+            }
+            canRemove = await maintenanceOptions.removeStoreIfUnused?.canRemoveStore();
+            return { status: "unavailable", reason: "git-unavailable" };
+          }),
+      });
+
+      await service.initialize();
+      expect(canRemove).toBe(false);
+      service.close();
+    });
+  }
+
+  it("removes a truly empty store without deleting a sibling", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-empty-store-removal-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "managed.txt"), "unreferenced");
+    let now = 0;
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore({
+          ...options,
+          onMetric: undefined,
+          testHooks: { now: () => now },
+        })),
+    });
+    await initial.createSession({ id: "empty-store-session", cwd: workspace, model: "test/mock" });
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    expect((await historyStore.capture()).status).toBe("captured");
+    now = 1;
+    const cleanup = await historyStore.runMaintenance({
+      loadExpectedRootTreeOids: () => [],
+      orphanGracePeriodMs: 0,
+    });
+    expect(cleanup).toMatchObject({
+      status: "maintained",
+      removedOrphanRefs: [expect.any(String)],
+    });
+    const storeDirectory = historyStore.storeDirectory;
+    const sibling = path.join(historyStore.historyRoot, "unrelated-sibling");
+    await mkdir(sibling, { recursive: true });
+    await writeFile(path.join(sibling, "sentinel"), "keep");
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    await reopened.initialize();
+    await expect(stat(storeDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await Bun.file(path.join(sibling, "sentinel")).text()).toBe("keep");
+    reopened.close();
+  });
+
+  it("removes only old orphan refs during production startup maintenance", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-startup-orphans-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const managed = path.join(workspace, "managed.txt");
+    await mkdir(workspace);
+    await writeFile(managed, "expected");
+    let now = 0;
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const factory = (options: WorkspaceHistoryStoreOptions): WorkspaceHistoryStore =>
+      (historyStore = new WorkspaceHistoryStore({
+        ...options,
+        onMetric: undefined,
+        testHooks: { now: () => now },
+      }));
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("expected-answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: factory,
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect((await initial.startPrompt(session.id, userMessage("capture expected"))).stream);
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    const expected = initial.store
+      .listWorkspaceSnapshots(initial.store.getWorkspaceForSession(session.id).id)
+      .at(0);
+    if (expected === undefined) throw new Error("expected snapshot was not stored");
+
+    await writeFile(managed, "old orphan");
+    const oldOrphan = await historyStore.capture();
+    if (oldOrphan.status !== "captured") throw new Error("old orphan capture was skipped");
+    now = 25 * 60 * 60 * 1_000;
+    await writeFile(managed, "young orphan");
+    const youngOrphan = await historyStore.capture();
+    if (youngOrphan.status !== "captured") throw new Error("young orphan capture was skipped");
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: factory,
+    });
+    await reopened.initialize();
+    if (historyStore === undefined) throw new Error("reopened history store was not created");
+    await expect(
+      privateGit(historyStore, ["rev-parse", "--verify", oldOrphan.gitRef]),
+    ).rejects.toThrow();
+    expect(await privateGit(historyStore, ["rev-parse", "--verify", youngOrphan.gitRef])).toBe(
+      youngOrphan.rootTreeOid,
+    );
+    expect(await privateGit(historyStore, ["rev-parse", "--verify", expected.gitRef])).toBe(
+      expected.rootTreeOid,
+    );
+    expect(reopened.getHistoryRecoveryStatus().workspaceSnapshots).toMatchObject([
+      { status: "reconciled", orphanRefs: [youngOrphan.gitRef] },
+    ]);
+    reopened.close();
+  });
+
+  it("clears a reconciled orphan promoted to expected during pending recovery", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-recovered-orphan-status-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "managed.txt"), "pending recovery snapshot");
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore({ ...options, onMetric: undefined })),
+    });
+    const session = await initial.createSession({
+      id: "recovered-orphan-session",
+      cwd: workspace,
+      model: "test/mock",
+    });
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    const orphan = await historyStore.capture();
+    if (orphan.status !== "captured") throw new Error("orphan capture was skipped");
+    expect(await historyStore.reconcileExpectedSnapshotRefs([])).toMatchObject({
+      status: "reconciled",
+      orphanRefs: [orphan.gitRef],
+    });
+
+    const runId = "recovered-orphan-run";
+    const transitionId = seedOpenHistory(
+      initial.store,
+      session.id,
+      runId,
+      userMessage("recover this pending run"),
+    );
+    initial.store.reservePendingRunFinalization({
+      runId,
+      sessionId: session.id,
+      openTransitionId: transitionId,
+      modelMessages: initial.store.getModelMessages(session.id),
+      uiMessages: initial.store.getUiMessages(session.id),
+      runStatus: "completed",
+      sessionStatus: "idle",
+      error: null,
+      terminalResult: { text: "recovered" },
+      inputTokens: 1,
+    });
+    expect(
+      initial.store.listWorkspaceSnapshots(initial.store.getWorkspaceForSession(session.id).id),
+    ).toEqual([]);
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(
+      reopened.store.listWorkspaceSnapshots(reopened.store.getWorkspaceForSession(session.id).id),
+    ).toMatchObject([{ rootTreeOid: orphan.rootTreeOid }]);
+    expect(reopened.getHistoryRecoveryStatus().workspaceSnapshots).toMatchObject([
+      { status: "reconciled", orphanRefs: [] },
+    ]);
+    reopened.close();
+  });
+
+  it("forwards aggregate capture, restore, and maintenance metrics through the factory seam", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-metrics-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "managed.txt"), "expected");
+    const metrics: WorkspaceHistoryMetric[] = [];
+    const metricTypes = new Set<WorkspaceHistoryMetric["type"]>();
+    const accountingReads: Array<{ metricType: string; snapshotCount: number }> = [];
+    let activeMetricType: string | undefined;
+    const metricWaiters = new Map(
+      (["capture", "restore", "maintenance"] as const).map((type) => [
+        type,
+        Promise.withResolvers<void>(),
+      ]),
+    );
+    const factory = (options: WorkspaceHistoryStoreOptions): WorkspaceHistoryStore => {
+      expect(options.onMetric).toBeFunction();
+      const onMetric = options.onMetric;
+      return new WorkspaceHistoryStore({
+        ...options,
+        onMetric: async (metric) => {
+          activeMetricType = metric.type;
+          metrics.push(metric);
+          metricTypes.add(metric.type);
+          try {
+            await onMetric?.(metric);
+          } finally {
+            activeMetricType = undefined;
+          }
+          metricWaiters.get(metric.type as "capture" | "restore" | "maintenance")?.resolve();
+        },
+      });
+    };
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: factory,
+    });
+    const originalAccounting = initial.store.getHistoryAccounting.bind(initial.store);
+    initial.store.getHistoryAccounting = (workspaceId) => {
+      const accounting = originalAccounting(workspaceId);
+      if (activeMetricType !== undefined) {
+        accountingReads.push({
+          metricType: activeMetricType,
+          snapshotCount: accounting.snapshotCount,
+        });
+      }
+      return accounting;
+    };
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect((await initial.startPrompt(session.id, userMessage("metric capture"))).stream);
+    await metricWaiters.get("capture")?.promise;
+    await writeFile(path.join(workspace, "managed.txt"), "restore source");
+    await initial.undo({ sessionId: session.id, clientCommandId: "metric-undo" });
+    await metricWaiters.get("restore")?.promise;
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: factory,
+    });
+    const reopenedAccounting = reopened.store.getHistoryAccounting.bind(reopened.store);
+    reopened.store.getHistoryAccounting = (workspaceId) => {
+      const accounting = reopenedAccounting(workspaceId);
+      if (activeMetricType !== undefined) {
+        accountingReads.push({
+          metricType: activeMetricType,
+          snapshotCount: accounting.snapshotCount,
+        });
+      }
+      return accounting;
+    };
+    await reopened.initialize();
+    await metricWaiters.get("maintenance")?.promise;
+
+    expect([...metricTypes]).toEqual(expect.arrayContaining(["capture", "restore", "maintenance"]));
+    expect(accountingReads).toEqual(
+      expect.arrayContaining([
+        { metricType: "capture", snapshotCount: expect.any(Number) },
+        { metricType: "restore", snapshotCount: expect.any(Number) },
+        { metricType: "maintenance", snapshotCount: expect.any(Number) },
+      ]),
+    );
+    const serializedMetrics = JSON.stringify(metrics, (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value,
+    );
+    expect(serializedMetrics).not.toContain(directory);
+    expect(serializedMetrics).not.toContain("managed.txt");
+    expect(serializedMetrics).not.toContain("expected");
+    reopened.close();
+  });
+
+  it("isolates copied databases under a shared workspace history root", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-database-namespace-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const sharedHistoryRoot = path.join(directory, "shared-history");
+    const firstDatabase = path.join(directory, "first.sqlite");
+    const copiedDatabase = path.join(directory, "copied.sqlite");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "tracked.txt"), "first");
+    const stores: WorkspaceHistoryStore[] = [];
+    const factory = (options: WorkspaceHistoryStoreOptions): WorkspaceHistoryStore => {
+      const store = new WorkspaceHistoryStore(options);
+      stores.push(store);
+      return store;
+    };
+    const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const first = new SessionService({
+      config: config(),
+      databasePath: firstDatabase,
+      workspaceHistoryDirectory: sharedHistoryRoot,
+      workspaceHistoryStoreFactory: factory,
+      modelResolver: () => model,
+    });
+    const session = await first.createSession({
+      id: "copied-session",
+      cwd: workspace,
+      model: "test/mock",
+    });
+    await collect((await first.startPrompt(session.id, userMessage("first prompt"))).stream);
+    const oldSnapshot = z
+      .object({ root_tree_oid: z.string() })
+      .parse(
+        first.store.database
+          .query("SELECT root_tree_oid FROM workspace_snapshots ORDER BY rowid DESC LIMIT 1")
+          .get(),
+      );
+    const firstStore = stores[0];
+    if (firstStore === undefined) throw new Error("First workspace history store was not created");
+    first.store.database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    first.close();
+    await copyFile(firstDatabase, copiedDatabase);
+
+    const copied = new SessionService({
+      config: config(),
+      databasePath: copiedDatabase,
+      workspaceHistoryDirectory: sharedHistoryRoot,
+      workspaceHistoryStoreFactory: factory,
+      modelResolver: () => model,
+    });
+    await copied.initialize();
+    copied.loadSession(session.id);
+    const copiedStore = stores[1];
+    if (copiedStore === undefined)
+      throw new Error("Copied workspace history store was not created");
+    expect(firstStore.historyRoot).not.toBe(copiedStore.historyRoot);
+    expect(path.dirname(firstStore.historyRoot)).toBe(sharedHistoryRoot);
+    expect(path.dirname(copiedStore.historyRoot)).toBe(sharedHistoryRoot);
+    expect(path.basename(firstStore.historyRoot)).toStartWith("database-");
+    expect(path.basename(copiedStore.historyRoot)).toStartWith("database-");
+    expect(await copiedStore.reconcileSnapshotRef(oldSnapshot.root_tree_oid)).toBe("missing");
+    expect(
+      copied.store
+        .listWorkspaceSnapshots(copied.store.getWorkspaceForSession(session.id).id)
+        .find((snapshot) => snapshot.rootTreeOid === oldSnapshot.root_tree_oid),
+    ).toMatchObject({
+      availability: "missing",
+      availabilityDetail: expect.stringContaining("authoritative startup reconciliation"),
+    });
+
+    await writeFile(path.join(workspace, "tracked.txt"), "second");
+    await collect((await copied.startPrompt(session.id, userMessage("copied prompt"))).stream);
+    const newSnapshot = z
+      .object({ root_tree_oid: z.string() })
+      .parse(
+        copied.store.database
+          .query("SELECT root_tree_oid FROM workspace_snapshots ORDER BY rowid DESC LIMIT 1")
+          .get(),
+      );
+    expect(newSnapshot.root_tree_oid).not.toBe(oldSnapshot.root_tree_oid);
+    expect(await copiedStore.objectExists(newSnapshot.root_tree_oid, "tree")).toBe(true);
+    expect(await copiedStore.reconcileSnapshotRef(oldSnapshot.root_tree_oid)).toBe("missing");
+    expect(
+      copied.store
+        .listWorkspaceSnapshots(copied.store.getWorkspaceForSession(session.id).id)
+        .find((snapshot) => snapshot.rootTreeOid === oldSnapshot.root_tree_oid)?.availability,
+    ).toBe("missing");
+    copied.close();
+  });
+
+  it("repairs missing snapshot refs at startup without mutating the managed workspace", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-reconcile-ref-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "managed-content");
+    let initialHistoryStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (initialHistoryStore = new WorkspaceHistoryStore(options)),
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("capture"), "prompt-command")).stream,
+    );
+    if (initialHistoryStore === undefined) throw new Error("history store was not created");
+    const snapshot = initial.store
+      .listWorkspaceSnapshots(initial.store.getWorkspaceForSession(session.id).id)
+      .at(0);
+    if (snapshot === undefined) throw new Error("snapshot was not stored");
+    const orphanRef = "refs/mini-lilac/snapshots/orphan-maintenance-test";
+    await privateGit(initialHistoryStore, ["update-ref", "-d", snapshot.gitRef]);
+    await privateGit(initialHistoryStore, ["update-ref", orphanRef, snapshot.rootTreeOid]);
+    initial.close();
+    const entriesBefore = (await readdir(workspace)).sort();
+    const contentBefore = await Bun.file(managed).text();
+
+    let reopenedHistoryStore: WorkspaceHistoryStore | undefined;
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (reopenedHistoryStore = new WorkspaceHistoryStore(options)),
+    });
+    await reopened.initialize();
+    if (reopenedHistoryStore === undefined)
+      throw new Error("reopened history store was not created");
+    expect(await reopenedHistoryStore.reconcileSnapshotRef(snapshot.rootTreeOid)).toBe("present");
+    expect(reopened.store.getWorkspaceSnapshot(snapshot.id)).toMatchObject({
+      availability: "available",
+      availabilityDetail: null,
+    });
+    expect(reopened.getHistoryRecoveryStatus().workspaceSnapshots).toMatchObject([
+      { status: "reconciled", orphanRefs: [orphanRef] },
+    ]);
+    expect(await privateGit(reopenedHistoryStore, ["rev-parse", "--verify", orphanRef])).toBe(
+      snapshot.rootTreeOid,
+    );
+    expect((await readdir(workspace)).sort()).toEqual(entriesBefore);
+    expect(await Bun.file(managed).text()).toBe(contentBefore);
+    reopened.close();
+  });
+
+  it("marks only missing snapshot objects and skips navigation to the affected state", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-reconcile-missing-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "first-state");
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({
+          doStream: [
+            textResult("first-answer", "first response"),
+            textResult("second-answer", "second response"),
+          ],
+        }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore(options)),
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    const firstUser = userMessage("first prompt");
+    await collect((await initial.startPrompt(session.id, firstUser, "first-prompt")).stream);
+    await writeFile(managed, "second-state");
+    const secondUser = userMessage("second prompt");
+    await collect((await initial.startPrompt(session.id, secondUser, "second-prompt")).stream);
+    if (historyStore === undefined) throw new Error("history store was not created");
+    const workspaceId = initial.store.getWorkspaceForSession(session.id).id;
+    const firstState = initial.store.listHistoryTopology(session.id).states.find((state) => {
+      const ui = initial.store.getHistoryStateUiMessages(state.id);
+      return ui.length === 0 && state.workspaceSnapshotId !== null;
+    });
+    const affectedSnapshot =
+      firstState?.workspaceSnapshotId === null || firstState?.workspaceSnapshotId === undefined
+        ? undefined
+        : initial.store.getWorkspaceSnapshot(firstState.workspaceSnapshotId);
+    if (affectedSnapshot === undefined || affectedSnapshot === null) {
+      throw new Error("first-state snapshot was not found");
+    }
+    await removeLoosePrivateObject(historyStore, affectedSnapshot.rootTreeOid);
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    const reconciled = reopened.store.listWorkspaceSnapshots(workspaceId);
+    expect(reconciled.find((snapshot) => snapshot.id === affectedSnapshot.id)).toMatchObject({
+      availability: "missing",
+      availabilityDetail: expect.stringContaining(affectedSnapshot.rootTreeOid),
+    });
+    expect(
+      reconciled.filter(
+        (snapshot) => snapshot.id !== affectedSnapshot.id && snapshot.availability === "available",
+      ).length,
+    ).toBeGreaterThan(0);
+
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-second" }),
+    ).toMatchObject({ status: "undone", message: secondUser, filesystem: { status: "restored" } });
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-first" }),
+    ).toMatchObject({
+      status: "undone",
+      message: firstUser,
+      filesystem: { status: "skipped", reason: "snapshot-unavailable" },
+    });
+    reopened.close();
+  });
+
+  it("heals a missing snapshot row when a later capture roots the same OID", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-reconcile-heal-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "managed.txt"), "stable-state");
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("first-answer", "first response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore(options)),
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("first"), "first-prompt")).stream,
+    );
+    if (historyStore === undefined) throw new Error("history store was not created");
+    const workspaceId = initial.store.getWorkspaceForSession(session.id).id;
+    const snapshot = initial.store.listWorkspaceSnapshots(workspaceId).at(0);
+    if (snapshot === undefined) throw new Error("snapshot was not stored");
+    await removeLoosePrivateObject(historyStore, snapshot.rootTreeOid);
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("second-answer", "second response") }),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.store.getWorkspaceSnapshot(snapshot.id)).toMatchObject({
+      availability: "missing",
+      availabilityDetail: expect.stringContaining(snapshot.rootTreeOid),
+    });
+    await collect(
+      (await reopened.startPrompt(session.id, userMessage("recapture"), "recapture-prompt")).stream,
+    );
+    expect(reopened.store.getWorkspaceSnapshot(snapshot.id)).toMatchObject({
+      availability: "available",
+      availabilityDetail: null,
+    });
+    reopened.close();
+  });
+
+  it("leaves snapshot availability unchanged when startup Git is unavailable", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-reconcile-git-missing-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "managed.txt"), "state");
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("capture"), "prompt-command")).stream,
+    );
+    const workspaceId = initial.store.getWorkspaceForSession(session.id).id;
+    const snapshot = initial.store.listWorkspaceSnapshots(workspaceId).at(0);
+    if (snapshot === undefined) throw new Error("snapshot was not stored");
+    initial.store.setWorkspaceSnapshotAvailability({
+      workspaceId,
+      updates: [
+        {
+          snapshotId: snapshot.id,
+          availability: "corrupt",
+          detail: "preexisting unavailable detail",
+        },
+      ],
+    });
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({
+          ...options,
+          gitExecutable: path.join(directory, "missing-git"),
+          platform: "linux",
+        }),
+    });
+    await reopened.initialize();
+    expect(reopened.store.getWorkspaceSnapshot(snapshot.id)).toMatchObject({
+      availability: "corrupt",
+      availabilityDetail: "preexisting unavailable detail",
+    });
+    expect(reopened.getHistoryRecoveryStatus().workspaceSnapshots).toMatchObject([
+      { workspaceId, status: "unavailable", reason: "git-unavailable", orphanRefs: [] },
+    ]);
+    reopened.close();
+  });
+
+  it("does not invoke prompt capture behind another session's retained operation", async () => {
+    let captureCalls = 0;
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-operation-capture-guard-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("unused", "unused") }),
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          captureCalls += 1;
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const owner = await service.createSession({
+      id: "journal-owner",
+      cwd: directory,
+      model: "test/mock",
+    });
+    const blocked = await service.createSession({
+      id: "journal-blocked",
+      cwd: directory,
+      model: "test/mock",
+    });
+    seedCompletedHistory(
+      service.store,
+      owner.id,
+      [{ role: "user", content: "seed operation" }],
+      [userMessage("seed operation")],
+    );
+    reserveRetainedHistoryOperation(service.store, owner.id, "retained-operation");
+
+    await expect(
+      service.startPrompt(blocked.id, userMessage("must not capture"), "blocked-prompt"),
+    ).rejects.toThrow("retained history operation");
+    expect(captureCalls).toBe(0);
+    service.close();
+  });
+
+  it("does not invoke prompt capture behind another session's pending finalization", async () => {
+    let captureCalls = 0;
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finalization-capture-guard-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("unused", "unused") }),
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          captureCalls += 1;
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const owner = await service.createSession({
+      id: "finalization-owner",
+      cwd: directory,
+      model: "test/mock",
+    });
+    const blocked = await service.createSession({
+      id: "finalization-blocked",
+      cwd: directory,
+      model: "test/mock",
+    });
+    const transitionId = seedOpenHistory(
+      service.store,
+      owner.id,
+      "pending-owner-run",
+      userMessage("pending owner"),
+    );
+    service.store.reservePendingRunFinalization({
+      runId: "pending-owner-run",
+      sessionId: owner.id,
+      openTransitionId: transitionId,
+      modelMessages: service.store.getModelMessages(owner.id),
+      uiMessages: service.store.getUiMessages(owner.id),
+      runStatus: "completed",
+      sessionStatus: "idle",
+      error: null,
+      terminalResult: undefined,
+      inputTokens: null,
+    });
+
+    await expect(
+      service.startPrompt(blocked.id, userMessage("must not capture"), "blocked-prompt"),
+    ).rejects.toThrow("pending run finalization");
+    expect(captureCalls).toBe(0);
+    service.close();
+  });
+
+  it("does not invoke terminal capture behind another session's retained operation", async () => {
+    const providerEntered = Promise.withResolvers<void>();
+    const releaseProvider = Promise.withResolvers<void>();
+    let captureCalls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        providerEntered.resolve();
+        await releaseProvider.promise;
+        return textResult("answer", "done");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-terminal-journal-guard-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          captureCalls += 1;
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const blocker = await service.createSession({
+      id: "terminal-blocker",
+      cwd: directory,
+      model: "test/mock",
+    });
+    const activeSession = await service.createSession({
+      id: "terminal-active",
+      cwd: directory,
+      model: "test/mock",
+    });
+    seedCompletedHistory(
+      service.store,
+      blocker.id,
+      [{ role: "user", content: "seed operation" }],
+      [userMessage("seed operation")],
+    );
+    const started = await service.startPrompt(activeSession.id, userMessage("finish later"));
+    const completion = collect(started.stream);
+    await providerEntered.promise;
+    expect(captureCalls).toBe(1);
+    reserveRetainedHistoryOperation(service.store, blocker.id, "terminal-blocking-operation");
+
+    releaseProvider.resolve();
+    await completion;
+    expect(captureCalls).toBe(1);
+    expect(service.store.getPendingRunFinalization(started.runId)).toBeNull();
+    expect(service.store.getRun(started.runId).status).toBe("active");
+    service.close();
+  });
+
+  it("recovers cancelled and error pending finalizations with their terminal facts", async () => {
+    const cases = [
+      {
+        name: "cancelled",
+        runStatus: "cancelled" as const,
+        sessionStatus: "idle" as const,
+        error: null,
+        terminalResult: { text: "cancelled partial output", reason: "cancelled" },
+      },
+      {
+        name: "error",
+        runStatus: "error" as const,
+        sessionStatus: "error" as const,
+        error: "provider failed after output",
+        terminalResult: { text: "error partial output", reason: "error" },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const directory = await mkdtemp(
+        path.join(tmpdir(), `mini-lilac-pending-${testCase.name}-recovery-`),
+      );
+      temporaryDirectories.push(directory);
+      const workspace = path.join(directory, "workspace");
+      const databasePath = path.join(directory, "runtime.sqlite");
+      await mkdir(workspace);
+      const initial = new MiniLilacSqliteStore(databasePath);
+      const sessionId = `${testCase.name}-session`;
+      const runId = `${testCase.name}-run`;
+      initial.createSession({
+        id: sessionId,
+        cwd: workspace,
+        model: "test/mock",
+        profile: "reader",
+        reasoning: "high",
+      });
+      const transitionId = seedOpenHistory(
+        initial,
+        sessionId,
+        runId,
+        userMessage(`${testCase.name} pending`),
+      );
+      initial.reservePendingRunFinalization({
+        runId,
+        sessionId,
+        openTransitionId: transitionId,
+        modelMessages: initial.getModelMessages(sessionId),
+        uiMessages: initial.getUiMessages(sessionId),
+        runStatus: testCase.runStatus,
+        sessionStatus: testCase.sessionStatus,
+        error: testCase.error,
+        terminalResult: testCase.terminalResult,
+        inputTokens: 7,
+      });
+      initial.close();
+
+      const recovered = new SessionService({
+        config: config(),
+        databasePath,
+        modelResolver: () => new MockLanguageModelV4({}),
+        attachCompaction: async () => () => {},
+      });
+      await recovered.initialize();
+      expect(recovered.getHistoryRecoveryStatus().pendingFinalizations).toEqual([]);
+      expect(recovered.store.getRun(runId)).toMatchObject({
+        status: testCase.runStatus,
+        error: testCase.error,
+        terminalResult: testCase.terminalResult,
+      });
+      expect(recovered.getSnapshot(sessionId)).toMatchObject({
+        status: testCase.sessionStatus,
+        activeRunId: null,
+        inputTokens: 7,
+      });
+      recovered.close();
+    }
+  });
+
+  it("recovers a retained transcript-only navigation before initialization completes", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-retained-operation-init-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const initial = new MiniLilacSqliteStore(databasePath);
+    initial.createSession({
+      id: "retained-session",
+      cwd: directory,
+      model: "test/mock",
+      profile: "reader",
+      reasoning: "high",
+    });
+    seedCompletedHistory(
+      initial,
+      "retained-session",
+      [{ role: "user", content: "seed operation" }],
+      [userMessage("seed operation")],
+    );
+    reserveRetainedHistoryOperation(initial, "retained-session", "blocked-initialization");
+    initial.close();
+    let captureCalls = 0;
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, capturedWorkspaceId) => {
+          captureCalls += 1;
+          return capturedWorkspace(call, capturedWorkspaceId);
+        }),
+    });
+
+    expect(() => service.close()).toThrow("runtime work is active");
+    await expect(service.initialize()).resolves.toBeUndefined();
+    expect(captureCalls).toBe(0);
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(service.getSnapshot("retained-session")).toMatchObject({
+      canUndo: false,
+      canRedo: true,
+    });
+    service.close();
+  });
+
+  it("waits for root workspace capture and admission commit before starting the provider", async () => {
+    const captureEntered = Promise.withResolvers<void>();
+    const releaseCapture = Promise.withResolvers<void>();
+    const providerEntered = Promise.withResolvers<void>();
+    const releaseProvider = Promise.withResolvers<void>();
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        providerEntered.resolve();
+        await releaseProvider.promise;
+        return textResult("answer", "done");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-capture-order-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          if (call === 1) {
+            captureEntered.resolve();
+            await releaseCapture.promise;
+          }
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    expect(session).toMatchObject({ canUndo: false, canRedo: false });
+    const prompt = service.startPrompt(session.id, userMessage("capture first"), "capture-prompt");
+
+    await captureEntered.promise;
+    expect(model.doStreamCalls).toHaveLength(0);
+    expect(service.store.getCurrentHistoryState(session.id).workspaceStatus).toBe(
+      "capture-deferred",
+    );
+
+    releaseCapture.resolve();
+    const started = await prompt;
+    await providerEntered.promise;
+    expect(
+      service.store
+        .listHistoryTopology(session.id)
+        .transitions.some(
+          (transition) => transition.rootRunId === started.runId && transition.toStateId === null,
+        ),
+    ).toBe(true);
+    releaseProvider.resolve();
+    await collect(started.stream);
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(service.getSnapshot(session.id)).toMatchObject({
+      historyStateId: expect.any(String),
+      canUndo: true,
+      canRedo: false,
+    });
+    service.close();
+  });
+
+  it("releases an untouched prompt command when workspace capture fails operationally", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-prompt-capture-failure-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async () => {
+          throw new Error("prompt capture failed");
+        }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+
+    await expect(
+      service.startPrompt(session.id, userMessage("must not start"), "failed-prompt"),
+    ).rejects.toThrow("prompt capture failed");
+    expect(model.doStreamCalls).toHaveLength(0);
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE session_id = ? AND command_id = ?")
+        .get(session.id, "failed-prompt"),
+    ).toBeNull();
+    expect(service.getSnapshot(session.id)).toMatchObject({ status: "idle", canUndo: false });
+    service.close();
+  });
+
+  it("records terminal capture failure without losing completed run state", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-terminal-capture-failure-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          if (call === 2) throw new Error("terminal capture failed");
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const started = await service.startPrompt(session.id, userMessage("finish despite capture"));
+    await collect(started.stream);
+
+    expect(service.store.getRun(started.runId).status).toBe("completed");
+    expect(service.getSnapshot(session.id)).toMatchObject({ status: "idle", canUndo: true });
+    expect(service.store.getCurrentHistoryState(session.id)).toMatchObject({
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "capture-failed",
+    });
+    expect(service.store.getPendingRunFinalization(started.runId)).toBeNull();
+    service.close();
+  });
+
+  it("keeps a failed steering capture queued while the run continues", async () => {
+    const firstEntered = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    let modelCall = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        modelCall += 1;
+        if (modelCall === 1) {
+          firstEntered.resolve();
+          await releaseFirst.promise;
+          return textAndReadToolResult("before-failure", "before failure", "visible.txt");
+        }
+        if (modelCall === 2) {
+          secondEntered.resolve();
+          await releaseSecond.promise;
+          return textResult("continued", "continued without steer");
+        }
+        return textResult("steered", "delivered after retry");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-steering-capture-failure-"));
+    temporaryDirectories.push(directory);
+    await writeFile(path.join(directory, "visible.txt"), "visible");
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          if (call === 2) throw new Error("steering capture failed");
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const started = await service.startPrompt(session.id, userMessage("start"));
+    const completion = collect(started.stream);
+    await firstEntered.promise;
+    await service.steer({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "capture-failed-steer",
+      message: steeringMessage("retry me"),
+    });
+    releaseFirst.resolve();
+
+    await secondEntered.promise;
+    expect(service.getSnapshot(session.id)).toMatchObject({
+      status: "streaming",
+      queuedSteeringCount: 1,
+    });
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain("retry me");
+    expect(
+      service.store
+        .listHistoryTopology(session.id)
+        .transitions.filter((transition) => transition.kind === "user-message"),
+    ).toHaveLength(1);
+
+    releaseSecond.resolve();
+    const chunks = await completion;
+    expect(chunks).toContainEqual(
+      expect.objectContaining({ type: "error", errorText: "steering capture failed" }),
+    );
+    expect(JSON.stringify(model.doStreamCalls[2]?.prompt)).toContain("retry me");
+    expect(service.store.getRun(started.runId).status).toBe("completed");
+    service.close();
+  });
+
+  it("does not canonicalize steering when cancellation lands during capture", async () => {
+    const firstEntered = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const steeringCaptureEntered = Promise.withResolvers<void>();
+    const releaseSteeringCapture = Promise.withResolvers<void>();
+    let modelCall = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        modelCall += 1;
+        if (modelCall === 1) {
+          firstEntered.resolve();
+          await releaseFirst.promise;
+          return textAndReadToolResult("before-cancel", "before cancel", "visible.txt");
+        }
+        return textResult("unexpected", "steering must not reach the provider");
+      },
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-steering-capture-cancel-"));
+    temporaryDirectories.push(directory);
+    await writeFile(path.join(directory, "visible.txt"), "visible");
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          if (call === 2) {
+            steeringCaptureEntered.resolve();
+            await releaseSteeringCapture.promise;
+          }
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const started = await service.startPrompt(session.id, userMessage("start"));
+    const completion = collect(started.stream);
+    await firstEntered.promise;
+    const steer = steeringMessage("cancel during capture");
+    await service.steer({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "cancelled-capture-steer",
+      message: steer,
+    });
+    releaseFirst.resolve();
+    await steeringCaptureEntered.promise;
+
+    await service.cancel({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "cancel-during-capture",
+    });
+    releaseSteeringCapture.resolve();
+    await completion;
+
+    expect(
+      service.store
+        .listHistoryTopology(session.id)
+        .transitions.filter((transition) => transition.delivery === "steer"),
+    ).toEqual([]);
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).not.toContain(
+      "cancel during capture",
+    );
+    expect(service.store.getUiMessages(session.id)).not.toContainEqual(steer);
+    expect(model.doStreamCalls).toHaveLength(1);
+    service.close();
+  });
+
   it("shares the inline result budget across settled batch children", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
     temporaryDirectories.push(directory);
@@ -742,6 +2373,167 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("bounds direct multibyte read_file output by UTF-8 bytes", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unicode-read-"));
+    temporaryDirectories.push(directory);
+    await writeFile(path.join(directory, "unicode.txt"), "😀".repeat(11_000));
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    const model = new MockLanguageModelV4({
+      doStream: [readToolResult("unicode.txt"), textResult("answer", "inspected")],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("read unicode"))).stream,
+    );
+
+    const transcript = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(transcript).toContain("[tool result overflow]");
+    expect(transcript).not.toContain("😀".repeat(1_000));
+    expect(chunks).toContainEqual(
+      expect.objectContaining({ type: "tool-output-available", toolCallId: "direct-read" }),
+    );
+    expect(chunks.some((chunk) => chunk.type === "tool-output-error")).toBe(false);
+    service.close();
+  });
+
+  it("preserves capable-model image and PDF batch attachments without exposing base64 to UI chunks", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-media-"));
+    temporaryDirectories.push(directory);
+    const image = Buffer.concat([
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+        "base64",
+      ),
+      Buffer.alloc(50 * 1024),
+    ]);
+    const pdf = Buffer.from("%PDF-1.4 mini-pdf-payload %%EOF");
+    await Promise.all([
+      writeFile(path.join(directory, "diagram.png"), image),
+      writeFile(path.join(directory, "reference.pdf"), pdf),
+    ]);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    const model = new MockLanguageModelV4({
+      doStream: [
+        batchedReadResult(["diagram.png", "reference.pdf"]),
+        textResult("answer", "inspected media"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      modelCapability: new ModelCapability({
+        overrides: {
+          "test/mock": {
+            attachment: true,
+            modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+            limit: { context: 128_000, output: 4_096 },
+          },
+        },
+      }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("inspect both attachments"))).stream,
+    );
+
+    const modelView = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(modelView).toContain(image.toString("base64"));
+    expect(modelView).toContain(pdf.toString("base64"));
+    expect(modelView.match(/"type":"file"/gu)).toHaveLength(2);
+    const canonical = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(canonical).toContain(image.toString("base64"));
+    expect(canonical).toContain(pdf.toString("base64"));
+    expect(JSON.stringify(chunks)).not.toContain(image.toString("base64"));
+    expect(JSON.stringify(chunks)).not.toContain(pdf.toString("base64"));
+    expect(JSON.stringify(chunks)).toContain('"kind":"attachment"');
+    expect(JSON.stringify(model.doStreamCalls[0]?.tools)).toContain(
+      "native visual or document analysis",
+    );
+    service.close();
+  });
+
+  it("projects structured read_file failures as failed exploration calls", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-read-failure-"));
+    temporaryDirectories.push(directory);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    const model = new MockLanguageModelV4({
+      doStream: [batchedReadResult(["missing.txt"]), textResult("answer", "handled")],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("read the missing file"))).stream,
+    );
+
+    expect(chunks).toContainEqual(
+      expect.objectContaining({
+        type: "tool-output-error",
+        errorText: expect.stringContaining("missing.txt"),
+      }),
+    );
+    service.close();
+  });
+
+  it("projects structured search failures as failed exploration calls", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-search-failure-"));
+    temporaryDirectories.push(directory);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["grep"];
+    const missingCwd = path.join(directory, "missing");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call" as const,
+                toolCallId: "failed-grep",
+                toolName: "grep",
+                input: JSON.stringify({ pattern: "needle", cwd: missingCwd }),
+              },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textResult("answer", "handled"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("search missing cwd"))).stream,
+    );
+
+    expect(chunks).toContainEqual(
+      expect.objectContaining({ type: "tool-output-error", toolCallId: "failed-grep" }),
+    );
+    service.close();
+  });
+
   it("stores oversized grep output out of line before the next model turn and UI persistence", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-tool-overflow-"));
     temporaryDirectories.push(directory);
@@ -778,7 +2570,7 @@ describe("SessionService", () => {
     expect(JSON.stringify(chunks)).not.toContain("x".repeat(1_000));
     expect(chunks).toContainEqual(
       expect.objectContaining({
-        type: "tool-output-error",
+        type: "tool-output-available",
         toolCallId: "oversized-grep",
       }),
     );
@@ -1068,6 +2860,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
     });
+    await reopened.initialize();
     expect(reopened.loadSession(session.id)).toMatchObject({ status: "idle", cwd: directory });
     expect(reopened.getMessages(session.id).map((message) => message.role)).toEqual([
       "user",
@@ -1171,34 +2964,34 @@ describe("SessionService", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-finished-replay-"));
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, "runtime.sqlite");
-    const store = new MiniLilacSqliteStore(databasePath);
-    store.createSession({
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("finished", "done") }),
+    });
+    const initialSession = await initial.createSession({
       id: "finished-session",
       cwd: directory,
       model: "test/mock",
       profile: "reader",
       reasoning: "high",
     });
-    store.createRun({
-      id: "finished-run",
-      sessionId: "finished-session",
-      profile: "reader",
-      depth: 0,
-    });
-    store.finishRun("finished-run", "completed");
-    store.close();
+    const finished = await initial.startPrompt(initialSession.id, userMessage("finish"));
+    await collect(finished.stream);
+    initial.close();
 
     const service = new SessionService({
       config: config(),
       databasePath,
       modelResolver: () => new MockLanguageModelV4({}),
     });
+    await service.initialize();
     service.store.getSession = () => {
       throw new Error("finished replay allocated an actor");
     };
 
-    expect(service.getRunChunks("finished-run")).toEqual([]);
-    expect(await collect(service.replayRun("finished-run", { tail: false }))).toEqual([]);
+    expect(service.getRunChunks(finished.runId)).toEqual([]);
+    expect(await collect(service.replayRun(finished.runId, { tail: false }))).toEqual([]);
     service.close();
   });
 
@@ -1216,7 +3009,7 @@ describe("SessionService", () => {
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
     let finalizationAttempts = 0;
-    service.store.finalizeRootRun = () => {
+    service.store.commitPendingRunFinalization = () => {
       finalizationAttempts += 1;
       throw new Error("injected finalization failure");
     };
@@ -1243,10 +3036,15 @@ describe("SessionService", () => {
     });
 
     await service.shutdown({ graceMs: 1_000 });
-    const recovered = new MiniLilacSqliteStore(databasePath);
-    expect(recovered.getRun(started.runId).status).toBe("error");
-    expect(recovered.getSession(session.id)).toMatchObject({
-      status: "error",
+    const recovered = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    await recovered.initialize();
+    expect(recovered.store.getRun(started.runId).status).toBe("completed");
+    expect(recovered.store.getSession(session.id)).toMatchObject({
+      status: "idle",
       activeRunId: null,
       inputTokens: 41,
     });
@@ -1268,8 +3066,10 @@ describe("SessionService", () => {
       modelResolver: () => model,
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
-    const finalizeRootRun = service.store.finalizeRootRun.bind(service.store);
-    service.store.finalizeRootRun = () => {
+    const commitPendingRunFinalization = service.store.commitPendingRunFinalization.bind(
+      service.store,
+    );
+    service.store.commitPendingRunFinalization = () => {
       throw new Error("injected finalization failure");
     };
     const failed = await service.startPrompt(session.id, userMessage("first prompt"));
@@ -1279,16 +3079,17 @@ describe("SessionService", () => {
       afterSeq: 0,
     });
 
-    service.store.finalizeRootRun = finalizeRootRun;
-    const durableSnapshot = finalizeRootRun({
+    service.store.commitPendingRunFinalization = commitPendingRunFinalization;
+    const durableSnapshot = commitPendingRunFinalization({
       runId: failed.runId,
-      sessionId: session.id,
-      runStatus: "error",
-      sessionStatus: "error",
-      error: "repaired finalization",
-      terminalResult: { text: "" },
-      modelMessages: service.store.getModelMessages(session.id),
-      uiMessages: service.store.getUiMessages(session.id),
+      destinationStateId: crypto.randomUUID(),
+      workspaceSnapshotId: null,
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "capture-failed",
+    }).snapshot;
+    expect(durableSnapshot).toMatchObject({
+      status: "idle",
+      activeRunId: null,
       inputTokens: 41,
     });
 
@@ -1516,6 +3317,7 @@ describe("SessionService", () => {
       modelResolver: () => model,
       modelLimitsResolver: async () => ({ context: 128_000, output: 8_000 }),
     });
+    await reopened.initialize();
     expect(reopened.getSnapshot(session.id)).toMatchObject({
       title: expectedTitle,
       inputTokens: 0,
@@ -1741,7 +3543,8 @@ describe("SessionService", () => {
         }),
       );
     };
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -1793,7 +3596,8 @@ describe("SessionService", () => {
       modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -1845,7 +3649,8 @@ describe("SessionService", () => {
       modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -1882,12 +3687,12 @@ describe("SessionService", () => {
     // The commit is the only observable moment the detached compaction reaches,
     // so it is what the test waits on rather than a timer.
     const committed = Promise.withResolvers<void>();
-    const commitCompaction = service.store.commitCompaction.bind(service.store);
-    service.store.commitCompaction = ((...args) => {
+    const commitCompaction = service.store.commitHistoryCompaction.bind(service.store);
+    service.store.commitHistoryCompaction = ((...args) => {
       const saved = commitCompaction(...args);
       committed.resolve();
       return saved;
-    }) as typeof service.store.commitCompaction;
+    }) as typeof service.store.commitHistoryCompaction;
 
     releaseSummary?.();
     await committed.promise;
@@ -1922,7 +3727,8 @@ describe("SessionService", () => {
       modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -1958,7 +3764,8 @@ describe("SessionService", () => {
       modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -2018,7 +3825,8 @@ describe("SessionService", () => {
       modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
     });
     const session = await service.createSession({ cwd: directory, model: "test/mock" });
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -2061,7 +3869,8 @@ describe("SessionService", () => {
       { id: "assistant-old", role: "assistant", parts: [{ type: "text", text: "old answer" }] },
       userMessage("latest request must remain"),
     ];
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service.store,
       session.id,
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
@@ -2069,27 +3878,14 @@ describe("SessionService", () => {
         { role: "user", content: "latest request must remain" },
       ],
       visibleMessages,
-    );
-    service.store.createRun({
-      id: "manual-compact-todo-seed",
-      sessionId: session.id,
-      profile: "reader",
-      depth: 0,
-    });
-    service.store.updateSessionState(session.id, "streaming", 0, "manual-compact-todo-seed");
-    service.store.replaceTodosForRun({
-      sessionId: session.id,
-      runId: "manual-compact-todo-seed",
-      todos: [
+      [
         {
           content: "Survive manual compaction",
           status: "in_progress",
           priority: "high",
         },
       ],
-    });
-    service.store.finishRun("manual-compact-todo-seed", "completed");
-    service.store.updateSessionState(session.id, "idle", 0, null);
+    );
 
     const request = { sessionId: session.id, clientCommandId: "compact-1" };
     const { events, result } = await compact(service, request);
@@ -2126,6 +3922,7 @@ describe("SessionService", () => {
               estimatedInputTokensAfter: result.estimatedInputTokensAfter,
               summary: result.summary,
               durationMs: expect.any(Number),
+              elapsedMs: expect.any(Number),
               modelCalls: expect.any(Number),
             },
           },
@@ -2136,12 +3933,9 @@ describe("SessionService", () => {
       phase: "completed",
       outcome: "compacted",
     });
-    expect(
-      await service.undo({ sessionId: session.id, clientCommandId: "undo-before-barrier" }),
-    ).toEqual({
-      status: "empty",
-      clientCommandId: "undo-before-barrier",
-    });
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "undo-before-barrier" }),
+    ).resolves.toEqual({ status: "empty", clientCommandId: "undo-before-barrier" });
 
     const afterBarrier = await service.startPrompt(
       session.id,
@@ -2159,14 +3953,6 @@ describe("SessionService", () => {
     )) {
       expect(JSON.stringify(call.prompt)).not.toContain("Survive manual compaction");
     }
-    expect(
-      await service.undo({ sessionId: session.id, clientCommandId: "undo-after-barrier" }),
-    ).toMatchObject({
-      status: "undone",
-      clientCommandId: "undo-after-barrier",
-      message: { role: "user" },
-    });
-    expect(service.getMessages(session.id).at(-1)?.parts[0]?.type).toBe("data-compaction");
     expect(JSON.stringify(service.store.getModelMessages(session.id))).toContain(
       "Condensed prior context.",
     );
@@ -2185,7 +3971,7 @@ describe("SessionService", () => {
     expect(JSON.stringify(reopened.store.getModelMessages(session.id))).toContain(
       "Condensed prior context.",
     );
-    expect(reopened.getMessages(session.id).at(-1)?.parts[0]?.type).toBe("data-compaction");
+    expect(JSON.stringify(reopened.getMessages(session.id))).toContain("data-compaction");
     reopened.close();
   });
 
@@ -2386,6 +4172,8 @@ describe("SessionService", () => {
       status: "undone",
       clientCommandId: "undo-second",
       message: secondUser,
+      historyStateId: expect.any(String),
+      filesystem: { status: "restored" },
     });
     expect(service.store.getModelMessages(session.id)).toEqual(expectedPrefix);
     expect(service.getMessages(session.id).map((message) => message.id)).toEqual([
@@ -2405,7 +4193,7 @@ describe("SessionService", () => {
     ).toMatchObject({ message: firstUser });
     expect(service.getMessages(session.id)).toEqual([]);
     expect(service.store.getModelMessages(session.id)).toEqual([]);
-    expect(service.store.getLatestRun(session.id)).toBeNull();
+    expect(service.store.getActiveRootRun(session.id)).toBeNull();
     const empty = await service.undo({
       sessionId: session.id,
       clientCommandId: "undo-empty",
@@ -2459,6 +4247,915 @@ describe("SessionService", () => {
     reopened.close();
   });
 
+  it("restores observed worktrees through undo/redo and retains discarded edit topology", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-redo-worktree-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    const ignored = path.join(workspace, "ignored.tmp");
+    await Promise.all([
+      writeFile(path.join(workspace, ".gitignore"), "ignored.tmp\n"),
+      writeFile(managed, "root"),
+      writeFile(ignored, "ignored-root"),
+    ]);
+    const model = new MockLanguageModelV4({
+      doStream: [
+        textResult("first-answer", "first response"),
+        textResult("branch-answer", "branch response"),
+      ],
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      attachCompaction: async () => () => {},
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const firstUser = userMessage("first prompt");
+    await collect((await service.startPrompt(session.id, firstUser, "first-prompt")).stream);
+    const firstTranscript = service.getMessages(session.id);
+
+    await Promise.all([
+      writeFile(managed, "manual-before-undo"),
+      writeFile(ignored, "ignored-manual"),
+    ]);
+    const statesBeforeUndo = service.store.listHistoryTopology(session.id).states.length;
+    const undone = await service.undo({ sessionId: session.id, clientCommandId: "undo-first" });
+    expect(undone).toMatchObject({
+      status: "undone",
+      message: firstUser,
+      filesystem: { status: "restored" },
+    });
+    expect(await Bun.file(managed).text()).toBe("root");
+    expect(await Bun.file(ignored).text()).toBe("ignored-manual");
+    expect(service.getMessages(session.id)).toEqual([]);
+    expect(service.store.listHistoryTopology(session.id).states.length).toBe(statesBeforeUndo + 1);
+
+    await Promise.all([
+      writeFile(managed, "manual-after-undo"),
+      writeFile(ignored, "ignored-after"),
+    ]);
+    const statesBeforeRedo = service.store.listHistoryTopology(session.id).states.length;
+    const redone = await service.redo({ sessionId: session.id, clientCommandId: "redo-first" });
+    expect(redone).toMatchObject({
+      status: "redone",
+      message: firstUser,
+      filesystem: { status: "restored" },
+    });
+    expect(await Bun.file(managed).text()).toBe("manual-before-undo");
+    expect(await Bun.file(ignored).text()).toBe("ignored-after");
+    expect(service.getMessages(session.id)).toEqual(firstTranscript);
+    expect(service.store.listHistoryTopology(session.id).states.length).toBe(statesBeforeRedo + 1);
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(await service.redo({ sessionId: session.id, clientCommandId: "redo-first" })).toEqual(
+      redone,
+    );
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "redo-first" }),
+    ).rejects.toThrow("already used for 'redo'");
+    expect(await service.redo({ sessionId: session.id, clientCommandId: "redo-empty" })).toEqual({
+      status: "empty",
+      clientCommandId: "redo-empty",
+    });
+
+    await service.undo({ sessionId: session.id, clientCommandId: "undo-for-branch" });
+    const retainedStateIds = new Set(
+      service.store.listHistoryTopology(session.id).states.map((state) => state.id),
+    );
+    await collect(
+      (await service.startPrompt(session.id, userMessage("new branch"), "branch-prompt")).stream,
+    );
+    expect(service.getSnapshot(session.id).canRedo).toBe(false);
+    expect(
+      service.store
+        .listHistoryTopology(session.id)
+        .states.filter((state) => retainedStateIds.has(state.id)),
+    ).toHaveLength(retainedStateIds.size);
+    service.close();
+  });
+
+  it("aborts before journaling when the workspace drifts between capture and restore preparation", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-source-drift-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    let injectDrift = false;
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new InterceptedWorkspaceHistoryStore(options, {
+          beforePrepare: async (expectedCurrent) => {
+            if (!injectDrift) return;
+            expect(expectedCurrent).toMatchObject({
+              status: "captured",
+              rootTreeOid: expect.any(String),
+            });
+            await writeFile(managed, "drift-after-source-capture");
+          },
+        }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("source binding"), "prompt-command"))
+        .stream,
+    );
+    await writeFile(managed, "captured-source");
+    const sourceStateId = service.getSnapshot(session.id).historyStateId;
+    const statesBefore = service.store.listHistoryTopology(session.id).states.length;
+    injectDrift = true;
+
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "source-drift-undo" }),
+    ).rejects.toMatchObject({ code: "restore-conflict" });
+    expect(await Bun.file(managed).text()).toBe("drift-after-source-capture");
+    expect(service.getSnapshot(session.id)).toMatchObject({
+      historyStateId: sourceStateId,
+      canRedo: false,
+    });
+    expect(service.store.listHistoryTopology(session.id).states).toHaveLength(statesBefore);
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE session_id = ? AND command_id = ?")
+        .get(session.id, "source-drift-undo"),
+    ).toBeNull();
+    service.close();
+  });
+
+  it("completes destination capability preflight before reserving a navigation journal", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-preflight-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    let rejectHardLinks = false;
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({
+          ...options,
+          testHooks: {
+            beforeHardLinkValidation: () => {
+              if (rejectHardLinks) {
+                throw Object.assign(new Error("hard links unavailable during preflight"), {
+                  code: "EOPNOTSUPP",
+                });
+              }
+            },
+          },
+        }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("preflight"), "prompt-command")).stream,
+    );
+    await writeFile(managed, "source-must-survive");
+    const sourceStateId = service.getSnapshot(session.id).historyStateId;
+    rejectHardLinks = true;
+
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "preflight-undo" }),
+    ).rejects.toMatchObject({
+      code: "filesystem-error",
+      operation: "prepare workspace restore",
+    });
+    expect(await Bun.file(managed).text()).toBe("source-must-survive");
+    expect(service.getSnapshot(session.id).historyStateId).toBe(sourceStateId);
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE session_id = ? AND command_id = ?")
+        .get(session.id, "preflight-undo"),
+    ).toBeNull();
+    service.close();
+  });
+
+  it("maps Git disappearance before journaling to a transcript-only navigation", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-git-disappears-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    const gitWrapper = path.join(directory, "git-wrapper");
+    await writeFile(managed, "target");
+    await writeFile(gitWrapper, '#!/bin/sh\nexec git "$@"\n');
+    await chmod(gitWrapper, 0o755);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({ ...options, gitExecutable: gitWrapper, platform: "linux" }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const prompt = userMessage("Git disappears");
+    await collect((await service.startPrompt(session.id, prompt, "prompt-command")).stream);
+    await writeFile(managed, "source-drift");
+    await rm(gitWrapper);
+
+    expect(
+      await service.undo({ sessionId: session.id, clientCommandId: "missing-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      message: prompt,
+      filesystem: { status: "skipped", reason: "git-unavailable" },
+    });
+    expect(await Bun.file(managed).text()).toBe("source-drift");
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    const redoTarget = service.store.peekHistoryRedo(session.id);
+    if (redoTarget === null) throw new Error("missing redo target for unavailable source");
+    expect(service.store.getHistoryState(redoTarget.targetStateId)).toMatchObject({
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "git-unavailable",
+    });
+    service.close();
+  });
+
+  it("treats Git exit 128 before journaling as an operational navigation failure", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-git-128-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    const gitWrapper = path.join(directory, "git-wrapper");
+    const failMarker = path.join(directory, "fail-git");
+    await writeFile(managed, "target");
+    await writeFile(
+      gitWrapper,
+      `#!/bin/sh\nif [ -e ${JSON.stringify(failMarker)} ]; then exit 128; fi\nexec git "$@"\n`,
+    );
+    await chmod(gitWrapper, 0o755);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({ ...options, gitExecutable: gitWrapper, platform: "linux" }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("Git failure"), "prompt-command")).stream,
+    );
+    await writeFile(managed, "source-must-survive");
+    const sourceStateId = service.getSnapshot(session.id).historyStateId;
+    await writeFile(failMarker, "fail");
+
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "git-128-undo" }),
+    ).rejects.toMatchObject({ code: "git-command-failed", exitCode: 128 });
+    expect(await Bun.file(managed).text()).toBe("source-must-survive");
+    expect(service.getSnapshot(session.id).historyStateId).toBe(sourceStateId);
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE session_id = ? AND command_id = ?")
+        .get(session.id, "git-128-undo"),
+    ).toBeNull();
+    service.close();
+  });
+
+  it("serializes navigation preparation across sessions sharing one workspace", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-contention-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "managed.txt"), "shared");
+    const firstPrepareEntered = Promise.withResolvers<void>();
+    const releaseFirstPrepare = Promise.withResolvers<void>();
+    const secondLockRequested = Promise.withResolvers<void>();
+    let navigationActive = false;
+    let lockRequests = 0;
+    let navigationCaptures = 0;
+    let heldFirstPrepare = false;
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () =>
+        new MockLanguageModelV4({
+          doStream: [
+            textResult("first-answer", "first response"),
+            textResult("second-answer", "second response"),
+          ],
+        }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new InterceptedWorkspaceHistoryStore(options, {
+          onLockRequest: () => {
+            if (!navigationActive) return;
+            lockRequests += 1;
+            if (lockRequests === 2) secondLockRequested.resolve();
+          },
+          onCapture: () => {
+            if (navigationActive) navigationCaptures += 1;
+          },
+          beforePrepare: async () => {
+            if (!navigationActive || heldFirstPrepare) return;
+            heldFirstPrepare = true;
+            firstPrepareEntered.resolve();
+            await releaseFirstPrepare.promise;
+          },
+        }),
+    });
+    const first = await service.createSession({
+      id: "contention-first",
+      cwd: workspace,
+      model: "test/mock",
+    });
+    const second = await service.createSession({
+      id: "contention-second",
+      cwd: workspace,
+      model: "test/mock",
+    });
+    await collect(
+      (await service.startPrompt(first.id, userMessage("first"), "first-prompt")).stream,
+    );
+    await collect(
+      (await service.startPrompt(second.id, userMessage("second"), "second-prompt")).stream,
+    );
+
+    navigationActive = true;
+    const firstUndo = service.undo({ sessionId: first.id, clientCommandId: "first-undo" });
+    await firstPrepareEntered.promise;
+    const secondUndo = service.undo({ sessionId: second.id, clientCommandId: "second-undo" });
+    await secondLockRequested.promise;
+    expect(navigationCaptures).toBe(1);
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE session_id = ? AND command_id = ?")
+        .get(second.id, "second-undo"),
+    ).not.toBeNull();
+
+    releaseFirstPrepare.resolve();
+    expect((await firstUndo).status).toBe("undone");
+    expect((await secondUndo).status).toBe("undone");
+    expect(navigationCaptures).toBe(2);
+    service.close();
+  });
+
+  for (const retainedPhase of ["prepared", "restoring", "verified"] as const) {
+    it(`rolls a retained ${retainedPhase} navigation forward on restart`, async () => {
+      const directory = await mkdtemp(
+        path.join(tmpdir(), `mini-lilac-navigation-${retainedPhase}-`),
+      );
+      temporaryDirectories.push(directory);
+      const workspace = path.join(directory, "workspace");
+      const databasePath = path.join(directory, "runtime.sqlite");
+      await mkdir(workspace);
+      const managed = path.join(workspace, "managed.txt");
+      await writeFile(managed, "target");
+      const service = new SessionService({
+        config: config(),
+        databasePath,
+        modelResolver: () =>
+          new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+        attachCompaction: async () => () => {},
+        ...(retainedPhase === "restoring"
+          ? {
+              workspaceHistoryStoreFactory: (options: WorkspaceHistoryStoreOptions) =>
+                new WorkspaceHistoryStore({
+                  ...options,
+                  testHooks: {
+                    beforeMutation: () => {
+                      throw new Error("injected restore write failure");
+                    },
+                  },
+                }),
+            }
+          : {}),
+      });
+      const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+      const prompt = userMessage(`recover ${retainedPhase}`);
+      await collect((await service.startPrompt(session.id, prompt, "prompt-command")).stream);
+      await writeFile(managed, "source-drift");
+
+      if (retainedPhase === "prepared") {
+        const updatePhase = service.store.updateHistoryOperationPhase.bind(service.store);
+        service.store.updateHistoryOperationPhase = (operationId, phase) => {
+          if (phase === "restoring") throw new Error("injected prepared crash");
+          return updatePhase(operationId, phase);
+        };
+      } else if (retainedPhase === "verified") {
+        service.store.commitHistoryNavigation = () => {
+          throw new Error("injected verified crash");
+        };
+      }
+
+      await expect(
+        service.undo({ sessionId: session.id, clientCommandId: "recoverable-undo" }),
+      ).rejects.toThrow("injected");
+      expect(service.store.listHistoryOperations()).toMatchObject([
+        { requestedAction: "undo", phase: retainedPhase },
+      ]);
+      expect(service.getMessages(session.id)).not.toEqual([]);
+      service.close();
+
+      const reopened = new SessionService({
+        config: config(),
+        databasePath,
+        modelResolver: () => new MockLanguageModelV4({}),
+        attachCompaction: async () => () => {},
+      });
+      await reopened.initialize();
+      expect(reopened.getHistoryRecoveryStatus().navigation).toEqual([]);
+      expect(await Bun.file(managed).text()).toBe("target");
+      expect(reopened.getMessages(session.id)).toEqual([]);
+      expect(
+        await reopened.undo({ sessionId: session.id, clientCommandId: "recoverable-undo" }),
+      ).toMatchObject({
+        status: "undone",
+        message: prompt,
+        filesystem: { status: "restored" },
+      });
+      reopened.close();
+    });
+  }
+
+  for (const scenario of [
+    {
+      name: "removed-ignore-rule",
+      sourceRule: "secret.txt\n",
+      targetRule: "other.txt\n",
+      preservedPath: "secret.txt",
+    },
+    {
+      name: "added-ignore-rule",
+      sourceRule: "other.txt\n",
+      targetRule: "secret.txt\n",
+      preservedPath: "other.txt",
+    },
+  ] as const) {
+    it(`recovers navigation from frozen membership after target ignore publication (${scenario.name})`, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), `mini-lilac-frozen-${scenario.name}-`));
+      temporaryDirectories.push(directory);
+      const workspace = path.join(directory, "workspace");
+      const databasePath = path.join(directory, "runtime.sqlite");
+      await mkdir(workspace);
+      const managed = path.join(workspace, "managed.txt");
+      const protectedPath = path.join(workspace, "protected.txt");
+      await writeFile(path.join(workspace, ".gitignore"), scenario.targetRule);
+      await writeFile(managed, "target");
+      await writeFile(protectedPath, "protected value");
+      let injected = false;
+      const initial = new SessionService({
+        config: config(),
+        databasePath,
+        modelResolver: () =>
+          new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+        attachCompaction: async () => () => {},
+        protectedToolPaths: [protectedPath],
+        workspaceHistoryStoreFactory: (options) =>
+          new WorkspaceHistoryStore({
+            ...options,
+            testHooks: {
+              afterPublication: (relativePath) => {
+                if (relativePath === ".gitignore" && !injected) {
+                  injected = true;
+                  throw new Error("injected crash after target ignore publication");
+                }
+              },
+            },
+          }),
+      });
+      const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+      await collect(
+        (await initial.startPrompt(session.id, userMessage("freeze source"), "prompt-command"))
+          .stream,
+      );
+      await writeFile(path.join(workspace, ".gitignore"), scenario.sourceRule);
+      await writeFile(managed, "source");
+      await writeFile(path.join(workspace, scenario.preservedPath), "preserved value");
+
+      await expect(
+        initial.undo({ sessionId: session.id, clientCommandId: "frozen-undo" }),
+      ).rejects.toThrow("injected crash after target ignore publication");
+      expect(await Bun.file(path.join(workspace, ".gitignore")).text()).toBe(scenario.targetRule);
+      const operation = initial.getHistoryRecoveryStatus().navigation[0];
+      if (operation === undefined) throw new Error("missing frozen restore operation");
+      expect(operation.phase).toBe("restoring");
+      initial.close();
+
+      const reopened = new SessionService({
+        config: config(),
+        databasePath,
+        modelResolver: () => new MockLanguageModelV4({}),
+        attachCompaction: async () => () => {},
+        protectedToolPaths: [protectedPath],
+      });
+      await reopened.initialize();
+      expect(await Bun.file(path.join(workspace, scenario.preservedPath)).text()).toBe(
+        "preserved value",
+      );
+      expect(await Bun.file(protectedPath).text()).toBe("protected value");
+      expect(await Bun.file(managed).text()).toBe("target");
+      expect(reopened.getHistoryRecoveryStatus().navigation).toEqual([]);
+      reopened.close();
+    });
+  }
+
+  it("fails initialization closed when a restore journal has no durable frozen plan", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-missing-restore-plan-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore(options)),
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("prepare"), "prompt-command")).stream,
+    );
+    await writeFile(managed, "source");
+    const updatePhase = initial.store.updateHistoryOperationPhase.bind(initial.store);
+    initial.store.updateHistoryOperationPhase = (operationId, phase) => {
+      if (phase === "restoring") throw new Error("injected journal gap");
+      return updatePhase(operationId, phase);
+    };
+    await expect(
+      initial.undo({ sessionId: session.id, clientCommandId: "missing-plan-undo" }),
+    ).rejects.toThrow("injected journal gap");
+    const operation = initial.getHistoryRecoveryStatus().navigation[0];
+    if (operation === undefined || historyStore === undefined) {
+      throw new Error("missing retained restore setup");
+    }
+    await historyStore.deleteRestorePlan(operation.id);
+    initial.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await expect(reopened.initialize()).rejects.toThrow("restore plan");
+    expect(reopened.getHistoryRecoveryStatus().navigation).toMatchObject([
+      { id: operation.id, phase: "prepared" },
+    ]);
+    await reopened.abandonHistoryNavigation({
+      operationId: operation.id,
+      acknowledgePartialWorktree: true,
+      message: "operator acknowledged missing durable plan",
+    });
+    reopened.close();
+  });
+
+  it("verification-only recovery retains a verified journal after offline drift", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-verified-drift-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("verified"), "prompt-command")).stream,
+    );
+    await writeFile(managed, "source-drift");
+    initial.store.commitHistoryNavigation = () => {
+      throw new Error("injected verified crash");
+    };
+    await expect(
+      initial.undo({ sessionId: session.id, clientCommandId: "verified-drift-undo" }),
+    ).rejects.toThrow("injected verified crash");
+    const operation = initial.getHistoryRecoveryStatus().navigation[0];
+    if (operation === undefined) throw new Error("missing verified operation");
+    expect(operation.phase).toBe("verified");
+    initial.close();
+    await writeFile(managed, "offline-edit-must-survive");
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({
+          ...options,
+          testHooks: {
+            beforeMutation: () => {
+              throw new Error("verified recovery must not materialize");
+            },
+          },
+        }),
+    });
+    await expect(reopened.initialize()).rejects.toMatchObject({
+      code: "filesystem-error",
+      operation: "verify restored workspace",
+    });
+    expect(await Bun.file(managed).text()).toBe("offline-edit-must-survive");
+    expect(reopened.getHistoryRecoveryStatus().navigation).toMatchObject([
+      { id: operation.id, phase: "verified" },
+    ]);
+    await reopened.abandonHistoryNavigation({
+      operationId: operation.id,
+      acknowledgePartialWorktree: true,
+      message: "operator acknowledged verified-worktree drift",
+    });
+    reopened.close();
+  });
+
+  it("keeps a prepared restore blocked when Git disappears after journaling", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-git-after-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const gitWrapper = path.join(directory, "git-wrapper");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    await writeFile(gitWrapper, '#!/bin/sh\nexec git "$@"\n');
+    await chmod(gitWrapper, 0o755);
+    const storeFactory = (options: WorkspaceHistoryStoreOptions): WorkspaceHistoryStore =>
+      new WorkspaceHistoryStore({ ...options, gitExecutable: gitWrapper, platform: "linux" });
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: storeFactory,
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("Git retained"), "prompt-command")).stream,
+    );
+    await writeFile(managed, "source-drift");
+    const updatePhase = initial.store.updateHistoryOperationPhase.bind(initial.store);
+    initial.store.updateHistoryOperationPhase = (operationId, phase) => {
+      if (phase === "restoring") throw new Error("injected prepared crash");
+      return updatePhase(operationId, phase);
+    };
+    await expect(
+      initial.undo({ sessionId: session.id, clientCommandId: "git-after-undo" }),
+    ).rejects.toThrow("injected prepared crash");
+    const operation = initial.getHistoryRecoveryStatus().navigation[0];
+    if (operation === undefined) throw new Error("missing prepared operation");
+    initial.close();
+    await rm(gitWrapper);
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: storeFactory,
+    });
+    await expect(reopened.initialize()).rejects.toThrow(
+      "requires Git for recovery (git-unavailable)",
+    );
+    expect(reopened.getHistoryRecoveryStatus().navigation).toMatchObject([
+      { id: operation.id, phase: "prepared" },
+    ]);
+    await reopened.abandonHistoryNavigation({
+      operationId: operation.id,
+      acknowledgePartialWorktree: true,
+      message: "operator acknowledged unavailable Git",
+    });
+    reopened.close();
+  });
+
+  it("abandons only the retained navigation and replays a stable command error", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-abandon-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({
+          ...options,
+          testHooks: {
+            beforeMutation: () => {
+              throw new Error("injected partial restore");
+            },
+          },
+        }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("abandon me"), "prompt-command")).stream,
+    );
+    await writeFile(managed, "source-drift");
+    const sourceStateId = service.getSnapshot(session.id).historyStateId;
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "abandoned-undo" }),
+    ).rejects.toThrow("injected partial restore");
+    const operation = service.getHistoryRecoveryStatus().navigation[0];
+    if (operation === undefined) throw new Error("missing retained navigation");
+
+    const abandoned = await service.abandonHistoryNavigation({
+      operationId: operation.id,
+      acknowledgePartialWorktree: true,
+      message: "operator acknowledged the partial worktree",
+    });
+    expect(abandoned).toMatchObject({
+      code: "history-recovery-abandoned",
+      commandId: "abandoned-undo",
+    });
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(service.getSnapshot(session.id).historyStateId).toBe(sourceStateId);
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "abandoned-undo" }),
+    ).rejects.toMatchObject({
+      code: "history-recovery-abandoned",
+      commandId: "abandoned-undo",
+      message: "operator acknowledged the partial worktree",
+    });
+    service.close();
+  });
+
+  it("skips a missing target snapshot discovered before journaling", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-missing-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore(options)),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const prompt = userMessage("lose target object");
+    await collect((await service.startPrompt(session.id, prompt, "prompt-command")).stream);
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    await rm(historyStore.storeDirectory, { recursive: true, force: true });
+    await writeFile(managed, "source-drift");
+
+    expect(
+      await service.undo({ sessionId: session.id, clientCommandId: "missing-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      message: prompt,
+      filesystem: { status: "skipped", reason: "snapshot-unavailable" },
+    });
+    expect(await Bun.file(managed).text()).toBe("source-drift");
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    service.close();
+  });
+
+  it("fails recovery closed when a target snapshot disappears after journaling", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-missing-after-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        (historyStore = new WorkspaceHistoryStore(options)),
+    });
+    const session = await initial.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (await initial.startPrompt(session.id, userMessage("retain journal"), "prompt-command"))
+        .stream,
+    );
+    await writeFile(managed, "source-drift");
+    const updatePhase = initial.store.updateHistoryOperationPhase.bind(initial.store);
+    initial.store.updateHistoryOperationPhase = (operationId, phase) => {
+      if (phase === "restoring") throw new Error("injected prepared crash");
+      return updatePhase(operationId, phase);
+    };
+    await expect(
+      initial.undo({ sessionId: session.id, clientCommandId: "missing-after-undo" }),
+    ).rejects.toThrow("injected prepared crash");
+    const operation = initial.getHistoryRecoveryStatus().navigation[0];
+    if (operation === undefined || historyStore === undefined) {
+      throw new Error("missing retained navigation setup");
+    }
+    initial.close();
+    await rm(historyStore.storeDirectory, { recursive: true, force: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await expect(reopened.initialize()).rejects.toThrow("target snapshot is unavailable");
+    expect(reopened.getHistoryRecoveryStatus().navigation).toMatchObject([
+      { id: operation.id, phase: "prepared" },
+    ]);
+    expect(reopened.getSnapshot(session.id).historyStateId).toBe(operation.sourceStateId);
+    await reopened.abandonHistoryNavigation({
+      operationId: operation.id,
+      acknowledgePartialWorktree: true,
+      message: "operator acknowledged missing recovery objects",
+    });
+    reopened.close();
+  });
+
+  it("aborts an operational undo capture without a journal or cursor movement", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-navigation-capture-fail-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new ScriptedWorkspaceHistoryStore(options, async (call, workspaceId) => {
+          if (call === 3) throw new Error("injected navigation capture failure");
+          return capturedWorkspace(call, workspaceId);
+        }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("capture first"), "prompt-command"))
+        .stream,
+    );
+    const sourceStateId = service.getSnapshot(session.id).historyStateId;
+
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "capture-failed-undo" }),
+    ).rejects.toThrow("injected navigation capture failure");
+    expect(service.getSnapshot(session.id).historyStateId).toBe(sourceStateId);
+    expect(service.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE session_id = ? AND command_id = ?")
+        .get(session.id, "capture-failed-undo"),
+    ).toBeNull();
+    service.close();
+  });
+
+  for (const unavailable of ["git-unavailable", "platform-unsupported"] as const) {
+    it(`navigates transcript-only when ${unavailable}`, async () => {
+      const directory = await mkdtemp(path.join(tmpdir(), `mini-lilac-${unavailable}-`));
+      temporaryDirectories.push(directory);
+      const workspace = path.join(directory, "workspace");
+      await mkdir(workspace);
+      const service = new SessionService({
+        config: config(),
+        databasePath: path.join(directory, "runtime.sqlite"),
+        modelResolver: () =>
+          new MockLanguageModelV4({ doStream: textResult("answer", "response") }),
+        attachCompaction: async () => () => {},
+        workspaceHistoryStoreFactory: (options) =>
+          new WorkspaceHistoryStore({
+            ...options,
+            ...(unavailable === "git-unavailable"
+              ? { gitExecutable: path.join(directory, "missing-git"), platform: "linux" as const }
+              : { platform: "win32" as const }),
+          }),
+      });
+      const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+      const prompt = userMessage(unavailable);
+      await collect((await service.startPrompt(session.id, prompt, "prompt-command")).stream);
+
+      expect(
+        await service.undo({ sessionId: session.id, clientCommandId: `${unavailable}-undo` }),
+      ).toMatchObject({
+        status: "undone",
+        message: prompt,
+        filesystem: { status: "skipped", reason: unavailable },
+      });
+      service.close();
+    });
+  }
+
   it("allows undo after an error once the actor and run are quiescent", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "complete") });
     const { service, session } = await temporaryRuntime(model);
@@ -2488,31 +5185,11 @@ describe("SessionService", () => {
       profile: "reader",
       reasoning: "high",
     });
-    first.reserveCommand("crash-session", "crash-prompt", {
-      kind: "prompt",
-      runId: null,
-      payload: {},
+    seedOpenHistory(first, "crash-session", "interrupted-run", rootUser);
+    expect(first.getSession("crash-session")).toMatchObject({
+      status: "streaming",
+      activeRunId: "interrupted-run",
     });
-    first.beginRootRun({
-      run: {
-        id: "interrupted-run",
-        sessionId: "crash-session",
-        profile: "reader",
-        depth: 0,
-      },
-      commandId: "crash-prompt",
-      commandPayload: {},
-      modelMessages: [{ role: "user", content: "interrupted prompt" }],
-      uiMessages: [rootUser],
-    });
-    first.updateSessionState("crash-session", "error", 0, null);
-    expect(() =>
-      first.undoLatestUser("crash-session", "active-run-undo", {
-        kind: "undo",
-        runId: null,
-        payload: {},
-      }),
-    ).toThrow("must be quiescent");
     first.close();
 
     const service = new SessionService({
@@ -2521,6 +5198,7 @@ describe("SessionService", () => {
       modelResolver: () => new MockLanguageModelV4({}),
       attachCompaction: async () => () => {},
     });
+    await service.initialize();
     expect(service.getSnapshot("crash-session")).toMatchObject({
       status: "error",
       activeRunId: null,
@@ -2556,9 +5234,17 @@ describe("SessionService", () => {
     await expect(
       service.undo({ sessionId: session.id, clientCommandId: "active-undo" }),
     ).rejects.toThrow("must be quiescent");
+    await expect(
+      service.redo({ sessionId: session.id, clientCommandId: "active-redo" }),
+    ).rejects.toThrow("must be quiescent");
     expect(
       service.store.database
         .query("SELECT COUNT(*) AS count FROM commands WHERE command_id = 'active-undo'")
+        .get(),
+    ).toEqual({ count: 0 });
+    expect(
+      service.store.database
+        .query("SELECT COUNT(*) AS count FROM commands WHERE command_id = 'active-redo'")
         .get(),
     ).toEqual({ count: 0 });
     await service.cancel({
@@ -2569,13 +5255,38 @@ describe("SessionService", () => {
     await expect(
       service.undo({ sessionId: session.id, clientCommandId: "cancelling-undo" }),
     ).rejects.toThrow("must be quiescent");
+    await expect(
+      service.redo({ sessionId: session.id, clientCommandId: "cancelling-redo" }),
+    ).rejects.toThrow("must be quiescent");
     expect(
       service.store.database
         .query("SELECT COUNT(*) AS count FROM commands WHERE command_id = 'cancelling-undo'")
         .get(),
     ).toEqual({ count: 0 });
+    expect(
+      service.store.database
+        .query("SELECT COUNT(*) AS count FROM commands WHERE command_id = 'cancelling-redo'")
+        .get(),
+    ).toEqual({ count: 0 });
     release();
     await collect(started.stream);
+    service.close();
+  });
+
+  it("commits quiescent undo instead of leaving an unreserved Stage 4 command", async () => {
+    const { service, session } = await temporaryRuntime(
+      new MockLanguageModelV4({ doStream: textResult("answer", "done") }),
+    );
+    await collect((await service.startPrompt(session.id, userMessage("history exists"))).stream);
+
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "stage-4-undo" }),
+    ).resolves.toMatchObject({ status: "undone" });
+    expect(
+      service.store.database
+        .query("SELECT 1 FROM commands WHERE command_id = 'stage-4-undo'")
+        .get(),
+    ).not.toBeNull();
     service.close();
   });
 
@@ -2964,13 +5675,19 @@ describe("SessionService", () => {
   });
 
   it("serializes steer/interrupt/cancel commands and reuses idempotent results", async () => {
-    let release = () => {};
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
+    let releaseFirst = () => {};
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
     });
+    let releaseSecond = () => {};
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    let modelCalls = 0;
     const model = new MockLanguageModelV4({
       doStream: async () => {
-        await gate;
+        modelCalls += 1;
+        await (modelCalls === 1 ? firstGate : secondGate);
         return textResult("cancelled", "too late");
       },
     });
@@ -2979,38 +5696,31 @@ describe("SessionService", () => {
     // test-wait-justification: command serialization is exercised only after the gated model call has entered its asynchronous turn.
     await Bun.sleep(0);
 
-    const controls = await Promise.allSettled([
-      service.steer({
-        sessionId: session.id,
-        runId: started.runId,
-        clientCommandId: "steer-command",
-        message: steeringMessage("new direction"),
-      }),
-      service.interruptQueuedSteering({
-        sessionId: session.id,
-        runId: started.runId,
-        clientCommandId: "interrupt-command",
-      }),
+    const first = await service.steer({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "steer-command",
+      message: steeringMessage("new direction"),
+    });
+    const interruptPromise = service.interruptQueuedSteering({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "interrupt-command",
+    });
+    releaseFirst();
+    const interrupted = await interruptPromise;
+    await expect(
       service.cancel({
         sessionId: session.id,
         runId: "stale-run",
         clientCommandId: "stale-cancel",
       }),
-      service.cancel({
-        sessionId: session.id,
-        runId: started.runId,
-        clientCommandId: "cancel-command",
-      }),
-    ]);
-    expect(controls.map((result) => result.status)).toEqual([
-      "fulfilled",
-      "fulfilled",
-      "rejected",
-      "fulfilled",
-    ]);
-    const first = controls[0]?.status === "fulfilled" ? controls[0].value : undefined;
-    const interrupted = controls[1]?.status === "fulfilled" ? controls[1].value : undefined;
-    const cancelled = controls[3]?.status === "fulfilled" ? controls[3].value : undefined;
+    ).rejects.toThrow("not active");
+    const cancelled = await service.cancel({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "cancel-command",
+    });
     expect(first?.status).toBe("queued");
     expect(interrupted?.status).toBe("interrupted");
     expect(cancelled?.status).toBe("cancelled");
@@ -3019,7 +5729,6 @@ describe("SessionService", () => {
       status: "cancelling",
       queuedSteeringCount: 0,
     });
-    if (!first || !cancelled) throw new Error("Expected fulfilled steer and cancel controls");
 
     const duplicate = await service.steer({
       sessionId: session.id,
@@ -3070,7 +5779,7 @@ describe("SessionService", () => {
         payload: { message: steeringMessage("must be rejected") },
       }),
     ).toBeUndefined();
-    release();
+    releaseSecond();
     const chunks = await collect(started.stream);
     const persistedChunks = chunks.filter((chunk) => chunk.type !== "data-streamCursor");
     const controlIds = persistedChunks
@@ -3356,10 +6065,15 @@ describe("SessionService", () => {
       END;
     `);
 
-    await expect(
-      service.startPrompt(session.id, userMessage("must roll back"), "atomic-prompt"),
-    ).rejects.toThrow("prompt command fault");
-    expect(service.store.getLatestRun(session.id)).toBeNull();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(
+        service.startPrompt(session.id, userMessage("must roll back"), "atomic-prompt"),
+      ).rejects.toThrow("prompt command fault");
+      expect(
+        service.store.database.query("SELECT COUNT(*) AS count FROM workspace_snapshots").get(),
+      ).toEqual({ count: 0 });
+    }
+    expect(service.store.getActiveRootRun(session.id)).toBeNull();
     expect(service.getMessages(session.id)).toEqual([]);
     expect(service.store.getModelMessages(session.id)).toEqual([]);
     expect(service.getSnapshot(session.id)).toMatchObject({
@@ -3380,7 +6094,45 @@ describe("SessionService", () => {
     );
     await collect(retried.stream);
     expect(service.store.getRun(retried.runId).status).toBe("completed");
+    expect(
+      service.store.database.query("SELECT COUNT(*) AS count FROM workspace_snapshots").get(),
+    ).toEqual({ count: 1 });
     service.close();
+  });
+
+  it("removes unreferenced snapshot rows at startup without deleting shared history snapshots", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const { directory, service, session } = await temporaryRuntime(model);
+    const started = await service.startPrompt(
+      session.id,
+      userMessage("create referenced snapshot"),
+      "referenced-prompt",
+    );
+    await collect(started.stream);
+    const workspace = service.store.getWorkspaceForSession(session.id);
+    const referencedSnapshotId = service.store.getCurrentHistoryState(
+      session.id,
+    ).workspaceSnapshotId;
+    if (referencedSnapshotId === null) throw new Error("missing referenced workspace snapshot");
+    const orphanSnapshotId = "orphan-snapshot";
+    service.store.createOrReuseWorkspaceSnapshot({
+      id: orphanSnapshotId,
+      workspaceId: workspace.id,
+      rootTreeOid: "f".repeat(40),
+      gitRef: "refs/lilac/snapshots/orphan-snapshot",
+      formatVersion: 1,
+    });
+    service.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({}),
+    });
+    await reopened.initialize();
+    expect(reopened.store.getWorkspaceSnapshot(orphanSnapshotId)).toBeNull();
+    expect(reopened.store.getWorkspaceSnapshot(referencedSnapshotId)).not.toBeNull();
+    reopened.close();
   });
 
   for (const mode of ["sync", "deferred"] as const) {
@@ -3490,98 +6242,100 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("limits total children per parent rather than only concurrent children", async () => {
-    const runtimeConfig = config();
-    runtimeConfig.agent.subagents.maxChildrenPerRun = 1;
+  it("allows more than eight children in one parent run", async () => {
+    const responses = Array.from({ length: 9 }, (_, index) => [
+      delegateResult("sync", `child-${index}`),
+      textResult(`child-${index}`, `result-${index}`),
+    ]).flat();
     const model = new MockLanguageModelV4({
-      doStream: [
-        delegateResult("sync", "first-child"),
-        textResult("child", "first result"),
-        delegateResult("sync", "second-child"),
-        textResult("root", "done"),
-      ],
+      doStream: [...responses, textResult("root", "done")],
     });
-    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-limit-"));
-    temporaryDirectories.push(directory);
-    const service = new SessionService({
-      config: runtimeConfig,
-      databasePath: path.join(directory, "runtime.sqlite"),
-      modelResolver: () => model,
-    });
-    const session = await service.createSession({
-      cwd: directory,
-      model: "test/mock",
-      profile: "delegate",
-    });
-    const started = await service.startPrompt(session.id, userMessage("delegate twice"));
+    const { service, session } = await temporaryRuntime(model, "delegate");
+    const started = await service.startPrompt(session.id, userMessage("delegate repeatedly"));
     await collect(started.stream);
 
-    expect(delegatedRuns(service, session.id)).toHaveLength(1);
-    expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain(
-      "maximum children per run reached",
-    );
+    expect(delegatedRuns(service, session.id)).toHaveLength(9);
+    expect(JSON.stringify(model.doStreamCalls)).not.toContain("maximum children per run reached");
     service.close();
   });
 
-  it("enforces maxConcurrent across sessions in one runtime", async () => {
-    const runtimeConfig = config();
-    runtimeConfig.agent.subagents.maxConcurrent = 1;
-    let childStarted = () => {};
-    const childStart = new Promise<void>((resolve) => {
-      childStarted = resolve;
-    });
-    let releaseChild = () => {};
-    const childGate = new Promise<void>((resolve) => {
-      releaseChild = resolve;
-    });
+  it("allows more than four child runs concurrently", async () => {
+    const allChildrenStarted = Promise.withResolvers<void>();
+    const releaseChildren = Promise.withResolvers<void>();
+    const delegatedRoots = new Set<string>();
+    let childCount = 0;
     const model = new MockLanguageModelV4({
       doStream: async (options) => {
-        const prompt = JSON.stringify(options.prompt);
         const latestUser = JSON.stringify(
           options.prompt.filter((message) => message.role === "user").at(-1),
         );
-        if (latestUser.includes("first root")) return delegateResult("sync", "held-child");
-        if (latestUser.includes("second root")) return delegateResult("sync", "blocked-child");
-        if (latestUser.includes("held-child")) {
-          childStarted();
-          await childGate;
-          return textResult("held-child", "child complete");
+        const childMatch = /child-(\d+)/u.exec(latestUser);
+        if (childMatch !== null) {
+          childCount += 1;
+          if (childCount === 5) allChildrenStarted.resolve();
+          await releaseChildren.promise;
+          return textResult(`child-${childMatch[1]}`, "child complete");
         }
-        if (prompt.includes("maximum concurrent subagents reached")) {
-          return textResult("blocked-root", "capacity respected");
+        const rootMatch = /root-(\d+)/u.exec(latestUser);
+        if (rootMatch !== null && !delegatedRoots.has(rootMatch[0])) {
+          delegatedRoots.add(rootMatch[0]);
+          return delegateResult("sync", `child-${rootMatch[1]}`);
         }
         return textResult("root", "done");
       },
     });
-    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-global-capacity-"));
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unbounded-concurrency-"));
     temporaryDirectories.push(directory);
     const service = new SessionService({
-      config: runtimeConfig,
+      config: config(),
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
     });
-    const firstSession = await service.createSession({
-      cwd: directory,
-      model: "test/mock",
-      profile: "delegate",
-    });
-    const secondSession = await service.createSession({
-      cwd: directory,
-      model: "test/mock",
-      profile: "delegate",
-    });
-    const first = await service.startPrompt(firstSession.id, userMessage("first root"));
-    const firstCompletion = collect(first.stream);
-    await childStart;
+    const sessions = await Promise.all(
+      Array.from({ length: 5 }, (_, index) =>
+        service.createSession({
+          id: `concurrent-${index}`,
+          cwd: directory,
+          model: "test/mock",
+          profile: "delegate",
+        }),
+      ),
+    );
+    const started = await Promise.all(
+      sessions.map((session, index) =>
+        service.startPrompt(session.id, userMessage(`root-${index}`)),
+      ),
+    );
+    const completions = started.map((run) => collect(run.stream));
 
-    const second = await service.startPrompt(secondSession.id, userMessage("second root"));
-    await collect(second.stream);
-    expect(delegatedRuns(service, secondSession.id)).toEqual([]);
-    expect(JSON.stringify(model.doStreamCalls)).toContain("maximum concurrent subagents reached");
+    await allChildrenStarted.promise;
+    expect(sessions.flatMap((session) => delegatedRuns(service, session.id))).toHaveLength(5);
+    releaseChildren.resolve();
+    await Promise.all(completions);
 
-    releaseChild();
-    await firstCompletion;
-    expect(delegatedRuns(service, firstSession.id)[0]?.status).toBe("completed");
+    expect(
+      sessions.flatMap((session) => delegatedRuns(service, session.id)).map((run) => run.status),
+    ).toEqual(Array.from({ length: 5 }, () => "completed"));
+    service.close();
+  });
+
+  it("allows only one delegation edge by default", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("sync", "child"),
+        delegateResult("sync", "grandchild"),
+        textResult("child", "child recovered"),
+        textResult("root", "done"),
+      ],
+    });
+    const { service, session } = await temporaryRuntime(model, "delegate");
+    const started = await service.startPrompt(session.id, userMessage("delegate once"));
+    await collect(started.stream);
+
+    expect(delegatedRuns(service, session.id)).toHaveLength(1);
+    expect(JSON.stringify(model.doStreamCalls[2]?.prompt)).toContain(
+      "maximum subagent depth reached",
+    );
     service.close();
   });
 
@@ -3900,7 +6654,7 @@ describe("SessionService", () => {
     await expect(service.startPrompt(session.id, userMessage("should roll back"))).rejects.toThrow(
       "model construction failed",
     );
-    expect(service.store.getLatestRun(session.id)).toBeNull();
+    expect(service.store.getActiveRootRun(session.id)).toBeNull();
     expect(service.getSnapshot(session.id).status).toBe("idle");
     expect(service.getMessages(session.id)).toEqual([]);
     service.close();
@@ -3951,6 +6705,7 @@ describe("SessionService", () => {
       databasePath,
       modelResolver: () => model,
     });
+    await reopened.initialize();
     expect(JSON.stringify(reopened.getMessages(session.id))).toContain("final survives");
     reopened.close();
   });
@@ -4055,6 +6810,88 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("persists model and effort changes for a reused named subagent", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("sync", "first child", { sessionName: "research" }),
+        textResult("child-1", "first result"),
+        textResult("root-1", "first done"),
+        delegateResult("sync", "second child", {
+          sessionName: "research",
+          model: "openai/child",
+          effort: "low",
+        }),
+        textResult("child-2", "second result"),
+        textResult("root-2", "second done"),
+        delegateResult("sync", "third child", { sessionName: "research" }),
+        textResult("child-3", "third result"),
+        textResult("root-3", "third done"),
+      ],
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-child-bindings-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const attachments: Array<{
+      modelSpecifier: string | undefined;
+      reasoning: string | undefined;
+    }> = [];
+    const options = {
+      config: config(),
+      databasePath,
+      modelResolver: () => model,
+      attachCompaction: async (agent) => {
+        attachments.push({
+          modelSpecifier: agent.state.modelSpecifier,
+          reasoning: agent.state.reasoning,
+        });
+        return () => {};
+      },
+    } satisfies SessionServiceOptions;
+    const service = new SessionService(options);
+    const session = await service.createSession({
+      cwd: directory,
+      model: "test/mock",
+      profile: "delegate",
+      reasoning: "high",
+    });
+
+    await collect((await service.startPrompt(session.id, userMessage("first"))).stream);
+    await collect((await service.startPrompt(session.id, userMessage("second"))).stream);
+    const childSessionId = `sub:${session.id}:named:research`;
+    expect(service.store.getSession(childSessionId)).toMatchObject({
+      model: "openai/child",
+      reasoning: "low",
+    });
+    service.close();
+
+    const resumed = new SessionService(options);
+    await resumed.initialize();
+    await collect((await resumed.startPrompt(session.id, userMessage("third"))).stream);
+
+    expect(resumed.store.getSession(childSessionId)).toMatchObject({
+      model: "openai/child",
+      reasoning: "low",
+    });
+    expect(attachments).toEqual([
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "openai/child", reasoning: "low" },
+      { modelSpecifier: "test/mock", reasoning: "high" },
+      { modelSpecifier: "openai/child", reasoning: "low" },
+    ]);
+    const childAssistantMetadata = resumed
+      .getMessages(childSessionId)
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.metadata);
+    expect(childAssistantMetadata).toEqual([
+      expect.objectContaining({ model: "test/mock", reasoning: "high" }),
+      expect.objectContaining({ model: "openai/child", reasoning: "low" }),
+      expect.objectContaining({ model: "openai/child", reasoning: "low" }),
+    ]);
+    resumed.close();
+  });
+
   it("delivers an eligible completed child before waiting for a newly launched child", async () => {
     let releaseSecondChild = () => {};
     const secondChildGate = new Promise<void>((resolve) => {
@@ -4106,26 +6943,30 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("restores pre-steer assistant and tool UI across merged steering and restart", async () => {
-    let release = () => {};
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+  it("persists incremental model and UI prefixes for merged steering", async () => {
+    const firstEntered = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
     let callCount = 0;
     const model = new MockLanguageModelV4({
       doStream: async () => {
         callCount += 1;
-        if (callCount === 1) await gate;
-        return callCount === 1
-          ? textAndReadToolResult("before-steering", "visible before steering", "visible.txt")
-          : textResult(`answer-${callCount}`, "after steering");
+        if (callCount === 1) {
+          firstEntered.resolve();
+          await releaseFirst.promise;
+          return textAndReadToolResult("before-steering", "visible before steering", "visible.txt");
+        }
+        secondEntered.resolve();
+        await releaseSecond.promise;
+        return textResult(`answer-${callCount}`, "after steering");
       },
     });
     const { directory, service, session } = await temporaryRuntime(model);
     await Bun.write(path.join(directory, "visible.txt"), "visible tool output");
     const started = await service.startPrompt(session.id, userMessage("start"));
-    // test-wait-justification: steering must be queued after the gated first model turn has entered asynchronous execution.
-    await Bun.sleep(0);
+    const completion = collect(started.stream);
+    await firstEntered.promise;
     const firstSteer = {
       id: "steer-one-message",
       role: "user",
@@ -4155,8 +6996,36 @@ describe("SessionService", () => {
     });
     expect(service.getSnapshot(session.id).queuedSteeringCount).toBe(2);
 
-    release();
-    const chunks = await collect(started.stream);
+    releaseFirst.resolve();
+    await secondEntered.promise;
+
+    const steeringTransitions = service.store
+      .listHistoryTopology(session.id)
+      .transitions.filter((transition) => transition.delivery === "steer");
+    expect(steeringTransitions).toHaveLength(2);
+    const firstDestinationId = steeringTransitions[0]?.toStateId;
+    if (firstDestinationId === null || firstDestinationId === undefined) {
+      throw new Error("First merged steering transition had no intermediate state");
+    }
+    expect(steeringTransitions[1]?.toStateId).toBeNull();
+    const firstModelPrefix = service.store.getHistoryStateModelMessages(firstDestinationId);
+    const firstUiPrefix = service.store.getHistoryStateUiMessages(firstDestinationId);
+    expect(JSON.stringify(firstModelPrefix)).toContain("first steering");
+    expect(JSON.stringify(firstModelPrefix)).not.toContain("second steering");
+    expect(firstUiPrefix.at(-1)).toEqual(firstSteer);
+    expect(JSON.stringify(firstUiPrefix)).not.toContain("second steering");
+    const openModelPrefix = service.store.getModelMessages(session.id);
+    const openUiPrefix = service.store.getUiMessages(session.id);
+    expect(JSON.stringify(openModelPrefix)).toContain("first steering");
+    expect(JSON.stringify(openModelPrefix)).toContain("second steering");
+    expect(openUiPrefix.slice(-2)).toEqual([firstSteer, secondSteer]);
+    const providerPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(providerPrompt.indexOf("first steering")).toBeLessThan(
+      providerPrompt.indexOf("second steering"),
+    );
+
+    releaseSecond.resolve();
+    const chunks = await completion;
 
     expect(model.doStreamCalls).toHaveLength(2);
     expect(
@@ -4179,6 +7048,7 @@ describe("SessionService", () => {
       .filter((message) => message.role === "user")
       .slice(1);
     expect(steeringUsers).toEqual([firstSteer, secondSteer]);
+    const canonicalUi = service.getMessages(session.id);
     service.close();
 
     const reopened = new SessionService({
@@ -4187,29 +7057,9 @@ describe("SessionService", () => {
       modelResolver: () => new MockLanguageModelV4({}),
       attachCompaction: async () => () => {},
     });
-    expect(
-      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-second-steer" }),
-    ).toMatchObject({ message: secondSteer });
-    expect(JSON.stringify(reopened.store.getModelMessages(session.id))).toContain("first steering");
-    expect(JSON.stringify(reopened.store.getModelMessages(session.id))).not.toContain(
-      "second steering",
-    );
-    const afterSecondUndo = reopened.getMessages(session.id);
-    expect(afterSecondUndo.filter((message) => message.role === "user").slice(1)).toEqual([
-      firstSteer,
-    ]);
-    expect(JSON.stringify(afterSecondUndo)).toContain("visible before steering");
-    expect(JSON.stringify(afterSecondUndo)).toContain("visible tool output");
-    expect(
-      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-first-steer" }),
-    ).toMatchObject({ message: firstSteer });
-    const afterFirstUndo = reopened.getMessages(session.id);
-    const modelAfterFirstUndo = JSON.stringify(reopened.store.getModelMessages(session.id));
-    expect(modelAfterFirstUndo).not.toContain("first steering");
-    expect(modelAfterFirstUndo).not.toContain("second steering");
-    expect(afterFirstUndo.map((message) => message.role)).toEqual(["user", "assistant"]);
-    expect(JSON.stringify(afterFirstUndo)).toContain("visible before steering");
-    expect(JSON.stringify(afterFirstUndo)).toContain("visible tool output");
+    await reopened.initialize();
+    expect(reopened.getMessages(session.id)).toEqual(canonicalUi);
+    expect(reopened.getSnapshot(session.id)).toMatchObject({ canUndo: true, canRedo: false });
     reopened.close();
   });
 
@@ -4284,9 +7134,9 @@ describe("SessionService", () => {
       await Bun.sleep(0);
     }
     const activeCanonicalUi = service.getMessages(session.id);
-    expect(activeCanonicalUi).toEqual([rootUser, firstSteer]);
-    expect(JSON.stringify(activeCanonicalUi)).not.toContain("before first steer");
-    expect(JSON.stringify(activeCanonicalUi)).not.toContain("first tool output");
+    expect(activeCanonicalUi.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(activeCanonicalUi)).toContain("before first steer");
+    expect(JSON.stringify(activeCanonicalUi)).toContain("first tool output");
     const resume = await service.getSessionResume(session.id);
     expect(resume.snapshot.activeRunId).toBe(started.runId);
     expect(resume.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
@@ -4353,14 +7203,9 @@ describe("SessionService", () => {
       modelResolver: () => new MockLanguageModelV4({}),
       attachCompaction: async () => () => {},
     });
+    await reopened.initialize();
     expect(reopened.getMessages(session.id)).toEqual(canonicalUi);
-    expect(
-      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-second-separate" }),
-    ).toMatchObject({ message: secondSteer });
-    expect(reopened.getMessages(session.id)).toEqual(canonicalUi.slice(0, 4));
-    const modelAfterUndo = JSON.stringify(reopened.store.getModelMessages(session.id));
-    expect(modelAfterUndo).toContain("first separate steer");
-    expect(modelAfterUndo).not.toContain("second separate steer");
+    expect(reopened.getSnapshot(session.id)).toMatchObject({ canUndo: true, canRedo: false });
     reopened.close();
   });
 
@@ -4422,13 +7267,15 @@ describe("SessionService", () => {
     const mergedPrompt = JSON.stringify(model.doStreamCalls[1]?.prompt);
     expect(mergedPrompt).toContain("first merged steer");
     expect(mergedPrompt).toContain("second merged steer");
-    await service.undo({ sessionId: session.id, clientCommandId: "undo-second-merged" });
-    const afterSecondUndo = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(afterSecondUndo).toContain("durable compacted prefix");
-    expect(afterSecondUndo).toContain("first merged steer");
-    expect(afterSecondUndo).not.toContain("second merged steer");
-    await service.undo({ sessionId: session.id, clientCommandId: "undo-first-merged" });
-    expect(service.store.getModelMessages(session.id)).toEqual(compactedPrefix);
+    const canonicalModel = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(canonicalModel).toContain("durable compacted prefix");
+    expect(canonicalModel).toContain("first merged steer");
+    expect(canonicalModel).toContain("second merged steer");
+    expect(
+      service.store
+        .listHistoryTopology(session.id)
+        .transitions.filter((transition) => transition.kind === "user-message"),
+    ).toHaveLength(3);
     service.close();
   });
 
@@ -5450,7 +8297,7 @@ describe("SessionService", () => {
       const chunks = await collect(started.stream);
 
       const childSessionId = `sub:${session.id}:named:investigation`;
-      const child = service.store.getLatestRun(childSessionId);
+      const child = service.store.getLatestSelectedRootRun(childSessionId);
       expect(child).toMatchObject({ profile: "child", depth: 1, status: "completed" });
       expect(child?.terminalResult).toMatchObject({ text: "child result" });
       expect(service.getRunChunks(child?.id ?? "")).toEqual([]);
@@ -5533,7 +8380,9 @@ describe("SessionService", () => {
     expect(continuedPrompt).toContain("first investigation");
     expect(continuedPrompt).toContain("first finding");
     expect(continuedPrompt).toContain("continue investigation");
-    expect(resumed.getRunChunks(resumed.store.getLatestRun(childSessionId)?.id ?? "")).toEqual([]);
+    expect(
+      resumed.getRunChunks(resumed.store.getLatestSelectedRootRun(childSessionId)?.id ?? ""),
+    ).toEqual([]);
     resumed.close();
   });
 
