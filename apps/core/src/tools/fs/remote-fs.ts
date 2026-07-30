@@ -1,14 +1,17 @@
 import type {
   EffectiveSearchBackend,
+  FileEdit,
   FsBackend,
   FuzzySearchResult,
+  HashlineEdit,
+  HashlineWarning,
   ReadFileStart,
 } from "@stanley2058/lilac-fs";
 import { createRequire } from "node:module";
+import path from "node:path";
 
 import { sshExecBash, sshExecScriptJson } from "../../ssh/ssh-exec";
 import { getRemoteRunnerJsText } from "../../ssh/remote-js";
-import type { FileEdit, HashlineEdit, HashlineWarning } from "@stanley2058/lilac-fs";
 
 const requirePackageJson = createRequire(import.meta.url);
 
@@ -17,6 +20,7 @@ export type RemoteReadTextInput = {
   start?: ReadFileStart;
   maxLines?: number;
   maxCharacters?: number;
+  maxBytes?: number;
   format?: "raw" | "numbered" | "hashline";
 };
 
@@ -238,6 +242,19 @@ function readRemoteFsRunnerPackageSpec(): string {
 
 function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function splitRemoteGrepTarget(cwd: string): {
+  launchCwd: string;
+  baseDir: string;
+  reportedFilePath: string;
+} {
+  const target = cwd.length > 1 ? cwd.replace(/\/+$/u, "") : cwd;
+  return {
+    launchCwd: path.posix.dirname(target),
+    baseDir: path.posix.basename(target) || target,
+    reportedFilePath: cwd,
+  };
 }
 
 function parseJsonEnvelope<T>(
@@ -491,6 +508,7 @@ export async function remoteGrep(params: {
   timeoutMs?: number;
 }): Promise<RemoteGrepOutput> {
   const mode = params.input.mode ?? "default";
+  const target = splitRemoteGrepTarget(params.cwd);
   const input = {
     op: "fs.grep",
     denyPaths: params.denyPaths,
@@ -501,13 +519,15 @@ export async function remoteGrep(params: {
       fileExtensions: params.input.fileExtensions,
       includeContextLines: params.input.includeContextLines,
       mode,
+      baseDir: target.baseDir,
+      reportedFilePath: target.reportedFilePath,
     },
   };
 
   if (params.fsBackend === "fff") {
     const runnerRes = await sshExecRemoteFsRunnerJson<RemoteGrepOutput>({
       host: params.host,
-      cwd: params.cwd,
+      cwd: target.launchCwd,
       input,
       timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       maxOutputChars: DEFAULT_MAX_OUTPUT_CHARS,
@@ -518,7 +538,7 @@ export async function remoteGrep(params: {
   const js = await getRemoteRunnerJsText();
   const res = await sshExecScriptJson<RemoteGrepOutput>({
     host: params.host,
-    cwd: params.cwd,
+    cwd: target.launchCwd,
     js,
     input,
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,

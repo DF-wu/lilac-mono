@@ -106,6 +106,7 @@ async function opReadText(input: Record<string, unknown>, fsTool: FileSystem): P
     start,
     maxLines: numberOrUndefined(input["maxLines"]),
     maxCharacters: numberOrUndefined(input["maxCharacters"]),
+    maxBytes: numberOrUndefined(input["maxBytes"]),
     format:
       input["format"] === "numbered"
         ? "numbered"
@@ -179,6 +180,9 @@ async function opGrep(input: Record<string, unknown>, fsTool: FileSystem): Promi
 
   return await fsTool.grep({
     pattern: String(input["pattern"] ?? ""),
+    baseDir: typeof input["baseDir"] === "string" ? input["baseDir"] : undefined,
+    reportedFilePath:
+      typeof input["reportedFilePath"] === "string" ? input["reportedFilePath"] : undefined,
     regex: Boolean(input["regex"]),
     maxResults: numberOrUndefined(input["maxResults"]),
     fileExtensions,

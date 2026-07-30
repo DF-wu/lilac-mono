@@ -136,10 +136,6 @@ function isValidSuffix(messages: readonly ModelMessage[], startIndex: number): b
   return openToolCallIds === null;
 }
 
-function isCutBoundaryMessage(message: ModelMessage): boolean {
-  return message.role === "user" || message.role === "assistant";
-}
-
 function stringifyForTokenEstimate(value: unknown): string {
   try {
     const serialized = JSON.stringify(value, (_key, item: unknown) => {
@@ -205,6 +201,34 @@ function estimateMessagesTokens(messages: readonly ModelMessage[]): number {
     total += estimateMessageTokens(message);
   }
   return total;
+}
+
+function estimateModelInputTokens(params: {
+  messages: readonly ModelMessage[];
+  context: Pick<TransformMessagesContext, "system" | "tools">;
+}): number {
+  try {
+    return estimateTokensFromText(
+      JSON.stringify({
+        system: params.context.system,
+        messages: params.messages,
+        tools: params.context.tools,
+      }),
+    );
+  } catch {
+    return estimateMessagesTokens(params.messages);
+  }
+}
+
+function resolveThresholdInputTokens(params: {
+  source: "usage" | "transcript-estimate";
+  usageInputTokens: number | undefined;
+  messages: readonly ModelMessage[];
+  modelInputEstimate?: number;
+}): number | undefined {
+  return params.source === "transcript-estimate"
+    ? (params.modelInputEstimate ?? estimateMessagesTokens(params.messages))
+    : params.usageInputTokens;
 }
 
 function inlineMediaStorageBytes(messages: readonly ModelMessage[]): number {
@@ -401,97 +425,95 @@ function shrinkCompactedMessagesToBudget(params: {
   return { messages: compacted, summary: shrunkSummary };
 }
 
-function chooseSuffixStartByMessageCount(
-  messages: readonly ModelMessage[],
-  keepLastMessages: number,
-): number {
-  const candidate = Math.max(0, messages.length - keepLastMessages);
-  for (let start = candidate; start >= 0; start--) {
-    if (!isValidSuffix(messages, start)) continue;
-    const message = messages[start];
-    if (!message) continue;
-    if (!isCutBoundaryMessage(message)) continue;
+type CompactionBoundary = {
+  suffixStart: number;
+};
+
+function hasCompletedAssistantToolTurn(messages: readonly ModelMessage[], start: number): boolean {
+  const message = messages[start];
+  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return false;
+
+  const toolCallIds = getAssistantToolCallIds(message);
+  if (toolCallIds.length === 0) return false;
+  if (getAssistantToolCallPartCount(message) !== toolCallIds.length) return false;
+  if (new Set(toolCallIds).size !== toolCallIds.length) return false;
+
+  const unresolved = new Set(toolCallIds);
+  const seenCalls = new Set<string>();
+  for (const part of message.content) {
+    if (part.type === "tool-call") {
+      seenCalls.add(part.toolCallId);
+      continue;
+    }
+    if (part.type !== "tool-result") continue;
+    if (!seenCalls.has(part.toolCallId) || !unresolved.delete(part.toolCallId)) return false;
+  }
+
+  let end = start + 1;
+  while (unresolved.size > 0) {
+    const resultMessage = messages[end];
+    if (!resultMessage || resultMessage.role !== "tool") return false;
+    const resultIds = getToolResultToolCallIds(resultMessage);
+    if (resultIds.length === 0) return false;
+    for (const id of resultIds) {
+      if (!unresolved.delete(id)) return false;
+    }
+    end += 1;
+  }
+  return true;
+}
+
+function isContinuableTurnStart(messages: readonly ModelMessage[], index: number): boolean {
+  const message = messages[index];
+  if (message?.role === "user") return !isAutoContinueMessage(message);
+  return hasCompletedAssistantToolTurn(messages, index);
+}
+
+function chooseRetainedTailStart(params: {
+  messages: readonly ModelMessage[];
+  keepRecentTokens: number;
+  keepRecentTurns: number;
+  minimumStart?: number;
+}): number {
+  const tokenCap = Math.max(0, Math.floor(params.keepRecentTokens));
+  const turnCap = Math.max(0, Math.floor(params.keepRecentTurns));
+  if (params.messages.length === 0 || tokenCap === 0 || turnCap === 0) {
+    return params.messages.length;
+  }
+
+  const turnStarts: number[] = [];
+  for (let index = 0; index < params.messages.length; index++) {
+    if (isContinuableTurnStart(params.messages, index)) turnStarts.push(index);
+  }
+
+  for (const [turnIndex, start] of turnStarts.entries()) {
+    if (start < (params.minimumStart ?? 0)) continue;
+    const retainedTurnCount = turnStarts.length - turnIndex;
+    if (retainedTurnCount > turnCap) continue;
+    if (!isValidSuffix(params.messages, start)) continue;
+    if (estimateMessagesTokens(params.messages.slice(start)) > tokenCap) continue;
     return start;
   }
 
-  return 0;
+  // An oversized newest atomic turn is summarized in full. Never retain a
+  // partial tool exchange or silently turn the hard token cap into a soft one.
+  return params.messages.length;
 }
-
-function chooseSuffixStartByTokenBudget(
-  messages: readonly ModelMessage[],
-  keepRecentTokens: number,
-): number {
-  if (messages.length === 0) return 0;
-  if (keepRecentTokens <= 0) return 0;
-
-  const validStarts: number[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    const message = messages[i]!;
-    if (!isCutBoundaryMessage(message)) continue;
-    if (!isValidSuffix(messages, i)) continue;
-    validStarts.push(i);
-  }
-  if (validStarts.length === 0) return 0;
-
-  let accumulated = 0;
-  let target = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    accumulated += estimateMessageTokens(messages[i]!);
-    if (accumulated >= keepRecentTokens) {
-      target = i;
-      break;
-    }
-  }
-
-  if (accumulated < keepRecentTokens) {
-    return 0;
-  }
-
-  for (const start of validStarts) {
-    if (start >= target) return start;
-  }
-
-  return validStarts[validStarts.length - 1] ?? 0;
-}
-
-function findTurnStartIndex(messages: readonly ModelMessage[], suffixStart: number): number | null {
-  for (let i = suffixStart - 1; i >= 0; i--) {
-    const message = messages[i]!;
-    if (message.role === "user") return i;
-  }
-  return null;
-}
-
-type CompactionBoundary = {
-  suffixStart: number;
-  splitTurnStart: number | null;
-};
 
 function resolveCompactionBoundary(params: {
   messages: readonly ModelMessage[];
   keepRecentTokens: number;
-  keepLastMessages: number;
+  keepRecentTurns: number;
+  forceCompaction?: boolean;
 }): CompactionBoundary {
-  const tokenStart = chooseSuffixStartByTokenBudget(params.messages, params.keepRecentTokens);
-  const suffixStart =
-    tokenStart > 0
-      ? tokenStart
-      : chooseSuffixStartByMessageCount(params.messages, params.keepLastMessages);
-
-  if (suffixStart <= 0) {
-    return {
-      suffixStart: 0,
-      splitTurnStart: null,
-    };
-  }
-
-  const cutMessage = params.messages[suffixStart];
-  const splitTurnStart =
-    cutMessage?.role === "assistant" ? findTurnStartIndex(params.messages, suffixStart) : null;
-
+  const suffixStart = chooseRetainedTailStart(params);
   return {
-    suffixStart,
-    splitTurnStart,
+    // Automatic pressure must establish a new context epoch even when the
+    // complete small transcript would otherwise qualify as retained tail.
+    suffixStart:
+      params.forceCompaction && suffixStart === 0
+        ? chooseRetainedTailStart({ ...params, minimumStart: 1 })
+        : suffixStart,
   };
 }
 
@@ -670,15 +692,9 @@ function chunkMessagesByEstimatedTokens(
   return chunks;
 }
 
-/**
- * Where a summarization request sits in the overall compaction.
- *
- * `stage` matters because history and split-turn prefixes are summarized
- * concurrently, so their deltas interleave; consumers that render streamed text
- * need to keep the two apart.
- */
+/** Where a summarization request sits in the single history refinement chain. */
 export type CompactionProgress = {
-  readonly stage: "history" | "split-turn";
+  readonly stage: "history";
   /** 1-based summarization request within the current pass. */
   readonly step: number;
   /** Requests planned for this pass, known once chunking has run. */
@@ -773,8 +789,9 @@ async function summarizeMessagesHierarchical(options: {
 }
 
 const DEFAULT_THRESHOLD_FRACTION = 0.8;
-const DEFAULT_KEEP_LAST_MESSAGES = 30;
+const DEFAULT_KEEP_RECENT_TURNS = 2;
 const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
+const DEFAULT_KEEP_RECENT_TOKEN_FRACTION = 0.25;
 // Try one summary request first; overflow retries split it as needed.
 const DEFAULT_SUMMARY_CHUNK_FRACTION = 1;
 const DEFAULT_SUMMARY_REDUCTION_PASSES = 6;
@@ -787,6 +804,13 @@ const DEFAULT_SUMMARY_MAX_CHARS_FLOOR = 2_000;
 // Leave room for prompt framing and summary output.
 const DEFAULT_SUMMARY_PROMPT_RESERVE_TOKENS = 8_192;
 const DEFAULT_SUMMARY_PROMPT_RESERVE_FRACTION = 0.15;
+
+function resolveRetainedTailTokenCap(inputBudget: number, configuredLimit: number): number {
+  return Math.max(
+    1,
+    Math.min(configuredLimit, Math.floor(inputBudget * DEFAULT_KEEP_RECENT_TOKEN_FRACTION)),
+  );
+}
 
 export type CompactionBudget = {
   inputBudget: number;
@@ -819,6 +843,9 @@ type ResolvedContextWindow =
     };
 
 type CompactionScheduleReason = "threshold" | "overflow";
+type PendingCompactionReason = CompactionScheduleReason | "media";
+
+export type CompactionSummaryModel = "current" | LanguageModel | (() => LanguageModel);
 
 type AutoCompactionObservedBudget = {
   inputBudget: number;
@@ -839,16 +866,16 @@ type AutoCompactionEndEvent = AutoCompactionStartEvent & {
   messageCountAfter?: number;
   estimatedInputTokensAfter?: number;
   status: "completed" | "cancelled" | "failed";
-  /** The summary the engine actually persisted, including every stage. */
+  /** The summary the engine actually persisted after the refinement chain. */
   summary?: string;
   error?: unknown;
 };
 
 function reconcilePendingCompactionReason(params: {
-  pendingReason: CompactionScheduleReason | null;
+  pendingReason: PendingCompactionReason | null;
   capabilityKnown: boolean;
-}): CompactionScheduleReason | null {
-  if (!params.capabilityKnown && params.pendingReason === "threshold") {
+}): PendingCompactionReason | null {
+  if (!params.capabilityKnown && params.pendingReason !== "overflow") {
     return null;
   }
   return params.pendingReason;
@@ -913,48 +940,62 @@ function computeUnknownOverflowCompactionBudget(params: {
 
 const AUTO_CONTINUE_AFTER_COMPACTION_TEXT =
   "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.";
+const AUTO_CONTINUE_PROVIDER_OPTIONS = {
+  lilac: { autoCompactionContinue: true },
+} as const satisfies NonNullable<ModelMessage["providerOptions"]>;
 
 const DEFAULT_SUMMARY_SYSTEM =
-  "You are preparing a handoff summary for another coding agent. Output only the requested summary in markdown.";
+  "You are an anchored context summarization assistant for coding sessions. Summarize only the conversation history you are given. The newest turns may be kept verbatim outside your summary. Output only the requested summary in markdown, do not answer the conversation, and do not mention compaction or summarization.";
+
+const SUMMARY_TEMPLATE = [
+  "Output exactly this Markdown structure and keep the section order unchanged:",
+  "",
+  "## Objective",
+  "- [one or two brief sentences describing what the user is trying to accomplish]",
+  "",
+  "## Important Details",
+  '- [constraints, preferences, decisions and why, exact context needed to continue, or "(none)"]',
+  "",
+  "## Work State",
+  "### Completed",
+  '- [finished work, verified facts, or changes made; otherwise "(none)"]',
+  "",
+  "### Active",
+  '- [current work, partial changes, or investigation state; otherwise "(none)"]',
+  "",
+  "### Blocked",
+  '- [blockers, failing commands, or unknowns; otherwise "(none)"]',
+  "",
+  "## Next Move",
+  '1. [immediate concrete action, or "(none)"]',
+  '2. [next action if known, or "(none)"]',
+  "",
+  "## Relevant Files",
+  '- [file or directory path: why it matters, or "(none)"]',
+  "",
+  "Rules:",
+  "- Keep every section, even when empty.",
+  "- Use terse bullets rather than prose paragraphs.",
+  "- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.",
+  "- Preserve still-relevant details from an existing context-compaction summary.",
+].join("\n");
 
 const DEFAULT_SUMMARY_PROMPT = (prefix: string) =>
   [
-    "Provide a detailed prompt for continuing our conversation.",
-    "Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.",
-    "The summary that you construct will be used so that another agent can read it and continue the work.",
+    "Create a new anchored summary from the conversation history below.",
+    "Recent messages may be retained verbatim after the summary, so focus on older context needed to continue.",
     "",
-    "When constructing the summary, try to stick to this template:",
-    "---",
-    "## Goal",
+    SUMMARY_TEMPLATE,
     "",
-    "[What goal(s) is the user trying to accomplish?]",
-    "",
-    "## Instructions",
-    "",
-    "- [What important instructions did the user give you that are relevant]",
-    "- [If there is a plan or spec, include information about it so next agent can continue using it]",
-    "",
-    "## Discoveries",
-    "",
-    "[What notable things were learned during this conversation that would be useful for the next agent to know when continuing the work]",
-    "",
-    "## Accomplished",
-    "",
-    "[What work has been completed, what work is still in progress, and what work is left?]",
-    "",
-    "## Relevant files / directories",
-    "",
-    "[Construct a structured list of relevant files that have been read, edited, or created that pertain to the task at hand. If all the files in a directory are relevant, include the path to the directory.]",
-    "---",
-    "",
-    "TRANSCRIPT:",
+    "<conversation-history>",
     prefix,
+    "</conversation-history>",
   ].join("\n");
 
 const DEFAULT_SUMMARY_UPDATE_PROMPT = (previousSummary: string, nextTranscript: string) =>
   [
-    "You are updating an existing handoff summary with NEW transcript content.",
-    "Preserve existing relevant context and integrate the new details.",
+    "Update the anchored summary with the new conversation history.",
+    "Preserve still-true details, remove stale details, and merge in new facts.",
     "",
     "<previous-summary>",
     previousSummary,
@@ -964,40 +1005,7 @@ const DEFAULT_SUMMARY_UPDATE_PROMPT = (previousSummary: string, nextTranscript: 
     nextTranscript,
     "</new-transcript>",
     "",
-    "Return one updated summary following the same markdown handoff structure as before.",
-  ].join("\n");
-
-const DEFAULT_SPLIT_TURN_PROMPT = (prefix: string) =>
-  [
-    "The following is the EARLY prefix of a single large turn.",
-    "Summarize only the context needed to understand the later retained suffix.",
-    "",
-    "Use this format:",
-    "## Original Request",
-    "## Early Progress",
-    "## Context for Suffix",
-    "",
-    "TRANSCRIPT:",
-    prefix,
-  ].join("\n");
-
-const DEFAULT_SPLIT_TURN_UPDATE_PROMPT = (previousSummary: string, nextTranscript: string) =>
-  [
-    "You are updating a split-turn prefix summary with additional transcript content.",
-    "Preserve details already captured and merge in new details.",
-    "",
-    "Maintain this output format:",
-    "## Original Request",
-    "## Early Progress",
-    "## Context for Suffix",
-    "",
-    "<previous-summary>",
-    previousSummary,
-    "</previous-summary>",
-    "",
-    "<new-transcript>",
-    nextTranscript,
-    "</new-transcript>",
+    SUMMARY_TEMPLATE,
   ].join("\n");
 
 function buildCompactionSummaryMessage(summary: string): ModelMessage {
@@ -1005,13 +1013,50 @@ function buildCompactionSummaryMessage(summary: string): ModelMessage {
     role: "user",
     content: [
       "<context-compaction>",
-      "The conversation before this point was automatically compacted.",
+      "The conversation before this point was compacted.",
       "Treat this summary as prior conversation context, not as a new user request.",
       "",
       summary,
       "</context-compaction>",
     ].join("\n"),
   };
+}
+
+function buildAutoContinueMessage(): ModelMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text: AUTO_CONTINUE_AFTER_COMPACTION_TEXT }],
+    providerOptions: AUTO_CONTINUE_PROVIDER_OPTIONS,
+  };
+}
+
+function isAutoContinueMessage(message: ModelMessage): boolean {
+  const marker = message.providerOptions?.["lilac"];
+  return (
+    message.role === "user" &&
+    typeof marker === "object" &&
+    marker !== null &&
+    marker["autoCompactionContinue"] === true
+  );
+}
+
+function splitThresholdContinueTrailer(messages: readonly ModelMessage[]): {
+  messages: readonly ModelMessage[];
+  trailer: ModelMessage[];
+} {
+  if (!messages.some(isAutoContinueMessage)) return { messages, trailer: [] };
+
+  const retained: ModelMessage[] = [];
+  let trailer: ModelMessage[] = [];
+  for (const [index, message] of messages.entries()) {
+    if (!isAutoContinueMessage(message)) {
+      retained.push(cloneMessage(message));
+      continue;
+    }
+    if (index === messages.length - 1) trailer = [cloneMessage(message)];
+    else if (messages[index + 1]?.role === "assistant") retained.push(cloneMessage(message));
+  }
+  return { messages: retained, trailer };
 }
 
 type OverflowRecoveryDecision = {
@@ -1063,22 +1108,30 @@ export type AutoCompactionOptions = {
   /** Determines model context windows. */
   modelCapability: ModelCapability;
 
-  /** Legacy fallback. How many trailing messages to always keep (default: 30). */
-  keepLastMessages?: number;
+  /** Maximum continuable user/tool turns retained verbatim (default: 2). */
+  keepRecentTurns?: number;
 
-  /** Preferred budget. Keep approximately this many recent tokens (default: 20k). */
+  /** Tail token ceiling; also capped at 25% of the post-compaction input budget (default: 20k). */
   keepRecentTokens?: number;
 
   /** Compact at this fraction of the context window, clamped to 0.05-0.95 (default: 0.8). */
   thresholdFraction?: number;
 
   /**
+   * Source used to measure context occupancy after a model turn.
+   * Agentic providers whose usage is cumulative across internal steps must use
+   * `transcript-estimate` instead of treating billed usage as prompt size.
+   */
+  thresholdInputSource?: "usage" | "transcript-estimate";
+
+  /**
    * The model used to generate summaries.
    *
    * - `current`: use the agent's current `state.model`.
-   * - a model instance: use that for summarization.
+   * - a model instance: reuse it for summarization.
+   * - a factory: create an isolated model for every summary request.
    */
-  summaryModel?: "current" | LanguageModel;
+  summaryModel?: CompactionSummaryModel;
 
   /** Override summary system prompt. */
   summarySystem?: string;
@@ -1088,12 +1141,6 @@ export type AutoCompactionOptions = {
 
   /** Builds update prompt from previous summary + new transcript chunk. */
   buildSummaryUpdatePrompt?: (previousSummary: string, nextTranscript: string) => string;
-
-  /** Builds split-turn prompt from split-turn prefix transcript. */
-  buildSplitTurnSummaryPrompt?: (splitTurnPrefix: string) => string;
-
-  /** Builds split-turn update prompt from previous summary + new transcript chunk. */
-  buildSplitTurnSummaryUpdatePrompt?: (previousSummary: string, nextTranscript: string) => string;
 
   /** Resolves the configured summary model's context window. */
   resolveSummaryContextLimit?: (params: {
@@ -1175,14 +1222,14 @@ export type ManualCompactionOptions = {
   /** Compact to this fraction of the context window, clamped to 0.05-0.95 (default: 0.8). */
   thresholdFraction?: number;
 
-  /** Legacy fallback. How many trailing messages to always keep (default: 30). */
-  keepLastMessages?: number;
+  /** Maximum continuable user/tool turns retained verbatim (default: 2). */
+  keepRecentTurns?: number;
 
-  /** Preferred budget. Keep approximately this many recent tokens (default: 20k). */
+  /** Tail token ceiling; also capped at 25% of the post-compaction input budget (default: 20k). */
   keepRecentTokens?: number;
 
-  /** Summary model. `current` uses `currentModel` (default: `current`). */
-  summaryModel?: "current" | LanguageModel;
+  /** Summary model or per-request factory. `current` uses `currentModel` (default: `current`). */
+  summaryModel?: CompactionSummaryModel;
 
   /** Provider-specific options forwarded to summary model calls. */
   providerOptions?: { [x: string]: JSONObject };
@@ -1195,12 +1242,6 @@ export type ManualCompactionOptions = {
 
   /** Builds update prompt from previous summary + new transcript chunk. */
   buildSummaryUpdatePrompt?: (previousSummary: string, nextTranscript: string) => string;
-
-  /** Builds split-turn prompt from split-turn prefix transcript. */
-  buildSplitTurnSummaryPrompt?: (splitTurnPrefix: string) => string;
-
-  /** Builds split-turn update prompt from previous summary + new transcript chunk. */
-  buildSplitTurnSummaryUpdatePrompt?: (previousSummary: string, nextTranscript: string) => string;
 
   abortSignal?: AbortSignal;
 } & CompactionStreamHooks;
@@ -1222,22 +1263,21 @@ export type ManualCompactionResult =
     })
   | (ManualCompactionMetrics & {
       status: "noop";
-      reason: "empty" | "no-compactable-messages";
+      reason: "empty" | "no-compactable-messages" | "already-minimal";
     });
 
 type CompactRepairedMessagesOptions = {
   messages: readonly ModelMessage[];
   budget: InputCompactionBudget;
   summaryContextLimit: number;
-  model: LanguageModel;
+  resolveModel: () => LanguageModel;
   providerOptions?: { [x: string]: JSONObject };
-  keepLastMessages: number;
+  keepRecentTurns: number;
   keepRecentTokens: number;
   summarySystem: string;
   buildSummaryPrompt: (prefix: string) => string;
   buildSummaryUpdatePrompt: (previousSummary: string, nextTranscript: string) => string;
-  buildSplitTurnSummaryPrompt: (splitTurnPrefix: string) => string;
-  buildSplitTurnSummaryUpdatePrompt: (previousSummary: string, nextTranscript: string) => string;
+  forceCompaction?: boolean;
   abortSignal?: AbortSignal;
 } & CompactionStreamHooks;
 
@@ -1245,11 +1285,10 @@ async function compactRepairedMessages(
   options: CompactRepairedMessagesOptions,
 ): Promise<{ messages: ModelMessage[]; summary: string } | null> {
   const maxCompactionPasses = DEFAULT_COMPACTION_MAX_PASSES;
-  let passKeepRecentTokens = Math.max(
-    1,
-    Math.min(options.keepRecentTokens, options.budget.inputBudget),
+  let passKeepRecentTokens = resolveRetainedTailTokenCap(
+    options.budget.inputBudget,
+    options.keepRecentTokens,
   );
-  let passKeepLastMessages = Math.max(1, options.keepLastMessages);
   let compactedCandidate: ModelMessage[] | null = null;
   let persistedSummary = "";
 
@@ -1257,22 +1296,14 @@ async function compactRepairedMessages(
     const boundary = resolveCompactionBoundary({
       messages: options.messages,
       keepRecentTokens: passKeepRecentTokens,
-      keepLastMessages: passKeepLastMessages,
+      keepRecentTurns: options.keepRecentTurns,
+      forceCompaction: options.forceCompaction,
     });
 
-    const historyEnd =
-      boundary.suffixStart <= 0
-        ? options.messages.length
-        : (boundary.splitTurnStart ?? boundary.suffixStart);
-    const historyMessages = options.messages.slice(0, historyEnd);
-    const splitTurnPrefixMessages =
-      boundary.suffixStart > 0 && boundary.splitTurnStart !== null
-        ? options.messages.slice(boundary.splitTurnStart, boundary.suffixStart)
-        : [];
-    const suffixMessages =
-      boundary.suffixStart > 0 ? options.messages.slice(boundary.suffixStart) : [];
+    const historyMessages = options.messages.slice(0, boundary.suffixStart);
+    const suffixMessages = options.messages.slice(boundary.suffixStart);
 
-    if (historyMessages.length === 0 && splitTurnPrefixMessages.length === 0) {
+    if (historyMessages.length === 0) {
       break;
     }
 
@@ -1294,19 +1325,8 @@ async function compactRepairedMessages(
       Math.floor(options.budget.inputBudget * 4 * passScale),
     );
 
-    // The two stages summarize concurrently. When either fails, the other must
-    // be aborted *and awaited* before the failure surfaces, or its provider
-    // request would outlive the terminal compaction event, untracked.
-    const stageFailure = new AbortController();
-    const stageSignal =
-      options.abortSignal === undefined
-        ? stageFailure.signal
-        : AbortSignal.any([options.abortSignal, stageFailure.signal]);
-
-    const summarizeMainHistory = async (): Promise<string> => {
-      if (historyMessages.length === 0) return "";
-
-      const text = await summarizeMessagesHierarchical({
+    let finalSummary = (
+      await summarizeMessagesHierarchical({
         messages: historyMessages,
         initialChunkTokenBudget: chunkTokenBudget,
         maxReductionPasses: DEFAULT_SUMMARY_REDUCTION_PASSES,
@@ -1318,7 +1338,7 @@ async function compactRepairedMessages(
             ? options.buildSummaryUpdatePrompt(previousSummary, transcriptText)
             : options.buildSummaryPrompt(transcriptText);
           return await summarizePrompt({
-            model: options.model,
+            model: options.resolveModel(),
             system: options.summarySystem,
             prompt,
             providerOptions: options.providerOptions,
@@ -1329,67 +1349,9 @@ async function compactRepairedMessages(
           });
         },
         onProgress: options.onProgress,
-        abortSignal: stageSignal,
-      });
-
-      return text.trim();
-    };
-
-    const summarizeSplitTurnPrefix = async (): Promise<string> => {
-      if (splitTurnPrefixMessages.length === 0) return "";
-
-      const text = await summarizeMessagesHierarchical({
-        messages: splitTurnPrefixMessages,
-        initialChunkTokenBudget: Math.max(1, Math.floor(chunkTokenBudget * 0.7)),
-        maxReductionPasses: DEFAULT_SUMMARY_REDUCTION_PASSES,
-        initialMaxCharsPerMessage: Math.max(1_500, Math.floor(chunkTokenBudget * 3)),
-        initialMaxCharsTotal: Math.max(3_000, Math.floor(chunkTokenBudget * 5)),
-        stage: "split-turn",
-        summarizeChunk: async (transcriptText, previousSummary, abortSignal, progress) => {
-          const prompt = previousSummary
-            ? options.buildSplitTurnSummaryUpdatePrompt(previousSummary, transcriptText)
-            : options.buildSplitTurnSummaryPrompt(transcriptText);
-          return await summarizePrompt({
-            model: options.model,
-            system: options.summarySystem,
-            prompt,
-            providerOptions: options.providerOptions,
-            abortSignal,
-            onDelta: options.onSummaryDelta
-              ? (delta) => options.onSummaryDelta?.(delta, progress)
-              : undefined,
-          });
-        },
-        onProgress: options.onProgress,
-        abortSignal: stageSignal,
-      });
-
-      return text.trim();
-    };
-
-    const [historySettled, splitTurnSettled] = await Promise.allSettled([
-      summarizeMainHistory().catch((error: unknown) => {
-        stageFailure.abort();
-        throw error;
-      }),
-      summarizeSplitTurnPrefix().catch((error: unknown) => {
-        stageFailure.abort();
-        throw error;
-      }),
-    ]);
-    if (historySettled.status === "rejected" || splitTurnSettled.status === "rejected") {
-      const reasons: unknown[] = [historySettled, splitTurnSettled].flatMap((settled) =>
-        settled.status === "rejected" ? [settled.reason as unknown] : [],
-      );
-      // Prefer the original failure over the abort it induced in its sibling;
-      // an external cancel leaves only abort errors, which must win unchanged.
-      const primary = reasons.find((reason) => !isAbortError(reason)) ?? reasons[0];
-      throw primary instanceof Error ? primary : new Error(String(primary));
-    }
-    const historySummary = historySettled.value;
-    const splitTurnSummary = splitTurnSettled.value;
-
-    let finalSummary = combineCompactionSummaryParts(historySummary, splitTurnSummary);
+        abortSignal: options.abortSignal,
+      })
+    ).trim();
     if (!finalSummary) {
       throw new Error("Compaction summarization returned no summary for selected transcript.");
     }
@@ -1408,7 +1370,6 @@ async function compactRepairedMessages(
     }
 
     passKeepRecentTokens = Math.max(1, Math.floor(passKeepRecentTokens * 0.6));
-    passKeepLastMessages = Math.max(1, Math.floor(passKeepLastMessages * 0.8));
   }
 
   if (!compactedCandidate) return null;
@@ -1431,23 +1392,6 @@ async function compactRepairedMessages(
  */
 export function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
-}
-
-/**
- * Join the per-stage summaries into the single text that gets persisted.
- *
- * History and split-turn prefixes summarize concurrently and independently, so
- * both the engine and any consumer rendering live progress have to assemble the
- * same string. Sharing this function is what keeps them from drifting.
- */
-export function combineCompactionSummaryParts(
-  historySummary: string,
-  splitTurnSummary: string,
-): string {
-  const parts: string[] = [];
-  if (historySummary) parts.push(historySummary);
-  if (splitTurnSummary) parts.push(`**Turn Context (split turn):**\n\n${splitTurnSummary}`);
-  return parts.join("\n\n---\n\n").trim();
 }
 
 /**
@@ -1496,7 +1440,9 @@ export async function compactMessages(
     outputLimit: options.outputLimit ?? 0,
     thresholdFraction: normalizeThresholdFraction(options.thresholdFraction),
   });
-  const noop = (reason: "empty" | "no-compactable-messages"): ManualCompactionResult => {
+  const noop = (
+    reason: "empty" | "no-compactable-messages" | "already-minimal",
+  ): ManualCompactionResult => {
     const messages = cloneMessages(options.messages);
     return {
       status: "noop",
@@ -1523,21 +1469,23 @@ export async function compactMessages(
       summaryContextLimit: options.summaryContextLimit,
       fallbackContextLimit: options.contextLimit,
     }),
-    model: summaryModel === "current" ? options.currentModel : summaryModel,
+    resolveModel: () =>
+      summaryModel === "current"
+        ? options.currentModel
+        : typeof summaryModel === "function"
+          ? summaryModel()
+          : summaryModel,
     providerOptions: buildSummaryProviderOptions(options.providerOptions),
-    keepLastMessages: options.keepLastMessages ?? DEFAULT_KEEP_LAST_MESSAGES,
+    keepRecentTurns: options.keepRecentTurns ?? DEFAULT_KEEP_RECENT_TURNS,
     keepRecentTokens: options.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS,
     summarySystem: options.summarySystem ?? DEFAULT_SUMMARY_SYSTEM,
     buildSummaryPrompt: options.buildSummaryPrompt ?? DEFAULT_SUMMARY_PROMPT,
     buildSummaryUpdatePrompt: options.buildSummaryUpdatePrompt ?? DEFAULT_SUMMARY_UPDATE_PROMPT,
-    buildSplitTurnSummaryPrompt: options.buildSplitTurnSummaryPrompt ?? DEFAULT_SPLIT_TURN_PROMPT,
-    buildSplitTurnSummaryUpdatePrompt:
-      options.buildSplitTurnSummaryUpdatePrompt ?? DEFAULT_SPLIT_TURN_UPDATE_PROMPT,
     abortSignal: options.abortSignal,
     onProgress: options.onProgress,
     onSummaryDelta: options.onSummaryDelta,
   });
-  if (!compacted) return noop("no-compactable-messages");
+  if (!compacted) return noop("already-minimal");
 
   const messages = cloneMessages(compacted.messages);
   return {
@@ -1643,25 +1591,22 @@ export async function attachAutoCompaction(
   if (options.enabled === false) return () => {};
 
   const thresholdFraction = normalizeThresholdFraction(options.thresholdFraction);
-  const keepLastMessages = options.keepLastMessages ?? DEFAULT_KEEP_LAST_MESSAGES;
+  const thresholdInputSource = options.thresholdInputSource ?? "usage";
+  const keepRecentTurns = options.keepRecentTurns ?? DEFAULT_KEEP_RECENT_TURNS;
   const keepRecentTokens = options.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
   const summaryModel = options.summaryModel ?? "current";
   const summarySystem = options.summarySystem ?? DEFAULT_SUMMARY_SYSTEM;
   const buildSummaryPrompt = options.buildSummaryPrompt ?? DEFAULT_SUMMARY_PROMPT;
   const buildSummaryUpdatePrompt =
     options.buildSummaryUpdatePrompt ?? DEFAULT_SUMMARY_UPDATE_PROMPT;
-  const buildSplitTurnSummaryPrompt =
-    options.buildSplitTurnSummaryPrompt ?? DEFAULT_SPLIT_TURN_PROMPT;
-  const buildSplitTurnSummaryUpdatePrompt =
-    options.buildSplitTurnSummaryUpdatePrompt ?? DEFAULT_SPLIT_TURN_UPDATE_PROMPT;
   const overflowRecoveryMaxAttempts =
     options.overflowRecoveryMaxAttempts ?? DEFAULT_OVERFLOW_RECOVERY_MAX_ATTEMPTS;
 
-  let pendingCompactionReason: CompactionScheduleReason | null = null;
+  let pendingCompactionReason: PendingCompactionReason | null = null;
   let inCompaction = false;
-  let queuedAutoContinue = false;
   let overflowRecoveryAttempts = 0;
   let lastTurnInputTokens: number | null = null;
+  let lastModelInputEstimate: number | null = null;
 
   const seenUnknownCapabilitySpecs = new Set<string>();
 
@@ -1676,9 +1621,14 @@ export async function attachAutoCompaction(
     });
   };
 
-  const scheduleCompaction = (reason: CompactionScheduleReason) => {
+  const scheduleCompaction = (reason: PendingCompactionReason) => {
     if (reason === "overflow") {
       pendingCompactionReason = "overflow";
+      return;
+    }
+
+    if (reason === "media") {
+      if (pendingCompactionReason !== "overflow") pendingCompactionReason = "media";
       return;
     }
 
@@ -1693,6 +1643,10 @@ export async function attachAutoCompaction(
   });
   notifyUnknownCapability(initialLimit);
   let currentCapability = initialLimit;
+  const restoredLastMessage = agent.state.messages[agent.state.messages.length - 1];
+  if (restoredLastMessage && isAutoContinueMessage(restoredLastMessage)) {
+    scheduleCompaction("threshold");
+  }
 
   const refreshContextLimit = async (abortSignal?: AbortSignal): Promise<ResolvedContextWindow> => {
     const resolved = await resolveContextLimit({
@@ -1784,7 +1738,6 @@ export async function attachAutoCompaction(
       maxAttempts: overflowRecoveryMaxAttempts,
     });
     scheduleCompaction("overflow");
-    queuedAutoContinue = false;
     return "retry";
   };
 
@@ -1793,7 +1746,12 @@ export async function attachAutoCompaction(
 
     overflowRecoveryAttempts = 0;
 
-    const inputTokens = event.usage.inputTokens;
+    const inputTokens = resolveThresholdInputTokens({
+      source: thresholdInputSource,
+      usageInputTokens: event.usage.inputTokens,
+      messages: agent.state.messages,
+      modelInputEstimate: lastModelInputEstimate ?? undefined,
+    });
     if (typeof inputTokens !== "number" || inputTokens <= 0) {
       lastTurnInputTokens = null;
       return;
@@ -1804,25 +1762,33 @@ export async function attachAutoCompaction(
     const budget = resolveKnownInputBudget();
     if (!budget) return;
     if (!evaluateThresholdWithBudget(inputTokens, budget.inputBudget)) return;
-
-    const wasCompactionPending = pendingCompactionReason !== null;
+    // A terminal turn should end normally. The next inbound request performs
+    // an estimate-based preflight; overflow recovery remains the final guard.
+    if (event.finishReason !== "tool-calls") return;
     scheduleCompaction("threshold");
-
-    if (event.finishReason === "tool-calls") return;
-    if (wasCompactionPending || queuedAutoContinue) return;
-
-    agent.followUp(AUTO_CONTINUE_AFTER_COMPACTION_TEXT);
-    queuedAutoContinue = true;
   });
 
   const transformMessages: TransformMessagesFn = async (
     messages,
     context: TransformMessagesContext,
   ) => {
-    const canonicalMediaBytes = inlineMediaStorageBytes(messages);
+    const canonicalSeparated = splitThresholdContinueTrailer(messages);
+    const canonicalMessages = [...canonicalSeparated.messages, ...canonicalSeparated.trailer];
+    if (canonicalMessages.length !== messages.length) {
+      agent.replaceMessages(canonicalMessages, {
+        reason: "replace",
+        preserveRecoveryCheckpoint: true,
+      });
+    }
+
+    const canonicalMediaBytes = inlineMediaStorageBytes(canonicalMessages);
     const maybeTransformed = options.baseTransformMessages
-      ? await options.baseTransformMessages(messages, context)
-      : [...messages];
+      ? await options.baseTransformMessages(canonicalMessages, context)
+      : canonicalMessages;
+    const modelInputEstimate = estimateModelInputTokens({ messages: maybeTransformed, context });
+    const hasOmittedCanonicalMedia =
+      canonicalMediaBytes > inlineMediaStorageBytes(maybeTransformed);
+    lastModelInputEstimate = modelInputEstimate;
 
     const latestCapability = await refreshContextLimit(context.abortSignal);
     pendingCompactionReason = reconcilePendingCompactionReason({
@@ -1830,27 +1796,38 @@ export async function attachAutoCompaction(
       capabilityKnown: latestCapability.known,
     });
 
-    if (
-      latestCapability.known &&
-      pendingCompactionReason === null &&
-      canonicalMediaBytes > inlineMediaStorageBytes(maybeTransformed)
-    ) {
-      scheduleCompaction("threshold");
-      // Deliver the newest retained media once before compacting omitted historical media.
-      return maybeTransformed;
-    }
-
-    if (
-      latestCapability.known &&
-      pendingCompactionReason === null &&
-      lastTurnInputTokens !== null
-    ) {
+    if (latestCapability.known) {
       const latestBudget = computeInputCompactionBudget({
         contextLimit: latestCapability.contextLimit,
         outputLimit: latestCapability.outputLimit,
         thresholdFraction,
       });
-      if (evaluateThresholdWithBudget(lastTurnInputTokens, latestBudget.inputBudget)) {
+      const observedInputTokens =
+        thresholdInputSource === "usage" && lastTurnInputTokens !== null
+          ? lastTurnInputTokens
+          : modelInputEstimate;
+
+      if (
+        pendingCompactionReason === "threshold" &&
+        !evaluateThresholdWithBudget(observedInputTokens, latestBudget.inputBudget)
+      ) {
+        pendingCompactionReason = null;
+      }
+
+      if (pendingCompactionReason === "media" && !hasOmittedCanonicalMedia) {
+        pendingCompactionReason = null;
+      }
+
+      if (pendingCompactionReason === null && hasOmittedCanonicalMedia) {
+        scheduleCompaction("media");
+        // Deliver the newest retained media once before compacting omitted historical media.
+        return maybeTransformed;
+      }
+
+      if (
+        pendingCompactionReason === null &&
+        evaluateThresholdWithBudget(observedInputTokens, latestBudget.inputBudget)
+      ) {
         scheduleCompaction("threshold");
       }
     }
@@ -1863,18 +1840,37 @@ export async function attachAutoCompaction(
     // Be conservative: compact only when context ends with user/tool.
     if (lastMessage?.role === "assistant") return maybeTransformed;
 
-    const repairedTranscript = repairTranscriptForCompaction(maybeTransformed);
+    const separated = splitThresholdContinueTrailer(maybeTransformed);
+    const repairedTranscript = repairTranscriptForCompaction(separated.messages);
     const compactableMessages = repairedTranscript.messages;
     if (compactableMessages.length === 0) return maybeTransformed;
 
+    const pendingReason = pendingCompactionReason;
+    const compactionReason: CompactionScheduleReason =
+      pendingReason === "media" ? "threshold" : pendingReason;
     const activeBudget = resolveActiveCompactionBudget({
       capability: latestCapability,
-      reason: pendingCompactionReason,
+      reason: compactionReason,
       estimatedInputTokens: estimateMessagesTokens(compactableMessages),
     });
     if (!activeBudget) return maybeTransformed;
 
-    const compactionReason = pendingCompactionReason;
+    if (pendingReason === "threshold") {
+      const retainedTailTokenCap = resolveRetainedTailTokenCap(
+        activeBudget.inputBudget,
+        keepRecentTokens,
+      );
+      const boundary = resolveCompactionBoundary({
+        messages: compactableMessages,
+        keepRecentTokens: retainedTailTokenCap,
+        keepRecentTurns,
+      });
+      if (boundary.suffixStart === 0) {
+        pendingCompactionReason = null;
+        return maybeTransformed;
+      }
+    }
+
     const estimatedInputTokens = estimateMessagesTokens(compactableMessages);
     const compactionStart = Date.now();
     const compactionEventBase: AutoCompactionStartEvent = {
@@ -1892,7 +1888,15 @@ export async function attachAutoCompaction(
     inCompaction = true;
     try {
       options.onCompactionStart?.(compactionEventBase);
-      queuedAutoContinue = false;
+
+      const trailerTokens = estimateMessagesTokens(separated.trailer);
+      if (trailerTokens >= activeBudget.inputBudget) {
+        throw new Error("Compaction continuation trailer exceeds the input budget.");
+      }
+      const contentBudget = {
+        ...activeBudget,
+        inputBudget: activeBudget.inputBudget - trailerTokens,
+      };
 
       const summaryContextLimit = pickSummaryContextLimit({
         summaryContextLimit: await options.resolveSummaryContextLimit?.({
@@ -1904,17 +1908,21 @@ export async function attachAutoCompaction(
       });
       const compactionOutcome = await compactRepairedMessages({
         messages: compactableMessages,
-        budget: activeBudget,
+        budget: contentBudget,
         summaryContextLimit,
-        model: summaryModel === "current" ? agent.state.model : summaryModel,
+        resolveModel: () =>
+          summaryModel === "current"
+            ? agent.state.model
+            : typeof summaryModel === "function"
+              ? summaryModel()
+              : summaryModel,
         providerOptions: buildSummaryProviderOptions(agent.state.providerOptions),
-        keepLastMessages,
+        keepRecentTurns,
         keepRecentTokens,
         summarySystem,
         buildSummaryPrompt,
         buildSummaryUpdatePrompt,
-        buildSplitTurnSummaryPrompt,
-        buildSplitTurnSummaryUpdatePrompt,
+        forceCompaction: pendingReason !== "threshold",
         onProgress: options.onProgress,
         onSummaryDelta: options.onSummaryDelta,
         abortSignal: context.abortSignal,
@@ -1923,7 +1931,7 @@ export async function attachAutoCompaction(
       if (!compactionOutcome) {
         throw new Error("Compaction could not select transcript content for summarization.");
       }
-      const compacted = compactionOutcome.messages;
+      const compacted = [...compactionOutcome.messages, ...separated.trailer];
 
       agent.replaceMessages(compacted, { reason: "compaction" });
 
@@ -1973,23 +1981,28 @@ export async function attachAutoCompaction(
 }
 
 export const __autoCompactionInternals = {
+  buildAutoContinueMessage,
   buildCompactionSummaryMessage,
   computeInputCompactionBudget,
   computeUnknownOverflowCompactionBudget,
   computeOverflowRecoveryDecision,
   reconcilePendingCompactionReason,
   chunkMessagesByEstimatedTokens,
-  chooseSuffixStartByMessageCount,
-  chooseSuffixStartByTokenBudget,
+  chooseRetainedTailStart,
+  hasCompletedAssistantToolTurn,
   estimateMessageTokens,
   estimateMessagesTokens,
+  estimateModelInputTokens,
   inlineMediaStorageBytes,
   isValidSuffix,
   normalizeThresholdFraction,
   repairTranscriptForCompaction,
   renderMessagesForSummarySegments,
+  resolveThresholdInputTokens,
   resolveContextLimit,
+  resolveRetainedTailTokenCap,
   resolveCompactionBoundary,
   shrinkCompactedMessagesToBudget,
+  splitThresholdContinueTrailer,
   summarizeMessagesHierarchical,
 };

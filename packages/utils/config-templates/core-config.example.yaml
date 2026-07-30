@@ -258,6 +258,12 @@ agent:
         # model: "openrouter/openai/gpt-4o"
         # Optional portable reasoning override for this subagent profile.
         # reasoning: low
+        # Optional ordered fallback chain. A profile chain takes precedence over
+        # the selected model slot or models.def alias chain.
+        # fallback:
+        #   - sonnet
+        #   - model: openrouter/openai/gpt-4o-mini
+        #     reasoning: none
         # options:
         #   temperature: 0.0
         # Optional extra prompt fragment appended in explore mode.
@@ -318,6 +324,12 @@ models:
   #     # exact provider-native reasoning controls.
   #     options:
   #       reasoningEffort: high
+  #     # Ordered fallback entries can be aliases, provider/model refs, or objects
+  #     # with per-candidate reasoning/options overrides.
+  #     fallback:
+  #       - sonnet
+  #       - model: openrouter/openai/gpt-4o
+  #         reasoning: medium
   # def:
   #   opus:
   #     model: vercel/anthropic/claude-opus-4.8
@@ -351,6 +363,12 @@ models:
     model: "openrouter/openai/gpt-4o"
     # Optional portable AI SDK reasoning effort.
     # reasoning: provider-default
+    # Optional ordered fallback chain. A slot chain takes precedence over a chain
+    # declared by the models.def alias selected above.
+    # fallback:
+    #   - openrouter/anthropic/claude-sonnet-4.5
+    #   - model: openai/gpt-4o
+    #     reasoning: medium
     # For non-official OpenAI-compatible upstreams, use:
     # model: "openai-compatible/your-model-id"
     # options:
@@ -371,6 +389,7 @@ models:
     model: "openrouter/openai/gpt-4o-mini"
     # Optional: disable reasoning for lightweight gate/router work.
     # reasoning: none
+    # fallback: [openrouter/openai/gpt-4o]
     # options:
     #   temperature: 0.0
 

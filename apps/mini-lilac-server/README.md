@@ -67,18 +67,23 @@ exact shape `{ "type": "api-key", "key": "..." }`.
 `workspaceWrites: false` also disables Bash because allowed commands have unrestricted process
 authority and can write outside filesystem-tool guardrails. Bash safety blocks known destructive
 operations, expansion-sensitive recursive deletion, and protected paths by default, but it is not
-a sandbox. Set `dangerouslyAllow: true` only to intentionally bypass every Bash guardrail for one
-call, including credential and state-path protections. Bash receives an environment with the HTTP
-auth-token variable removed.
+a sandbox. Filesystem and patch tools similarly deny credential and state paths by default. For a
+profile that exposes the relevant tool, `dangerouslyAllow: true` is an explicit per-call escape
+hatch that bypasses its guardrails, including protected-path checks. Hidden paths such as `.bun` do
+not require this flag unless a tool first reports an access denial. Bash receives an environment
+with the HTTP auth-token variable removed.
 
-Model-facing tool results are limited to 40 KiB. When a non-Bash tool completes with a larger
-materialized result, Mini Lilac stores the complete sanitized result under the transient,
-session-scoped `tool-result://` artifact referenced by the replacement tool error. Use `read_file`
-with that URI and its returned `nextStart` to page the result instead of rerunning the original
-tool. Bash keeps a bounded head-and-tail preview and includes the artifact URI in its structured
-truncation metadata. Encrypted artifact files live under `$XDG_STATE_HOME/mini-lilac/tool-results`,
-are invalidated when the server restarts, and never include results omitted by native query limits
-such as `maxResults` or `maxCharacters`.
+Model-facing tool results are limited to 40 KiB. For `read_file`, that limit applies only to the
+returned textual payload, measured as UTF-8 bytes; metadata, paths, JSON encoding, and loaded
+`AGENTS.md` instructions are outside the limit. Direct and batched reads return `nextStart` rather
+than creating duplicate overflow artifacts, and batched reads do not share an aggregate inline
+budget. When another non-Bash tool completes with a larger materialized result, Mini Lilac stores
+the complete sanitized result under the transient, session-scoped `tool-result://` artifact
+referenced by the replacement tool error. Use `read_file` with that URI and its returned `nextStart`
+to page the result instead of rerunning the original tool. Bash keeps a bounded head-and-tail
+preview and includes the artifact URI in its structured truncation metadata. Encrypted artifact
+files live under `$XDG_STATE_HOME/mini-lilac/tool-results`, are invalidated when the server restarts,
+and never include results omitted by native query limits such as `maxResults` or `maxCharacters`.
 
 ## Run
 

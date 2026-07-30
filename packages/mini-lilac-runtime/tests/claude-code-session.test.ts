@@ -256,7 +256,7 @@ function fakeClaudeCode(options: {
     });
     const run: FakeClaudeRun = {
       agentModel: options.agentModel,
-      utilityModel: options.utilityModel ?? new MockLanguageModelV4({}),
+      createUtilityModel: () => options.utilityModel ?? new MockLanguageModelV4({}),
       injected: [],
       interrupts: 0,
       disposals: 0,
@@ -337,6 +337,22 @@ describe("claude-code sessions", () => {
     // Claude ignores AI SDK tool declarations; the toolset reaches it via MCP.
     expect(model.doStreamCalls[0]?.tools ?? []).toEqual([]);
     expect(runs[0]?.disposals).toBe(1);
+    service.close();
+  });
+
+  it("measures compaction thresholds from transcript occupancy", async () => {
+    let thresholdInputSource: string | undefined;
+    const { service, session } = await temporaryRuntime({
+      model: new MockLanguageModelV4({ doStream: [textResult("answer", "done")] }),
+      attachCompaction: async (_agent, options) => {
+        thresholdInputSource = options.thresholdInputSource;
+        return () => {};
+      },
+    });
+
+    await collect((await service.startPrompt(session.id, userMessage("hello"))).stream);
+
+    expect(thresholdInputSource).toBe("transcript-estimate");
     service.close();
   });
 

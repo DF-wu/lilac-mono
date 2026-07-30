@@ -257,7 +257,7 @@ function grepToolResult(pattern: string) {
   };
 }
 
-function readToolResult(path: string) {
+function readToolResult(path: string, options?: { dangerouslyAllow?: boolean }) {
   return {
     stream: simulateReadableStream({
       chunks: [
@@ -265,7 +265,7 @@ function readToolResult(path: string) {
           type: "tool-call" as const,
           toolCallId: "direct-read",
           toolName: "read_file",
-          input: JSON.stringify({ path, maxCharacters: 20_000 }),
+          input: JSON.stringify({ path, maxCharacters: 20_000, ...options }),
         },
         {
           type: "finish" as const,
@@ -2330,7 +2330,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("shares the inline result budget across settled batch children", async () => {
+  it("exempts bounded read_file children from the settled aggregate budget", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
     temporaryDirectories.push(directory);
     const largePayload = `large:${"x".repeat(900)}\n`;
@@ -2362,14 +2362,10 @@ describe("SessionService", () => {
     await collect((await service.startPrompt(session.id, userMessage("read both"))).stream);
 
     const transcript = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(transcript.match(/\[tool result overflow\]/gu)).toHaveLength(1);
-    expect(transcript).not.toContain("x".repeat(500));
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(transcript).toContain("x".repeat(500));
     expect(transcript).toContain("y".repeat(300));
-    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(transcript)?.[0];
-    if (uri === undefined) throw new Error("batch overflow artifact URI was not persisted");
-    const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(artifact.content).toContain(largePayload.trim());
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
     service.close();
   });
 
@@ -2396,8 +2392,9 @@ describe("SessionService", () => {
     );
 
     const transcript = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(transcript).toContain("[tool result overflow]");
-    expect(transcript).not.toContain("😀".repeat(1_000));
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(transcript).toContain("😀".repeat(1_000));
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
     expect(chunks).toContainEqual(
       expect.objectContaining({ type: "tool-output-available", toolCallId: "direct-read" }),
     );
@@ -3980,12 +3977,42 @@ describe("SessionService", () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-auto-compact-event-"));
     temporaryDirectories.push(directory);
     let resolvedLimits: number | { readonly context: number; readonly output: number } | undefined;
+    let thresholdInputSource: string | undefined;
+    let mediaScrubbed = false;
     const service = new SessionService({
       config: config(),
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       modelLimitsResolver: async () => ({ context: 32_000, output: 12_000 }),
       attachCompaction: async (agent, options) => {
+        thresholdInputSource = options.thresholdInputSource;
+        const encoded = Buffer.alloc(4, 7).toString("base64");
+        const transformed = await options.baseTransformMessages?.(
+          [
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "media",
+                  toolName: "read_file",
+                  output: {
+                    type: "content",
+                    value: [
+                      {
+                        type: "file",
+                        mediaType: "image/png",
+                        data: { type: "data", data: encoded },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+          { system: "test", tools: {} },
+        );
+        mediaScrubbed = transformed !== undefined && !JSON.stringify(transformed).includes(encoded);
         resolvedLimits = await options.resolveContextLimit?.({
           defaultModel: options.model,
           currentModelSpecifier: agent.state.modelSpecifier,
@@ -4012,11 +4039,7 @@ describe("SessionService", () => {
               stepCount: 1,
               pass: 1,
             };
-            const splitTurn = { ...progress, stage: "split-turn" as const };
             options.onCompactionStart?.(base);
-            // The split turn summarizes concurrently with history; its deltas
-            // must reach the summary rather than being dropped.
-            options.onSummaryDelta?.("Mid-turn state.", splitTurn);
             options.onProgress?.(progress);
             options.onSummaryDelta?.("Condensed prior context.", progress);
             options.onCompactionEnd?.({
@@ -4025,7 +4048,7 @@ describe("SessionService", () => {
               messageCountAfter: 4,
               estimatedInputTokensAfter: 2_000,
               durationMs: 20,
-              summary: "Engine summary covering both stages.",
+              summary: "Engine anchored summary.",
             });
           });
         });
@@ -4036,6 +4059,8 @@ describe("SessionService", () => {
     const streamed = await collect(started.stream);
 
     expect(resolvedLimits).toEqual({ context: 32_000, output: 12_000 });
+    expect(thresholdInputSource).toBe("usage");
+    expect(mediaScrubbed).toBe(true);
     const compactionChunks = streamed.filter((chunk) => chunk.type === "data-compaction");
     // One chunk id spans the lifecycle so the renderer updates a single entry.
     expect(new Set(compactionChunks.map((chunk) => chunk.id)).size).toBe(1);
@@ -4049,19 +4074,17 @@ describe("SessionService", () => {
     // carry the state captured when it was raised, not whatever came later.
     expect(compactionChunks.at(0)?.data).toMatchObject({ modelCalls: 0, elapsedMs: 0 });
     expect(compactionChunks.at(0)?.data.summary).toBeUndefined();
-    // Split-turn text is part of the summary, assembled the way the engine does.
-    expect(compactionChunks.at(1)?.data.summary).toBe(
-      "**Turn Context (split turn):**\n\nMid-turn state.",
-    );
+    expect(compactionChunks.at(1)?.data.summary).toBeUndefined();
     expect(compactionChunks.at(2)?.data.progress).toEqual({
       stage: "history",
       step: 1,
       stepCount: 1,
       pass: 1,
     });
+    expect(compactionChunks.at(2)?.data.summary).toBe("Condensed prior context.");
     // The engine's own summary wins at the terminal phase: it is post-truncation
     // and complete, which a throttled delta buffer cannot guarantee.
-    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine summary covering both stages.");
+    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine anchored summary.");
     expect(compactionChunks.at(-1)?.data).toMatchObject({
       source: "automatic",
       reason: "threshold",
@@ -7886,12 +7909,6 @@ describe("SessionService", () => {
                 toolName: "read_file",
                 input: JSON.stringify({ path: protectedPath }),
               })),
-              ...protectedPaths.map((protectedPath, index) => ({
-                type: "tool-call" as const,
-                toolCallId: `read-protected-bypass-${index}`,
-                toolName: "read_file",
-                input: JSON.stringify({ path: protectedPath, dangerouslyAllow: true }),
-              })),
               {
                 type: "finish",
                 finishReason: { unified: "tool-calls", raw: "tool-calls" },
@@ -7920,7 +7937,31 @@ describe("SessionService", () => {
     expect(continuation).not.toContain("must-not-read");
     expect(continuation).not.toContain("provider-marker-must-not-read");
     expect(continuation).not.toContain("mini-lilac-token-must-not-read");
-    expect(continuation).toContain("dangerouslyAllow is disabled");
+    service.close();
+  });
+
+  it("permits an explicit filesystem dangerouslyAllow retry for an enabled profile tool", async () => {
+    const runtimeConfig = config();
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-filesystem-bypass-"));
+    temporaryDirectories.push(directory);
+    const protectedPath = path.join(directory, "protected.txt");
+    await Bun.write(protectedPath, "explicit-bypass-marker");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        readToolResult(protectedPath, { dangerouslyAllow: true }),
+        textResult("answer", "inspected"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      protectedToolPaths: [protectedPath],
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect((await service.startPrompt(session.id, userMessage("read protected"))).stream);
+
+    expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain("explicit-bypass-marker");
     service.close();
   });
 

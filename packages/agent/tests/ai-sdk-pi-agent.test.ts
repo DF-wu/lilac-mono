@@ -1,5 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { jsonSchema, tool, type LanguageModel, type ModelMessage, type ToolModelMessage } from "ai";
+import {
+  APICallError,
+  jsonSchema,
+  tool,
+  type LanguageModel,
+  type ModelMessage,
+  type ToolModelMessage,
+} from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
 import { AiSdkPiAgent, extractToolCallsFromMessages } from "../ai-sdk-pi-agent";
@@ -50,6 +57,17 @@ function textStream(id: string, text: string) {
   };
 }
 
+function retryableApiCallError(): APICallError {
+  return new APICallError({
+    message: "Service unavailable",
+    url: "https://api.example.test/v1/messages",
+    requestBodyValues: {},
+    statusCode: 503,
+    responseHeaders: { "retry-after-ms": "0" },
+    isRetryable: true,
+  });
+}
+
 function syntheticResultMessages(toolCallId: string): ModelMessage[] {
   return [
     {
@@ -96,6 +114,8 @@ describe("AiSdkPiAgent model spec tracking", () => {
     agent.setModel(fakeModel());
     expect(agent.state.modelSpecifier).toBeUndefined();
     expect(agent.state.reasoning).toBeUndefined();
+
+    agent.setExperimentalDownload(undefined);
   });
 
   it("normalizes stringified assistant tool-call inputs from constructor messages", () => {
@@ -685,6 +705,50 @@ describe("AiSdkPiAgent model spec tracking", () => {
   });
 });
 
+describe("AiSdkPiAgent streamText retries", () => {
+  it("preserves AI SDK retries when no stream retry limit is supplied", async () => {
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls === 1) throw retryableApiCallError();
+        return textStream("answer", "recovered");
+      },
+    });
+    const agent = new AiSdkPiAgent({ system: "test", model });
+
+    await agent.prompt("retry internally");
+
+    expect(model.doStreamCalls).toHaveLength(2);
+  });
+
+  it("lets the agent handler control the exact call count when SDK retries are disabled", async () => {
+    let calls = 0;
+    let retries = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls <= 2) throw retryableApiCallError();
+        return textStream("answer", "recovered");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      streamTextMaxRetries: 0,
+      turnErrorHandler: () => {
+        retries += 1;
+        return "retry";
+      },
+    });
+
+    await agent.prompt("retry through the agent");
+
+    expect(retries).toBe(2);
+    expect(model.doStreamCalls).toHaveLength(3);
+  });
+});
+
 describe("AiSdkPiAgent provider stream parts", () => {
   it("emits custom, source, file, and reasoning-file updates without text or tools", async () => {
     const providerMetadata = { test: { itemId: "provider-item" } };
@@ -874,6 +938,71 @@ describe("AiSdkPiAgent provider stream parts", () => {
     expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("normalized:provider-1");
     expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain("normalized:provider-2");
     expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain("raw provider one");
+  });
+
+  it("classifies failures after response tool normalization as post-model", async () => {
+    const localError = Object.assign(new Error("socket connection closed unexpectedly"), {
+      code: "ECONNRESET",
+    });
+    const model = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "tool-call",
+              toolCallId: "provider-call",
+              toolName: "provider_tool",
+              input: "{}",
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "tool-calls", raw: "tool-calls" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      }),
+    });
+    const phases: Array<string | undefined> = [];
+    const retryReasons: string[] = [];
+    let normalizations = 0;
+    let switchAttempts = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        provider_tool: tool({
+          inputSchema: jsonSchema(
+            { type: "object", additionalProperties: false },
+            { validate: () => ({ success: false, error: new Error("provider validation") }) },
+          ),
+        }),
+      },
+      normalizeToolResultOutput: (output) => {
+        normalizations += 1;
+        return output;
+      },
+      turnErrorHandler: (_error, context) => {
+        phases.push(context.phase);
+        if (!context.retrySafety.canRetry) retryReasons.push(context.retrySafety.reason);
+        if (context.phase === "model-call" && switchAttempts === 0) {
+          switchAttempts += 1;
+          return "retry";
+        }
+        return "fail";
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "message_end" && event.message.role === "tool") throw localError;
+    });
+
+    await expect(agent.prompt("use provider tool")).rejects.toBe(localError);
+
+    expect(normalizations).toBe(1);
+    expect(phases).toEqual(["post-model"]);
+    expect(retryReasons).toEqual(["post-model-phase"]);
+    expect(switchAttempts).toBe(0);
+    expect(model.doStreamCalls).toHaveLength(1);
   });
 });
 
@@ -2085,6 +2214,49 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     ]);
   });
 
+  it("reports whether a turn error came from setup, transformation, or the model call", async () => {
+    const phases: Array<string | undefined> = [];
+    const handler = (_error: unknown, context: { phase?: string }) => {
+      phases.push(context.phase);
+      return "fail" as const;
+    };
+    const beforeStepError = new Error("before step failed");
+    const beforeStepAgent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      beforeStep: () => {
+        throw beforeStepError;
+      },
+      turnErrorHandler: handler,
+    });
+    await expect(beforeStepAgent.prompt("before step")).rejects.toBe(beforeStepError);
+
+    const transformError = new Error("transform failed");
+    const transformAgent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      transformMessages: () => {
+        throw transformError;
+      },
+      turnErrorHandler: handler,
+    });
+    await expect(transformAgent.prompt("transform")).rejects.toBe(transformError);
+
+    const modelError = new Error("model failed");
+    const modelAgent = new AiSdkPiAgent({
+      system: "test",
+      model: new MockLanguageModelV4({
+        doStream: {
+          stream: simulateReadableStream({ chunks: [{ type: "error", error: modelError }] }),
+        },
+      }),
+      turnErrorHandler: handler,
+    });
+    await expect(modelAgent.prompt("model")).rejects.toBe(modelError);
+
+    expect(phases).toEqual(["before-step", "transform-messages", "model-call"]);
+  });
+
   it("lets cancellation win while the turn error handler is awaited", async () => {
     for (const decision of ["fail", "retry"] as const) {
       const handlerEntered = deferred();
@@ -2813,6 +2985,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       },
     });
     const retryReasons: string[] = [];
+    const errorPhases: Array<string | undefined> = [];
     const agent = new AiSdkPiAgent({
       system: "test",
       model,
@@ -2820,6 +2993,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
         throw boundaryError;
       },
       turnErrorHandler: async (_error, context) => {
+        errorPhases.push(context.phase);
         if (!context.retrySafety.canRetry) retryReasons.push(context.retrySafety.reason);
         return "retry" as const;
       },
@@ -2829,6 +3003,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
 
     expect(model.doStreamCalls).toHaveLength(1);
     expect(retryReasons).toEqual(["post-model-phase"]);
+    expect(errorPhases).toEqual(["post-model"]);
     expect(agent.state.messages.at(-1)).toEqual({
       role: "assistant",
       content: [{ type: "text", text: "committed" }],
@@ -3246,7 +3421,6 @@ describe("AiSdkPiAgent turn boundaries", () => {
         },
         historyToolMessage,
       ],
-      genericOutputNormalizerBypassTools: new Set(["history_tool", "boundary_one", "boundary_two"]),
       normalizeToolResultOutput: (_output, context) => {
         normalizationContexts.push(context);
         return { type: "text", value: `normalized:${context.toolCallId}` };
@@ -3285,6 +3459,9 @@ describe("AiSdkPiAgent turn boundaries", () => {
         };
       },
     });
+    agent.setGenericOutputNormalizerBypassTools(
+      new Set(["history_tool", "boundary_one", "boundary_two"]),
+    );
     agent.subscribe((event) => {
       if (
         event.type === "message_end" &&
@@ -3609,7 +3786,9 @@ describe("AiSdkPiAgent tool-call expansion", () => {
     let started = 0;
     let cohortCalls = 0;
     const ordinaryNormalizedNames: string[] = [];
-    const cohortEntries: Array<Array<{ toolCallId: string; output: unknown }>> = [];
+    const cohortEntries: Array<
+      Array<{ toolCallId: string; output: unknown; aggregateOutputBudgetExempt?: boolean }>
+    > = [];
     const childEndIds: string[] = [];
     const agent = new AiSdkPiAgent({
       system: "test",
@@ -3650,12 +3829,16 @@ describe("AiSdkPiAgent tool-call expansion", () => {
         ordinaryNormalizedNames.push(context.toolName);
         return output;
       },
+      aggregateOutputBudgetExemptTools: new Set(["first_child"]),
       normalizeSettledToolResultOutputs: async (entries) => {
         cohortCalls += 1;
         cohortEntries.push(
           entries.map((entry) => ({
             toolCallId: entry.context.toolCallId,
             output: entry.output,
+            ...(entry.context.aggregateOutputBudgetExempt === true
+              ? { aggregateOutputBudgetExempt: true }
+              : {}),
           })),
         );
         return entries.map((entry) => ({
@@ -3699,7 +3882,11 @@ describe("AiSdkPiAgent tool-call expansion", () => {
     expect(cohortCalls).toBe(1);
     expect(cohortEntries).toEqual([
       [
-        { toolCallId: "child-first", output: { type: "json", value: { raw: "first" } } },
+        {
+          toolCallId: "child-first",
+          output: { type: "json", value: { raw: "first" } },
+          aggregateOutputBudgetExempt: true,
+        },
         { toolCallId: "child-second", output: { type: "json", value: { raw: "second" } } },
       ],
     ]);

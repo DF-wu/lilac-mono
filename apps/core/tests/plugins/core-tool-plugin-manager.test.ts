@@ -220,8 +220,10 @@ describe("core tool plugin manager", () => {
       "apply_patch",
       "bash",
       "batch",
+      "read_file",
       "subagent_delegate",
     ]);
+    expect([...applyPatchTools.aggregateOutputBudgetExemptTools]).toEqual(["read_file"]);
     expect([...applyPatchTools.directToolNames].sort()).toEqual([
       "apply_patch",
       "bash",

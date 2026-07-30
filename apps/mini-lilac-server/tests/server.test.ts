@@ -1069,6 +1069,12 @@ describe("createMiniLilacServer", () => {
     const { app, directory, service } = await testServer(model);
     const session = await service.createSession({ cwd: directory, model: "test/reasoner" });
     const visibleMessages = [
+      userMessage("earliest-user", "earliest request"),
+      {
+        id: "earliest-assistant",
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: "earliest answer" }],
+      },
       userMessage("old-user", `old request ${"a".repeat(6_000)}`),
       {
         id: "old-assistant",
@@ -1082,6 +1088,8 @@ describe("createMiniLilacServer", () => {
       session.id,
       "manual-compaction-seed",
       [
+        { role: "user", content: "earliest request" },
+        { role: "assistant", content: "earliest answer" },
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
         { role: "user", content: "latest request" },
@@ -1166,11 +1174,17 @@ describe("createMiniLilacServer", () => {
       session.id,
       "cancel-compaction-seed",
       [
+        { role: "user", content: "earliest request" },
+        { role: "assistant", content: "earliest answer" },
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
         { role: "user", content: "latest request" },
       ],
-      [userMessage("old-user", "old request"), userMessage("latest-user", "latest request")],
+      [
+        userMessage("earliest-user", "earliest request"),
+        userMessage("old-user", "old request"),
+        userMessage("latest-user", "latest request"),
+      ],
     );
     const before = service.store.getModelMessages(session.id);
 
@@ -1223,11 +1237,17 @@ describe("createMiniLilacServer", () => {
       session.id,
       "conflicting-compaction-seed",
       [
+        { role: "user", content: "earliest request" },
+        { role: "assistant", content: "earliest answer" },
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
         { role: "user", content: "latest request" },
       ],
-      [userMessage("old-user", "old request"), userMessage("latest-user", "latest request")],
+      [
+        userMessage("earliest-user", "earliest request"),
+        userMessage("old-user", "old request"),
+        userMessage("latest-user", "latest request"),
+      ],
     );
 
     const compacting = app.handle(

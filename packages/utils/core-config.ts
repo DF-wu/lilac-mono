@@ -54,6 +54,8 @@ export {
 };
 export { MODEL_REASONING_EFFORTS } from "./core-config/types";
 export type {
+  ConfiguredModelChainEntry,
+  ConfiguredModelRef,
   ConfigParser,
   CoreConfig,
   CoreConfigKeyPath,
@@ -193,9 +195,25 @@ function reportConfiguredModelOptionWarnings(
 
   for (const [alias, preset] of Object.entries(cfg.models.def)) {
     validate(preset.model, preset.options, `models.def.${alias}.options`);
+    for (const [index, fallback] of (preset.fallback ?? []).entries()) {
+      if (typeof fallback !== "string") {
+        validate(
+          fallback.model,
+          fallback.options,
+          `models.def.${alias}.fallback[${index}].options`,
+        );
+      }
+    }
   }
   validate(cfg.models.main.model, cfg.models.main.options, "models.main.options");
   validate(cfg.models.fast.model, cfg.models.fast.options, "models.fast.options");
+  for (const slot of ["main", "fast"] as const) {
+    for (const [index, fallback] of (cfg.models[slot].fallback ?? []).entries()) {
+      if (typeof fallback !== "string") {
+        validate(fallback.model, fallback.options, `models.${slot}.fallback[${index}].options`);
+      }
+    }
+  }
 }
 
 export async function parseCoreConfig(

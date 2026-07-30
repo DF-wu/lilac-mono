@@ -38,6 +38,7 @@ import {
 } from "./workflow-domain";
 import { applyWorkflowSchemaMigrations } from "./workflow-migrations";
 import {
+  workflowRequestPolicyIdentityProjection,
   workflowRequestPolicySchema,
   type AuthorizedWorkflowRequest,
   type WorkflowRequestPolicy,
@@ -1658,8 +1659,9 @@ export class DurableWorkflowStore {
         );
         if (
           !existingPolicy.success ||
-          canonicalJson(existingPolicy.data.resolvedModelRequest) !==
-            canonicalJson(policy.resolvedModelRequest)
+          canonicalJson(
+            workflowRequestPolicyIdentityProjection(existingPolicy.data).resolvedModelRequest,
+          ) !== canonicalJson(workflowRequestPolicyIdentityProjection(policy).resolvedModelRequest)
         ) {
           return null;
         }

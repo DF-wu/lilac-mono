@@ -41,7 +41,10 @@ import {
   WORKFLOW_INLINE_VALUE_BYTES,
   writeWorkflowValueArtifact,
 } from "./workflow-artifact-store";
-import type { WorkflowRequestPolicy } from "./workflow-request-authority";
+import {
+  workflowRequestPolicyIdentityProjection,
+  type WorkflowRequestPolicy,
+} from "./workflow-request-authority";
 import {
   resolveWorkflowAgentOperationInput,
   resolvedWorkflowAgentInputSchema,
@@ -77,6 +80,8 @@ type ResolvedAgentSelection = {
   reasoning: NonNullable<ResolvedWorkflowAgentInput["options"]["reasoning"]> | null;
   request: DurableResolvedModelRequest;
 };
+
+type DurableAgentFallback = NonNullable<DurableResolvedModelRequest["fallbacks"]>[number];
 
 const TERMINAL_RECEIPT_WAIT_MS = 250;
 const IDLE_CANCEL_QUIESCENCE_WAIT_MS = 10_000;
@@ -160,6 +165,11 @@ export class WorkflowEngine {
         model?: string;
         reasoning?: ResolvedWorkflowAgentInput["options"]["reasoning"];
       }) => void | ResolvedAgentSelection | Promise<void | ResolvedAgentSelection>;
+      resolveAgentFallbacks?: (input: {
+        profile: "explore" | "general" | "self";
+        model?: string;
+        reasoning?: ResolvedWorkflowAgentInput["options"]["reasoning"];
+      }) => readonly DurableAgentFallback[] | Promise<readonly DurableAgentFallback[]>;
       dispatchAgentRequest?: (input: {
         run: WorkflowRun;
         revision: WorkflowRevision;
@@ -826,19 +836,20 @@ export class WorkflowEngine {
     } else {
       const agentCwd = input.options.cwd;
       const liveOwner = reconcile && handoff.status === "live";
-      const durableHandoff = handoff.status === "live" || handoff.status === "stale";
-      const resolvedSelection = durableHandoff
-        ? {
-            model: handoff.policy.resolvedModelRequest.spec,
-            reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
-            request: handoff.policy.resolvedModelRequest,
-          }
-        : await this.input.validateAgentSelection?.({
-            profile,
-            ...(model ? { model } : {}),
-            ...(reasoning ? { reasoning } : {}),
-          });
-      const concreteSelection = resolvedSelection ?? {
+      const selectionInput = {
+        profile,
+        ...(model ? { model } : {}),
+        ...(reasoning ? { reasoning } : {}),
+      };
+      const currentSelection =
+        handoff.status === "fresh"
+          ? await this.input.validateAgentSelection?.(selectionInput)
+          : undefined;
+      const currentFallbacks =
+        handoff.status === "stale"
+          ? ((await this.input.resolveAgentFallbacks?.(selectionInput)) ?? [])
+          : undefined;
+      const currentConcreteSelection = currentSelection ?? {
         model: model ?? `profile-native:${profile}`,
         reasoning: reasoning ?? null,
         request: {
@@ -849,6 +860,23 @@ export class WorkflowEngine {
           reasoningDisplay: "simple",
         },
       };
+      const concreteSelection: ResolvedAgentSelection =
+        handoff.status === "live"
+          ? {
+              model: handoff.policy.resolvedModelRequest.spec,
+              reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
+              request: handoff.policy.resolvedModelRequest,
+            }
+          : handoff.status === "stale"
+            ? {
+                model: handoff.policy.resolvedModelRequest.spec,
+                reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
+                request: {
+                  ...handoff.policy.resolvedModelRequest,
+                  fallbacks: [...(currentFallbacks ?? [])],
+                },
+              }
+            : currentConcreteSelection;
       const dispatchEpoch = liveOwner
         ? handoff.dispatchEpoch
         : (this.input.createDispatchEpoch?.() ?? crypto.randomUUID());
@@ -868,13 +896,22 @@ export class WorkflowEngine {
           userId: run.origin.userId,
         },
       } satisfies WorkflowRequestPolicy;
-      const policy: WorkflowRequestPolicy = durableHandoff
-        ? { ...handoff.policy, dispatchEpoch }
-        : newlyResolvedPolicy;
+      const policy: WorkflowRequestPolicy =
+        handoff.status === "live"
+          ? { ...handoff.policy, dispatchEpoch }
+          : handoff.status === "stale"
+            ? {
+                ...handoff.policy,
+                dispatchEpoch,
+                resolvedModelRequest: concreteSelection.request,
+              }
+            : newlyResolvedPolicy;
       if (
         handoff.status === "live" &&
-        canonicalJson(jsonValueSchema.parse(policy)) !==
-          canonicalJson(jsonValueSchema.parse(handoff.policy))
+        canonicalJson(jsonValueSchema.parse(workflowRequestPolicyIdentityProjection(policy))) !==
+          canonicalJson(
+            jsonValueSchema.parse(workflowRequestPolicyIdentityProjection(handoff.policy)),
+          )
       ) {
         throw new Error(
           "Live workflow dispatch policy diverged from its durable operation identity",

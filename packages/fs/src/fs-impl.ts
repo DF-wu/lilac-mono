@@ -242,6 +242,8 @@ export interface ReadFileOptions {
   maxLines?: number;
   /** Maximum number of characters to return, defaults to 10000 */
   maxCharacters?: number;
+  /** Maximum UTF-8 bytes in the returned textual payload. Must be at least 4 when set. */
+  maxBytes?: number;
   /** Output format, defaults to "raw" */
   format?: "raw" | "numbered" | "hashline";
   /** Bypass denylist guardrails for this call. */
@@ -426,9 +428,11 @@ export type GlobOpts = {
 
 export type GrepOpts = {
   /**
-   * The base directory to search from, must be absolute path. Default is the root.
+   * The file or base directory to search. Relative paths resolve from the root.
    */
   baseDir?: string;
+  /** Path to report for single-file matches when transport requires a different search path. */
+  reportedFilePath?: string;
   regex?: boolean;
   maxResults?: number;
   fileExtensions?: string[];
@@ -564,6 +568,7 @@ export class FileSystem {
         start = { type: "line", line: 1 },
         maxLines = 2000,
         maxCharacters = 10000,
+        maxBytes,
         format = "raw",
         dangerouslyAllow = false,
       } = opts;
@@ -583,6 +588,13 @@ export class FileSystem {
       const requestedMaxCharacters = Number.isFinite(maxCharacters)
         ? Math.max(1, Math.floor(maxCharacters))
         : 10000;
+      const requestedMaxBytes =
+        maxBytes !== undefined && Number.isFinite(maxBytes)
+          ? Math.max(1, Math.floor(maxBytes))
+          : Number.POSITIVE_INFINITY;
+      if (requestedMaxBytes < 4) {
+        throw new RangeError("readFile maxBytes must be at least 4 to fit one Unicode character");
+      }
       const storedLineLimit = requestedMaxCharacters + 2;
       const storedCharacterLimit = requestedMaxCharacters + 1;
       const windowLines: string[] = [];
@@ -729,27 +741,42 @@ export class FileSystem {
       if (includesOffsetBoundaryNewline) output += "\n";
 
       let outputCharacters = Array.from(output);
-      if (outputCharacters.length > requestedMaxCharacters && effectiveFormat !== "raw") {
+      if (
+        (outputCharacters.length > requestedMaxCharacters ||
+          Buffer.byteLength(output, "utf8") > requestedMaxBytes) &&
+        effectiveFormat !== "raw"
+      ) {
         effectiveFormat = "raw";
         degradedFromHashline ||= format === "hashline";
         output = windowLines.join("\n") + (includesOffsetBoundaryNewline ? "\n" : "");
         outputCharacters = Array.from(output);
       }
       const truncatedByChars = outputCharacters.length > requestedMaxCharacters;
-      output = outputCharacters.slice(0, requestedMaxCharacters).join("");
-      const completeLines = truncatedByChars ? output.split("\n").length - 1 : selectedLineCount;
-      const endLine = truncatedByChars ? normalizedStartLine + completeLines - 1 : windowEndLine;
-      const hasMoreLines = truncatedByChars || endLine < totalLines;
+      const boundedCharacters: string[] = [];
+      let outputBytes = 0;
+      for (const character of outputCharacters.slice(0, requestedMaxCharacters)) {
+        const characterBytes = Buffer.byteLength(character, "utf8");
+        if (outputBytes + characterBytes > requestedMaxBytes) break;
+        boundedCharacters.push(character);
+        outputBytes += characterBytes;
+      }
+      const truncatedByBytes =
+        boundedCharacters.length < Math.min(outputCharacters.length, requestedMaxCharacters);
+      output = boundedCharacters.join("");
+      const truncated = truncatedByChars || truncatedByBytes;
+      const completeLines = truncated ? output.split("\n").length - 1 : selectedLineCount;
+      const endLine = truncated ? normalizedStartLine + completeLines - 1 : windowEndLine;
+      const hasMoreLines = truncated || endLine < totalLines;
       let nextStart: ReadFileStart | undefined;
       if (hasMoreLines) {
         if (start.type === "offset") {
           nextStart = {
             type: "offset",
-            offset: truncatedByChars
+            offset: truncated
               ? (normalizedStartOffset ?? sourceOffset) + Array.from(output).length
               : (selectedNextLineOffset ?? normalizedStartOffset ?? sourceOffset),
           };
-        } else if (truncatedByChars) {
+        } else if (truncated) {
           nextStart = {
             type: "line",
             line: normalizedStartLine + completeLines,
@@ -1764,10 +1791,19 @@ export class FileSystem {
       this.assertAllowed(resolvedBaseDir, "grep", dangerouslyAllow);
       const canonicalBaseDir = await fs.realpath(resolvedBaseDir);
       this.assertAllowed(canonicalBaseDir, "grep", dangerouslyAllow);
+      const targetStats = await fs.stat(canonicalBaseDir);
+      if (!targetStats.isDirectory() && !targetStats.isFile()) {
+        throw new Error(`Grep target '${resolvedBaseDir}' must be a regular file or directory`);
+      }
+
+      const isFileTarget = targetStats.isFile();
+      const searchCwd = isFileTarget ? dirname(canonicalBaseDir) : canonicalBaseDir;
+      const searchPath = isFileTarget ? basename(canonicalBaseDir) : undefined;
+      const reportedFilePath = opts.reportedFilePath ?? baseDir;
 
       const globs = fileExtensions.map((ext) => `**/*.${ext.replace(/^\./, "")}`);
 
-      if (!dangerouslyAllow) {
+      if (!dangerouslyAllow && !isFileTarget) {
         // Ensure ripgrep doesn't traverse blocked paths when searching from broad base dirs (e.g. "/").
         for (const denyAbs of this.denyPaths) {
           const rel = relative(canonicalBaseDir, denyAbs);
@@ -1786,7 +1822,8 @@ export class FileSystem {
       const ripgrepResult = await getSearchBackend(this.fsBackend).grep({
         pattern,
         regex,
-        cwd: canonicalBaseDir,
+        cwd: searchCwd,
+        searchPath,
         maxMatches: maxResults,
         globs: globs.length > 0 ? globs : undefined,
         extraArgs,
@@ -1795,10 +1832,20 @@ export class FileSystem {
         contextLines: includeContextLines,
         fffCacheDir: this.fffCacheDir,
       });
+      const fileMatchesExtensions =
+        !isFileTarget ||
+        fileExtensions.length === 0 ||
+        fileExtensions.some((ext) => canonicalBaseDir.endsWith(`.${ext.replace(/^\./, "")}`));
+      const matches = !fileMatchesExtensions
+        ? []
+        : isFileTarget
+          ? ripgrepResult.matches.map((match) => ({ ...match, file: reportedFilePath }))
+          : ripgrepResult.matches;
+      const truncated = fileMatchesExtensions ? ripgrepResult.truncated : false;
 
       if (mode === "hashline") {
         const warnings: HashlineWarning[] = [];
-        const rawResults = ripgrepResult.matches.map((match) => ({
+        const rawResults = matches.map((match) => ({
           file: match.file,
           line: match.line,
           text: match.text,
@@ -1812,7 +1859,7 @@ export class FileSystem {
         }[] = [];
         const fileHashCache = new Map<string, string>();
 
-        for (const match of ripgrepResult.matches) {
+        for (const match of matches) {
           const normalizedMatchText = match.text.replace(/\r?\n$/, "");
 
           if (normalizedMatchText.length > HASHLINE_MAX_LINE_CHARS) {
@@ -1820,16 +1867,17 @@ export class FileSystem {
             continue;
           }
 
-          const resolvedMatchPath = this.resolvePath(match.file, resolvedBaseDir);
+          const resolvedMatchPath = isFileTarget
+            ? canonicalBaseDir
+            : this.resolvePath(match.file, resolvedBaseDir);
           let fileHash = fileHashCache.get(resolvedMatchPath);
           if (!fileHash) {
             const matchFile = await fs.readFile(resolvedMatchPath, "utf-8");
             fileHash = this.hash(matchFile);
             fileHashCache.set(resolvedMatchPath, fileHash);
-            this.fileAccessRecord.set(resolvedMatchPath, {
-              lastAccess: Date.now(),
-              fileHash,
-            });
+            const access = { lastAccess: Date.now(), fileHash };
+            this.fileAccessRecord.set(resolvedMatchPath, access);
+            if (isFileTarget) this.fileAccessRecord.set(resolvedBaseDir, access);
           }
 
           hashlineResults.push({
@@ -1844,7 +1892,7 @@ export class FileSystem {
         if (warnings.length > 0) {
           return {
             mode: "default",
-            truncated: ripgrepResult.truncated,
+            truncated,
             results: rawResults,
             effectiveBackend: ripgrepResult.effectiveBackend,
             warnings,
@@ -1854,21 +1902,21 @@ export class FileSystem {
 
         return {
           mode,
-          truncated: ripgrepResult.truncated,
+          truncated,
           results: hashlineResults,
           effectiveBackend: ripgrepResult.effectiveBackend,
         };
       }
 
       if (mode === "default") {
-        const results = ripgrepResult.matches.map((match) => ({
+        const results = matches.map((match) => ({
           file: match.file,
           line: match.line,
           text: match.text,
         }));
         return {
           mode,
-          truncated: ripgrepResult.truncated,
+          truncated,
           results,
           effectiveBackend: ripgrepResult.effectiveBackend,
         };
@@ -1876,8 +1924,8 @@ export class FileSystem {
 
       return {
         mode,
-        truncated: ripgrepResult.truncated,
-        results: ripgrepResult.matches,
+        truncated,
+        results: matches,
         effectiveBackend: ripgrepResult.effectiveBackend,
       };
     } catch (e) {

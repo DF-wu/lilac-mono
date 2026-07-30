@@ -797,6 +797,18 @@ describe("miniLilacUIMessageSchema", () => {
     ).toBe(false);
   });
 
+  it("accepts legacy persisted split-turn compaction progress", () => {
+    expect(
+      miniLilacCompactionEventSchema.safeParse({
+        source: "automatic",
+        reason: "threshold",
+        phase: "progress",
+        messageCountBefore: 12,
+        progress: { stage: "split-turn", step: 1, stepCount: 1, pass: 1 },
+      }).success,
+    ).toBe(true);
+  });
+
   it("rejects unknown top-level and nested fields instead of stripping them", () => {
     const messagesWithUnknownFields: unknown[] = [
       {

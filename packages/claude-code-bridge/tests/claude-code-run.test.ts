@@ -35,8 +35,7 @@ describe("materializeClaudeCodeRun", () => {
       },
     });
 
-    expect(run.agentModel).not.toBe(run.utilityModel);
-    expect(settings).toHaveLength(2);
+    expect(settings).toHaveLength(1);
     expect(settings[0]).toMatchObject({
       cwd,
       env: { ENABLE_TOOL_SEARCH: "true" },
@@ -49,6 +48,8 @@ describe("materializeClaudeCodeRun", () => {
     expect(settings[0]?.canUseTool).toBeFunction();
     expect(settings[0]?.onStreamStart).toBeFunction();
     expect(settings[0]?.onQueryControllerCreated).toBeFunction();
+    const utilityModel = run.createUtilityModel();
+    expect(utilityModel).not.toBe(run.agentModel);
     expect(settings[1]).toEqual({
       ...claudeCodeExecutableSettings(),
       cwd,
@@ -56,6 +57,9 @@ describe("materializeClaudeCodeRun", () => {
       settingSources: [],
       persistSession: false,
     });
+    const nextUtilityModel = run.createUtilityModel();
+    expect(nextUtilityModel).not.toBe(utilityModel);
+    expect(settings[2]).toEqual(settings[1]);
     // Both models must target the same Claude installation.
     expect(settings[0]?.pathToClaudeCodeExecutable).toBe(
       settings[1]?.pathToClaudeCodeExecutable as string | undefined,
@@ -106,6 +110,7 @@ describe("materializeClaudeCodeRun", () => {
 
     expect(settings[0]?.tools).toEqual(["WebSearch", "ToolSearch"]);
     expect(settings[0]?.env).toEqual({ ENABLE_TOOL_SEARCH: "true" });
+    run.createUtilityModel();
     expect(settings[1]?.tools).toEqual([]);
     expect(settings[1]?.env).toBeUndefined();
 

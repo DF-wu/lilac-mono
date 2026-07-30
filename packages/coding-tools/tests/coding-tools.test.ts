@@ -638,6 +638,23 @@ describe("coding tools", () => {
     ).toMatchObject({ success: false, error: { code: "PERMISSION" } });
   });
 
+  it("applies the configured UTF-8 payload cap independently of maxCharacters", async () => {
+    await writeFile(path.join(cwd, "unicode.txt"), "A😀BéC");
+    const read = executable(createCodingToolset({ cwd, maxOutputBytes: 5 }), "read_file");
+
+    const result = await read.execute(
+      { path: "unicode.txt", start: { type: "offset", offset: 0 }, maxCharacters: 100 },
+      options("read-unicode"),
+    );
+
+    expect(result).toMatchObject({
+      success: true,
+      content: "A😀",
+      truncatedByChars: false,
+      nextStart: { type: "offset", offset: 2 },
+    });
+  });
+
   it("read_file keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
     const image = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
@@ -758,6 +775,7 @@ describe("coding tools", () => {
     const read = executable(
       createCodingToolset({
         cwd,
+        maxOutputBytes: 5,
         artifactIntegration: {
           artifacts,
           scopeId: "scope-read",
@@ -780,11 +798,11 @@ describe("coding tools", () => {
       success: true,
       kind: "artifact",
       resolvedPath: created.uri,
-      content: "😀cd",
+      content: "😀c",
       startOffset: 2,
-      endOffset: 5,
+      endOffset: 4,
       totalCharacters: 12,
-      nextStart: { type: "offset", offset: 5 },
+      nextStart: { type: "offset", offset: 4 },
       hasMore: true,
     });
     expect(JSON.stringify(first)).not.toContain("loadedInstructions");

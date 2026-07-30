@@ -26,7 +26,7 @@ export type ClaudeCodeRunControl = {
 
 export type MaterializedClaudeCodeRun = {
   agentModel: LanguageModel;
-  utilityModel: LanguageModel;
+  createUtilityModel(): LanguageModel;
   control: ClaudeCodeRunControl;
   dispose(): Promise<void>;
 };
@@ -117,17 +117,17 @@ export async function materializeClaudeCodeRun(options: {
         if (!disposed) controller = nextController;
       },
     });
-    const utilityModel = createModel(options.modelId, {
-      ...executable,
-      cwd: options.cwd,
-      tools: [],
-      settingSources: [],
-      persistSession: false,
-    });
-
+    const createUtilityModel = () =>
+      createModel(options.modelId, {
+        ...executable,
+        cwd: options.cwd,
+        tools: [],
+        settingSources: [],
+        persistSession: false,
+      });
     return {
       agentModel,
-      utilityModel,
+      createUtilityModel,
       control,
       dispose: async () => {
         if (disposed) return;

@@ -13,6 +13,7 @@ import {
   resolveDiscordSearchDbPath,
   resolveTranscriptDbPath,
   toDurableResolvedModelRequest,
+  toDurableResolvedModelPlan,
 } from "@stanley2058/lilac-utils";
 import path from "node:path";
 import { watch, type FSWatcher } from "node:fs";
@@ -30,7 +31,11 @@ import type { SurfaceAdapter } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import { startBusRequestRouter } from "../surface/bridge/bus-request-router";
-import { resolveAgentRunModel, startBusAgentRunner } from "../surface/bridge/bus-agent-runner";
+import {
+  resolveAgentRunModel,
+  resolveAgentRunModelFallbacks,
+  startBusAgentRunner,
+} from "../surface/bridge/bus-agent-runner";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
 import { DiscordSearchService, DiscordSearchStore } from "../surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
@@ -1043,10 +1048,19 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
             ...(reasoning ? { reasoningOverride: reasoning } : {}),
           });
           return {
-            model: resolved.spec,
-            reasoning: resolved.reasoning ?? null,
-            request: toDurableResolvedModelRequest(resolved, cfg.agent.reasoningDisplay),
+            model: resolved.head.spec,
+            reasoning: resolved.head.reasoning ?? null,
+            request: toDurableResolvedModelPlan(resolved, cfg.agent.reasoningDisplay),
           };
+        },
+        resolveAgentFallbacks: async ({ profile, model, reasoning }) => {
+          const cfg = await getCoreConfig();
+          return resolveAgentRunModelFallbacks({
+            cfg,
+            runProfile: profile,
+            ...(model ? { requestModelOverride: model } : {}),
+            ...(reasoning ? { reasoningOverride: reasoning } : {}),
+          }).map((fallback) => toDurableResolvedModelRequest(fallback, cfg.agent.reasoningDisplay));
         },
       });
       await workflowEngine.start();

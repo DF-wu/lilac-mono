@@ -38,9 +38,11 @@ export type CoreToolPluginRuntime = {
 };
 
 const BOUNDED_BUILTIN_OUTPUT = Symbol("bounded-builtin-output");
+const AGGREGATE_OUTPUT_BUDGET_EXEMPT = Symbol("aggregate-output-budget-exempt");
 
 export type CoreLevel1ToolSpec = Level1ToolSpec<CoreToolPluginRuntime> & {
   [BOUNDED_BUILTIN_OUTPUT]?: true;
+  [AGGREGATE_OUTPUT_BUDGET_EXEMPT]?: true;
 };
 
 export function markBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
@@ -49,6 +51,14 @@ export function markBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): CoreLevel1To
 
 export function hasBoundedBuiltinOutput(spec: CoreLevel1ToolSpec): boolean {
   return spec[BOUNDED_BUILTIN_OUTPUT] === true;
+}
+
+export function markAggregateOutputBudgetExempt(spec: CoreLevel1ToolSpec): CoreLevel1ToolSpec {
+  return { ...spec, [AGGREGATE_OUTPUT_BUDGET_EXEMPT]: true };
+}
+
+export function isAggregateOutputBudgetExempt(spec: CoreLevel1ToolSpec): boolean {
+  return spec[AGGREGATE_OUTPUT_BUDGET_EXEMPT] === true;
 }
 
 export type CoreToolPlugin = LilacToolPlugin<CoreToolPluginRuntime, CoreLevel1ToolSpec, ServerTool>;

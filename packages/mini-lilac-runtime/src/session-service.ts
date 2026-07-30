@@ -8,7 +8,6 @@ import {
   AiSdkPiAgent,
   attachAutoCompaction,
   buildSafeRecoveryCheckpoint,
-  combineCompactionSummaryParts,
   compactMessages,
   createAgentRunIdleWatchdog,
   createTransientModelRetryController,
@@ -1637,6 +1636,16 @@ class SessionActor {
       normalizationContext.bypassGenericOutputNormalizer
         ? output
         : normalizeOverflow(output, normalizationContext);
+    const mediaScrubTransform = (outboundMessages: readonly ModelMessage[]) =>
+      scrubReadFileMediaForModelView(
+        outboundMessages,
+        readFileMediaSupported
+          ? {
+              maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+              maxBytesTotal: READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+            }
+          : { maxBytesPerPart: 0, maxBytesTotal: 0 },
+      );
     const agent = new AiSdkPiAgent<ToolSet>({
       system: systemPrompt(
         this.config,
@@ -1660,24 +1669,14 @@ class SessionActor {
       normalizeToolResultOutput,
       normalizeSettledToolResultOutputs: (entries) =>
         normalizeOverflow.normalizeSettled(entries, normalizeToolResultOutput),
-      genericOutputNormalizerBypassTools: new Set(["bash"]),
+      genericOutputNormalizerBypassTools: new Set(["bash", "read_file"]),
+      aggregateOutputBudgetExemptTools: new Set(["read_file"]),
       providerOptions,
       turnErrorHandler: transientRetryController?.handler,
       turnBoundaryHandler: () => this.finishDeferredChildren(context),
       beforeSteeringDelivery: (delivery) => this.commitSteeringBoundary(context, delivery),
     });
     input.onAgentReady(agent);
-    agent.appendTransformMessages((outboundMessages) =>
-      scrubReadFileMediaForModelView(
-        outboundMessages,
-        readFileMediaSupported
-          ? {
-              maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
-              maxBytesTotal: READ_FILE_MEDIA_MAX_BYTES_TOTAL,
-            }
-          : { maxBytesPerPart: 0, maxBytesTotal: 0 },
-      ),
-    );
     if (transientRetryController) {
       agent.subscribe((event) => {
         if (event.type === "turn_end") {
@@ -1696,9 +1695,10 @@ class SessionActor {
         configuredSummaryModel === "inherit"
           ? // Never summarize with the tool-enabled model: its embedded MCP
             // settings would let a summarization prompt call workspace tools.
-            (claudeCodeRun?.utilityModel ?? "current")
-          : this.resolveModel(configuredSummaryModel),
+            (claudeCodeRun?.createUtilityModel ?? "current")
+          : () => this.resolveModel(configuredSummaryModel),
       thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
+      thresholdInputSource: claudeCodeRun === null ? "usage" : "transcript-estimate",
       resolveCurrentModelSpecifier: () => agent.state.modelSpecifier,
       resolveContextLimit: async ({ defaultModel, currentModelSpecifier }) =>
         (await this.resolveModelLimits(currentModelSpecifier ?? defaultModel)) ?? 0,
@@ -1706,13 +1706,14 @@ class SessionActor {
         configuredSummaryModel === "inherit"
           ? undefined
           : async () => (await this.resolveModelLimits(configuredSummaryModel))?.context,
+      baseTransformMessages: mediaScrubTransform,
       baseTurnErrorHandler: transientRetryController?.handler,
       onCompactionStart: (event) => {
         this.automaticCompaction = {
           chunkId: crypto.randomUUID(),
           startedAt: Date.now(),
           modelCalls: 0,
-          stageSummaries: { history: "", "split-turn": "" },
+          summary: "",
           lastPublishedAt: 0,
         };
         this.queueAutomaticCompaction({ ...event, phase: "started" });
@@ -1723,15 +1724,15 @@ class SessionActor {
         const base = this.lastAutomaticCompactionEvent;
         if (!live || !base) return;
         live.modelCalls += 1;
-        // Each step rewrites its stage's summary rather than extending it.
-        live.stageSummaries[progress.stage] = "";
+        // Each refinement step rewrites the whole anchored summary.
+        live.summary = "";
         this.queueAutomaticCompaction({ ...base, phase: "progress", progress });
       },
       onSummaryDelta: (delta, progress) => {
         const live = this.automaticCompaction;
         const base = this.lastAutomaticCompactionEvent;
         if (!live || !base) return;
-        live.stageSummaries[progress.stage] += delta;
+        live.summary += delta;
         // A summary emits thousands of deltas; republishing each one would bloat
         // the persisted run log for no visible gain at terminal refresh rates.
         const now = Date.now();
@@ -2023,11 +2024,12 @@ class SessionActor {
       batchExcludedTools: ["todowrite", "websearch"],
       bashStreamOutput: true,
       bashMergeOutput: true,
-      allowBashGuardrailBypass: true,
+      allowGuardrailBypass: true,
       denyPaths: this.protectedToolPaths,
       preloadedInstructionPaths,
       readFileDirectAttachmentSupported: readFileMediaSupported,
       maxInlineMediaBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+      maxOutputBytes: this.toolResultOutputConfig.maxInlineBytes,
       ...(this.toolResultArtifacts
         ? {
             artifactIntegration: {
@@ -3113,7 +3115,7 @@ class SessionActor {
     | {
         readonly chunkId: string;
         readonly startedAt: number;
-        readonly stageSummaries: Record<CompactionProgress["stage"], string>;
+        summary: string;
         modelCalls: number;
         lastPublishedAt: number;
       }
@@ -3146,7 +3148,7 @@ class SessionActor {
     const live = (this.automaticCompaction ??= {
       chunkId: crypto.randomUUID(),
       startedAt: Date.now(),
-      stageSummaries: { history: "", "split-turn": "" },
+      summary: "",
       modelCalls: 0,
       lastPublishedAt: 0,
     });
@@ -3154,9 +3156,7 @@ class SessionActor {
     // keeps mutating. Everything the chunk reports is captured now so a backed-up
     // queue cannot backdate later progress onto an earlier phase.
     const terminal = event.phase !== "started" && event.phase !== "progress";
-    const summary =
-      event.finalSummary ??
-      combineCompactionSummaryParts(live.stageSummaries.history, live.stageSummaries["split-turn"]);
+    const summary = event.finalSummary ?? live.summary;
     const data: MiniLilacCompactionEvent = {
       source: "automatic",
       reason: event.reason,
@@ -3712,21 +3712,12 @@ class SessionActor {
 
     let modelCalls = 0;
     let lastPublishedAt = 0;
-    // History and split-turn prefixes summarize concurrently, so their deltas
-    // interleave; keeping one buffer per stage is what lets the live text be
-    // assembled the same way the engine assembles the persisted summary.
-    const stageSummaries: Record<CompactionProgress["stage"], string> = {
-      history: "",
-      "split-turn": "",
-    };
-    const combinedSummary = (): string =>
-      combineCompactionSummaryParts(stageSummaries.history, stageSummaries["split-turn"]);
+    let summary = "";
 
     const event = (
       phase: MiniLilacCompactionPhase,
       extra: Partial<MiniLilacCompactionEvent> = {},
     ): MiniLilacCompactionEvent => {
-      const summary = combinedSummary();
       return miniLilacCompactionEventSchema.parse({
         source: "manual",
         reason: "manual",
@@ -3754,12 +3745,12 @@ class SessionActor {
         abortSignal: live.controller.signal,
         onProgress: (progress) => {
           modelCalls += 1;
-          // Each step rewrites its stage's summary rather than extending it.
-          stageSummaries[progress.stage] = "";
+          // Each refinement step rewrites the whole anchored summary.
+          summary = "";
           publish(event("progress", { progress }));
         },
         onSummaryDelta: (delta, progress) => {
-          stageSummaries[progress.stage] += delta;
+          summary += delta;
           const now = Date.now();
           if (now - lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
           lastPublishedAt = now;
@@ -3893,8 +3884,8 @@ class SessionActor {
       thresholdFraction: this.config.agent.compaction.earlyCompactionPoint,
       summaryModel:
         configuredSummaryModel === "inherit"
-          ? "current"
-          : this.resolveModel(configuredSummaryModel),
+          ? () => this.resolveModel(modelSpecifier)
+          : () => this.resolveModel(configuredSummaryModel),
       providerOptions: this.supersededProviderIds.has(
         parseModelRef(summaryModelSpecifier).providerId,
       )

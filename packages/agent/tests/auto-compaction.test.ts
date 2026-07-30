@@ -7,7 +7,6 @@ import { ModelCapability } from "@stanley2058/lilac-utils";
 import {
   attachAutoCompaction,
   buildSummaryProviderOptions,
-  combineCompactionSummaryParts,
   compactMessages,
   __autoCompactionInternals,
   type CompactionProgress,
@@ -49,7 +48,7 @@ describe("auto-compaction internals", () => {
       role: "user",
       content: [
         "<context-compaction>",
-        "The conversation before this point was automatically compacted.",
+        "The conversation before this point was compacted.",
         "Treat this summary as prior conversation context, not as a new user request.",
         "",
         "summary details",
@@ -77,23 +76,28 @@ describe("auto-compaction internals", () => {
 
     expect(__autoCompactionInternals.inlineMediaStorageBytes(withMedia)).toBe(8);
     expect(__autoCompactionInternals.inlineMediaStorageBytes(scrubbed)).toBe(0);
+    const largeMedia: ModelMessage[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "file",
+            mediaType: "image/png",
+            data: "a".repeat(10 * 1024 * 1024),
+          },
+        ],
+      },
+    ];
+    expect(__autoCompactionInternals.estimateMessagesTokens(largeMedia)).toBeLessThan(100);
     expect(
-      __autoCompactionInternals.estimateMessagesTokens([
-        {
-          role: "user",
-          content: [
-            {
-              type: "file",
-              mediaType: "image/png",
-              data: "a".repeat(10 * 1024 * 1024),
-            },
-          ],
-        },
-      ]),
-    ).toBeLessThan(100);
+      __autoCompactionInternals.estimateModelInputTokens({
+        messages: largeMedia,
+        context: { system: "test", tools: {} },
+      }),
+    ).toBeGreaterThan(2_000_000);
   });
 
-  it("selects a split-turn boundary using token budget", () => {
+  it("retains two continuable turns plus intervening messages", () => {
     const messages: ModelMessage[] = [
       { role: "user", content: "old request" },
       { role: "assistant", content: "old answer" },
@@ -127,13 +131,133 @@ describe("auto-compaction internals", () => {
 
     const boundary = __autoCompactionInternals.resolveCompactionBoundary({
       messages,
-      keepRecentTokens: 15,
-      keepLastMessages: 2,
+      keepRecentTokens: 10_000,
+      keepRecentTurns: 2,
     });
 
-    expect(boundary.suffixStart).toBeGreaterThan(0);
-    expect(messages[boundary.suffixStart]?.role).not.toBe("tool");
-    expect(boundary.splitTurnStart).toBe(2);
+    expect(__autoCompactionInternals.hasCompletedAssistantToolTurn(messages, 4)).toBe(true);
+    expect(__autoCompactionInternals.hasCompletedAssistantToolTurn(messages, 3)).toBe(false);
+    expect(
+      __autoCompactionInternals.chooseRetainedTailStart({
+        messages,
+        keepRecentTokens: 10_000,
+        keepRecentTurns: 2,
+      }),
+    ).toBe(4);
+    expect(boundary).toEqual({ suffixStart: 4 });
+    expect(messages.slice(boundary.suffixStart)).toEqual(messages.slice(4));
+  });
+
+  it("summarizes an oversized newest atomic tool turn instead of exceeding the cap", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "request" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "oversized-call",
+            toolName: "bash",
+            input: { command: "large output" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "oversized-call",
+            toolName: "bash",
+            output: { type: "text", value: "x".repeat(4_000) },
+          },
+        ],
+      },
+    ];
+
+    expect(
+      __autoCompactionInternals.resolveCompactionBoundary({
+        messages,
+        keepRecentTokens: 100,
+        keepRecentTurns: 2,
+      }),
+    ).toEqual({ suffixStart: messages.length });
+  });
+
+  it("summarizes an oversized newest user turn instead of exceeding the hard cap", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "older request" },
+      { role: "assistant", content: "older response" },
+      { role: "user", content: `large paste ${"x".repeat(4_000)}` },
+    ];
+
+    expect(
+      __autoCompactionInternals.resolveCompactionBoundary({
+        messages,
+        keepRecentTokens: 100,
+        keepRecentTurns: 2,
+      }),
+    ).toEqual({ suffixStart: messages.length });
+  });
+
+  it("separates a threshold continuation from retained-tail selection", () => {
+    const continuation = __autoCompactionInternals.buildAutoContinueMessage();
+    const messages: ModelMessage[] = [
+      { role: "user", content: "real request" },
+      { role: "assistant", content: "completed response" },
+      continuation,
+    ];
+
+    expect(__autoCompactionInternals.splitThresholdContinueTrailer(messages)).toEqual({
+      messages: messages.slice(0, -1),
+      trailer: [messages[2]!],
+    });
+    expect(
+      __autoCompactionInternals.splitThresholdContinueTrailer([
+        ...messages,
+        { role: "user", content: "new actual request" },
+      ]),
+    ).toEqual({
+      messages: [...messages.slice(0, -1), { role: "user", content: "new actual request" }],
+      trailer: [],
+    });
+    expect(
+      __autoCompactionInternals.splitThresholdContinueTrailer([
+        { role: "user", content: "real request" },
+        continuation,
+        { role: "assistant", content: "continued response" },
+      ]),
+    ).toEqual({
+      messages: [
+        { role: "user", content: "real request" },
+        continuation,
+        { role: "assistant", content: "continued response" },
+      ],
+      trailer: [],
+    });
+  });
+
+  it("forces automatic pressure to summarize a wholly retainable transcript", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "small request" },
+      { role: "assistant", content: "small response" },
+    ];
+
+    expect(
+      __autoCompactionInternals.resolveCompactionBoundary({
+        messages,
+        keepRecentTokens: 10_000,
+        keepRecentTurns: 2,
+      }),
+    ).toEqual({ suffixStart: 0 });
+    expect(
+      __autoCompactionInternals.resolveCompactionBoundary({
+        messages,
+        keepRecentTokens: 10_000,
+        keepRecentTurns: 2,
+        forceCompaction: true,
+      }),
+    ).toEqual({ suffixStart: messages.length });
   });
 
   it("packs under-budget messages into a single summarization call", async () => {
@@ -364,6 +488,29 @@ describe("auto-compaction internals", () => {
     expect(fullOutputWindow.reservedOutputTokens).toBe(100_000);
     expect(fullOutputWindow.safeInputBudget).toBe(400_000);
     expect(fullOutputWindow.inputBudget).toBe(400_000);
+    expect(__autoCompactionInternals.resolveRetainedTailTokenCap(20_000, 20_000)).toBe(5_000);
+  });
+
+  it("uses transcript occupancy instead of cumulative agentic-provider usage", () => {
+    const messages: ModelMessage[] = Array.from({ length: 9 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `message ${index} ${"x".repeat(20_400)}`,
+    }));
+
+    const estimated = __autoCompactionInternals.resolveThresholdInputTokens({
+      source: "transcript-estimate",
+      usageInputTokens: 900_000,
+      messages,
+    });
+    expect(estimated).toBeGreaterThan(45_000);
+    expect(estimated).toBeLessThan(47_000);
+    expect(
+      __autoCompactionInternals.resolveThresholdInputTokens({
+        source: "usage",
+        usageInputTokens: 900_000,
+        messages,
+      }),
+    ).toBe(900_000);
   });
 
   it("normalizes configurable threshold fractions", () => {
@@ -408,8 +555,8 @@ describe("auto-compaction internals", () => {
       contextLimit: 10_000,
       outputLimit: 1_000,
       thresholdFraction: 0.25,
-      keepRecentTokens: 1,
-      keepLastMessages: 1,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
     });
 
     expect(result.status).toBe("compacted");
@@ -421,7 +568,7 @@ describe("auto-compaction internals", () => {
       role: "user",
       content: [
         "<context-compaction>",
-        "The conversation before this point was automatically compacted.",
+        "The conversation before this point was compacted.",
         "Treat this summary as prior conversation context, not as a new user request.",
         "",
         "Condensed prior work.",
@@ -432,7 +579,7 @@ describe("auto-compaction internals", () => {
     expect(messages).toHaveLength(3);
   });
 
-  it("issues a single summarization request for a below-threshold transcript", async () => {
+  it("issues one request for a transcript at 47 percent of a 372k window", async () => {
     const summaryResponse = () => ({
       stream: simulateReadableStream({
         chunks: [
@@ -456,22 +603,24 @@ describe("auto-compaction internals", () => {
       },
     });
 
-    // Exceeds the old 35% split while remaining below the compaction threshold.
+    // Reproduces the observed manual-compaction case: the selected history fits
+    // comfortably in the summary model even after retaining the exact tail.
     const messages: ModelMessage[] = Array.from({ length: 300 }, (_, index) => ({
       role: index % 2 === 0 ? "user" : "assistant",
-      content: `msg ${index} ${"x".repeat(2_930)}`,
+      content: `msg ${index} ${"x".repeat(2_320)}`,
     }));
 
     const result = await compactMessages({
       messages,
       currentModel: model,
-      contextLimit: 369_000,
-      outputLimit: 128_000,
+      contextLimit: 372_000,
+      outputLimit: 32_768,
     });
 
     expect(result.status).toBe("compacted");
     expect(result.estimatedTokensBefore).toBeLessThan(result.budget.inputBudget);
-    expect(result.estimatedTokensBefore).toBeGreaterThan(369_000 * 0.35);
+    expect(result.estimatedTokensBefore / 372_000).toBeGreaterThan(0.46);
+    expect(result.estimatedTokensBefore / 372_000).toBeLessThan(0.48);
     expect(calls).toBe(1);
   });
 
@@ -552,8 +701,8 @@ describe("auto-compaction internals", () => {
       contextLimit: 10_000,
       outputLimit: 1_000,
       thresholdFraction: 0.25,
-      keepRecentTokens: 1,
-      keepLastMessages: 1,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
       onProgress: (progress) => progressEvents.push(progress),
       onSummaryDelta: (delta) => deltas.push(delta),
     });
@@ -566,12 +715,13 @@ describe("auto-compaction internals", () => {
     expect(progressEvents).toEqual([{ stage: "history", step: 1, stepCount: 1, pass: 1 }]);
   });
 
-  it("reports a summary covering every stage, including the split turn", async () => {
+  it("summarizes an early active-turn prefix in the single history lane", async () => {
+    let calls = 0;
+    let capturedPrompt = "";
     const model = new MockLanguageModelV4({
       doStream: async ({ prompt }) => {
-        // The split-turn prompt is built separately from the history prompt, so
-        // the two stages are distinguishable by what they were asked to do.
-        const splitTurn = JSON.stringify(prompt).includes("split");
+        calls += 1;
+        capturedPrompt = JSON.stringify(prompt);
         return {
           stream: simulateReadableStream({
             chunks: [
@@ -579,7 +729,7 @@ describe("auto-compaction internals", () => {
               {
                 type: "text-delta" as const,
                 id: "summary",
-                delta: splitTurn ? "Turn so far." : "Prior work.",
+                delta: "Anchored summary.",
               },
               { type: "text-end" as const, id: "summary" },
               {
@@ -594,54 +744,69 @@ describe("auto-compaction internals", () => {
     });
 
     const stages: Array<CompactionProgress["stage"]> = [];
+    const toolTurn = (id: string, result: string): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: id,
+            toolName: "bash",
+            input: { command: id },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: id,
+            toolName: "bash",
+            output: { type: "text", value: result },
+          },
+        ],
+      },
+    ];
     const result = await compactMessages({
       messages: [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
-        { role: "user", content: "latest request" },
-        // A trailing assistant message leaves a split turn, so both stages run.
-        { role: "assistant", content: `partial answer ${"c".repeat(6_000)}` },
+        { role: "user", content: "active request marker" },
+        ...toolTurn("call-1", "early active result"),
+        ...toolTurn("call-2", "retained middle result"),
+        { role: "assistant", content: "intervening progress remains exact" },
+        ...toolTurn("call-3", "retained latest result"),
       ],
       currentModel: model,
       contextLimit: 10_000,
       outputLimit: 1_000,
       thresholdFraction: 0.25,
-      keepRecentTokens: 1,
-      keepLastMessages: 1,
+      keepRecentTokens: 1_000,
+      keepRecentTurns: 2,
       onProgress: (progress) => stages.push(progress.stage),
-      buildSplitTurnSummaryPrompt: (prefix) => `Summarize this split turn:\n${prefix}`,
     });
 
     expect(result.status).toBe("compacted");
-    expect(new Set(stages)).toEqual(new Set(["history", "split-turn"]));
-    // The reported summary is the one written into the transcript, so a consumer
-    // never has to reassemble the stages itself and cannot get it wrong.
-    expect(result.summary).toBe(combineCompactionSummaryParts("Prior work.", "Turn so far."));
+    expect(calls).toBe(1);
+    expect(stages).toEqual(["history"]);
+    expect(capturedPrompt).toContain("## Objective");
+    expect(capturedPrompt).toContain("## Work State");
+    expect(capturedPrompt).toContain("active request marker");
+    expect(capturedPrompt).toContain("early active result");
+    expect(capturedPrompt).not.toContain("retained middle result");
+    expect(JSON.stringify(result.messages)).toContain("retained middle result");
+    expect(JSON.stringify(result.messages)).toContain("intervening progress remains exact");
+    expect(JSON.stringify(result.messages)).toContain("retained latest result");
     expect(result.messages[0]).toMatchObject({
-      content: expect.stringContaining(result.summary ?? " "),
+      content: expect.stringContaining(result.summary ?? "Anchored summary."),
     });
   });
 
-  it("aborts and awaits the sibling stage when one summarization fails", async () => {
-    let splitTurnAborted = false;
+  it("surfaces a failure from the single summary lane", async () => {
     const model = new MockLanguageModelV4({
-      doStream: async ({ prompt, abortSignal }) => {
-        const splitTurn = JSON.stringify(prompt).includes("split");
-        if (!splitTurn) throw new Error("history summarization exploded");
-        // The split-turn request hangs like a live provider call. When its
-        // sibling fails, it must be aborted and awaited before the failure
-        // surfaces, or it would keep streaming after the terminal event.
-        await new Promise<never>((_, reject) => {
-          const fail = () => {
-            splitTurnAborted = true;
-            const error = new Error("aborted");
-            error.name = "AbortError";
-            reject(error);
-          };
-          if (abortSignal?.aborted) fail();
-          else abortSignal?.addEventListener("abort", fail, { once: true });
-        });
-        throw new Error("unreachable");
+      doStream: async () => {
+        throw new Error("history summarization exploded");
       },
     });
 
@@ -652,28 +817,21 @@ describe("auto-compaction internals", () => {
           { role: "user", content: `old request ${"a".repeat(6_000)}` },
           { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
           { role: "user", content: "latest request" },
-          // A trailing assistant message leaves a split turn, so both run.
           { role: "assistant", content: `partial answer ${"c".repeat(6_000)}` },
         ],
         currentModel: model,
         contextLimit: 10_000,
         outputLimit: 1_000,
         thresholdFraction: 0.25,
-        keepRecentTokens: 1,
-        keepLastMessages: 1,
-        buildSplitTurnSummaryPrompt: (prefix) => `Summarize this split turn:\n${prefix}`,
+        keepRecentTokens: 100,
+        keepRecentTurns: 1,
       }).then(
         () => undefined,
         (error: unknown) => error,
       );
 
-      // The genuine failure wins over the abort it induced in the sibling, so
-      // callers classify this as a failure rather than a cancellation.
       expect(failure).toBeInstanceOf(Error);
-      expect(failure instanceof Error ? failure.name : "").not.toBe("AbortError");
-      // By the time the failure surfaced, the sibling request had been aborted
-      // (and awaited): nothing keeps streaming past the terminal event.
-      expect(splitTurnAborted).toBe(true);
+      expect(failure instanceof Error ? failure.message : "").toContain("No output generated");
     } finally {
       errorSpy.mockRestore();
     }
@@ -705,8 +863,7 @@ describe("auto-compaction internals", () => {
       },
     });
 
-    // Ending on a user message keeps the cut off a split turn, so only the
-    // history chain runs and the call count is unambiguous.
+    // The tiny hard tail cap forces every message into the history chain.
     const messages: ModelMessage[] = Array.from({ length: 41 }, (_, index) => ({
       role: index % 2 === 0 ? "user" : "assistant",
       content: `msg ${index} ${"x".repeat(4_000)}`,
@@ -715,9 +872,9 @@ describe("auto-compaction internals", () => {
       __autoCompactionInternals.resolveCompactionBoundary({
         messages,
         keepRecentTokens: 1,
-        keepLastMessages: 1,
-      }).splitTurnStart,
-    ).toBeNull();
+        keepRecentTurns: 1,
+      }),
+    ).toEqual({ suffixStart: messages.length });
 
     await expect(
       compactMessages({
@@ -727,14 +884,14 @@ describe("auto-compaction internals", () => {
         outputLimit: 1_000,
         summaryContextLimit: 2_000,
         keepRecentTokens: 1,
-        keepLastMessages: 1,
+        keepRecentTurns: 1,
         abortSignal: controller.signal,
       }),
     ).rejects.toThrow();
     expect(calls).toBe(1);
   });
 
-  it("honours a split-turn summary update prompt override", async () => {
+  it("honours an anchored summary update prompt override", async () => {
     const model = new MockLanguageModelV4({
       doStream: async () => ({
         stream: simulateReadableStream({
@@ -752,9 +909,8 @@ describe("auto-compaction internals", () => {
       }),
     });
 
-    // Cutting on an assistant message makes the preceding turn a split-turn
-    // prefix; oversizing it forces a second segment, which is the only path that
-    // reaches the update prompt.
+    // Oversizing the discarded history forces a second segment, which reaches
+    // the anchored update prompt.
     const messages: ModelMessage[] = [
       { role: "user", content: `turn request ${"a".repeat(4_000)}` },
       { role: "assistant", content: `early progress ${"b".repeat(4_000)}` },
@@ -765,11 +921,11 @@ describe("auto-compaction internals", () => {
       __autoCompactionInternals.resolveCompactionBoundary({
         messages,
         keepRecentTokens: 1,
-        keepLastMessages: 1,
+        keepRecentTurns: 1,
       }),
-    ).toEqual({ suffixStart: 3, splitTurnStart: 0 });
+    ).toEqual({ suffixStart: messages.length });
 
-    const splitTurnUpdates: string[] = [];
+    const summaryUpdates: string[] = [];
     const result = await compactMessages({
       messages,
       currentModel: model,
@@ -778,16 +934,62 @@ describe("auto-compaction internals", () => {
       // Small enough that the prefix cannot fit one segment.
       summaryContextLimit: 500,
       keepRecentTokens: 1,
-      keepLastMessages: 1,
-      buildSplitTurnSummaryUpdatePrompt: (previousSummary, nextTranscript) => {
-        const prompt = `CUSTOM SPLIT UPDATE\n${previousSummary}\n${nextTranscript}`;
-        splitTurnUpdates.push(prompt);
+      keepRecentTurns: 1,
+      buildSummaryUpdatePrompt: (previousSummary, nextTranscript) => {
+        const prompt = `CUSTOM ANCHORED UPDATE\n${previousSummary}\n${nextTranscript}`;
+        summaryUpdates.push(prompt);
         return prompt;
       },
     });
 
     expect(result.status).toBe("compacted");
-    expect(splitTurnUpdates.length).toBeGreaterThan(0);
+    expect(summaryUpdates.length).toBeGreaterThan(0);
+  });
+
+  it("resolves an isolated summary model for every refinement request", async () => {
+    let factoryCalls = 0;
+    let progressCalls = 0;
+    const summaryModel = () => {
+      factoryCalls += 1;
+      return new MockLanguageModelV4({
+        doStream: async () => ({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "summary" },
+              { type: "text-delta" as const, id: "summary", delta: "Updated summary." },
+              { type: "text-end" as const, id: "summary" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        }),
+      });
+    };
+
+    const result = await compactMessages({
+      messages: [
+        { role: "user", content: `request ${"a".repeat(4_000)}` },
+        { role: "assistant", content: `progress ${"b".repeat(4_000)}` },
+        { role: "user", content: `next ${"c".repeat(4_000)}` },
+      ],
+      currentModel: fakeModel(),
+      contextLimit: 40_000,
+      outputLimit: 1_000,
+      summaryContextLimit: 500,
+      summaryModel,
+      keepRecentTokens: 1,
+      keepRecentTurns: 1,
+      onProgress: () => {
+        progressCalls += 1;
+      },
+    });
+
+    expect(result.status).toBe("compacted");
+    expect(factoryCalls).toBeGreaterThan(1);
+    expect(factoryCalls).toBe(progressCalls);
   });
 
   it("drops discarded reasoning summaries from summarization provider options", () => {
@@ -822,6 +1024,21 @@ describe("auto-compaction internals", () => {
       messageCountAfter: 0,
       estimatedTokensBefore: 0,
       estimatedTokensAfter: 0,
+    });
+  });
+
+  it("reports an already-minimal manual transcript accurately", async () => {
+    const result = await compactMessages({
+      messages: [{ role: "user", content: "small request" }],
+      currentModel: fakeModel(),
+      contextLimit: 100_000,
+    });
+
+    expect(result).toMatchObject({
+      status: "noop",
+      reason: "already-minimal",
+      messageCountBefore: 1,
+      messageCountAfter: 1,
     });
   });
 
@@ -890,6 +1107,410 @@ describe("auto-compaction internals", () => {
     });
 
     detach();
+  });
+
+  it("forwards turn error provenance to the wrapped base handler", async () => {
+    const transformError = new Error("base transform failed");
+    const phases: Array<string | undefined> = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      modelSpecifier: "test/main",
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      resolveContextLimit: async () => ({ context: 100_000, output: 10_000 }),
+      baseTransformMessages: () => {
+        throw transformError;
+      },
+      baseTurnErrorHandler: (_error, context) => {
+        phases.push(context.phase);
+        return "fail";
+      },
+    });
+
+    try {
+      await expect(agent.prompt("fail before model call")).rejects.toBe(transformError);
+      expect(phases).toEqual(["transform-messages"]);
+    } finally {
+      detach();
+    }
+  });
+
+  it("does not compact or auto-continue a terminal stop turn", async () => {
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: "text" },
+            { type: "text-delta" as const, id: "text", delta: "final answer" },
+            { type: "text-end" as const, id: "text" },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: "stop" },
+              usage: {
+                ...zeroUsage(),
+                inputTokens: {
+                  total: 900_000,
+                  noCache: 100_000,
+                  cacheRead: 800_000,
+                  cacheWrite: 0,
+                },
+              },
+            },
+          ],
+        }),
+      }),
+    });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "summary" },
+              { type: "text-delta" as const, id: "summary", delta: "## Objective\n- Continue." },
+              { type: "text-end" as const, id: "summary" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "prior request" },
+        { role: "assistant", content: "prior response" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 1_000_000, output: 200_000 }),
+    });
+
+    try {
+      await agent.prompt("small request");
+      expect(summaryCalls).toBe(0);
+      expect(mainModel.doStreamCalls).toHaveLength(1);
+      expect(agent.state.messages.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+      ]);
+      expect(JSON.stringify(agent.state.messages)).not.toContain("Continue if you have next steps");
+
+      await agent.prompt("next request");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBe(1);
+    expect(mainModel.doStreamCalls).toHaveLength(2);
+    expect(agent.state.messages.map((message) => message.role)).toEqual([
+      "user",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    expect(agent.state.messages[0]?.content).toContain("<context-compaction>");
+    expect(agent.state.messages.at(-2)?.content).toBe("next request");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("Continue if you have next steps");
+  });
+
+  it("does not let the estimate override known usage for usage-source providers", async () => {
+    const response = (text: string) => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start" as const, id: "text" },
+          { type: "text-delta" as const, id: "text", delta: text },
+          { type: "text-end" as const, id: "text" },
+          {
+            type: "finish" as const,
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage: {
+              ...zeroUsage(),
+              inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+            },
+          },
+        ],
+      }),
+    });
+    let mainCalls = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => {
+        mainCalls += 1;
+        return response(mainCalls === 1 ? `large response ${"x".repeat(40_000)}` : "done");
+      },
+    });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        throw new Error("usage-source estimate must not force compaction");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "usage",
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("first");
+      await agent.prompt("second");
+    } finally {
+      detach();
+    }
+
+    expect(mainCalls).toBe(2);
+    expect(summaryCalls).toBe(0);
+  });
+
+  it("uses full-input preflight for a fresh agent with no prior usage", async () => {
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "summary" },
+              { type: "text-delta" as const, id: "summary", delta: "## Objective\n- Continue." },
+              { type: "text-end" as const, id: "summary" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start" as const, id: "text" },
+            { type: "text-delta" as const, id: "text", delta: "new answer" },
+            { type: "text-end" as const, id: "text" },
+            {
+              type: "finish" as const,
+              finishReason: { unified: "stop" as const, raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      }),
+    });
+    const agent = new AiSdkPiAgent({
+      system: `large system ${"s".repeat(20_000)}`,
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "prior request" },
+        { role: "assistant", content: `prior response ${"x".repeat(20_000)}` },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "usage",
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("new request");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBe(1);
+    expect(agent.state.messages.map((message) => message.role)).toEqual([
+      "user",
+      "user",
+      "assistant",
+    ]);
+    expect(agent.state.messages[1]?.content).toBe("new request");
+  });
+
+  it("restores a final threshold trailer and preserves it across a failed compaction retry", async () => {
+    const response = (text: string, inputTokens: number) => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start" as const, id: "text" },
+          { type: "text-delta" as const, id: "text", delta: text },
+          { type: "text-end" as const, id: "text" },
+          {
+            type: "finish" as const,
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage: {
+              ...zeroUsage(),
+              inputTokens: {
+                total: inputTokens,
+                noCache: inputTokens,
+                cacheRead: 0,
+                cacheWrite: 0,
+              },
+            },
+          },
+        ],
+      }),
+    });
+    let mainCalls = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => {
+        mainCalls += 1;
+        return response("continued response", 100);
+      },
+    });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        if (summaryCalls === 1) throw new Error("summary unavailable");
+        return response("## Objective\n- Retry succeeded.", 100);
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(20_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(20_000)}` },
+        { role: "user", content: "middle request" },
+        { role: "assistant", content: "middle response" },
+        { role: "user", content: "recent request" },
+        { role: "assistant", content: "initial response" },
+        __autoCompactionInternals.buildAutoContinueMessage(),
+      ],
+    });
+    const statuses: string[] = [];
+    let completedEstimate = 0;
+    let completedBudget = 0;
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      onCompactionEnd: ({ status, estimatedInputTokensAfter, budget }) => {
+        statuses.push(status);
+        if (status !== "completed") return;
+        completedEstimate = estimatedInputTokensAfter ?? 0;
+        completedBudget = budget.inputBudget;
+      },
+    });
+
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    let summaryCallsAfterRetry = 0;
+    try {
+      await expect(agent.continue()).rejects.toThrow();
+      await agent.continue();
+      summaryCallsAfterRetry = summaryCalls;
+      await agent.prompt("later request");
+    } finally {
+      errorSpy.mockRestore();
+      detach();
+    }
+
+    const serialized = JSON.stringify(agent.state.messages);
+    const continuation =
+      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.";
+    expect(summaryCallsAfterRetry).toBeGreaterThan(1);
+    expect(summaryCalls).toBe(summaryCallsAfterRetry);
+    expect(mainCalls).toBe(2);
+    expect(statuses).toEqual(["failed", "completed"]);
+    expect(completedEstimate).toBeLessThanOrEqual(completedBudget);
+    expect(serialized.split(continuation)).toHaveLength(2);
+    expect(agent.state.messages[0]?.content).toContain("<context-compaction>");
+    expect(agent.state.messages.at(-2)?.content).toBe("later request");
+    expect(agent.state.messages.at(-1)?.role).toBe("assistant");
+  });
+
+  it("drops a reconstructed threshold trailer when a real user prompt supersedes it", async () => {
+    let modelInput = "";
+    const model = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        modelInput = JSON.stringify(prompt);
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start" as const, id: "text" },
+              { type: "text-delta" as const, id: "text", delta: "new response" },
+              { type: "text-end" as const, id: "text" },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "stop" as const, raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        };
+      },
+    });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        throw new Error("stale small marker must not force compaction");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "old request" },
+        { role: "assistant", content: "old response" },
+        __autoCompactionInternals.buildAutoContinueMessage(),
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("new actual request");
+    } finally {
+      detach();
+    }
+
+    expect(modelInput).not.toContain("autoCompactionContinue");
+    expect(modelInput).not.toContain("Continue if you have next steps");
+    expect(summaryCalls).toBe(0);
+    expect(agent.state.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    expect(agent.state.messages[2]?.content).toBe("new actual request");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("autoCompactionContinue");
   });
 
   it("uses explicit context and output limits without fetching model capabilities", async () => {

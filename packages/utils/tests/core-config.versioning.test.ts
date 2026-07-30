@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
-import { parseCoreConfig, readCoreConfigVersion } from "../core-config";
+import {
+  parseCoreConfig,
+  parseCoreConfigV1ToUniversal,
+  parseCoreConfigV2ToUniversal,
+  readCoreConfigVersion,
+} from "../core-config";
 
 describe("core config versioning", () => {
   it("treats missing configVersion as v1", async () => {
@@ -118,6 +123,100 @@ describe("core config versioning", () => {
     expect(parsed.models.main.reasoning).toBe("medium");
     expect(parsed.models.fast.reasoning).toBe("none");
     expect(parsed.agent.subagents.profiles.explore.reasoning).toBe("minimal");
+  });
+
+  it("parses flat v2 fallback chains without normalizing order or duplicates", () => {
+    const repeatedFallback = [
+      "primary",
+      {
+        model: "backup",
+        reasoning: "low" as const,
+        options: { temperature: 0.1 },
+      },
+      "primary",
+    ];
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      models: {
+        def: {
+          primary: {
+            model: "openai/gpt-5.5",
+            fallback: repeatedFallback,
+          },
+        },
+        main: {
+          model: "primary",
+          fallback: repeatedFallback,
+        },
+        fast: {
+          model: "openai/gpt-5.5-mini",
+          fallback: repeatedFallback,
+        },
+      },
+      agent: {
+        subagents: {
+          profiles: {
+            explore: {
+              fallback: repeatedFallback,
+            },
+          },
+        },
+      },
+    });
+
+    expect(parsed.models.def.primary?.fallback).toEqual(repeatedFallback);
+    expect(parsed.models.main.fallback).toEqual(repeatedFallback);
+    expect(parsed.models.fast.fallback).toEqual(repeatedFallback);
+    expect(parsed.agent.subagents.profiles.explore.fallback).toEqual(repeatedFallback);
+  });
+
+  it("keeps fallback out of the frozen v1 input shape", () => {
+    const parsed = parseCoreConfigV1ToUniversal({
+      models: {
+        def: {
+          primary: {
+            model: "openai/gpt-5.5",
+            fallback: ["openai/gpt-4o"],
+          },
+        },
+        main: {
+          model: "primary",
+          fallback: ["openai/gpt-4o"],
+        },
+      },
+    });
+
+    expect(parsed.models.def.primary?.fallback).toBeUndefined();
+    expect(parsed.models.main.fallback).toBeUndefined();
+  });
+
+  it("rejects incomplete fallback objects and strips nested chains", () => {
+    expect(() =>
+      parseCoreConfigV2ToUniversal({
+        configVersion: 2,
+        models: {
+          main: {
+            fallback: [{ reasoning: "low" }],
+          },
+        },
+      }),
+    ).toThrow();
+
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      models: {
+        main: {
+          fallback: [
+            {
+              model: "openai/gpt-4o",
+              fallback: ["openai/gpt-4o-mini"],
+            },
+          ],
+        },
+      },
+    });
+    const entry = parsed.models.main.fallback?.[0];
+    expect(typeof entry === "object" && entry !== null && "fallback" in entry).toBe(false);
   });
 
   it("parses v2 subagent delegation guidance and model selection metadata", async () => {

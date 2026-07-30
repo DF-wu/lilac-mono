@@ -57,6 +57,8 @@ import {
   resolveSessionAdditionalPrompts,
   refreshSelectedLevel1Tools,
   resolveAgentRunModel,
+  resolveAgentRunModelFallbacks,
+  selectNextNativeModelFallback,
   shouldRunAutoInjectedThreadSearch,
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
@@ -135,6 +137,7 @@ function level1TestToolset(params?: {
     },
     updateActiveBatchTools: (activeToolNames) => params?.onBatchUpdate?.(activeToolNames),
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
+    aggregateOutputBudgetExemptTools: new Set(),
   };
 }
 
@@ -311,6 +314,7 @@ describe("runner Level 1 catalog selection", () => {
       catalogMetadata: {},
       updateActiveBatchTools: () => {},
       genericOutputNormalizerBypassTools: new Set(),
+      aggregateOutputBudgetExemptTools: new Set(),
     };
     let calls = 0;
     const model = new MockLanguageModelV4({
@@ -680,9 +684,9 @@ describe("subagent model selection", () => {
       reasoningOverride: "high",
     });
 
-    expect(resolved.alias).toBe("scout");
-    expect(resolved.spec).toBe("openai/gpt-4o-mini");
-    expect(resolved.reasoning).toBe("high");
+    expect(resolved.head.alias).toBe("scout");
+    expect(resolved.head.spec).toBe("openai/gpt-4o-mini");
+    expect(resolved.head.reasoning).toBe("high");
   });
 
   it("rejects direct and opted-out subagent model overrides", () => {
@@ -729,7 +733,7 @@ describe("subagent model selection", () => {
       runProfile: "general",
     });
 
-    expect(resolved.alias).toBe("manual");
+    expect(resolved.head.alias).toBe("manual");
   });
 
   it("applies reasoning overrides to the configured profile fallback", () => {
@@ -746,8 +750,7 @@ describe("subagent model selection", () => {
       reasoningOverride: "medium",
     });
 
-    expect(resolved).toMatchObject({ slot: "fast" });
-    expect(resolved.reasoning).toBe("medium");
+    expect(resolved.head.reasoning).toBe("medium");
   });
 
   it("rehydrates a durable workflow model request without current preset resolution", () => {
@@ -774,7 +777,7 @@ describe("subagent model selection", () => {
       },
     });
 
-    expect(resolved).toMatchObject({
+    expect(resolved.head).toMatchObject({
       alias: "removed-preset",
       spec: "codex/durable-model",
       provider: "codex",
@@ -784,6 +787,263 @@ describe("subagent model selection", () => {
       responseCommentary: true,
       anthropicPromptCache: true,
     });
+  });
+
+  it("preserves request alias fallback order and applies the strongest reasoning chain-wide", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      requested: {
+        model: "openai/head",
+        reasoning: "low",
+        agentCanSelect: true,
+        fallback: [
+          "openai/backup",
+          { model: "openai/special", reasoning: "none" },
+          "openai/backup",
+        ],
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      reasoning: "medium",
+    };
+
+    const defaultReasoningPlan = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      requestModelOverride: "requested",
+    });
+    expect(
+      [defaultReasoningPlan.head, ...defaultReasoningPlan.fallbacks].map(
+        (candidate) => candidate.reasoning,
+      ),
+    ).toEqual(["medium", "medium", "none", "medium"]);
+
+    const plan = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      requestModelOverride: "requested",
+      reasoningOverride: "xhigh",
+    });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/head",
+      "openai/backup",
+      "openai/special",
+      "openai/backup",
+    ]);
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.reasoning)).toEqual([
+      "xhigh",
+      "xhigh",
+      "xhigh",
+      "xhigh",
+    ]);
+  });
+
+  it("resolves current override fallbacks without resolving or validating the alias head", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      requested: {
+        model: "invalid-changed-head",
+        agentCanSelect: false,
+        fallback: ["openai/current", { model: "openai/explicit", reasoning: "low" }],
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      reasoning: "medium",
+    };
+
+    const fallbacks = resolveAgentRunModelFallbacks({
+      cfg,
+      runProfile: "general",
+      requestModelOverride: "requested",
+    });
+
+    expect(fallbacks.map((candidate) => [candidate.spec, candidate.reasoning])).toEqual([
+      ["openai/current", "medium"],
+      ["openai/explicit", "low"],
+    ]);
+    delete cfg.models.def.requested;
+    expect(
+      resolveAgentRunModelFallbacks({
+        cfg,
+        runProfile: "general",
+        requestModelOverride: "requested",
+        reasoningOverride: "high",
+      }),
+    ).toEqual([]);
+  });
+
+  it("keeps explicit profile and slot fallbacks when their head aliases are missing", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.main = {
+      model: "missing-slot-head",
+      fallback: ["openai/slot-backup"],
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      model: "missing-profile-head",
+      fallback: ["openai/profile-backup"],
+    };
+
+    expect(
+      resolveAgentRunModelFallbacks({ cfg, runProfile: "general" }).map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/profile-backup"]);
+    expect(
+      resolveAgentRunModelFallbacks({ cfg, runProfile: "explore" }).map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/slot-backup"]);
+  });
+
+  it("uses explicit profile fallback and profile reasoning unless an entry overrides it", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      profile: {
+        model: "openai/profile",
+        fallback: ["openai/alias-backup"],
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      model: "profile",
+      reasoning: "medium",
+      fallback: [
+        "openai/common-reasoning",
+        { model: "openai/own-reasoning", reasoning: "low" },
+        "openai/common-reasoning",
+      ],
+    };
+
+    const plan = resolveAgentRunModel({ cfg, runProfile: "general" });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/profile",
+      "openai/common-reasoning",
+      "openai/own-reasoning",
+      "openai/common-reasoning",
+    ]);
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.reasoning)).toEqual([
+      "medium",
+      "medium",
+      "low",
+      "medium",
+    ]);
+  });
+
+  it("lets profile fallback replace slot and alias fallback", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      slot: { model: "openai/slot", fallback: ["openai/alias-backup"] },
+    };
+    cfg.models.fast = { model: "slot", fallback: ["openai/slot-backup"] };
+    cfg.agent.subagents.profiles.explore = {
+      ...cfg.agent.subagents.profiles.explore,
+      modelSlot: "fast",
+      fallback: ["openai/profile-backup", "openai/profile-backup"],
+    };
+
+    const plan = resolveAgentRunModel({ cfg, runProfile: "explore" });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/slot",
+      "openai/profile-backup",
+      "openai/profile-backup",
+    ]);
+  });
+
+  it("inherits alias fallback for a direct profile and slot fallback for a slot profile", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      direct: { model: "openai/direct", fallback: ["openai/direct-alias-backup"] },
+      slot: { model: "openai/slot", fallback: ["openai/slot-alias-backup"] },
+    };
+    cfg.models.fast = { model: "slot", fallback: ["openai/slot-backup"] };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      model: "direct",
+    };
+    cfg.agent.subagents.profiles.explore = {
+      ...cfg.agent.subagents.profiles.explore,
+      modelSlot: "fast",
+    };
+
+    expect(
+      resolveAgentRunModel({ cfg, runProfile: "general" }).fallbacks.map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/direct-alias-backup"]);
+    expect(
+      resolveAgentRunModel({ cfg, runProfile: "explore" }).fallbacks.map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/slot-backup"]);
+  });
+
+  it("rehydrates the complete durable fallback plan", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    const plan = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      resolvedModelRequest: {
+        spec: "openai/durable-head",
+        provider: "openai",
+        modelId: "durable-head",
+        reasoning: "low",
+        reasoningDisplay: "simple",
+        fallbacks: [
+          {
+            spec: "openai/durable-backup",
+            provider: "openai",
+            modelId: "durable-backup",
+            reasoning: "high",
+            reasoningDisplay: "simple",
+          },
+        ],
+      },
+    });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/durable-head",
+      "openai/durable-backup",
+    ]);
+    expect(plan.fallbacks[0]?.reasoning).toBe("high");
+    expect(plan.fallbacks[0]?.reasoningDisplay).toBe("simple");
+  });
+
+  it("skips claude-code candidates, preserves duplicates, and never advances a claude head", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.main = {
+      model: "openai/head",
+      fallback: ["claude-code/sonnet", "openai/backup", "openai/backup"],
+    };
+    const plan = resolveAgentRunModel({ cfg, runProfile: "primary" });
+    const skipped: string[] = [];
+
+    const first = selectNextNativeModelFallback({
+      plan,
+      activeIndex: 0,
+      onSkipClaudeCode: (candidate) => skipped.push(candidate.spec),
+    });
+    const second = selectNextNativeModelFallback({
+      plan,
+      activeIndex: first?.index ?? 0,
+    });
+
+    expect(skipped).toEqual(["claude-code/sonnet"]);
+    expect(first).toMatchObject({ index: 2, candidate: { spec: "openai/backup" } });
+    expect(second).toMatchObject({ index: 3, candidate: { spec: "openai/backup" } });
+
+    cfg.models.main = { model: "claude-code/sonnet", fallback: ["openai/backup"] };
+    expect(
+      selectNextNativeModelFallback({
+        plan: resolveAgentRunModel({ cfg, runProfile: "primary" }),
+        activeIndex: 0,
+      }),
+    ).toBeNull();
   });
 
   it("validates workflow reasoning against the operation request, not resolved defaults", () => {

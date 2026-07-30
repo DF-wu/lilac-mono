@@ -171,6 +171,7 @@ export async function handleRequest(envelope: RequestEnvelope): Promise<unknown>
       start,
       maxLines: numberOrUndefined(input["maxLines"]),
       maxCharacters: numberOrUndefined(input["maxCharacters"]),
+      maxBytes: numberOrUndefined(input["maxBytes"]),
       format:
         input["format"] === "numbered"
           ? "numbered"
@@ -214,6 +215,9 @@ export async function handleRequest(envelope: RequestEnvelope): Promise<unknown>
   if (envelope.op === "fs.grep") {
     return await fsTool.grep({
       pattern: String(input["pattern"] ?? ""),
+      baseDir: typeof input["baseDir"] === "string" ? input["baseDir"] : undefined,
+      reportedFilePath:
+        typeof input["reportedFilePath"] === "string" ? input["reportedFilePath"] : undefined,
       regex: Boolean(input["regex"]),
       maxResults: numberOrUndefined(input["maxResults"]),
       fileExtensions: stringArray(input["fileExtensions"]).map((ext) => ext.replace(/^\./, "")),

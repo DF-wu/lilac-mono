@@ -31,11 +31,23 @@ export type DiscordSessionAliasConfig =
       comment?: string;
     };
 
+export type ConfiguredModelRef = {
+  /** Model ref in provider/model format or alias from models.def. */
+  model: string;
+  /** Optional portable AI SDK reasoning effort. */
+  reasoning?: ModelReasoningEffort;
+  /** Optional providerOptions override. */
+  options?: JSONObject;
+};
+
+export type ConfiguredModelChainEntry = string | ConfiguredModelRef;
+
 export type SubagentProfileConfig = {
   modelSlot: "main" | "fast";
   model?: string;
   reasoning?: ModelReasoningEffort;
   options?: JSONObject;
+  fallback?: ConfiguredModelChainEntry[];
   promptOverlay?: string;
   level1: {
     tools: string[];
@@ -249,6 +261,7 @@ export type UniversalCoreConfig = {
         model: string;
         reasoning?: ModelReasoningEffort;
         options?: JSONObject;
+        fallback?: ConfiguredModelChainEntry[];
         comment?: string;
         agentCanSelect?: boolean;
       }
@@ -257,11 +270,13 @@ export type UniversalCoreConfig = {
       model: string;
       reasoning?: ModelReasoningEffort;
       options?: JSONObject;
+      fallback?: ConfiguredModelChainEntry[];
     };
     fast: {
       model: string;
       reasoning?: ModelReasoningEffort;
       options?: JSONObject;
+      fallback?: ConfiguredModelChainEntry[];
     };
     capability: {
       forceUnknownProviders: string[];
