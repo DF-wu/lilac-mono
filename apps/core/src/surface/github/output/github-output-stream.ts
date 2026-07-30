@@ -1,9 +1,13 @@
 import type { MsgRef, SessionRef, SurfaceAttachment } from "../../types";
 import type { SurfaceOutputPart, SurfaceOutputResult, SurfaceOutputStream } from "../../adapter";
 
-import { createIssueComment } from "../../../github/github-api";
+import { createIssueComment, getIssue } from "../../../github/github-api";
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
-import { githubMessageUrl, parseGithubSessionId } from "../../../github/github-ids";
+import {
+  githubMessageUrl,
+  isGithubIssueTriggerId,
+  parseGithubSessionId,
+} from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
@@ -61,15 +65,28 @@ export class GithubOutputStream implements SurfaceOutputStream {
 
     const thread = parseGithubSessionId(this.sessionRef.channelId);
 
-    const replyPrefix = (() => {
-      const replyTo = this.opts?.replyTo;
-      if (!replyTo || replyTo.platform !== "github") return "";
+    const replyTo = this.opts?.replyTo;
+    let replyPrefix = "";
+    if (replyTo?.platform === "github") {
+      const replyThread = parseGithubSessionId(replyTo.channelId);
+      const repliesToIssue = isGithubIssueTriggerId({
+        sessionId: replyTo.channelId,
+        triggerId: replyTo.messageId,
+      });
+      const issue = repliesToIssue
+        ? await getIssue({
+            owner: replyThread.owner,
+            repo: replyThread.repo,
+            number: replyThread.number,
+          })
+        : undefined;
       const replyUrl = githubMessageUrl({
         sessionId: replyTo.channelId,
         messageId: replyTo.messageId,
+        issueId: issue?.id,
       });
-      return `In reply to ${replyUrl}:\n\n`;
-    })();
+      replyPrefix = `In reply to ${replyUrl}:\n\n`;
+    }
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);
     const res = await createIssueComment({

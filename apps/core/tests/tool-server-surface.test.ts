@@ -2387,6 +2387,7 @@ describe("tool-server surface", () => {
 
     const githubApi: GithubSurfaceApi = {
       getIssue: async () => ({
+        id: 12,
         title: "t",
         body: "b",
         user: { login: "alice", id: 1 },
