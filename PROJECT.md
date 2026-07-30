@@ -401,6 +401,8 @@ Key sections:
   - Each profile may configure Level-1 tools/plugins, Level-2 callables/plugins, network behavior, workspace-write behavior/tool exposure, execution, and delegation. `network` and `workspaceWrites` do not sandbox ordinary trusted Bash when execution is enabled. `resolveNativeSubagentProfile` is authoritative for every launch path, direct or workflow-launched.
   - `delegatePromptOverlay` appends free-form routing policy to the parent-visible `subagent_delegate` description.
 - `models.def`: reusable model aliases. `comment` documents an alias to the orchestrating agent, while `agentCanSelect: true` explicitly opts it into dynamic subagent selection without changing explicit static or human selection.
+  - Model aliases, `models.main` / `models.fast`, and native subagent profiles may define an ordered `fallback` array. Core exhausts each candidate's transient retry budget before rebuilding the model-derived prompt and complete Level-1 toolset for the next eligible model. There is no global enable flag or switch cap.
+  - Workflow heads remain pinned, while fallback is excluded from workflow identity hashes and is re-resolved from current config on stale redispatch.
   - Delegation policy: `explore`/`general` cannot delegate; `self` may delegate but cannot delegate to `self`.
 - `plugins.disabled`: plugin ids to disable without uninstalling them.
 - `plugins.config`: opaque per-plugin config passed through to plugin code.
