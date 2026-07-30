@@ -162,6 +162,30 @@ describe("model catalog", () => {
     });
   });
 
+  it("creates capability overrides for attachment-only catalog entries", async () => {
+    const capability = new ModelCapability({
+      overrides: modelCapabilityOverrides({
+        models: [
+          {
+            ref: { providerId: "custom", modelId: "vision", value: "custom/vision" },
+            provider: { id: "custom", type: "openai-compatible" },
+            source: "v1",
+            name: "Vision",
+            attachment: true,
+            modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+          },
+        ],
+      }),
+      forceUnknownProviders: ["custom"],
+    });
+
+    await expect(capability.resolve("custom/vision")).resolves.toMatchObject({
+      attachment: true,
+      limit: { context: 0, output: 0 },
+      modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+    });
+  });
+
   it("ignores invalid unrelated providers and accepts zero modality limits", async () => {
     const catalog = new ModelCatalog(
       {

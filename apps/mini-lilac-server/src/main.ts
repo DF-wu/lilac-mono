@@ -7,6 +7,7 @@ import {
   loadProviderRegistry,
   loadRuntimeConfig,
   ModelCatalog,
+  modelCapabilityOverrides,
   MiniLilacSkillCatalog,
   MiniLilacSqliteStore,
   readMiniLilacHistoryRecoveryStatus,
@@ -18,6 +19,7 @@ import { createToolResultArtifactStore } from "@stanley2058/lilac-tool-results";
 import {
   clearCodexTokens,
   createCodexOAuthProvider,
+  ModelCapability,
   readCodexTokens,
   startCodexOAuthLogin,
   writeCodexTokens,
@@ -689,7 +691,7 @@ export async function main(
       codexOAuthProviderIds: providers.supersededProviderIds,
       onWarning: (warning) => console.warn(`Model catalog warning: ${warning.message}`),
     });
-    await modelCatalog.get({ backgroundRefresh: true });
+    const initialModelCatalog = await modelCatalog.get();
     const toolResultArtifacts = createToolResultArtifactStore(statePaths.toolResultsDirectory);
     await toolResultArtifacts.init();
 
@@ -697,6 +699,9 @@ export async function main(
       config,
       databasePath,
       providers,
+      modelCapability: new ModelCapability({
+        overrides: modelCapabilityOverrides(initialModelCatalog),
+      }),
       modelLimitsResolver: async (specifier) => {
         const model = (await modelCatalog.get()).models.find(
           (entry) => entry.ref.value === specifier,

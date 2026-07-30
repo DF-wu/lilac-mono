@@ -45,6 +45,10 @@ export type CodingToolsetOptions = {
   preloadedInstructionPaths?: readonly string[];
   /** Fixed artifact authority for recoverable Bash output and tool-result:// reads. */
   artifactIntegration?: CodingToolArtifactIntegration;
+  /** Attach supported local images and PDFs to the model-facing read_file result. */
+  readFileDirectAttachmentSupported?: boolean;
+  /** Maximum decoded bytes in one read_file media attachment. */
+  maxInlineMediaBytesPerPart?: number;
 };
 
 /**
@@ -98,6 +102,8 @@ export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
       preloadedInstructionPaths: options.preloadedInstructionPaths,
       denyPaths,
       artifactIntegration,
+      readFileDirectAttachmentSupported: options.readFileDirectAttachmentSupported,
+      maxInlineMediaBytesPerPart: options.maxInlineMediaBytesPerPart,
     }),
     ...createApplyPatchTool({ cwd, denyPaths, allowGuardrailBypass }),
     ...options.extraTools,

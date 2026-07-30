@@ -122,6 +122,13 @@ import {
 } from "./config";
 import { parseModelRef, resolveLanguageModel } from "./model-catalog";
 import {
+  READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+  READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+  scrubReadFileMediaForModelView,
+  supportsReadFileMedia,
+  toolResultContentDisplayValue,
+} from "./model-message-media";
+import {
   reasoningProviderOptions,
   type LoadedProviderRegistry,
   type ProviderType,
@@ -577,8 +584,23 @@ function toolOutputErrorText(output: ToolResultOutput, fallback: string): string
   return fallback;
 }
 
-function toolOutputDisplayValue(output: ToolResultOutput): unknown {
+const readFileAttachmentDisplaySchema = z.object({
+  success: z.literal(true),
+  kind: z.literal("attachment"),
+  resolvedPath: z.string(),
+  fileHash: z.string(),
+  filename: z.string(),
+  mimeType: z.string(),
+  bytes: z.number().int().nonnegative(),
+});
+
+function toolOutputDisplayValue(output: ToolResultOutput, rawResult?: unknown): unknown {
   if (output.type === "execution-denied") return output.reason;
+  if (output.type === "content") {
+    const attachment = readFileAttachmentDisplaySchema.safeParse(rawResult);
+    if (attachment.success) return attachment.data;
+    return toolResultContentDisplayValue(output);
+  }
   return output.value;
 }
 
@@ -1478,10 +1500,19 @@ class SessionActor {
     const workspaceInstructions = await loadWorkspaceInstructions(this.snapshot.cwd, {
       denyPaths: [...DEFAULT_DENY_PATHS, ...this.protectedToolPaths],
     });
+    let readFileMediaSupported = false;
+    try {
+      readFileMediaSupported = supportsReadFileMedia(
+        await this.modelCapability.resolve(modelSpecifier),
+      );
+    } catch {
+      // Unknown capability stays text-only rather than risking a provider-invalid request.
+    }
     const tools = this.createTools(
       profile,
       context,
       modelSpecifier,
+      readFileMediaSupported,
       skills,
       workspaceInstructions?.loaded,
     );
@@ -1561,6 +1592,7 @@ class SessionActor {
         providerOptions,
         transientRetryController,
         normalizeOverflow,
+        readFileMediaSupported,
         usesCodexOAuth,
         claudeBuiltInTools,
         claudeCodeRun,
@@ -1592,6 +1624,7 @@ class SessionActor {
     providerOptions: ReturnType<typeof reasoningProviderOptions>;
     transientRetryController: ReturnType<typeof createTransientModelRetryController> | undefined;
     normalizeOverflow: ReturnType<typeof createOverflowReferenceNormalizer>;
+    readFileMediaSupported: boolean;
     usesCodexOAuth: boolean;
     claudeBuiltInTools: readonly ClaudeCodeBuiltInTool[];
     claudeCodeRun: MaterializedClaudeCodeRun | null;
@@ -1610,6 +1643,7 @@ class SessionActor {
       providerOptions,
       transientRetryController,
       normalizeOverflow,
+      readFileMediaSupported,
       usesCodexOAuth,
       claudeBuiltInTools,
       claudeCodeRun,
@@ -1648,6 +1682,17 @@ class SessionActor {
       beforeSteeringDelivery: (delivery) => this.commitSteeringBoundary(context, delivery),
     });
     input.onAgentReady(agent);
+    agent.appendTransformMessages((outboundMessages) =>
+      scrubReadFileMediaForModelView(
+        outboundMessages,
+        readFileMediaSupported
+          ? {
+              maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+              maxBytesTotal: READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+            }
+          : { maxBytesPerPart: 0, maxBytesTotal: 0 },
+      ),
+    );
     if (transientRetryController) {
       agent.subscribe((event) => {
         if (event.type === "turn_end") {
@@ -1927,6 +1972,7 @@ class SessionActor {
     profile: AgentProfile,
     context: RunContext,
     modelSpecifier: string,
+    readFileMediaSupported: boolean,
     skills?: MiniLilacSkillCatalogSnapshot,
     preloadedInstructionPaths?: readonly string[],
   ): ToolSet {
@@ -1995,6 +2041,8 @@ class SessionActor {
       allowBashGuardrailBypass: true,
       denyPaths: this.protectedToolPaths,
       preloadedInstructionPaths,
+      readFileDirectAttachmentSupported: readFileMediaSupported,
+      maxInlineMediaBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
       ...(this.toolResultArtifacts
         ? {
             artifactIntegration: {
@@ -2855,7 +2903,7 @@ class SessionActor {
               : {
                   type: "tool-output-available",
                   toolCallId: event.toolCallId,
-                  output: toolOutputDisplayValue(event.output),
+                  output: toolOutputDisplayValue(event.output, event.result),
                   dynamic: true,
                 },
           );

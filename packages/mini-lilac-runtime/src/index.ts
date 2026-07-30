@@ -47,6 +47,12 @@ export {
   type ProviderRef,
 } from "./model-catalog";
 export {
+  READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+  READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+  scrubReadFileMediaForModelView,
+  supportsReadFileMedia,
+} from "./model-message-media";
+export {
   SessionService,
   HistoryRecoveryAbandonedError,
   type CreateSessionInput,

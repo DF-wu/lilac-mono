@@ -30,7 +30,7 @@ import {
   type UIMessageChunk,
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import { getCodexAuthStoragePath } from "@stanley2058/lilac-utils";
+import { getCodexAuthStoragePath, ModelCapability } from "@stanley2058/lilac-utils";
 import { z } from "zod";
 
 import type { RuntimeConfig } from "../src/config";
@@ -238,6 +238,26 @@ function grepToolResult(pattern: string) {
           toolCallId: "oversized-grep",
           toolName: "grep",
           input: JSON.stringify({ pattern }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function readToolResult(path: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        {
+          type: "tool-call" as const,
+          toolCallId: "direct-read",
+          toolName: "read_file",
+          input: JSON.stringify({ path, maxCharacters: 20_000 }),
         },
         {
           type: "finish" as const,
@@ -2347,6 +2367,167 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("bounds direct multibyte read_file output by UTF-8 bytes", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unicode-read-"));
+    temporaryDirectories.push(directory);
+    await writeFile(path.join(directory, "unicode.txt"), "😀".repeat(11_000));
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file"];
+    const artifacts = createToolResultArtifactStore(path.join(directory, "tool-results"));
+    await artifacts.init();
+    const model = new MockLanguageModelV4({
+      doStream: [readToolResult("unicode.txt"), textResult("answer", "inspected")],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      toolResultArtifacts: artifacts,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("read unicode"))).stream,
+    );
+
+    const transcript = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(transcript).toContain("[tool result overflow]");
+    expect(transcript).not.toContain("😀".repeat(1_000));
+    expect(chunks).toContainEqual(
+      expect.objectContaining({ type: "tool-output-available", toolCallId: "direct-read" }),
+    );
+    expect(chunks.some((chunk) => chunk.type === "tool-output-error")).toBe(false);
+    service.close();
+  });
+
+  it("preserves capable-model image and PDF batch attachments without exposing base64 to UI chunks", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-media-"));
+    temporaryDirectories.push(directory);
+    const image = Buffer.concat([
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+        "base64",
+      ),
+      Buffer.alloc(50 * 1024),
+    ]);
+    const pdf = Buffer.from("%PDF-1.4 mini-pdf-payload %%EOF");
+    await Promise.all([
+      writeFile(path.join(directory, "diagram.png"), image),
+      writeFile(path.join(directory, "reference.pdf"), pdf),
+    ]);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    const model = new MockLanguageModelV4({
+      doStream: [
+        batchedReadResult(["diagram.png", "reference.pdf"]),
+        textResult("answer", "inspected media"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      modelCapability: new ModelCapability({
+        overrides: {
+          "test/mock": {
+            attachment: true,
+            modalities: { input: ["text", "image", "pdf"], output: ["text"] },
+            limit: { context: 128_000, output: 4_096 },
+          },
+        },
+      }),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("inspect both attachments"))).stream,
+    );
+
+    const modelView = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(modelView).toContain(image.toString("base64"));
+    expect(modelView).toContain(pdf.toString("base64"));
+    expect(modelView.match(/"type":"file"/gu)).toHaveLength(2);
+    const canonical = JSON.stringify(service.store.getModelMessages(session.id));
+    expect(canonical).toContain(image.toString("base64"));
+    expect(canonical).toContain(pdf.toString("base64"));
+    expect(JSON.stringify(chunks)).not.toContain(image.toString("base64"));
+    expect(JSON.stringify(chunks)).not.toContain(pdf.toString("base64"));
+    expect(JSON.stringify(chunks)).toContain('"kind":"attachment"');
+    expect(JSON.stringify(model.doStreamCalls[0]?.tools)).toContain(
+      "native visual or document analysis",
+    );
+    service.close();
+  });
+
+  it("projects structured read_file failures as failed exploration calls", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-read-failure-"));
+    temporaryDirectories.push(directory);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["read_file", "batch"];
+    const model = new MockLanguageModelV4({
+      doStream: [batchedReadResult(["missing.txt"]), textResult("answer", "handled")],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("read the missing file"))).stream,
+    );
+
+    expect(chunks).toContainEqual(
+      expect.objectContaining({
+        type: "tool-output-error",
+        errorText: expect.stringContaining("missing.txt"),
+      }),
+    );
+    service.close();
+  });
+
+  it("projects structured search failures as failed exploration calls", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-search-failure-"));
+    temporaryDirectories.push(directory);
+    const runtimeConfig = config();
+    runtimeConfig.agent.profiles.reader!.tools = ["grep"];
+    const missingCwd = path.join(directory, "missing");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call" as const,
+                toolCallId: "failed-grep",
+                toolName: "grep",
+                input: JSON.stringify({ pattern: "needle", cwd: missingCwd }),
+              },
+              {
+                type: "finish" as const,
+                finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textResult("answer", "handled"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    const chunks = await collect(
+      (await service.startPrompt(session.id, userMessage("search missing cwd"))).stream,
+    );
+
+    expect(chunks).toContainEqual(
+      expect.objectContaining({ type: "tool-output-error", toolCallId: "failed-grep" }),
+    );
+    service.close();
+  });
+
   it("stores oversized grep output out of line before the next model turn and UI persistence", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-tool-overflow-"));
     temporaryDirectories.push(directory);
@@ -2383,7 +2564,7 @@ describe("SessionService", () => {
     expect(JSON.stringify(chunks)).not.toContain("x".repeat(1_000));
     expect(chunks).toContainEqual(
       expect.objectContaining({
-        type: "tool-output-error",
+        type: "tool-output-available",
         toolCallId: "oversized-grep",
       }),
     );
