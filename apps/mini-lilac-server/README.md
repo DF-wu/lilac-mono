@@ -93,8 +93,42 @@ needed:
 mini-lilac server --config ./config.yaml --database ./data/mini-lilac.sqlite
 ```
 
-Mini Lilac automatically migrates its schema-v2 databases to schema v3 in one startup transaction.
-Other database versions, including databases from unrelated experimental lineages, are rejected.
+Mini Lilac transactionally migrates supported schema-v2, schema-v3, and schema-v4 databases to
+schema v5 at startup. Unsupported versions and unrelated experimental lineages are rejected.
+
+## History Recovery
+
+Mini Lilac automatically retries retained history navigation and pending run finalization recovery
+when the server starts. A normal server restart is the retry mechanism; there is no separate recovery
+retry command.
+
+Inspect blocked recovery while the HTTP server is stopped:
+
+```sh
+mini-lilac history-recovery status
+mini-lilac history-recovery status --workspace /path/to/workspace
+mini-lilac history-recovery status --database ./data/mini-lilac.sqlite
+mini-lilac history-recovery status --database ./data/mini-lilac.sqlite --workspace /path/to/workspace
+```
+
+Use `--database` whenever the server uses a nondefault SQLite path. `--workspace` filters by the exact
+canonical workspace path stored in that database; the filter also works when that directory no longer
+exists.
+
+If automatic recovery cannot safely complete, inspect and copy the potentially partial worktree before
+abandoning its retained navigation operation. Abandonment is an explicit last resort:
+
+```sh
+mini-lilac history-recovery abandon \
+  --database ./data/mini-lilac.sqlite \
+  --workspace /path/to/workspace \
+  --acknowledge-partial-worktree
+```
+
+Abandonment records a replayable command error, leaves the history cursor and transcript at the
+operation's source state, and deletes the retained navigation journal. It does not restore, verify, or
+synchronize workspace files. The acknowledgement flag confirms that the operator accepts this partial
+worktree risk. Pending run finalizations cannot be abandoned through this command.
 
 Build the unified executable from `apps/mini-lilac`. Run `mini-lilac server --help` for serve and
 auth usage.
@@ -153,6 +187,7 @@ To preserve destination pinning, `webfetch` refuses to run when inherited `HTTP_
 - `POST /api/mini-lilac/sessions/:sessionId/interrupt-queued-steering`
 - `POST /api/mini-lilac/sessions/:sessionId/cancel`
 - `POST /api/mini-lilac/sessions/:sessionId/undo`
+- `POST /api/mini-lilac/sessions/:sessionId/redo`
 - `POST /api/mini-lilac/sessions/:sessionId/compact`
 - `GET /api/mini-lilac/models`
 - `POST /api/mini-lilac/models/refresh`
@@ -197,11 +232,53 @@ payload is rejected. Active sessions cannot be updated, profiles must exist and 
 sessions, and models must resolve through the configured provider registry. The response is the
 updated session snapshot; cwd and session identity are unchanged.
 
-Undo is a quiescent-session command with body
-`{ "sessionId": "...", "clientCommandId": "..." }`. Idle and error sessions are eligible only when
-they have no active actor or run. Undo atomically restores the exact durable model and UI transcript
-prefixes from before the latest user message. The strict result is either
-`{ "status": "undone", "clientCommandId": "...", "message": { ... } }` or, when no user message
-exists, `{ "status": "empty", "clientCommandId": "..." }` with HTTP 200 and no transcript change.
-Both results are persisted atomically; retry the same command ID to receive the same result. Legacy
-checkpoints without an exact UI prefix still fail safely when a latest user message exists.
+Undo and redo are quiescent-session commands. Both accept the strict body
+`{ "sessionId": "...", "clientCommandId": "..." }`; idle and error sessions are eligible only when
+they have no active actor or run. Undo restores the exact durable model/UI transcript and managed
+worktree state from before the latest applied user message. A successful strict response is:
+
+```json
+{
+  "status": "undone",
+  "clientCommandId": "undo-1",
+  "message": {
+    "id": "user-1",
+    "role": "user",
+    "parts": [{ "type": "text", "text": "change the greeting" }]
+  },
+  "historyStateId": "history-before-user-1",
+  "filesystem": { "status": "restored" }
+}
+```
+
+Redo restores the exact state saved by the corresponding undo, including managed edits observed
+immediately before undo. It restores retained transcript and snapshot data; it never reruns the model,
+tools, patches, or commands. A successful strict response is:
+
+```json
+{
+  "status": "redone",
+  "clientCommandId": "redo-1",
+  "message": {
+    "id": "user-1",
+    "role": "user",
+    "parts": [{ "type": "text", "text": "change the greeting" }]
+  },
+  "historyStateId": "history-after-user-1",
+  "filesystem": { "status": "skipped", "reason": "snapshot-unavailable" }
+}
+```
+
+`filesystem.status = "restored"` means the target managed worktree was restored and verified.
+`filesystem.status = "skipped"` means transcript history moved but the worktree was left unchanged:
+
+- `git-unavailable`: the Git executable needed by the private snapshot store was unavailable.
+- `snapshot-unavailable`: the target has no usable snapshot, including legacy, failed, missing, or
+  corrupt captures.
+- `platform-unsupported`: native filesystem history is unavailable on the current platform.
+
+Undo returns `{ "status": "empty", "clientCommandId": "..." }` when no applied user transition
+exists above the undo floor. Redo returns the same empty shape when its navigation stack is empty.
+Empty results do not move transcripts or capture a workspace state. Successful and empty outcomes are
+persisted by `clientCommandId`; retrying the same request returns the original result without another
+capture or restore. Both endpoints return HTTP 200 for these outcomes.

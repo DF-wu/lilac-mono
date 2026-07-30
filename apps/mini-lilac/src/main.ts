@@ -7,10 +7,13 @@ Usage:
   mini-lilac [tui-options]
   mini-lilac tui [tui-options]
   mini-lilac server [server-options]
+  mini-lilac history-recovery status [--workspace <cwd>] [--database <path>]
+  mini-lilac history-recovery abandon --workspace <cwd> --acknowledge-partial-worktree [--database <path>]
 
 Commands:
   tui      Start the terminal client (default)
   server   Start or administer the Mini Lilac server
+  history-recovery  Inspect or abandon blocked workspace history recovery
 
 Run 'mini-lilac tui --help' or 'mini-lilac server --help' for command options.
 `;
@@ -54,6 +57,10 @@ export async function runMiniLilac(
   }
   if (command === "server") {
     await runners.server(commandArgs);
+    return 0;
+  }
+  if (command === "history-recovery") {
+    await runners.server([command, ...commandArgs]);
     return 0;
   }
   if (command === "tui") return runners.tui(commandArgs);

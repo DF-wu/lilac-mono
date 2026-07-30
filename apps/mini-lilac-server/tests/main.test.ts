@@ -1,9 +1,16 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { CodexOAuthLogin } from "@stanley2058/lilac-utils";
+import {
+  MiniLilacSqliteStore,
+  SessionService,
+  type RuntimeConfig,
+} from "@stanley2058/mini-lilac-runtime";
+import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
 import {
   acquireDatabaseLock,
@@ -14,8 +21,10 @@ import {
   main,
   miniLilacStatePaths,
   parseCliArgs,
+  runHistoryRecoveryCommand,
   shutdownMiniLilacServer,
   type MiniLilacAuthDependencies,
+  type MiniLilacServerCliOptions,
 } from "../src/main";
 
 const temporaryDirectories: string[] = [];
@@ -55,6 +64,117 @@ function testDependencies(overrides: Partial<MiniLilacAuthDependencies> = {}): {
   };
 }
 
+function historyRuntimeConfig(): RuntimeConfig {
+  return {
+    configVersion: 1,
+    server: { host: "127.0.0.1", port: 3210 },
+    providerConfigFile: "providers.yaml",
+    providerAuthFile: "auth.json",
+    agent: {
+      systemPrompt: "test",
+      defaultProfile: "coding",
+      idleTimeoutMs: 900_000,
+      compaction: { model: "inherit", earlyCompactionPoint: 0.8 },
+      subagents: {
+        enabled: false,
+        maxDepth: 1,
+        maxChildrenPerRun: 1,
+        maxConcurrent: 1,
+        idleTimeoutMs: 300_000,
+      },
+      profiles: {
+        coding: {
+          subagentOnly: false,
+          tools: [],
+          execution: false,
+          workspaceWrites: false,
+          delegation: false,
+        },
+      },
+    },
+  };
+}
+
+function historyModel(): MockLanguageModelV4 {
+  return new MockLanguageModelV4({
+    doStream: {
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start" as const, id: "answer" },
+          { type: "text-delta" as const, id: "answer", delta: "response" },
+          { type: "text-end" as const, id: "answer" },
+          {
+            type: "finish" as const,
+            finishReason: { unified: "stop" as const, raw: "stop" },
+            usage: {
+              inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 0, text: 0, reasoning: 0 },
+            },
+          },
+        ],
+      }),
+    },
+  });
+}
+
+async function collectStream(stream: ReadableStream<unknown>): Promise<void> {
+  const reader = stream.getReader();
+  while (!(await reader.read()).done) {
+    // Drain the runtime stream so terminal history finalization completes.
+  }
+}
+
+async function retainedHistoryDatabase(): Promise<{
+  databasePath: string;
+  workspace: string;
+  sessionId: string;
+  commandId: string;
+}> {
+  const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-history-cli-"));
+  temporaryDirectories.push(directory);
+  const workspace = path.join(directory, "workspace");
+  const databasePath = path.join(directory, "runtime.sqlite");
+  await mkdir(workspace);
+  await writeFile(path.join(workspace, "managed.txt"), "before");
+  const service = new SessionService({
+    config: historyRuntimeConfig(),
+    databasePath,
+    modelResolver: historyModel,
+    attachCompaction: async () => () => {},
+  });
+  const session = await service.createSession({ cwd: workspace, model: "test/model" });
+  await collectStream(
+    (
+      await service.startPrompt(
+        session.id,
+        { id: "user", role: "user", parts: [{ type: "text", text: "change it" }] },
+        "prompt-command",
+      )
+    ).stream,
+  );
+  await writeFile(path.join(workspace, "managed.txt"), "after");
+  const commit = service.store.commitHistoryNavigation.bind(service.store);
+  service.store.commitHistoryNavigation = () => {
+    throw new Error("injected post-restore crash");
+  };
+  const commandId = "retained-undo";
+  await expect(service.undo({ sessionId: session.id, clientCommandId: commandId })).rejects.toThrow(
+    "injected post-restore crash",
+  );
+  service.store.commitHistoryNavigation = commit;
+  expect(service.getHistoryRecoveryStatus().navigation).toHaveLength(1);
+  service.close();
+  return { databasePath, workspace, sessionId: session.id, commandId };
+}
+
+function historyCli(
+  args: readonly string[],
+): Extract<MiniLilacServerCliOptions, { command: "history-recovery" }> {
+  const cli = parseCliArgs(args);
+  if (cli.command !== "history-recovery") throw new Error("expected history-recovery command");
+  return cli;
+}
+
 describe("mini-lilac server CLI", () => {
   it("keeps the existing serve invocation and parses auth actions without config", () => {
     expect(parseCliArgs(["--config", "config.yaml", "--database", "db.sqlite"])).toEqual({
@@ -79,12 +199,326 @@ describe("mini-lilac server CLI", () => {
     });
     expect(parseCliArgs(["init"])).toEqual({ command: "init", force: false });
     expect(parseCliArgs(["init", "--force"])).toEqual({ command: "init", force: true });
+    expect(parseCliArgs(["history-recovery", "status"])).toEqual({
+      command: "history-recovery",
+      action: "status",
+      workspace: undefined,
+      database: undefined,
+    });
+    expect(parseCliArgs(["history-recovery", "status", "--workspace", "."])).toEqual({
+      command: "history-recovery",
+      action: "status",
+      workspace: ".",
+      database: undefined,
+    });
+    expect(
+      parseCliArgs([
+        "history-recovery",
+        "abandon",
+        "--workspace",
+        ".",
+        "--acknowledge-partial-worktree",
+        "--database",
+        "custom.sqlite",
+      ]),
+    ).toEqual({
+      command: "history-recovery",
+      action: "abandon",
+      workspace: ".",
+      acknowledgePartialWorktree: true,
+      database: "custom.sqlite",
+    });
+    expect(parseCliArgs(["history-recovery", "status", "--database", "custom.sqlite"])).toEqual({
+      command: "history-recovery",
+      action: "status",
+      workspace: undefined,
+      database: "custom.sqlite",
+    });
     expect(parseCliArgs(["--help"])).toEqual({ command: "help" });
     expect(parseCliArgs([])).toEqual({ command: "serve" });
     expect(MINI_LILAC_SERVER_HELP).toContain("mini-lilac server");
     expect(MINI_LILAC_SERVER_HELP).toContain("auth codex --status");
+    expect(MINI_LILAC_SERVER_HELP).toContain(
+      "mini-lilac history-recovery status [--workspace <cwd>] [--database <path>]",
+    );
+    expect(MINI_LILAC_SERVER_HELP).toContain(
+      "mini-lilac history-recovery abandon --workspace <cwd> --acknowledge-partial-worktree [--database <path>]",
+    );
     expect(() => parseCliArgs(["auth", "codex", "--status", "--logout"])).toThrow("only one");
     expect(() => parseCliArgs(["auth", "openai"])).toThrow();
+    expect(() => parseCliArgs(["history-recovery", "abandon", "--workspace", "."])).toThrow(
+      "requires --acknowledge-partial-worktree",
+    );
+    expect(() =>
+      parseCliArgs(["history-recovery", "status", "--acknowledge-partial-worktree"]),
+    ).toThrow("valid only with abandon");
+  });
+
+  it("reports and exactly filters retained history recovery without creating a database", async () => {
+    const missing = await temporaryDatabase();
+    const emptyLogs: string[] = [];
+    const empty = await runHistoryRecoveryCommand(historyCli(["history-recovery", "status"]), {
+      defaultDatabasePath: missing.databasePath,
+      log: (message) => emptyLogs.push(message),
+    });
+    expect(empty).toEqual({
+      action: "status",
+      report: { navigation: [], pendingFinalizations: [] },
+    });
+    expect(await Bun.file(missing.databasePath).exists()).toBe(false);
+    expect(JSON.parse(emptyLogs.join("\n"))).toEqual({
+      navigation: [],
+      pendingFinalizations: [],
+    });
+
+    const retained = await retainedHistoryDatabase();
+    const status = await runHistoryRecoveryCommand(
+      historyCli([
+        "history-recovery",
+        "status",
+        "--workspace",
+        retained.workspace,
+        "--database",
+        retained.databasePath,
+      ]),
+      { defaultDatabasePath: missing.databasePath, log: () => {} },
+    );
+    expect(status).toMatchObject({
+      action: "status",
+      report: {
+        navigation: [
+          {
+            workspace: retained.workspace,
+            session: retained.sessionId,
+            command: retained.commandId,
+            phase: "verified",
+            source: expect.any(String),
+            target: expect.any(String),
+            update: expect.any(String),
+          },
+        ],
+        pendingFinalizations: [],
+      },
+    });
+
+    const otherWorkspace = path.join(path.dirname(retained.workspace), "other-workspace");
+    await mkdir(otherWorkspace);
+    const filtered = await runHistoryRecoveryCommand(
+      historyCli(["history-recovery", "status", "--workspace", otherWorkspace]),
+      { defaultDatabasePath: retained.databasePath, log: () => {} },
+    );
+    expect(filtered).toEqual({
+      action: "status",
+      report: { navigation: [], pendingFinalizations: [] },
+    });
+
+    await rm(retained.workspace, { recursive: true });
+    const missingWorkspace = await runHistoryRecoveryCommand(
+      historyCli(["history-recovery", "status", "--workspace", retained.workspace]),
+      { defaultDatabasePath: retained.databasePath, log: () => {} },
+    );
+    expect(missingWorkspace).toMatchObject({
+      action: "status",
+      report: { navigation: [{ workspace: retained.workspace }] },
+    });
+  });
+
+  it("keeps status readonly and rejects an unmigrated database without sidecars", async () => {
+    const { databasePath } = await temporaryDatabase();
+    await mkdir(path.dirname(databasePath), { recursive: true });
+    const legacy = new Database(databasePath, { create: true, strict: true });
+    legacy.exec("PRAGMA user_version = 4");
+    legacy.close();
+    const before = await readFile(databasePath);
+
+    await expect(
+      runHistoryRecoveryCommand(historyCli(["history-recovery", "status"]), {
+        defaultDatabasePath: databasePath,
+        log: () => {},
+      }),
+    ).rejects.toThrow(
+      "requires mini-lilac database schema version 5, but the database is version 4",
+    );
+
+    expect(await readFile(databasePath)).toEqual(before);
+    expect(await Bun.file(`${databasePath}-wal`).exists()).toBe(false);
+    expect(await Bun.file(`${databasePath}-shm`).exists()).toBe(false);
+    const unchanged = new Database(databasePath, { readonly: true, strict: true });
+    expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    unchanged.close();
+  });
+
+  it("reports pending finalization recovery fields without starting runtime recovery", async () => {
+    const { directory, databasePath } = await temporaryDatabase();
+    const workspace = path.join(directory, "workspace");
+    await Promise.all([mkdir(workspace), mkdir(path.dirname(databasePath), { recursive: true })]);
+    const store = new MiniLilacSqliteStore(databasePath);
+    const sessionId = "pending-session";
+    const runId = "pending-run";
+    const transitionId = "pending-transition";
+    const message = {
+      id: "pending-user",
+      role: "user" as const,
+      parts: [{ type: "text" as const, text: "pending" }],
+    };
+    store.createSession({
+      id: sessionId,
+      cwd: workspace,
+      model: "test/model",
+      profile: "coding",
+      reasoning: "provider-default",
+    });
+    store.reserveCommand(sessionId, "pending-command", {
+      kind: "prompt",
+      runId: null,
+      payload: { message },
+    });
+    const current = store.getCurrentHistoryState(sessionId);
+    const admitted = store.admitRootPromptHistory({
+      run: { id: runId, sessionId, profile: "coding", depth: 0 },
+      commandId: "pending-command",
+      commandPayload: { message },
+      transitionId,
+      expectedCurrentStateId: current.id,
+      modelMessages: [{ role: "user", content: "pending" }],
+      uiMessages: [message],
+      observation: {
+        stateId: "pending-observation",
+        transitionId: "pending-observation-transition",
+        workspaceSnapshotId: null,
+        workspaceStatus: "unavailable",
+        workspaceUnavailableReason: "git-unavailable",
+      },
+    });
+    const pending = store.reservePendingRunFinalization({
+      runId,
+      sessionId,
+      openTransitionId: admitted.transition.id,
+      modelMessages: [{ role: "user", content: "pending" }],
+      uiMessages: [message],
+      runStatus: "cancelled",
+      sessionStatus: "idle",
+      error: null,
+      terminalResult: undefined,
+      inputTokens: 1,
+    });
+    store.close();
+
+    const status = await runHistoryRecoveryCommand(
+      historyCli(["history-recovery", "status", "--workspace", workspace]),
+      { defaultDatabasePath: databasePath, log: () => {} },
+    );
+    expect(status).toEqual({
+      action: "status",
+      report: {
+        navigation: [],
+        pendingFinalizations: [
+          {
+            workspace,
+            session: sessionId,
+            run: runId,
+            transition: transitionId,
+            status: "cancelled",
+            prepared: pending.preparedAt,
+          },
+        ],
+      },
+    });
+  });
+
+  it("atomically abandons one exact workspace and replays the command error", async () => {
+    const retained = await retainedHistoryDatabase();
+    const result = await runHistoryRecoveryCommand(
+      historyCli([
+        "history-recovery",
+        "abandon",
+        "--workspace",
+        retained.workspace,
+        "--acknowledge-partial-worktree",
+      ]),
+      { defaultDatabasePath: retained.databasePath, log: () => {} },
+    );
+    expect(result).toEqual({
+      action: "abandon",
+      workspace: retained.workspace,
+      session: retained.sessionId,
+      command: retained.commandId,
+      code: "history-recovery-abandoned",
+    });
+
+    const reopened = new SessionService({
+      config: historyRuntimeConfig(),
+      databasePath: retained.databasePath,
+      modelResolver: historyModel,
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    await expect(
+      reopened.undo({ sessionId: retained.sessionId, clientCommandId: retained.commandId }),
+    ).rejects.toMatchObject({
+      code: "history-recovery-abandoned",
+      commandId: retained.commandId,
+      message: expect.stringContaining("no worktree synchronization is claimed"),
+    });
+    reopened.close();
+
+    await expect(
+      runHistoryRecoveryCommand(
+        historyCli([
+          "history-recovery",
+          "abandon",
+          "--workspace",
+          retained.workspace,
+          "--acknowledge-partial-worktree",
+        ]),
+        { defaultDatabasePath: retained.databasePath, log: () => {} },
+      ),
+    ).rejects.toThrow("No retained history navigation");
+  });
+
+  it("abandons an exact persisted workspace after its directory is removed", async () => {
+    const retained = await retainedHistoryDatabase();
+    await rm(retained.workspace, { recursive: true });
+
+    const result = await runHistoryRecoveryCommand(
+      historyCli([
+        "history-recovery",
+        "abandon",
+        "--workspace",
+        retained.workspace,
+        "--acknowledge-partial-worktree",
+        "--database",
+        retained.databasePath,
+      ]),
+      {
+        defaultDatabasePath: path.join(path.dirname(retained.databasePath), "wrong.sqlite"),
+        log: () => {},
+      },
+    );
+    expect(result).toMatchObject({
+      action: "abandon",
+      workspace: retained.workspace,
+      command: retained.commandId,
+    });
+
+    const store = new MiniLilacSqliteStore(retained.databasePath);
+    expect(store.listHistoryOperations()).toEqual([]);
+    store.close();
+  });
+
+  it("requires the database process lock for history recovery commands", async () => {
+    const { databasePath } = await temporaryDatabase();
+    const lock = await acquireDatabaseLock(databasePath);
+    try {
+      await expect(
+        runHistoryRecoveryCommand(historyCli(["history-recovery", "status"]), {
+          defaultDatabasePath: databasePath,
+          log: () => {},
+        }),
+      ).rejects.toThrow("already using database");
+    } finally {
+      await lock.release();
+    }
   });
 
   it("centralizes default server state under XDG_STATE_HOME", () => {
@@ -98,6 +532,7 @@ describe("mini-lilac server CLI", () => {
       codexOAuthFile: path.join("/state", "mini-lilac", "codex.json"),
       modelsDevCacheFile: path.join("/state", "mini-lilac", "models-dev.json"),
       toolResultsDirectory: path.join("/state", "mini-lilac", "tool-results"),
+      workspaceHistoryDirectory: path.join("/state", "mini-lilac", "workspace-history"),
     });
     expect(createMiniLilacAuthDependencies(paths).storagePath()).toBe(
       path.join("/state", "mini-lilac", "codex.json"),
@@ -115,6 +550,7 @@ describe("mini-lilac server CLI", () => {
     expect(await readFile(paths.providerConfigFile, "utf8")).toContain("catalog: models-dev");
     expect(await readFile(paths.providerAuthFile, "utf8")).toBe("{}\n");
     expect((await stat(paths.directory)).mode & 0o777).toBe(0o700);
+    expect((await stat(paths.workspaceHistoryDirectory)).mode & 0o777).toBe(0o700);
     for (const file of [paths.configFile, paths.providerConfigFile, paths.providerAuthFile]) {
       expect((await stat(file)).mode & 0o777).toBe(0o600);
     }
@@ -278,6 +714,67 @@ describe("mini-lilac-server database lock", () => {
 
     const lock = await acquireDatabaseLock(databasePath);
     await lock.release();
+  });
+
+  it("closes an owned runtime when initialization recovery rejects", async () => {
+    const retained = await retainedHistoryDatabase();
+    const directory = path.dirname(retained.databasePath);
+    const providerConfigFile = path.join(directory, "providers.yaml");
+    const providerAuthFile = path.join(directory, "auth.json");
+    const configFile = path.join(directory, "config.yaml");
+    const config = {
+      ...historyRuntimeConfig(),
+      providerConfigFile,
+      providerAuthFile,
+    };
+    await Promise.all([
+      writeFile(configFile, JSON.stringify(config)),
+      writeFile(
+        providerConfigFile,
+        JSON.stringify({
+          configVersion: 1,
+          providers: {
+            local: {
+              type: "openai-compatible",
+              baseUrl: "https://models.test/v1",
+              catalog: "v1",
+            },
+          },
+        }),
+      ),
+      writeFile(providerAuthFile, JSON.stringify({ local: { type: "api-key", key: "test-key" } })),
+      rm(retained.workspace, { recursive: true }),
+    ]);
+    await chmod(providerAuthFile, 0o600);
+    const shutdown = spyOn(SessionService.prototype, "shutdown");
+    const close = spyOn(SessionService.prototype, "close");
+    const expectedError = spyOn(console, "error").mockImplementation(() => {});
+    const fetch = spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [] }));
+
+    try {
+      let startupError: unknown;
+      try {
+        await main(["--config", configFile, "--database", retained.databasePath], undefined, {
+          statePaths: miniLilacStatePaths({ XDG_STATE_HOME: path.join(directory, "state") }),
+        });
+      } catch (error) {
+        startupError = error;
+      }
+      expect(startupError).toBeInstanceOf(Error);
+      if (shutdown.mock.calls.length === 0) throw startupError;
+      expect(shutdown).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledTimes(1);
+
+      const lock = await acquireDatabaseLock(retained.databasePath);
+      await lock.release();
+      const reopened = new MiniLilacSqliteStore(retained.databasePath);
+      reopened.close();
+    } finally {
+      expectedError.mockRestore();
+      fetch.mockRestore();
+      close.mockRestore();
+      shutdown.mockRestore();
+    }
   });
 });
 

@@ -12,6 +12,7 @@ import {
   miniLilacMessagesSchema,
   miniLilacModelsSchema,
   miniLilacProfilesSchema,
+  miniLilacRedoResultSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSkillsSchema,
   miniLilacSteerResultSchema,
@@ -21,8 +22,10 @@ import {
   type MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
 import {
+  HistoryRecoveryAbandonedError,
   MiniLilacSkillCatalog,
   SessionService,
+  WorkspaceHistoryStoreError,
   type ModelCatalogSnapshot,
   type RuntimeConfig,
 } from "@stanley2058/mini-lilac-runtime";
@@ -175,6 +178,7 @@ async function testServer(
   };
   let app: ReturnType<typeof createMiniLilacServer>;
   try {
+    await service.initialize();
     app = createMiniLilacServer({
       config,
       sessionService: service,
@@ -188,8 +192,90 @@ async function testServer(
   return { app, catalogCalls, config, directory, modelCatalog, service };
 }
 
-function userMessage(id: string, text: string): MiniLilacUIMessage {
+function userMessage(id: string, text: string): MiniLilacUIMessage & { role: "user" } {
   return { id, role: "user", parts: [{ type: "text", text }] };
+}
+
+function seedOpenHistory(
+  service: SessionService,
+  sessionId: string,
+  runId: string,
+  modelMessages: Parameters<
+    SessionService["store"]["reservePendingRunFinalization"]
+  >[0]["modelMessages"],
+  uiMessages: readonly MiniLilacUIMessage[],
+): string {
+  const currentModelMessages = service.store.getModelMessages(sessionId);
+  const currentUiMessages = service.store.getUiMessages(sessionId);
+  const admittedUser = uiMessages[currentUiMessages.length];
+  if (admittedUser?.role !== "user") {
+    throw new Error("Seed history requires one new user message after the current transcript");
+  }
+  const admittedModelMessages = modelMessages.slice(0, currentModelMessages.length + 1);
+  if (admittedModelMessages.at(-1)?.role !== "user") {
+    throw new Error(
+      "Seed history requires one new model user message after the current transcript",
+    );
+  }
+  const commandId = `seed-command:${crypto.randomUUID()}`;
+  const command = { kind: "prompt", runId: null, payload: { seed: commandId } } as const;
+  service.store.reserveCommand(sessionId, commandId, command);
+  const current = service.store.getCurrentHistoryState(sessionId);
+  const admitted = service.store.admitRootPromptHistory({
+    run: { id: runId, sessionId, profile: "coding", depth: 0 },
+    commandId,
+    commandPayload: command.payload,
+    transitionId: `seed-transition:${crypto.randomUUID()}`,
+    expectedCurrentStateId: current.id,
+    modelMessages: admittedModelMessages,
+    uiMessages: [...currentUiMessages, admittedUser],
+    observation:
+      current.workspaceStatus === "capture-deferred"
+        ? {
+            stateId: `seed-observation:${crypto.randomUUID()}`,
+            transitionId: `seed-observation-transition:${crypto.randomUUID()}`,
+            workspaceSnapshotId: null,
+            workspaceStatus: "unavailable",
+            workspaceUnavailableReason: "git-unavailable",
+          }
+        : undefined,
+  });
+  return admitted.transition.id;
+}
+
+function seedCompletedHistory(
+  service: SessionService,
+  sessionId: string,
+  runId: string,
+  modelMessages: Parameters<
+    SessionService["store"]["reservePendingRunFinalization"]
+  >[0]["modelMessages"],
+  uiMessages: readonly MiniLilacUIMessage[],
+  todos?: MiniLilacTodoState["todos"],
+): void {
+  const transitionId = seedOpenHistory(service, sessionId, runId, modelMessages, uiMessages);
+  if (todos !== undefined) {
+    service.store.replaceTodosForRun({ sessionId, runId, todos });
+  }
+  service.store.reservePendingRunFinalization({
+    runId,
+    sessionId,
+    openTransitionId: transitionId,
+    modelMessages,
+    uiMessages,
+    runStatus: "completed",
+    sessionStatus: "idle",
+    error: null,
+    terminalResult: undefined,
+    inputTokens: null,
+  });
+  service.store.commitPendingRunFinalization({
+    runId,
+    destinationStateId: `seed-final:${crypto.randomUUID()}`,
+    workspaceSnapshotId: null,
+    workspaceStatus: "unavailable",
+    workspaceUnavailableReason: "git-unavailable",
+  });
 }
 
 function chatBody(
@@ -589,25 +675,20 @@ describe("createMiniLilacServer", () => {
       cwd: directory,
       model: "test/plain",
     });
-    const runId = "todo-run";
-    service.store.createRun({
-      id: runId,
-      sessionId: session.id,
-      profile: "coding",
-      depth: 0,
-    });
-    service.store.updateSessionState(session.id, "streaming", 0, runId);
     const todos = [
       { content: "Expose durable todos", status: "in_progress", priority: "high" },
       { content: "Verify reopen", status: "pending", priority: "medium" },
     ] satisfies MiniLilacTodoState["todos"];
-    const expected = service.store.replaceTodosForRun({
-      sessionId: session.id,
-      runId,
+    const seededUser = userMessage("todo-user", "persist todos");
+    seedCompletedHistory(
+      service,
+      session.id,
+      "todo-run",
+      [{ role: "user", content: "persist todos" }],
+      [seededUser],
       todos,
-    }).state;
-    service.store.finishRun(runId, "completed");
-    service.store.updateSessionState(session.id, "idle", 0, null);
+    );
+    const expected = service.store.getTodos(session.id);
 
     const populated = await app.handle(
       jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/todos`),
@@ -623,6 +704,7 @@ describe("createMiniLilacServer", () => {
       modelResolver: () => model,
       modelLimitsResolver: async () => ({ context: 16_384, output: 2_048 }),
     });
+    await reopenedService.initialize();
     const reopenedApp = createMiniLilacServer({
       config,
       sessionService: reopenedService,
@@ -737,7 +819,7 @@ describe("createMiniLilacServer", () => {
     service.close();
   });
 
-  it("serves strict durable undo and does not replay the undone terminal run", async () => {
+  it("serves strict durable undo/redo and does not replay an undone terminal run", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "terminal answer") });
     const { app, directory, service } = await testServer(model);
     const multipartUser = {
@@ -764,6 +846,8 @@ describe("createMiniLilacServer", () => {
       status: "undone",
       clientCommandId: "undo-command",
       message: multipartUser,
+      historyStateId: expect.any(String),
+      filesystem: { status: "restored" },
     });
     expect(service.getMessages("session-1")).toEqual([]);
     expect(service.store.getModelMessages("session-1")).toEqual([]);
@@ -772,6 +856,48 @@ describe("createMiniLilacServer", () => {
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/undo`, undoBody),
     );
     expect(miniLilacUndoResultSchema.parse(await responseJson(duplicate))).toEqual(result);
+
+    const redoBody = { sessionId: "session-1", clientCommandId: "redo-command" };
+    const redo = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/redo`, redoBody),
+    );
+    expect(redo.status).toBe(200);
+    const redoResult = miniLilacRedoResultSchema.parse(await responseJson(redo));
+    expect(redoResult).toEqual({
+      status: "redone",
+      clientCommandId: "redo-command",
+      message: multipartUser,
+      historyStateId: expect.any(String),
+      filesystem: { status: "restored" },
+    });
+    expect(
+      miniLilacRedoResultSchema.parse(
+        await responseJson(
+          await app.handle(
+            jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/redo`, redoBody),
+          ),
+        ),
+      ),
+    ).toEqual(redoResult);
+    const emptyRedoBody = { sessionId: "session-1", clientCommandId: "empty-redo-command" };
+    const emptyRedo = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/redo`, emptyRedoBody),
+    );
+    expect(emptyRedo.status).toBe(200);
+    expect(miniLilacRedoResultSchema.parse(await responseJson(emptyRedo))).toEqual({
+      status: "empty",
+      clientCommandId: "empty-redo-command",
+    });
+
+    const secondUndoBody = { sessionId: "session-1", clientCommandId: "undo-command-2" };
+    const secondUndo = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/undo`, secondUndoBody),
+    );
+    expect(miniLilacUndoResultSchema.parse(await responseJson(secondUndo))).toMatchObject({
+      status: "undone",
+      clientCommandId: "undo-command-2",
+      message: multipartUser,
+    });
     const emptyBody = { sessionId: "session-1", clientCommandId: "empty-undo-command" };
     const empty = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/undo`, emptyBody),
@@ -810,6 +936,131 @@ describe("createMiniLilacServer", () => {
       }),
     );
     expect(malformed.status).toBe(400);
+    const redoMismatch = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/other/redo`, redoBody),
+    );
+    expect(redoMismatch.status).toBe(409);
+    const malformedRedo = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/redo`, {
+        ...redoBody,
+        unexpected: true,
+      }),
+    );
+    expect(malformedRedo.status).toBe(400);
+    const missingRedoCommandId = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/redo`, {
+        sessionId: "session-1",
+      }),
+    );
+    expect(missingRedoCommandId.status).toBe(400);
+    service.close();
+  });
+
+  it("maps redo quiescence, recovery blocks, abandonment, and operational failures", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("answer", "terminal answer") });
+    const { app, directory, service } = await testServer(model);
+    const session = await service.createSession({ cwd: directory, model: "test/reasoner" });
+    const message = userMessage("redo-message", "redo message");
+    const originalRedo = service.redo.bind(service);
+
+    const cases: readonly {
+      readonly id: string;
+      readonly error: Error;
+      readonly status: number;
+      readonly code: string;
+    }[] = [
+      {
+        id: "quiescence",
+        error: new Error(`Session '${session.id}' must be quiescent to redo`),
+        status: 409,
+        code: "conflict",
+      },
+      {
+        id: "journal",
+        error: new Error("Workspace 'workspace-1' has a retained history operation"),
+        status: 409,
+        code: "conflict",
+      },
+      {
+        id: "abandoned",
+        error: new HistoryRecoveryAbandonedError({
+          type: "history-command-error",
+          code: "history-recovery-abandoned",
+          commandId: "redo-abandoned",
+          message: "operator abandoned recovery",
+        }),
+        status: 409,
+        code: "history-recovery-abandoned",
+      },
+      {
+        id: "restore-conflict",
+        error: new WorkspaceHistoryStoreError({
+          code: "restore-conflict",
+          operation: "restore workspace",
+          message: "workspace changed during restore preparation",
+        }),
+        status: 409,
+        code: "conflict",
+      },
+      {
+        id: "restore",
+        error: new WorkspaceHistoryStoreError({
+          code: "filesystem-error",
+          operation: "restore workspace",
+          message: "injected restore failure",
+        }),
+        status: 500,
+        code: "internal_error",
+      },
+      {
+        id: "corruption",
+        error: new WorkspaceHistoryStoreError({
+          code: "ownership-mismatch",
+          operation: "open history store",
+          message: "history store ownership does not match",
+        }),
+        status: 500,
+        code: "internal_error",
+      },
+    ];
+    for (const testCase of cases) {
+      service.redo = () => Promise.reject(testCase.error);
+      const response = await app.handle(
+        jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/redo`, {
+          sessionId: session.id,
+          clientCommandId: `redo-${testCase.id}`,
+        }),
+      );
+      expect(response.status).toBe(testCase.status);
+      const body = await responseJson(response);
+      expect(body).toMatchObject({ error: { code: testCase.code } });
+      if (testCase.id === "restore-conflict") {
+        expect(body).toMatchObject({
+          error: { message: "workspace changed during restore preparation" },
+        });
+      }
+    }
+
+    service.redo = async (request) => ({
+      status: "redone",
+      clientCommandId: request.clientCommandId,
+      message,
+      historyStateId: "history-state",
+      filesystem: { status: "skipped", reason: "git-unavailable" },
+    });
+    const skipped = await app.handle(
+      jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/redo`, {
+        sessionId: session.id,
+        clientCommandId: "redo-skipped",
+      }),
+    );
+    expect(skipped.status).toBe(200);
+    expect(miniLilacRedoResultSchema.parse(await responseJson(skipped))).toMatchObject({
+      status: "redone",
+      filesystem: { status: "skipped", reason: "git-unavailable" },
+    });
+
+    service.redo = originalRedo;
     service.close();
   });
 
@@ -828,8 +1079,10 @@ describe("createMiniLilacServer", () => {
       },
       userMessage("latest-user", "latest request"),
     ];
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service,
       session.id,
+      "manual-compaction-seed",
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
@@ -910,8 +1163,10 @@ describe("createMiniLilacServer", () => {
           sessionId: session.id,
         }),
       );
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service,
       session.id,
+      "cancel-compaction-seed",
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
@@ -965,8 +1220,10 @@ describe("createMiniLilacServer", () => {
     });
     const { app, directory, service } = await testServer(model);
     const session = await service.createSession({ cwd: directory, model: "test/reasoner" });
-    service.store.replaceMessages(
+    seedCompletedHistory(
+      service,
       session.id,
+      "conflicting-compaction-seed",
       [
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
@@ -1304,7 +1561,7 @@ describe("createMiniLilacServer", () => {
         jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
       );
       const fullChunks = parseSseChunks(await initial.text());
-      const run = service.store.getLatestRun("session-1");
+      const run = service.store.getLatestSelectedRootRun("session-1");
       if (!run) throw new Error("Expected an error run");
       expect(run.status).toBe("error");
 
@@ -1354,15 +1611,41 @@ describe("createMiniLilacServer", () => {
       profile: "coding",
       reasoning: "provider-default",
     });
-    for (const runId of ["older-run", "newer-run"] as const) {
-      service.store.createRun({
-        id: runId,
-        sessionId: "session-1",
-        profile: "coding",
-        depth: 0,
-      });
-      service.store.finishRun(runId, "completed");
-    }
+    const olderUser = userMessage("older-user", "older prompt");
+    const olderAssistant = {
+      id: "older-assistant",
+      role: "assistant" as const,
+      parts: [{ type: "text" as const, text: "older answer" }],
+    };
+    seedCompletedHistory(
+      service,
+      "session-1",
+      "older-run",
+      [
+        { role: "user", content: "older prompt" },
+        { role: "assistant", content: "older answer" },
+      ],
+      [olderUser, olderAssistant],
+    );
+    seedCompletedHistory(
+      service,
+      "session-1",
+      "newer-run",
+      [
+        ...service.store.getModelMessages("session-1"),
+        { role: "user", content: "newer prompt" },
+        { role: "assistant", content: "newer answer" },
+      ],
+      [
+        ...service.store.getUiMessages("session-1"),
+        userMessage("newer-user", "newer prompt"),
+        {
+          id: "newer-assistant",
+          role: "assistant",
+          parts: [{ type: "text", text: "newer answer" }],
+        },
+      ],
+    );
     service.store.database
       .query("UPDATE runs SET started_at = ? WHERE session_id = ?")
       .run("2026-07-21T12:00:00.000Z", "session-1");
@@ -1548,16 +1831,13 @@ describe("createMiniLilacServer", () => {
     expect(stale.status).toBe(409);
     expect(service.getSnapshot("session-1").activeRunId).not.toBe("stale-run");
 
-    const interrupt = await app.handle(
+    const interruptPromise = app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/interrupt-queued-steering`, {
         sessionId: "session-1",
         runId: service.getSnapshot("session-1").activeRunId,
         clientCommandId: "interrupt-command",
       }),
     );
-    expect(
-      miniLilacInterruptQueuedSteeringResultSchema.parse(await responseJson(interrupt)),
-    ).toMatchObject({ status: "interrupted", clientCommandId: "interrupt-command" });
 
     const cancel = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/cancel`, {
@@ -1572,6 +1852,10 @@ describe("createMiniLilacServer", () => {
     });
 
     release();
+    const interrupt = await interruptPromise;
+    expect(
+      miniLilacInterruptQueuedSteeringResultSchema.parse(await responseJson(interrupt)),
+    ).toMatchObject({ status: "inactive", clientCommandId: "interrupt-command" });
     const replayed = await reconnect.text();
     expect(replayed).toContain('"type":"data-control"');
     expect(replayed).toContain("data: [DONE]");
