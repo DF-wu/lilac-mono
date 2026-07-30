@@ -3,7 +3,7 @@ import type { SurfaceOutputPart, SurfaceOutputResult, SurfaceOutputStream } from
 
 import { createIssueComment } from "../../../github/github-api";
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
-import { parseGithubSessionId } from "../../../github/github-ids";
+import { githubMessageUrl, parseGithubSessionId } from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
@@ -64,7 +64,11 @@ export class GithubOutputStream implements SurfaceOutputStream {
     const replyPrefix = (() => {
       const replyTo = this.opts?.replyTo;
       if (!replyTo || replyTo.platform !== "github") return "";
-      return `In reply to ${replyTo.messageId}:\n\n`;
+      const replyUrl = githubMessageUrl({
+        sessionId: replyTo.channelId,
+        messageId: replyTo.messageId,
+      });
+      return `In reply to ${replyUrl}:\n\n`;
     })();
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);

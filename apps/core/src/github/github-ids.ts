@@ -47,6 +47,15 @@ export function isGithubIssueTriggerId(input: { sessionId: string; triggerId: st
   return String(thread.number) === input.triggerId;
 }
 
+export function githubMessageUrl(input: { sessionId: string; messageId: string }): string {
+  const thread = parseGithubSessionId(input.sessionId);
+  const threadUrl = `https://github.com/${encodeURIComponent(thread.owner)}/${encodeURIComponent(thread.repo)}/issues/${thread.number}`;
+
+  return String(thread.number) === input.messageId
+    ? threadUrl
+    : `${threadUrl}#issuecomment-${encodeURIComponent(input.messageId)}`;
+}
+
 export function repoFullName(ref: GithubRepoRef): string {
   return `${ref.owner}/${ref.repo}`;
 }
