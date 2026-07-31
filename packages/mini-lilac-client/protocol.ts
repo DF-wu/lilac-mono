@@ -798,7 +798,12 @@ export const miniLilacHistoryFilesystemResultSchema = z.discriminatedUnion("stat
   z.strictObject({ status: z.literal("restored") }),
   z.strictObject({
     status: z.literal("skipped"),
-    reason: z.enum(["git-unavailable", "snapshot-unavailable", "platform-unsupported"]),
+    reason: z.enum([
+      "git-unavailable",
+      "non-git-workspace",
+      "snapshot-unavailable",
+      "platform-unsupported",
+    ]),
   }),
 ]);
 export type MiniLilacHistoryFilesystemResult = z.infer<

@@ -462,6 +462,85 @@ describe("MiniLilacSqliteStore history schema", () => {
     store.close();
   });
 
+  it("migrates v5 history constraints to accept non-Git workspace outcomes", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-history-v5-");
+    const original = new MiniLilacSqliteStore(file);
+    createSession(original, "session-1", directory);
+    const root = original.getCurrentHistoryState("session-1");
+    const message = userMessage("v5-user");
+    admitPrompt(original, {
+      sessionId: "session-1",
+      runId: "v5-run",
+      commandId: "v5-prompt",
+      transitionId: "v5-transition",
+      message,
+      observationIds: { stateId: "v5-observation", transitionId: "v5-observation-transition" },
+    });
+    finalizePrompt(original, {
+      sessionId: "session-1",
+      runId: "v5-run",
+      transitionId: "v5-transition",
+      destinationStateId: "v5-destination",
+      user: message,
+    });
+    original.reserveCommand("session-1", "v5-undo", { kind: "undo", runId: null, payload: {} });
+    original.reserveHistoryOperation({
+      id: "v5-operation",
+      sessionId: "session-1",
+      commandId: "v5-undo",
+      requestedAction: "undo",
+      expectedSourceStateId: "v5-destination",
+      targetStateId: "v5-observation",
+      userTransitionId: "v5-transition",
+      filesystemMode: "skip",
+      skipReason: "git-unavailable",
+    });
+    const rootRow = original.database
+      .query("SELECT rowid FROM history_states WHERE id = ?")
+      .get(root.id);
+    original.close();
+
+    const legacy = new Database(file, { strict: true });
+    legacy.exec("PRAGMA user_version = 5;");
+    legacy.close();
+
+    const migrated = new MiniLilacSqliteStore(file);
+    expect(migrated.database.query("PRAGMA user_version").get()).toEqual({ user_version: 6 });
+    expect(
+      migrated.database.query("SELECT rowid FROM history_states WHERE id = ?").get(root.id),
+    ).toEqual(rootRow);
+    expect(migrated.database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(migrated.listHistoryOperations()).toMatchObject([
+      { id: "v5-operation", skipReason: "git-unavailable" },
+    ]);
+    expect(
+      migrated.database
+        .query(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'index' AND name LIKE 'history_states_%' ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([{ name: "history_states_session" }, { name: "history_states_workspace_snapshot" }]);
+    expect(
+      migrated.database
+        .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'history_operations'")
+        .get(),
+    ).toMatchObject({ sql: expect.stringContaining("'non-git-workspace'") });
+
+    migrated.database
+      .query(
+        `UPDATE history_states
+         SET workspace_status = 'unavailable', workspace_unavailable_reason = 'non-git-workspace'
+         WHERE id = ?`,
+      )
+      .run("v5-destination");
+    expect(migrated.getCurrentHistoryState("session-1")).toMatchObject({
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "non-git-workspace",
+    });
+    migrated.close();
+  });
+
   it("atomically commits and replays action-specific empty navigation results", async () => {
     const { directory, file } = await temporaryDatabasePath("mini-lilac-history-empty-");
     const store = new MiniLilacSqliteStore(file);

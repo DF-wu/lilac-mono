@@ -282,6 +282,8 @@ tools, patches, or commands. A successful strict response is:
 `filesystem.status = "skipped"` means transcript history moved but the worktree was left unchanged:
 
 - `git-unavailable`: the Git executable needed by the private snapshot store was unavailable.
+- `non-git-workspace`: filesystem history is disabled because the session directory is outside a Git
+  worktree.
 - `snapshot-unavailable`: the target has no usable snapshot, including legacy, failed, missing, or
   corrupt captures.
 - `platform-unsupported`: native filesystem history is unavailable on the current platform.
