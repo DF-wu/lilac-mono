@@ -225,6 +225,7 @@ export async function deleteIssueComment(input: {
 }
 
 export async function getIssue(input: { owner: string; repo: string; number: number }): Promise<{
+  id: number;
   title: string;
   body: string | null;
   html_url?: string;
