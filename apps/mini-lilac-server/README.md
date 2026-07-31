@@ -154,8 +154,10 @@ system prompt or an earlier `read_file` result.
 Provider model metadata can override discovered models.dev or `/v1/models` values under
 `providers.<provider>.models.<model>`. Configured fields win while omitted fields keep their
 catalog values. Supported patches include `name`, `family`, `attachment`, `reasoning`, `toolCall`,
-`modalities`, and partial `limit.context` / `limit.output` values. These resolved limits are shared
-by the model list, token-usage display, and automatic and manual compaction.
+`modalities`, partial `limit.context` / `limit.output` values, and `openaiServerCompaction`.
+`openaiServerCompaction: true` is accepted only for `type: openai`; omitting it or setting `false`
+disables it. These resolved limits are shared by the model list, token-usage display, and automatic
+and manual compaction.
 
 Profiles can expose the native `skill` tool explicitly or through `tools: ["*"]`. Mini Lilac only
 discovers compatible `SKILL.md` bundles from workspace `.agents/skills`, user `~/.agents/skills`, and

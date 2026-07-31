@@ -8,7 +8,16 @@ import type {
 } from "./ai-sdk-pi-agent";
 import { AiSdkPiAgent } from "./ai-sdk-pi-agent";
 import { isLikelyContextOverflowError } from "./context-overflow";
-import { ModelCapability, type JSONObject, type ModelSpecifier } from "@stanley2058/lilac-utils";
+import {
+  readOpenAIServerCompactionArtifact,
+  type OpenAIServerCompactionArtifact,
+} from "./openai-server-compaction";
+import {
+  isOpenAICompactionPart,
+  ModelCapability,
+  type JSONObject,
+  type ModelSpecifier,
+} from "@stanley2058/lilac-utils";
 
 function getString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
@@ -163,6 +172,11 @@ function estimateMessageTokens(message: ModelMessage): number {
     }
     let text = "";
     for (const part of message.content) {
+      const artifact = readOpenAIServerCompactionArtifact(part);
+      if (artifact) {
+        return artifact.metadata.estimatedTokens;
+      }
+      if (isOpenAICompactionPart(part)) continue;
       if (typeof part !== "object" || part === null) {
         text += stringifyUnknown(part);
         continue;
@@ -531,6 +545,12 @@ function renderMessageForSummary(message: ModelMessage): string {
 
     const lines: string[] = [];
     for (const part of message.content) {
+      const artifact = readOpenAIServerCompactionArtifact(part);
+      if (artifact) {
+        lines.push(`[OPENAI SERVER COMPACTION]\n${artifact.metadata.portableSummary}`);
+        continue;
+      }
+      if (isOpenAICompactionPart(part)) continue;
       if (typeof part === "object" && part !== null) {
         const record = part as Record<string, unknown>;
         const type = getString(record["type"]);
@@ -713,6 +733,13 @@ export type CompactionStreamHooks = {
    */
   onSummaryDelta?: (delta: string, progress: CompactionProgress) => void;
 };
+
+export type ServerCompactionFn = (params: {
+  readonly messages: readonly ModelMessage[];
+  readonly portableSummary: string;
+  readonly context?: TransformMessagesContext;
+  readonly abortSignal?: AbortSignal;
+}) => Promise<OpenAIServerCompactionArtifact>;
 
 async function summarizeMessagesHierarchical(options: {
   messages: readonly ModelMessage[];
@@ -1022,6 +1049,38 @@ function buildCompactionSummaryMessage(summary: string): ModelMessage {
   };
 }
 
+function isCompactionSummaryMessage(message: ModelMessage): boolean {
+  return (
+    message.role === "user" &&
+    typeof message.content === "string" &&
+    message.content.startsWith("<context-compaction>\n")
+  );
+}
+
+function retainServerCompactionUserMessages(
+  messages: readonly ModelMessage[],
+  tokenBudget: number,
+): ModelMessage[] {
+  let remaining = Math.max(0, Math.floor(tokenBudget));
+  const retained: ModelMessage[] = [];
+  for (let index = messages.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message?.role !== "user" ||
+      isAutoContinueMessage(message) ||
+      isCompactionSummaryMessage(message)
+    ) {
+      continue;
+    }
+    const tokens = Math.max(1, estimateMessageTokens(message));
+    if (tokens > remaining) break;
+    retained.push(cloneMessage(message));
+    remaining -= tokens;
+  }
+  retained.reverse();
+  return retained;
+}
+
 function buildAutoContinueMessage(): ModelMessage {
   return {
     role: "user",
@@ -1166,6 +1225,15 @@ export type AutoCompactionOptions = {
   /** Optional base transform to run before compaction. */
   baseTransformMessages?: TransformMessagesFn;
 
+  /** Optional provider-native compaction lane; local summary remains the portable fallback. */
+  serverCompaction?: ServerCompactionFn;
+
+  /** Dynamic gate used when the active model may change during a run. */
+  serverCompactionEnabled?: () => boolean;
+
+  /** Reports native-lane failure before the local compaction result is used. */
+  onServerCompactionError?: (error: unknown) => void;
+
   /** Optional base turn error handler to chain before overflow recovery logic. */
   baseTurnErrorHandler?: TurnErrorHandler;
 
@@ -1234,6 +1302,15 @@ export type ManualCompactionOptions = {
   /** Provider-specific options forwarded to summary model calls. */
   providerOptions?: { [x: string]: JSONObject };
 
+  /** Optional provider-native compaction lane; local summary remains the portable fallback. */
+  serverCompaction?: ServerCompactionFn;
+
+  /** Model request context supplied to the provider-native compaction lane. */
+  serverCompactionContext?: TransformMessagesContext;
+
+  /** Reports native-lane failure before the local compaction result is used. */
+  onServerCompactionError?: (error: unknown) => void;
+
   /** Override summary system prompt. */
   summarySystem?: string;
 
@@ -1278,6 +1355,10 @@ type CompactRepairedMessagesOptions = {
   buildSummaryPrompt: (prefix: string) => string;
   buildSummaryUpdatePrompt: (previousSummary: string, nextTranscript: string) => string;
   forceCompaction?: boolean;
+  serverCompaction?: ServerCompactionFn;
+  serverCompactionEnabled?: () => boolean;
+  serverCompactionContext?: TransformMessagesContext;
+  onServerCompactionError?: (error: unknown) => void;
   abortSignal?: AbortSignal;
 } & CompactionStreamHooks;
 
@@ -1291,6 +1372,7 @@ async function compactRepairedMessages(
   );
   let compactedCandidate: ModelMessage[] | null = null;
   let persistedSummary = "";
+  let serverCompactionMessages: readonly ModelMessage[] | null = null;
 
   for (let pass = 0; pass < maxCompactionPasses; pass++) {
     const boundary = resolveCompactionBoundary({
@@ -1364,6 +1446,7 @@ async function compactRepairedMessages(
       ...suffixMessages,
     ]).messages;
     compactedCandidate = passCompacted;
+    serverCompactionMessages = historyMessages;
 
     if (estimateMessagesTokens(passCompacted) <= options.budget.inputBudget) {
       break;
@@ -1376,11 +1459,60 @@ async function compactRepairedMessages(
 
   // Final shrinking can truncate the summary; report the post-shrink text so
   // the persisted summary never diverges from the committed model context.
-  return shrinkCompactedMessagesToBudget({
+  const localCompaction = shrinkCompactedMessagesToBudget({
     messages: compactedCandidate,
     inputBudget: options.budget.inputBudget,
     summary: persistedSummary,
   });
+
+  if (
+    !options.serverCompaction ||
+    !serverCompactionMessages ||
+    options.serverCompactionEnabled?.() === false
+  ) {
+    return localCompaction;
+  }
+
+  try {
+    const artifact = await options.serverCompaction({
+      messages: serverCompactionMessages,
+      portableSummary: localCompaction.summary,
+      context: options.serverCompactionContext,
+      abortSignal: options.abortSignal,
+    });
+    const retainedUserBudget = resolveRetainedTailTokenCap(
+      options.budget.inputBudget,
+      options.keepRecentTokens,
+    );
+    const retainedUsers = retainServerCompactionUserMessages(
+      serverCompactionMessages,
+      retainedUserBudget,
+    );
+    const suffix = localCompaction.messages.slice(1);
+    let nativeMessages: ModelMessage[] = [
+      ...retainedUsers,
+      { role: "assistant", content: [artifact.part] },
+      ...suffix,
+    ];
+    while (
+      retainedUsers.length > 0 &&
+      estimateMessagesTokens(nativeMessages) > options.budget.inputBudget
+    ) {
+      retainedUsers.shift();
+      nativeMessages = [
+        ...retainedUsers,
+        { role: "assistant", content: [artifact.part] },
+        ...suffix,
+      ];
+    }
+    return estimateMessagesTokens(nativeMessages) <= options.budget.inputBudget
+      ? { messages: nativeMessages, summary: localCompaction.summary }
+      : localCompaction;
+  } catch (error) {
+    if (options.abortSignal?.aborted === true || isAbortError(error)) throw error;
+    options.onServerCompactionError?.(error);
+    return localCompaction;
+  }
 }
 
 /**
@@ -1476,6 +1608,9 @@ export async function compactMessages(
           ? summaryModel()
           : summaryModel,
     providerOptions: buildSummaryProviderOptions(options.providerOptions),
+    serverCompaction: options.serverCompaction,
+    serverCompactionContext: options.serverCompactionContext,
+    onServerCompactionError: options.onServerCompactionError,
     keepRecentTurns: options.keepRecentTurns ?? DEFAULT_KEEP_RECENT_TURNS,
     keepRecentTokens: options.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS,
     summarySystem: options.summarySystem ?? DEFAULT_SUMMARY_SYSTEM,
@@ -1917,6 +2052,10 @@ export async function attachAutoCompaction(
               ? summaryModel()
               : summaryModel,
         providerOptions: buildSummaryProviderOptions(agent.state.providerOptions),
+        serverCompaction: options.serverCompaction,
+        serverCompactionEnabled: options.serverCompactionEnabled,
+        serverCompactionContext: context,
+        onServerCompactionError: options.onServerCompactionError,
         keepRecentTurns,
         keepRecentTokens,
         summarySystem,
@@ -1998,6 +2137,7 @@ export const __autoCompactionInternals = {
   normalizeThresholdFraction,
   repairTranscriptForCompaction,
   renderMessagesForSummarySegments,
+  retainServerCompactionUserMessages,
   resolveThresholdInputTokens,
   resolveContextLimit,
   resolveRetainedTailTokenCap,

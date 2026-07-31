@@ -114,6 +114,23 @@ describe("reasoningProviderOptions", () => {
     });
   });
 
+  it("keeps encrypted reasoning content out of storage for direct OpenAI server compaction", () => {
+    expect(
+      reasoningProviderOptions({
+        usesCodexOAuth: false,
+        providerType: "openai",
+        reasoningEnabled: true,
+        openaiServerCompactionEnabled: true,
+      }),
+    ).toEqual({
+      openai: {
+        store: false,
+        include: ["reasoning.encrypted_content"],
+        reasoningSummary: "detailed",
+      },
+    });
+  });
+
   it("leaves other provider types and unknown providers untouched", () => {
     expect(
       reasoningProviderOptions({
@@ -197,6 +214,48 @@ describe("provider configuration", () => {
       }),
     );
     await expect(loadProviderConfig(configFile)).rejects.toThrow();
+  });
+
+  it("allows openaiServerCompaction only for openai model overrides", () => {
+    const openaiConfig = {
+      configVersion: 1,
+      providers: {
+        openai: {
+          type: "openai",
+          catalog: "models-dev",
+          models: { "gpt-test": { openaiServerCompaction: true } },
+        },
+      },
+    } satisfies ProviderConfig;
+    expect(providerConfigSchema.parse(openaiConfig)).toEqual(openaiConfig);
+
+    expect(
+      providerConfigSchema.safeParse({
+        ...openaiConfig,
+        providers: {
+          local: {
+            type: "openai-compatible",
+            baseUrl: "http://127.0.0.1:11434/v1",
+            catalog: "v1",
+            models: { "llama/test": { openaiServerCompaction: true } },
+          },
+        },
+      }).success,
+    ).toBe(false);
+
+    expect(
+      providerConfigSchema.safeParse({
+        ...openaiConfig,
+        providers: {
+          local: {
+            type: "openai-compatible",
+            baseUrl: "http://127.0.0.1:11434/v1",
+            catalog: "v1",
+            models: { "llama/test": { openaiServerCompaction: false } },
+          },
+        },
+      }).success,
+    ).toBe(true);
   });
 
   it("rejects group-readable auth files on POSIX", async () => {

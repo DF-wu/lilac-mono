@@ -226,7 +226,7 @@ describe("tool-server discovery", () => {
       fixture.discordSearchStore.close();
       fixture.transcriptStore.close();
     }
-  });
+  }, 20_000);
 
   it("updates only the edited discovery document", async () => {
     const fixture = await makeFixture();

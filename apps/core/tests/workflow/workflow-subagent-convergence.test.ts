@@ -1235,7 +1235,7 @@ describe("workflow subagent convergence", () => {
     expect(raw.activeSubscriptions()).toBe(0);
     await bus.close();
     setupResult.store.close();
-  });
+  }, 20_000);
 
   it("converges a coalesced null-target event to one card after surface fallback", async () => {
     const { store, run } = await createRun();

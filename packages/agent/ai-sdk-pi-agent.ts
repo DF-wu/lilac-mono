@@ -746,7 +746,7 @@ function hiddenToolRejection(toolName: string): string {
   return `Tool '${toolName}' was not offered on the step that produced this call, so it was not executed.`;
 }
 
-function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet {
+export function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet {
   // We keep the schema/description/title so the model can call tools,
   // but remove execution so we can run tools ourselves (enables steering).
   return Object.fromEntries(

@@ -107,6 +107,7 @@ describe("model catalog", () => {
             "gpt-test": {
               name: "Configured GPT",
               reasoning: false,
+              openaiServerCompaction: true,
               limit: { context: 262_144 },
             },
           },
@@ -115,7 +116,9 @@ describe("model catalog", () => {
           type: "openai-compatible",
           baseUrl: "http://localhost:11434/v1",
           catalog: "v1",
-          models: { "llama/test": { limit: { context: 131_072 } } },
+          models: {
+            "llama/test": { limit: { context: 131_072 }, openaiServerCompaction: false },
+          },
         },
       },
     };
@@ -144,6 +147,7 @@ describe("model catalog", () => {
       name: "Configured GPT",
       family: "gpt",
       reasoning: false,
+      openaiServerCompaction: true,
       limits: { context: 262_144, output: 16_000 },
     });
     expect(snapshot.models.find((model) => model.ref.value === "local/llama/test")?.limits).toEqual(
@@ -152,6 +156,10 @@ describe("model catalog", () => {
         output: 0,
       },
     );
+    expect(
+      snapshot.models.find((model) => model.ref.value === "local/llama/test")
+        ?.openaiServerCompaction,
+    ).toBe(false);
 
     const capability = new ModelCapability({ overrides: modelCapabilityOverrides(snapshot) });
     await expect(capability.resolve("primary/gpt-test")).resolves.toMatchObject({

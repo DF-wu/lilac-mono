@@ -1029,7 +1029,7 @@ export class WorkspaceHistoryStore {
         return { status: "skipped", reason: capability.reason };
       }
       await this.ensureStore();
-      const classified = await this.classifyWorkspace();
+      const classified = await this.classifyWorkspaceForCapture();
       observation.candidatePathCount = classified.entries.size + classified.directories.size;
       observation.managedPathCount = classified.managed.size;
       const result = await this.captureClassifiedWorkspace(classified, observation);
@@ -2558,11 +2558,18 @@ export class WorkspaceHistoryStore {
     }
   }
 
-  private async scanWorkspace(): Promise<ScanResult> {
+  private async scanWorkspace(managedPaths?: ReadonlySet<string>): Promise<ScanResult> {
     const entries = new Map<string, ScannedEntry>();
     const directories = new Set<string>();
     const boundaryRoots = new Set<string>();
     const ownedRestoreArtifacts = await this.validatedOwnedRestoreArtifactPaths();
+    const traversedDirectories = new Set<string>();
+    if (managedPaths) {
+      for (const relativePath of managedPaths) {
+        traversedDirectories.add(relativePath);
+        for (const ancestor of pathAncestors(relativePath)) traversedDirectories.add(ancestor);
+      }
+    }
 
     const scanDirectory = async (
       absoluteDirectory: string,
@@ -2591,6 +2598,7 @@ export class WorkspaceHistoryStore {
         const stats = await lstat(absolutePath, { bigint: true });
         if (stats.isDirectory()) {
           directories.add(relativePath);
+          if (managedPaths && !traversedDirectories.has(relativePath)) continue;
           await scanDirectory(absolutePath, relativePath);
           continue;
         }
@@ -2642,6 +2650,29 @@ export class WorkspaceHistoryStore {
         [...scan.entries.keys()].filter((relativePath) => !ignored.has(relativePath)),
       );
     }
+    const managed = new Map<string, ScannedEntry>();
+    for (const relativePath of managedPaths) {
+      const entry = scan.entries.get(relativePath);
+      if (entry) managed.set(relativePath, entry);
+    }
+    for (const relativePath of managed.keys()) ignored.delete(relativePath);
+    const ignoredDirectories = new Set(
+      [...scan.directories].filter((relativePath) => ignored.has(relativePath)),
+    );
+    return { ...scan, managed, ignored, ignoredDirectories };
+  }
+
+  private async classifyWorkspaceForCapture(): Promise<ClassifiedWorkspace> {
+    const sourceRepository = await this.discoverSourceRepository();
+    if (!sourceRepository) return await this.classifyWorkspace();
+
+    this.sourceExcludesFile = await this.resolveEffectiveExcludesFile(sourceRepository.root);
+    const managedPaths = await this.listSourceManagedPaths(sourceRepository.root);
+    const scan = await this.scanWorkspace(managedPaths);
+    const ignored = await this.checkIgnoredPaths(scan, {
+      repositoryRoot: sourceRepository.root,
+      sourceProfile: true,
+    });
     const managed = new Map<string, ScannedEntry>();
     for (const relativePath of managedPaths) {
       const entry = scan.entries.get(relativePath);

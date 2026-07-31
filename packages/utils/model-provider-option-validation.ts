@@ -6,6 +6,7 @@ export type ModelProviderOptionWarning = CoreConfigModelOptionWarning;
 const MODEL_OPTION_META_KEYS = new Set([
   "anthropic_prompt_cache",
   "codex_instructions",
+  "openai_server_compaction",
   "response_commentary",
 ]);
 

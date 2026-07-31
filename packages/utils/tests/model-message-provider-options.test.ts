@@ -5,7 +5,7 @@ import type { ModelMessage } from "ai";
 import { withoutOpenAIItemIds } from "../model-message-provider-options";
 
 describe("withoutOpenAIItemIds", () => {
-  it("strips item IDs from stored assistant parts while preserving all other metadata", () => {
+  it("strips item IDs from other parts while preserving compaction item IDs", () => {
     const messages: ModelMessage[] = [
       { role: "user", content: "Continue" },
       {
@@ -97,7 +97,9 @@ describe("withoutOpenAIItemIds", () => {
           {
             type: "custom",
             kind: "openai.compaction",
-            providerOptions: { openai: { encryptedContent: "encrypted-compaction" } },
+            providerOptions: {
+              openai: { itemId: "cmp_123", encryptedContent: "encrypted-compaction" },
+            },
           },
         ],
       },

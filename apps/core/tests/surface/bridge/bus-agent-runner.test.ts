@@ -3227,9 +3227,9 @@ describe("anthropic fallback URL downloads", () => {
         },
       ]);
 
-      expect(downloadCalls).toEqual([
-        "https://example.com/image.png?test=force-download",
+      expect(downloadCalls.toSorted()).toEqual([
         "data:image/png;base64,AA==",
+        "https://example.com/image.png?test=force-download",
       ]);
       expect(result).toEqual([
         {

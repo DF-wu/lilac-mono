@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   chmod,
   copyFile,
@@ -14,6 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createOpenAI } from "@ai-sdk/openai";
+import { attachAutoCompaction, type AutoCompactionOptions } from "@stanley2058/lilac-agent";
 import type {
   MiniLilacCancelCompactionResult,
   MiniLilacCompactionEvent,
@@ -3972,6 +3974,82 @@ describe("SessionService", () => {
     reopened.close();
   });
 
+  it("manually compacts an ungated session whose stored profile no longer exists", async () => {
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => textResult("summary", "Portable context."),
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-removed-profile-compact-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await initial.createSession({ cwd: directory, model: "test/mock" });
+    seedCompletedHistory(
+      initial.store,
+      session.id,
+      [
+        { role: "user", content: "retained native input" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "custom",
+              kind: "openai.compaction",
+              providerOptions: {
+                openai: {
+                  type: "compaction",
+                  itemId: "cmp_removed_profile",
+                  encryptedContent: "encrypted-removed-profile-state",
+                },
+                lilac: {
+                  serverCompaction: {
+                    formatVersion: 1,
+                    protocol: "openai-responses-v2",
+                    replayKey: "openai:openai/gpt-old",
+                    portableSummary: `Portable removed-profile context ${"p".repeat(6_000)}`,
+                    estimatedTokens: 1_600,
+                  },
+                },
+              },
+            },
+          ],
+        },
+        { role: "user", content: `latest request ${"b".repeat(6_000)}` },
+      ],
+      [userMessage("visible history")],
+    );
+    initial.close();
+
+    const database = new Database(databasePath, { strict: true });
+    database.query("UPDATE sessions SET profile = ? WHERE id = ?").run("removed", session.id);
+    database.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const { result } = await compact(reopened, {
+      sessionId: session.id,
+      clientCommandId: "compact-removed-profile",
+    });
+
+    expect(result).toMatchObject({ phase: "completed", outcome: "compacted" });
+    expect(result.messageCountBefore).toBe(3);
+    expect(JSON.stringify(summaryModel.doStreamCalls)).toContain(
+      "Portable removed-profile context",
+    );
+    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain(
+      "encrypted-removed-profile-state",
+    );
+    reopened.close();
+  });
+
   it("streams and persists automatic compaction events in visible history", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-auto-compact-event-"));
@@ -4102,6 +4180,161 @@ describe("SessionService", () => {
         data: expect.objectContaining({ phase: "completed", outcome: "compacted" }),
       }),
     );
+    service.close();
+  });
+
+  it("enables OpenAI server compaction only for its exact configured model override", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-server-compaction-"));
+    temporaryDirectories.push(directory);
+    const providerConfig: ProviderConfig = {
+      configVersion: 1,
+      providers: {
+        openai: {
+          type: "openai",
+          catalog: "models-dev",
+          models: { "gpt-enabled": { openaiServerCompaction: true } },
+        },
+        other: { type: "openai", catalog: "models-dev" },
+      },
+    };
+    const auth: ProviderAuth = {
+      openai: { type: "api-key", key: "test-openai-key" },
+      other: { type: "api-key", key: "test-other-key" },
+    };
+    const providers: LoadedProviderRegistry = {
+      config: providerConfig,
+      auth,
+      registry: createAiProviderRegistry(providerConfig, auth),
+      supersededProviderIds: [],
+    };
+    const attached: Array<{ model: string; hasServerCompaction: boolean }> = [];
+    const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers,
+      modelResolver: () => model,
+      attachCompaction: async (_agent, options) => {
+        attached.push({
+          model: options.model,
+          hasServerCompaction: options.serverCompaction !== undefined,
+        });
+        return () => {};
+      },
+    });
+
+    for (const modelSpecifier of [
+      "openai/gpt-enabled",
+      "openai/gpt-unmatched",
+      "other/gpt-enabled",
+    ]) {
+      const session = await service.createSession({
+        cwd: directory,
+        model: modelSpecifier,
+        reasoning: "high",
+      });
+      await collect((await service.startPrompt(session.id, userMessage(modelSpecifier))).stream);
+    }
+
+    expect(attached).toEqual([
+      { model: "openai/gpt-enabled", hasServerCompaction: true },
+      { model: "openai/gpt-unmatched", hasServerCompaction: false },
+      { model: "other/gpt-enabled", hasServerCompaction: false },
+    ]);
+    service.close();
+  });
+
+  it("heals a rejected native replay and re-enables later server compaction", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-server-replay-fallback-"));
+    temporaryDirectories.push(directory);
+    const providerConfig: ProviderConfig = {
+      configVersion: 1,
+      providers: {
+        openai: {
+          type: "openai",
+          catalog: "models-dev",
+          models: { "gpt-enabled": { openaiServerCompaction: true } },
+        },
+      },
+    };
+    const auth: ProviderAuth = { openai: { type: "api-key", key: "test-openai-key" } };
+    const providers: LoadedProviderRegistry = {
+      config: providerConfig,
+      auth,
+      registry: createAiProviderRegistry(providerConfig, auth),
+      supersededProviderIds: [],
+    };
+    let calls = 0;
+    const prompts: string[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: async (options) => {
+        calls += 1;
+        prompts.push(JSON.stringify(options.prompt));
+        if (calls === 1) {
+          throw Object.assign(new Error("invalid compaction item"), { statusCode: 400 });
+        }
+        return textResult("answer", "portable retry succeeded");
+      },
+    });
+    let attachedOptions: AutoCompactionOptions | undefined;
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers,
+      modelResolver: () => model,
+      modelLimitsResolver: async () => ({ context: 100_000, output: 4_000 }),
+      attachCompaction: async (agent, options) => {
+        attachedOptions = options;
+        return await attachAutoCompaction(agent, options);
+      },
+    });
+    const session = await service.createSession({ cwd: directory, model: "openai/gpt-enabled" });
+    seedCompletedHistory(
+      service.store,
+      session.id,
+      [
+        { role: "user", content: "retained native input" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "custom",
+              kind: "openai.compaction",
+              providerOptions: {
+                openai: {
+                  type: "compaction",
+                  itemId: "cmp_rejected",
+                  encryptedContent: "encrypted-rejected-state",
+                },
+                lilac: {
+                  serverCompaction: {
+                    formatVersion: 1,
+                    protocol: "openai-responses-v2",
+                    replayKey: "openai:openai/gpt-enabled",
+                    portableSummary: "Portable replay context.",
+                    estimatedTokens: 64,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+      [userMessage("visible prior request")],
+    );
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("continue after native replay"))).stream,
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("encrypted-rejected-state");
+    expect(prompts[1]).toContain("Portable replay context.");
+    expect(prompts[1]).not.toContain("encrypted-rejected-state");
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).not.toContain(
+      "encrypted-rejected-state",
+    );
+    expect(attachedOptions?.serverCompactionEnabled?.()).toBe(true);
     service.close();
   });
 
