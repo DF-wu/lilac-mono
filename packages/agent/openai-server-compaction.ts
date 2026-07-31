@@ -153,13 +153,22 @@ export function materializeOpenAIServerCompaction(
   replayKey: string | undefined,
 ): ModelMessage[] {
   const sanitizedMessages = messages.flatMap((message): ModelMessage[] => {
-    if (message.role !== "assistant" || !Array.isArray(message.content)) {
-      return [structuredClone(message)];
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      const content = message.content
+        .filter(
+          (part) =>
+            !isOpenAICompactionPart(part) || readOpenAIServerCompactionArtifact(part) !== null,
+        )
+        .map((part) => ({ ...part }));
+      return content.length === 0 ? [] : [{ ...message, content }];
     }
-    const content = message.content.filter(
-      (part) => !isOpenAICompactionPart(part) || readOpenAIServerCompactionArtifact(part) !== null,
-    );
-    return content.length === 0 ? [] : [{ ...structuredClone(message), content }];
+    if (message.role === "tool") {
+      return [{ ...message, content: message.content.map((part) => ({ ...part })) }];
+    }
+    if (message.role === "user" && Array.isArray(message.content)) {
+      return [{ ...message, content: message.content.map((part) => ({ ...part })) }];
+    }
+    return [{ ...message }];
   });
   let newestArtifactIndex = -1;
   let newestArtifact: OpenAIServerCompactionArtifact | null = null;

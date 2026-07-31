@@ -147,6 +147,28 @@ describe("OpenAI server compaction artifacts", () => {
     expect(materializeOpenAIServerCompaction(messages, "workspace/model")).toEqual(messages);
   });
 
+  it("materializes URL-backed file parts without deep-cloning runtime values", () => {
+    const url = new URL("https://example.com/context.pdf");
+    const filePart = {
+      type: "file" as const,
+      data: url,
+      mediaType: "application/pdf",
+    };
+    const messages: ModelMessage[] = [{ role: "user", content: [filePart] }];
+
+    const materialized = materializeOpenAIServerCompaction(messages, "workspace/model");
+    const message = materialized[0];
+    if (message?.role !== "user" || !Array.isArray(message.content)) {
+      throw new Error("Expected a user message with multipart content.");
+    }
+    const part = message.content[0];
+    if (part?.type !== "file") throw new Error("Expected a file part.");
+
+    expect(message).not.toBe(messages[0]);
+    expect(part).not.toBe(filePart);
+    expect(part.data).toBe(url);
+  });
+
   it("projects a portable summary for a mismatched or unavailable replay key", () => {
     const artifact = artifactMessage(
       compactionPart({ replayKey: "workspace/original", portableSummary: "Portable summary." }),
