@@ -109,6 +109,11 @@ export type UniversalCoreConfig = {
 
   tools: {
     fsBackend: "fff" | "node-rg";
+    generate: {
+      image: {
+        provider: "default" | "openai-compatible";
+      };
+    };
     web: {
       extract: {
         providers: Array<"tavily" | "exa" | "firecrawl">;

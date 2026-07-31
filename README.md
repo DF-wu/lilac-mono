@@ -176,6 +176,7 @@ If you persist `/data`, the `smart-search` config and provider credentials persi
 - [`PROJECT.md`](./PROJECT.md): architecture, terminology, and runtime flow
 - [`AGENTS.md`](./AGENTS.md): repo-specific coding and validation rules
 - [`apps/acp-controller/README.md`](./apps/acp-controller/README.md): ACP controller usage details
+- [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md): routing `generate.image` through an OpenAI-compatible provider
 
 ### Runtime and deployment smoke commands
 

@@ -1,4 +1,5 @@
 import { ToolPluginSkipError, type ServerTool } from "@stanley2058/lilac-plugin-runtime";
+import { getCoreConfig } from "@stanley2058/lilac-utils";
 
 import {
   Attachment,
@@ -104,7 +105,22 @@ export function createBuiltinCodexPlugin(): CoreToolPlugin {
 }
 
 export function createBuiltinGeneratePlugin(): CoreToolPlugin {
-  return singletonLevel2("generate", () => new Generate());
+  return {
+    meta: {
+      id: "generate",
+    },
+    create({ runtime }) {
+      const config = runtime.config;
+      // Fall back to reading core-config from disk instead of leaving this
+      // undefined: an undefined getConfig makes Generate assume the "default"
+      // provider, which would silently route prompts to the built-in providers
+      // even when core-config.yaml selects "openai-compatible".
+      const getConfig = runtime.getConfig ?? (config ? async () => config : () => getCoreConfig());
+      return {
+        level2: [new Generate({ getConfig })],
+      };
+    },
+  };
 }
 
 export function createBuiltinContentInspectPlugin(): CoreToolPlugin {

@@ -396,6 +396,7 @@ Key sections:
 - `tools.web.extract.providers`: ordered web provider list shared by `web.search` and provider-backed `web.fetch`/extract (`tavily`, `exa`, `firecrawl`).
 - `tools.web.fetch.mode`: default fetch strategy (`auto`, `fetch`, `browser`, `extract`, or `provider-only`).
 - `agent.idleTimeoutMs`: primary agent inactivity timeout; active runs have no total runtime cap.
+- `tools.generate.image.provider`: transport routing switch (`default` | `openai-compatible`). When set to `openai-compatible`, image generation calls route through the OpenAI-compatible provider configured via `OPENAI_COMPATIBLE_BASE_URL` and `OPENAI_COMPATIBLE_API_KEY`. Aliases and adapters remain unchanged; all aliases route together. Canonical model IDs are fixed. Selecting third-party routing has no automatic fallback. See `docs/generate-image-openai-compatible.md` for setup and usage.
 - `agent.subagents`: subagent enablement/depth/timeout/profile config.
   - Built-in defaults: `explore` (read/search, no workspace writes/Bash/delegation), `general` (full useful tools/plugins, workspace writes, Bash, and network, without delegation), and `self` (the same plus delegation).
   - Each profile may configure Level-1 tools/plugins, Level-2 callables/plugins, network behavior, workspace-write behavior/tool exposure, execution, and delegation. `network` and `workspaceWrites` do not sandbox ordinary trusted Bash when execution is enabled. `resolveNativeSubagentProfile` is authoritative for every launch path, direct or workflow-launched.
