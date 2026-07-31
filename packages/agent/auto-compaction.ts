@@ -145,16 +145,69 @@ function isValidSuffix(messages: readonly ModelMessage[], startIndex: number): b
   return openToolCallIds === null;
 }
 
-function stringifyForTokenEstimate(value: unknown): string {
+const INLINE_MEDIA_TEXT_PLACEHOLDER = "[inline media omitted]";
+
+function isDataUrl(value: unknown): value is string {
+  return typeof value === "string" && /^data:[^,]*,/i.test(value);
+}
+
+function withoutInlineMediaPayload(value: unknown): unknown {
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value) || isDataUrl(value)) {
+    return INLINE_MEDIA_TEXT_PLACEHOLDER;
+  }
+  if (value instanceof URL) {
+    return isDataUrl(String(value)) ? INLINE_MEDIA_TEXT_PLACEHOLDER : value;
+  }
+  if (typeof value === "string") {
+    return /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : INLINE_MEDIA_TEXT_PLACEHOLDER;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  return record["type"] === "data" ? { ...record, data: INLINE_MEDIA_TEXT_PLACEHOLDER } : value;
+}
+
+function stringifyTextOnly(value: unknown, space?: number): string {
   try {
-    const serialized = JSON.stringify(value, (_key, item: unknown) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return item;
-      const record = item as Record<string, unknown>;
-      return record["type"] === "file" ? { ...record, data: "[inline media payload]" } : item;
-    });
-    return serialized ?? stringifyUnknown(value);
+    const serialized = JSON.stringify(
+      value,
+      (_key, item: unknown) => {
+        if (item instanceof ArrayBuffer || ArrayBuffer.isView(item) || isDataUrl(item)) {
+          return INLINE_MEDIA_TEXT_PLACEHOLDER;
+        }
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        const record = item as Record<string, unknown>;
+        const type = record["type"];
+        if (type === "Buffer") return INLINE_MEDIA_TEXT_PLACEHOLDER;
+        if (type === "file-data" || type === "image-data") {
+          return { ...record, data: INLINE_MEDIA_TEXT_PLACEHOLDER };
+        }
+        if (type === "file" || type === "reasoning-file") {
+          return { ...record, data: withoutInlineMediaPayload(record["data"]) };
+        }
+        if (type === "image") {
+          return {
+            ...record,
+            ...(record["data"] === undefined
+              ? {}
+              : { data: withoutInlineMediaPayload(record["data"]) }),
+            ...(record["image"] === undefined
+              ? {}
+              : { image: withoutInlineMediaPayload(record["image"]) }),
+          };
+        }
+        if (type === "file-url" || type === "image-url") {
+          return {
+            ...record,
+            url: isDataUrl(String(record["url"])) ? INLINE_MEDIA_TEXT_PLACEHOLDER : record["url"],
+          };
+        }
+        return item;
+      },
+      space,
+    );
+    return serialized ?? String(value);
   } catch {
-    return stringifyUnknown(value);
+    return "[unserializable text content omitted]";
   }
 }
 
@@ -163,7 +216,7 @@ function estimateMessageTokens(message: ModelMessage): number {
     if (typeof message.content === "string") {
       return estimateTokensFromText(message.content);
     }
-    return estimateTokensFromText(stringifyForTokenEstimate(message.content));
+    return estimateTokensFromText(stringifyTextOnly(message.content));
   }
 
   if (message.role === "assistant") {
@@ -193,20 +246,20 @@ function estimateMessageTokens(message: ModelMessage): number {
       if (type === "tool-call") {
         const toolName = getString(record["toolName"]) ?? "unknown";
         const toolCallId = getString(record["toolCallId"]) ?? "unknown";
-        text += `TOOL_CALL ${toolName} id=${toolCallId} ${stringifyUnknown(record["input"])}\n`;
+        text += `TOOL_CALL ${toolName} id=${toolCallId} ${stringifyTextOnly(record["input"])}\n`;
         continue;
       }
 
-      text += stringifyForTokenEstimate(part);
+      text += stringifyTextOnly(part);
     }
     return estimateTokensFromText(text);
   }
 
   if (message.role === "tool") {
-    return estimateTokensFromText(stringifyForTokenEstimate(message.content));
+    return estimateTokensFromText(stringifyTextOnly(message.content));
   }
 
-  return estimateTokensFromText(stringifyForTokenEstimate(message));
+  return estimateTokensFromText(stringifyTextOnly(message));
 }
 
 function estimateMessagesTokens(messages: readonly ModelMessage[]): number {
@@ -221,17 +274,16 @@ function estimateModelInputTokens(params: {
   messages: readonly ModelMessage[];
   context: Pick<TransformMessagesContext, "system" | "tools">;
 }): number {
-  try {
-    return estimateTokensFromText(
-      JSON.stringify({
-        system: params.context.system,
-        messages: params.messages,
-        tools: params.context.tools,
-      }),
-    );
-  } catch {
-    return estimateMessagesTokens(params.messages);
-  }
+  // Provider usage is authoritative for multimodal occupancy. This fallback is
+  // intentionally text-only: image tokens are provider-specific and must never
+  // be inferred from encoded bytes, dimensions, or attachment count.
+  return estimateTokensFromText(
+    stringifyTextOnly({
+      system: params.context.system,
+      messages: params.messages,
+      tools: params.context.tools,
+    }),
+  );
 }
 
 function resolveThresholdInputTokens(params: {
@@ -243,29 +295,6 @@ function resolveThresholdInputTokens(params: {
   return params.source === "transcript-estimate"
     ? (params.modelInputEstimate ?? estimateMessagesTokens(params.messages))
     : params.usageInputTokens;
-}
-
-function inlineMediaStorageBytes(messages: readonly ModelMessage[]): number {
-  const seen = new WeakSet<object>();
-  const dataBytes = (value: unknown): number => {
-    if (typeof value === "string") return Buffer.byteLength(value, "utf8");
-    if (value instanceof Uint8Array) return value.byteLength;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return 0;
-    const record = value as Record<string, unknown>;
-    return record["type"] === "data" ? dataBytes(record["data"]) : 0;
-  };
-  const visit = (value: unknown): number => {
-    if (!value || typeof value !== "object") return 0;
-    if (seen.has(value)) return 0;
-    seen.add(value);
-    if (Array.isArray(value)) return value.reduce((total, item) => total + visit(item), 0);
-
-    const record = value as Record<string, unknown>;
-    if (record["type"] === "file") return dataBytes(record["data"]);
-    return Object.values(record).reduce<number>((total, item) => total + visit(item), 0);
-  };
-
-  return messages.reduce((total, message) => total + visit(message), 0);
 }
 
 type RepairTranscriptResult = {
@@ -534,7 +563,7 @@ function resolveCompactionBoundary(params: {
 function renderMessageForSummary(message: ModelMessage): string {
   if (message.role === "user") {
     const content =
-      typeof message.content === "string" ? message.content : stringifyUnknown(message.content);
+      typeof message.content === "string" ? message.content : stringifyTextOnly(message.content, 2);
     return `USER:\n${content}`;
   }
 
@@ -568,14 +597,14 @@ function renderMessageForSummary(message: ModelMessage): string {
           const toolCallId = getString(record["toolCallId"]);
           if (toolName && toolCallId) {
             lines.push(
-              `TOOL_CALL ${toolName} id=${toolCallId}: ${stringifyUnknown(record["input"])}`,
+              `TOOL_CALL ${toolName} id=${toolCallId}: ${stringifyTextOnly(record["input"], 2)}`,
             );
             continue;
           }
         }
       }
 
-      lines.push(stringifyUnknown(part));
+      lines.push(stringifyTextOnly(part, 2));
     }
 
     return `ASSISTANT:\n${lines.join("\n")}`;
@@ -592,20 +621,20 @@ function renderMessageForSummary(message: ModelMessage): string {
           const toolCallId = getString(record["toolCallId"]);
           if (toolName && toolCallId) {
             lines.push(
-              `TOOL_RESULT ${toolName} id=${toolCallId}: ${stringifyUnknown(record["output"])}`,
+              `TOOL_RESULT ${toolName} id=${toolCallId}: ${stringifyTextOnly(record["output"], 2)}`,
             );
             continue;
           }
         }
       }
 
-      lines.push(stringifyUnknown(part));
+      lines.push(stringifyTextOnly(part, 2));
     }
 
     return `TOOL:\n${lines.join("\n")}`;
   }
 
-  return `${String((message as { role?: unknown }).role ?? "UNKNOWN").toUpperCase()}:\n${stringifyUnknown(message)}`;
+  return `${String((message as { role?: unknown }).role ?? "UNKNOWN").toUpperCase()}:\n${stringifyTextOnly(message, 2)}`;
 }
 
 const SUMMARY_OVERFLOW_RETRY_SCALE = 0.5;
@@ -870,7 +899,7 @@ type ResolvedContextWindow =
     };
 
 type CompactionScheduleReason = "threshold" | "overflow";
-type PendingCompactionReason = CompactionScheduleReason | "media";
+type PendingCompactionReason = CompactionScheduleReason;
 
 export type CompactionSummaryModel = "current" | LanguageModel | (() => LanguageModel);
 
@@ -884,6 +913,8 @@ type AutoCompactionStartEvent = {
   spec: ModelSpecifier;
   reason: CompactionScheduleReason;
   messageCountBefore: number;
+  observedInputTokens: number;
+  inputTokenSource: "provider-usage" | "text-estimate";
   estimatedInputTokens: number;
   budget: AutoCompactionObservedBudget;
 };
@@ -1179,7 +1210,8 @@ export type AutoCompactionOptions = {
   /**
    * Source used to measure context occupancy after a model turn.
    * Agentic providers whose usage is cumulative across internal steps must use
-   * `transcript-estimate` instead of treating billed usage as prompt size.
+   * `transcript-estimate` instead of treating billed usage as prompt size. The
+   * runtimes currently select this exception for Claude Code runs.
    */
   thresholdInputSource?: "usage" | "transcript-estimate";
 
@@ -1762,11 +1794,6 @@ export async function attachAutoCompaction(
       return;
     }
 
-    if (reason === "media") {
-      if (pendingCompactionReason !== "overflow") pendingCompactionReason = "media";
-      return;
-    }
-
     if (!pendingCompactionReason) {
       pendingCompactionReason = "threshold";
     }
@@ -1916,14 +1943,17 @@ export async function attachAutoCompaction(
       });
     }
 
-    const canonicalMediaBytes = inlineMediaStorageBytes(canonicalMessages);
     const maybeTransformed = options.baseTransformMessages
       ? await options.baseTransformMessages(canonicalMessages, context)
       : canonicalMessages;
+    // Model-view transforms may omit media for transport safety. That is not
+    // evidence of token pressure: only provider usage, text fallback estimates,
+    // or an actual context overflow may schedule transcript compaction.
     const modelInputEstimate = estimateModelInputTokens({ messages: maybeTransformed, context });
-    const hasOmittedCanonicalMedia =
-      canonicalMediaBytes > inlineMediaStorageBytes(maybeTransformed);
     lastModelInputEstimate = modelInputEstimate;
+    const providerInputTokens = thresholdInputSource === "usage" ? lastTurnInputTokens : null;
+    const observedInputTokens = providerInputTokens ?? modelInputEstimate;
+    const inputTokenSource = providerInputTokens === null ? "text-estimate" : "provider-usage";
 
     const latestCapability = await refreshContextLimit(context.abortSignal);
     pendingCompactionReason = reconcilePendingCompactionReason({
@@ -1937,26 +1967,11 @@ export async function attachAutoCompaction(
         outputLimit: latestCapability.outputLimit,
         thresholdFraction,
       });
-      const observedInputTokens =
-        thresholdInputSource === "usage" && lastTurnInputTokens !== null
-          ? lastTurnInputTokens
-          : modelInputEstimate;
-
       if (
         pendingCompactionReason === "threshold" &&
         !evaluateThresholdWithBudget(observedInputTokens, latestBudget.inputBudget)
       ) {
         pendingCompactionReason = null;
-      }
-
-      if (pendingCompactionReason === "media" && !hasOmittedCanonicalMedia) {
-        pendingCompactionReason = null;
-      }
-
-      if (pendingCompactionReason === null && hasOmittedCanonicalMedia) {
-        scheduleCompaction("media");
-        // Deliver the newest retained media once before compacting omitted historical media.
-        return maybeTransformed;
       }
 
       if (
@@ -1981,11 +1996,9 @@ export async function attachAutoCompaction(
     if (compactableMessages.length === 0) return maybeTransformed;
 
     const pendingReason = pendingCompactionReason;
-    const compactionReason: CompactionScheduleReason =
-      pendingReason === "media" ? "threshold" : pendingReason;
     const activeBudget = resolveActiveCompactionBudget({
       capability: latestCapability,
-      reason: compactionReason,
+      reason: pendingReason,
       estimatedInputTokens: estimateMessagesTokens(compactableMessages),
     });
     if (!activeBudget) return maybeTransformed;
@@ -2007,11 +2020,16 @@ export async function attachAutoCompaction(
     }
 
     const estimatedInputTokens = estimateMessagesTokens(compactableMessages);
+    const eventObservedInputTokens =
+      pendingReason === "overflow" ? modelInputEstimate : observedInputTokens;
+    const eventInputTokenSource = pendingReason === "overflow" ? "text-estimate" : inputTokenSource;
     const compactionStart = Date.now();
     const compactionEventBase: AutoCompactionStartEvent = {
       spec: latestCapability.spec,
-      reason: compactionReason,
+      reason: pendingReason,
       messageCountBefore: compactableMessages.length,
+      observedInputTokens: eventObservedInputTokens,
+      inputTokenSource: eventInputTokenSource,
       estimatedInputTokens,
       budget: {
         inputBudget: activeBudget.inputBudget,
@@ -2061,7 +2079,7 @@ export async function attachAutoCompaction(
         summarySystem,
         buildSummaryPrompt,
         buildSummaryUpdatePrompt,
-        forceCompaction: pendingReason !== "threshold",
+        forceCompaction: pendingReason === "overflow",
         onProgress: options.onProgress,
         onSummaryDelta: options.onSummaryDelta,
         abortSignal: context.abortSignal,
@@ -2132,7 +2150,6 @@ export const __autoCompactionInternals = {
   estimateMessageTokens,
   estimateMessagesTokens,
   estimateModelInputTokens,
-  inlineMediaStorageBytes,
   isValidSuffix,
   normalizeThresholdFraction,
   repairTranscriptForCompaction,

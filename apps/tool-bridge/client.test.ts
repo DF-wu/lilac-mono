@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import {
   buildToolInput,
@@ -133,7 +134,7 @@ describe("tool-bridge build id", () => {
             loadedExternal: 2,
           },
         },
-      ),
+      ).map(stripVTControlCharacters),
     ).toEqual(["[commit: abc123def456]", "[build: deadbeef]", "[app-dirty]", "[plugins: 2]"]);
   });
 });

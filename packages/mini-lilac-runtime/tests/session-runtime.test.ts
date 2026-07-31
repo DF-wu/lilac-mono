@@ -4104,6 +4104,8 @@ describe("SessionService", () => {
               spec: "test/mock" as const,
               reason: "threshold" as const,
               messageCountBefore: 12,
+              observedInputTokens: 8_000,
+              inputTokenSource: "provider-usage" as const,
               estimatedInputTokens: 8_000,
               budget: {
                 inputBudget: 9_000,

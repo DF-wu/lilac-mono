@@ -106,46 +106,6 @@ describe("auto-compaction internals", () => {
     });
   });
 
-  it("counts canonical inline media separately from text token estimates", () => {
-    const withMedia: ModelMessage[] = [
-      {
-        role: "user",
-        content: [
-          {
-            type: "file",
-            mediaType: "image/png",
-            data: "aGVsbG8=",
-          },
-        ],
-      },
-    ];
-    const scrubbed: ModelMessage[] = [
-      { role: "user", content: [{ type: "text", text: "Image omitted after its limit." }] },
-    ];
-
-    expect(__autoCompactionInternals.inlineMediaStorageBytes(withMedia)).toBe(8);
-    expect(__autoCompactionInternals.inlineMediaStorageBytes(scrubbed)).toBe(0);
-    const largeMedia: ModelMessage[] = [
-      {
-        role: "user",
-        content: [
-          {
-            type: "file",
-            mediaType: "image/png",
-            data: "a".repeat(10 * 1024 * 1024),
-          },
-        ],
-      },
-    ];
-    expect(__autoCompactionInternals.estimateMessagesTokens(largeMedia)).toBeLessThan(100);
-    expect(
-      __autoCompactionInternals.estimateModelInputTokens({
-        messages: largeMedia,
-        context: { system: "test", tools: {} },
-      }),
-    ).toBeGreaterThan(2_000_000);
-  });
-
   it("uses native artifact metadata instead of encrypted content to estimate tokens", () => {
     const artifact = serverCompactionArtifact("x".repeat(100_000));
     const message: ModelMessage = {
@@ -440,6 +400,51 @@ describe("auto-compaction internals", () => {
       true,
     );
     expect(segments.slice(1).length).toBeGreaterThan(1);
+  });
+
+  it("omits inline media payloads from summary text", () => {
+    const payload = `RAW_IMAGE_${"a".repeat(10_000)}`;
+    const reasoningPayload = `RAW_REASONING_FILE_${"b".repeat(10_000)}`;
+    const dataUrl = `data:image/png;base64,${payload}`;
+    const remoteUrl = "https://cdn.example.com/reference.png";
+    const segments = __autoCompactionInternals.renderMessagesForSummarySegments(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Please inspect this image." },
+            { type: "file", mediaType: "image/png", data: payload },
+            { type: "file", mediaType: "image/png", data: new URL(remoteUrl) },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "inspect-image",
+              toolName: "inspect",
+              input: {
+                image: dataUrl,
+                reasoning: {
+                  type: "reasoning-file",
+                  mediaType: "application/json",
+                  data: { type: "data", data: reasoningPayload },
+                },
+              },
+            },
+          ],
+        },
+      ],
+      { maxCharsPerMessage: 20_000, maxCharsTotal: 20_000 },
+    );
+
+    expect(segments.join("\n")).toContain("Please inspect this image.");
+    expect(segments.join("\n")).toContain("[inline media omitted]");
+    expect(segments.join("\n")).toContain(remoteUrl);
+    expect(segments.join("\n")).not.toContain(payload);
+    expect(segments.join("\n")).not.toContain(reasoningPayload);
+    expect(segments.join("\n")).not.toContain(dataUrl);
   });
 
   it("retries hierarchical summary with smaller budgets after overflow", async () => {
@@ -1353,6 +1358,104 @@ describe("auto-compaction internals", () => {
     }
 
     expect(mainCalls).toBe(2);
+    expect(summaryCalls).toBe(0);
+  });
+
+  it("does not infer fresh-request occupancy from inline media bytes", async () => {
+    const payload = `RAW_IMAGE_${"a".repeat(40_000)}`;
+    const mainModel = new MockLanguageModelV4({ doStream: async () => summaryResponse("answer") });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        throw new Error("inline media bytes must not schedule compaction");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "file", mediaType: "image/png", data: payload }],
+        },
+        { role: "assistant", content: "image reviewed" },
+        { role: "user", content: "prior follow-up" },
+        { role: "assistant", content: "prior answer" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "usage",
+      keepRecentTurns: 1,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("continue");
+    } finally {
+      detach();
+    }
+
+    expect(mainModel.doStreamCalls).toHaveLength(1);
+    expect(summaryCalls).toBe(0);
+  });
+
+  it("does not compact when the model-view transform omits media", async () => {
+    const mainModel = new MockLanguageModelV4({ doStream: async () => summaryResponse("answer") });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        throw new Error("media pruning must not schedule compaction");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "old image" },
+            { type: "file", mediaType: "image/png", data: "aGVsbG8=" },
+          ],
+        },
+        { role: "assistant", content: "image reviewed" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "usage",
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      baseTransformMessages: (messages) =>
+        messages.map((message): ModelMessage => {
+          if (message.role !== "user" || !Array.isArray(message.content)) return message;
+          return {
+            ...message,
+            content: message.content.map((part) =>
+              part.type === "file"
+                ? { type: "text" as const, text: "Image omitted after its inline limit." }
+                : part,
+            ),
+          };
+        }),
+    });
+
+    try {
+      await agent.prompt("first follow-up");
+      await agent.prompt("second follow-up");
+    } finally {
+      detach();
+    }
+
+    expect(mainModel.doStreamCalls).toHaveLength(2);
     expect(summaryCalls).toBe(0);
   });
 
