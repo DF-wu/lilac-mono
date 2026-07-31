@@ -15,7 +15,7 @@
     "lint": "oxlint --tsconfig tsconfig.json apps packages scripts/generate-provider-option-shapes.ts scripts/oxlint-plugins examples __tests__",
     "lint:fix": "oxlint --tsconfig tsconfig.json --fix apps packages scripts/generate-provider-option-shapes.ts scripts/oxlint-plugins examples __tests__",
     "test:all": "bun run test:root && bun run test:workspaces && bun run test:lint-rules",
-    "test:ci": "bun run test:root -- --only-failures && bun run --filter '*' --sequential test -- --only-failures && bun test --only-failures ./scripts/oxlint-plugins/*.test.mts && node --experimental-strip-types scripts/oxlint-plugins/test-waits.rule-test.mts",
+    "test:ci": "set -e; bun run test:root -- --only-failures; for dir in apps/* packages/*; do bun --cwd=\"$dir\" run test -- --only-failures; done; bun test --only-failures ./scripts/oxlint-plugins/*.test.mts; node --experimental-strip-types scripts/oxlint-plugins/test-waits.rule-test.mts",
     "test:lint-rules": "bun test ./scripts/oxlint-plugins/*.test.mts && node --experimental-strip-types scripts/oxlint-plugins/test-waits.rule-test.mts",
     "test:root": "bun test",
     "test:workspaces": "bun run --parallel --workspaces test",
