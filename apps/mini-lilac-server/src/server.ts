@@ -8,8 +8,11 @@ import {
   miniLilacInterruptQueuedSteeringRequestSchema,
   miniLilacMessagesSchema,
   miniLilacReconnectQuerySchema,
+  miniLilacRedoRequestSchema,
+  miniLilacRedoResultSchema,
   miniLilacSteerRequestSchema,
   miniLilacUndoRequestSchema,
+  miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
   type MiniLilacModelSummary,
   type MiniLilacProfileSummary,
@@ -18,9 +21,11 @@ import {
   type MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
 import {
+  HistoryRecoveryAbandonedError,
   type ModelCatalogSnapshot,
   type RuntimeConfig,
   type SessionService,
+  WorkspaceHistoryStoreError,
 } from "@stanley2058/mini-lilac-runtime";
 import { createUIMessageStreamResponse, safeValidateUIMessages } from "ai";
 import Elysia from "elysia";
@@ -165,6 +170,12 @@ function errorResponse(error: unknown): Response {
   }
 
   const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof HistoryRecoveryAbandonedError) {
+    return jsonResponse({ error: { code: "history-recovery-abandoned", message } }, 409);
+  }
+  if (error instanceof WorkspaceHistoryStoreError && error.code === "restore-conflict") {
+    return jsonResponse({ error: { code: "conflict", message } }, 409);
+  }
   if (message.includes("was not found")) {
     return jsonResponse({ error: { code: "not_found", message } }, 404);
   }
@@ -186,6 +197,8 @@ function errorResponse(error: unknown): Response {
     message.includes("is pending") ||
     message.includes("was already used") ||
     message.includes("must be quiescent to undo") ||
+    message.includes("must be quiescent to redo") ||
+    message.includes("must be quiescent for history navigation") ||
     message.includes("must be quiescent to compact") ||
     // A prompt refused because the session is compacting is an admission
     // conflict, not a server fault.
@@ -194,9 +207,20 @@ function errorResponse(error: unknown): Response {
     message.includes("has no durable checkpoint") ||
     message.includes("has no exact UI prefix") ||
     message.includes("has an invalid checkpoint") ||
+    message.includes("has a retained history operation") ||
+    message.includes("Retained history operation") ||
+    message.includes("pending run finalization") ||
+    message.includes("requires Git for recovery") ||
+    message.includes("requires Git for verification") ||
     message.includes("UNIQUE constraint failed")
   ) {
     return jsonResponse({ error: { code: "conflict", message } }, 409);
+  }
+  if (error instanceof WorkspaceHistoryStoreError) {
+    return jsonResponse(
+      { error: { code: "internal_error", message: "The request could not be completed" } },
+      500,
+    );
   }
   return jsonResponse(
     { error: { code: "internal_error", message: "The request could not be completed" } },
@@ -538,11 +562,26 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
     safely(async () => {
       const { sessionId } = sessionParamsSchema.parse(params);
       const request = miniLilacUndoRequestSchema.parse(body);
+      requireClientCommandId(request);
       if (request.sessionId !== sessionId) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
       return withSessionLock(sessionId, async () =>
-        jsonResponse(await sessionService.undo(request)),
+        jsonResponse(miniLilacUndoResultSchema.parse(await sessionService.undo(request))),
+      );
+    }),
+  );
+
+  app.post(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/redo`, ({ body, params }) =>
+    safely(async () => {
+      const { sessionId } = sessionParamsSchema.parse(params);
+      const request = miniLilacRedoRequestSchema.parse(body);
+      requireClientCommandId(request);
+      if (request.sessionId !== sessionId) {
+        throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
+      }
+      return withSessionLock(sessionId, async () =>
+        jsonResponse(miniLilacRedoResultSchema.parse(await sessionService.redo(request))),
       );
     }),
   );

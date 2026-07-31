@@ -137,4 +137,33 @@ describe("tool output model-view policy", () => {
     expect(JSON.stringify(view)).toContain("must be reduced before reading it again");
     expect(JSON.stringify(view)).toContain("application/pdf");
   });
+
+  it("bounds legacy and data URL media representations", () => {
+    const encoded = Buffer.alloc(9).toString("base64");
+    const message: ModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "legacy-media",
+          toolName: "plugin",
+          output: {
+            type: "content",
+            value: [
+              { type: "file-data", data: encoded, mediaType: "application/pdf" },
+              { type: "image-data", data: encoded, mediaType: "image/png" },
+              { type: "image-url", url: `DATA:image/png;base64,${encoded}` },
+            ],
+          },
+        },
+      ],
+    };
+    const view = scrubLargeBinaryForModelView([message], {
+      maxBytesPerPart: 8,
+      maxBytesTotal: 24,
+    });
+    expect(JSON.stringify(view)).not.toContain(encoded);
+    expect(JSON.stringify(view)).toContain("Resize the image");
+    expect(JSON.stringify(view)).toContain("must be reduced");
+  });
 });

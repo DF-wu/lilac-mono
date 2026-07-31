@@ -239,22 +239,22 @@ export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
         }).bash;
       },
     }),
-    withBoundedOutput({
+    withBuiltinMetadata({
       name: "read_file",
       isEnabled: () => true,
       createTool: (context) => getFsReadOnlyTool("read_file", context),
     }),
-    withBoundedOutput({
+    withBuiltinMetadata({
       name: "glob",
       isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
       createTool: (context) => getFsReadOnlyTool("glob", context),
     }),
-    withBoundedOutput({
+    withBuiltinMetadata({
       name: "grep",
       isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",
       createTool: (context) => getFsReadOnlyTool("grep", context),
     }),
-    withBoundedOutput({
+    withBuiltinMetadata({
       name: "fuzzy_search",
       isEnabled: (context) =>
         context.runtime.config?.tools.fsBackend === "fff" &&

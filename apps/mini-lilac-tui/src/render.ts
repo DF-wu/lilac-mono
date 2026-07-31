@@ -1,4 +1,5 @@
 import { posix } from "node:path";
+import { inspect } from "node:util";
 
 import { getToolName, isToolUIPart, type UIMessageChunk } from "ai";
 import { z } from "zod";
@@ -86,6 +87,8 @@ export interface ShellTranscriptPreview {
 export interface ExplorationOperation {
   readonly action: "Read" | "Grep" | "Glob" | "Find";
   readonly detail: string;
+  readonly status: "pending" | "success" | "error" | "denied" | "cancelled";
+  readonly error?: string;
 }
 
 export interface ExplorationTranscript {
@@ -424,7 +427,6 @@ type ExplorationState = {
   cancellations: number;
   operations: ExplorationOperation[];
   toolCallIds: string[];
-  outcomes: Map<string, "error" | "denied" | "cancelled" | undefined>;
   pending: Set<string>;
 };
 
@@ -452,7 +454,8 @@ export function explorationTranscriptText(
   return [
     header,
     ...exploration.operations.map(
-      (operation) => `${operation.action} ${previewText(operation.detail, 240)}`,
+      (operation) =>
+        `${operation.action} ${previewText(operation.detail, 240)} · ${operation.status}${operation.error === undefined ? "" : `: ${operation.error}`}`,
     ),
   ].join("\n");
 }
@@ -488,7 +491,10 @@ function explorationOperation(
   name: string,
   input: unknown,
   options: TranscriptRenderOptions = {},
+  status: ExplorationOperation["status"] = "pending",
+  error?: string,
 ): ExplorationOperation {
+  const outcome = { status, ...(error === undefined ? {} : { error: previewText(error, 180) }) };
   if (name === "read_file") {
     const parsed = readInputSchema.safeParse(input);
     if (parsed.success) {
@@ -506,9 +512,10 @@ function explorationOperation(
       return {
         action: "Read",
         detail: [explorationPath(parsed.data.path, options.cwd), ...details].join(" · "),
+        ...outcome,
       };
     }
-    return { action: "Read", detail: "file" };
+    return { action: "Read", detail: rawExplorationInput(input), ...outcome };
   }
   if (name === "grep") {
     const parsed = grepInputSchema.safeParse(input);
@@ -521,9 +528,10 @@ function explorationOperation(
         ]
           .filter((value) => value !== undefined)
           .join(" · "),
+        ...outcome,
       };
     }
-    return { action: "Grep", detail: "pattern" };
+    return { action: "Grep", detail: rawExplorationInput(input), ...outcome };
   }
   if (name === "glob") {
     const parsed = globInputSchema.safeParse(input);
@@ -533,9 +541,10 @@ function explorationOperation(
         detail: [explorationScope(parsed.data.cwd, options.cwd), parsed.data.patterns.join(", ")]
           .filter((value) => value !== undefined)
           .join(" · "),
+        ...outcome,
       };
     }
-    return { action: "Glob", detail: "files" };
+    return { action: "Glob", detail: rawExplorationInput(input), ...outcome };
   }
   const parsed = fuzzyInputSchema.safeParse(input);
   return {
@@ -544,8 +553,28 @@ function explorationOperation(
       ? [explorationScope(parsed.data.cwd, options.cwd), JSON.stringify(parsed.data.query)]
           .filter((value) => value !== undefined)
           .join(" · ")
-      : "query",
+      : rawExplorationInput(input),
+    ...outcome,
   };
+}
+
+function rawExplorationInput(input: unknown): string {
+  try {
+    return previewText(
+      `input: ${inspect(input, {
+        breakLength: Infinity,
+        compact: true,
+        customInspect: false,
+        depth: 2,
+        getters: false,
+        maxArrayLength: 8,
+        maxStringLength: 120,
+      })}`,
+      180,
+    );
+  } catch {
+    return "input: <unavailable>";
+  }
 }
 
 function explorationPath(value: string, cwd: string | undefined): string {
@@ -1173,31 +1202,36 @@ export function renderInitialMessages(
               cancellations: 0,
               operations: [],
               toolCallIds: [],
-              outcomes: new Map(),
               pending: new Set(),
             };
             entries.push({ id, ...explorationEntry(exploration) });
           }
           if (category === "read") exploration.reads += 1;
           else exploration.searches += 1;
-          exploration.operations.push(explorationOperation(name, input, options));
-          exploration.toolCallIds.push(part.toolCallId);
-          if (part.state !== "output-available") {
-            if (part.state === "output-error" || part.state === "output-denied") {
-              exploration.failures += 1;
-              if (part.state === "output-error") exploration.errors += 1;
-            } else {
-              exploration.pending.add(id);
-            }
-          }
-          exploration.outcomes.set(
-            part.toolCallId,
-            part.state === "output-error"
-              ? "error"
-              : part.state === "output-denied"
-                ? "denied"
-                : undefined,
+          const operationStatus =
+            part.state === "output-available"
+              ? "success"
+              : part.state === "output-error"
+                ? "error"
+                : part.state === "output-denied"
+                  ? "denied"
+                  : "pending";
+          exploration.operations.push(
+            explorationOperation(
+              name,
+              input,
+              options,
+              operationStatus,
+              part.state === "output-error" ? part.errorText : undefined,
+            ),
           );
+          exploration.toolCallIds.push(part.toolCallId);
+          if (operationStatus === "error" || operationStatus === "denied") {
+            exploration.failures += 1;
+            if (operationStatus === "error") exploration.errors += 1;
+          } else if (operationStatus === "pending") {
+            exploration.pending.add(part.toolCallId);
+          }
           const entryIndex = entries.findIndex((entry) => entry.id === exploration?.id);
           if (entryIndex >= 0)
             entries[entryIndex] = { id: exploration.id, ...explorationEntry(exploration) };
@@ -1469,7 +1503,15 @@ export class ChunkRenderer {
     }
     const category = explorationCategory(toolName);
     if (category !== undefined) {
-      if (!inputAvailable || this.explorationByToolId.has(toolCallId)) return;
+      if (!inputAvailable) return;
+      const existingExploration = this.explorationByToolId.get(toolCallId);
+      if (existingExploration !== undefined) {
+        const index = existingExploration.toolCallIds.indexOf(toolCallId);
+        if (existingExploration.operations[index]?.status !== "pending") {
+          this.activeToolIds.delete(toolCallId);
+        }
+        return;
+      }
       if (this.exploration === undefined) {
         const state: ExplorationState = {
           id: "",
@@ -1480,7 +1522,6 @@ export class ChunkRenderer {
           cancellations: 0,
           operations: [explorationOperation(toolName, input, this.options)],
           toolCallIds: [toolCallId],
-          outcomes: new Map([[toolCallId, undefined]]),
           pending: new Set([toolCallId]),
         };
         state.id = this.output.append(explorationEntry(state));
@@ -1490,7 +1531,6 @@ export class ChunkRenderer {
         else this.exploration.searches += 1;
         this.exploration.operations.push(explorationOperation(toolName, input, this.options));
         this.exploration.toolCallIds.push(toolCallId);
-        this.exploration.outcomes.set(toolCallId, undefined);
         this.exploration.pending.add(toolCallId);
         this.output.update(this.exploration.id, explorationEntry(this.exploration));
       }
@@ -1634,7 +1674,7 @@ export class ChunkRenderer {
       return;
     }
     if (this.explorationByToolId.has(toolCallId)) {
-      this.settleExploration(toolCallId, "error");
+      this.settleExploration(toolCallId, "error", errorText);
       return;
     }
     if (this.flattenedBatchToolIds.has(toolCallId)) {
@@ -1720,14 +1760,27 @@ export class ChunkRenderer {
     return this.output.append(entry);
   }
 
-  private settleExploration(toolCallId: string, failure?: "error" | "denied" | "cancelled"): void {
+  private settleExploration(
+    toolCallId: string,
+    status: Exclude<ExplorationOperation["status"], "pending"> = "success",
+    errorText?: string,
+  ): void {
     const state = this.explorationByToolId.get(toolCallId);
     if (state === undefined) return;
+    const index = state.toolCallIds.indexOf(toolCallId);
+    const operation = state.operations[index];
+    if (operation === undefined || operation.status !== "pending") return;
     state.pending.delete(toolCallId);
-    state.outcomes.set(toolCallId, failure);
-    if (failure === "error" || failure === "denied") state.failures += 1;
-    if (failure === "error") state.errors += 1;
-    if (failure === "cancelled") state.cancellations += 1;
+    state.operations[index] = {
+      ...operation,
+      status,
+      ...(status === "error" && errorText !== undefined
+        ? { error: previewText(errorText, 180) }
+        : {}),
+    };
+    if (status === "error" || status === "denied") state.failures += 1;
+    if (status === "error") state.errors += 1;
+    if (status === "cancelled") state.cancellations += 1;
     this.output.update(state.id, explorationEntry(state));
   }
 
@@ -1793,18 +1846,17 @@ export class ChunkRenderer {
       if (exploration !== undefined) {
         const index = exploration.toolCallIds.indexOf(toolCallId);
         if (index >= 0) {
+          const status = exploration.operations[index]?.status;
           exploration.toolCallIds.splice(index, 1);
-          exploration.operations.splice(index, 1);
           const category = explorationCategory(this.toolNames.get(toolCallId) ?? "");
           if (category === "read") exploration.reads -= 1;
           if (category === "search") exploration.searches -= 1;
-          const outcome = exploration.outcomes.get(toolCallId);
-          if (outcome === "error" || outcome === "denied") exploration.failures -= 1;
-          if (outcome === "error") exploration.errors -= 1;
-          if (outcome === "cancelled") exploration.cancellations -= 1;
+          if (status === "error" || status === "denied") exploration.failures -= 1;
+          if (status === "error") exploration.errors -= 1;
+          if (status === "cancelled") exploration.cancellations -= 1;
+          exploration.operations.splice(index, 1);
         }
         exploration.pending.delete(toolCallId);
-        exploration.outcomes.delete(toolCallId);
         this.explorationByToolId.delete(toolCallId);
         if (exploration.toolCallIds.length === 0) {
           this.output.remove(exploration.id);

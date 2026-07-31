@@ -238,13 +238,13 @@ export function modelCapabilityOverrides(
 ): ModelCapabilityOverrides {
   return Object.fromEntries(
     snapshot.models.flatMap((model) =>
-      model.limits === undefined
+      model.limits === undefined && model.attachment === undefined && model.modalities === undefined
         ? []
         : [
             [
               model.ref.value,
               {
-                limit: model.limits,
+                limit: model.limits ?? { context: 0, output: 0 },
                 ...(model.attachment === undefined ? {} : { attachment: model.attachment }),
                 ...(model.modalities === undefined ? {} : { modalities: model.modalities }),
               },

@@ -23,6 +23,7 @@ export const COMMAND_PALETTE_ITEMS: readonly PaletteItem[] = [
   { id: "todo", label: "/todo", description: "view all todos" },
   { id: "compact", label: "/compact", description: "compact session context" },
   { id: "undo", label: "/undo", description: "remove the latest turn" },
+  { id: "redo", label: "/redo", description: "restore the latest undone turn" },
   { id: "model", label: "/model", description: "switch language model" },
   { id: "reasoning", label: "/reasoning", description: "change reasoning effort" },
   { id: "session", label: "/session", description: "switch to an old session" },

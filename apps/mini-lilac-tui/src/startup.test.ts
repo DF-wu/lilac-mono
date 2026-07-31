@@ -56,6 +56,9 @@ const snapshot: MiniLilacSessionSnapshot = {
   model: "removed-provider/removed-model",
   profile: "removed-profile",
   reasoning: "high",
+  historyStateId: "history-1",
+  canUndo: true,
+  canRedo: false,
   queuedSteeringCount: 2,
 };
 

@@ -339,6 +339,58 @@ describe("reduceInput slash commands and files", () => {
     expect(transition.state.phase).toBe("submitting");
   });
 
+  it("dispatches idle /redo without sending it to the model", () => {
+    const state = run(initialInputState(), [{ type: "insert", text: "/redo" }]);
+    const transition = reduceInput(state, { type: "submit" });
+    expect(transition.effects).toEqual([{ type: "redo" }]);
+    expect(transition.state.editor).toBe("");
+    expect(transition.state.phase).toBe("submitting");
+  });
+
+  it("never steers /redo during active work, including with an attachment", () => {
+    const file = {
+      id: "image-1",
+      placeholder: "[Image 1]",
+      start: 5,
+      end: 14,
+      file: {
+        type: "file" as const,
+        mediaType: "image/png",
+        url: "data:image/png;base64,AA==",
+      },
+    };
+    const active = run(initialInputState(), [
+      { type: "agent-started" },
+      { type: "insert", text: "/redo" },
+      { type: "add-file", file },
+    ]);
+    const transition = reduceInput(active, { type: "submit" });
+    expect(transition.effects).toEqual([]);
+    expect(transition.state.editor).toBe("/redo");
+    expect(transition.state.files).toEqual([file]);
+  });
+
+  it("treats attachment-bearing idle /redo as a prompt, not a local command", () => {
+    const file = {
+      id: "image-1",
+      placeholder: "[Image 1]",
+      start: 5,
+      end: 14,
+      file: {
+        type: "file" as const,
+        mediaType: "image/png",
+        url: "data:image/png;base64,AA==",
+      },
+    };
+    const state = run(initialInputState(), [
+      { type: "insert", text: "/redo" },
+      { type: "add-file", file },
+    ]);
+    expect(reduceInput(state, { type: "submit" }).effects).toEqual([
+      { type: "prompt", text: "/redo", files: [file], pastedTexts: [] },
+    ]);
+  });
+
   it("dispatches attachment-free idle /compact without sending it to the model", () => {
     const state = run(initialInputState(), [{ type: "insert", text: "/compact" }]);
     const transition = reduceInput(state, { type: "submit" });

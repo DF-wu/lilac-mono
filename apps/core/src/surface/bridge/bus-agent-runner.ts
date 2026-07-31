@@ -10,6 +10,7 @@ import {
   type ToolSet,
   type UserContent,
 } from "ai";
+import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type {
   CoreConfig,
   CustomCommandResult,
@@ -442,97 +443,7 @@ export function scrubLargeBinaryForModelView(
   messages: readonly ModelMessage[],
   limits: { maxBytesPerPart: number; maxBytesTotal: number },
 ): ModelMessage[] {
-  let totalBytes = 0;
-
-  const estimateBase64Bytes = (b64: string): number => {
-    // Approximate decoded bytes; good enough for bounding.
-    const len = b64.length;
-    const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
-    const bytes = Math.floor((len * 3) / 4) - padding;
-    return Math.max(0, bytes);
-  };
-
-  const out = [...messages];
-
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const msg = messages[messageIndex]!;
-    if (msg.role !== "tool" || !Array.isArray(msg.content)) {
-      continue;
-    }
-
-    let nextContent: ToolContent | null = null;
-
-    for (let i = msg.content.length - 1; i >= 0; i -= 1) {
-      const part = msg.content[i];
-      if (part?.type !== "tool-result") continue;
-
-      const output = part.output;
-      const outputType = output.type;
-      if (outputType !== "content") continue;
-
-      const rawValue = output["value"];
-      if (!Array.isArray(rawValue)) continue;
-
-      const value = rawValue;
-      let nextValue: typeof rawValue | null = null;
-
-      for (let j = value.length - 1; j >= 0; j -= 1) {
-        const item = value[j];
-        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-
-        if (item.type !== "file") continue;
-
-        const fileData = item.data;
-        if (!fileData || typeof fileData !== "object" || Array.isArray(fileData)) continue;
-        if (fileData.type !== "data" || typeof fileData.data !== "string") continue;
-
-        const data = fileData.data;
-
-        const bytes = estimateBase64Bytes(data);
-        const tooBig = bytes > limits.maxBytesPerPart;
-        const tooMuch = totalBytes + bytes > limits.maxBytesTotal;
-        if (!tooBig && !tooMuch) {
-          totalBytes += bytes;
-          continue;
-        }
-
-        nextValue ??= value.map((v) => ({ ...v }));
-
-        const mediaType =
-          "mediaType" in item && typeof item.mediaType === "string" ? item.mediaType : "";
-        const filename =
-          "filename" in item && typeof item.filename === "string" ? item.filename : "";
-        const detail =
-          filename || mediaType ? ` (${[filename, mediaType].filter(Boolean).join(", ")})` : "";
-
-        const instruction = mediaType.startsWith("image/")
-          ? "Image exceeds the inline limit. Resize the image before reading it again."
-          : "File exceeds the inline limit and must be reduced before reading it again.";
-        nextValue[j] = {
-          type: "text",
-          text: `${instruction}${detail}`,
-        };
-      }
-
-      if (!nextValue) continue;
-
-      nextContent ??= msg.content.map((p) => ({ ...p }));
-      const nextPart = nextContent[i];
-      if (nextPart?.type !== "tool-result") continue;
-
-      const nextOutput = {
-        ...output,
-        value: nextValue,
-      };
-      nextPart["output"] = nextOutput;
-    }
-
-    if (!nextContent) continue;
-
-    out[messageIndex] = { ...msg, content: nextContent };
-  }
-
-  return out;
+  return boundToolResultMediaForModelView(messages, limits);
 }
 
 function getBatchOkFromResult(result: unknown): boolean | null {

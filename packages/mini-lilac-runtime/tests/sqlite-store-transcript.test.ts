@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -23,6 +23,15 @@ afterEach(async () => {
 
 function serialize(value: unknown): string {
   return superjson.stringify(value);
+}
+
+function openStoreWithSuppressedMigrationWarning(databasePath: string): MiniLilacSqliteStore {
+  const warning = spyOn(console, "warn").mockImplementation(() => undefined);
+  try {
+    return new MiniLilacSqliteStore(databasePath);
+  } finally {
+    warning.mockRestore();
+  }
 }
 
 function transcriptNodeId(database: Database, sessionId: string, lane: "model" | "ui"): number {
@@ -201,10 +210,9 @@ function seedLegacyTranscripts(databasePath: string): {
 describe("MiniLilacSqliteStore transcript schema", () => {
   it("migrates v2 chains and divergent checkpoints while preserving durable state", async () => {
     const { databasePath } = await createV2Database();
-    const { secondUser, divergentUiPrefix, sharedModelPrefix } =
-      seedLegacyTranscripts(databasePath);
+    seedLegacyTranscripts(databasePath);
 
-    const store = new MiniLilacSqliteStore(databasePath);
+    const store = openStoreWithSuppressedMigrationWarning(databasePath);
 
     expect(store.database.query("PRAGMA user_version").get()).toEqual({
       user_version: MINI_LILAC_DATABASE_SCHEMA_VERSION,
@@ -221,7 +229,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     expect(
       store.database
         .query(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('run_chunks', 'model_transcript', 'ui_messages')",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('run_chunks', 'model_transcript', 'ui_messages', 'user_checkpoints')",
         )
         .all(),
     ).toEqual([]);
@@ -229,43 +237,57 @@ describe("MiniLilacSqliteStore transcript schema", () => {
       count: 9,
     });
 
-    expect(
-      store.undoLatestUser("session-1", "undo-migrated", {
-        kind: "undo",
-        runId: null,
-        payload: {},
-      }),
-    ).toMatchObject({ status: "undone", message: secondUser });
-    expect(store.getModelMessages("session-1")).toEqual(sharedModelPrefix);
-    expect(store.getUiMessages("session-1")).toEqual(divergentUiPrefix);
+    expect(store.getModelMessages("session-1")).toHaveLength(4);
+    expect(store.getUiMessages("session-1")).toHaveLength(4);
+    const topology = store.listHistoryTopology("session-1");
+    expect(topology.states).toHaveLength(1);
+    expect(topology.transitions).toEqual([]);
+    expect(topology.history).toMatchObject({
+      rootStateId: topology.states[0]?.id,
+      currentStateId: topology.states[0]?.id,
+      undoFloorStateId: topology.states[0]?.id,
+    });
+    expect(store.getHistoryNavigation("session-1")).toMatchObject({
+      canUndo: false,
+      canRedo: false,
+    });
     store.close();
   });
 
-  it("undoes the latest checkpoint when its stored SuperJSON keys have different order", async () => {
+  it("does not let reordered legacy checkpoint JSON bypass v5 history authority", async () => {
     const { databasePath } = await createV2Database();
-    const { secondUser, divergentUiPrefix, sharedModelPrefix } =
-      seedLegacyTranscripts(databasePath);
-    const store = new MiniLilacSqliteStore(databasePath);
+    const { secondUser } = seedLegacyTranscripts(databasePath);
     const reorderedJson = serialize({
       parts: secondUser.parts,
       id: secondUser.id,
       role: secondUser.role,
     });
-    store.database
+    const legacy = new Database(databasePath, { strict: true });
+    legacy
       .query(
         "UPDATE user_checkpoints SET user_message_json = ? WHERE session_id = ? AND ui_position = ?",
       )
       .run(reorderedJson, "session-1", 2);
+    legacy.close();
 
+    const store = openStoreWithSuppressedMigrationWarning(databasePath);
+
+    expect(store.getModelMessages("session-1")).toHaveLength(4);
+    expect(store.getUiMessages("session-1")).toHaveLength(4);
+    expect(store.listHistoryTopology("session-1")).toMatchObject({
+      states: [{ origin: "migration" }],
+      transitions: [],
+      redoStack: [],
+    });
+    expect(store.getHistoryNavigation("session-1")).toMatchObject({
+      canUndo: false,
+      canRedo: false,
+    });
     expect(
-      store.undoLatestUser("session-1", "undo-reordered", {
-        kind: "undo",
-        runId: null,
-        payload: {},
-      }),
-    ).toMatchObject({ status: "undone", message: secondUser });
-    expect(store.getModelMessages("session-1")).toEqual(sharedModelPrefix);
-    expect(store.getUiMessages("session-1")).toEqual(divergentUiPrefix);
+      store.database
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_checkpoints'")
+        .get(),
+    ).toBeNull();
     store.close();
   });
 
@@ -311,7 +333,11 @@ describe("MiniLilacSqliteStore transcript schema", () => {
       role: "user",
       parts: [{ type: "text", text: "first" }],
     };
-    store.replaceMessages("session-1", [{ role: "user", content: "first" }], [firstUi]);
+    store.internHistoryTranscriptHeads(
+      "session-1",
+      [{ role: "user", content: "first" }],
+      [firstUi],
+    );
     expect(store.database.query("SELECT COUNT(*) AS count FROM transcript_nodes").get()).toEqual({
       count: 2,
     });
@@ -322,11 +348,15 @@ describe("MiniLilacSqliteStore transcript schema", () => {
       BEGIN SELECT RAISE(ABORT, 'transcript node deleted'); END;
     `);
 
-    store.replaceMessages("session-1", [{ role: "user", content: "first" }], [firstUi]);
+    store.internHistoryTranscriptHeads(
+      "session-1",
+      [{ role: "user", content: "first" }],
+      [firstUi],
+    );
     expect(store.database.query("SELECT COUNT(*) AS count FROM transcript_nodes").get()).toEqual({
       count: 2,
     });
-    store.replaceMessages(
+    const heads = store.internHistoryTranscriptHeads(
       "session-1",
       [
         { role: "user", content: "first" },
@@ -337,8 +367,10 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     expect(store.database.query("SELECT COUNT(*) AS count FROM transcript_nodes").get()).toEqual({
       count: 4,
     });
-    expect(store.getModelMessages("session-1")).toHaveLength(2);
-    expect(store.getUiMessages("session-1")).toHaveLength(2);
+    expect(heads.modelHeadId).not.toBeNull();
+    expect(heads.uiHeadId).not.toBeNull();
+    expect(store.getModelMessages("session-1")).toEqual([]);
+    expect(store.getUiMessages("session-1")).toEqual([]);
     store.close();
   });
 
@@ -352,7 +384,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
         profile: "reader",
         reasoning: "high",
       });
-      store.replaceMessages(
+      store.internHistoryTranscriptHeads(
         sessionId,
         [{ role: "user", content: sessionId }],
         [
@@ -364,42 +396,18 @@ describe("MiniLilacSqliteStore transcript schema", () => {
         ],
       );
     }
-    store.createRun({
-      id: "run-1",
-      sessionId: "session-1",
-      profile: "reader",
-      depth: 0,
-    });
     const session1Ui = transcriptNodeId(store.database, "session-1", "ui");
     const session2Model = transcriptNodeId(store.database, "session-2", "model");
 
     expect(() =>
       store.database
-        .query("UPDATE session_transcript_heads SET model_head_id = ? WHERE session_id = ?")
-        .run(session2Model, "session-1"),
+        .query("INSERT INTO session_transcript_heads (session_id, model_head_id) VALUES (?, ?)")
+        .run("session-1", session2Model),
     ).toThrow("FOREIGN KEY constraint failed");
     expect(() =>
       store.database
-        .query("UPDATE session_transcript_heads SET model_head_id = ? WHERE session_id = ?")
-        .run(session1Ui, "session-1"),
-    ).toThrow("FOREIGN KEY constraint failed");
-    expect(() =>
-      store.database
-        .query(
-          `INSERT INTO user_checkpoints
-            (session_id, ui_position, user_message_json, model_head_id, root_run_id, replay_after_seq)
-           VALUES (?, 0, ?, ?, ?, 0)`,
-        )
-        .run("session-1", serialize({}), session2Model, "run-1"),
-    ).toThrow("FOREIGN KEY constraint failed");
-    expect(() =>
-      store.database
-        .query(
-          `INSERT INTO user_checkpoints
-            (session_id, ui_position, user_message_json, model_head_id, root_run_id, replay_after_seq)
-           VALUES (?, 0, ?, ?, ?, 0)`,
-        )
-        .run("session-1", serialize({}), session1Ui, "run-1"),
+        .query("INSERT INTO session_transcript_heads (session_id, model_head_id) VALUES (?, ?)")
+        .run("session-1", session1Ui),
     ).toThrow("FOREIGN KEY constraint failed");
     expect(() =>
       store.database
@@ -413,7 +421,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     store.close();
   });
 
-  it("rolls back a forced hash collision without moving either session head", () => {
+  it("rolls back a forced hash collision without moving the history cursor", () => {
     const store = new MiniLilacSqliteStore(":memory:");
     store.createSession({
       id: "session-1",
@@ -426,7 +434,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     const initialUi: MiniLilacUIMessage[] = [
       { id: "first", role: "user", parts: [{ type: "text", text: "first" }] },
     ];
-    store.replaceMessages("session-1", initialModel, initialUi);
+    store.internHistoryTranscriptHeads("session-1", initialModel, initialUi);
     const replacementUi: MiniLilacUIMessage[] = [
       { id: "replacement", role: "user", parts: [{ type: "text", text: "collision" }] },
     ];
@@ -438,33 +446,25 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     store.database
       .query("UPDATE transcript_nodes SET hash = ? WHERE session_id = ? AND lane = 'ui'")
       .run(collisionHash, "session-1");
-    const headsBefore = store.database
-      .query("SELECT model_head_id, ui_head_id FROM session_transcript_heads WHERE session_id = ?")
-      .get("session-1");
+    const stateBefore = store.getCurrentHistoryState("session-1");
     const countBefore = store.database
       .query("SELECT COUNT(*) AS count FROM transcript_nodes")
       .get();
 
     expect(() =>
-      store.replaceMessages(
+      store.internHistoryTranscriptHeads(
         "session-1",
         [...initialModel, { role: "assistant", content: "must roll back" }],
         replacementUi,
       ),
     ).toThrow("Transcript hash collision");
 
-    expect(
-      store.database
-        .query(
-          "SELECT model_head_id, ui_head_id FROM session_transcript_heads WHERE session_id = ?",
-        )
-        .get("session-1"),
-    ).toEqual(headsBefore);
+    expect(store.getCurrentHistoryState("session-1")).toEqual(stateBefore);
     expect(store.database.query("SELECT COUNT(*) AS count FROM transcript_nodes").get()).toEqual(
       countBefore,
     );
-    expect(store.getModelMessages("session-1")).toEqual(initialModel);
-    expect(store.getUiMessages("session-1")).toEqual(initialUi);
+    expect(store.getModelMessages("session-1")).toEqual([]);
+    expect(store.getUiMessages("session-1")).toEqual([]);
     store.close();
   });
 });

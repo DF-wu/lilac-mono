@@ -50,9 +50,7 @@ describe("runtime config", () => {
     expect(config.agent.idleTimeoutMs).toBe(900_000);
     expect(config.agent.subagents).toEqual({
       enabled: true,
-      maxDepth: 2,
-      maxChildrenPerRun: 8,
-      maxConcurrent: 4,
+      maxDepth: 1,
       idleTimeoutMs: 360_000,
     });
     expect(config.agent.compaction).toEqual({
@@ -69,6 +67,21 @@ describe("runtime config", () => {
         agent: {
           ...baseConfig.agent,
           profiles: { main: { ...baseConfig.agent.profiles.main, workspace: "/tmp" } },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      runtimeConfigSchema.parse({
+        ...baseConfig,
+        agent: {
+          ...baseConfig.agent,
+          subagents: {
+            enabled: true,
+            maxDepth: 1,
+            maxChildrenPerRun: 8,
+            maxConcurrent: 4,
+            idleTimeoutMs: 360_000,
+          },
         },
       }),
     ).toThrow();

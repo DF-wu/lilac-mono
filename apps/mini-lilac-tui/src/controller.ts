@@ -6,6 +6,7 @@ import {
   miniLilacStreamCursorChunkSchema,
   type MiniLilacCompactResult,
   type MiniLilacControlResult,
+  type MiniLilacHistoryFilesystemResult,
   type MiniLilacOutputRollback,
   type MiniLilacReasoning,
   type MiniLilacSessionSnapshot,
@@ -42,12 +43,19 @@ export interface ControllerUISink {
   onTodos?(todos: MiniLilacTodoState): void;
   onBindings?(bindings: SessionBindings): void;
   onSession?(session: SessionPresentation): void;
+  onNotice?(message: string, tone: "warning" | "danger"): void;
 }
 
 export interface SessionBindings {
   readonly model: string | undefined;
   readonly profile: string | undefined;
   readonly reasoning: MiniLilacReasoning | undefined;
+}
+
+export interface HistoryNavigationState {
+  readonly historyStateId: string | undefined;
+  readonly canUndo: boolean | undefined;
+  readonly canRedo: boolean | undefined;
 }
 
 export type SessionBindingUpdate =
@@ -75,6 +83,13 @@ const COMPACTION_WATCH_INTERVAL_MS = 1_500;
 
 type StreamOutcome = "completed" | "disconnected" | "disposed" | "superseded";
 
+type DraftSnapshot = Pick<InputState, "editor" | "files" | "pastedTexts">;
+
+interface DraftProvenance {
+  readonly before: DraftSnapshot;
+  readonly after: DraftSnapshot;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -96,6 +111,12 @@ export class Controller {
   private activeRunId: string | undefined;
   private activeReader: ReadableStreamDefaultReader<UIMessageChunk> | undefined;
   private pendingUndoCommandId: string | undefined;
+  private pendingRedoCommandId: string | undefined;
+  private undoDraftProvenance: DraftProvenance[] = [];
+  private draftMutationGeneration = 0;
+  private historyStateId: string | undefined;
+  private canUndo: boolean | undefined;
+  private canRedo: boolean | undefined;
   /**
    * Resolves once the running compact request is admitted server-side (its
    * first lifecycle event). `esc` cancellation awaits this: a cancel that
@@ -134,6 +155,9 @@ export class Controller {
     this.activeRunId = options.initialSnapshot?.activeRunId ?? undefined;
     this.sessionExists =
       options.initialSnapshot !== undefined || (options.initialMessages?.length ?? 0) > 0;
+    this.historyStateId = options.initialSnapshot?.historyStateId;
+    this.canUndo = options.initialSnapshot?.canUndo;
+    this.canRedo = options.initialSnapshot?.canRedo;
     this.bindings =
       options.initialSnapshot === undefined
         ? (options.initialBindings ?? {
@@ -207,6 +231,7 @@ export class Controller {
 
   /** Replace the editor value from a managed textarea. */
   setEditor(text: string): void {
+    if (text !== this.state.editor) this.invalidateDraftProvenance();
     this.dispatch({ type: "set-editor", text });
   }
 
@@ -217,6 +242,10 @@ export class Controller {
 
   undo(): void {
     this.dispatch({ type: "request-undo" });
+  }
+
+  redo(): void {
+    this.dispatch({ type: "request-redo" });
   }
 
   compact(): void {
@@ -288,18 +317,33 @@ export class Controller {
 
   /** First Ctrl-C clears the draft; a second consecutive Ctrl-C exits. */
   ctrlC(): void {
+    if (
+      this.state.editor.length > 0 ||
+      this.state.files.length > 0 ||
+      this.state.pastedTexts.length > 0
+    ) {
+      this.invalidateDraftProvenance();
+    }
     this.dispatch({ type: "ctrl-c" });
   }
 
   addFile(file: DraftFile): void {
+    this.invalidateDraftProvenance();
     this.dispatch({ type: "add-file", file });
   }
 
   addPastedText(pastedText: DraftPastedText): void {
+    this.invalidateDraftProvenance();
     this.dispatch({ type: "add-pasted-text", pastedText });
   }
 
   syncDraftParts(files: readonly DraftFile[], pastedTexts: readonly DraftPastedText[]): void {
+    if (
+      !draftPartsEqual(this.state.files, files) ||
+      !draftPartsEqual(this.state.pastedTexts, pastedTexts)
+    ) {
+      this.invalidateDraftProvenance();
+    }
     this.dispatch({ type: "sync-draft-parts", files, pastedTexts });
   }
 
@@ -327,6 +371,14 @@ export class Controller {
     return this.steering;
   }
 
+  get historyNavigation(): HistoryNavigationState {
+    return {
+      historyStateId: this.historyStateId,
+      canUndo: this.canUndo,
+      canRedo: this.canRedo,
+    };
+  }
+
   private dispatch(event: InputEvent): void {
     const { state, effects } = reduceInput(this.state, event);
     this.state = state;
@@ -344,6 +396,9 @@ export class Controller {
         return;
       case "undo":
         void this.runUndo();
+        return;
+      case "redo":
+        void this.runRedo();
         return;
       case "compact":
         void this.runCompact();
@@ -368,8 +423,6 @@ export class Controller {
     files: readonly DraftFile[],
     pastedTexts: readonly DraftPastedText[],
   ): Promise<void> {
-    // A newly admitted turn supersedes any undo whose response remained uncertain.
-    this.pendingUndoCommandId = undefined;
     const generation = this.nextRunGeneration();
     let resolveAdmission: (runId: string | undefined) => void = () => {};
     const text = expandDraftText(draftText, files, pastedTexts);
@@ -410,6 +463,7 @@ export class Controller {
         recovery.snapshot.activeRunId !== null &&
         recovery.snapshot.activeRunId !== undefined
       ) {
+        this.onPromptAdmitted();
         const runId = recovery.snapshot.activeRunId;
         resolveAdmission(runId);
         this.resolvePromptAdmission = undefined;
@@ -428,6 +482,7 @@ export class Controller {
         recovery.snapshot.status !== "compacting" &&
         recovery.messages?.some((candidate) => candidate.id === message.id)
       ) {
+        this.onPromptAdmitted();
         resolveAdmission(undefined);
         this.resolvePromptAdmission = undefined;
         this.replaceMessages(recovery.messages);
@@ -439,6 +494,7 @@ export class Controller {
       if (recovery.kind === "session" && recovery.snapshot.status === "compacting") {
         const promptWasCommitted =
           recovery.messages?.some((candidate) => candidate.id === message.id) === true;
+        if (promptWasCommitted) this.onPromptAdmitted();
         resolveAdmission(undefined);
         if (this.resolvePromptAdmission === resolveAdmission) {
           this.resolvePromptAdmission = undefined;
@@ -490,6 +546,7 @@ export class Controller {
       await stream.cancel().catch(() => undefined);
       return;
     }
+    this.onPromptAdmitted();
     this.beginRun();
 
     const outcome = await this.driveStream(stream, generation);
@@ -813,6 +870,9 @@ export class Controller {
   }
 
   private acceptSnapshot(snapshot: MiniLilacSessionSnapshot): void {
+    this.historyStateId = snapshot.historyStateId;
+    this.canUndo = snapshot.canUndo;
+    this.canRedo = snapshot.canRedo;
     if (snapshot.status === "compacting") {
       this.compactionCommandId = snapshot.activeCompactionCommandId ?? undefined;
     }
@@ -877,6 +937,8 @@ export class Controller {
       this.dispatch({ type: "operation-completed" });
       return;
     }
+    const draftBefore = draftSnapshot(this.state);
+    const draftGeneration = this.draftMutationGeneration;
     const clientCommandId = (this.pendingUndoCommandId ??= crypto.randomUUID());
     let result: Awaited<ReturnType<MiniLilacTransport["undo"]>>;
     try {
@@ -901,20 +963,16 @@ export class Controller {
     if (this.disposed) return;
     if (result.status === "empty") {
       this.pendingUndoCommandId = undefined;
+      this.canUndo = false;
       this.dispatch({ type: "operation-completed" });
       return;
     }
-    try {
-      this.messages = await this.options.transport.getMessages(this.sessionId, {
-        signal: this.abortController.signal,
-      });
-      if (this.disposed) return;
-      this.output = this.renderMessages();
-      this.runOutputBaseline = this.output.length;
-      this.runMessageBaseline = this.messages.length;
-      this.notifyOutput();
-    } catch (error) {
-      if (this.disposed) return;
+    const refresh = await this.refreshHistoryState(result.historyStateId);
+    if (this.disposed) return;
+    if (refresh.kind === "failed") {
+      this.historyStateId = result.historyStateId;
+      this.canUndo = undefined;
+      this.canRedo = true;
       const removedIndex = this.messages.findIndex((message) => message.id === result.message.id);
       if (removedIndex >= 0) {
         this.messages = this.messages.slice(0, removedIndex);
@@ -923,10 +981,146 @@ export class Controller {
         this.runMessageBaseline = this.messages.length;
         this.notifyOutput();
       }
-      this.commitError(`undo saved; transcript refresh failed: ${errorMessage(error)}`);
+      this.commitError(
+        `undo committed on server; transcript refresh failed: ${errorMessage(refresh.error)}`,
+      );
+    } else if (refresh.kind === "moved") {
+      this.pendingUndoCommandId = undefined;
+      this.undoDraftProvenance = [];
+      this.finishHistoryRefresh(refresh.snapshot);
+      this.reportMovedHistory();
+      return;
     }
-    this.restoreDraft(result.message, true, true);
+
+    const draftAfter = this.restoreDraft(result.message, true, true);
+    if (this.draftMutationGeneration === draftGeneration) {
+      this.undoDraftProvenance.push({ before: draftBefore, after: draftAfter });
+    }
+    this.reportSkippedFilesystem("undone", result.filesystem);
     this.pendingUndoCommandId = undefined;
+    this.pendingRedoCommandId = undefined;
+  }
+
+  private async runRedo(): Promise<void> {
+    if (!this.sessionExists) {
+      this.dispatch({ type: "operation-completed" });
+      return;
+    }
+    const clientCommandId = (this.pendingRedoCommandId ??= crypto.randomUUID());
+    let result: Awaited<ReturnType<MiniLilacTransport["redo"]>>;
+    try {
+      try {
+        result = await this.options.transport.redo(
+          { sessionId: this.sessionId, clientCommandId },
+          { signal: this.abortController.signal },
+        );
+      } catch {
+        result = await this.options.transport.redo(
+          { sessionId: this.sessionId, clientCommandId },
+          { signal: this.abortController.signal },
+        );
+      }
+    } catch (error) {
+      if (this.disposed) return;
+      this.dispatch({ type: "operation-failed" });
+      this.commitError(error);
+      return;
+    }
+
+    if (this.disposed) return;
+    if (result.status === "empty") {
+      this.pendingRedoCommandId = undefined;
+      this.canRedo = false;
+      this.dispatch({ type: "operation-completed" });
+      return;
+    }
+    const refresh = await this.refreshHistoryState(result.historyStateId);
+    if (this.disposed) return;
+    if (refresh.kind === "failed") {
+      this.historyStateId = result.historyStateId;
+      this.canUndo = true;
+      this.canRedo = undefined;
+      this.undoDraftProvenance = [];
+      this.dispatch({ type: "operation-completed" });
+      const skipped = skippedFilesystemReason(result.filesystem);
+      this.options.ui.onNotice?.(
+        `Redo committed; transcript refresh required: ${errorMessage(refresh.error)}${
+          skipped === undefined ? "" : `. Managed worktree unchanged because ${skipped}.`
+        }`,
+        "warning",
+      );
+      this.pendingRedoCommandId = undefined;
+      return;
+    }
+    if (refresh.kind === "moved") {
+      this.pendingRedoCommandId = undefined;
+      this.undoDraftProvenance = [];
+      this.finishHistoryRefresh(refresh.snapshot);
+      this.reportMovedHistory();
+      return;
+    }
+
+    const provenance = this.undoDraftProvenance.pop();
+    if (provenance !== undefined && draftMatches(this.state, provenance.after)) {
+      this.dispatch({
+        type: "draft-restored",
+        text: provenance.before.editor,
+        files: provenance.before.files,
+        pastedTexts: provenance.before.pastedTexts,
+        finishOperation: true,
+      });
+    } else this.finishHistoryRefresh(refresh.snapshot);
+    this.reportSkippedFilesystem("redone", result.filesystem);
+    this.pendingRedoCommandId = undefined;
+    this.pendingUndoCommandId = undefined;
+  }
+
+  private async refreshHistoryState(
+    expectedHistoryStateId: string,
+  ): Promise<
+    | { readonly kind: "matched"; readonly snapshot: MiniLilacSessionSnapshot }
+    | { readonly kind: "moved"; readonly snapshot: MiniLilacSessionSnapshot }
+    | { readonly kind: "failed"; readonly error: unknown }
+  > {
+    try {
+      const resume = await this.options.transport.getSessionResume(this.sessionId, {
+        signal: this.abortController.signal,
+      });
+      if (this.disposed) return { kind: "failed", error: new Error("controller disposed") };
+      this.sessionExists = true;
+      this.acceptSnapshot(resume.snapshot);
+      this.replaceMessages(resume.messages);
+      this.options.transport.setReconnectCursor(this.sessionId, resume.replayCursor);
+      this.onTodos(resume.todos);
+      const quiescent =
+        resume.snapshot.activeRunId === null &&
+        (resume.snapshot.status === "idle" || resume.snapshot.status === "error");
+      return resume.snapshot.historyStateId === expectedHistoryStateId && quiescent
+        ? { kind: "matched", snapshot: resume.snapshot }
+        : { kind: "moved", snapshot: resume.snapshot };
+    } catch (error) {
+      return { kind: "failed", error };
+    }
+  }
+
+  private finishHistoryRefresh(snapshot: MiniLilacSessionSnapshot): void {
+    if (!this.followSnapshotActivity(snapshot)) this.dispatch({ type: "operation-completed" });
+  }
+
+  private reportMovedHistory(): void {
+    this.options.ui.onNotice?.("History changed again; showing latest server state.", "warning");
+  }
+
+  private reportSkippedFilesystem(
+    action: "undone" | "redone",
+    filesystem: MiniLilacHistoryFilesystemResult,
+  ): void {
+    const reason = skippedFilesystemReason(filesystem);
+    if (reason === undefined) return;
+    this.options.ui.onNotice?.(
+      `Transcript ${action}; managed worktree unchanged because ${reason}.`,
+      "warning",
+    );
   }
 
   private async runCompact(): Promise<void> {
@@ -1401,7 +1595,7 @@ export class Controller {
     message: MiniLilacUserUIMessage,
     finishOperation = false,
     preserveCurrent = false,
-  ): void {
+  ): DraftSnapshot {
     const restoredText = message.parts
       .filter((part) => part.type === "text")
       .map((part) => part.text)
@@ -1453,6 +1647,7 @@ export class Controller {
         )
       : [];
     this.dispatch({ type: "draft-restored", text, files, pastedTexts, finishOperation });
+    return { editor: text, files, pastedTexts };
   }
 
   private restoreSubmittedDraft(
@@ -1505,6 +1700,18 @@ export class Controller {
 
   private beginRun(): void {
     this.renderer.startRun();
+  }
+
+  private onPromptAdmitted(): void {
+    this.pendingUndoCommandId = undefined;
+    this.pendingRedoCommandId = undefined;
+    this.undoDraftProvenance = [];
+    this.canRedo = false;
+  }
+
+  private invalidateDraftProvenance(): void {
+    this.draftMutationGeneration += 1;
+    this.undoDraftProvenance = [];
   }
 
   private nextRunGeneration(): number {
@@ -1576,4 +1783,31 @@ function sessionBindingUpdateMatches(
   if (update.profile !== undefined && snapshot.profile !== update.profile) return false;
   if (update.reasoning !== undefined && snapshot.reasoning !== update.reasoning) return false;
   return true;
+}
+
+function draftSnapshot(state: InputState): DraftSnapshot {
+  return {
+    editor: state.editor,
+    files: state.files,
+    pastedTexts: state.pastedTexts,
+  };
+}
+
+function draftMatches(state: InputState, snapshot: DraftSnapshot): boolean {
+  return (
+    state.editor === snapshot.editor &&
+    draftPartsEqual(state.files, snapshot.files) &&
+    draftPartsEqual(state.pastedTexts, snapshot.pastedTexts)
+  );
+}
+
+function draftPartsEqual<T>(left: readonly T[], right: readonly T[]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function skippedFilesystemReason(filesystem: MiniLilacHistoryFilesystemResult): string | undefined {
+  if (filesystem.status !== "skipped") return undefined;
+  if (filesystem.reason === "git-unavailable") return "Git is unavailable";
+  if (filesystem.reason === "snapshot-unavailable") return "no worktree snapshot is available";
+  return "worktree restore is unsupported on this platform";
 }

@@ -13,6 +13,13 @@ export type ToolResultOutput = Extract<
   { type: "tool-result" }
 >["output"];
 
+type MeasuredText = {
+  outputIndex: number;
+  itemIndex?: number;
+  value: string;
+  bytes: number;
+};
+
 export type NormalizeToolResultOutputFn = (
   output: ToolResultOutput,
   context: {
@@ -116,17 +123,22 @@ export function createOverflowReferenceNormalizer(
 ): ToolResultOutputGroupNormalizer {
   const logger = createLogger({ module: "tool-result-output" });
 
+  function prepareCapturedText(value: string): string {
+    if (GENERATED_OVERFLOW_REFERENCE.test(value)) return value;
+    value = removeUnsafeControls(value);
+    if (params.sanitize) value = removeUnsafeControls(params.sanitize(value));
+    return value;
+  }
+
   async function normalizeCapturedText(
     value: string,
     context: Parameters<NormalizeToolResultOutputFn>[1],
-    forceOverflow = false,
+    spill: boolean,
     config = resolveConfig(params.getOutputConfig()),
-  ): Promise<{ value: string; overflow: boolean }> {
-    if (GENERATED_OVERFLOW_REFERENCE.test(value)) return { value, overflow: true };
-    const overflow = forceOverflow || utf8Bytes(value) > config.maxInlineBytes;
-    value = removeUnsafeControls(value);
-    if (params.sanitize) value = removeUnsafeControls(params.sanitize(value));
-    if (!overflow) return { value, overflow: false };
+  ): Promise<string> {
+    if (GENERATED_OVERFLOW_REFERENCE.test(value)) return value;
+    value = prepareCapturedText(value);
+    if (!spill) return value;
 
     let uri: string | undefined;
     try {
@@ -155,20 +167,104 @@ export function createOverflowReferenceNormalizer(
       artifactStored: uri !== undefined,
     });
 
-    return { value: buildOverflowReference(uri), overflow: true };
+    return buildOverflowReference(uri);
   }
 
-  const normalize: NormalizeToolResultOutputFn = async (output, context) => {
+  function measureOutput(output: ToolResultOutput, outputIndex: number): MeasuredText[] {
     if (output.type === "text" || output.type === "error-text") {
-      const normalized = await normalizeCapturedText(output.value, context);
-      if (!normalized.overflow) return { ...output, value: normalized.value };
-      return { type: "error-text", value: normalized.value };
+      const value = prepareCapturedText(output.value);
+      return [
+        {
+          outputIndex,
+          value,
+          bytes: GENERATED_OVERFLOW_REFERENCE.test(value) ? 0 : utf8Bytes(value),
+        },
+      ];
+    }
+
+    if (output.type === "execution-denied") {
+      if (output.reason === undefined) return [];
+      const value = prepareCapturedText(output.reason);
+      return [
+        {
+          outputIndex,
+          value,
+          bytes: GENERATED_OVERFLOW_REFERENCE.test(value) ? 0 : utf8Bytes(value),
+        },
+      ];
+    }
+
+    if (output.type === "json" || output.type === "error-json") {
+      try {
+        const value = JSON.stringify(output.value, null, 2);
+        if (value === undefined) return [];
+        return [{ outputIndex, value, bytes: utf8Bytes(value) }];
+      } catch {
+        return [];
+      }
+    }
+
+    if (output.type === "content") {
+      return output.value.flatMap((item, itemIndex) => {
+        if (item.type !== "text") return [];
+        const value = prepareCapturedText(item.text);
+        return [
+          {
+            outputIndex,
+            itemIndex,
+            value,
+            bytes: GENERATED_OVERFLOW_REFERENCE.test(value) ? 0 : utf8Bytes(value),
+          },
+        ];
+      });
+    }
+
+    return [];
+  }
+
+  function measuredTextKey(outputIndex: number, itemIndex?: number): string {
+    return itemIndex === undefined ? `${outputIndex}` : `${outputIndex}:${itemIndex}`;
+  }
+
+  function selectSpills(measured: readonly MeasuredText[], maxInlineBytes: number): Set<string> {
+    let inlineBytes = measured.reduce((sum, item) => sum + item.bytes, 0);
+    const selected = new Set<string>();
+    const candidates = measured
+      .filter((item) => item.bytes > 0)
+      .toSorted(
+        (left, right) =>
+          right.bytes - left.bytes ||
+          left.outputIndex - right.outputIndex ||
+          (left.itemIndex ?? -1) - (right.itemIndex ?? -1),
+      );
+
+    for (const candidate of candidates) {
+      if (inlineBytes <= maxInlineBytes) break;
+      selected.add(measuredTextKey(candidate.outputIndex, candidate.itemIndex));
+      inlineBytes -= candidate.bytes;
+    }
+
+    return selected;
+  }
+
+  async function normalizeOutput(
+    output: ToolResultOutput,
+    context: Parameters<NormalizeToolResultOutputFn>[1],
+    outputIndex: number,
+    selected: ReadonlySet<string>,
+    config: ToolResultOutputNormalizerConfig,
+  ): Promise<ToolResultOutput> {
+    const spillOutput = selected.has(measuredTextKey(outputIndex));
+
+    if (output.type === "text" || output.type === "error-text") {
+      const value = await normalizeCapturedText(output.value, context, spillOutput, config);
+      return { ...output, value };
     }
 
     if (output.type === "execution-denied") {
       if (!output.reason) return output;
-      const normalized = await normalizeCapturedText(output.reason, context);
-      return { ...output, reason: normalized.value };
+      const reason = await normalizeCapturedText(output.reason, context, spillOutput, config);
+      return { ...output, reason };
     }
 
     if (output.type === "json" || output.type === "error-json") {
@@ -180,33 +276,45 @@ export function createOverflowReferenceNormalizer(
       }
       if (serialized === undefined) {
         return output.type === "error-json"
-          ? { type: "error-text", value: UNSERIALIZABLE_JSON_OUTPUT }
-          : { type: "text", value: UNSERIALIZABLE_JSON_OUTPUT };
+          ? { ...output, type: "error-text", value: UNSERIALIZABLE_JSON_OUTPUT }
+          : { ...output, type: "text", value: UNSERIALIZABLE_JSON_OUTPUT };
       }
-      if (utf8Bytes(serialized) <= resolveConfig(params.getOutputConfig()).maxInlineBytes) {
-        return output;
-      }
-      const reference = await normalizeCapturedText(serialized, context);
-      return { type: "error-text", value: reference.value };
+      if (!spillOutput) return output;
+      const value = await normalizeCapturedText(serialized, context, true, config);
+      return output.type === "error-json"
+        ? { ...output, type: "error-text", value }
+        : { ...output, type: "text", value };
     }
 
     if (output.type === "content") {
-      let serialized: string | undefined;
-      try {
-        serialized = JSON.stringify(output.value, null, 2);
-      } catch {
-        serialized = undefined;
-      }
-      if (serialized === undefined)
-        return { type: "error-text", value: UNSERIALIZABLE_JSON_OUTPUT };
-      if (utf8Bytes(serialized) <= resolveConfig(params.getOutputConfig()).maxInlineBytes) {
-        return output;
-      }
-      const reference = await normalizeCapturedText(serialized, context);
-      return { type: "error-text", value: reference.value };
+      const value = await Promise.all(
+        output.value.map(async (item, itemIndex) => {
+          if (item.type !== "text") return item;
+          const text = await normalizeCapturedText(
+            item.text,
+            context,
+            selected.has(measuredTextKey(outputIndex, itemIndex)),
+            config,
+          );
+          return { ...item, text };
+        }),
+      );
+      return { ...output, value };
     }
 
     return output;
+  }
+
+  const normalize: NormalizeToolResultOutputFn = async (output, context) => {
+    const config = resolveConfig(params.getOutputConfig());
+    const measured = measureOutput(output, 0);
+    return await normalizeOutput(
+      output,
+      context,
+      0,
+      selectSpills(measured, config.maxInlineBytes),
+      config,
+    );
   };
 
   const normalizeSettled: NormalizeSettledToolResultOutputsFn = async (
@@ -214,54 +322,22 @@ export function createOverflowReferenceNormalizer(
     normalizeUnspilled = normalize,
   ) => {
     const config = resolveConfig(params.getOutputConfig());
-    const measured = entries.map((entry, index) => {
-      let payload: string | undefined;
-      if (entry.output.type === "text" || entry.output.type === "error-text") {
-        payload = entry.output.value;
-      } else if (entry.output.type === "execution-denied") {
-        payload = entry.output.reason;
-      } else if (
-        entry.output.type === "json" ||
-        entry.output.type === "error-json" ||
-        entry.output.type === "content"
-      ) {
-        try {
-          payload = JSON.stringify(entry.output.value, null, 2);
-        } catch {
-          payload = undefined;
-        }
-      }
-
-      return {
-        index,
-        payload,
-        bytes: payload === undefined ? 0 : utf8Bytes(payload),
-        alreadySpilled: payload !== undefined && GENERATED_OVERFLOW_REFERENCE.test(payload),
-      };
-    });
-    let activeCount = measured.reduce((count, entry) => count + (entry.alreadySpilled ? 0 : 1), 0);
-    const selected = new Set<number>();
-    const candidates = measured
-      .filter((entry) => !entry.alreadySpilled && entry.payload !== undefined)
-      .sort((left, right) => right.bytes - left.bytes || left.index - right.index);
-
-    for (const candidate of candidates) {
-      if (candidate.bytes * activeCount <= config.maxInlineBytes) break;
-      selected.add(candidate.index);
-      activeCount -= 1;
-    }
+    const measured = entries.flatMap((entry, outputIndex) =>
+      measureOutput(entry.output, outputIndex),
+    );
+    const selected = selectSpills(measured, config.maxInlineBytes);
 
     return await Promise.all(
-      entries.map(async (entry, index) => {
-        if (!selected.has(index)) return await normalizeUnspilled(entry.output, entry.context);
-
-        const payload = measured[index]!.payload;
-        if (payload === undefined) return await normalizeUnspilled(entry.output, entry.context);
-        const reference = await normalizeCapturedText(payload, entry.context, true, config);
-        if (entry.output.type === "execution-denied") {
-          return { ...entry.output, reason: reference.value };
+      entries.map(async (entry, outputIndex) => {
+        const outputSelected = measured.some(
+          (item) =>
+            item.outputIndex === outputIndex &&
+            selected.has(measuredTextKey(item.outputIndex, item.itemIndex)),
+        );
+        if (!outputSelected && normalizeUnspilled !== normalize) {
+          return await normalizeUnspilled(entry.output, entry.context);
         }
-        return { type: "error-text", value: reference.value };
+        return await normalizeOutput(entry.output, entry.context, outputIndex, selected, config);
       }),
     );
   };

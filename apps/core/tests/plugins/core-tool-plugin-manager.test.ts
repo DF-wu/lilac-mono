@@ -216,9 +216,12 @@ describe("core tool plugin manager", () => {
       "read_file",
       "subagent_delegate",
     ]);
-    expect([...applyPatchTools.genericOutputNormalizerBypassTools].sort()).toEqual(
-      [...applyPatchTools.specs.keys()].sort(),
-    );
+    expect([...applyPatchTools.genericOutputNormalizerBypassTools].sort()).toEqual([
+      "apply_patch",
+      "bash",
+      "batch",
+      "subagent_delegate",
+    ]);
     expect([...applyPatchTools.directToolNames].sort()).toEqual([
       "apply_patch",
       "bash",
