@@ -22,6 +22,7 @@ import {
   writeCodexTokens,
 } from "./codex-oauth";
 import { createLogger } from "./logging";
+import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
 import { isRecord } from "./runtime-utils";
@@ -419,7 +420,7 @@ export function getModelProviders() {
       ? createOpenAI({
           baseURL: env.providers.openai.baseUrl,
           apiKey: env.providers.openai.apiKey,
-          fetch: openaiFetch,
+          fetch: withOpenAIImageEditFilenamesFetch(openaiFetch),
         })
       : null,
 
