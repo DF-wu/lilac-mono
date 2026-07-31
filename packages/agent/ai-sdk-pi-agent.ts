@@ -372,16 +372,57 @@ export type TransformMessagesContext = {
   abortSignal?: AbortSignal;
 };
 
-/**
- * Hook to transform the outbound `messages` array right before a model call.
- *
- * This is outbound-only: it affects what the model sees for this turn, but does
- * not rewrite the canonical transcript in `state.messages`.
- */
-export type TransformMessagesFn = (
-  messages: readonly ModelMessage[],
+export type PrepareFullModelView = (
+  canonicalMessages: readonly ModelMessage[],
   context: TransformMessagesContext,
 ) => ModelMessage[] | Promise<ModelMessage[]>;
+
+export type CanonicalModelCallPreflight = (
+  canonicalMessages: readonly ModelMessage[],
+  context: TransformMessagesContext,
+) => void | Promise<void>;
+
+export type BuildEphemeralOverlay = (
+  context: TransformMessagesContext,
+) => readonly ModelMessage[] | Promise<readonly ModelMessage[]>;
+
+export type DecorateRequestPayload = (
+  payload: readonly ModelMessage[],
+  context: TransformMessagesContext,
+) => ModelMessage[] | Promise<ModelMessage[]>;
+
+export type ModelCallExecutionMode = "local-tools" | "provider-tools";
+
+export type ModelCallRuntime = {
+  readonly model: LanguageModel;
+  readonly modelSpecifier?: string;
+  readonly executionMode: ModelCallExecutionMode;
+  /** Stable identity for outer calls that belong to one persistent provider attempt. */
+  readonly persistentAttemptIdentity?: string;
+  /** Per-call AI SDK retry limit. Omit to inherit the Agent constructor default. */
+  readonly streamTextMaxRetries?: number;
+};
+
+export type CanonicalPayloadSelection =
+  | { readonly mode: "full" }
+  | { readonly mode: "suffix"; readonly startIndex: number };
+
+export type PrepareModelCallContext = {
+  readonly canonicalMessages: readonly ModelMessage[];
+  readonly fullBudgetView: readonly ModelMessage[];
+  readonly runtime: ModelCallRuntime;
+  readonly payload: CanonicalPayloadSelection;
+  readonly transformContext: TransformMessagesContext;
+};
+
+export type PreparedModelCall = {
+  readonly runtime: ModelCallRuntime;
+  readonly payload: CanonicalPayloadSelection;
+};
+
+export type PrepareModelCall = (
+  context: PrepareModelCallContext,
+) => PreparedModelCall | Promise<PreparedModelCall>;
 
 export type TurnErrorHandlerDecision = "retry" | "fail";
 
@@ -458,13 +499,11 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   sendToolsToModel?: boolean;
   /** Optional initial transcript (defaults to empty). */
   messages?: ModelMessage[];
-  /**
-   * Optional hook to transform the outbound context before each model call.
-   *
-   * The hook sees the exact message list that would be sent to the model,
-   * including any messages injected by `steer()`/`followUp()` and tool results.
-   */
-  transformMessages?: TransformMessagesFn;
+  prepareFullModelView?: PrepareFullModelView;
+  canonicalModelCallPreflight?: CanonicalModelCallPreflight;
+  buildEphemeralOverlay?: BuildEphemeralOverlay;
+  decorateRequestPayload?: DecorateRequestPayload;
+  prepareModelCall?: PrepareModelCall;
   /** Optional hook to recover from turn errors (e.g. context overflow). */
   turnErrorHandler?: TurnErrorHandler;
   /** Inject messages after tools finish and before the next model turn. */
@@ -996,7 +1035,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private cancelResetPending = false;
   private abortRequestedReason: TurnAbortReason | null = null;
 
-  private transformMessages: TransformMessagesFn | undefined;
+  private prepareFullModelView: PrepareFullModelView | undefined;
+  private canonicalModelCallPreflight: CanonicalModelCallPreflight | undefined;
+  private buildEphemeralOverlay: BuildEphemeralOverlay | undefined;
+  private decorateRequestPayload: DecorateRequestPayload | undefined;
+  private prepareModelCall: PrepareModelCall | undefined;
   private turnErrorHandler: TurnErrorHandler | undefined;
   private turnBoundaryHandler: TurnBoundaryHandler | undefined;
   private beforeSteeringDelivery: BeforeSteeringDeliveryHandler | undefined;
@@ -1008,6 +1051,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private aggregateOutputBudgetExemptTools: ReadonlySet<string>;
   private exclusiveToolNames: ReadonlySet<string>;
   private alreadyNormalizedExternalToolCallIds = new Set<string>();
+  private providerExecutedToolAttemptLatched = false;
+  private activePersistentAttemptIdentity: string | undefined;
 
   private context?: unknown;
 
@@ -1016,7 +1061,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   /** Create a new agent instance. */
   constructor(options: AiSdkPiAgentOptions<TOOLS>) {
-    this.transformMessages = options.transformMessages;
+    this.prepareFullModelView = options.prepareFullModelView;
+    this.canonicalModelCallPreflight = options.canonicalModelCallPreflight;
+    this.buildEphemeralOverlay = options.buildEphemeralOverlay;
+    this.decorateRequestPayload = options.decorateRequestPayload;
+    this.prepareModelCall = options.prepareModelCall;
     this.turnErrorHandler = options.turnErrorHandler;
     this.turnBoundaryHandler = options.turnBoundaryHandler;
     this.beforeSteeringDelivery = options.beforeSteeringDelivery;
@@ -1161,6 +1210,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     abortSignal?: AbortSignal;
     inputValidation?: "validate" | "prevalidated";
   }): Promise<ExternalToolExecutionOutcome> {
+    this.providerExecutedToolAttemptLatched = true;
     const signals = [input.abortSignal, this.abortController?.signal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
@@ -1238,17 +1288,34 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     return { ...outcome, ...(executedExpansion ? { executedExpansion } : {}) };
   }
 
-  /** Replace the outbound message transform hook. */
-  setTransformMessages(transformMessages: TransformMessagesFn | undefined) {
-    this.transformMessages = transformMessages;
+  setPrepareFullModelView(prepareFullModelView: PrepareFullModelView | undefined) {
+    this.prepareFullModelView = prepareFullModelView;
   }
 
-  /** Append an outbound transform without replacing an existing transform. */
-  appendTransformMessages(transformMessages: TransformMessagesFn) {
-    const previous = this.transformMessages;
-    this.transformMessages = previous
-      ? async (messages, context) => transformMessages(await previous(messages, context), context)
-      : transformMessages;
+  setCanonicalModelCallPreflight(
+    canonicalModelCallPreflight: CanonicalModelCallPreflight | undefined,
+  ) {
+    this.canonicalModelCallPreflight = canonicalModelCallPreflight;
+  }
+
+  setBuildEphemeralOverlay(buildEphemeralOverlay: BuildEphemeralOverlay | undefined) {
+    this.buildEphemeralOverlay = buildEphemeralOverlay;
+  }
+
+  setDecorateRequestPayload(decorateRequestPayload: DecorateRequestPayload | undefined) {
+    this.decorateRequestPayload = decorateRequestPayload;
+  }
+
+  appendDecorateRequestPayload(decorateRequestPayload: DecorateRequestPayload) {
+    const previous = this.decorateRequestPayload;
+    this.decorateRequestPayload = previous
+      ? async (messages, context) =>
+          decorateRequestPayload(await previous(messages, context), context)
+      : decorateRequestPayload;
+  }
+
+  setPrepareModelCall(prepareModelCall: PrepareModelCall | undefined) {
+    this.prepareModelCall = prepareModelCall;
   }
 
   /** Replace the turn-error recovery hook. */
@@ -1979,7 +2046,6 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           }
 
           let modelTurnCompleted = false;
-          let providerExecutedToolObserved = false;
           let turnErrorPhase: TurnErrorPhase = "before-step";
           const localToolDraftIds = new Set<string>();
 
@@ -1990,7 +2056,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                 if (phase === "post-model") modelTurnCompleted = true;
               },
               onProviderExecutedTool: () => {
-                providerExecutedToolObserved = true;
+                this.providerExecutedToolAttemptLatched = true;
               },
               onLocalToolDraft: (toolCallId) => {
                 localToolDraftIds.add(toolCallId);
@@ -2187,7 +2253,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               const lastMessage = this.state.messages.at(-1);
               const retrySafety: TurnRetrySafety = modelTurnCompleted
                 ? { canRetry: false, reason: "post-model-phase" }
-                : providerExecutedToolObserved
+                : this.providerExecutedToolAttemptLatched
                   ? { canRetry: false, reason: "provider-executed-tool" }
                   : lastMessage?.role === "assistant" || this.state.pendingToolCalls.size > 0
                     ? { canRetry: false, reason: "invalid-transcript-boundary" }
@@ -2293,6 +2359,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     modelInputMessages: ModelMessage[];
     toolSnapshot: StepToolSnapshot<TOOLS>;
   }> {
+    // Ordinary runtimes retain per-call retry semantics. Persistent runtimes
+    // keep the latch until model-call preparation installs a distinct attempt.
+    if (this.activePersistentAttemptIdentity === undefined) {
+      this.providerExecutedToolAttemptLatched = false;
+    }
     params.onErrorPhase("before-step");
     this.emit({ type: "turn_start" });
 
@@ -2320,42 +2391,101 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     const toolSnapshot = this.createStepToolSnapshot(turnIndex);
     this.lastStepToolSnapshot = toolSnapshot;
-    const modelTools = this.sendToolsToModel ? stripToolExecuteForModel(toolSnapshot.tools) : {};
+    const allModelTools = stripToolExecuteForModel(toolSnapshot.tools);
 
     const getAbortReason = (): TurnAbortReason =>
       this.abortRequestedReason ?? (this.pendingInterrupt ? "interrupt" : "manual");
 
     const abortSignal = this.abortController?.signal;
 
-    let messagesForModel = normalizeReplayMessages(this.state.messages.map(cloneMessage));
-    if (this.transformMessages) {
-      params.onErrorPhase("transform-messages");
-      if (abortSignal?.aborted) {
-        throw new TurnAbortedError({
-          reason: getAbortReason(),
-          phase: "model",
-        });
-      }
+    params.onErrorPhase("transform-messages");
+    const throwIfPreparationAborted = () => {
+      if (!abortSignal?.aborted) return;
+      throw new TurnAbortedError({ reason: getAbortReason(), phase: "model" });
+    };
+    const contextForMode = (executionMode: ModelCallExecutionMode): TransformMessagesContext => ({
+      system: this.state.system,
+      tools: executionMode === "local-tools" ? allModelTools : {},
+      abortSignal,
+    });
+    const initialRuntime: ModelCallRuntime = {
+      model: this.state.model,
+      modelSpecifier: this.state.modelSpecifier,
+      executionMode: this.sendToolsToModel ? "local-tools" : "provider-tools",
+      streamTextMaxRetries: this.streamTextMaxRetries,
+    };
+    let canonicalMessages: ModelMessage[] = [];
+    let preparedCanonical: ModelMessage[] = [];
+    let preparationContext = contextForMode(initialRuntime.executionMode);
+    throwIfPreparationAborted();
+    canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
+    await this.canonicalModelCallPreflight?.(canonicalMessages, preparationContext);
+    canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
+    preparedCanonical = this.prepareFullModelView
+      ? await this.prepareFullModelView(canonicalMessages, preparationContext)
+      : canonicalMessages;
+    preparedCanonical = normalizeReplayMessages(preparedCanonical);
+    throwIfPreparationAborted();
 
-      messagesForModel = await this.transformMessages(messagesForModel, {
-        system: this.state.system,
-        tools: modelTools,
-        abortSignal,
-      });
+    const budgetOverlay = this.buildEphemeralOverlay
+      ? await this.buildEphemeralOverlay(preparationContext)
+      : [];
+    const fullBudgetView = normalizeReplayMessages([...preparedCanonical, ...budgetOverlay]);
+    const defaultPreparation: PreparedModelCall = {
+      runtime: initialRuntime,
+      payload: { mode: "full" },
+    };
+    const callPreparation = this.prepareModelCall
+      ? await this.prepareModelCall({
+          canonicalMessages,
+          fullBudgetView,
+          runtime: defaultPreparation.runtime,
+          payload: defaultPreparation.payload,
+          transformContext: preparationContext,
+        })
+      : defaultPreparation;
+    throwIfPreparationAborted();
 
-      messagesForModel = normalizeReplayMessages(messagesForModel);
-
-      if (abortSignal?.aborted) {
-        throw new TurnAbortedError({
-          reason: getAbortReason(),
-          phase: "model",
-        });
-      }
+    const suffixStart =
+      callPreparation.payload.mode === "full" ? 0 : callPreparation.payload.startIndex;
+    if (
+      !Number.isInteger(suffixStart) ||
+      suffixStart < 0 ||
+      suffixStart > canonicalMessages.length
+    ) {
+      throw new Error(`prepareModelCall selected invalid canonical suffix index ${suffixStart}`);
     }
+    const persistentAttemptIdentity = callPreparation.runtime.persistentAttemptIdentity;
+    if (
+      persistentAttemptIdentity === undefined ||
+      persistentAttemptIdentity !== this.activePersistentAttemptIdentity
+    ) {
+      this.providerExecutedToolAttemptLatched = false;
+    }
+    this.activePersistentAttemptIdentity = persistentAttemptIdentity;
+    preparationContext = contextForMode(callPreparation.runtime.executionMode);
+    const selectedCanonical = canonicalMessages.slice(suffixStart);
+    let messagesForModel = this.prepareFullModelView
+      ? await this.prepareFullModelView(selectedCanonical, preparationContext)
+      : selectedCanonical;
+    messagesForModel = normalizeReplayMessages(messagesForModel);
+    if (messagesForModel.at(-1)?.role === "assistant") {
+      throw new Error("Cannot append an ephemeral overlay after an assistant message");
+    }
+    const payloadOverlay = this.buildEphemeralOverlay
+      ? await this.buildEphemeralOverlay(preparationContext)
+      : [];
+    messagesForModel = normalizeReplayMessages([...messagesForModel, ...payloadOverlay]);
+    if (this.decorateRequestPayload) {
+      messagesForModel = normalizeReplayMessages(
+        await this.decorateRequestPayload(messagesForModel, preparationContext),
+      );
+    }
+    throwIfPreparationAborted();
 
     messagesForModel = normalizeModelMessagesToolCallIds({
       messages: messagesForModel,
-      modelSpecifier: this.state.modelSpecifier,
+      modelSpecifier: callPreparation.runtime.modelSpecifier,
     });
 
     if (this.captureModelViewMessages) {
@@ -2370,20 +2500,22 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       messagesForModel.length > 0 ? messagesForModel[messagesForModel.length - 1] : undefined;
     if (lastMessage?.role === "assistant") {
       throw new Error(
-        "transformMessages produced an invalid outbound context: last message is assistant.",
+        "Request preparation produced an invalid outbound context: last message is assistant.",
       );
     }
 
     params.onErrorPhase("model-call");
+    const streamTextMaxRetries =
+      callPreparation.runtime.streamTextMaxRetries ?? this.streamTextMaxRetries;
     const result = streamText({
-      model: this.state.model,
+      model: callPreparation.runtime.model,
       instructions: this.state.system,
       messages: messagesForModel,
-      ...(this.sendToolsToModel ? { tools: modelTools } : {}),
+      ...(callPreparation.runtime.executionMode === "local-tools" ? { tools: allModelTools } : {}),
       reasoning: this.state.reasoning,
       providerOptions: this.state.providerOptions,
       experimental_download: this.experimentalDownload,
-      ...(this.streamTextMaxRetries === undefined ? {} : { maxRetries: this.streamTextMaxRetries }),
+      ...(streamTextMaxRetries === undefined ? {} : { maxRetries: streamTextMaxRetries }),
       abortSignal,
       onError: () => {},
     });

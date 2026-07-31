@@ -60,7 +60,7 @@ import {
   hasOpenAIServerCompaction,
   materializeOpenAIServerCompaction,
   type AiSdkPiAgentEvent,
-  type TransformMessagesFn,
+  type PrepareFullModelView,
 } from "@stanley2058/lilac-agent";
 
 import fs from "node:fs/promises";
@@ -3309,7 +3309,7 @@ export async function startBusAgentRunner(params: {
       agent.setFollowUpMode("all");
       agent.setSteeringMode("all");
 
-      const toolPruneTransform: TransformMessagesFn = async (messages) => {
+      const toolPruneTransform: PrepareFullModelView = async (messages) => {
         const configuredServerCompactionReplayKey = activeBinding.resolved.openaiServerCompaction
           ? `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`
           : undefined;
@@ -3369,11 +3369,7 @@ export async function startBusAgentRunner(params: {
             })
           : scrubbed;
 
-        if (!activeBinding.anthropicPromptCachingEnabled) return compacted;
-        return withProviderOptionsOnLastUserMessage(
-          compacted,
-          ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-        );
+        return compacted;
       };
 
       let autoCompactionSeq = 0;
@@ -3413,7 +3409,14 @@ export async function startBusAgentRunner(params: {
           thresholdInputSource: claudeCodeRun === null ? "usage" : "transcript-estimate",
           resolveCurrentModelSpecifier: () =>
             agent.state.modelSpecifier ?? activeBinding.resolved.spec,
-          baseTransformMessages: toolPruneTransform,
+          prepareFullModelView: toolPruneTransform,
+          decorateRequestPayload: (payload) =>
+            activeBinding.anthropicPromptCachingEnabled
+              ? withProviderOptionsOnLastUserMessage(
+                  [...payload],
+                  ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+                )
+              : [...payload],
           baseTurnErrorHandler: turnErrorHandler,
           serverCompaction: async ({
             messages: prefix,

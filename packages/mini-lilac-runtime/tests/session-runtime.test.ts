@@ -4111,7 +4111,7 @@ describe("SessionService", () => {
       attachCompaction: async (agent, options) => {
         thresholdInputSource = options.thresholdInputSource;
         const encoded = Buffer.alloc(4, 7).toString("base64");
-        const transformed = await options.baseTransformMessages?.(
+        const transformed = await options.prepareFullModelView?.(
           [
             {
               role: "tool",
@@ -7812,7 +7812,7 @@ describe("SessionService", () => {
       databasePath,
       modelResolver: () => model,
       attachCompaction: async (agent) => {
-        agent.setTransformMessages((messages) => [
+        agent.setPrepareFullModelView((messages) => [
           ...messages,
           { role: "user", content: "compaction-transform-marker" },
         ]);
@@ -8009,7 +8009,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       attachCompaction: async (agent) => {
-        agent.setTransformMessages((messages) => [
+        agent.setPrepareFullModelView((messages) => [
           ...messages,
           { role: "assistant", content: "invalid assistant tail" },
         ]);
@@ -8023,7 +8023,7 @@ describe("SessionService", () => {
     expect(model.doStreamCalls).toHaveLength(0);
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
-      error: "Cannot append todo context after an assistant message",
+      error: "Cannot append an ephemeral overlay after an assistant message",
     });
     service.close();
   });

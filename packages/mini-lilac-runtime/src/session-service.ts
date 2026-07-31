@@ -1761,6 +1761,26 @@ class SessionActor {
     }
     agent.setSteeringMode("all");
     const configuredSummaryModel = this.config.agent.compaction.model;
+    const buildEphemeralOverlay =
+      context.depth === 0
+        ? () => {
+            const state = this.store.getTodos(this.snapshot.id);
+            if (state.revision === 0) return [];
+            const serialized = JSON.stringify({ revision: state.revision, todos: state.todos });
+            return [
+              {
+                role: "user" as const,
+                content: [
+                  "<session-todos>",
+                  "This is the authoritative current todo state for this session, not a new user request.",
+                  "It supersedes todo state found in older tool calls or compaction summaries.",
+                  serialized,
+                  "</session-todos>",
+                ].join("\n"),
+              },
+            ];
+          }
+        : undefined;
     await this.attachCompaction(agent, {
       model: modelSpecifier,
       modelCapability: this.modelCapability,
@@ -1779,7 +1799,9 @@ class SessionActor {
         configuredSummaryModel === "inherit"
           ? undefined
           : async () => (await this.resolveModelLimits(configuredSummaryModel))?.context,
-      baseTransformMessages: mediaScrubTransform,
+      prepareFullModelView: mediaScrubTransform,
+      buildEphemeralOverlay,
+      decorateRequestPayload: usesCodexOAuth ? withoutOpenAIItemIds : undefined,
       baseTurnErrorHandler: openaiServerCompactionEnabled
         ? turnErrorHandler
         : transientRetryController?.handler,
@@ -1858,30 +1880,8 @@ class SessionActor {
           ...(event.summary === undefined ? {} : { finalSummary: event.summary }),
         }),
     });
-    if (context.depth === 0) {
-      agent.appendTransformMessages((outboundMessages) => {
-        if (outboundMessages.at(-1)?.role === "assistant") {
-          throw new Error("Cannot append todo context after an assistant message");
-        }
-        const state = this.store.getTodos(this.snapshot.id);
-        if (state.revision === 0) return [...outboundMessages];
-        const serialized = JSON.stringify({ revision: state.revision, todos: state.todos });
-        return [
-          ...outboundMessages,
-          {
-            role: "user",
-            content: [
-              "<session-todos>",
-              "This is the authoritative current todo state for this session, not a new user request.",
-              "It supersedes todo state found in older tool calls or compaction summaries.",
-              serialized,
-              "</session-todos>",
-            ].join("\n"),
-          },
-        ];
-      });
-    }
-    if (usesCodexOAuth) agent.appendTransformMessages(withoutOpenAIItemIds);
+    agent.setBuildEphemeralOverlay(buildEphemeralOverlay);
+    agent.setDecorateRequestPayload(usesCodexOAuth ? withoutOpenAIItemIds : undefined);
     return { agent, claudeCodeRun };
   }
 

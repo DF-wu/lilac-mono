@@ -13,6 +13,8 @@ import {
 } from "../auto-compaction";
 import { AiSdkPiAgent } from "../ai-sdk-pi-agent";
 import {
+  hasMatchingOpenAIServerCompaction,
+  materializeOpenAIServerCompaction,
   readOpenAIServerCompactionArtifact,
   type OpenAIServerCompactionArtifact,
 } from "../openai-server-compaction";
@@ -66,6 +68,7 @@ function summaryResponse(summary = "Condensed prior work.") {
 function serverCompactionArtifact(
   encryptedContent = "encrypted context",
   estimatedTokens = 31,
+  replayKey = "test/model",
 ): OpenAIServerCompactionArtifact {
   const artifact = readOpenAIServerCompactionArtifact({
     type: "custom",
@@ -80,7 +83,7 @@ function serverCompactionArtifact(
         serverCompaction: {
           formatVersion: 1,
           protocol: "openai-responses-v2",
-          replayKey: "test/model",
+          replayKey,
           portableSummary: "Condensed prior work.",
           estimatedTokens,
         },
@@ -1196,7 +1199,7 @@ describe("auto-compaction internals", () => {
       model: "test/main",
       modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
       resolveContextLimit: async () => ({ context: 100_000, output: 10_000 }),
-      baseTransformMessages: () => {
+      prepareFullModelView: () => {
         throw transformError;
       },
       baseTurnErrorHandler: (_error, context) => {
@@ -1434,7 +1437,7 @@ describe("auto-compaction internals", () => {
       summaryModel,
       thresholdInputSource: "usage",
       resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
-      baseTransformMessages: (messages) =>
+      prepareFullModelView: (messages) =>
         messages.map((message): ModelMessage => {
           if (message.role !== "user" || !Array.isArray(message.content)) return message;
           return {
@@ -1683,6 +1686,55 @@ describe("auto-compaction internals", () => {
       "assistant",
     ]);
     expect(agent.state.messages[2]?.content).toBe("new actual request");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("autoCompactionContinue");
+  });
+
+  it("compacts an over-budget restored transcript after removing a superseded trailer", async () => {
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        return summaryResponse("Restored transcript summary.");
+      },
+    });
+    let providerInvokedBeforeCompaction = false;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => {
+        providerInvokedBeforeCompaction = summaryCalls === 0;
+        return summaryResponse("new response");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(20_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(20_000)}` },
+        __autoCompactionInternals.buildAutoContinueMessage(),
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTurns: 1,
+      keepRecentTokens: 500,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("new actual request");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBeGreaterThan(0);
+    expect(providerInvokedBeforeCompaction).toBe(false);
+    expect(mainModel.doStreamCalls).toHaveLength(1);
+    expect(agent.state.messages[0]?.content).toContain("Restored transcript summary.");
+    expect(agent.state.messages.at(-2)?.content).toBe("new actual request");
     expect(JSON.stringify(agent.state.messages)).not.toContain("autoCompactionContinue");
   });
 
@@ -2122,7 +2174,7 @@ describe("auto-compaction internals", () => {
     ).toThrow("Compaction could not fit bounded context within the input budget");
   });
 
-  it("commits a native artifact with the local summary and retained suffix", async () => {
+  it("persists only the portable summary and retained canonical suffix", async () => {
     const messages: ModelMessage[] = [
       { role: "user", content: `old request ${"a".repeat(6_000)}` },
       { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
@@ -2163,16 +2215,11 @@ describe("auto-compaction internals", () => {
     expect(serverRequests[0]?.portableSummary).toBe(local.summary);
     expect(serverRequests[0]?.messages).toEqual(messages.slice(0, 2));
     expect(hybrid.summary).toBe(local.summary);
-    expect(hybrid.messages.slice(1)).toEqual(local.messages.slice(1));
-    const nativeMessage = hybrid.messages[0];
-    expect(nativeMessage?.role).toBe("assistant");
-    if (nativeMessage?.role !== "assistant" || !Array.isArray(nativeMessage.content)) {
-      throw new Error("Expected native compaction to be persisted as an assistant artifact.");
-    }
-    expect(readOpenAIServerCompactionArtifact(nativeMessage.content[0])).not.toBeNull();
+    expect(hybrid.messages).toEqual(local.messages);
+    expect(JSON.stringify(hybrid.messages)).not.toContain("encrypted context");
   });
 
-  it("retains bounded real user inputs before the native artifact", async () => {
+  it("does not persist native retained-user decoration", async () => {
     const oldRequest = { role: "user" as const, content: "old exact user constraint" };
     const messages: ModelMessage[] = [
       oldRequest,
@@ -2192,13 +2239,8 @@ describe("auto-compaction internals", () => {
     });
 
     expect(result.status).toBe("compacted");
-    expect(result.messages[0]).toEqual(oldRequest);
-    const nativeMessage = result.messages[1];
-    expect(nativeMessage?.role).toBe("assistant");
-    if (nativeMessage?.role !== "assistant" || !Array.isArray(nativeMessage.content)) {
-      throw new Error("Expected a native artifact after the retained user message.");
-    }
-    expect(readOpenAIServerCompactionArtifact(nativeMessage.content[0])).not.toBeNull();
+    expect(result.messages[0]).not.toEqual(oldRequest);
+    expect(JSON.stringify(result.messages)).not.toContain("encrypted context");
     expect(result.messages.at(-1)).toEqual(messages.at(-1));
   });
 
@@ -2298,6 +2340,145 @@ describe("auto-compaction internals", () => {
     expect(failure).toBe(abortError);
   });
 
+  it("activates a generated server-compaction view so rejection retries its portable summary", async () => {
+    const nativeReplayError = new Error("generated native replay rejected");
+    const prompts: string[] = [];
+    let mainCalls = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        mainCalls += 1;
+        prompts.push(JSON.stringify(prompt));
+        if (mainCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [{ type: "error" as const, error: nativeReplayError }],
+            }),
+          };
+        }
+        return summaryResponse("portable retry succeeded");
+      },
+    });
+    const summaryModel = new MockLanguageModelV4({ doStream: summaryResponse() });
+    let serverReplayEnabled = true;
+    let nativeReplayActive = false;
+    const replayKey = "test/model";
+    const prepareFullModelView = (messages: readonly ModelMessage[]) => {
+      const activeKey = serverReplayEnabled ? replayKey : undefined;
+      nativeReplayActive = hasMatchingOpenAIServerCompaction(messages, activeKey);
+      return materializeOpenAIServerCompaction(messages, activeKey);
+    };
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(8_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(8_000)}` },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      thresholdFraction: 0.25,
+      keepRecentTurns: 1,
+      keepRecentTokens: 100,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      prepareFullModelView,
+      serverCompactionEnabled: () => serverReplayEnabled,
+      serverCompaction: async () => serverCompactionArtifact("generated encrypted context"),
+      baseTurnErrorHandler: (error, context) => {
+        if (
+          error === nativeReplayError &&
+          nativeReplayActive &&
+          context.phase === "model-call" &&
+          context.retrySafety.canRetry
+        ) {
+          serverReplayEnabled = false;
+          nativeReplayActive = false;
+          return "retry";
+        }
+        return "fail";
+      },
+    });
+
+    try {
+      await agent.prompt("latest request remains verbatim");
+    } finally {
+      detach();
+    }
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("generated encrypted context");
+    expect(prompts[1]).toContain("Condensed prior work.");
+    expect(prompts[1]).not.toContain("generated encrypted context");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("generated encrypted context");
+  });
+
+  it("materializes a cached server-compaction view when the replay key changes", async () => {
+    const firstModelError = new Error("advance to another replay key");
+    const prompts: string[] = [];
+    let mainCalls = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        mainCalls += 1;
+        prompts.push(JSON.stringify(prompt));
+        if (mainCalls === 1) {
+          return {
+            stream: simulateReadableStream({
+              chunks: [{ type: "error" as const, error: firstModelError }],
+            }),
+          };
+        }
+        return summaryResponse("replacement model response");
+      },
+    });
+    const summaryModel = new MockLanguageModelV4({ doStream: summaryResponse() });
+    let activeReplayKey = "test/model-a";
+    const prepareFullModelView = (messages: readonly ModelMessage[]) =>
+      materializeOpenAIServerCompaction(messages, activeReplayKey);
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main-a",
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(8_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(8_000)}` },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main-a",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      thresholdFraction: 0.25,
+      keepRecentTurns: 1,
+      keepRecentTokens: 100,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      prepareFullModelView,
+      serverCompactionEnabled: () => true,
+      serverCompaction: async () =>
+        serverCompactionArtifact("model-a encrypted context", 31, "test/model-a"),
+      baseTurnErrorHandler: (error, context) => {
+        if (error !== firstModelError || !context.retrySafety.canRetry) return "fail";
+        activeReplayKey = "test/model-b";
+        return "retry";
+      },
+    });
+
+    try {
+      await agent.prompt("latest request remains verbatim");
+    } finally {
+      detach();
+    }
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("model-a encrypted context");
+    expect(prompts[1]).toContain("Condensed prior work.");
+    expect(prompts[1]).not.toContain("model-a encrypted context");
+  });
+
   it("skips server compaction when the automatic path is dynamically disabled", async () => {
     let summaryCalls = 0;
     let serverCalls = 0;
@@ -2342,5 +2523,294 @@ describe("auto-compaction internals", () => {
     expect(serverCalls).toBe(0);
     expect(agent.state.messages[0]?.role).toBe("user");
     expect(agent.state.messages[0]?.content).toContain("<context-compaction>");
+  });
+
+  it("summarizes an expanding prepared prefix while preserving the canonical suffix and excluding overlays and decoration", async () => {
+    let summaryPrompt = "";
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        summaryPrompt = JSON.stringify(prompt);
+        return summaryResponse("Prepared prefix summary.");
+      },
+    });
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => summaryResponse("answer"),
+    });
+    const latest: ModelMessage = {
+      role: "user",
+      content: "latest canonical request",
+      providerOptions: { test: { canonical: true } },
+    };
+    let overlayRevision = 0;
+    let seamCanonical: readonly ModelMessage[] = [];
+    let seamFullBudgetView: readonly ModelMessage[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(50_000)}` },
+        { role: "assistant", content: `CANONICAL_UNPRUNED_${"b".repeat(8_000)}` },
+      ],
+      prepareModelCall: ({ canonicalMessages, fullBudgetView, runtime, payload }) => {
+        seamCanonical = canonicalMessages;
+        seamFullBudgetView = fullBudgetView;
+        return { runtime, payload };
+      },
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTurns: 1,
+      keepRecentTokens: 500,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      prepareFullModelView: (messages) =>
+        messages.flatMap((message): ModelMessage[] => {
+          if (message.role !== "assistant" || typeof message.content !== "string") {
+            return [{ ...message }];
+          }
+          return [
+            { role: "assistant", content: "PREPARED_PRUNED_PART_ONE" },
+            { role: "assistant", content: "PREPARED_PRUNED_PART_TWO" },
+          ];
+        }),
+      buildEphemeralOverlay: () => {
+        overlayRevision += 1;
+        return [{ role: "user", content: `EPHEMERAL_OVERLAY_${overlayRevision}` }];
+      },
+      decorateRequestPayload: (payload) => {
+        const last = payload.at(-1);
+        if (last?.role !== "user") return [...payload];
+        return [
+          ...payload.slice(0, -1),
+          { ...last, providerOptions: { test: { finalDecoration: true } } },
+        ];
+      },
+    });
+
+    try {
+      await agent.prompt(latest);
+    } finally {
+      detach();
+    }
+
+    expect(summaryPrompt).toContain("PREPARED_PRUNED_PART_ONE");
+    expect(summaryPrompt).toContain("PREPARED_PRUNED_PART_TWO");
+    expect(summaryPrompt).not.toContain("CANONICAL_UNPRUNED");
+    expect(summaryPrompt).not.toContain("EPHEMERAL_OVERLAY");
+    expect(JSON.stringify(seamCanonical[0])).toContain("Prepared prefix summary.");
+    expect(seamCanonical[1]).toEqual(latest);
+    expect(JSON.stringify(seamFullBudgetView)).toContain("EPHEMERAL_OVERLAY");
+    expect(agent.state.messages[1]).toEqual(latest);
+    expect(JSON.stringify(agent.state.messages)).not.toContain("PREPARED_PRUNED");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("EPHEMERAL_OVERLAY");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("finalDecoration");
+    const payload = JSON.stringify(mainModel.doStreamCalls[0]?.prompt);
+    expect(payload).toContain(`EPHEMERAL_OVERLAY_${overlayRevision}`);
+    expect(payload).toContain("finalDecoration");
+  });
+
+  it("includes the current overlay in preflight estimates without summarizing or persisting it", async () => {
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        summaryCalls += 1;
+        expect(JSON.stringify(prompt)).not.toContain("OVERLAY_BUDGET_PRESSURE");
+        return summaryResponse("Overlay-aware summary.");
+      },
+    });
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => summaryResponse("done"),
+    });
+    let overlayRevision = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `older ${"a".repeat(3_000)}` },
+        { role: "assistant", content: `answer ${"b".repeat(2_000)}` },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTurns: 1,
+      keepRecentTokens: 100,
+      resolveContextLimit: async () => ({ context: 6_000, output: 2_000 }),
+      buildEphemeralOverlay: () => {
+        overlayRevision += 1;
+        return [
+          {
+            role: "user",
+            content: `OVERLAY_BUDGET_PRESSURE_${overlayRevision}_${"x".repeat(12_000)}`,
+          },
+        ];
+      },
+    });
+
+    try {
+      await agent.prompt("latest");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBe(1);
+    expect(JSON.stringify(agent.state.messages)).not.toContain("OVERLAY_BUDGET_PRESSURE");
+    expect(JSON.stringify(mainModel.doStreamCalls[0]?.prompt)).toContain(
+      `OVERLAY_BUDGET_PRESSURE_${overlayRevision}`,
+    );
+  });
+
+  it("uses an input estimate floor to trigger compaction and re-evaluates it with a fresh overlay", async () => {
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        return summaryResponse("Floor-aware summary.");
+      },
+    });
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => summaryResponse("done"),
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `older request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `older answer ${"b".repeat(6_000)}` },
+      ],
+    });
+    let overlayRevision = 0;
+    const floorCalls: Array<{
+      readonly canonicalCount: number;
+      readonly preparedCount: number;
+      readonly overlay: string;
+      readonly ordinaryEstimate: number;
+      readonly suffixAndOverlayEstimate: number;
+    }> = [];
+    let startEstimate = 0;
+    let endEstimate = 0;
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTurns: 1,
+      keepRecentTokens: 100,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      buildEphemeralOverlay: () => {
+        overlayRevision += 1;
+        return [{ role: "user", content: `FLOOR_OVERLAY_${overlayRevision}` }];
+      },
+      inputEstimateFloor: ({
+        canonicalMessages,
+        preparedFullView,
+        overlay,
+        context,
+        ordinaryModelInputEstimate,
+        estimateMessagesTokens,
+      }) => {
+        expect(context.system).toBe("test");
+        floorCalls.push({
+          canonicalCount: canonicalMessages.length,
+          preparedCount: preparedFullView.length,
+          overlay: JSON.stringify(overlay),
+          ordinaryEstimate: ordinaryModelInputEstimate,
+          suffixAndOverlayEstimate: estimateMessagesTokens([
+            ...canonicalMessages.slice(-1),
+            ...overlay,
+          ]),
+        });
+        return floorCalls.length === 1 ? 9_000 : 7_000;
+      },
+      onCompactionStart: ({ estimatedInputTokens }) => {
+        startEstimate = estimatedInputTokens;
+      },
+      onCompactionEnd: ({ status, estimatedInputTokensAfter }) => {
+        if (status === "completed") endEstimate = estimatedInputTokensAfter ?? 0;
+      },
+    });
+
+    try {
+      await agent.prompt("latest request");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBe(1);
+    expect(floorCalls).toHaveLength(2);
+    expect(floorCalls[0]).toMatchObject({ canonicalCount: 3, preparedCount: 3 });
+    expect(floorCalls[0]?.ordinaryEstimate).toBeLessThan(8_000);
+    expect(floorCalls[0]?.suffixAndOverlayEstimate).toBeLessThan(
+      floorCalls[0]?.ordinaryEstimate ?? 0,
+    );
+    expect(floorCalls[0]?.overlay).toContain("FLOOR_OVERLAY_1");
+    expect(floorCalls[1]?.overlay).toContain("FLOOR_OVERLAY_2");
+    expect(floorCalls[1]?.ordinaryEstimate).toBeLessThan(7_000);
+    expect(startEstimate).toBe(9_000);
+    expect(endEstimate).toBe(7_000);
+  });
+
+  it("rejects an invalid input estimate floor", async () => {
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: new MockLanguageModelV4({ doStream: async () => summaryResponse("unused") }),
+      modelSpecifier: "test/main",
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      inputEstimateFloor: () => Number.NaN,
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(agent.prompt("reject invalid floor")).rejects.toThrow(
+        "input estimate floor must return null or a finite non-negative number",
+      );
+    } finally {
+      errorSpy.mockRestore();
+      detach();
+    }
+  });
+
+  it("keeps ordinary preflight behavior when the input estimate floor is omitted", async () => {
+    let summaryCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: new MockLanguageModelV4({ doStream: async () => summaryResponse("done") }),
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "small prior request" },
+        { role: "assistant", content: "small prior response" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel: new MockLanguageModelV4({
+        doStream: async () => {
+          summaryCalls += 1;
+          return summaryResponse("unexpected");
+        },
+      }),
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("small current request");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBe(0);
+    expect(agent.state.messages[0]?.content).toBe("small prior request");
   });
 });
