@@ -12,6 +12,10 @@ import {
   type CompactionProgress,
 } from "../auto-compaction";
 import { AiSdkPiAgent } from "../ai-sdk-pi-agent";
+import {
+  readOpenAIServerCompactionArtifact,
+  type OpenAIServerCompactionArtifact,
+} from "../openai-server-compaction";
 
 function createRegistryFetch(registry: unknown): typeof fetch {
   return (async () => {
@@ -40,6 +44,51 @@ function zeroUsage() {
       reasoning: 0,
     },
   };
+}
+
+function summaryResponse(summary = "Condensed prior work.") {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "summary" },
+        { type: "text-delta" as const, id: "summary", delta: summary },
+        { type: "text-end" as const, id: "summary" },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function serverCompactionArtifact(
+  encryptedContent = "encrypted context",
+  estimatedTokens = 31,
+): OpenAIServerCompactionArtifact {
+  const artifact = readOpenAIServerCompactionArtifact({
+    type: "custom",
+    kind: "openai.compaction",
+    providerOptions: {
+      openai: {
+        type: "compaction",
+        itemId: "cmp_123",
+        encryptedContent,
+      },
+      lilac: {
+        serverCompaction: {
+          formatVersion: 1,
+          protocol: "openai-responses-v2",
+          replayKey: "test/model",
+          portableSummary: "Condensed prior work.",
+          estimatedTokens,
+        },
+      },
+    },
+  });
+  if (!artifact) throw new Error("Expected a valid OpenAI server compaction artifact.");
+  return artifact;
 }
 
 describe("auto-compaction internals", () => {
@@ -95,6 +144,16 @@ describe("auto-compaction internals", () => {
         context: { system: "test", tools: {} },
       }),
     ).toBeGreaterThan(2_000_000);
+  });
+
+  it("uses native artifact metadata instead of encrypted content to estimate tokens", () => {
+    const artifact = serverCompactionArtifact("x".repeat(100_000));
+    const message: ModelMessage = {
+      role: "assistant",
+      content: [artifact.part],
+    };
+
+    expect(__autoCompactionInternals.estimateMessageTokens(message)).toBe(31);
   });
 
   it("retains two continuable turns plus intervening messages", () => {
@@ -182,6 +241,17 @@ describe("auto-compaction internals", () => {
         keepRecentTurns: 2,
       }),
     ).toEqual({ suffixStart: messages.length });
+  });
+
+  it("does not retain older server-compaction users past a newer oversized user", () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: "small older request" },
+      { role: "assistant", content: "older answer" },
+      { role: "user", content: "x".repeat(400) },
+      { role: "assistant", content: "newer answer" },
+    ];
+
+    expect(__autoCompactionInternals.retainServerCompactionUserMessages(messages, 20)).toEqual([]);
   });
 
   it("summarizes an oversized newest user turn instead of exceeding the hard cap", () => {
@@ -1947,5 +2017,227 @@ describe("auto-compaction internals", () => {
         summary: "",
       }),
     ).toThrow("Compaction could not fit bounded context within the input budget");
+  });
+
+  it("commits a native artifact with the local summary and retained suffix", async () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: `old request ${"a".repeat(6_000)}` },
+      { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+      { role: "user", content: "latest request remains verbatim" },
+    ];
+    const local = await compactMessages({
+      messages,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+    });
+    const serverRequests: Array<{ messages: readonly ModelMessage[]; portableSummary: string }> =
+      [];
+    const hybrid = await compactMessages({
+      messages,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+      serverCompaction: async (request) => {
+        serverRequests.push({
+          messages: request.messages,
+          portableSummary: request.portableSummary,
+        });
+        return serverCompactionArtifact();
+      },
+    });
+
+    if (local.status !== "compacted" || hybrid.status !== "compacted") {
+      throw new Error("Expected both local and native compaction to succeed.");
+    }
+    expect(serverRequests).toHaveLength(1);
+    expect(serverRequests[0]?.portableSummary).toBe(local.summary);
+    expect(serverRequests[0]?.messages).toEqual(messages.slice(0, 2));
+    expect(hybrid.summary).toBe(local.summary);
+    expect(hybrid.messages.slice(1)).toEqual(local.messages.slice(1));
+    const nativeMessage = hybrid.messages[0];
+    expect(nativeMessage?.role).toBe("assistant");
+    if (nativeMessage?.role !== "assistant" || !Array.isArray(nativeMessage.content)) {
+      throw new Error("Expected native compaction to be persisted as an assistant artifact.");
+    }
+    expect(readOpenAIServerCompactionArtifact(nativeMessage.content[0])).not.toBeNull();
+  });
+
+  it("retains bounded real user inputs before the native artifact", async () => {
+    const oldRequest = { role: "user" as const, content: "old exact user constraint" };
+    const messages: ModelMessage[] = [
+      oldRequest,
+      { role: "assistant", content: `large old response ${"x".repeat(8_000)}` },
+      { role: "user", content: "latest request remains verbatim" },
+    ];
+
+    const result = await compactMessages({
+      messages,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 1_000,
+      keepRecentTurns: 1,
+      serverCompaction: async () => serverCompactionArtifact(),
+    });
+
+    expect(result.status).toBe("compacted");
+    expect(result.messages[0]).toEqual(oldRequest);
+    const nativeMessage = result.messages[1];
+    expect(nativeMessage?.role).toBe("assistant");
+    if (nativeMessage?.role !== "assistant" || !Array.isArray(nativeMessage.content)) {
+      throw new Error("Expected a native artifact after the retained user message.");
+    }
+    expect(readOpenAIServerCompactionArtifact(nativeMessage.content[0])).not.toBeNull();
+    expect(result.messages.at(-1)).toEqual(messages.at(-1));
+  });
+
+  it("uses the local candidate when the native artifact would exceed the hard budget", async () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: `old request ${"a".repeat(6_000)}` },
+      { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+      { role: "user", content: "latest request remains verbatim" },
+    ];
+    const options = {
+      messages,
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+    } as const;
+    const local = await compactMessages({
+      ...options,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+    });
+    const bounded = await compactMessages({
+      ...options,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      serverCompaction: async () => serverCompactionArtifact("encrypted", 9_000),
+    });
+
+    expect(bounded.messages).toEqual(local.messages);
+  });
+
+  it("falls back to the local summary when server compaction fails", async () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: `old request ${"a".repeat(6_000)}` },
+      { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+      { role: "user", content: "latest request remains verbatim" },
+    ];
+    const local = await compactMessages({
+      messages,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+    });
+    const serverFailure = new Error("native compaction unavailable");
+    const reportedFailures: unknown[] = [];
+    const fallback = await compactMessages({
+      messages,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+      serverCompaction: async () => {
+        throw serverFailure;
+      },
+      onServerCompactionError: (error) => reportedFailures.push(error),
+    });
+
+    expect(fallback).toEqual(local);
+    expect(reportedFailures).toEqual([serverFailure]);
+  });
+
+  it("propagates an abort from server compaction instead of falling back", async () => {
+    const controller = new AbortController();
+    const abortError = new Error("cancelled server compaction");
+    abortError.name = "AbortError";
+    let calls = 0;
+
+    const failure = await compactMessages({
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+        { role: "user", content: "latest request remains verbatim" },
+      ],
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+      abortSignal: controller.signal,
+      serverCompaction: async (request) => {
+        calls += 1;
+        expect(request.abortSignal).toBe(controller.signal);
+        controller.abort();
+        throw abortError;
+      },
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(calls).toBe(1);
+    expect(failure).toBe(abortError);
+  });
+
+  it("skips server compaction when the automatic path is dynamically disabled", async () => {
+    let summaryCalls = 0;
+    let serverCalls = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => summaryResponse("continued response"),
+    });
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        return summaryResponse();
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `old request ${"a".repeat(6_000)}` },
+        { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      thresholdFraction: 0.25,
+      serverCompactionEnabled: () => false,
+      serverCompaction: async () => {
+        serverCalls += 1;
+        return serverCompactionArtifact();
+      },
+    });
+
+    try {
+      await agent.prompt("latest request remains verbatim");
+    } finally {
+      detach();
+    }
+
+    expect(summaryCalls).toBe(1);
+    expect(serverCalls).toBe(0);
+    expect(agent.state.messages[0]?.role).toBe("user");
+    expect(agent.state.messages[0]?.content).toContain("<context-compaction>");
   });
 });

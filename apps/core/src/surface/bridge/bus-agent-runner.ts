@@ -54,7 +54,11 @@ import {
   attachAutoCompaction,
   buildSafeRecoveryCheckpoint,
   buildSyntheticToolCallId,
+  compactWithOpenAIResponses,
   createAgentRunIdleWatchdog,
+  hasMatchingOpenAIServerCompaction,
+  hasOpenAIServerCompaction,
+  materializeOpenAIServerCompaction,
   type AiSdkPiAgentEvent,
   type TransformMessagesFn,
 } from "@stanley2058/lilac-agent";
@@ -3027,9 +3031,25 @@ export async function startBusAgentRunner(params: {
             },
           };
         })();
+        const providerOptionsWithServerCompaction = (() => {
+          if (!resolved.openaiServerCompaction) return providerOptionsWithPromptCacheKey;
+          const base = providerOptionsWithPromptCacheKey ?? {};
+          const existingOpenAI = base.openai ?? {};
+          const include = Array.isArray(existingOpenAI.include)
+            ? existingOpenAI.include.filter((value): value is string => typeof value === "string")
+            : [];
+          return {
+            ...base,
+            openai: {
+              ...existingOpenAI,
+              store: false,
+              include: [...new Set([...include, "reasoning.encrypted_content"])],
+            },
+          };
+        })();
         const providerOptionsForAgent = anthropicModel
-          ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithPromptCacheKey)
-          : providerOptionsWithPromptCacheKey;
+          ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithServerCompaction)
+          : providerOptionsWithServerCompaction;
         const systemPrompt = buildSystemPrompt(resolved, editingToolMode);
         const agentSystem = anthropicPromptCachingEnabled
           ? {
@@ -3188,6 +3208,38 @@ export async function startBusAgentRunner(params: {
         modelSpec: activeBinding.resolved.spec,
         ...(hasNativeModelFallback ? { advanceModel } : {}),
       });
+      const disabledServerCompactionReplayKeys = new Set<string>();
+      let activeNativeServerCompactionReplayKey: string | null = null;
+      const turnErrorHandler = async (
+        error: unknown,
+        errorContext: Parameters<
+          NonNullable<Parameters<typeof attachAutoCompaction>[1]["baseTurnErrorHandler"]>
+        >[1],
+      ) => {
+        const transientDecision = await transientRetryController.handler(error, errorContext);
+        if (transientDecision === "retry") return "retry" as const;
+        if (
+          activeNativeServerCompactionReplayKey &&
+          errorContext.phase === "model-call" &&
+          errorContext.retrySafety.canRetry &&
+          errorContext.abortSignal?.aborted !== true
+        ) {
+          disabledServerCompactionReplayKeys.add(activeNativeServerCompactionReplayKey);
+          logger.warn(
+            "OpenAI server compaction replay failed; retrying portable summary",
+            {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              modelSpec: activeBinding.resolved.spec,
+              ...extractAiErrorLogDetails(error),
+            },
+            error,
+          );
+          activeNativeServerCompactionReplayKey = null;
+          return "retry" as const;
+        }
+        return "fail" as const;
+      };
       if (activeBinding.resolved.provider === "claude-code") {
         const claudeCodeToolMapping = completeLevel1ToolMapping(activeBinding.toolset);
         claudeCodeRun = await waitForPreAgent(
@@ -3218,7 +3270,7 @@ export async function startBusAgentRunner(params: {
         providerOptions: activeBinding.providerOptionsForAgent,
         reasoning: activeBinding.resolved.reasoning,
         ...(hasNativeModelFallback ? { streamTextMaxRetries: 0 } : {}),
-        turnErrorHandler: transientRetryController.handler,
+        turnErrorHandler,
         beforeStep:
           claudeCodeRun === null
             ? async () => {
@@ -3258,8 +3310,36 @@ export async function startBusAgentRunner(params: {
       agent.setSteeringMode("all");
 
       const toolPruneTransform: TransformMessagesFn = async (messages) => {
+        const configuredServerCompactionReplayKey = activeBinding.resolved.openaiServerCompaction
+          ? `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`
+          : undefined;
+        const serverCompactionReplayKey =
+          configuredServerCompactionReplayKey &&
+          !disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey)
+            ? configuredServerCompactionReplayKey
+            : undefined;
+        activeNativeServerCompactionReplayKey = configuredServerCompactionReplayKey
+          ? hasMatchingOpenAIServerCompaction(messages, serverCompactionReplayKey)
+            ? (serverCompactionReplayKey ?? null)
+            : null
+          : null;
+        const materialized =
+          configuredServerCompactionReplayKey || hasOpenAIServerCompaction(messages)
+            ? materializeOpenAIServerCompaction(messages, serverCompactionReplayKey)
+            : messages;
+        if (
+          configuredServerCompactionReplayKey &&
+          disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey) &&
+          hasMatchingOpenAIServerCompaction(messages, configuredServerCompactionReplayKey)
+        ) {
+          agent.replaceMessages(materializeOpenAIServerCompaction(messages, undefined), {
+            reason: "compaction",
+            preserveRecoveryCheckpoint: true,
+          });
+          disabledServerCompactionReplayKeys.delete(configuredServerCompactionReplayKey);
+        }
         // First, remove pathological binary blobs from the *model-facing* view.
-        const scrubbed = scrubLargeBinaryForModelView(messages, {
+        const scrubbed = scrubLargeBinaryForModelView(materialized, {
           maxBytesPerPart: cfg.tools.media.maxInlineBytesPerPart,
           maxBytesTotal: cfg.tools.media.maxInlineBytesTotal,
         });
@@ -3334,7 +3414,45 @@ export async function startBusAgentRunner(params: {
           resolveCurrentModelSpecifier: () =>
             agent.state.modelSpecifier ?? activeBinding.resolved.spec,
           baseTransformMessages: toolPruneTransform,
-          baseTurnErrorHandler: transientRetryController.handler,
+          baseTurnErrorHandler: turnErrorHandler,
+          serverCompaction: async ({
+            messages: prefix,
+            portableSummary,
+            context: modelContext,
+            abortSignal,
+          }) => {
+            if (!activeBinding.resolved.openaiServerCompaction) {
+              throw new Error("OpenAI server compaction is disabled for the active model");
+            }
+            return await compactWithOpenAIResponses({
+              model: agent.state.model,
+              replayKey: `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`,
+              portableSummary,
+              messages: prefix,
+              system: modelContext?.system ?? agent.state.system,
+              tools: modelContext?.tools,
+              providerOptions: agent.state.providerOptions,
+              reasoning: agent.state.reasoning,
+              abortSignal,
+            });
+          },
+          serverCompactionEnabled: () => {
+            if (!activeBinding.resolved.openaiServerCompaction) return false;
+            const replayKey = `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`;
+            return !disabledServerCompactionReplayKeys.has(replayKey);
+          },
+          onServerCompactionError: (error) => {
+            logger.warn(
+              "OpenAI server compaction failed; using portable summary",
+              {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                modelSpec: activeBinding.resolved.spec,
+                ...extractAiErrorLogDetails(error),
+              },
+              error,
+            );
+          },
           onUnknownCapability: ({ spec, reason, error }) => {
             logger.warn(
               "auto-compaction capability unknown; disabling threshold compaction",

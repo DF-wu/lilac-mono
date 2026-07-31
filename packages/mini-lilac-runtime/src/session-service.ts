@@ -9,9 +9,13 @@ import {
   attachAutoCompaction,
   buildSafeRecoveryCheckpoint,
   compactMessages,
+  compactWithOpenAIResponses,
   createAgentRunIdleWatchdog,
   createTransientModelRetryController,
+  hasMatchingOpenAIServerCompaction,
+  hasOpenAIServerCompaction,
   isAbortError,
+  materializeOpenAIServerCompaction,
   type AiSdkPiAgentEvent,
   type AutoCompactionOptions,
   type CompactionProgress,
@@ -995,6 +999,7 @@ class SessionActor {
     ) => Promise<DelegatedSessionHandle>,
     private readonly supersededProviderIds: ReadonlySet<string>,
     private readonly resolveProviderType: (providerId: string) => ProviderType | undefined,
+    private readonly resolveOpenAIServerCompaction: (modelSpecifier: string) => boolean,
     private readonly skillCatalog: MiniLilacSkillCatalog | undefined,
     private readonly resolveWebSearchProvider: WebSearchProviderResolver,
     private readonly protectedToolPaths: readonly string[],
@@ -1509,12 +1514,14 @@ class SessionActor {
     const providerId = parseModelRef(modelSpecifier).providerId;
     const usesCodexOAuth = this.supersededProviderIds.has(providerId);
     const providerType = this.resolveProviderType(providerId);
+    const openaiServerCompactionEnabled = this.resolveOpenAIServerCompaction(modelSpecifier);
     const webSearchProvider =
       tools.websearch === undefined ? undefined : this.resolveWebSearchProvider(modelSpecifier);
     const baseProviderOptions = reasoningProviderOptions({
       usesCodexOAuth,
       providerType,
       reasoningEnabled: reasoning !== "none",
+      openaiServerCompactionEnabled,
     });
     const providerOptions =
       webSearchProvider === "openai"
@@ -1578,6 +1585,7 @@ class SessionActor {
         normalizeOverflow,
         readFileMediaSupported,
         usesCodexOAuth,
+        openaiServerCompactionEnabled,
         claudeBuiltInTools,
         claudeCodeRun,
         onAgentReady: (ready) => {
@@ -1610,6 +1618,7 @@ class SessionActor {
     normalizeOverflow: ReturnType<typeof createOverflowReferenceNormalizer>;
     readFileMediaSupported: boolean;
     usesCodexOAuth: boolean;
+    openaiServerCompactionEnabled: boolean;
     claudeBuiltInTools: readonly ClaudeCodeBuiltInTool[];
     claudeCodeRun: MaterializedClaudeCodeRun | null;
     onAgentReady: (agent: AiSdkPiAgent<ToolSet>) => void;
@@ -1629,6 +1638,7 @@ class SessionActor {
       normalizeOverflow,
       readFileMediaSupported,
       usesCodexOAuth,
+      openaiServerCompactionEnabled,
       claudeBuiltInTools,
       claudeCodeRun,
     } = input;
@@ -1636,9 +1646,43 @@ class SessionActor {
       normalizationContext.bypassGenericOutputNormalizer
         ? output
         : normalizeOverflow(output, normalizationContext);
-    const mediaScrubTransform = (outboundMessages: readonly ModelMessage[]) =>
-      scrubReadFileMediaForModelView(
+    const serverCompactionReplayKey = openaiServerCompactionEnabled
+      ? `${usesCodexOAuth ? "codex-oauth" : "openai"}:${modelSpecifier}`
+      : undefined;
+    let serverCompactionDisabled = false;
+    let nativeServerCompactionReplayActive = false;
+    const activeServerCompactionReplayKey = () =>
+      serverCompactionDisabled ? undefined : serverCompactionReplayKey;
+    const mediaScrubTransform = (outboundMessages: readonly ModelMessage[]) => {
+      if (!openaiServerCompactionEnabled && !hasOpenAIServerCompaction(outboundMessages)) {
+        return scrubReadFileMediaForModelView(
+          outboundMessages,
+          readFileMediaSupported
+            ? {
+                maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+                maxBytesTotal: READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+              }
+            : { maxBytesPerPart: 0, maxBytesTotal: 0 },
+        );
+      }
+      const replayKey = activeServerCompactionReplayKey();
+      nativeServerCompactionReplayActive = hasMatchingOpenAIServerCompaction(
         outboundMessages,
+        replayKey,
+      );
+      const materialized = materializeOpenAIServerCompaction(outboundMessages, replayKey);
+      if (
+        serverCompactionDisabled &&
+        hasMatchingOpenAIServerCompaction(outboundMessages, serverCompactionReplayKey)
+      ) {
+        agent.replaceMessages(materialized, {
+          reason: "compaction",
+          preserveRecoveryCheckpoint: true,
+        });
+        serverCompactionDisabled = false;
+      }
+      return scrubReadFileMediaForModelView(
+        materialized,
         readFileMediaSupported
           ? {
               maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
@@ -1646,6 +1690,33 @@ class SessionActor {
             }
           : { maxBytesPerPart: 0, maxBytesTotal: 0 },
       );
+    };
+    const turnErrorHandler = async (
+      error: unknown,
+      errorContext: Parameters<NonNullable<AutoCompactionOptions["baseTurnErrorHandler"]>>[1],
+    ) => {
+      const transientDecision = transientRetryController
+        ? await transientRetryController.handler(error, errorContext)
+        : "fail";
+      if (transientDecision === "retry") return "retry" as const;
+      if (
+        nativeServerCompactionReplayActive &&
+        errorContext.phase === "model-call" &&
+        errorContext.retrySafety.canRetry &&
+        errorContext.abortSignal?.aborted !== true
+      ) {
+        serverCompactionDisabled = true;
+        nativeServerCompactionReplayActive = false;
+        logger.warn("OpenAI server compaction replay failed; retrying portable summary", {
+          requestId: context.runId,
+          sessionId: this.snapshot.id,
+          modelSpec: modelSpecifier,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return "retry" as const;
+      }
+      return "fail" as const;
+    };
     const agent = new AiSdkPiAgent<ToolSet>({
       system: systemPrompt(
         this.config,
@@ -1672,7 +1743,9 @@ class SessionActor {
       genericOutputNormalizerBypassTools: new Set(["bash", "read_file"]),
       aggregateOutputBudgetExemptTools: new Set(["read_file"]),
       providerOptions,
-      turnErrorHandler: transientRetryController?.handler,
+      turnErrorHandler: openaiServerCompactionEnabled
+        ? turnErrorHandler
+        : transientRetryController?.handler,
       turnBoundaryHandler: () => this.finishDeferredChildren(context),
       beforeSteeringDelivery: (delivery) => this.commitSteeringBoundary(context, delivery),
     });
@@ -1707,7 +1780,40 @@ class SessionActor {
           ? undefined
           : async () => (await this.resolveModelLimits(configuredSummaryModel))?.context,
       baseTransformMessages: mediaScrubTransform,
-      baseTurnErrorHandler: transientRetryController?.handler,
+      baseTurnErrorHandler: openaiServerCompactionEnabled
+        ? turnErrorHandler
+        : transientRetryController?.handler,
+      serverCompaction: openaiServerCompactionEnabled
+        ? ({ messages: prefix, portableSummary, context: modelContext, abortSignal }) =>
+            compactWithOpenAIResponses({
+              model: agent.state.model,
+              replayKey: serverCompactionReplayKey!,
+              portableSummary,
+              messages: scrubReadFileMediaForModelView(
+                prefix,
+                readFileMediaSupported
+                  ? {
+                      maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+                      maxBytesTotal: READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+                    }
+                  : { maxBytesPerPart: 0, maxBytesTotal: 0 },
+              ),
+              system: modelContext?.system ?? agent.state.system,
+              tools: modelContext?.tools,
+              providerOptions: agent.state.providerOptions,
+              reasoning: agent.state.reasoning,
+              abortSignal,
+            })
+        : undefined,
+      serverCompactionEnabled: () => openaiServerCompactionEnabled && !serverCompactionDisabled,
+      onServerCompactionError: (error) => {
+        logger.warn("OpenAI server compaction failed; using portable summary", {
+          requestId: context.runId,
+          sessionId: this.snapshot.id,
+          modelSpec: modelSpecifier,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
       onCompactionStart: (event) => {
         this.automaticCompaction = {
           chunkId: crypto.randomUUID(),
@@ -3862,6 +3968,16 @@ class SessionActor {
     }
     const modelSpecifier = this.snapshot.model;
     if (modelSpecifier === null) throw new Error("Session model is required for compaction");
+    const modelRef = parseModelRef(modelSpecifier);
+    const usesCodexOAuth = this.supersededProviderIds.has(modelRef.providerId);
+    const openaiServerCompactionEnabled = this.resolveOpenAIServerCompaction(modelSpecifier);
+    const serverCompactionReplayKey = openaiServerCompactionEnabled
+      ? `${usesCodexOAuth ? "codex-oauth" : "openai"}:${modelSpecifier}`
+      : undefined;
+    const messagesForCompaction = materializeOpenAIServerCompaction(
+      params.messages,
+      serverCompactionReplayKey,
+    );
     const limits = await this.resolveModelLimits(modelSpecifier);
     if (limits === undefined || limits.context <= 0) {
       throw new Error(`Context window is unavailable for model '${modelSpecifier}'`);
@@ -3875,8 +3991,67 @@ class SessionActor {
       summaryModelSpecifier === modelSpecifier
         ? limits
         : await this.resolveModelLimits(summaryModelSpecifier);
+    let serverCompactionSetup:
+      | {
+          readonly tools: ToolSet;
+          readonly system: string;
+          readonly providerOptions: ReturnType<typeof reasoningProviderOptions>;
+          readonly readFileMediaSupported: boolean;
+        }
+      | undefined;
+    if (openaiServerCompactionEnabled) {
+      const profileId = this.snapshot.profile;
+      const profile = profileId ? this.config.agent.profiles[profileId] : undefined;
+      if (!profile || !profileId) throw new Error("Session profile is required for compaction");
+      const skills =
+        this.skillCatalog !== undefined && profileRequestsTool(profile, "skill")
+          ? await this.skillCatalog.discover(this.snapshot.cwd)
+          : undefined;
+      const workspaceInstructions = await loadWorkspaceInstructions(this.snapshot.cwd, {
+        denyPaths: [...DEFAULT_DENY_PATHS, ...this.protectedToolPaths],
+      });
+      let readFileMediaSupported = false;
+      try {
+        readFileMediaSupported = supportsReadFileMedia(
+          await this.modelCapability.resolve(modelSpecifier),
+        );
+      } catch {
+        // Keep the manual compaction tool declaration conservative when capability is unknown.
+      }
+      const tools = this.createTools(
+        profile,
+        {
+          runId: `compaction:${id}`,
+          depth: 0,
+          profileId,
+          deferred: [],
+        },
+        modelSpecifier,
+        readFileMediaSupported,
+        skills,
+        workspaceInstructions?.loaded,
+      );
+      serverCompactionSetup = {
+        tools,
+        system: systemPrompt(
+          this.config,
+          profile,
+          this.snapshot.cwd,
+          workspaceInstructions?.text,
+          tools.skill === undefined ? undefined : skills?.promptSection(limits.context),
+          tools.websearch !== undefined,
+        ),
+        providerOptions: reasoningProviderOptions({
+          usesCodexOAuth,
+          providerType: this.resolveProviderType(modelRef.providerId),
+          reasoningEnabled: this.snapshot.reasoning !== "none",
+          openaiServerCompactionEnabled: true,
+        }),
+        readFileMediaSupported,
+      };
+    }
     const compacted = await compactMessages({
-      messages: params.messages,
+      messages: messagesForCompaction,
       currentModel: this.resolveModel(modelSpecifier),
       contextLimit: limits.context,
       outputLimit: limits.output,
@@ -3891,6 +4066,36 @@ class SessionActor {
       )
         ? { openai: { store: false, include: ["reasoning.encrypted_content"] } }
         : undefined,
+      serverCompaction: openaiServerCompactionEnabled
+        ? ({ messages: prefix, portableSummary, abortSignal }) =>
+            compactWithOpenAIResponses({
+              model: this.resolveModel(modelSpecifier),
+              replayKey: serverCompactionReplayKey!,
+              portableSummary,
+              messages: scrubReadFileMediaForModelView(
+                prefix,
+                serverCompactionSetup!.readFileMediaSupported
+                  ? {
+                      maxBytesPerPart: READ_FILE_MEDIA_MAX_BYTES_PER_PART,
+                      maxBytesTotal: READ_FILE_MEDIA_MAX_BYTES_TOTAL,
+                    }
+                  : { maxBytesPerPart: 0, maxBytesTotal: 0 },
+              ),
+              system: serverCompactionSetup!.system,
+              tools: serverCompactionSetup!.tools,
+              providerOptions: serverCompactionSetup!.providerOptions,
+              reasoning: this.snapshot.reasoning ?? undefined,
+              abortSignal,
+            })
+        : undefined,
+      onServerCompactionError: (error) => {
+        logger.warn("manual OpenAI server compaction failed; using portable summary", {
+          requestId: id,
+          sessionId: this.snapshot.id,
+          modelSpec: modelSpecifier,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
       abortSignal: params.abortSignal,
       onProgress: params.onProgress,
       onSummaryDelta: params.onSummaryDelta,
@@ -3908,7 +4113,7 @@ class SessionActor {
               ? "empty"
               : "noop",
         clientCommandId: id,
-        messageCountBefore: compacted.messageCountBefore,
+        messageCountBefore: params.messages.length,
         messageCountAfter: compacted.messageCountAfter,
         estimatedInputTokensBefore: compacted.estimatedTokensBefore,
         estimatedInputTokensAfter: compacted.estimatedTokensAfter,
@@ -3987,6 +4192,7 @@ export class SessionService {
   ) => Promise<() => void>;
   private readonly supersededProviderIds: ReadonlySet<string>;
   private readonly resolveProviderType: (providerId: string) => ProviderType | undefined;
+  private readonly resolveOpenAIServerCompaction: (modelSpecifier: string) => boolean;
   private readonly resolveWebSearchProvider: WebSearchProviderResolver;
   private readonly protectedToolPaths: readonly string[];
   private readonly workspaceHistoryDirectory: string;
@@ -4096,6 +4302,14 @@ export class SessionService {
     this.attachCompaction = this.options.attachCompaction ?? attachAutoCompaction;
     this.supersededProviderIds = new Set(providers?.supersededProviderIds);
     this.resolveProviderType = (providerId) => providers?.config.providers[providerId]?.type;
+    this.resolveOpenAIServerCompaction = (modelSpecifier) => {
+      if (!providers) return false;
+      const ref = parseModelRef(modelSpecifier);
+      return (
+        providers.config.providers[ref.providerId]?.models?.[ref.modelId]
+          ?.openaiServerCompaction === true
+      );
+    };
     this.resolveWebSearchProvider =
       this.options.webSearchProviderResolver ?? createWebSearchProviderResolver(providers);
     this.initializationBlocksClose =
@@ -5087,6 +5301,7 @@ export class SessionService {
       (request) => this.promptDelegatedSession(request),
       this.supersededProviderIds,
       this.resolveProviderType,
+      this.resolveOpenAIServerCompaction,
       this.options.skillCatalog,
       this.resolveWebSearchProvider,
       this.protectedToolPaths,
