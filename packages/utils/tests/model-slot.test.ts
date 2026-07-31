@@ -251,6 +251,61 @@ describe("resolveModelSlot", () => {
     expect(resolved.providerOptions?.response_commentary).toBeUndefined();
   });
 
+  it("uses openai_server_compaction as a top-level meta option after alias and slot merging", () => {
+    const cfg = baseConfig();
+    cfg.models.def = {
+      primary: {
+        model: "openai/gpt-4o",
+        options: {
+          openai_server_compaction: true,
+          openai: { temperature: 0.1 },
+        },
+      },
+    };
+    cfg.models.main = {
+      model: "primary",
+      options: {
+        openai: { textVerbosity: "low" },
+      },
+    };
+
+    const resolved = resolveModelSlot(cfg, "main");
+    expect(resolved.openaiServerCompaction).toBe(true);
+    expect(resolved.providerOptions?.openai?.temperature).toBe(0.1);
+    expect(resolved.providerOptions?.openai?.textVerbosity).toBe("low");
+    expect(resolved.providerOptions?.openai_server_compaction).toBeUndefined();
+  });
+
+  it("rejects invalid or unsupported openai_server_compaction options", () => {
+    const cfg = baseConfig();
+    cfg.models.main = {
+      model: "openai/gpt-4o",
+      options: { openai_server_compaction: false },
+    };
+    expect(() => resolveModelSlot(cfg, "main")).toThrow(
+      "Model option 'openai_server_compaction' must be literal boolean true",
+    );
+
+    cfg.models.main.options = { openai_server_compaction: "true" };
+    expect(() => resolveModelSlot(cfg, "main")).toThrow(
+      "Model option 'openai_server_compaction' must be literal boolean true",
+    );
+
+    cfg.models.main = {
+      model: "openrouter/openai/gpt-4o",
+      options: { openai_server_compaction: true },
+    };
+    expect(() => resolveModelSlot(cfg, "main")).toThrow(
+      "Model option 'openai_server_compaction' is supported only by openai and codex providers",
+    );
+
+    cfg.models.main = {
+      model: "codex/gpt-4o",
+      options: { openai_server_compaction: true },
+    };
+    expect(resolveModelSlot(cfg, "main").openaiServerCompaction).toBe(true);
+  });
+
   it("uses anthropic_prompt_cache as a top-level meta option", () => {
     const cfg = baseConfig();
     cfg.models.main = {
@@ -475,7 +530,15 @@ describe("resolved model plans", () => {
     const cfg = baseConfig();
     cfg.models.main = {
       model: "openai/gpt-5.5",
-      fallback: ["openrouter/openai/gpt-4o", { model: "openai/gpt-4o-mini", reasoning: "none" }],
+      options: { openai_server_compaction: true },
+      fallback: [
+        "openrouter/openai/gpt-4o",
+        {
+          model: "openai/gpt-4o-mini",
+          reasoning: "none",
+          options: { openai_server_compaction: true },
+        },
+      ],
     };
     const plan = resolveModelSlotPlan(cfg, "main");
 
@@ -487,6 +550,8 @@ describe("resolved model plans", () => {
     expect(durable.fallbacks?.every((candidate) => candidate.reasoningDisplay === "detailed")).toBe(
       true,
     );
+    expect(durable.openaiServerCompaction).toBe(true);
+    expect(durable.fallbacks?.[1]?.openaiServerCompaction).toBe(true);
 
     const restored = fromDurableResolvedModelPlan(durable);
     expect(restored.head.spec).toBe(plan.head.spec);
@@ -495,8 +560,19 @@ describe("resolved model plans", () => {
     );
     expect(restored.fallbacks[1]?.reasoning).toBe("none");
     expect(restored.fallbacks[1]?.reasoningDisplay).toBe("detailed");
+    expect(restored.head.openaiServerCompaction).toBe(true);
+    expect(restored.fallbacks[1]?.openaiServerCompaction).toBe(true);
 
     const { fallbacks: _fallbacks, ...legacy } = durable;
     expect(fromDurableResolvedModelPlan(legacy).fallbacks).toEqual([]);
+    expect(() =>
+      fromDurableResolvedModelPlan({
+        ...legacy,
+        spec: "anthropic/claude-test",
+        provider: "anthropic",
+        modelId: "claude-test",
+        openaiServerCompaction: true,
+      }),
+    ).toThrow("supported only by openai and codex providers");
   });
 });

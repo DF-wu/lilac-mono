@@ -39,6 +39,8 @@ export type ResolvedModelSlot = {
   reasoning?: ModelReasoningEffort;
   /** Optional Responses API commentary-phase behavior toggle for OpenAI/Codex providers. */
   responseCommentary?: boolean;
+  /** Explicit opt-in for OpenAI server-side compaction. */
+  openaiServerCompaction?: true;
   /** Opt-in Anthropic cache-control injection for system prompt + latest user message. */
   anthropicPromptCache?: boolean;
   /** Durable workflow candidates may retain the display policy from their dispatch. */
@@ -72,6 +74,7 @@ type DurableResolvedModelRequestBase = {
   providerOptions?: Record<string, DurableJsonObject>;
   reasoning?: ModelReasoningEffort;
   responseCommentary?: boolean;
+  openaiServerCompaction?: true;
   anthropicPromptCache?: boolean;
   reasoningDisplay: CoreConfig["agent"]["reasoningDisplay"];
 };
@@ -112,6 +115,7 @@ export function toDurableResolvedModelRequest(
     ...(providerOptions ? { providerOptions } : {}),
     ...(resolved.reasoning ? { reasoning: resolved.reasoning } : {}),
     ...(resolved.responseCommentary ? { responseCommentary: true } : {}),
+    ...(resolved.openaiServerCompaction ? { openaiServerCompaction: true } : {}),
     ...(resolved.anthropicPromptCache ? { anthropicPromptCache: true } : {}),
     reasoningDisplay: resolved.reasoningDisplay ?? reasoningDisplay,
   };
@@ -136,6 +140,15 @@ export function fromDurableResolvedModelRequest(
   if (parsed.provider !== request.provider || parsed.model !== request.modelId) {
     throw new Error("Durable model request does not match its canonical model spec");
   }
+  if (
+    request.openaiServerCompaction &&
+    request.provider !== "openai" &&
+    request.provider !== "codex"
+  ) {
+    throw new Error(
+      "Durable OpenAI server compaction is supported only by openai and codex providers",
+    );
+  }
   const provider = providers[request.provider as Providers];
   if (typeof provider !== "function") {
     throw new Error(`Provider '${request.provider}' is not configured for durable dispatch`);
@@ -149,6 +162,7 @@ export function fromDurableResolvedModelRequest(
     ...(request.providerOptions ? { providerOptions: request.providerOptions } : {}),
     ...(request.reasoning ? { reasoning: request.reasoning } : {}),
     ...(request.responseCommentary ? { responseCommentary: true } : {}),
+    ...(request.openaiServerCompaction ? { openaiServerCompaction: true } : {}),
     ...(request.anthropicPromptCache ? { anthropicPromptCache: true } : {}),
     reasoningDisplay: request.reasoningDisplay,
   };
@@ -254,16 +268,22 @@ function withOpenAIParallelToolCallsDefault(
 function buildProviderOptions(params: { provider: string; options?: JSONObject }): {
   providerOptions?: { [x: string]: JSONObject };
   responseCommentary?: boolean;
+  openaiServerCompaction?: true;
   anthropicPromptCache?: boolean;
 } {
   const options = params.options ?? {};
 
-  const { anthropic_prompt_cache, codex_instructions, response_commentary } =
-    options as JSONObject & {
-      anthropic_prompt_cache?: JSONValue;
-      codex_instructions?: JSONValue;
-      response_commentary?: JSONValue;
-    };
+  const {
+    anthropic_prompt_cache,
+    codex_instructions,
+    openai_server_compaction,
+    response_commentary,
+  } = options as JSONObject & {
+    anthropic_prompt_cache?: JSONValue;
+    codex_instructions?: JSONValue;
+    openai_server_compaction?: JSONValue;
+    response_commentary?: JSONValue;
+  };
   const codexInstructions =
     typeof codex_instructions === "string" && codex_instructions.length > 0
       ? codex_instructions
@@ -273,6 +293,19 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
     response_commentary === true && (params.provider === "openai" || params.provider === "codex")
       ? true
       : undefined;
+
+  let openaiServerCompaction: true | undefined;
+  if (Object.hasOwn(options, "openai_server_compaction")) {
+    if (openai_server_compaction !== true) {
+      throw new Error("Model option 'openai_server_compaction' must be literal boolean true");
+    }
+    if (params.provider !== "openai" && params.provider !== "codex") {
+      throw new Error(
+        "Model option 'openai_server_compaction' is supported only by openai and codex providers",
+      );
+    }
+    openaiServerCompaction = true;
+  }
 
   const anthropicPromptCache = anthropic_prompt_cache === true ? true : undefined;
 
@@ -284,6 +317,7 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
     return {
       providerOptions: withOpenAIParallelToolCallsDefault(provider, providerOptions),
       responseCommentary,
+      openaiServerCompaction,
       anthropicPromptCache,
     };
   }
@@ -311,6 +345,7 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
       [openaiKey]: nextOpenAI,
     }),
     responseCommentary,
+    openaiServerCompaction,
     anthropicPromptCache,
   };
 }
@@ -388,10 +423,11 @@ function resolveModel(params: {
   const parsed = parseModelSpecifier(params.spec);
   const provider = parsed.provider;
   const modelId = parsed.model;
-  const { providerOptions, responseCommentary, anthropicPromptCache } = buildProviderOptions({
-    provider,
-    options: params.options,
-  });
+  const { providerOptions, responseCommentary, openaiServerCompaction, anthropicPromptCache } =
+    buildProviderOptions({
+      provider,
+      options: params.options,
+    });
 
   const p = providers[provider as Providers];
   const hasProvider = Object.prototype.hasOwnProperty.call(providers, provider);
@@ -423,6 +459,7 @@ function resolveModel(params: {
     providerOptions,
     reasoning: params.reasoning,
     responseCommentary,
+    openaiServerCompaction,
     anthropicPromptCache,
   };
 }

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
 import { parseCoreConfig, type CoreConfigModelOptionWarning } from "../core-config";
-import { validateModelProviderOptions } from "../model-provider-option-validation";
+import {
+  validateConfiguredModelProviderOptions,
+  validateModelProviderOptions,
+} from "../model-provider-option-validation";
 
 describe("validateModelProviderOptions", () => {
   it("reports options from unused model presets during config parsing", async () => {
@@ -45,6 +48,12 @@ describe("validateModelProviderOptions", () => {
         openai: { textVerbosity: "low" },
         openaiCompatible: { reasoningEffort: "high" },
       }),
+    ).toEqual([]);
+  });
+
+  it("strips openai_server_compaction metadata before validating provider options", () => {
+    expect(
+      validateConfiguredModelProviderOptions("openai", { openai_server_compaction: true }),
     ).toEqual([]);
   });
 

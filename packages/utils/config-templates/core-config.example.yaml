@@ -376,6 +376,8 @@ models:
     #   # For direct openai/codex providers, append commentary/final_answer
     #   # channel guidance to the end of the system prompt.
     #   response_commentary: true
+    #   # Allow this direct openai/codex model to use OpenAI server-side compaction.
+    #   openai_server_compaction: true
     #   # For openai/codex providers, parallelToolCalls defaults to true.
     #   # Set false to force sequential provider-side tool calling.
     #   openai:

@@ -72,6 +72,10 @@ persistence are disabled; run-scoped Lilac tools are exposed through an in-proce
 `batch` is intentionally omitted because Claude can issue independent MCP calls in parallel. This
 provider is distinct from the API-key-backed `anthropic` provider.
 
+For direct Core `openai` or `codex` models, set `options.openai_server_compaction: true` to opt a
+model into OpenAI server compaction. This is model metadata and is never forwarded as an AI SDK
+provider option.
+
 Mini Lilac supports the same provider, declared in `providers.yaml`:
 
 ```yaml

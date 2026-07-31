@@ -16,6 +16,8 @@ providers:
     # Optional patches applied after catalog discovery. Unspecified fields inherit.
     models:
       gpt-5.6-sol:
+        # Available only on type: openai providers. Omit or set false to disable.
+        # openaiServerCompaction: true
         limit:
           context: 372000
           # output: 32768

@@ -7,7 +7,7 @@ import {
   workflowReasoningSchema,
 } from "./workflow-domain";
 
-const workflowResolvedModelRequestBaseSchema = z.strictObject({
+const workflowResolvedModelRequestBaseShape = {
   alias: z.string().min(1).max(200).optional(),
   spec: z.string().min(1).max(500),
   provider: z.string().min(1).max(200),
@@ -15,13 +15,34 @@ const workflowResolvedModelRequestBaseSchema = z.strictObject({
   providerOptions: z.record(z.string(), jsonObjectSchema).optional(),
   reasoning: workflowReasoningSchema.optional(),
   responseCommentary: z.boolean().optional(),
+  openaiServerCompaction: z.literal(true).optional(),
   anthropicPromptCache: z.boolean().optional(),
   reasoningDisplay: z.enum(["none", "simple", "detailed"]),
-});
+} as const;
 
-export const workflowResolvedModelRequestSchema = workflowResolvedModelRequestBaseSchema.extend({
-  fallbacks: z.array(workflowResolvedModelRequestBaseSchema).optional(),
-});
+function validateServerCompactionProvider(
+  input: { provider: string; openaiServerCompaction?: true },
+  context: z.RefinementCtx,
+): void {
+  if (input.openaiServerCompaction && input.provider !== "openai" && input.provider !== "codex") {
+    context.addIssue({
+      code: "custom",
+      path: ["openaiServerCompaction"],
+      message: "OpenAI server compaction requires an openai or codex provider",
+    });
+  }
+}
+
+const workflowResolvedModelRequestBaseSchema = z
+  .strictObject(workflowResolvedModelRequestBaseShape)
+  .superRefine(validateServerCompactionProvider);
+
+export const workflowResolvedModelRequestSchema = z
+  .strictObject({
+    ...workflowResolvedModelRequestBaseShape,
+    fallbacks: z.array(workflowResolvedModelRequestBaseSchema).optional(),
+  })
+  .superRefine(validateServerCompactionProvider);
 
 export const workflowRequestPolicySchema = z.strictObject({
   runId: z.string().min(1).max(200),

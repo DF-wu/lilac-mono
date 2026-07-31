@@ -778,5 +778,20 @@ describe("durable workflow store minimal dispatch schema", () => {
         fallbacks: [{ ...legacy, fallbacks: [] }],
       }).success,
     ).toBe(false);
+    expect(
+      workflowResolvedModelRequestSchema.safeParse({
+        ...legacy,
+        openaiServerCompaction: false,
+      }).success,
+    ).toBe(false);
+    expect(
+      workflowResolvedModelRequestSchema.safeParse({
+        ...legacy,
+        provider: "anthropic",
+        spec: "anthropic/claude-test",
+        modelId: "claude-test",
+        openaiServerCompaction: true,
+      }).success,
+    ).toBe(false);
   });
 });
