@@ -370,6 +370,73 @@ describe("WorkspaceHistoryStore", () => {
     expect((await readdir(path.join(workspace, ".git"))).sort()).toEqual(gitEntriesBefore);
   });
 
+  it("does not recursively scan ignored directories when capturing a Git workspace", async () => {
+    const root = await temporaryDirectory();
+    const metrics: WorkspaceHistoryMetric[] = [];
+    const { workspace, store } = await createStore(root, {
+      onMetric: (metric) => {
+        metrics.push(metric);
+      },
+    });
+    await git(workspace, ["init", "--quiet"]);
+    await mkdir(path.join(workspace, "ignored"));
+    await writeFile(path.join(workspace, ".gitignore"), "ignored/\n");
+    await writeFile(path.join(workspace, "tracked.txt"), "tracked\n");
+    await git(workspace, ["add", ".gitignore", "tracked.txt"]);
+    for (let index = 0; index < 100; index += 1) {
+      await writeFile(path.join(workspace, "ignored", `artifact-${index}.txt`), "ignored\n");
+    }
+
+    await captured(store);
+
+    expect(metrics.find((metric) => metric.type === "capture")).toMatchObject({
+      candidatePathCount: 3,
+      managedPathCount: 2,
+      outcome: "captured",
+    });
+  });
+
+  it("captures Git directory-to-file transitions without traversing stale index paths", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    await git(workspace, ["init", "--quiet"]);
+    await mkdir(path.join(workspace, "entry"));
+    await writeFile(path.join(workspace, "entry", "child.txt"), "child\n");
+    await git(workspace, ["add", "entry/child.txt"]);
+    const directorySnapshot = await captured(store);
+
+    await rm(path.join(workspace, "entry"), { recursive: true });
+    await writeFile(path.join(workspace, "entry"), "file\n");
+
+    expect((await captured(store)).managedPathCount).toBe(1);
+    expect(await restoreFromCurrent(store, directorySnapshot.rootTreeOid)).toEqual({
+      status: "restored",
+    });
+    expect(await readFile(path.join(workspace, "entry", "child.txt"), "utf8")).toBe("child\n");
+  });
+
+  it("does not traverse a symlink that replaces a tracked directory", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    const external = path.join(root, "external");
+    await git(workspace, ["init", "--quiet"]);
+    await mkdir(path.join(workspace, "entry"));
+    await mkdir(external);
+    await writeFile(path.join(workspace, "entry", "child.txt"), "inside\n");
+    await writeFile(path.join(external, "child.txt"), "outside\n");
+    await git(workspace, ["add", "entry/child.txt"]);
+
+    await rm(path.join(workspace, "entry"), { recursive: true });
+    await symlink(external, path.join(workspace, "entry"));
+    const snapshot = await captured(store);
+
+    expect(snapshot.managedPathCount).toBe(1);
+    await rm(path.join(workspace, "entry"));
+    expect(await restoreFromCurrent(store, snapshot.rootTreeOid)).toEqual({ status: "restored" });
+    expect(await readlink(path.join(workspace, "entry"))).toBe(external);
+    expect(await readFile(path.join(external, "child.txt"), "utf8")).toBe("outside\n");
+  });
+
   it("restores add, modify, delete, binary, executable, symlink, and type transitions", async () => {
     const root = await temporaryDirectory();
     const { workspace, store } = await createStore(root);
