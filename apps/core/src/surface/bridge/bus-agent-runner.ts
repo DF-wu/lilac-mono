@@ -3487,6 +3487,8 @@ export async function startBusAgentRunner(params: {
             spec,
             reason,
             messageCountBefore,
+            observedInputTokens,
+            inputTokenSource,
             estimatedInputTokens,
             budget,
           }) => {
@@ -3512,6 +3514,8 @@ export async function startBusAgentRunner(params: {
               modelSpec: spec,
               reason,
               messageCountBefore,
+              observedInputTokens,
+              inputTokenSource,
               estimatedInputTokens,
               inputBudget: budget.inputBudget,
               safeInputBudget: budget.safeInputBudget,

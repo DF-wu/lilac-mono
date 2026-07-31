@@ -913,6 +913,8 @@ type AutoCompactionStartEvent = {
   spec: ModelSpecifier;
   reason: CompactionScheduleReason;
   messageCountBefore: number;
+  observedInputTokens: number;
+  inputTokenSource: "provider-usage" | "text-estimate";
   estimatedInputTokens: number;
   budget: AutoCompactionObservedBudget;
 };
@@ -1951,6 +1953,7 @@ export async function attachAutoCompaction(
     lastModelInputEstimate = modelInputEstimate;
     const providerInputTokens = thresholdInputSource === "usage" ? lastTurnInputTokens : null;
     const observedInputTokens = providerInputTokens ?? modelInputEstimate;
+    const inputTokenSource = providerInputTokens === null ? "text-estimate" : "provider-usage";
 
     const latestCapability = await refreshContextLimit(context.abortSignal);
     pendingCompactionReason = reconcilePendingCompactionReason({
@@ -2017,11 +2020,16 @@ export async function attachAutoCompaction(
     }
 
     const estimatedInputTokens = estimateMessagesTokens(compactableMessages);
+    const eventObservedInputTokens =
+      pendingReason === "overflow" ? modelInputEstimate : observedInputTokens;
+    const eventInputTokenSource = pendingReason === "overflow" ? "text-estimate" : inputTokenSource;
     const compactionStart = Date.now();
     const compactionEventBase: AutoCompactionStartEvent = {
       spec: latestCapability.spec,
       reason: pendingReason,
       messageCountBefore: compactableMessages.length,
+      observedInputTokens: eventObservedInputTokens,
+      inputTokenSource: eventInputTokenSource,
       estimatedInputTokens,
       budget: {
         inputBudget: activeBudget.inputBudget,
