@@ -164,9 +164,10 @@ export class TelegramSurfaceStore {
     // survive a bus outage or a crash mid-publish is to commit the event here
     // first and replay from this table afterwards.
     //
-    // `dedupe_key` gives replay its exactly-once property: a redelivered or
+    // `dedupe_key` deduplicates rows in this table: a redelivered or
     // re-enqueued event collides on the primary key instead of producing a
-    // second bus message.
+    // second pending row. It does not make the downstream bus side effect
+    // exactly-once across a process crash after publish and before delete.
     this.db.run(`
       CREATE TABLE IF NOT EXISTS telegram_ingress_outbox (
         dedupe_key TEXT PRIMARY KEY,
@@ -297,6 +298,23 @@ export class TelegramSurfaceStore {
           WHERE session_id = $session_id AND message_id = $message_id AND deleted = 0`,
       )
       .get({ $session_id: input.sessionId, $message_id: input.messageId });
+
+    return row ? toRecord(row) : null;
+  }
+
+  /** Telegram message ids are unique within a chat, including forum topics. */
+  getMessageByChatMessage(input: {
+    chatId: string;
+    messageId: string;
+  }): TelegramMessageRecord | null {
+    const row = this.db
+      .query<DbTelegramMessage, { $chat_id: string; $message_id: string }>(
+        `SELECT * FROM telegram_messages
+          WHERE chat_id = $chat_id AND message_id = $message_id AND deleted = 0
+          ORDER BY ts DESC, rowid DESC
+          LIMIT 1`,
+      )
+      .get({ $chat_id: input.chatId, $message_id: input.messageId });
 
     return row ? toRecord(row) : null;
   }

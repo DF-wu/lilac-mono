@@ -8,6 +8,7 @@ import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { Update } from "grammy/types";
 
 import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
+import { buildTelegramCancelCallbackData } from "../../../src/surface/telegram/output/telegram-output-stream";
 import {
   parseStoredAdapterEvent,
   telegramIngressDedupeKey,
@@ -255,6 +256,60 @@ describe("durable ingress", () => {
     expect(seen).toHaveLength(1);
   });
 
+  it("retries a retained update in the same process", async () => {
+    adapter = makeAdapter();
+    const seen: AdapterEvent[] = [];
+    let failing = true;
+    await adapter.subscribe(async (evt) => {
+      seen.push(evt);
+      if (failing) throw new Error("redis unavailable");
+    });
+
+    await adapter.connect();
+    await adapter.whenReady();
+
+    server.enqueueMessage(inboundMessage(37, "retry in place"));
+    await waitForPending(1);
+    failing = false;
+    await waitForPending(0);
+
+    expect(seen).toHaveLength(2);
+    expect(JSON.stringify(seen[1])).toContain("retry in place");
+  });
+
+  it("does not tell the user a cancel succeeded when publishing it failed", async () => {
+    adapter = makeAdapter();
+    await adapter.subscribe(async () => {
+      throw new Error("bus down");
+    });
+    await adapter.connect();
+    await adapter.whenReady();
+
+    const callbackData = buildTelegramCancelCallbackData("telegram:1001:42");
+    expect(callbackData).not.toBeNull();
+
+    server.enqueueUpdate({
+      callback_query: {
+        id: "cb-1",
+        from: { id: 7, is_bot: false, first_name: "Ada" },
+        chat_instance: "ci",
+        data: callbackData ?? "",
+        message: {
+          message_id: 500,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: CHAT, type: "private", first_name: "Ada" },
+        },
+      },
+    });
+
+    const answer = await server.waitForCall("answerCallbackQuery");
+    expect(answer.params.text).toContain("could not be delivered");
+    expect(answer.params.show_alert).toBe(true);
+    const store = new TelegramSurfaceStore(dbPath());
+    expect(store.countPendingIngress()).toBe(0);
+    store.close();
+  });
+
   it("forgets the update once the bus accepts it", async () => {
     adapter = makeAdapter();
     await adapter.subscribe(async () => {});
@@ -269,7 +324,7 @@ describe("durable ingress", () => {
     store.close();
   });
 
-  it("republishes a retained update on the next start, exactly once", async () => {
+  it("republishes a retained update on the next start and removes it after acceptance", async () => {
     // The whole point: the first run loses the bus, the second run recovers
     // the message even though Telegram will never resend it.
     adapter = makeAdapter();

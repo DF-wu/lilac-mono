@@ -48,6 +48,17 @@ describe("TelegramSurfaceStore messages", () => {
     expect(store.getMessage({ sessionId: "1001", messageId: "9" })).toBeNull();
   });
 
+  it("finds a topic message by chat id and message id", () => {
+    store.upsertMessage(
+      record({ sessionId: "1001:7", chatId: "1001", threadId: "7", messageId: "9" }),
+    );
+
+    expect(store.getMessageByChatMessage({ chatId: "1001", messageId: "9" })).toMatchObject({
+      sessionId: "1001:7",
+      threadId: "7",
+    });
+  });
+
   it("updates text on edit rather than inserting a duplicate", () => {
     store.upsertMessage(record({ text: "before" }));
     store.upsertMessage(record({ text: "after", editedTs: 2_000 }));

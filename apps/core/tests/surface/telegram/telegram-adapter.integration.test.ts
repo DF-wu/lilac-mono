@@ -384,6 +384,7 @@ describe("telegram adapter against a fake Bot API", () => {
     expect(evt.type === "adapter.request.cancel" && evt.requestId).toBe(requestId);
     expect(evt.type === "adapter.request.cancel" && evt.sessionId).toBe(String(ALLOWED_CHAT));
     expect(sink.ofType("adapter.action.invoked")).toHaveLength(0);
+    await server.waitForCall("answerCallbackQuery");
     expect(server.callsOf("answerCallbackQuery")).toHaveLength(1);
   });
 
@@ -408,6 +409,42 @@ describe("telegram adapter against a fake Bot API", () => {
     const removed = sink.ofType("adapter.reaction.removed")[0];
     expect(added?.type === "adapter.reaction.added" && added.reaction).toBe("🔥");
     expect(removed?.type === "adapter.reaction.removed" && removed.reaction).toBe("👀");
+  });
+
+  it("attributes reaction updates on topic messages to the topic session", async () => {
+    const topicChat = makeSupergroupChat();
+    const cfg = testConfig({ allowedChatIds: [String(topicChat.id)] });
+    const { sink } = await connectAdapter({ cfg });
+
+    server.enqueueMessage(
+      makeMessage({
+        message_id: 61,
+        chat: topicChat,
+        is_topic_message: true,
+        message_thread_id: 7,
+        text: "topic message",
+      }) as NonNullable<Update["message"]>,
+    );
+    await sink.waitFor((e) => e.type === "adapter.message.created", "topic message.created");
+
+    server.enqueueUpdate({
+      message_reaction: {
+        chat: topicChat,
+        message_id: 61,
+        user: { id: 7, is_bot: false, first_name: "Ada" },
+        date: Math.floor(Date.now() / 1000),
+        old_reaction: [],
+        new_reaction: [{ type: "emoji", emoji: "🔥" }],
+      },
+    });
+
+    const added = await sink.waitFor((e) => e.type === "adapter.reaction.added", "topic reaction");
+    expect(added.type === "adapter.reaction.added" && added.session.channelId).toBe(
+      `${topicChat.id}:7`,
+    );
+    expect(added.type === "adapter.reaction.added" && added.messageRef.channelId).toBe(
+      `${topicChat.id}:7`,
+    );
   });
 
   it("sends a reaction through setMessageReaction", async () => {

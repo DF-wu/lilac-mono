@@ -290,6 +290,12 @@ type OutputMessage = {
   /** Last payload successfully handed to the API, for edit deduplication. */
   sentText: string;
   sentMarkup: string;
+  /**
+   * False for resumed refs whose remote text is unknown and was not edited by
+   * this process. They stay tracked for reconciliation, but must not overwrite
+   * local history with an empty placeholder.
+   */
+  deliveredTextKnown: boolean;
 };
 
 function markupKey(markup: TelegramReplyMarkup | undefined): string {
@@ -348,6 +354,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
         messageId: parseTelegramMessageId(ref.messageId),
         sentText: "",
         sentMarkup: "",
+        deliveredTextKnown: false,
       });
       this.created.push(ref);
     }
@@ -365,10 +372,12 @@ export class TelegramOutputStream implements SurfaceOutputStream {
    * or the agent would never see its own prior replies as reply context.
    */
   getDeliveredMessages(): { messageId: number; text: string }[] {
-    return this.messages.map((message) => ({
-      messageId: message.messageId,
-      text: stripTelegramHtml(message.sentText),
-    }));
+    return this.messages
+      .filter((message) => message.deliveredTextKnown)
+      .map((message) => ({
+        messageId: message.messageId,
+        text: stripTelegramHtml(message.sentText),
+      }));
   }
 
   /** Attachments are buffered here; the adapter owns their delivery. */
@@ -725,6 +734,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
       messageId: sent.message_id,
       sentText: html,
       sentMarkup: markupKey(markup),
+      deliveredTextKnown: true,
     });
 
     const ref = telegramMsgRef({
@@ -765,6 +775,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     if (result === null) return;
     message.sentText = html;
     message.sentMarkup = nextMarkup;
+    message.deliveredTextKnown = true;
   }
 
   /**

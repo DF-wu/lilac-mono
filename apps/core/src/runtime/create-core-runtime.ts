@@ -291,7 +291,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   let stopGithubBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopTelegramBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopTelegramAdapterToBus: { stop(): Promise<void> } | null = null;
-  let stopTelegramRouter: { stop(): Promise<void> } | null = null;
+  let stopTelegramRouter: { stop(): Promise<void>; drain?: () => Promise<void> } | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
   let stopHeartbeat: Awaited<ReturnType<typeof startHeartbeatService>> | null = null;
   let stopConversationThreadWorker: Awaited<
@@ -1221,6 +1221,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         () => stopTelegramAdapterToBus?.stop() ?? Promise.resolve(),
       );
       stopTelegramAdapterToBus = null;
+
+      await safe(
+        "graceful.ingress.telegramRouter.drain",
+        () => stopTelegramRouter?.drain?.() ?? Promise.resolve(),
+      );
 
       await safe(
         "graceful.ingress.telegramRouter.stop",

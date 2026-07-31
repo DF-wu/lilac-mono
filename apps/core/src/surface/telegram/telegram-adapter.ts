@@ -175,6 +175,8 @@ export function isFatalTelegramPollingExit(error: unknown): boolean {
   return error.error_code === 401 || error.error_code === 409;
 }
 
+type TelegramIngressDeliveryResult = { ok: true } | { ok: false; error: string; cause: unknown };
+
 export class TelegramAdapter implements SurfaceAdapter {
   private bot: Bot | null = null;
   private store: TelegramSurfaceStore | null = null;
@@ -201,6 +203,8 @@ export class TelegramAdapter implements SurfaceAdapter {
    * rejection.
    */
   private pollingFailure: Error | null = null;
+  private ingressReplayTimer: ReturnType<typeof setTimeout> | null = null;
+  private ingressReplayActive = false;
 
   private readonly logger = createLogger({ module: "surface:telegram" });
 
@@ -387,6 +391,7 @@ export class TelegramAdapter implements SurfaceAdapter {
     }
     this.pollingStopped = null;
     this.ingressStopped = false;
+    this.cancelIngressReplay();
 
     this.ready = null;
     this.store?.close();
@@ -750,12 +755,20 @@ export class TelegramAdapter implements SurfaceAdapter {
       const update = ctx.messageReaction;
       if (!this.isAllowed({ chatId: update.chat.id, userId: update.user?.id })) return;
 
-      const sessionId = formatTelegramSessionId({ chatId: update.chat.id });
+      const indexed = this.store?.getMessageByChatMessage({
+        chatId: String(update.chat.id),
+        messageId: String(update.message_id),
+      });
+      const sessionId = indexed?.sessionId ?? formatTelegramSessionId({ chatId: update.chat.id });
+      const session = telegramSessionRef({
+        chatId: update.chat.id,
+        ...(indexed?.threadId === undefined ? {} : { threadId: Number(indexed.threadId) }),
+      });
       const messageRef = telegramMsgRef({
         chatId: update.chat.id,
+        ...(indexed?.threadId === undefined ? {} : { threadId: Number(indexed.threadId) }),
         messageId: update.message_id,
       });
-      const session = telegramSessionRef({ chatId: update.chat.id });
 
       const before = new Set(
         update.old_reaction.flatMap((r) => (r.type === "emoji" ? [r.emoji] : [])),
@@ -804,17 +817,12 @@ export class TelegramAdapter implements SurfaceAdapter {
 
       const cancelRequestId = parseTelegramCancelCallbackData(query.data);
 
-      // Always answer, otherwise the client spins until the query times out.
-      await ctx
-        .answerCallbackQuery(cancelRequestId ? { text: "Cancelling\u2026" } : {})
-        .catch(() => undefined);
-
       const threadId = topicIdOfCallbackMessage(message);
 
       // The cancel button rides the same callback_query channel as ordinary
       // actions, but the runtime cancels through a distinct event.
       if (cancelRequestId) {
-        await this.emit({
+        const delivered = await this.emit({
           type: "adapter.request.cancel",
           platform: "telegram",
           ts: Date.now(),
@@ -825,10 +833,16 @@ export class TelegramAdapter implements SurfaceAdapter {
           userId: String(query.from.id),
           messageId: String(message.message_id),
         });
+        await ctx
+          .answerCallbackQuery({
+            text: delivered.ok ? "Cancelling…" : "Cancel could not be delivered. Try again.",
+            show_alert: !delivered.ok,
+          })
+          .catch(() => undefined);
         return;
       }
 
-      await this.emit({
+      const delivered = await this.emit({
         type: "adapter.action.invoked",
         platform: "telegram",
         ts: Date.now(),
@@ -840,6 +854,13 @@ export class TelegramAdapter implements SurfaceAdapter {
           messageId: message.message_id,
         }),
       });
+      await ctx
+        .answerCallbackQuery(
+          delivered.ok
+            ? {}
+            : { text: "Action could not be delivered. Try again.", show_alert: true },
+        )
+        .catch(() => undefined);
     });
   }
 
@@ -971,7 +992,7 @@ export class TelegramAdapter implements SurfaceAdapter {
    * Interactive events (cancel, button presses) are deliberately not queued —
    * see `telegramIngressDedupeKey`.
    */
-  private async emit(evt: AdapterEvent): Promise<void> {
+  private async emit(evt: AdapterEvent): Promise<TelegramIngressDeliveryResult> {
     const dedupeKey = telegramIngressDedupeKey(evt);
 
     if (dedupeKey !== null) {
@@ -984,16 +1005,20 @@ export class TelegramAdapter implements SurfaceAdapter {
       // owns; publishing again here would duplicate it.
       if (fresh === false) {
         this.logger.debug("telegram ingress already queued; leaving it to replay", { dedupeKey });
-        return;
+        return {
+          ok: false,
+          error: "telegram ingress already queued",
+          cause: new Error("telegram ingress already queued"),
+        };
       }
     }
 
     const delivered = await this.deliver(evt);
 
-    if (dedupeKey === null) return;
+    if (dedupeKey === null) return delivered;
     if (delivered.ok) {
       this.store?.deleteIngress(dedupeKey);
-      return;
+      return delivered;
     }
 
     this.store?.recordIngressFailure({
@@ -1006,6 +1031,8 @@ export class TelegramAdapter implements SurfaceAdapter {
       { dedupeKey, type: evt.type },
       delivered.cause,
     );
+    this.scheduleIngressReplay();
+    return delivered;
   }
 
   /**
@@ -1015,9 +1042,7 @@ export class TelegramAdapter implements SurfaceAdapter {
    * `bridgeAdapterToBus` rethrows precisely when the bus rejected the publish
    * — the one signal that says the event has not been accepted anywhere.
    */
-  private async deliver(
-    evt: AdapterEvent,
-  ): Promise<{ ok: true } | { ok: false; error: string; cause: unknown }> {
+  private async deliver(evt: AdapterEvent): Promise<TelegramIngressDeliveryResult> {
     // No subscribers means the event reached nothing. Reporting success here
     // would delete it from the outbox, which is the exact loss the outbox
     // exists to prevent.
@@ -1090,6 +1115,8 @@ export class TelegramAdapter implements SurfaceAdapter {
       });
     }
 
+    if (failed > 0 && store.countPendingIngress() > 0) this.scheduleIngressReplay();
+
     this.logger.info("telegram ingress replay finished", {
       replayed,
       failed,
@@ -1097,6 +1124,36 @@ export class TelegramAdapter implements SurfaceAdapter {
     });
 
     return { replayed, failed };
+  }
+
+  private scheduleIngressReplay(delayMs = 1_000): void {
+    if (this.ingressReplayTimer || this.ingressStopped || this.bot === null) return;
+    this.ingressReplayTimer = setTimeout(() => {
+      this.ingressReplayTimer = null;
+      void this.replayPendingIngressInProcess();
+    }, delayMs);
+  }
+
+  private cancelIngressReplay(): void {
+    if (!this.ingressReplayTimer) return;
+    clearTimeout(this.ingressReplayTimer);
+    this.ingressReplayTimer = null;
+  }
+
+  private async replayPendingIngressInProcess(): Promise<void> {
+    if (this.ingressReplayActive || this.ingressStopped || this.bot === null) return;
+    this.ingressReplayActive = true;
+    try {
+      const result = await this.replayPendingIngress();
+      if (result.failed > 0 && (this.store?.countPendingIngress() ?? 0) > 0) {
+        this.scheduleIngressReplay(Math.min(30_000, 1_000 * (result.failed + 1)));
+      }
+    } catch (error: unknown) {
+      this.logger.error("telegram ingress replay attempt failed", {}, error);
+      if ((this.store?.countPendingIngress() ?? 0) > 0) this.scheduleIngressReplay(5_000);
+    } finally {
+      this.ingressReplayActive = false;
+    }
   }
 
   /**

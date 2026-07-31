@@ -823,6 +823,43 @@ describe("subagent model selection", () => {
 });
 
 describe("agent run activity", () => {
+  function createManualTimers() {
+    type Entry = { at: number; cb: () => void };
+    let now = 0;
+    let nextId = 0;
+    const entries = new Map<number, Entry>();
+
+    return {
+      timers: {
+        now: () => now,
+        setTimeout: ((cb: () => void, ms?: number) => {
+          nextId += 1;
+          entries.set(nextId, { at: now + Math.max(0, ms ?? 0), cb });
+          return nextId as unknown as ReturnType<typeof setTimeout>;
+        }) as typeof setTimeout,
+        clearTimeout: ((id: ReturnType<typeof setTimeout>) => {
+          entries.delete(id as unknown as number);
+        }) as typeof clearTimeout,
+      },
+      async advance(ms: number) {
+        now += ms;
+        const due = [...entries]
+          .filter(([, entry]) => entry.at <= now)
+          .sort((a, b) => a[1].at - b[1].at);
+        for (const [id, entry] of due) {
+          if (!entries.delete(id)) continue;
+          entry.cb();
+          await Promise.resolve();
+        }
+      },
+      delay(ms: number): Promise<string> {
+        return new Promise((resolve) => {
+          this.timers.setTimeout(() => resolve("resolved"), ms);
+        });
+      },
+    };
+  }
+
   it("fails a wait after the configured idle interval", async () => {
     const timedOut: Error[] = [];
     const watchdog = createAgentRunIdleWatchdog({
@@ -840,24 +877,25 @@ describe("agent run activity", () => {
   });
 
   it("extends the idle deadline when activity continues", async () => {
+    const fakeTimers = createManualTimers();
     let timeoutCount = 0;
     const watchdog = createAgentRunIdleWatchdog({
       idleTimeoutMs: 45,
       onTimeout: () => {
         timeoutCount += 1;
       },
+      timers: fakeTimers.timers,
     });
 
     watchdog.start();
-    // test-wait-justification: advances part of the real idle deadline before resetting the watchdog
-    await Bun.sleep(30);
+    await fakeTimers.advance(30);
     watchdog.reset();
 
-    // test-wait-justification: keeps the watched operation active across the reset idle window
-    await expect(watchdog.waitFor(Bun.sleep(30).then(() => "resolved"))).resolves.toBe("resolved");
+    const watched = watchdog.waitFor(fakeTimers.delay(30));
+    await fakeTimers.advance(30);
+    await expect(watched).resolves.toBe("resolved");
     watchdog.stop();
-    // test-wait-justification: verifies no stale watchdog deadline fires after the watched operation completes
-    await Bun.sleep(20);
+    await fakeTimers.advance(20);
     expect(timeoutCount).toBe(0);
   });
 

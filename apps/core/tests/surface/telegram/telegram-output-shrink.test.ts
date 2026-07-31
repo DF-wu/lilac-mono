@@ -6,7 +6,7 @@ import {
   type TelegramOutputStreamDeps,
 } from "../../../src/surface/telegram/output/telegram-output-stream";
 import { classifySurplusDeletionFailure } from "../../../src/surface/telegram/output/telegram-output-stream";
-import type { TelegramSessionRef } from "../../../src/surface/types";
+import type { MsgRef, TelegramSessionRef } from "../../../src/surface/types";
 
 const SESSION: TelegramSessionRef = { platform: "telegram", channelId: "1001" };
 
@@ -49,6 +49,7 @@ function harness(opts: { failDelete?: () => Error | null } = {}): {
 function makeStream(
   api: TelegramOutputApi,
   outputMode: "inline" | "preview" = "inline",
+  opts?: TelegramOutputStreamDeps["opts"],
 ): TelegramOutputStream {
   let now = 0;
   const deps: TelegramOutputStreamDeps = {
@@ -65,6 +66,7 @@ function makeStream(
     outputMode,
     outputNotification: true,
     workingIndicators: ["working"],
+    ...(opts === undefined ? {} : { opts }),
   };
   return new TelegramOutputStream(deps);
 }
@@ -248,6 +250,23 @@ describe("an unremovable surplus message is reported, not silently kept", () => 
     // Still visible in the chat, so still reported as part of the answer.
     expect(live.size).toBeGreaterThan(1);
     expect(result.created.length).toBeGreaterThan(1);
+  });
+
+  it("does not report untouched resumed surplus text as an empty delivered message", async () => {
+    const resumed: MsgRef[] = [
+      { platform: "telegram", channelId: "1001", messageId: "10" },
+      { platform: "telegram", channelId: "1001", messageId: "11" },
+    ];
+    const { api } = harness({
+      failDelete: () => new Error("Bad Request: message can't be deleted"),
+    });
+    const stream = makeStream(api, "inline", { resume: { created: resumed } });
+
+    await stream.push({ type: "text.set", text: "replacement" });
+    await stream.finish();
+
+    expect(stream.getSurplusDeletionFailures().length).toBeGreaterThan(0);
+    expect(stream.getDeliveredMessages()).toEqual([{ messageId: 10, text: "replacement" }]);
   });
 
   it("distinguishes retryable failures from unreconciled ones", async () => {

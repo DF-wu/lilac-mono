@@ -5,7 +5,20 @@ export type IdleTimer = {
   stop(): void;
 };
 
-export function createIdleTimer(idleTimeoutMs: number, onIdle: () => void): IdleTimer {
+export type IdleTimerDeps = {
+  now?: () => number;
+  setTimeout?: typeof setTimeout;
+  clearTimeout?: typeof clearTimeout;
+};
+
+export function createIdleTimer(
+  idleTimeoutMs: number,
+  onIdle: () => void,
+  deps: IdleTimerDeps = {},
+): IdleTimer {
+  const now = deps.now ?? Date.now;
+  const setTimer = deps.setTimeout ?? setTimeout;
+  const clearTimer = deps.clearTimeout ?? clearTimeout;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let generation = 0;
   let deadlineAt = 0;
@@ -13,16 +26,16 @@ export function createIdleTimer(idleTimeoutMs: number, onIdle: () => void): Idle
   const stop = () => {
     generation += 1;
     if (timer) {
-      clearTimeout(timer);
+      clearTimer(timer);
       timer = null;
     }
   };
   const arm = (expectedGeneration: number) => {
-    const remainingMs = Math.max(0, deadlineAt - Date.now());
-    timer = setTimeout(
+    const remainingMs = Math.max(0, deadlineAt - now());
+    timer = setTimer(
       () => {
         if (expectedGeneration !== generation) return;
-        const remaining = deadlineAt - Date.now();
+        const remaining = deadlineAt - now();
         if (remaining > 0) {
           arm(expectedGeneration);
           return;
@@ -38,7 +51,7 @@ export function createIdleTimer(idleTimeoutMs: number, onIdle: () => void): Idle
   return {
     reset() {
       stop();
-      deadlineAt = Date.now() + idleTimeoutMs;
+      deadlineAt = now() + idleTimeoutMs;
       arm(generation);
     },
     stop,
@@ -57,6 +70,7 @@ export class AgentIdleTimeoutError extends Error {
 export function createAgentRunIdleWatchdog(params: {
   idleTimeoutMs: number;
   onTimeout: (error: AgentIdleTimeoutError) => void;
+  timers?: IdleTimerDeps;
 }) {
   let timedOut = false;
   let monitoring = false;
@@ -66,14 +80,18 @@ export function createAgentRunIdleWatchdog(params: {
   });
   void timeoutPromise.catch(() => undefined);
 
-  const timer = createIdleTimer(params.idleTimeoutMs, () => {
-    if (timedOut) return;
-    timedOut = true;
-    const error = new AgentIdleTimeoutError(params.idleTimeoutMs);
-    params.onTimeout(error);
-    rejectTimeout?.(error);
-    rejectTimeout = null;
-  });
+  const timer = createIdleTimer(
+    params.idleTimeoutMs,
+    () => {
+      if (timedOut) return;
+      timedOut = true;
+      const error = new AgentIdleTimeoutError(params.idleTimeoutMs);
+      params.onTimeout(error);
+      rejectTimeout?.(error);
+      rejectTimeout = null;
+    },
+    params.timers,
+  );
 
   return {
     start() {

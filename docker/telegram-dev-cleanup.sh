@@ -130,7 +130,7 @@ else
 fi
 
 # --- scratch -----------------------------------------------------------------
-# The Telegram test suites mkdtemp under these four fixed prefixes; a suite
+# The Telegram test suites mkdtemp under these fixed prefixes; a suite
 # killed mid-run leaves the directory behind. Listed individually rather than as
 # a blanket /tmp/lilac-telegram-* so an unrelated directory that merely shares
 # the project prefix is not swept up — note this still cannot distinguish *our*
@@ -142,6 +142,7 @@ SCRATCH_PREFIXES=(
   "/tmp/lilac-telegram-menu-"
   "/tmp/lilac-telegram-e2e-"
   "/tmp/lilac-telegram-poll-"
+  "/tmp/lilac-telegram-outbox-"
 )
 shopt -s nullglob
 scratch=()

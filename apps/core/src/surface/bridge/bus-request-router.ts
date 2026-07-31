@@ -1527,6 +1527,21 @@ export async function startBusRequestRouter(params: {
     });
   }
 
+  async function drainPendingRouting(): Promise<void> {
+    const debounceSessionIds = [...buffers.keys()];
+    for (const sessionId of debounceSessionIds) {
+      await flushDebounce(sessionId);
+    }
+
+    const batches = [...pendingMentionReplyBatchBySession.entries()];
+    for (const [sessionId, batch] of batches) {
+      await flushPendingMentionReplyBatchAsPrompt({
+        sessionId,
+        sourceRequestId: batch.sourceRequestId,
+      });
+    }
+  }
+
   async function handleMentionMode(input: {
     adapter: SurfaceAdapter;
     bus: LilacBus;
@@ -1803,7 +1818,9 @@ export async function startBusRequestRouter(params: {
   }
 
   return {
+    drain: drainPendingRouting,
     stop: async () => {
+      await drainPendingRouting();
       await adapterSub.stop();
       await lifecycleSub.stop();
       await surfaceSub.stop();

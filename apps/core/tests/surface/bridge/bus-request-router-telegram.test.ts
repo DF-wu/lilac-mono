@@ -256,6 +256,29 @@ describe("the shared router serving the telegram surface", () => {
     }
   });
 
+  it("flushes active debounce buffers before stopping", async () => {
+    const adapter = new FakeTelegramAdapter({
+      [`${CHAT}:12`]: surfaceMessage({
+        messageId: "12",
+        text: "queued before restart",
+        raw: telegramRaw({ messageId: "12", mentionsBot: false, isDMBased: false }),
+      }),
+    });
+    const { bus, published, router } = await startRouter(adapter);
+
+    await publishTelegramMessage(bus, {
+      messageId: "12",
+      text: "queued before restart",
+      raw: telegramRaw({ messageId: "12", mentionsBot: false, isDMBased: false }),
+    });
+    expect(published).toHaveLength(0);
+
+    await router.stop();
+
+    expect(published).toHaveLength(1);
+    expect(JSON.stringify(published[0]?.data)).toContain("queued before restart");
+  });
+
   it("ignores adapter events from another platform", async () => {
     // One router instance serves one adapter; a Discord event must not leak in.
     const adapter = new FakeTelegramAdapter();

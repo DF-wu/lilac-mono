@@ -338,8 +338,8 @@ or a `docker prune` — and the running stack's container names (`lilac-mono-cat
 deployment down with the scratch environment.
 
 Two targets cannot be matched by exact name and are not. The inject proxy is
-found by its script path, and `/tmp` scratch directories are found by the four
-`lilac-telegram-{it,menu,e2e,poll}-` prefixes the test suites `mkdtemp` under —
+found by its script path, and `/tmp` scratch directories are found by the five
+`lilac-telegram-{it,menu,e2e,poll,outbox}-` prefixes the test suites `mkdtemp` under —
 their random suffixes are never recorded, so there is nothing exact to match on.
 If a second verification session or test run is in flight on the same host, this
 script will clean up its proxy and scratch directories too. Run `--dry-run`
