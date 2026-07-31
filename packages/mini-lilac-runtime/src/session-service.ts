@@ -3559,8 +3559,11 @@ class SessionActor {
           }
 
           let filesystemMode: "restore" | "skip" = "skip";
-          let skipReason: "git-unavailable" | "snapshot-unavailable" | "platform-unsupported" =
-            "snapshot-unavailable";
+          let skipReason:
+            | "git-unavailable"
+            | "non-git-workspace"
+            | "snapshot-unavailable"
+            | "platform-unsupported" = "snapshot-unavailable";
           let preparedRestore: PreparedWorkspaceRestore | undefined;
           if (target.target.workspaceStatus === "captured") {
             const snapshot =
@@ -4765,6 +4768,7 @@ export class SessionService {
     operation: StoredHistoryOperation,
     lockedStore: LockedWorkspaceHistoryStore,
   ): Promise<void> {
+    let recoveredOperation = operation;
     assertWorkspaceHistoryAvailable(this.store, operation.sessionId, "recover-navigation", {
       kind: "history-operation",
       operationId: operation.id,
@@ -4798,7 +4802,7 @@ export class SessionService {
         const verified = await this.workspaceHistoryForSession(operation.sessionId).verifySnapshot(
           snapshot.rootTreeOid,
         );
-        if (verified.status === "skipped") {
+        if (verified.status === "skipped" && verified.reason !== "non-git-workspace") {
           throw new Error(
             `Retained history operation '${operation.id}' requires Git for verification (${verified.reason})`,
           );
@@ -4829,26 +4833,37 @@ export class SessionService {
           sourceRootTreeOid: sourceSnapshot.rootTreeOid,
         });
         if (prepared.status === "skipped") {
-          throw new Error(
-            `Retained history operation '${operation.id}' requires Git for recovery (${prepared.reason})`,
-          );
+          if (prepared.reason === "non-git-workspace" && operation.phase === "prepared") {
+            recoveredOperation = this.store.skipPreparedHistoryRestore(
+              operation.id,
+              "non-git-workspace",
+            );
+            await this.workspaceHistoryForSession(operation.sessionId).deleteRestorePlan(
+              operation.id,
+            );
+          } else {
+            throw new Error(
+              `Retained history operation '${operation.id}' requires Git for recovery (${prepared.reason})`,
+            );
+          }
+        } else {
+          if (operation.phase === "prepared") {
+            this.store.updateHistoryOperationPhase(operation.id, "restoring");
+          }
+          await prepared.plan.apply();
+          this.store.updateHistoryOperationPhase(operation.id, "verified");
         }
-        if (operation.phase === "prepared") {
-          this.store.updateHistoryOperationPhase(operation.id, "restoring");
-        }
-        await prepared.plan.apply();
-        this.store.updateHistoryOperationPhase(operation.id, "verified");
       }
     }
 
     let filesystem: MiniLilacHistoryFilesystemResult;
-    if (operation.filesystemMode === "restore") {
+    if (recoveredOperation.filesystemMode === "restore") {
       filesystem = { status: "restored" };
     } else {
-      if (operation.skipReason === null) {
+      if (recoveredOperation.skipReason === null) {
         throw new Error(`Retained history operation '${operation.id}' has no skip reason`);
       }
-      filesystem = { status: "skipped", reason: operation.skipReason };
+      filesystem = { status: "skipped", reason: recoveredOperation.skipReason };
     }
     const result: StoredHistoryNavigationResult =
       operation.requestedAction === "undo"
@@ -4867,7 +4882,7 @@ export class SessionService {
             filesystem,
           };
     this.store.commitHistoryNavigation({ operationId: operation.id, result });
-    if (operation.filesystemMode === "restore") {
+    if (recoveredOperation.filesystemMode === "restore") {
       try {
         await this.workspaceHistoryForSession(operation.sessionId).deleteRestorePlan(operation.id);
       } catch (error) {

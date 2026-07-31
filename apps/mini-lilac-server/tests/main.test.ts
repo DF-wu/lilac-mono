@@ -1,6 +1,14 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp as mkdtempFs,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -29,6 +37,19 @@ import {
 
 const temporaryDirectories: string[] = [];
 const databaseLockSignalFixture = path.join(import.meta.dir, "fixtures", "database-lock-signal.ts");
+
+async function mkdtemp(prefix: string): Promise<string> {
+  const directory = await mkdtempFs(prefix);
+  const child = Bun.spawn(["git", "-C", directory, "init", "--quiet"], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  if (exitCode !== 0) throw new Error(`git init failed: ${stderr}`);
+  return directory;
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -335,7 +356,7 @@ describe("mini-lilac server CLI", () => {
         log: () => {},
       }),
     ).rejects.toThrow(
-      "requires mini-lilac database schema version 5, but the database is version 4",
+      "requires mini-lilac database schema version 6, but the database is version 4",
     );
 
     expect(await readFile(databasePath)).toEqual(before);

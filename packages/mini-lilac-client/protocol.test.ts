@@ -313,6 +313,7 @@ describe("miniLilacUIMessageSchema", () => {
 
     for (const reason of [
       "git-unavailable",
+      "non-git-workspace",
       "snapshot-unavailable",
       "platform-unsupported",
     ] as const) {

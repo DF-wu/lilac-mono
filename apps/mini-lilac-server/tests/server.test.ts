@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp as mkdtempFs, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -42,6 +42,19 @@ import { z } from "zod";
 import { createMiniLilacServer, MINI_LILAC_API_PREFIX, withSseKeepAlive } from "../src/server";
 
 const temporaryDirectories: string[] = [];
+
+async function mkdtemp(prefix: string): Promise<string> {
+  const directory = await mkdtempFs(prefix);
+  const child = Bun.spawn(["git", "-C", directory, "init", "--quiet"], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  if (exitCode !== 0) throw new Error(`git init failed: ${stderr}`);
+  return directory;
+}
 
 afterEach(async () => {
   await Promise.all(

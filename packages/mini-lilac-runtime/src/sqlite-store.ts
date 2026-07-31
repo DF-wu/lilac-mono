@@ -46,7 +46,7 @@ import { z } from "zod";
 
 const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
-export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 5;
+export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 6;
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -135,6 +135,7 @@ const historyWorkspaceUnavailableReasonSchema = z.enum([
   "git-unavailable",
   "capture-failed",
   "legacy-migration",
+  "non-git-workspace",
   "platform-unsupported",
 ]);
 const historyStateOriginSchema = z.enum([
@@ -151,6 +152,7 @@ const historyOperationPhaseSchema = z.enum(["prepared", "restoring", "verified"]
 const historyFilesystemModeSchema = z.enum(["restore", "skip"]);
 const historySkipReasonSchema = z.enum([
   "git-unavailable",
+  "non-git-workspace",
   "snapshot-unavailable",
   "platform-unsupported",
 ]);
@@ -170,6 +172,7 @@ const historyWorkspaceOutcomeSchema = z.discriminatedUnion("workspaceStatus", [
     workspaceUnavailableReason: z.enum([
       "git-unavailable",
       "capture-failed",
+      "non-git-workspace",
       "platform-unsupported",
     ]),
   }),
@@ -809,6 +812,7 @@ export type StoredHistoryWorkspaceOutcome =
       readonly workspaceUnavailableReason:
         | "git-unavailable"
         | "capture-failed"
+        | "non-git-workspace"
         | "platform-unsupported";
     };
 
@@ -1392,7 +1396,7 @@ export class MiniLilacSqliteStore {
       .object({ user_version: z.number().int() })
       .parse(this.database.query("PRAGMA user_version").get()).user_version;
     if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return;
-    if (version !== 0 && version !== 2 && version !== 3 && version !== 4) {
+    if (version !== 0 && version !== 2 && version !== 3 && version !== 4 && version !== 5) {
       throw new MiniLilacDatabaseVersionError(version);
     }
 
@@ -1402,11 +1406,12 @@ export class MiniLilacSqliteStore {
     try {
       this.database.transaction(() => {
         if (version === 0) {
-          this.createSchemaV5();
+          this.createSchemaV6();
         } else {
           if (version === 2) this.migrateSchemaV2ToV3();
           if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
-          this.migrateSchemaV4ToV5();
+          if (version === 2 || version === 3 || version === 4) this.migrateSchemaV4ToV5();
+          if (version === 5) this.migrateSchemaV5ToV6();
         }
         const violations = this.database.query("PRAGMA foreign_key_check").all();
         if (violations.length > 0) {
@@ -1427,7 +1432,7 @@ export class MiniLilacSqliteStore {
     }
   }
 
-  private createSchemaV5(): void {
+  private createSchemaV6(): void {
     this.database.exec(`
         CREATE TABLE history_store_metadata (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1559,7 +1564,8 @@ export class MiniLilacSqliteStore {
         ),
         workspace_unavailable_reason TEXT CHECK(
           workspace_unavailable_reason IN (
-            'git-unavailable', 'capture-failed', 'legacy-migration', 'platform-unsupported'
+            'git-unavailable', 'capture-failed', 'legacy-migration', 'non-git-workspace',
+            'platform-unsupported'
           )
         ),
         origin TEXT NOT NULL CHECK(
@@ -1651,7 +1657,9 @@ export class MiniLilacSqliteStore {
         user_transition_id TEXT NOT NULL,
         filesystem_mode TEXT NOT NULL CHECK(filesystem_mode IN ('restore', 'skip')),
         skip_reason TEXT CHECK(
-          skip_reason IN ('git-unavailable', 'snapshot-unavailable', 'platform-unsupported')
+          skip_reason IN (
+            'git-unavailable', 'non-git-workspace', 'snapshot-unavailable', 'platform-unsupported'
+          )
         ),
         phase TEXT NOT NULL CHECK(phase IN ('prepared', 'restoring', 'verified')),
         prepared_at TEXT NOT NULL,
@@ -1700,6 +1708,110 @@ export class MiniLilacSqliteStore {
         ON history_transitions(session_id, from_state_id);
       CREATE INDEX history_transitions_root_run
         ON history_transitions(session_id, root_run_id);
+    `);
+  }
+
+  private migrateSchemaV5ToV6(): void {
+    this.database.exec(`
+      CREATE TABLE history_states_v6 (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        model_head_id INTEGER,
+        model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+        ui_head_id INTEGER,
+        ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+        workspace_snapshot_id TEXT,
+        workspace_status TEXT NOT NULL CHECK(
+          workspace_status IN ('captured', 'unavailable', 'capture-deferred')
+        ),
+        workspace_unavailable_reason TEXT CHECK(
+          workspace_unavailable_reason IN (
+            'git-unavailable', 'capture-failed', 'legacy-migration', 'non-git-workspace',
+            'platform-unsupported'
+          )
+        ),
+        origin TEXT NOT NULL CHECK(
+          origin IN ('root', 'turn-boundary', 'workspace-observation', 'compaction', 'migration')
+        ),
+        created_at TEXT NOT NULL,
+        UNIQUE(id, session_id),
+        UNIQUE(id, workspace_id),
+        FOREIGN KEY(session_id, workspace_id)
+          REFERENCES sessions(id, workspace_id) ON DELETE CASCADE,
+        FOREIGN KEY(workspace_snapshot_id, workspace_id)
+          REFERENCES workspace_snapshots(id, workspace_id),
+        FOREIGN KEY(model_head_id, session_id, model_lane)
+          REFERENCES transcript_nodes(id, session_id, lane),
+        FOREIGN KEY(ui_head_id, session_id, ui_lane)
+          REFERENCES transcript_nodes(id, session_id, lane),
+        CHECK(
+          (workspace_status = 'captured' AND workspace_snapshot_id IS NOT NULL
+            AND workspace_unavailable_reason IS NULL) OR
+          (workspace_status = 'unavailable' AND workspace_snapshot_id IS NULL
+            AND workspace_unavailable_reason IS NOT NULL) OR
+          (workspace_status = 'capture-deferred' AND workspace_snapshot_id IS NULL
+            AND workspace_unavailable_reason IS NULL)
+        )
+      );
+      INSERT INTO history_states_v6 (
+        rowid, id, session_id, workspace_id, model_head_id, model_lane, ui_head_id, ui_lane,
+        workspace_snapshot_id, workspace_status, workspace_unavailable_reason, origin, created_at
+      )
+      SELECT
+        rowid, id, session_id, workspace_id, model_head_id, model_lane, ui_head_id, ui_lane,
+        workspace_snapshot_id, workspace_status, workspace_unavailable_reason, origin, created_at
+      FROM history_states;
+      DROP TABLE history_states;
+      ALTER TABLE history_states_v6 RENAME TO history_states;
+      CREATE INDEX history_states_session ON history_states(session_id);
+      CREATE INDEX history_states_workspace_snapshot ON history_states(workspace_snapshot_id);
+
+      CREATE TABLE history_operations_v6 (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind = 'navigate'),
+        requested_action TEXT NOT NULL CHECK(requested_action IN ('undo', 'redo')),
+        source_state_id TEXT NOT NULL,
+        observed_source_state_id TEXT,
+        target_state_id TEXT NOT NULL,
+        user_transition_id TEXT NOT NULL,
+        filesystem_mode TEXT NOT NULL CHECK(filesystem_mode IN ('restore', 'skip')),
+        skip_reason TEXT CHECK(
+          skip_reason IN (
+            'git-unavailable', 'non-git-workspace', 'snapshot-unavailable', 'platform-unsupported'
+          )
+        ),
+        phase TEXT NOT NULL CHECK(phase IN ('prepared', 'restoring', 'verified')),
+        prepared_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(workspace_id),
+        FOREIGN KEY(session_id, workspace_id) REFERENCES sessions(id, workspace_id),
+        FOREIGN KEY(session_id, command_id) REFERENCES commands(session_id, command_id),
+        FOREIGN KEY(source_state_id, session_id) REFERENCES history_states(id, session_id),
+        FOREIGN KEY(observed_source_state_id, session_id) REFERENCES history_states(id, session_id),
+        FOREIGN KEY(target_state_id, session_id) REFERENCES history_states(id, session_id),
+        FOREIGN KEY(user_transition_id, session_id)
+          REFERENCES history_transitions(id, session_id),
+        CHECK(
+          (filesystem_mode = 'restore' AND skip_reason IS NULL) OR
+          (filesystem_mode = 'skip' AND skip_reason IS NOT NULL)
+        )
+      );
+      INSERT INTO history_operations_v6 (
+        rowid, id, session_id, workspace_id, command_id, kind, requested_action, source_state_id,
+        observed_source_state_id, target_state_id, user_transition_id, filesystem_mode, skip_reason,
+        phase, prepared_at, updated_at
+      )
+      SELECT
+        rowid, id, session_id, workspace_id, command_id, kind, requested_action, source_state_id,
+        observed_source_state_id, target_state_id, user_transition_id, filesystem_mode, skip_reason,
+        phase, prepared_at, updated_at
+      FROM history_operations;
+      DROP TABLE history_operations;
+      ALTER TABLE history_operations_v6 RENAME TO history_operations;
     `);
   }
 
@@ -3819,6 +3931,33 @@ export class MiniLilacSqliteStore {
       .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
       .all()
       .map(toHistoryOperation);
+  }
+
+  skipPreparedHistoryRestore(
+    operationId: string,
+    reasonValue: z.infer<typeof historySkipReasonSchema>,
+  ): StoredHistoryOperation {
+    const reason = historySkipReasonSchema.parse(reasonValue);
+    return this.runImmediateTransaction(() => {
+      const operation = this.getHistoryOperation(operationId);
+      if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
+      if (operation.filesystemMode !== "restore" || operation.phase !== "prepared") {
+        throw new Error(`History operation '${operationId}' cannot skip its prepared restore`);
+      }
+      const updated = this.database
+        .query(
+          `UPDATE history_operations
+           SET filesystem_mode = 'skip', skip_reason = ?, updated_at = ?
+           WHERE id = ? AND filesystem_mode = 'restore' AND phase = 'prepared'`,
+        )
+        .run(reason, new Date().toISOString(), operationId);
+      if (updated.changes !== 1) {
+        throw new Error(`History operation '${operationId}' could not skip its prepared restore`);
+      }
+      const skipped = this.getHistoryOperation(operationId);
+      if (skipped === null) throw new Error(`History operation '${operationId}' disappeared`);
+      return skipped;
+    });
   }
 
   updateHistoryOperationPhase(

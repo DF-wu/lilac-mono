@@ -4,7 +4,7 @@ import {
   chmod,
   copyFile,
   mkdir,
-  mkdtemp,
+  mkdtemp as mkdtempFs,
   readdir,
   rm,
   stat,
@@ -61,6 +61,19 @@ import {
 } from "../src/workspace-history-store";
 
 const temporaryDirectories: string[] = [];
+
+async function mkdtemp(prefix: string): Promise<string> {
+  const directory = await mkdtempFs(prefix);
+  const child = Bun.spawn(["git", "-C", directory, "init", "--quiet"], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  if (exitCode !== 0) throw new Error(`git init failed: ${stderr}`);
+  return directory;
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -1072,6 +1085,39 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("keeps transcript history without workspace snapshots outside Git", async () => {
+    const directory = await mkdtempFs(path.join(tmpdir(), "mini-lilac-non-git-history-"));
+    temporaryDirectories.push(directory);
+    const model = new MockLanguageModelV4({
+      doStream: async () => textResult("non-git-answer", "done"),
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("non-git prompt"), "non-git-prompt"))
+        .stream,
+    );
+    const workspace = service.store.getWorkspaceForSession(session.id);
+    expect(service.store.listWorkspaceSnapshots(workspace.id)).toEqual([]);
+    expect(service.store.getCurrentHistoryState(session.id)).toMatchObject({
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "non-git-workspace",
+    });
+    expect(
+      await service.undo({ sessionId: session.id, clientCommandId: "non-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      filesystem: { status: "skipped", reason: "non-git-workspace" },
+    });
+    expect(service.store.getUiMessages(session.id)).toEqual([]);
+    service.close();
+  });
+
   it("runs workspace maintenance after retained history recovery", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-maintenance-order-"));
     temporaryDirectories.push(directory);
@@ -4939,6 +4985,161 @@ describe("SessionService", () => {
       reopened.close();
     });
   }
+
+  it("downgrades an unmutated prepared restore when the worktree becomes non-Git", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-prepared-non-git-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("non-git-recovery", "response") }),
+      attachCompaction: async () => () => {},
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const prompt = userMessage("prepared non-git recovery");
+    await collect((await service.startPrompt(session.id, prompt, "prepared-prompt")).stream);
+    await writeFile(managed, "source-drift");
+    const updatePhase = service.store.updateHistoryOperationPhase.bind(service.store);
+    service.store.updateHistoryOperationPhase = (operationId, phase) => {
+      if (phase === "restoring") throw new Error("injected prepared crash");
+      return updatePhase(operationId, phase);
+    };
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "prepared-non-git-undo" }),
+    ).rejects.toThrow("injected prepared crash");
+    service.close();
+    await rm(path.join(directory, ".git"), { recursive: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(await Bun.file(managed).text()).toBe("source-drift");
+    expect(reopened.getMessages(session.id)).toEqual([]);
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "prepared-non-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      message: prompt,
+      filesystem: { status: "skipped", reason: "non-git-workspace" },
+    });
+    reopened.close();
+  });
+
+  it("commits a verified restore after the worktree becomes non-Git", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-verified-non-git-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("verified-non-git", "response") }),
+      attachCompaction: async () => () => {},
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const prompt = userMessage("verified non-git recovery");
+    await collect((await service.startPrompt(session.id, prompt, "verified-prompt")).stream);
+    await writeFile(managed, "source-drift");
+    service.store.commitHistoryNavigation = () => {
+      throw new Error("injected verified crash");
+    };
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "verified-non-git-undo" }),
+    ).rejects.toThrow("injected verified crash");
+    expect(service.store.listHistoryOperations()).toMatchObject([{ phase: "verified" }]);
+    service.close();
+    await rm(path.join(directory, ".git"), { recursive: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(await Bun.file(managed).text()).toBe("target");
+    expect(reopened.getMessages(session.id)).toEqual([]);
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "verified-non-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      message: prompt,
+      filesystem: { status: "restored" },
+    });
+    reopened.close();
+  });
+
+  it("does not resume a restoring operation after the worktree becomes non-Git", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-restoring-non-git-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("restoring-non-git", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({
+          ...options,
+          testHooks: {
+            beforeMutation: () => {
+              throw new Error("injected restoring failure");
+            },
+          },
+        }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (
+        await service.startPrompt(
+          session.id,
+          userMessage("restoring non-git recovery"),
+          "restoring-prompt",
+        )
+      ).stream,
+    );
+    await writeFile(managed, "source-drift");
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "restoring-non-git-undo" }),
+    ).rejects.toThrow("injected restoring failure");
+    expect(service.store.listHistoryOperations()).toMatchObject([{ phase: "restoring" }]);
+    service.close();
+    await rm(path.join(directory, ".git"), { recursive: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await expect(reopened.initialize()).rejects.toThrow(
+      "requires Git for recovery (non-git-workspace)",
+    );
+    expect(reopened.getHistoryRecoveryStatus().navigation).toMatchObject([{ phase: "restoring" }]);
+    expect(await Bun.file(managed).text()).toBe("source-drift");
+    reopened.close();
+  });
 
   for (const scenario of [
     {

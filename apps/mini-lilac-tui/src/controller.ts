@@ -1807,6 +1807,7 @@ function draftPartsEqual<T>(left: readonly T[], right: readonly T[]): boolean {
 
 function skippedFilesystemReason(filesystem: MiniLilacHistoryFilesystemResult): string | undefined {
   if (filesystem.status !== "skipped") return undefined;
+  if (filesystem.reason === "non-git-workspace") return undefined;
   if (filesystem.reason === "git-unavailable") return "Git is unavailable";
   if (filesystem.reason === "snapshot-unavailable") return "no worktree snapshot is available";
   return "worktree restore is unsupported on this platform";

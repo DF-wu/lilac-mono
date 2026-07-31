@@ -2877,6 +2877,41 @@ describe("Controller effect wiring", () => {
     }
   });
 
+  it("does not warn when filesystem history is disabled outside Git", async () => {
+    const message: MiniLilacUserUIMessage = {
+      id: "user-non-git",
+      role: "user",
+      parts: [{ type: "text", text: "non-git" }],
+    };
+    const notices: string[] = [];
+    const operations = operationTracker();
+    const transport = new FakeTransport({
+      redo: (request) =>
+        Promise.resolve({
+          status: "redone",
+          clientCommandId: request.clientCommandId,
+          message,
+          historyStateId: "history-non-git",
+          filesystem: { status: "skipped", reason: "non-git-workspace" },
+        }),
+      getMessages: () => Promise.resolve([message]),
+    });
+    const controller = new Controller({
+      transport,
+      ui: { ...operations.ui, onNotice: (notice) => notices.push(notice) },
+      sessionId: "session-non-git",
+      initialMessages: [],
+      onExit: () => {},
+    });
+    controller.start();
+
+    const completed = operations.next();
+    controller.redo();
+    await completed;
+    expect(notices).toEqual([]);
+    controller.dispose();
+  });
+
   it("reports an undo filesystem skip after restoring the draft and returning idle", async () => {
     const removed: MiniLilacUserUIMessage = {
       id: "user-skipped-undo",
