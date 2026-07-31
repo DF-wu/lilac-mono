@@ -114,11 +114,11 @@ class FakeAdapter implements SurfaceAdapter {
     return msgs.slice(0, limit);
   }
 
-  async editMsg(): Promise<void> {
+  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<void> {
     throw new Error("not implemented");
   }
 
-  async deleteMsg(): Promise<void> {
+  async deleteMsg(_msgRef: MsgRef): Promise<void> {
     throw new Error("not implemented");
   }
 
@@ -182,7 +182,204 @@ class FakeAdapter implements SurfaceAdapter {
   }
 }
 
+class FakeTelegramToolAdapter extends FakeAdapter {
+  readonly editCalls: Array<{ msgRef: MsgRef; content: ContentOpts }> = [];
+  readonly deleteCalls: MsgRef[] = [];
+
+  override async getSelf(): Promise<SurfaceSelf> {
+    return { platform: "telegram", userId: "bot", userName: "lilac" };
+  }
+
+  override async getCapabilities(): Promise<AdapterCapabilities> {
+    return { ...(await super.getCapabilities()), platform: "telegram" };
+  }
+
+  override async sendMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<MsgRef> {
+    this.sendCalls.push({ sessionRef, content, opts });
+    return { platform: "telegram", channelId: sessionRef.channelId, messageId: "sent" };
+  }
+
+  override async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<void> {
+    this.editCalls.push({ msgRef, content });
+  }
+
+  override async deleteMsg(msgRef: MsgRef): Promise<void> {
+    this.deleteCalls.push(msgRef);
+  }
+}
+
 describe("tool-server surface", () => {
+  it("routes Telegram message tools through the Telegram adapter", async () => {
+    const baseCfg = testConfig({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      surface: {
+        ...baseCfg.surface,
+        telegram: {
+          ...baseCfg.surface.telegram,
+          enabled: true,
+          allowedChatIds: ["1001"],
+          allowedUserIds: [],
+        },
+      },
+    };
+    const session = { platform: "telegram", channelId: "1001" } as const;
+    const message: SurfaceMessage = {
+      ref: { ...session, messageId: "42" },
+      session,
+      userId: "7",
+      userName: "Ada",
+      text: "hello from Telegram",
+      ts: 100,
+    };
+    const discordAdapter = new FakeAdapter([], {});
+    const telegramAdapter = new FakeTelegramToolAdapter(
+      [
+        { ref: session, kind: "dm", title: "Allowed" },
+        { ref: { platform: "telegram", channelId: "2002" }, kind: "dm", title: "Denied" },
+      ],
+      { "1001": [message] },
+    );
+    const tool = new Surface({
+      adapter: discordAdapter,
+      adapters: new Map([
+        ["discord", discordAdapter],
+        ["telegram", telegramAdapter],
+      ]),
+      config: cfg,
+    });
+    const ctx = {
+      requestClient: "telegram",
+      sessionId: "1001",
+      requestId: "telegram:1001:42",
+    } as RequestContext;
+
+    expect(await tool.call("surface.sessions.list", {}, { context: ctx })).toEqual([
+      { channelId: "1001", kind: "dm", title: "Allowed" },
+    ]);
+    const listed = (await tool.call("surface.messages.list", {}, { context: ctx })) as {
+      messages: Array<{ messageId: string; richText: string }>;
+    };
+    expect(listed.messages).toMatchObject([{ messageId: "42", richText: "hello from Telegram" }]);
+    const read = (await tool.call("surface.messages.read", {}, { context: ctx })) as {
+      message: { messageId: string; richText: string } | null;
+    };
+    expect(read.message).toMatchObject({ messageId: "42", richText: "hello from Telegram" });
+
+    await tool.call("surface.messages.send", { text: "reply", silent: true }, { context: ctx });
+    expect(telegramAdapter.sendCalls.at(-1)).toMatchObject({
+      sessionRef: session,
+      content: { text: "reply" },
+      opts: { silent: true },
+    });
+    await tool.call("surface.messages.edit", { messageId: "42", text: "edited" }, { context: ctx });
+    await tool.call("surface.messages.delete", { messageId: "42" }, { context: ctx });
+    await tool.call("surface.reactions.add", { reaction: "👍" }, { context: ctx });
+    await tool.call("surface.reactions.remove", { reaction: "👍" }, { context: ctx });
+
+    expect(telegramAdapter.editCalls.at(-1)?.msgRef).toEqual({ ...session, messageId: "42" });
+    expect(telegramAdapter.deleteCalls.at(-1)).toEqual({ ...session, messageId: "42" });
+    expect(telegramAdapter.addReactionCalls.at(-1)).toEqual({
+      msgRef: { ...session, messageId: "42" },
+      reaction: "👍",
+    });
+    expect(telegramAdapter.removeReactionCalls.at(-1)).toEqual({
+      msgRef: { ...session, messageId: "42" },
+      reaction: "👍",
+    });
+  });
+
+  it("infers Telegram topic refs and rejects disallowed or cross-surface targets", async () => {
+    const baseCfg = testConfig({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      surface: {
+        ...baseCfg.surface,
+        telegram: {
+          ...baseCfg.surface.telegram,
+          enabled: true,
+          allowedChatIds: ["-100123"],
+          allowedUserIds: [],
+        },
+      },
+    };
+    const discordAdapter = new FakeAdapter([], {});
+    const telegramAdapter = new FakeTelegramToolAdapter([], {});
+    const tool = new Surface({
+      adapter: discordAdapter,
+      adapters: new Map([
+        ["discord", discordAdapter],
+        ["telegram", telegramAdapter],
+      ]),
+      config: cfg,
+    });
+    const ctx = {
+      requestClient: "telegram",
+      requestId: "telegram:-100123:7:42",
+    } as RequestContext;
+
+    await tool.call("surface.reactions.add", { reaction: "👀" }, { context: ctx });
+    expect(telegramAdapter.addReactionCalls.at(-1)?.msgRef).toEqual({
+      platform: "telegram",
+      channelId: "-100123:7",
+      messageId: "42",
+    });
+    await expect(
+      tool.call(
+        "surface.messages.send",
+        { sessionId: "-100999", text: "denied" },
+        { context: ctx },
+      ),
+    ).rejects.toThrow("Not allowed: Telegram sessionId '-100999'");
+    await expect(
+      tool.call("surface.messages.send", { client: "discord", text: "cross" }, { context: ctx }),
+    ).rejects.toThrow("Client mismatch");
+  });
+
+  it("fails closed when Telegram was not injected into the adapter registry", async () => {
+    const adapter = new FakeAdapter([], {});
+    const baseCfg = testConfig({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      surface: {
+        ...baseCfg.surface,
+        telegram: {
+          ...baseCfg.surface.telegram,
+          enabled: true,
+          allowedChatIds: ["1001"],
+        },
+      },
+    };
+    const tool = new Surface({ adapter, config: cfg });
+    const ctx = { requestClient: "telegram", sessionId: "1001" } as RequestContext;
+
+    await expect(
+      tool.call("surface.messages.send", { text: "unavailable" }, { context: ctx }),
+    ).rejects.toThrow("Telegram adapter is unavailable");
+  });
+
+  it("uses the authenticated Telegram principal when workflow requestClient is unknown", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: testConfig({}) });
+    const context = {
+      requestClient: "unknown",
+      sessionId: "workflow:run-1:operation-1",
+      authenticatedPrincipal: { platform: "telegram" as const, userId: "user-7" },
+    } satisfies RequestContext;
+
+    await expect(
+      tool.call(
+        "surface.messages.send",
+        { client: "discord", sessionId: "123", text: "cross-surface" },
+        { context },
+      ),
+    ).rejects.toThrow("Client mismatch");
+  });
+
   it("marks surface.messages.search as deprecated and hidden", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 

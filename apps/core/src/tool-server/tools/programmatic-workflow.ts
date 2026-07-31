@@ -63,7 +63,7 @@ const definitionListInputSchema = z.strictObject({
 const progressInputSchema = z
   .strictObject({
     requestOrigin: z.literal(true).optional(),
-    client: z.enum(["discord", "github"]).optional(),
+    client: z.enum(["discord", "github", "telegram"]).optional(),
     sessionId: z.string().min(1).max(200).optional(),
   })
   .superRefine((progress, ctx) => {
@@ -135,7 +135,9 @@ const runResumeInputSchema = z.strictObject({ runId: z.string().min(1).max(200) 
 function requestProgressTarget(context: RequestContext) {
   if (
     !context.sessionId ||
-    (context.requestClient !== "discord" && context.requestClient !== "github")
+    (context.requestClient !== "discord" &&
+      context.requestClient !== "github" &&
+      context.requestClient !== "telegram")
   ) {
     return null;
   }
@@ -145,6 +147,23 @@ function requestProgressTarget(context: RequestContext) {
     sessionRef: { platform: context.requestClient, channelId: context.sessionId },
     originMessageRef: null,
   } as const;
+}
+
+function assertProgressTargetAllowed(
+  context: RequestContext,
+  progress: { client?: "discord" | "github" | "telegram"; sessionId?: string } | undefined,
+): void {
+  if (!progress?.client) return;
+  const telegramPrincipal =
+    context.requestClient === "telegram" || context.authenticatedPrincipal?.platform === "telegram";
+  if (!telegramPrincipal) return;
+  if (
+    context.requestClient !== "telegram" ||
+    progress.client !== "telegram" ||
+    progress.sessionId !== context.sessionId
+  ) {
+    throw new Error("Telegram workflow progress targets must use the current Telegram session");
+  }
 }
 
 function assertProjectScope(input: {
@@ -483,6 +502,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         input: rawInput,
         schema: scheduledTriggerCreateInputSchema,
       });
+      assertProgressTargetAllowed(context, input.progress);
       const definition = await definitions.get({
         scope: input.scope,
         name: input.name,
@@ -708,6 +728,7 @@ export class ProgrammaticWorkflow implements ServerTool {
       const context = requireTriggerContext(opts?.context);
       const requestTarget = requestProgressTarget(context);
       const input = parseToolInput({ callableId, input: rawInput, schema: runTriggerInputSchema });
+      assertProgressTargetAllowed(context, input.progress);
       const definition = await definitions.get({
         scope: input.scope,
         name: input.name,

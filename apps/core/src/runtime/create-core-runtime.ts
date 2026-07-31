@@ -29,6 +29,7 @@ import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { GithubAdapter } from "../surface/github/github-adapter";
 import { TelegramAdapter } from "../surface/telegram/telegram-adapter";
 import type { SurfaceAdapter } from "../surface/adapter";
+import type { SurfaceRefPlatform } from "../surface/types";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import { startBusRequestRouter } from "../surface/bridge/bus-request-router";
@@ -818,10 +819,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         });
       }
 
-      const workflowAdapters = new Map<"discord" | "github", SurfaceAdapter>([
+      const workflowAdapters = new Map<"discord" | "github" | "telegram", SurfaceAdapter>([
         ["discord", adapter],
         ["github", githubAdapter],
       ]);
+      if (telegramAdapter) workflowAdapters.set("telegram", telegramAdapter);
       workflowProgressProjector = new WorkflowProgressProjector({
         bus,
         store: durableWorkflowStore,
@@ -911,10 +913,17 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
             })()
           : undefined;
 
+      const surfaceAdapters = new Map<SurfaceRefPlatform, SurfaceAdapter>([
+        ["discord", adapter],
+        ["github", githubAdapter],
+      ]);
+      if (telegramAdapter) surfaceAdapters.set("telegram", telegramAdapter);
+
       pluginManager = createCoreToolPluginManager({
         runtime: {
           bus,
           adapter,
+          surfaceAdapters,
           getConfig: () => getCoreConfig(),
           discovery: discoveryService ?? undefined,
           conversationThreads: conversationThreadToolService,

@@ -28,6 +28,7 @@ import type {
   SurfaceSession,
   TelegramMsgRef,
   TelegramSessionRef,
+  SurfaceAction,
 } from "../types";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 
@@ -75,6 +76,7 @@ import {
   parseTelegramCancelCallbackData,
   type TelegramReplyMarkup,
 } from "./output/telegram-output-stream";
+import { markdownToTelegramHtml } from "./output/telegram-html";
 
 export type TelegramAdapterHealthSnapshot = {
   /**
@@ -110,6 +112,22 @@ export type TelegramAdapterOptions = {
    */
   customCommands?: CustomCommandManager;
 };
+
+const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
+
+export function buildTelegramActionKeyboard(
+  actions: readonly SurfaceAction[] | undefined,
+): InlineKeyboardMarkup | undefined {
+  if (!actions) return undefined;
+
+  const inlineKeyboard = actions.flatMap((action) =>
+    Buffer.byteLength(action.actionId, "utf8") <= TELEGRAM_CALLBACK_DATA_MAX_BYTES
+      ? [[{ text: action.label, callback_data: action.actionId }]]
+      : [],
+  );
+
+  return { inline_keyboard: inlineKeyboard };
+}
 
 /**
  * Telegram's ceiling for `setMyCommands`. Exceeding it fails the whole call,
@@ -528,10 +546,23 @@ export class TelegramAdapter implements SurfaceAdapter {
 
     const { chatId, threadId } = parseTelegramSessionId(sessionRef.channelId);
     const replyTo = opts?.replyTo;
+    const replyMarkup = buildTelegramActionKeyboard(content.actions);
+    const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
 
-    const sent = await bot.api.sendMessage(chatId, text, {
+    for (const action of content.actions ?? []) {
+      if (Buffer.byteLength(action.actionId, "utf8") > TELEGRAM_CALLBACK_DATA_MAX_BYTES) {
+        this.logger.warn("telegram action omitted because callback_data exceeds 64 bytes", {
+          actionIdBytes: Buffer.byteLength(action.actionId, "utf8"),
+          label: action.label,
+        });
+      }
+    }
+
+    const sent = await bot.api.sendMessage(chatId, renderedText, {
+      ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
       ...(threadId === undefined ? {} : { message_thread_id: threadId }),
       ...(opts?.silent ? { disable_notification: true } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       ...(replyTo && replyTo.platform === "telegram"
         ? {
             reply_parameters: {
@@ -603,13 +634,20 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (!text.trim()) {
       throw new Error("telegram adapter: editMsg requires non-empty text");
     }
+    const replyMarkup = buildTelegramActionKeyboard(content.actions);
+    const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
 
     try {
-      await bot.api.editMessageText(
+      const edited = await bot.api.editMessageText(
         chatIdOf(msgRef),
         parseTelegramMessageId(msgRef.messageId),
-        text,
+        renderedText,
+        {
+          ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
+          ...(content.actions === undefined ? {} : { reply_markup: replyMarkup }),
+        },
       );
+      if (edited !== true) this.recordMessage(edited, { fromBot: true });
     } catch (error: unknown) {
       const notFound = classifyTelegramNotFound(error);
       if (notFound) throw notFound;

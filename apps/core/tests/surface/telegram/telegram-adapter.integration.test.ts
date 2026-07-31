@@ -8,7 +8,10 @@ import type { Message, Update } from "grammy/types";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 
-import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
+import {
+  buildTelegramActionKeyboard,
+  TelegramAdapter,
+} from "../../../src/surface/telegram/telegram-adapter";
 import { buildTelegramCancelCallbackData } from "../../../src/surface/telegram/output/telegram-output-stream";
 import type { AdapterEvent } from "../../../src/surface/events";
 import { FakeBotApiServer } from "./fake-bot-api-server";
@@ -147,6 +150,58 @@ afterEach(async () => {
 });
 
 describe("telegram adapter against a fake Bot API", () => {
+  it("renders action buttons on sends and replaces them on edits", async () => {
+    const { adapter: a } = await connectAdapter({});
+    const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
+
+    const ref = await a.sendMsg(sessionRef, {
+      text: "**Queued**",
+      format: "markdown",
+      actions: [{ actionId: "pause-token", label: "Pause", style: "secondary" }],
+    });
+    expect(server.callsOf("sendMessage").at(-1)?.params).toMatchObject({
+      text: "<b>Queued</b>",
+      parse_mode: "HTML",
+    });
+    expect(server.callsOf("sendMessage").at(-1)?.params.reply_markup).toEqual({
+      inline_keyboard: [[{ text: "Pause", callback_data: "pause-token" }]],
+    });
+
+    await a.editMsg(ref, {
+      text: "**Paused**",
+      format: "markdown",
+      actions: [{ actionId: "resume-token", label: "Resume", style: "primary" }],
+    });
+    expect(server.callsOf("editMessageText").at(-1)?.params).toMatchObject({
+      text: "<b>Paused</b>",
+      parse_mode: "HTML",
+    });
+    expect(server.callsOf("editMessageText").at(-1)?.params.reply_markup).toEqual({
+      inline_keyboard: [[{ text: "Resume", callback_data: "resume-token" }]],
+    });
+    expect((await a.readMsg(ref))?.text).toBe("<b>Paused</b>");
+
+    await a.editMsg(ref, { text: "done", actions: [] });
+    expect(server.callsOf("editMessageText").at(-1)?.params.reply_markup).toEqual({
+      inline_keyboard: [],
+    });
+  });
+
+  it("omits action ids that exceed Telegram's callback_data byte limit", () => {
+    expect(
+      buildTelegramActionKeyboard([
+        { actionId: "x".repeat(65), label: "Too long", style: "danger" },
+        { actionId: "ok", label: "Keep", style: "primary" },
+      ]),
+    ).toEqual({ inline_keyboard: [[{ text: "Keep", callback_data: "ok" }]] });
+    expect(
+      buildTelegramActionKeyboard([
+        { actionId: "界".repeat(22), label: "Too long", style: "danger" },
+      ]),
+    ).toEqual({ inline_keyboard: [] });
+    expect(buildTelegramActionKeyboard([])).toEqual({ inline_keyboard: [] });
+  });
+
   it("connects, identifies itself, and reports ready", async () => {
     const { adapter: a } = await connectAdapter({});
 
@@ -386,6 +441,39 @@ describe("telegram adapter against a fake Bot API", () => {
     expect(sink.ofType("adapter.action.invoked")).toHaveLength(0);
     await server.waitForCall("answerCallbackQuery");
     expect(server.callsOf("answerCallbackQuery")).toHaveLength(1);
+  });
+
+  it("turns an inline-keyboard callback into a workflow action event", async () => {
+    const { sink } = await connectAdapter({});
+    const actionId = crypto.randomUUID();
+
+    server.enqueueUpdate({
+      callback_query: {
+        id: "cb-action",
+        from: { id: 7, is_bot: false, first_name: "Ada" },
+        chat_instance: "ci",
+        data: actionId,
+        message: {
+          message_id: 501,
+          date: Math.floor(Date.now() / 1000),
+          chat: { id: ALLOWED_CHAT, type: "private", first_name: "Ada" },
+        },
+      },
+    });
+
+    const evt = await sink.waitFor((event) => event.type === "adapter.action.invoked", "action");
+    expect(evt).toMatchObject({
+      type: "adapter.action.invoked",
+      platform: "telegram",
+      actionId,
+      userId: "7",
+      messageRef: {
+        platform: "telegram",
+        channelId: String(ALLOWED_CHAT),
+        messageId: "501",
+      },
+    });
+    await server.waitForCall("answerCallbackQuery");
   });
 
   it("maps a reaction update onto add and remove events", async () => {

@@ -94,6 +94,119 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     }
   });
 
+  it("creates a durable Telegram progress target from the request origin", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-telegram-tool-"));
+    const workspaceRoot = path.join(root, "workspace");
+    await fs.mkdir(workspaceRoot);
+    const cards: string[] = [];
+    const tool = new ProgrammaticWorkflow({
+      dataDir: path.join(root, "data"),
+      dbPath: path.join(root, "workflow.sqlite"),
+      now: () => 100,
+      progressCards: {
+        ensureInitialCard: async (runId) => {
+          cards.push(runId);
+          return { platform: "telegram", channelId: "-100123:7", messageId: "501" };
+        },
+        requestProjection: () => {},
+      },
+    });
+    const context = {
+      requestId: "telegram:-100123:7:42",
+      sessionId: "-100123:7",
+      requestClient: "telegram",
+      cwd: workspaceRoot,
+      safetyMode: "restricted" as const,
+      authenticatedPrincipal: { platform: "telegram" as const, userId: "user-7" },
+      toolCallId: "tool-call-telegram",
+    } satisfies RequestContext;
+
+    await tool.init();
+    try {
+      await tool.call(
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      const invocation = invocationSchema.parse(
+        await tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          { context },
+        ),
+      );
+      expect(cards).toEqual([invocation.runId]);
+
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "discord", sessionId: "channel-1" },
+            idempotencyKey: "telegram-cross-surface",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "telegram", sessionId: "-100999" },
+            idempotencyKey: "telegram-cross-session",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "discord", sessionId: "channel-1" },
+            idempotencyKey: "telegram-child-cross-surface",
+          },
+          {
+            context: {
+              ...context,
+              requestClient: "unknown",
+              sessionId: "workflow:run-1:operation-1",
+            },
+          },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+
+      const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
+      try {
+        expect(store.getRun(invocation.runId)).toMatchObject({
+          origin: {
+            client: "telegram",
+            sessionId: "-100123:7",
+            userId: "user-7",
+          },
+          completionTarget: { kind: "durable_surface" },
+          progressTarget: {
+            platform: "telegram",
+            channelId: "-100123:7",
+            replyToMessageId: null,
+          },
+        });
+      } finally {
+        store.close();
+      }
+    } finally {
+      await tool.destroy();
+    }
+  });
+
   it("does not gate workflow calls by safety, principal, operator, or server-owned metadata", async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-denied-origin-"));
     const workspaceRoot = path.join(root, "workspace");

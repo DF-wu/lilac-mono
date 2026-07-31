@@ -69,7 +69,7 @@ class ProjectionAdapter implements SurfaceAdapter {
   failNextRead = false;
   failNextEditNotFound = false;
 
-  constructor(readonly platform: "discord" | "github" = "discord") {}
+  constructor(readonly platform: "discord" | "github" | "telegram" = "discord") {}
 
   async connect() {}
   async disconnect() {}
@@ -101,10 +101,11 @@ class ProjectionAdapter implements SurfaceAdapter {
     }
     this.sends += 1;
     this.contents.push(content);
-    const ref: MsgRef =
-      this.platform === "discord"
-        ? { platform: "discord", channelId: session.channelId, messageId: `card-${this.sends}` }
-        : { platform: "github", channelId: session.channelId, messageId: `card-${this.sends}` };
+    const ref: MsgRef = {
+      platform: this.platform,
+      channelId: session.channelId,
+      messageId: `card-${this.sends}`,
+    };
     this.messages.set(ref.messageId, {
       ref,
       session,
@@ -181,7 +182,11 @@ class BlockingProjectionAdapter extends ProjectionAdapter {
   }
 }
 
-function createInvocation(store: DurableWorkflowStore, hasProgressTarget = true): void {
+function createInvocation(
+  store: DurableWorkflowStore,
+  hasProgressTarget = true,
+  platform: "discord" | "telegram" = "discord",
+): void {
   store.createInvocation({
     revision: {
       revisionId: "revision-1",
@@ -227,15 +232,15 @@ function createInvocation(store: DurableWorkflowStore, hasProgressTarget = true)
       args: { directory: "src", token: "secret" },
       argsSha256: "d".repeat(64),
       origin: {
-        requestId: "discord:channel-1:origin-1",
+        requestId: `${platform}:channel-1:origin-1`,
         sessionId: "channel-1",
-        client: "discord",
+        client: platform,
         userId: "user-1",
         projectCwd: "/workspace",
       },
       completionTarget: { kind: "durable_surface" },
       progressTarget: hasProgressTarget
-        ? { platform: "discord", channelId: "channel-1", replyToMessageId: "origin-1" }
+        ? { platform, channelId: "channel-1", replyToMessageId: "origin-1" }
         : null,
       terminalDetail: null,
       result: null,
@@ -263,6 +268,50 @@ function tempDbPath(label: string): string {
 }
 
 describe("WorkflowProgressProjector", () => {
+  it("projects Telegram cards with consumable workflow actions", async () => {
+    const dbPath = tempDbPath("workflow-telegram-controls");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["telegram", adapter]]),
+      subscriptionId: "telegram-controls",
+      now: () => 20,
+    });
+    try {
+      createInvocation(store, true, "telegram");
+      const messageRef = await projector.ensureInitialCard("run-1");
+      expect(messageRef.platform).toBe("telegram");
+      expect(adapter.contents.at(-1)?.actions?.map((action) => action.label)).toEqual([
+        "Pause",
+        "Cancel",
+      ]);
+      expect(
+        store.applySurfaceAction({
+          tokenSha256: sha256(actionToken(adapter, "Pause")),
+          platform: "telegram",
+          userId: "user-1",
+          messageRef,
+          now: 21,
+        }).status,
+      ).toBe("applied");
+      await projector.ensureInitialCard("run-1");
+      expect(adapter.edits).toBe(1);
+      expect(adapter.sends).toBe(1);
+      expect(adapter.contents.at(-1)?.actions?.map((action) => action.label)).toEqual([
+        "Resume",
+        "Cancel",
+      ]);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("ignores event projection for a null target and rejects explicit card creation", async () => {
     const dbPath = tempDbPath("workflow-null-target");
     const store = new DurableWorkflowStore(dbPath);

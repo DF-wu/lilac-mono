@@ -185,6 +185,7 @@ export function createBuiltinSurfacePlugin(): CoreToolPlugin {
         level2: [
           new Surface({
             adapter: runtime.adapter,
+            adapters: runtime.surfaceAdapters,
             config: runtime.config,
             getConfig: runtime.getConfig,
             discordSearch: runtime.discordSearch,

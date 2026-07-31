@@ -27,13 +27,14 @@ type CachedActions = {
 };
 
 const WORKFLOW_CARD_TEXT_LIMIT = 4_000;
+type WorkflowProjectionPlatform = "discord" | "github" | "telegram";
 
-function asSessionRef(platform: "discord" | "github", channelId: string): SessionRef {
+function asSessionRef(platform: WorkflowProjectionPlatform, channelId: string): SessionRef {
   return { platform, channelId };
 }
 
 function asSupportedMsgRef(
-  platform: "discord" | "github",
+  platform: WorkflowProjectionPlatform,
   channelId: string,
   messageId: string,
 ): MsgRef {
@@ -52,6 +53,9 @@ function asMsgRef(input: {
   }
   if (input.platform === "github") {
     return { platform: "github", channelId: input.channelId, messageId: input.messageId };
+  }
+  if (input.platform === "telegram") {
+    return { platform: "telegram", channelId: input.channelId, messageId: input.messageId };
   }
   return null;
 }
@@ -82,7 +86,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     private readonly input: {
       bus: LilacBus;
       store: DurableWorkflowStore;
-      adapters: ReadonlyMap<"discord" | "github", SurfaceAdapter>;
+      adapters: ReadonlyMap<WorkflowProjectionPlatform, SurfaceAdapter>;
       subscriptionId: string;
       now?: () => number;
       coalesceMs?: number;
@@ -263,7 +267,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     const expiresAt = now + 86_400_000;
     if (
       expectedUserId &&
-      (expectedPlatform === "discord" || expectedPlatform === "github") &&
+      (expectedPlatform === "discord" ||
+        expectedPlatform === "github" ||
+        expectedPlatform === "telegram") &&
       expectedPlatform === view.run.progressTarget?.platform
     ) {
       for (const kind of view.availableActions) {
@@ -349,7 +355,12 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       now,
     });
     const target = view.run.progressTarget;
-    if (!target || (target.platform !== "discord" && target.platform !== "github")) {
+    if (
+      !target ||
+      (target.platform !== "discord" &&
+        target.platform !== "github" &&
+        target.platform !== "telegram")
+    ) {
       throw new Error(`Workflow run ${runId} has no supported durable progress target`);
     }
     const adapter = this.input.adapters.get(target.platform);

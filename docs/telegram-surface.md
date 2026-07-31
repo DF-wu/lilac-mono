@@ -379,20 +379,6 @@ Discord has, stated precisely so nobody has to infer it from silence.
   uncaptioned photo does not start a run at all. Outbound attachments work.
   Tracked in [#42](https://github.com/DF-wu/lilac-mono/issues/42), which carries
   the agreed design.
-- **Workflow progress cards and action buttons.** The projector is constructed
-  with `Map<"discord" | "github", SurfaceAdapter>`
-  (`create-core-runtime.ts:788`), so nothing is ever projected to Telegram. The
-  adapter already emits `adapter.action.invoked` for non-cancel callbacks
-  (`telegram-adapter.ts:679`), but that wiring is currently unreachable because
-  no buttons are ever drawn there. Blocked on `sendMsg` ignoring
-  `content.actions` — see below. Tracked in
-  [#43](https://github.com/DF-wu/lilac-mono/issues/43).
-- **The agent's surface tools on Telegram.** `tool-server/tools/surface.ts`
-  builds only Discord and GitHub refs and skips non-Discord sessions, so an
-  agent asked to send or read a message through a tool cannot act on Telegram
-  even when the request originated there. Request-level Level-2 authority *is*
-  granted to Telegram principals; the tools are what is missing. Tracked in
-  [#44](https://github.com/DF-wu/lilac-mono/issues/44).
 - **Webhook ingress.** Long polling only.
 - **A Telegram-side conversation search index.** Discord has a dedicated search
   store; Telegram relies on the shared transcript store.
@@ -403,6 +389,16 @@ Discord has, stated precisely so nobody has to infer it from silence.
 
 These are platform consequences rather than omissions. They are listed because
 code that assumes Discord semantics will be surprised.
+
+- **Workflow progress cards use inline keyboards.** Pause, resume and cancel
+  actions are projected to Telegram and consumed through the same durable
+  workflow action store as Discord/GitHub. Callback data over Telegram's
+  64-byte limit is omitted rather than truncated.
+- **Level-2 surface tools are same-surface only.** A Telegram-origin request can
+  list/read/send/edit/delete messages and add/remove reactions only in chats
+  admitted by `allowedChatIds`. A Telegram principal cannot select Discord as
+  the target client. Local file attachments, participant enumeration, message
+  search, and reaction queries remain unsupported by these tools.
 
 - **`listReactions()` always returns `[]`.** The Bot API delivers reactions only
   as update events; there is no endpoint to query a message's current

@@ -7,6 +7,7 @@ import type {
 } from "@stanley2058/lilac-plugin-runtime";
 
 import type { SurfaceAdapter } from "../surface/adapter";
+import type { SurfaceRefPlatform } from "../surface/types";
 import type { DiscoveryService } from "../discovery/discovery-service";
 import type { ConversationThreadToolService } from "../conversation/thread-service";
 import type { DiscordSearchService } from "../surface/store/discord-search-store";
@@ -22,6 +23,7 @@ export type CoreToolPluginRuntime = {
   dataDir?: string;
   bus?: LilacBus;
   adapter?: SurfaceAdapter;
+  surfaceAdapters?: ReadonlyMap<SurfaceRefPlatform, SurfaceAdapter>;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;
   discovery?: DiscoveryService;
