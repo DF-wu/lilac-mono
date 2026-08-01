@@ -991,7 +991,7 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
-  it("chains OpenAI final-answer text after commentary without replaying tool status", async () => {
+  it("defers OpenAI phase splitting until terminal finalization", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const adapter = new FakeAdapter();
@@ -1045,13 +1045,13 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
     await bus.publish(
-      lilacEventTypes.EvtAgentOutputTextReset,
-      { text: "NO_ \n\nFinal answer.", phase: "final_answer" },
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "NO_ \n\nFinal answer." },
       { headers: { request_id: requestId } },
     );
 
-    expect(adapter.streams).toHaveLength(2);
-    expect(adapter.streams[0]?.aborted).toBe("reanchor");
+    expect(adapter.streams).toHaveLength(1);
+    expect(adapter.streams[0]?.aborted).toBeUndefined();
     expect(adapter.streams[0]?.parts).toEqual([
       {
         type: "tool.status",
@@ -1073,49 +1073,17 @@ describe("bridgeBusToAdapter", () => {
           error: undefined,
         },
       },
-      { type: "text.delta", delta: "NO_" },
+      { type: "text.delta", delta: "NO_ " },
+      { type: "text.delta", delta: "\n\nFinal answer." },
+      {
+        type: "text.set",
+        text: "NO_ \n\nFinal answer.",
+        finalSegments: ["NO_", " Final answer."],
+      },
     ]);
-    expect(adapter.starts[1]?.opts?.replyTo).toEqual({
-      platform: "discord",
-      channelId: "chan",
-      messageId: "m_out_1",
-    });
-    expect(adapter.streams[1]?.parts).toEqual([
-      { type: "text.delta", delta: " Final answer." },
-      { type: "text.set", text: " Final answer." },
-    ]);
-    const snapshot = bridge.snapshotRelays()[0];
-    expect(snapshot?.createdOutputRefs.map((ref) => ref.messageId)).toEqual(["m_out_1", "m_out_2"]);
-    expect(snapshot?.activeOutputRefs?.map((ref) => ref.messageId)).toEqual(["m_out_2"]);
-    expect(snapshot?.textPhase).toBe("final_answer");
+    expect(adapter.streams[0]?.finished).toBe(true);
+
     await bridge.stop();
-
-    const restoredBridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter-restored",
-      idleTimeoutMs: 10_000,
-    });
-    if (snapshot === undefined) throw new Error("phase-split relay had no snapshot");
-    await restoredBridge.restoreRelays([snapshot]);
-    expect(adapter.starts[2]?.opts?.resume?.created.map((ref) => ref.messageId)).toEqual([
-      "m_out_2",
-    ]);
-    expect(adapter.streams[2]?.parts).toEqual([{ type: "text.set", text: " Final answer." }]);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: " \n\nFinal answer." },
-      { headers: { request_id: requestId } },
-    );
-    expect(adapter.streams[2]?.parts).toEqual([
-      { type: "text.set", text: " Final answer." },
-      { type: "text.set", text: " Final answer." },
-    ]);
-    expect(adapter.streams[2]?.finished).toBe(true);
-
-    await restoredBridge.stop();
   });
 
   it("restores retained commentary phase before a later final answer", async () => {
@@ -1170,23 +1138,33 @@ describe("bridgeBusToAdapter", () => {
       { headers: { request_id: requestId } },
     );
     await bus.publish(
+      lilacEventTypes.EvtAgentOutputTextReset,
+      {
+        text: "Retained commentary. \n\nVisible final answer.",
+        phase: "final_answer",
+      },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "Retained commentary. \n\nVisible final answer." },
       { headers: { request_id: requestId } },
     );
 
-    expect(adapter.streams).toHaveLength(2);
+    expect(adapter.streams).toHaveLength(1);
     expect(adapter.streams[0]?.parts).toEqual([
       { type: "text.delta", delta: "Retained commentary." },
       { type: "text.delta", delta: "Transient commentary." },
       { type: "text.set", text: "Retained commentary." },
+      { type: "text.delta", delta: " \n\nVisible final answer." },
+      { type: "text.set", text: "Retained commentary. \n\nVisible final answer." },
+      {
+        type: "text.set",
+        text: "Retained commentary. \n\nVisible final answer.",
+        finalSegments: ["Retained commentary.", " Visible final answer."],
+      },
     ]);
-    expect(adapter.streams[0]?.aborted).toBe("reanchor");
-    expect(adapter.streams[1]?.parts).toEqual([
-      { type: "text.delta", delta: " Visible final answer." },
-      { type: "text.set", text: " Visible final answer." },
-    ]);
-    expect(adapter.streams[1]?.finished).toBe(true);
+    expect(adapter.streams[0]?.finished).toBe(true);
     await bridge.stop();
   });
 
@@ -2406,6 +2384,141 @@ describe("bridgeBusToAdapter", () => {
     );
     expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "ab" });
 
+    await bridge.stop();
+  });
+
+  it("keeps terminal continuation text in restored phase segments", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_resume_phased_suffix";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bridge.restoreRelays([
+      {
+        requestId,
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "CF",
+        totalTextChars: 2,
+        textPhase: "final_answer",
+        commentaryText: "C",
+        finalAnswerText: "F",
+        toolStatus: [],
+      },
+    ]);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "!" },
+      { headers: { request_id: requestId } },
+    );
+
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(adapter.stream?.parts.at(-1)).toEqual({
+      type: "text.set",
+      text: "CF!",
+      finalSegments: ["C", "F!"],
+    });
+    await bridge.stop();
+  });
+
+  it("does not emit stale phase segments after an authoritative terminal rewrite", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_terminal_phase_rewrite";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bridge.restoreRelays([
+      {
+        requestId,
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "C\n\nF",
+        totalTextChars: 4,
+        textPhase: "final_answer",
+        commentaryText: "C",
+        finalAnswerText: "F",
+        streamPhaseBoundaryPrefixChars: 2,
+        streamPhaseBoundaryOffsetChars: 1,
+        streamPhaseBoundaryPrefix: "\n\n",
+        toolStatus: [],
+      },
+    ]);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "Corrected response." },
+      { headers: { request_id: requestId } },
+    );
+
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(adapter.stream?.parts.at(-1)).toEqual({
+      type: "text.set",
+      text: "Corrected response.",
+    });
+    await bridge.stop();
+  });
+
+  it("does not split terminal text without a tracked final-answer phase", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_commentary_only_rewrite";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bridge.restoreRelays([
+      {
+        requestId,
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "C",
+        totalTextChars: 1,
+        textPhase: "commentary",
+        commentaryText: "C",
+        toolStatus: [],
+      },
+    ]);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "Corrected response." },
+      { headers: { request_id: requestId } },
+    );
+
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(adapter.stream?.parts.at(-1)).toEqual({
+      type: "text.set",
+      text: "Corrected response.",
+    });
     await bridge.stop();
   });
 

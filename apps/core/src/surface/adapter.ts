@@ -41,7 +41,7 @@ export type SurfaceReasoningStatusUpdate = {
 
 export type SurfaceOutputPart =
   | { type: "text.delta"; delta: string }
-  | { type: "text.set"; text: string }
+  | { type: "text.set"; text: string; finalSegments?: readonly string[] }
   | { type: "reasoning.status"; update: SurfaceReasoningStatusUpdate }
   | { type: "meta.stats"; line: string }
   | { type: "tool.status"; update: SurfaceToolStatusUpdate }

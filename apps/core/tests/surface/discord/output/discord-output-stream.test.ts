@@ -888,6 +888,46 @@ describe("attachment finalization", () => {
 });
 
 describe("preview final output style", () => {
+  it("reposts phased final segments as a plain reply chain", async () => {
+    const { client, operations, deletedMessageIds } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "Commentary.\n\nFinal answer." });
+    await out.push({ type: "attachment.add", attachment: makeAttachment(9) });
+    await out.push({
+      type: "text.set",
+      text: "Commentary.\n\nFinal answer.",
+      finalSegments: ["Commentary.", "Final answer."],
+    });
+    const res = await out.finish();
+
+    const plainFinalOps = operations.filter(
+      (operation) =>
+        (operation.kind === "send" || operation.kind === "reply") &&
+        !hasEmbeds(operation.options) &&
+        ["Commentary.", "Final answer."].includes(contentFromOptions(operation.options) ?? ""),
+    );
+    expect(plainFinalOps.map((operation) => contentFromOptions(operation.options))).toEqual([
+      "Commentary.",
+      "Final answer.",
+    ]);
+    expect(plainFinalOps[1]?.parentId).toBe(plainFinalOps[0]?.messageId);
+    expect(filesCount(plainFinalOps[0]?.options)).toBe(0);
+    expect(filesCount(plainFinalOps[1]?.options)).toBe(1);
+    expect(deletedMessageIds.length).toBeGreaterThan(0);
+    const finalPlainOperation = plainFinalOps[1];
+    if (!finalPlainOperation) throw new Error("expected final plain segment");
+    expect(res.last.messageId).toBe(finalPlainOperation.messageId);
+  });
+
   it("posts preview final output as content and stats as metadata when configured", async () => {
     const { client, operations, deletedMessageIds } = createFakeDiscordClient();
 
