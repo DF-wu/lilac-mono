@@ -14,6 +14,7 @@ import path from "node:path";
 
 import type { CodexOAuthLogin } from "@stanley2058/lilac-utils";
 import {
+  MINI_LILAC_DATABASE_SCHEMA_VERSION,
   MiniLilacSqliteStore,
   SessionService,
   type RuntimeConfig,
@@ -356,7 +357,7 @@ describe("mini-lilac server CLI", () => {
         log: () => {},
       }),
     ).rejects.toThrow(
-      "requires mini-lilac database schema version 6, but the database is version 4",
+      `requires mini-lilac database schema version ${MINI_LILAC_DATABASE_SCHEMA_VERSION}, but the database is version 4`,
     );
 
     expect(await readFile(databasePath)).toEqual(before);

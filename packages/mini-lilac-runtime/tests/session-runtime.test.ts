@@ -15,7 +15,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createOpenAI } from "@ai-sdk/openai";
-import { attachAutoCompaction, type AutoCompactionOptions } from "@stanley2058/lilac-agent";
+import {
+  attachAutoCompaction,
+  type AutoCompactionOptions,
+  type HistoryProviderState,
+} from "@stanley2058/lilac-agent";
 import type {
   MiniLilacCancelCompactionResult,
   MiniLilacCompactionEvent,
@@ -412,6 +416,7 @@ function seedCompletedHistory(
   uiMessages: readonly MiniLilacUIMessage[],
   todos?: readonly MiniLilacTodo[],
   runId = `seed-run:${crypto.randomUUID()}`,
+  providerState?: HistoryProviderState,
 ): string {
   const currentModelMessages = store.getModelMessages(sessionId);
   const currentUiMessages = store.getUiMessages(sessionId);
@@ -462,6 +467,7 @@ function seedCompletedHistory(
     workspaceSnapshotId: null,
     workspaceStatus: "unavailable",
     workspaceUnavailableReason: "git-unavailable",
+    ...(providerState === undefined ? {} : { providerState }),
   });
   return runId;
 }
@@ -4369,6 +4375,9 @@ describe("SessionService", () => {
         },
       ],
       [userMessage("visible prior request")],
+      undefined,
+      undefined,
+      { lastFamily: "ai-sdk", containsCrossFamilyTurns: false },
     );
 
     await collect(
@@ -7094,7 +7103,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("rolls back root setup when agent construction fails", async () => {
+  it("terminalizes an admitted root prompt when model preparation fails", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-setup-"));
     temporaryDirectories.push(directory);
@@ -7114,8 +7123,8 @@ describe("SessionService", () => {
       "model construction failed",
     );
     expect(service.store.getActiveRootRun(session.id)).toBeNull();
-    expect(service.getSnapshot(session.id).status).toBe("idle");
-    expect(service.getMessages(session.id)).toEqual([]);
+    expect(service.getSnapshot(session.id).status).toBe("error");
+    expect(JSON.stringify(service.getMessages(session.id))).toContain("should roll back");
     service.close();
   });
 

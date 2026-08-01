@@ -62,15 +62,15 @@ Status: completed. Covers implementation-order items 3 through 6.
 
 ## Stage 3: Mini Main Continuation
 
-Status: pending. Covers implementation-order items 9 through 11.
+Status: completed. Covers implementation-order items 9 through 11.
 
-- [ ] Add Mini provider-state, native-binding, and native-attempt schema migration.
-- [ ] Add startup recovery and transactional store APIs.
-- [ ] Integrate fresh, fork, and text-replay selection for Mini main sessions.
-- [ ] Promote bindings transactionally with committed terminal history states.
-- [ ] Bind exact Mini history states for undo, redo, and branching.
-- [ ] Verify model and effort changes preserve compatible native bindings.
-- [ ] Run a Stage 3 review agent and resolve correctness blockers.
+- [x] Add Mini provider-state, native-binding, and native-attempt schema migration.
+- [x] Add startup recovery and transactional store APIs.
+- [x] Integrate fresh, fork, and text-replay selection for Mini main sessions.
+- [x] Promote bindings transactionally with committed terminal history states.
+- [x] Bind exact Mini history states for undo, redo, and branching.
+- [x] Verify model and effort changes preserve compatible native bindings.
+- [x] Run a Stage 3 review agent and resolve correctness blockers.
 
 ## Stage 4: Mini Named Continuation
 
@@ -141,7 +141,15 @@ Status: pending. Covers implementation-order items 21 through 23.
   implemented and review-gated. Persistence and product wiring remain disabled until Stage 3.
 - 2026-08-01: Stage 2 native observations gained per-call init/result freshness fencing, and the
   feature-disabled compaction substrate gained a validated native-occupancy estimate floor plus owner
-  helper. Product wiring and persistence remain disabled; Stage 2 review remains pending.
+  helper. Follow-up review and validation passed before Stage 3 began.
+- 2026-08-01: Stage 3 Mini schema v7, conservative provider-head metadata, exact-state bindings,
+  bounded attempts, startup uncertainty recovery, pre-call fresh/fork selection, cross-family text
+  replay, canonical-first CAS promotion, restart continuation, and undo/redo/branch selection were
+  implemented and independently review-gated. Review blockers for interruption retirement, exact
+  canonical cursor promotion, compaction replay boundaries, steering promotion, observability
+  degradation, execution scope, run ownership, and pending-finalization recovery were resolved.
+  Mini's 354 tests, root/workspace tests, root/workspace typechecks, lint, formatting, and local lint
+  rule tests all passed. Stage 3 is complete; Stage 4 remains intentionally disabled.
 
 ## Deferred
 
@@ -151,3 +159,14 @@ Status: pending. Covers implementation-order items 21 through 23.
   part of the release validation matrix.
 - Stage 1: Normalize equivalent bare and tagged provider-reference file forms in the canonical hash.
   The current mismatch fails safe by starting fresh rather than permitting incorrect native reuse.
+- Stage 3: Add an automatic-compaction integration test for a mixed-family active tool exchange. The
+  explicit admitted-user boundary and fresh replacement are implemented; focused coverage currently
+  exercises the underlying replay, cursor, and compaction contracts separately.
+- Stage 3: Add an explicit named-child regression asserting Claude remains ephemeral with no Mini
+  main attempt rows when Stage 4 begins. Production depth-positive routing remains on the existing
+  ephemeral bridge path.
+- Stage 3: Cancellation before native materialization may conservatively record the selected target
+  family on a user-only terminal error state. It cannot reuse an unsafe binding and may only cause a
+  later fresh text replay.
+- Stage 3: Authenticated Claude interruption, observability, and restart validation remains part of
+  the Stage 8 credentialed release matrix.

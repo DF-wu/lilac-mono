@@ -3,9 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type {
-  MaterializedClaudeCodeRun,
-  materializeClaudeCodeRun,
+import {
+  ClaudeNativeSessionPreflightError,
+  type ClaudeNativeSessionStart,
+  type MaterializedClaudeCodeRun,
+  type materializeClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
 import type { MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 import type { LanguageModel } from "ai";
@@ -222,11 +224,30 @@ function claudeProviders(): LoadedProviderRegistry {
   };
 }
 
+function hybridProviders(): LoadedProviderRegistry {
+  const providerConfig: ProviderConfig = {
+    configVersion: 1,
+    providers: {
+      claude: { type: "claude-code", catalog: "models-dev" },
+      openai: { type: "openai", catalog: "models-dev" },
+    },
+  };
+  const auth = { openai: { type: "api-key" as const, key: "test-key" } };
+  return {
+    config: providerConfig,
+    auth,
+    registry: createAiProviderRegistry(providerConfig, auth),
+    supersededProviderIds: [],
+  };
+}
+
 type MaterializeCall = {
   modelId: string;
   cwd: string;
   toolNames: string[];
   builtInTools: readonly string[];
+  nativeSession: ClaudeNativeSessionStart | undefined;
+  reasoning: string | undefined;
 };
 
 type FakeClaudeRun = MaterializedClaudeCodeRun & {
@@ -244,6 +265,8 @@ function fakeClaudeCode(options: {
   agentModel: LanguageModel;
   utilityModel?: LanguageModel;
   deliverSteering?: boolean;
+  rejectForks?: boolean;
+  missingUsage?: boolean;
   calls?: MaterializeCall[];
   runs?: FakeClaudeRun[];
 }): typeof materializeClaudeCodeRun {
@@ -253,9 +276,23 @@ function fakeClaudeCode(options: {
       cwd: input.cwd,
       toolNames: Object.keys(input.tools),
       builtInTools: [...(input.builtInTools ?? [])],
+      nativeSession: input.nativeSession,
+      reasoning: input.reasoning,
     });
+    if (options.rejectForks && input.nativeSession?.mode === "fork") {
+      throw new ClaudeNativeSessionPreflightError([
+        { code: "source-preflight-missing", message: "test source is missing" },
+      ]);
+    }
+    const requestedSessionId =
+      input.nativeSession?.mode === "ephemeral" ? null : (input.nativeSession?.sessionId ?? null);
+    if (requestedSessionId === null) throw new Error("expected a persistent Claude test session");
+    const sourceSessionId =
+      input.nativeSession?.mode === "fork" ? input.nativeSession.baseSessionId : null;
+    let disposed = false;
     const run: FakeClaudeRun = {
       agentModel: options.agentModel,
+      continuationModel: options.agentModel,
       createUtilityModel: () => options.utilityModel ?? new MockLanguageModelV4({}),
       injected: [],
       interrupts: 0,
@@ -272,7 +309,77 @@ function fakeClaudeCode(options: {
         },
         clear() {},
       },
+      nativeSession: {
+        getObservation: () => ({
+          requestedSessionId,
+          sourceSessionId,
+          initSessionId: requestedSessionId,
+          resultSessionId: requestedSessionId,
+          contextTokens: options.missingUsage ? null : 100,
+          contextMaxTokens: options.missingUsage ? null : 200_000,
+          requestedModel: input.modelId,
+          initializedModel: input.modelId,
+          requestedReasoning: input.reasoning ?? null,
+          providerWarnings: [],
+          invoked: true,
+          requiredObservabilityError: null,
+          callbackError: null,
+        }),
+        waitForObservation: async () => ({
+          requestedSessionId,
+          sourceSessionId,
+          initSessionId: requestedSessionId,
+          resultSessionId: requestedSessionId,
+          contextTokens: options.missingUsage ? null : 100,
+          contextMaxTokens: options.missingUsage ? null : 200_000,
+          requestedModel: input.modelId,
+          initializedModel: input.modelId,
+          requestedReasoning: input.reasoning ?? null,
+          providerWarnings: [],
+          invoked: true,
+          requiredObservabilityError: null,
+          callbackError: null,
+        }),
+        recordWarning() {},
+        finalize: async () => {
+          await run.dispose();
+          return {
+            status: "promotable" as const,
+            issues: [],
+            observations: run.nativeSession!.getObservation(),
+            candidate: {
+              sessionId: requestedSessionId,
+              cwd: input.cwd,
+              lastModified: 1_000,
+            },
+            sourcePreflight:
+              sourceSessionId === null
+                ? null
+                : {
+                    sessionId: sourceSessionId,
+                    cwd: input.cwd,
+                    lastModified:
+                      input.nativeSession?.mode === "fork"
+                        ? input.nativeSession.expectedSourceLastModified
+                        : 0,
+                  },
+            sourceFinal:
+              sourceSessionId === null
+                ? null
+                : {
+                    sessionId: sourceSessionId,
+                    cwd: input.cwd,
+                    lastModified:
+                      input.nativeSession?.mode === "fork"
+                        ? input.nativeSession.expectedSourceLastModified
+                        : 0,
+                  },
+          };
+        },
+      },
       dispose: async () => {
+        if (disposed) return;
+        disposed = true;
         run.disposals += 1;
       },
     };
@@ -289,14 +396,19 @@ async function temporaryRuntime(options: {
   calls?: MaterializeCall[];
   runs?: FakeClaudeRun[];
   attachCompaction?: SessionServiceOptions["attachCompaction"];
+  providers?: LoadedProviderRegistry;
+  initialModel?: string;
+  modelResolver?: SessionServiceOptions["modelResolver"];
+  rejectForks?: boolean;
+  missingUsage?: boolean;
 }) {
   const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-claude-"));
   temporaryDirectories.push(directory);
   const service = new SessionService({
     config: config(options.profileTools),
     databasePath: path.join(directory, "runtime.sqlite"),
-    providers: claudeProviders(),
-    modelResolver: () => new MockLanguageModelV4({}),
+    providers: options.providers ?? claudeProviders(),
+    modelResolver: options.modelResolver ?? (() => new MockLanguageModelV4({})),
     ...(options.attachCompaction ? { attachCompaction: options.attachCompaction } : {}),
     materializeClaudeCodeRun: fakeClaudeCode({
       agentModel: options.model,
@@ -304,11 +416,13 @@ async function temporaryRuntime(options: {
       deliverSteering: options.deliverSteering,
       calls: options.calls,
       runs: options.runs,
+      rejectForks: options.rejectForks,
+      missingUsage: options.missingUsage,
     }),
   });
   const session = await service.createSession({
     cwd: directory,
-    model: "claude/claude-sonnet-4-6",
+    model: options.initialModel ?? "claude/claude-sonnet-4-6",
     profile: "reader",
     reasoning: "high",
   });
@@ -337,6 +451,318 @@ describe("claude-code sessions", () => {
     // Claude ignores AI SDK tool declarations; the toolset reaches it via MCP.
     expect(model.doStreamCalls[0]?.tools ?? []).toEqual([]);
     expect(runs[0]?.disposals).toBe(1);
+    service.close();
+  });
+
+  it("persists a fresh binding and forks only the unsynchronized suffix", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [textResult("first", "one"), textResult("second", "two")],
+    });
+    const calls: MaterializeCall[] = [];
+    const { service, session } = await temporaryRuntime({ model, calls });
+
+    await collect((await service.startPrompt(session.id, userMessage("first prompt"))).stream);
+    const firstState = service.store.getCurrentHistoryState(session.id);
+    const firstBinding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: firstState.id,
+      providerId: "claude",
+    }).binding;
+    if (firstBinding === null) throw new Error("expected first Claude binding");
+
+    await collect((await service.startPrompt(session.id, userMessage("second prompt"))).stream);
+    const secondState = service.store.getCurrentHistoryState(session.id);
+    const secondBinding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: secondState.id,
+      providerId: "claude",
+    }).binding;
+    if (secondBinding === null) throw new Error("expected second Claude binding");
+
+    expect(calls.map((call) => call.nativeSession)).toEqual([
+      { mode: "fresh", sessionId: firstBinding.claudeSessionId },
+      {
+        mode: "fork",
+        baseSessionId: firstBinding.claudeSessionId,
+        sessionId: secondBinding.claudeSessionId,
+        expectedSourceLastModified: firstBinding.nativeLastModified,
+      },
+    ]);
+    const firstPayload = model.doStreamCalls[0]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    const secondPayload = model.doStreamCalls[1]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    expect(firstPayload).toHaveLength(1);
+    expect(JSON.stringify(firstPayload)).toContain("first prompt");
+    expect(secondPayload).toHaveLength(1);
+    expect(JSON.stringify(secondPayload)).toContain("second prompt");
+    expect(secondBinding.revision).toBe(firstBinding.revision + 1);
+    expect(secondState.providerState).toEqual({
+      lastFamily: "claude-code",
+      containsCrossFamilyTurns: false,
+    });
+    service.close();
+  });
+
+  it("keeps model and effort changes compatible with the selected history binding", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [textResult("first", "one"), textResult("second", "two")],
+    });
+    const calls: MaterializeCall[] = [];
+    const { service, session } = await temporaryRuntime({ model, calls });
+
+    await collect((await service.startPrompt(session.id, userMessage("first prompt"))).stream);
+    const firstState = service.store.getCurrentHistoryState(session.id);
+    const firstBinding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: firstState.id,
+      providerId: "claude",
+    }).binding;
+    if (firstBinding === null) throw new Error("expected first Claude binding");
+    await service.updateSessionBindings({
+      sessionId: session.id,
+      clientCommandId: crypto.randomUUID(),
+      model: "claude/claude-opus-4-1",
+      reasoning: "low",
+    });
+
+    await collect((await service.startPrompt(session.id, userMessage("changed model"))).stream);
+
+    expect(calls[1]?.modelId).toBe("claude-opus-4-1");
+    expect(calls[1]?.reasoning).toBe("low");
+    expect(calls[1]?.nativeSession).toMatchObject({
+      mode: "fork",
+      baseSessionId: firstBinding.claudeSessionId,
+    });
+    service.close();
+  });
+
+  it("selects exact undo and redo bindings and retains an abandoned forward branch", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        textResult("first", "one"),
+        textResult("second", "two"),
+        textResult("third", "three"),
+        textResult("branch", "branch"),
+      ],
+    });
+    const calls: MaterializeCall[] = [];
+    const { service, session } = await temporaryRuntime({ model, calls });
+
+    await collect((await service.startPrompt(session.id, userMessage("first"))).stream);
+    const firstState = service.store.getCurrentHistoryState(session.id);
+    const firstBinding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: firstState.id,
+      providerId: "claude",
+    }).binding;
+    if (firstBinding === null) throw new Error("expected first Claude binding");
+    await collect((await service.startPrompt(session.id, userMessage("second"))).stream);
+    const secondState = service.store.getCurrentHistoryState(session.id);
+    const secondBinding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: secondState.id,
+      providerId: "claude",
+    }).binding;
+    if (secondBinding === null) throw new Error("expected second Claude binding");
+
+    await service.undo({ sessionId: session.id, clientCommandId: crypto.randomUUID() });
+    await service.redo({ sessionId: session.id, clientCommandId: crypto.randomUUID() });
+    await collect((await service.startPrompt(session.id, userMessage("after redo"))).stream);
+    expect(calls[2]?.nativeSession).toMatchObject({
+      mode: "fork",
+      baseSessionId: secondBinding.claudeSessionId,
+    });
+
+    await service.undo({ sessionId: session.id, clientCommandId: crypto.randomUUID() });
+    await service.undo({ sessionId: session.id, clientCommandId: crypto.randomUUID() });
+    expect(service.store.getCurrentHistoryState(session.id).id).toBe(firstState.id);
+    await collect((await service.startPrompt(session.id, userMessage("new branch"))).stream);
+    expect(calls[3]?.nativeSession).toMatchObject({
+      mode: "fork",
+      baseSessionId: firstBinding.claudeSessionId,
+    });
+    expect(
+      service.store.getMiniMainClaudeState({
+        sessionId: session.id,
+        historyStateId: secondState.id,
+        providerId: "claude",
+      }).binding?.claudeSessionId,
+    ).toBe(secondBinding.claudeSessionId);
+    service.close();
+  });
+
+  it("continues a persisted binding after the Mini runtime restarts", async () => {
+    const firstCalls: MaterializeCall[] = [];
+    const first = await temporaryRuntime({
+      model: new MockLanguageModelV4({ doStream: [textResult("first", "one")] }),
+      calls: firstCalls,
+    });
+    await collect(
+      (await first.service.startPrompt(first.session.id, userMessage("before restart"))).stream,
+    );
+    const boundState = first.service.store.getCurrentHistoryState(first.session.id);
+    const binding = first.service.store.getMiniMainClaudeState({
+      sessionId: first.session.id,
+      historyStateId: boundState.id,
+      providerId: "claude",
+    }).binding;
+    if (binding === null) throw new Error("expected binding before restart");
+    first.service.close();
+
+    const secondCalls: MaterializeCall[] = [];
+    const reopened = new SessionService({
+      config: config(),
+      databasePath: path.join(first.directory, "runtime.sqlite"),
+      providers: claudeProviders(),
+      modelResolver: () => new MockLanguageModelV4({}),
+      materializeClaudeCodeRun: fakeClaudeCode({
+        agentModel: new MockLanguageModelV4({ doStream: [textResult("second", "two")] }),
+        calls: secondCalls,
+      }),
+    });
+    await reopened.initialize();
+    await collect(
+      (await reopened.startPrompt(first.session.id, userMessage("after restart"))).stream,
+    );
+
+    expect(secondCalls[0]?.nativeSession).toMatchObject({
+      mode: "fork",
+      baseSessionId: binding.claudeSessionId,
+    });
+    reopened.close();
+  });
+
+  it("starts fresh when effective protected paths change across restart", async () => {
+    const first = await temporaryRuntime({
+      model: new MockLanguageModelV4({ doStream: [textResult("first", "one")] }),
+    });
+    await collect(
+      (await first.service.startPrompt(first.session.id, userMessage("before scope change")))
+        .stream,
+    );
+    const binding = first.service.store.getMiniMainClaudeState({
+      sessionId: first.session.id,
+      historyStateId: first.service.store.getCurrentHistoryState(first.session.id).id,
+      providerId: "claude",
+    }).binding;
+    if (binding === null) throw new Error("expected binding before scope change");
+    first.service.close();
+
+    const calls: MaterializeCall[] = [];
+    const reopened = new SessionService({
+      config: config(),
+      databasePath: path.join(first.directory, "runtime.sqlite"),
+      providers: claudeProviders(),
+      modelResolver: () => new MockLanguageModelV4({}),
+      protectedToolPaths: [path.join(first.directory, "new-protected-path")],
+      materializeClaudeCodeRun: fakeClaudeCode({
+        agentModel: new MockLanguageModelV4({ doStream: [textResult("second", "two")] }),
+        calls,
+      }),
+    });
+    await reopened.initialize();
+    await collect(
+      (await reopened.startPrompt(first.session.id, userMessage("after scope change"))).stream,
+    );
+
+    expect(calls[0]?.nativeSession).toMatchObject({ mode: "fresh" });
+    expect(calls[0]?.nativeSession).not.toMatchObject({
+      mode: "fork",
+      baseSessionId: binding.claudeSessionId,
+    });
+    reopened.close();
+  });
+
+  it("falls back to a fresh persisted candidate when native fork preflight fails", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [textResult("first", "one"), textResult("second", "two")],
+    });
+    const calls: MaterializeCall[] = [];
+    const { service, session } = await temporaryRuntime({ model, calls, rejectForks: true });
+    await collect((await service.startPrompt(session.id, userMessage("first"))).stream);
+    const sourceState = service.store.getCurrentHistoryState(session.id);
+    const sourceBinding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: sourceState.id,
+      providerId: "claude",
+    }).binding;
+    if (sourceBinding === null) throw new Error("expected source binding");
+
+    await collect((await service.startPrompt(session.id, userMessage("second"))).stream);
+    const destination = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: service.store.getCurrentHistoryState(session.id).id,
+      providerId: "claude",
+    });
+
+    expect(calls.map((call) => call.nativeSession?.mode)).toEqual(["fresh", "fork", "fresh"]);
+    expect(destination.binding?.claudeSessionId).not.toBe(sourceBinding.claudeSessionId);
+    expect(
+      service.store.getMiniMainClaudeState({
+        sessionId: session.id,
+        historyStateId: sourceState.id,
+        providerId: "claude",
+      }).binding?.claudeSessionId,
+    ).toBe(sourceBinding.claudeSessionId);
+    service.close();
+  });
+
+  it("uses text-only replay when Mini crosses the Claude provider boundary", async () => {
+    const apiModel = new MockLanguageModelV4({
+      doStream: [textResult("api-first", "api answer"), textResult("api-second", "api again")],
+    });
+    const claudeModel = new MockLanguageModelV4({
+      doStream: [textResult("claude", "claude answer")],
+    });
+    const calls: MaterializeCall[] = [];
+    const { service, session } = await temporaryRuntime({
+      model: claudeModel,
+      calls,
+      providers: hybridProviders(),
+      initialModel: "openai/gpt-5",
+      modelResolver: () => apiModel,
+    });
+    await collect((await service.startPrompt(session.id, userMessage("api prompt"))).stream);
+    await service.updateSessionBindings({
+      sessionId: session.id,
+      clientCommandId: crypto.randomUUID(),
+      model: "claude/claude-sonnet-4-6",
+    });
+    await collect((await service.startPrompt(session.id, userMessage("claude prompt"))).stream);
+    const claudeState = service.store.getCurrentHistoryState(session.id);
+
+    expect(calls[0]?.nativeSession?.mode).toBe("fresh");
+    expect(claudeState.providerState).toEqual({
+      lastFamily: "claude-code",
+      containsCrossFamilyTurns: true,
+    });
+    const claudePayload = claudeModel.doStreamCalls[0]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    expect(JSON.stringify(claudePayload)).toContain("api prompt");
+    expect(JSON.stringify(claudePayload)).toContain("api answer");
+    expect(JSON.stringify(claudePayload)).toContain("claude prompt");
+
+    await service.updateSessionBindings({
+      sessionId: session.id,
+      clientCommandId: crypto.randomUUID(),
+      model: "openai/gpt-5",
+    });
+    await collect((await service.startPrompt(session.id, userMessage("back to api"))).stream);
+    const returnPayload = apiModel.doStreamCalls[1]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    expect(JSON.stringify(returnPayload)).toContain("claude answer");
+    expect(
+      returnPayload?.every(
+        (message) =>
+          typeof message.content === "string" ||
+          message.content.every((part) => part.type === "text"),
+      ),
+    ).toBe(true);
     service.close();
   });
 
@@ -484,6 +910,13 @@ describe("claude-code sessions", () => {
     releaseFirstTurn?.();
     await collected;
     expect(service.store.getSession(session.id).queuedSteeringCount).toBe(0);
+    expect(
+      service.store.getMiniMainClaudeState({
+        sessionId: session.id,
+        historyStateId: service.store.getCurrentHistoryState(session.id).id,
+        providerId: "claude",
+      }).binding,
+    ).not.toBeNull();
     service.close();
   });
 
@@ -541,9 +974,15 @@ describe("claude-code sessions", () => {
       },
     });
     const runs: FakeClaudeRun[] = [];
+    const calls: MaterializeCall[] = [];
     // Delivery fails, so the entry stays queued and the operator must be able
     // to flush it rather than wait out the whole Claude query.
-    const { service, session } = await temporaryRuntime({ model, runs, deliverSteering: false });
+    const { service, session } = await temporaryRuntime({
+      model,
+      runs,
+      calls,
+      deliverSteering: false,
+    });
 
     const started = await service.startPrompt(session.id, userMessage("start"));
     const collected = collect(started.stream);
@@ -569,10 +1008,19 @@ describe("claude-code sessions", () => {
     expect(runs[0]?.interrupts).toBe(1);
 
     await collected;
+    expect(calls.map((call) => call.nativeSession?.mode)).toEqual(["fresh", "fresh"]);
+    const binding = service.store.getMiniMainClaudeState({
+      sessionId: session.id,
+      historyStateId: service.store.getCurrentHistoryState(session.id).id,
+      providerId: "claude",
+    }).binding;
+    expect(binding?.claudeSessionId).toBe(
+      calls[1]?.nativeSession?.mode === "fresh" ? calls[1].nativeSession.sessionId : undefined,
+    );
     service.close();
   });
 
-  it("interrupts the live query on cancel without waiting for it", async () => {
+  it("cancels before lazy Claude materialization without starting a native query", async () => {
     let releaseFirstTurn: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       releaseFirstTurn = resolve;
@@ -592,11 +1040,11 @@ describe("claude-code sessions", () => {
     if (runId === null) throw new Error("expected an active run");
 
     await service.cancel({ sessionId: session.id, runId, clientCommandId: crypto.randomUUID() });
-    expect(runs[0]?.interrupts).toBe(1);
+    expect(runs).toHaveLength(0);
 
     releaseFirstTurn?.();
     await collected;
-    expect(runs[0]?.disposals).toBe(1);
+    expect(runs).toHaveLength(0);
     service.close();
   });
 
@@ -691,7 +1139,7 @@ describe("claude-code sessions", () => {
     reopened.close();
   });
 
-  it("releases the Claude run when agent construction fails after materialization", async () => {
+  it("does not materialize Claude when agent construction fails before the first call", async () => {
     const runs: FakeClaudeRun[] = [];
     const { service, session } = await temporaryRuntime({
       model: new MockLanguageModelV4({ doStream: [textResult("a", "done")] }),
@@ -706,8 +1154,7 @@ describe("claude-code sessions", () => {
     await expect(service.startPrompt(session.id, userMessage("start"))).rejects.toThrow(
       "compaction attach failed",
     );
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.disposals).toBe(1);
+    expect(runs).toHaveLength(0);
     service.close();
   });
 
@@ -766,6 +1213,34 @@ describe("claude-code sessions", () => {
         },
       ],
     });
+    expect(
+      service.store.getMiniMainClaudeState({
+        sessionId: session.id,
+        historyStateId: service.store.getCurrentHistoryState(session.id).id,
+        providerId: "claude",
+      }).binding,
+    ).toBeNull();
+    service.close();
+  });
+
+  it("keeps successful output but does not bind when native usage is missing", async () => {
+    const { service, session } = await temporaryRuntime({
+      model: new MockLanguageModelV4({ doStream: [textResult("answer", "visible answer")] }),
+      missingUsage: true,
+    });
+
+    const started = await service.startPrompt(session.id, userMessage("hello"));
+    await collect(started.stream);
+
+    expect(service.store.getRun(started.runId).status).toBe("completed");
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).toContain("visible answer");
+    expect(
+      service.store.getMiniMainClaudeState({
+        sessionId: session.id,
+        historyStateId: service.store.getCurrentHistoryState(session.id).id,
+        providerId: "claude",
+      }).binding,
+    ).toBeNull();
     service.close();
   });
 });

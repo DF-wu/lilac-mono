@@ -8,7 +8,13 @@ import type { MiniLilacUserUIMessage } from "@stanley2058/mini-lilac-client";
 import type { ModelMessage } from "ai";
 import superjson from "superjson";
 
-import { MINI_LILAC_DATABASE_SCHEMA_VERSION, MiniLilacSqliteStore } from "../src/sqlite-store";
+import {
+  MINI_LILAC_DATABASE_SCHEMA_VERSION,
+  MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT,
+  MiniLilacSqliteStore,
+  type HistoryProviderState,
+  type PromoteMiniMainClaudeSessionBinding,
+} from "../src/sqlite-store";
 
 const temporaryDirectories: string[] = [];
 
@@ -44,6 +50,73 @@ function userMessage(id: string): MiniLilacUserUIMessage {
   return { id, role: "user", parts: [{ type: "text", text: id }] };
 }
 
+function testUuid(index: number): string {
+  return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+}
+
+const claudeProviderState = {
+  lastFamily: "claude-code",
+  containsCrossFamilyTurns: false,
+} as const satisfies HistoryProviderState;
+
+function reserveClaudeAttempt(
+  store: MiniLilacSqliteStore,
+  input: {
+    sessionId: string;
+    sourceHistoryStateId: string;
+    requestId: string;
+    candidateIndex: number;
+    sourceSessionId?: string;
+    expectedBindingRevision?: number;
+  },
+): void {
+  store.reserveMiniMainClaudeSessionAttempt({
+    providerId: "claude-provider",
+    requestClient: "mini-test",
+    lilacSessionId: input.sessionId,
+    sourceHistoryStateId: input.sourceHistoryStateId,
+    executionScopeHashVersion: 1,
+    executionScopeHash: "scope-v1",
+    requestId: input.requestId,
+    attemptIndex: 0,
+    candidateSessionId: testUuid(input.candidateIndex),
+    sourceSessionId: input.sourceSessionId ?? null,
+    expectedBindingRevision: input.expectedBindingRevision ?? null,
+  });
+}
+
+function succeedClaudeAttempt(
+  store: MiniLilacSqliteStore,
+  sessionId: string,
+  requestId: string,
+): void {
+  store.recordMiniMainClaudeSessionAttemptOutcome({
+    providerId: "claude-provider",
+    lilacSessionId: sessionId,
+    requestId,
+    attemptIndex: 0,
+    state: "succeeded",
+  });
+}
+
+function claudePromotion(
+  requestId: string,
+  overrides: Partial<PromoteMiniMainClaudeSessionBinding> = {},
+): PromoteMiniMainClaudeSessionBinding {
+  return {
+    providerId: "claude-provider",
+    requestId,
+    attemptIndex: 0,
+    nativeCwd: "/native/cwd",
+    nativeLastModified: 1_000,
+    nativeContextTokens: 100,
+    nativeContextMaxTokens: 200_000,
+    lastModelSpecifier: "claude-sonnet",
+    lastReasoning: "high",
+    ...overrides,
+  };
+}
+
 const unavailableWorkspace = {
   workspaceSnapshotId: null,
   workspaceStatus: "unavailable",
@@ -68,8 +141,12 @@ function admitPrompt(
         };
   },
 ): void {
-  const modelMessages: ModelMessage[] = [{ role: "user", content: input.message.id }];
-  const uiMessages = [input.message];
+  const current = store.getCurrentHistoryState(input.sessionId);
+  const modelMessages: ModelMessage[] = [
+    ...store.getHistoryStateModelMessages(current.id),
+    { role: "user", content: input.message.id },
+  ];
+  const uiMessages = [...store.getHistoryStateUiMessages(current.id), input.message];
   const payload = { messageId: input.message.id };
   store.reserveCommand(input.sessionId, input.commandId, {
     kind: "prompt",
@@ -86,7 +163,7 @@ function admitPrompt(
     commandId: input.commandId,
     commandPayload: payload,
     transitionId: input.transitionId,
-    expectedCurrentStateId: store.getCurrentHistoryState(input.sessionId).id,
+    expectedCurrentStateId: current.id,
     modelMessages,
     uiMessages,
     ...(input.observationIds === undefined
@@ -108,8 +185,10 @@ function finalizePrompt(
     transitionId: string;
     destinationStateId: string;
     user: MiniLilacUserUIMessage;
+    providerState?: HistoryProviderState;
+    claudeBindingPromotion?: PromoteMiniMainClaudeSessionBinding;
   },
-): void {
+): ReturnType<MiniLilacSqliteStore["commitPendingRunFinalization"]> {
   const assistant = {
     id: `assistant:${input.runId}`,
     role: "assistant" as const,
@@ -120,19 +199,27 @@ function finalizePrompt(
     sessionId: input.sessionId,
     openTransitionId: input.transitionId,
     modelMessages: [
-      { role: "user", content: input.user.id },
+      ...store.getModelMessages(input.sessionId),
       { role: "assistant", content: `answer:${input.runId}` },
     ],
-    uiMessages: [input.user, assistant],
+    uiMessages: [...store.getUiMessages(input.sessionId), assistant],
     runStatus: "completed",
     sessionStatus: "idle",
     error: null,
     terminalResult: { status: "completed" },
     inputTokens: 2,
+    ...(input.providerState === undefined ? {} : { providerState: input.providerState }),
+    ...(input.claudeBindingPromotion === undefined
+      ? {}
+      : { claudeBindingPromotion: input.claudeBindingPromotion }),
   });
-  store.commitPendingRunFinalization({
+  return store.commitPendingRunFinalization({
     runId: input.runId,
     destinationStateId: input.destinationStateId,
+    ...(input.providerState === undefined ? {} : { providerState: input.providerState }),
+    ...(input.claudeBindingPromotion === undefined
+      ? {}
+      : { claudeBindingPromotion: input.claudeBindingPromotion }),
     ...unavailableWorkspace,
   });
 }
@@ -462,7 +549,7 @@ describe("MiniLilacSqliteStore history schema", () => {
     store.close();
   });
 
-  it("migrates v5 history constraints to accept non-Git workspace outcomes", async () => {
+  it("migrates v6 history to conservative provider metadata and native records", async () => {
     const { directory, file } = await temporaryDatabasePath("mini-lilac-history-v5-");
     const original = new MiniLilacSqliteStore(file);
     createSession(original, "session-1", directory);
@@ -501,15 +588,42 @@ describe("MiniLilacSqliteStore history schema", () => {
     original.close();
 
     const legacy = new Database(file, { strict: true });
-    legacy.exec("PRAGMA user_version = 5;");
+    legacy.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TABLE mini_main_claude_attempts;
+      DROP TABLE mini_main_claude_bindings;
+      ALTER TABLE pending_run_finalizations DROP COLUMN claude_binding_promotion_json;
+      ALTER TABLE pending_run_finalizations DROP COLUMN contains_cross_family_turns;
+      ALTER TABLE pending_run_finalizations DROP COLUMN last_provider_family;
+      ALTER TABLE history_states DROP COLUMN contains_cross_family_turns;
+      ALTER TABLE history_states DROP COLUMN last_provider_family;
+      PRAGMA user_version = 6;
+    `);
     legacy.close();
 
     const migrated = new MiniLilacSqliteStore(file);
-    expect(migrated.database.query("PRAGMA user_version").get()).toEqual({ user_version: 6 });
+    expect(migrated.database.query("PRAGMA user_version").get()).toEqual({
+      user_version: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
     expect(
       migrated.database.query("SELECT rowid FROM history_states WHERE id = ?").get(root.id),
     ).toEqual(rootRow);
     expect(migrated.database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(
+      migrated
+        .listHistoryTopology("session-1")
+        .states.every((state) => state.providerState === null),
+    ).toBe(true);
+    expect(
+      migrated.database
+        .query(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'table' AND name IN (
+             'mini_main_claude_bindings', 'mini_main_claude_attempts'
+           ) ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([{ name: "mini_main_claude_attempts" }, { name: "mini_main_claude_bindings" }]);
     expect(migrated.listHistoryOperations()).toMatchObject([
       { id: "v5-operation", skipReason: "git-unavailable" },
     ]);
@@ -539,6 +653,360 @@ describe("MiniLilacSqliteStore history schema", () => {
       workspaceUnavailableReason: "non-git-workspace",
     });
     migrated.close();
+  });
+
+  it("promotes exact-state Claude bindings and rejects a stale binding revision", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-native-cas-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+
+    const firstUser = userMessage("native-user-1");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "native-run-1",
+      commandId: "native-command-1",
+      transitionId: "native-transition-1",
+      message: firstUser,
+      observationIds: {
+        stateId: "native-observed-root",
+        transitionId: "native-observation-transition",
+      },
+    });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "native-observed-root",
+      requestId: "native-run-1",
+      candidateIndex: 1,
+    });
+    succeedClaudeAttempt(store, "session-1", "native-run-1");
+    const firstCommit = finalizePrompt(store, {
+      sessionId: "session-1",
+      runId: "native-run-1",
+      transitionId: "native-transition-1",
+      destinationStateId: "native-state-1",
+      user: firstUser,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("native-run-1"),
+    });
+    expect(firstCommit.bindingPromotion).toBe("promoted");
+    const firstNativeState = store.getMiniMainClaudeState({
+      sessionId: "session-1",
+      historyStateId: "native-state-1",
+      providerId: "claude-provider",
+    });
+    expect(firstNativeState.providerState).toEqual(claudeProviderState);
+    expect(firstNativeState.binding).toMatchObject({
+      claudeSessionId: testUuid(1),
+      revision: 1,
+      canonicalMessageCount: 2,
+      lastModelSpecifier: "claude-sonnet",
+      lastReasoning: "high",
+    });
+
+    const secondUser = userMessage("native-user-2");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "native-run-2",
+      commandId: "native-command-2",
+      transitionId: "native-transition-2",
+      message: secondUser,
+    });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "native-state-1",
+      requestId: "native-run-2",
+      candidateIndex: 2,
+      sourceSessionId: testUuid(1),
+      expectedBindingRevision: 1,
+    });
+    succeedClaudeAttempt(store, "session-1", "native-run-2");
+    const secondCommit = finalizePrompt(store, {
+      sessionId: "session-1",
+      runId: "native-run-2",
+      transitionId: "native-transition-2",
+      destinationStateId: "native-state-2",
+      user: secondUser,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("native-run-2", {
+        lastModelSpecifier: "claude-opus",
+        lastReasoning: "low",
+      }),
+    });
+    expect(secondCommit.bindingPromotion).toBe("promoted");
+    expect(
+      store.getMiniMainClaudeState({
+        sessionId: "session-1",
+        historyStateId: "native-state-2",
+        providerId: "claude-provider",
+      }).binding,
+    ).toMatchObject({
+      claudeSessionId: testUuid(2),
+      revision: 2,
+      canonicalMessageCount: 4,
+      lastModelSpecifier: "claude-opus",
+      lastReasoning: "low",
+    });
+
+    const thirdUser = userMessage("native-user-3");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "native-run-3",
+      commandId: "native-command-3",
+      transitionId: "native-transition-3",
+      message: thirdUser,
+    });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "native-state-2",
+      requestId: "native-run-3",
+      candidateIndex: 3,
+      sourceSessionId: testUuid(2),
+      expectedBindingRevision: 2,
+    });
+    succeedClaudeAttempt(store, "session-1", "native-run-3");
+    store.database
+      .query(
+        `UPDATE mini_main_claude_bindings SET revision = 3
+         WHERE session_id = 'session-1' AND history_state_id = 'native-state-2'
+           AND provider_id = 'claude-provider'`,
+      )
+      .run();
+    const staleCommit = finalizePrompt(store, {
+      sessionId: "session-1",
+      runId: "native-run-3",
+      transitionId: "native-transition-3",
+      destinationStateId: "native-state-3",
+      user: thirdUser,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("native-run-3"),
+    });
+    expect(staleCommit.bindingPromotion).toBe("cas-failed");
+    expect(staleCommit.state.providerState).toEqual(claudeProviderState);
+    expect(
+      store.getMiniMainClaudeState({
+        sessionId: "session-1",
+        historyStateId: "native-state-3",
+        providerId: "claude-provider",
+      }).binding,
+    ).toBeNull();
+    expect(store.database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    store.close();
+  });
+
+  it("marks active Claude attempts uncertain on recovery and never promotes them", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-native-recovery-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const message = userMessage("recovery-user");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "recovery-run",
+      commandId: "recovery-command",
+      transitionId: "recovery-transition",
+      message,
+      observationIds: {
+        stateId: "recovery-observed-root",
+        transitionId: "recovery-observation-transition",
+      },
+    });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "recovery-observed-root",
+      requestId: "recovery-run",
+      candidateIndex: 10,
+    });
+
+    store.recoverInterruptedRuntimeState();
+    expect(
+      store.getMiniMainClaudeSessionAttempt({
+        providerId: "claude-provider",
+        lilacSessionId: "session-1",
+        requestId: "recovery-run",
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+    expect(() => succeedClaudeAttempt(store, "session-1", "recovery-run")).toThrow(
+      "already terminal as 'uncertain'",
+    );
+    const committed = finalizePrompt(store, {
+      sessionId: "session-1",
+      runId: "recovery-run",
+      transitionId: "recovery-transition",
+      destinationStateId: "recovery-state",
+      user: message,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("recovery-run"),
+    });
+    expect(committed.bindingPromotion).toBe("cas-failed");
+    expect(
+      store.getMiniMainClaudeState({
+        sessionId: "session-1",
+        historyStateId: "recovery-state",
+        providerId: "claude-provider",
+      }).binding,
+    ).toBeNull();
+    store.close();
+  });
+
+  it("recovers persisted provider and succeeded promotion metadata", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-native-pending-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const message = userMessage("pending-user");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "pending-run",
+      commandId: "pending-command",
+      transitionId: "pending-transition",
+      message,
+      observationIds: {
+        stateId: "pending-observed-root",
+        transitionId: "pending-observation-transition",
+      },
+    });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "pending-observed-root",
+      requestId: "pending-run",
+      candidateIndex: 30,
+    });
+    succeedClaudeAttempt(store, "session-1", "pending-run");
+    store.reservePendingRunFinalization({
+      runId: "pending-run",
+      sessionId: "session-1",
+      openTransitionId: "pending-transition",
+      modelMessages: [
+        ...store.getModelMessages("session-1"),
+        { role: "assistant", content: "pending answer" },
+      ],
+      uiMessages: [
+        ...store.getUiMessages("session-1"),
+        {
+          id: "pending-assistant",
+          role: "assistant",
+          parts: [{ type: "text", text: "pending answer" }],
+        },
+      ],
+      runStatus: "completed",
+      sessionStatus: "idle",
+      error: null,
+      terminalResult: { text: "pending answer" },
+      inputTokens: 10,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("pending-run"),
+    });
+
+    store.recoverInterruptedRuntimeState();
+    const committed = store.commitPendingRunFinalization({
+      runId: "pending-run",
+      destinationStateId: "pending-state",
+      ...unavailableWorkspace,
+    });
+
+    expect(committed.bindingPromotion).toBe("promoted");
+    expect(committed.state.providerState).toEqual(claudeProviderState);
+    expect(
+      store.getMiniMainClaudeState({
+        sessionId: "session-1",
+        historyStateId: "pending-state",
+        providerId: "claude-provider",
+      }).binding?.claudeSessionId,
+    ).toBe(testUuid(30));
+    store.close();
+  });
+
+  it("rejects promotion metadata owned by a different run", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-native-owner-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const message = userMessage("owner-user");
+    admitPrompt(store, {
+      sessionId: "session-1",
+      runId: "owner-run",
+      commandId: "owner-command",
+      transitionId: "owner-transition",
+      message,
+      observationIds: {
+        stateId: "owner-observed-root",
+        transitionId: "owner-observation-transition",
+      },
+    });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "owner-observed-root",
+      requestId: "different-run",
+      candidateIndex: 31,
+    });
+    succeedClaudeAttempt(store, "session-1", "different-run");
+
+    const committed = finalizePrompt(store, {
+      sessionId: "session-1",
+      runId: "owner-run",
+      transitionId: "owner-transition",
+      destinationStateId: "owner-state",
+      user: message,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("different-run"),
+    });
+
+    expect(committed.bindingPromotion).toBe("cas-failed");
+    expect(
+      store.getMiniMainClaudeState({
+        sessionId: "session-1",
+        historyStateId: "owner-state",
+        providerId: "claude-provider",
+      }).binding,
+    ).toBeNull();
+    store.close();
+  });
+
+  it("bounds terminal Mini main Claude attempt metadata", async () => {
+    const { directory, file } = await temporaryDatabasePath("mini-lilac-native-retention-");
+    const store = new MiniLilacSqliteStore(file);
+    createSession(store, "session-1", directory);
+    const sourceHistoryStateId = store.getCurrentHistoryState("session-1").id;
+    const total = MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT + 5;
+    for (let index = 0; index < total; index += 1) {
+      const requestId = `retained-request-${index}`;
+      reserveClaudeAttempt(store, {
+        sessionId: "session-1",
+        sourceHistoryStateId,
+        requestId,
+        candidateIndex: 100 + index,
+      });
+      store.recordMiniMainClaudeSessionAttemptOutcome({
+        providerId: "claude-provider",
+        lilacSessionId: "session-1",
+        requestId,
+        attemptIndex: 0,
+        state: "failed",
+      });
+    }
+    expect(
+      store.database
+        .query(
+          `SELECT COUNT(*) AS count FROM mini_main_claude_attempts
+           WHERE session_id = 'session-1' AND provider_id = 'claude-provider'`,
+        )
+        .get(),
+    ).toEqual({ count: MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT });
+    expect(
+      store.getMiniMainClaudeSessionAttempt({
+        providerId: "claude-provider",
+        lilacSessionId: "session-1",
+        requestId: "retained-request-0",
+        attemptIndex: 0,
+      }),
+    ).toBeNull();
+    expect(
+      store.getMiniMainClaudeSessionAttempt({
+        providerId: "claude-provider",
+        lilacSessionId: "session-1",
+        requestId: `retained-request-${total - 1}`,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("failed");
+    store.close();
   });
 
   it("atomically commits and replays action-specific empty navigation results", async () => {
@@ -879,12 +1347,21 @@ describe("MiniLilacSqliteStore history schema", () => {
       message: firstUser,
       observationIds: { stateId: "observed-root", transitionId: "observe-root" },
     });
+    reserveClaudeAttempt(store, {
+      sessionId: "session-1",
+      sourceHistoryStateId: "observed-root",
+      requestId: "run-a",
+      candidateIndex: 20,
+    });
+    succeedClaudeAttempt(store, "session-1", "run-a");
     finalizePrompt(store, {
       sessionId: "session-1",
       runId: "run-a",
       transitionId: "transition-a",
       destinationStateId: "state-a",
       user: firstUser,
+      providerState: claudeProviderState,
+      claudeBindingPromotion: claudePromotion("run-a"),
     });
     store.reserveCommand("session-1", "undo-a", { kind: "undo", runId: null, payload: {} });
     expect(
@@ -1049,6 +1526,13 @@ describe("MiniLilacSqliteStore history schema", () => {
       .run(new Date().toISOString());
     expect(reopened.getLatestSelectedRootRun("session-1")?.id).toBe("run-b");
     expect(reopened.peekHistoryRedo("session-1")).toBeNull();
+    expect(
+      reopened.getMiniMainClaudeState({
+        sessionId: "session-1",
+        historyStateId: "state-a",
+        providerId: "claude-provider",
+      }).binding,
+    ).toMatchObject({ claudeSessionId: testUuid(20), revision: 1 });
     expect(reopened.getHistoryAccounting()).toEqual({
       stateCount: 5,
       transitionCount: 4,
