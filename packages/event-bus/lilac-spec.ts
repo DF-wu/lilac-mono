@@ -45,6 +45,7 @@ export const lilacEventTypes = {
 
   EvtAgentOutputDeltaReasoning: "evt.agent.output.delta.reasoning",
   EvtAgentOutputDeltaText: "evt.agent.output.delta.text",
+  EvtAgentOutputTextReset: "evt.agent.output.text.reset",
   EvtAgentOutputResponseText: "evt.agent.output.response.text",
   EvtAgentOutputResponseBinary: "evt.agent.output.response.binary",
   EvtAgentOutputToolCall: "evt.agent.output.toolcall",
@@ -302,7 +303,18 @@ export type EvtAgentOutputDeltaReasoningData = {
 
 export type EvtAgentOutputDeltaTextData = {
   delta: string;
+  /** Native OpenAI Responses message phase when available. */
+  phase?: "commentary" | "final_answer";
+  /** Synthetic leading separator inserted between assistant text parts. */
+  phaseBoundaryPrefixChars?: number;
   seq?: number;
+};
+
+export type EvtAgentOutputTextResetData = {
+  /** Full retained response text after rolling back transient streamed output. */
+  text: string;
+  /** Phase of the last retained OpenAI text item, when known. */
+  phase?: "commentary" | "final_answer";
 };
 
 export type EvtAgentOutputResponseTextData = {
@@ -467,6 +479,12 @@ export type LilacEventSpec = {
     topic: OutReqTopic;
     key: string;
     data: EvtAgentOutputDeltaTextData;
+  };
+
+  [lilacEventTypes.EvtAgentOutputTextReset]: {
+    topic: OutReqTopic;
+    key: string;
+    data: EvtAgentOutputTextResetData;
   };
 
   [lilacEventTypes.EvtAgentOutputResponseText]: {

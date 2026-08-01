@@ -1294,6 +1294,7 @@ export class WorkflowEngine {
       }
       resetIdle();
       if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) output += message.data.delta;
+      if (message.type === lilacEventTypes.EvtAgentOutputTextReset) output = message.data.text;
       if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
         output = message.data.finalText;
         usage = message.data.usage ?? null;

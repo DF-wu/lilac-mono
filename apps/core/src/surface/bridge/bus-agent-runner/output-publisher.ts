@@ -9,6 +9,7 @@ export const AGENT_OUTPUT_FLUSH_INTERVAL_MS = 40;
 export const AGENT_OUTPUT_FLUSH_BYTES = 4 * 1024;
 
 type TextData = LilacDataForType<typeof lilacEventTypes.EvtAgentOutputDeltaText>;
+type TextResetData = LilacDataForType<typeof lilacEventTypes.EvtAgentOutputTextReset>;
 type ReasoningData = LilacDataForType<typeof lilacEventTypes.EvtAgentOutputDeltaReasoning>;
 type ToolCallData = LilacDataForType<typeof lilacEventTypes.EvtAgentOutputToolCall>;
 type ResponseTextData = LilacDataForType<typeof lilacEventTypes.EvtAgentOutputResponseText>;
@@ -92,15 +93,27 @@ export function createAgentOutputPublisher(params: {
     if (pending && pending.bytes >= AGENT_OUTPUT_FLUSH_BYTES) flushPending();
   };
 
-  const publishText = (delta: string): void => {
-    if (pending?.type === "text") {
+  const publishText = (
+    delta: string,
+    phase?: TextData["phase"],
+    phaseBoundaryPrefixChars = 0,
+  ): void => {
+    if (
+      pending?.type === "text" &&
+      pending.data.phase === phase &&
+      phaseBoundaryPrefixChars === 0
+    ) {
       pending.data.delta += delta;
       pending.bytes += Buffer.byteLength(delta);
     } else {
       flushPending();
       pending = {
         type: "text",
-        data: { delta },
+        data: {
+          delta,
+          ...(phase === undefined ? {} : { phase }),
+          ...(phaseBoundaryPrefixChars > 0 ? { phaseBoundaryPrefixChars } : {}),
+        },
         bytes: Buffer.byteLength(delta),
       };
     }
@@ -122,6 +135,15 @@ export function createAgentOutputPublisher(params: {
     }
     schedulePendingFlush();
     flushAtSizeLimit();
+  };
+
+  const publishTextReset = (data: TextResetData): Promise<void> => {
+    flushPending();
+    return enqueue("text reset", async () => {
+      await params.bus.publish(lilacEventTypes.EvtAgentOutputTextReset, data, {
+        headers: params.headers,
+      });
+    });
   };
 
   const publishReasoningBoundary = (data: ReasoningData): Promise<void> => {
@@ -167,6 +189,7 @@ export function createAgentOutputPublisher(params: {
 
   return {
     publishText,
+    publishTextReset,
     publishReasoningSnapshot,
     publishReasoningBoundary,
     publishToolCall,

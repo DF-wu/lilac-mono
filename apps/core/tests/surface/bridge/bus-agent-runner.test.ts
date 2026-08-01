@@ -227,6 +227,40 @@ function level1TextStep(text: string) {
   };
 }
 
+function level1PhasedTextStep(finalText = "Final answer.") {
+  const commentaryMetadata = {
+    openai: { itemId: "msg_commentary", phase: "commentary" },
+  } as const;
+  const finalMetadata = { openai: { itemId: "msg_final", phase: "final_answer" } } as const;
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "commentary", providerMetadata: commentaryMetadata },
+        {
+          type: "text-delta" as const,
+          id: "commentary",
+          delta: "Commentary.",
+          providerMetadata: commentaryMetadata,
+        },
+        { type: "text-end" as const, id: "commentary", providerMetadata: commentaryMetadata },
+        { type: "text-start" as const, id: "final", providerMetadata: finalMetadata },
+        {
+          type: "text-delta" as const,
+          id: "final",
+          delta: finalText,
+          providerMetadata: finalMetadata,
+        },
+        { type: "text-end" as const, id: "final", providerMetadata: finalMetadata },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: level1ZeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 function level1ToolCallStep(calls: readonly { toolCallId: string; toolName: string }[]) {
   return {
     stream: simulateReadableStream({
@@ -2276,6 +2310,119 @@ describe("startBusAgentRunner production path", () => {
     });
     expect(switchedSpecs).toEqual(["openai/fallback"]);
 
+    await lifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("publishes OpenAI phases and honors a final-answer NO_REPLY", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/phased" };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-phased-output-"));
+    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const bus = createLilacBus(createInMemoryRawBus());
+    let createdAgents = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-phased-output",
+      config,
+      pluginManager,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options) => {
+        createdAgents += 1;
+        return new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "phased",
+            doStream: level1PhasedTextStep(createdAgents === 1 ? "Final answer." : "NO_REPLY"),
+          }),
+        });
+      },
+    });
+    const requestId = "github:phased-output:request";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    const responsePublished = deferred<void>();
+    const textDeltas: Array<{
+      delta: string;
+      phase?: "commentary" | "final_answer";
+      phaseBoundaryPrefixChars?: number;
+    }> = [];
+    const outputSubscription = await bus.subscribeTopic(
+      outReqTopic(requestId),
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
+          textDeltas.push(message.data);
+        }
+        if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
+          responsePublished.resolve(undefined);
+        }
+        await context.commit();
+      },
+    );
+
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "phased-output",
+      text: "show both phases",
+    });
+
+    await expect(lifecycle.terminal).resolves.toBe("resolved");
+    await responsePublished.promise;
+    expect(textDeltas).toEqual([
+      { delta: "Commentary.", phase: "commentary" },
+      {
+        delta: "\n\nFinal answer.",
+        phase: "final_answer",
+        phaseBoundaryPrefixChars: 2,
+      },
+    ]);
+
+    const skippedRequestId = "github:phased-output:skip";
+    const skippedLifecycle = await observeRequestLifecycle(bus, skippedRequestId);
+    const skippedDeltas: typeof textDeltas = [];
+    const skippedResets: string[] = [];
+    const skippedResponse = deferred<{
+      finalText: string;
+      delivery?: "reply" | "skip";
+    }>();
+    const skippedOutputSubscription = await bus.subscribeTopic(
+      outReqTopic(skippedRequestId),
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
+          skippedDeltas.push(message.data);
+        }
+        if (message.type === lilacEventTypes.EvtAgentOutputTextReset) {
+          skippedResets.push(message.data.text);
+        }
+        if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
+          skippedResponse.resolve(message.data);
+        }
+        await context.commit();
+      },
+    );
+    await publishRunnerRequest({
+      bus,
+      requestId: skippedRequestId,
+      sessionId: "phased-output-skip",
+      text: "skip the final response",
+    });
+
+    await expect(skippedLifecycle.terminal).resolves.toBe("resolved");
+    await expect(skippedResponse.promise).resolves.toMatchObject({
+      finalText: "",
+      delivery: "skip",
+    });
+    expect(skippedDeltas).toEqual([{ delta: "Commentary.", phase: "commentary" }]);
+    expect(skippedResets).toEqual([""]);
+
+    await skippedOutputSubscription.stop();
+    await skippedLifecycle.stop();
+    await outputSubscription.stop();
     await lifecycle.stop();
     await runner.stop();
     await pluginManager.destroy();
@@ -6323,6 +6470,36 @@ describe("silent assistant turn removal", () => {
 
     expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
       [],
+    );
+  });
+
+  it("uses final-answer phase text when commentary precedes the sentinel", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "Commentary update.",
+            providerOptions: { openai: { phase: "commentary" } },
+          },
+          {
+            type: "text",
+            text: "NO_REPLY",
+            providerOptions: { openai: { phase: "final_answer" } },
+          },
+          { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
+      [
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} }],
+        },
+      ],
     );
   });
 });

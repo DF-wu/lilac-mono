@@ -34,6 +34,7 @@ import type { TranscriptStore } from "../../../src/transcript/transcript-store";
 
 function createInMemoryRawBus(): RawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
+  let sequence = 0;
   const subs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
@@ -42,7 +43,8 @@ function createInMemoryRawBus(): RawBus {
 
   return {
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
-      const id = String(Date.now()) + "-0";
+      const id = `${Date.now()}-${sequence}`;
+      sequence += 1;
       const stored: Message<unknown> = {
         topic: opts.topic,
         id,
@@ -476,7 +478,6 @@ describe("bridgeBusToAdapter", () => {
       },
       { headers: { request_id: requestId } },
     );
-
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseText,
       { finalText: "final" },
@@ -987,6 +988,205 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.streams[1]?.finished).toBe(true);
 
+    await bridge.stop();
+  });
+
+  it("chains OpenAI final-answer text after commentary without replaying tool status", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_phase_split";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "NO_", phase: "commentary" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputToolCall,
+      { toolCallId: "call-1", status: "start", display: "read_file" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputToolCall,
+      { toolCallId: "call-1", status: "end", display: "read_file", ok: true },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: " ", phase: "final_answer" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      {
+        delta: "\n\nFinal answer.",
+        phase: "final_answer",
+        phaseBoundaryPrefixChars: 2,
+      },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputTextReset,
+      { text: "NO_ \n\nFinal answer.", phase: "final_answer" },
+      { headers: { request_id: requestId } },
+    );
+
+    expect(adapter.streams).toHaveLength(2);
+    expect(adapter.streams[0]?.aborted).toBe("reanchor");
+    expect(adapter.streams[0]?.parts).toEqual([
+      {
+        type: "tool.status",
+        update: {
+          toolCallId: "call-1",
+          status: "start",
+          display: "read_file",
+          ok: undefined,
+          error: undefined,
+        },
+      },
+      {
+        type: "tool.status",
+        update: {
+          toolCallId: "call-1",
+          status: "end",
+          display: "read_file",
+          ok: true,
+          error: undefined,
+        },
+      },
+      { type: "text.delta", delta: "NO_" },
+    ]);
+    expect(adapter.starts[1]?.opts?.replyTo).toEqual({
+      platform: "discord",
+      channelId: "chan",
+      messageId: "m_out_1",
+    });
+    expect(adapter.streams[1]?.parts).toEqual([
+      { type: "text.delta", delta: " Final answer." },
+      { type: "text.set", text: " Final answer." },
+    ]);
+    const snapshot = bridge.snapshotRelays()[0];
+    expect(snapshot?.createdOutputRefs.map((ref) => ref.messageId)).toEqual(["m_out_1", "m_out_2"]);
+    expect(snapshot?.activeOutputRefs?.map((ref) => ref.messageId)).toEqual(["m_out_2"]);
+    expect(snapshot?.textPhase).toBe("final_answer");
+    await bridge.stop();
+
+    const restoredBridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter-restored",
+      idleTimeoutMs: 10_000,
+    });
+    if (snapshot === undefined) throw new Error("phase-split relay had no snapshot");
+    await restoredBridge.restoreRelays([snapshot]);
+    expect(adapter.starts[2]?.opts?.resume?.created.map((ref) => ref.messageId)).toEqual([
+      "m_out_2",
+    ]);
+    expect(adapter.streams[2]?.parts).toEqual([{ type: "text.set", text: " Final answer." }]);
+
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: " \n\nFinal answer." },
+      { headers: { request_id: requestId } },
+    );
+    expect(adapter.streams[2]?.parts).toEqual([
+      { type: "text.set", text: " Final answer." },
+      { type: "text.set", text: " Final answer." },
+    ]);
+    expect(adapter.streams[2]?.finished).toBe(true);
+
+    await restoredBridge.stop();
+  });
+
+  it("restores retained commentary phase before a later final answer", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_phase_reset";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "Retained commentary.", phase: "commentary" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "Transient commentary.", phase: "commentary" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputTextReset,
+      { text: "Retained commentary.", phase: "commentary" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: " ", phase: "final_answer" },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      {
+        delta: "\n\nVisible final answer.",
+        phase: "final_answer",
+        phaseBoundaryPrefixChars: 2,
+      },
+      { headers: { request_id: requestId } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "Retained commentary. \n\nVisible final answer." },
+      { headers: { request_id: requestId } },
+    );
+
+    expect(adapter.streams).toHaveLength(2);
+    expect(adapter.streams[0]?.parts).toEqual([
+      { type: "text.delta", delta: "Retained commentary." },
+      { type: "text.delta", delta: "Transient commentary." },
+      { type: "text.set", text: "Retained commentary." },
+    ]);
+    expect(adapter.streams[0]?.aborted).toBe("reanchor");
+    expect(adapter.streams[1]?.parts).toEqual([
+      { type: "text.delta", delta: " Visible final answer." },
+      { type: "text.set", text: " Visible final answer." },
+    ]);
+    expect(adapter.streams[1]?.finished).toBe(true);
     await bridge.stop();
   });
 

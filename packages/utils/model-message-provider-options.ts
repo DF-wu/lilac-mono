@@ -11,6 +11,18 @@ export const openAICompactionPartSchema = z
 
 export type OpenAICompactionPart = z.infer<typeof openAICompactionPartSchema>;
 
+export const openAIMessagePhaseSchema = z.enum(["commentary", "final_answer"]);
+export type OpenAIMessagePhase = z.infer<typeof openAIMessagePhaseSchema>;
+
+const openAIMessagePhaseMetadataSchema = z.object({
+  openai: z.object({ phase: openAIMessagePhaseSchema }),
+});
+
+export function openAIMessagePhase(value: unknown): OpenAIMessagePhase | undefined {
+  const parsed = openAIMessagePhaseMetadataSchema.safeParse(value);
+  return parsed.success ? parsed.data.openai.phase : undefined;
+}
+
 export function isOpenAICompactionPart(value: unknown): value is OpenAICompactionPart {
   return openAICompactionPartSchema.safeParse(value).success;
 }
