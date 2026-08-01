@@ -114,7 +114,7 @@ describe("compact subagent progress", () => {
     ]);
   });
 
-  it("compacts three agents, abbreviates effort, and folds overflow into the last row", () => {
+  it("moves completed agents into tool history while active agents stay at the bottom", () => {
     const lines = visible(
       buildDiscordProgressLines({
         tools: [],
@@ -147,10 +147,120 @@ describe("compact subagent progress", () => {
     );
 
     expect(lines).toEqual([
+      "✓ explore (3/3)",
+      "✓ general (4/4)",
       "… explore (grok-4.5 [xh]; 8/10; batch)",
       "… self (gpt-5.6-sol [md]; 1/2; apply_patch)",
-      "… general (cl...fable-5 [hi]; 12/13; read_file) · +2 more",
+      "… general (cl...fable-5 [hi]; 12/13; read_file)",
     ]);
+  });
+
+  it("orders completed agents with tools by recency", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [
+          entry("tool-old", 1, { status: "end", display: "glob src", ok: true }),
+          entry("tool-new", 3, { status: "end", display: "grep auth", ok: true }),
+        ],
+        subagents: [
+          entry("agent-complete", 2, {
+            status: "end",
+            display: "subagent (general; gpt-5.6-sol [high]; 2/2 done)",
+            ok: true,
+          }),
+          entry("agent-active", 4, {
+            status: "update",
+            display: "subagent (explore; gpt-5.6-sol [low]; 1/2 done)",
+          }),
+        ],
+      }),
+    );
+
+    expect(lines).toEqual([
+      "✓ glob src",
+      "✓ general (gpt-5.6-sol [hi]; 2/2)",
+      "✓ grep auth",
+      "… explore (gpt-5.6-sol [lo]; 1/2)",
+    ]);
+  });
+
+  it("evicts completed agents naturally as newer tools fill the history", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: Array.from({ length: 5 }, (_, index) =>
+          entry(`tool-${index}`, index + 2, {
+            status: "end",
+            display: `bash command-${index}`,
+            ok: true,
+          }),
+        ),
+        subagents: [
+          entry("agent-complete", 1, {
+            status: "end",
+            display: "subagent (general; 2/2 done)",
+            ok: true,
+          }),
+        ],
+      }),
+    );
+
+    expect(lines).toEqual([
+      "✓ bash command-0",
+      "✓ bash command-1",
+      "✓ bash command-2",
+      "✓ bash command-3",
+      "✓ bash command-4",
+    ]);
+  });
+
+  it("counts only active agents in subagent overflow", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [],
+        subagents: [
+          entry("agent-complete", 1, {
+            status: "end",
+            display: "subagent (general; resolved)",
+            ok: true,
+          }),
+          ...Array.from({ length: 4 }, (_, index) =>
+            entry(`agent-active-${index}`, index + 2, {
+              status: "update",
+              display: `subagent (explore; ${index + 1}/4 done)`,
+            }),
+          ),
+        ],
+      }),
+    );
+
+    expect(lines).toEqual([
+      "✓ general (resolved)",
+      "… explore (4/4)",
+      "… explore (3/4)",
+      "… explore (2/4) · +1 more",
+    ]);
+  });
+
+  it("renders failed and cancelled agents as terminal tool history", () => {
+    const lines = visible(
+      buildDiscordProgressLines({
+        tools: [],
+        subagents: [
+          entry("agent-failed", 1, {
+            status: "end",
+            display: "subagent (general; failed)",
+            ok: false,
+          }),
+          entry("agent-cancelled", 2, {
+            status: "end",
+            display: "subagent (explore; cancelled)",
+            ok: false,
+          }),
+        ],
+      }),
+    );
+
+    expect(lines).toEqual(["✗ general (failed)", "✗ explore (cancelled)"]);
   });
 
   it("collapses a completed agent and omits unresolved effort", () => {
@@ -463,6 +573,85 @@ function makeAttachment(index: number): SurfaceAttachment {
 }
 
 describe("Discord compact progress integration", () => {
+  it("moves a completed agent into history before newer tool activity", async () => {
+    let resolveActiveEdit: (options: unknown) => void = () => {};
+    let resolveCompletedEdit: (options: unknown) => void = () => {};
+    let resolveShiftedEdit: (options: unknown) => void = () => {};
+    const activeEdit = new Promise<unknown>((resolve) => {
+      resolveActiveEdit = resolve;
+    });
+    const completedEdit = new Promise<unknown>((resolve) => {
+      resolveCompletedEdit = resolve;
+    });
+    const shiftedEdit = new Promise<unknown>((resolve) => {
+      resolveShiftedEdit = resolve;
+    });
+    const { client } = createFakeDiscordClient({
+      onEdit: (options) => {
+        const lines = embedFieldValuesFromOptions(options)
+          .flatMap((value) => value.replaceAll("\\", "").split("\n"))
+          .filter(Boolean);
+        if (lines.some((line) => line.includes("… general") && line.includes("1/2"))) {
+          resolveActiveEdit(options);
+        }
+        if (lines.some((line) => line.includes("✓ general")) && lines.length === 1) {
+          resolveCompletedEdit(options);
+        }
+        const completedIndex = lines.findIndex((line) => line.includes("✓ general"));
+        const newerToolIndex = lines.findIndex((line) => line.includes("▶ bash parent-check"));
+        if (completedIndex >= 0 && newerToolIndex > completedIndex) {
+          resolveShiftedEdit(options);
+        }
+      },
+    });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({
+      type: "tool.status",
+      update: {
+        toolCallId: "agent-1",
+        status: "update",
+        display: "subagent (general; gpt-5.6-sol [high]; 1/2 done)\n`- > bash child-check",
+      },
+    });
+    await activeEdit;
+
+    await out.push({
+      type: "tool.status",
+      update: {
+        toolCallId: "agent-1",
+        status: "end",
+        display: "subagent (general; resolved)",
+        ok: true,
+      },
+    });
+    const completedEditOptions = await completedEdit;
+    expect(
+      embedFieldValuesFromOptions(completedEditOptions).map((value) => value.replaceAll("\\", "")),
+    ).toEqual(["✓ general (gpt-5.6-sol [hi]; 1/2)"]);
+
+    await out.push({
+      type: "tool.status",
+      update: {
+        toolCallId: "tool-1",
+        status: "start",
+        display: "bash parent-check",
+      },
+    });
+    const shiftedEditOptions = await shiftedEdit;
+    expect(
+      embedFieldValuesFromOptions(shiftedEditOptions).map((value) => value.replaceAll("\\", "")),
+    ).toEqual(["✓ general (gpt-5.6-sol [hi]; 1/2)\n▶ bash parent-check"]);
+    await out.finish();
+  });
+
   it("keeps agents in the Working field and removes progress on completion", async () => {
     let resolveStreamingEdit: (options: unknown) => void = () => {};
     const streamingEdit = new Promise<unknown>((resolve) => {
