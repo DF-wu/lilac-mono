@@ -71,6 +71,7 @@ import {
   buildSurfaceMetadataOverlay,
   isRetryableTransientModelError,
   isActiveRuntimeModelCompatible,
+  isWorkflowAgentRecoveryEntry,
   markAssistantTextPartEnded,
   markAssistantTextPartStarted,
   mapCorePrimaryCompactionCurrentCanonicalStart,
@@ -1580,6 +1581,35 @@ describe("agent run activity", () => {
 describe("workflow request claim pacing", () => {
   it("refreshes at one third of the engine's 30s stale-owner threshold", () => {
     expect(WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS).toBe(10_000);
+  });
+});
+
+describe("agent recovery ownership", () => {
+  it("does not treat workflow-owned recovery entries as root parent requests", () => {
+    const base = {
+      kind: "active" as const,
+      requestId: "request-1",
+      sessionId: "session-1",
+      requestClient: "discord" as const,
+      queue: "prompt" as const,
+      messages: [] as ModelMessage[],
+    };
+
+    expect(isWorkflowAgentRecoveryEntry(base)).toBe(false);
+    expect(
+      isWorkflowAgentRecoveryEntry({
+        ...base,
+        requestId: "wfr:run:operation:0",
+        requestClient: "unknown",
+        raw: {
+          workflow: {
+            runId: "run-1",
+            operationId: "operation-1",
+            dispatchEpoch: "1234567890abcdef",
+          },
+        },
+      }),
+    ).toBe(true);
   });
 });
 

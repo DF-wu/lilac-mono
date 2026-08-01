@@ -1223,6 +1223,14 @@ export type AgentRunnerRecoveryEntry = {
   };
 };
 
+export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): boolean {
+  return (
+    parseWorkflowRequestHintFromRaw(entry.raw) !== null ||
+    entry.requestId.startsWith("wfr:") ||
+    entry.sessionId.startsWith("workflow:")
+  );
+}
+
 export function validateCorePrimaryLineageAtRunnerIntake(input: {
   requestClient: AdapterPlatform;
   sessionId?: string;
@@ -2609,6 +2617,30 @@ export async function startBusAgentRunner(params: {
     if (entries.length === 0) return;
 
     for (const entry of entries) {
+      if (isWorkflowAgentRecoveryEntry(entry)) {
+        const hint = parseWorkflowRequestHintFromRaw(entry.raw);
+        const authorized =
+          hint && params.durableWorkflowStore
+            ? params.durableWorkflowStore.authorizeWorkflowRequest({
+                requestId: entry.requestId,
+                sessionId: entry.sessionId,
+                platform: entry.requestClient,
+              })
+            : null;
+        if (
+          !hint ||
+          !authorized ||
+          authorized.policy.runId !== hint.runId ||
+          authorized.policy.operationId !== hint.operationId ||
+          authorized.policy.dispatchEpoch !== hint.dispatchEpoch
+        ) {
+          logger.warn("discarded stale workflow-owned agent recovery entry", {
+            requestId: entry.requestId,
+            sessionId: entry.sessionId,
+          });
+          continue;
+        }
+      }
       const state =
         bySession.get(entry.sessionId) ??
         ({
@@ -4318,6 +4350,7 @@ export async function startBusAgentRunner(params: {
           }
 
           if (completion) {
+            if (!liveParentSession.isPending(completion.runId)) continue;
             liveParentSession.clearMaterializationFailure(completion.runId);
             completions.push(completion);
             continue;
@@ -4344,6 +4377,7 @@ export async function startBusAgentRunner(params: {
             materializationError,
           );
           if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS) continue;
+          if (!liveParentSession.isPending(identity.runId)) continue;
 
           completions.push({
             ...identity,
@@ -4354,24 +4388,18 @@ export async function startBusAgentRunner(params: {
           });
         }
 
-        const plan = planDeferredSubagentBoundary({
+        const deliverableCompletions = completions.filter((completion) =>
+          liveParentSession.isPending(completion.runId),
+        );
+
+        const provisionalPlan = planDeferredSubagentBoundary({
           canonicalMessages: agent.state.messages,
           modelInputMessages: input.modelInputMessages,
-          completions,
+          completions: deliverableCompletions,
         });
-        if (
-          plan.append.length > 0 &&
-          runProfile === "primary" &&
-          next.requestClient === "discord"
-        ) {
-          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
-            "deferred-result-insertion",
-            agent.state.messages.length,
-          );
-          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        }
 
-        for (const completion of completions) {
+        for (const completion of deliverableCompletions) {
+          if (!liveParentSession.isPending(completion.runId)) continue;
           if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
           try {
             await outputPublisher.publishToolCall({
@@ -4393,11 +4421,30 @@ export async function startBusAgentRunner(params: {
           }
         }
 
-        if (plan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
-          await liveParentSession.acknowledge(plan.consumedRunIds);
+        if (provisionalPlan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
+          await liveParentSession.acknowledge(provisionalPlan.consumedRunIds);
         }
 
-        return { append: plan.append, forceNextTurn: plan.forceNextTurn };
+        const finalPlan = planDeferredSubagentBoundary({
+          canonicalMessages: agent.state.messages,
+          modelInputMessages: input.modelInputMessages,
+          completions: deliverableCompletions.filter((completion) =>
+            liveParentSession.isPending(completion.runId),
+          ),
+        });
+        if (
+          finalPlan.append.length > 0 &&
+          runProfile === "primary" &&
+          next.requestClient === "discord"
+        ) {
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "deferred-result-insertion",
+            agent.state.messages.length,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
+
+        return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
       };
       agent.setTurnBoundaryHandler(async (context) => {
         await coreNamedClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);

@@ -34,6 +34,7 @@ import { startBusRequestRouter } from "../surface/bridge/bus-request-router";
 import {
   resolveAgentRunModel,
   resolveAgentRunModelFallbacks,
+  isWorkflowAgentRecoveryEntry,
   startBusAgentRunner,
 } from "../surface/bridge/bus-agent-runner";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
@@ -968,6 +969,48 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         logger.info("GitHub App secret missing; skipping GitHub surface");
       }
 
+      const restartLoad = gracefulRestartStore?.loadAndConsumeCompletedSnapshotDetailed() ?? {
+        snapshot: null,
+        reason: "empty" as const,
+      };
+
+      const initialHeartbeatExternalState = restartLoad.snapshot
+        ? {
+            activeRequestIds: restartLoad.snapshot.agent
+              .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
+              .map((entry) => entry.requestId),
+          }
+        : undefined;
+
+      if (!restartLoad.snapshot && restartLoad.reason === "stale") {
+        logger.warn("Graceful restart snapshot discarded (stale)", {
+          createdAt: restartLoad.createdAt,
+          ageMs: restartLoad.ageMs,
+          deadlineMs: restartLoad.deadlineMs,
+        });
+      } else if (restartLoad.reason !== "empty" && restartLoad.reason !== "loaded") {
+        logger.warn("Graceful restart snapshot discarded", {
+          reason: restartLoad.reason,
+        });
+      }
+
+      const recoverableRootParentRequestIds =
+        restartLoad.snapshot?.agent
+          .filter(
+            (entry) =>
+              entry.kind === "active" &&
+              !isHeartbeatSessionId(entry.sessionId) &&
+              !isWorkflowAgentRecoveryEntry(entry),
+          )
+          .map((entry) => entry.requestId) ?? [];
+      const remainingSnapshotProtectionMs = restartLoad.snapshot
+        ? Math.max(1, restartLoad.snapshot.createdAt + restartLoad.snapshot.deadlineMs - Date.now())
+        : GRACEFUL_SNAPSHOT_TTL_MS;
+      await workflowLiveParentBridge.enableOrphanHandling({
+        protectedParentRequestIds: recoverableRootParentRequestIds,
+        protectionMs: remainingSnapshotProtectionMs,
+      });
+
       // Start agent runner last so it can't publish replies before relay is online.
       stopAgentRunner = await startBusAgentRunner({
         bus,
@@ -1035,32 +1078,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         cwd: canonicalWorkspaceRoot,
       });
 
-      const restartLoad = gracefulRestartStore?.loadAndConsumeCompletedSnapshotDetailed() ?? {
-        snapshot: null,
-        reason: "empty" as const,
-      };
-
-      const initialHeartbeatExternalState = restartLoad.snapshot
-        ? {
-            activeRequestIds: restartLoad.snapshot.agent
-              .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
-              .map((entry) => entry.requestId),
-          }
-        : undefined;
-
       if (restartLoad.snapshot) {
         await restoreGracefulSnapshot(restartLoad.snapshot).catch((e: unknown) => {
           logger.error("Failed to restore graceful restart snapshot", e);
-        });
-      } else if (restartLoad.reason === "stale") {
-        logger.warn("Graceful restart snapshot discarded (stale)", {
-          createdAt: restartLoad.createdAt,
-          ageMs: restartLoad.ageMs,
-          deadlineMs: restartLoad.deadlineMs,
-        });
-      } else if (restartLoad.reason !== "empty") {
-        logger.warn("Graceful restart snapshot discarded", {
-          reason: restartLoad.reason,
         });
       }
 
@@ -1094,13 +1114,6 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         },
       });
       await workflowEngine.start();
-      await workflowLiveParentBridge.enableFallbacks({
-        protectedParentRequestIds:
-          restartLoad.snapshot?.agent
-            .filter((entry) => entry.kind === "active")
-            .map((entry) => entry.requestId) ?? [],
-        protectionMs: GRACEFUL_SNAPSHOT_TTL_MS,
-      });
 
       logger.info("Unified workflow engine started", {
         subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
