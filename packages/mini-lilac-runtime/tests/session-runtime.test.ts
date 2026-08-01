@@ -149,6 +149,45 @@ function textResultWithOpenAIItemId(id: string, text: string, itemId: string) {
   };
 }
 
+function phasedOpenAITextResult(
+  parts: readonly {
+    readonly id: string;
+    readonly itemId: string;
+    readonly phase: "commentary" | "final_answer";
+    readonly text: string;
+  }[],
+) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        ...parts.flatMap((part) => {
+          const providerMetadata = {
+            openai: { itemId: part.itemId, phase: part.phase },
+          };
+          return [
+            { type: "text-start" as const, id: part.id, providerMetadata },
+            {
+              type: "text-delta" as const,
+              id: part.id,
+              delta: part.text,
+              providerMetadata,
+            },
+            { type: "text-end" as const, id: part.id, providerMetadata },
+          ];
+        }),
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            inputTokens: { total: 9, noCache: 9, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+        },
+      ],
+    }),
+  };
+}
+
 function streamErrorResult(error: unknown, partialText?: string) {
   return {
     stream: simulateReadableStream({
@@ -172,6 +211,32 @@ function textAndReadToolResult(id: string, text: string, filePath: string) {
         { type: "text-start" as const, id },
         { type: "text-delta" as const, id, delta: text },
         { type: "text-end" as const, id },
+        {
+          type: "tool-call" as const,
+          toolCallId: `${id}-read`,
+          toolName: "read_file",
+          input: JSON.stringify({ path: filePath }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function commentaryAndReadToolResult(id: string, text: string, filePath: string) {
+  const providerMetadata = {
+    openai: { itemId: `msg_${id}`, phase: "commentary" as const },
+  };
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id, providerMetadata },
+        { type: "text-delta" as const, id, delta: text, providerMetadata },
+        { type: "text-end" as const, id, providerMetadata },
         {
           type: "tool-call" as const,
           toolCallId: `${id}-read`,
@@ -2918,6 +2983,187 @@ describe("SessionService", () => {
       "assistant",
     ]);
     reopened.close();
+  });
+
+  it("persists OpenAI commentary and plain final text as adjacent UI messages", async () => {
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        return callCount === 1
+          ? phasedOpenAITextResult([
+              {
+                id: "commentary",
+                itemId: "msg_commentary",
+                phase: "commentary",
+                text: "I am checking the implementation.",
+              },
+              {
+                id: "final",
+                itemId: "msg_final",
+                phase: "final_answer",
+                text: "The implementation is correct.",
+              },
+            ])
+          : textResult("next-answer", "Continued successfully.");
+      },
+    });
+    const { directory, service, session } = await temporaryRuntime(model);
+    const first = await service.startPrompt(session.id, userMessage("check it"));
+    await collect(first.stream);
+
+    const firstUiMessages = service.getMessages(session.id);
+    expect(firstUiMessages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+    ]);
+    const commentary = firstUiMessages[1];
+    const finalAnswer = firstUiMessages[2];
+    expect(commentary?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+      "I am checking the implementation.",
+    ]);
+    expect(finalAnswer?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(
+      ["The implementation is correct."],
+    );
+    expect(finalAnswer?.id).toBe(`${commentary?.id}:final-answer`);
+    expect(commentary?.metadata?.usage).toBeUndefined();
+    expect(finalAnswer?.metadata?.usage).toMatchObject({
+      inputTokens: 9,
+      outputTokens: 5,
+      totalTokens: 14,
+    });
+    expect(service.store.getRun(first.runId).terminalResult).toEqual({
+      text: "The implementation is correct.",
+    });
+
+    const firstModelMessages = service.store.getModelMessages(session.id);
+    expect(firstModelMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain("msg_commentary");
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain("msg_final");
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain('"phase":"commentary"');
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain('"phase":"final_answer"');
+
+    const second = await service.startPrompt(session.id, userMessage("continue"));
+    await collect(second.stream);
+    const replayedAssistantMessages = model.doStreamCalls[1]?.prompt.filter(
+      (message) => message.role === "assistant",
+    );
+    expect(replayedAssistantMessages).toHaveLength(1);
+    expect(JSON.stringify(replayedAssistantMessages)).toContain("msg_commentary");
+    expect(JSON.stringify(replayedAssistantMessages)).toContain("msg_final");
+
+    const canonicalUi = service.getMessages(session.id);
+    expect(canonicalUi.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    service.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.getMessages(session.id)).toEqual(canonicalUi);
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-after-phase-split" }),
+    ).toMatchObject({ status: "undone" });
+    expect(reopened.getMessages(session.id)).toEqual(firstUiMessages);
+    expect(
+      await reopened.redo({ sessionId: session.id, clientCommandId: "redo-after-phase-split" }),
+    ).toMatchObject({ status: "redone" });
+    expect(reopened.getMessages(session.id)).toEqual(canonicalUi);
+    reopened.close();
+  });
+
+  it("keeps completed operations on the commentary parent of a plain final answer", async () => {
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        return callCount === 1
+          ? commentaryAndReadToolResult(
+              "operation-commentary",
+              "I am reading the requested file.",
+              "answer.txt",
+            )
+          : phasedOpenAITextResult([
+              {
+                id: "operation-final",
+                itemId: "msg_operation_final",
+                phase: "final_answer",
+                text: "The file contains the answer.",
+              },
+            ]);
+      },
+    });
+    const { directory, service, session } = await temporaryRuntime(model);
+    await Bun.write(path.join(directory, "answer.txt"), "the answer");
+    const started = await service.startPrompt(session.id, userMessage("read the answer"));
+    await collect(started.stream);
+
+    const messages = service.getMessages(session.id);
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "assistant"]);
+    expect(JSON.stringify(messages[1])).toContain("I am reading the requested file.");
+    expect(JSON.stringify(messages[1])).toContain("the answer");
+    expect(JSON.stringify(messages[2])).toContain("The file contains the answer.");
+    expect(
+      messages[2]?.parts.every(
+        (part) =>
+          part.type === "text" || part.type === "step-start" || part.type.startsWith("data-"),
+      ),
+    ).toBe(true);
+    expect(service.store.getModelMessages(session.id).map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+    ]);
+    service.close();
+  });
+
+  it("keeps malformed OpenAI phase ordering in one UI message", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: phasedOpenAITextResult([
+        {
+          id: "commentary-before",
+          itemId: "msg_commentary_before",
+          phase: "commentary",
+          text: "Before final.",
+        },
+        {
+          id: "premature-final",
+          itemId: "msg_premature_final",
+          phase: "final_answer",
+          text: "Premature final.",
+        },
+        {
+          id: "commentary-after",
+          itemId: "msg_commentary_after",
+          phase: "commentary",
+          text: "After final.",
+        },
+      ]),
+    });
+    const { service, session } = await temporaryRuntime(model);
+    const started = await service.startPrompt(session.id, userMessage("malformed phases"));
+    await collect(started.stream);
+
+    const messages = service.getMessages(session.id);
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(messages[1]?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(
+      ["Before final.", "Premature final.", "After final."],
+    );
+    expect(service.store.getRun(started.runId).terminalResult).toEqual({
+      text: "Premature final.",
+    });
+    service.close();
   });
 
   it("replays and tails the process-local live log without a chunk table", async () => {
@@ -7414,6 +7660,86 @@ describe("SessionService", () => {
     ]);
     expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain("result-b");
     expect(service.store.getRun(started.runId).status).toBe("completed");
+    service.close();
+  });
+
+  it("splits phased assistant output before a committed steering message", async () => {
+    const firstEntered = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          firstEntered.resolve();
+          await releaseFirst.promise;
+          return phasedOpenAITextResult([
+            {
+              id: "pre-steer-commentary",
+              itemId: "msg_pre_steer_commentary",
+              phase: "commentary",
+              text: "Preparing for steering.",
+            },
+            {
+              id: "pre-steer-final",
+              itemId: "msg_pre_steer_final",
+              phase: "final_answer",
+              text: "Ready for steering.",
+            },
+          ]);
+        }
+        secondEntered.resolve();
+        await releaseSecond.promise;
+        return textResult("after-steer", "Steering applied.");
+      },
+    });
+    const { service, session } = await temporaryRuntime(model);
+    const rootUser = userMessage("start phased work");
+    const steer = steeringMessage("change direction");
+    const started = await service.startPrompt(session.id, rootUser);
+    const completion = collect(started.stream);
+    await firstEntered.promise;
+    await service.steer({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "phase-boundary-steer",
+      message: steer,
+    });
+    releaseFirst.resolve();
+    await secondEntered.promise;
+    const activeResume = await service.getSessionResume(session.id);
+    expect(activeResume.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+    ]);
+    expect(activeResume.messages[3]).toEqual(steer);
+    expect(activeResume.replayCursor).toMatchObject({ runId: started.runId });
+    releaseSecond.resolve();
+    await completion;
+
+    const messages = service.getMessages(session.id);
+    expect(messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    expect(messages[0]).toEqual(rootUser);
+    expect(messages[3]).toEqual(steer);
+    expect(JSON.stringify(messages[1])).toContain("Preparing for steering.");
+    expect(JSON.stringify(messages[2])).toContain("Ready for steering.");
+    expect(JSON.stringify(messages[4])).toContain("Steering applied.");
+    expect(service.store.getModelMessages(session.id).map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
     service.close();
   });
 
