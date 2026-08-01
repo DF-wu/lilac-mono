@@ -115,7 +115,7 @@ import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
-import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
+import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
@@ -359,6 +359,42 @@ export function consumeAssistantTextDelta(params: {
   }
   params.state.lastTextPartId = params.partId;
   return nextDelta;
+}
+
+export function removeSilentAssistantTurnMessages(input: {
+  messages: readonly ModelMessage[];
+  startIndex: number;
+  messageCount: number;
+}): ModelMessage[] {
+  const endIndex = input.startIndex + input.messageCount;
+  const messages: ModelMessage[] = [];
+
+  for (let index = 0; index < input.messages.length; index += 1) {
+    const message = input.messages[index]!;
+    if (index < input.startIndex || index >= endIndex || message.role !== "assistant") {
+      messages.push(message);
+      continue;
+    }
+
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("\n\n");
+    if (resolveReplyDeliveryFromFinalText(text) !== "skip") {
+      messages.push(message);
+      continue;
+    }
+    if (typeof message.content === "string") continue;
+
+    const content = message.content.filter((part) => part.type !== "text");
+    if (content.every((part) => part.type === "reasoning")) continue;
+    messages.push({ ...message, content });
+  }
+
+  return messages;
 }
 
 export type ReasoningChunkState = {
@@ -4446,9 +4482,40 @@ export async function startBusAgentRunner(params: {
 
         return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
       };
+      let pendingSilentTurnStartIndex: number | null = null;
+      const removePendingSilentTurn = () => {
+        if (pendingSilentTurnStartIndex === null) return;
+        const startIndex = pendingSilentTurnStartIndex;
+        pendingSilentTurnStartIndex = null;
+        const hasAssistantMessage = agent.state.messages
+          .slice(startIndex)
+          .some((message) => message.role === "assistant");
+        if (!hasAssistantMessage) return;
+
+        const messages = removeSilentAssistantTurnMessages({
+          messages: agent.state.messages,
+          startIndex,
+          messageCount: agent.state.messages.length - startIndex,
+        });
+        if (runProfile === "primary" && next.requestClient === "discord") {
+          const currentCanonicalStart =
+            state.activeRun?.corePrimaryLineage?.currentCanonicalStart ??
+            next.corePrimaryLineage?.currentCanonicalStart ??
+            startIndex;
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "silent-turn-removal",
+            currentCanonicalStart,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
+        agent.replaceMessages(messages);
+      };
+
       agent.setTurnBoundaryHandler(async (context) => {
         await coreNamedClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
         await corePrimaryClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
+        removePendingSilentTurn();
+
         lastBoundaryModelInputMessages = context.modelInputMessages;
         return await drainDeferredCompletions({
           modelInputMessages: context.modelInputMessages,
@@ -4461,6 +4528,11 @@ export async function startBusAgentRunner(params: {
       let finalText = "";
       let stableFinalText = "";
       let stablePartialText = state.activeRun?.partialText ?? "";
+      let turnTextStartIndex = 0;
+      let turnPartialTextStartIndex = stablePartialText.length;
+      let pendingNoReplyTurnText = "";
+      let bufferNoReplyTurnText = true;
+      let lastCompletedTurnWasSilent = false;
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
         next.recovery?.partialText,
       );
@@ -4560,9 +4632,36 @@ export async function startBusAgentRunner(params: {
           runStats.finalMessages = event.messages;
         }
 
+        if (event.type === "messages_reset") {
+          removePendingSilentTurn();
+        }
+
         if (event.type === "turn_end") {
           transientRetryController.reset();
           retryAttemptHadReasoning = false;
+          const turnText = finalText.slice(turnTextStartIndex);
+          const silentTurn = resolveReplyDeliveryFromFinalText(turnText) === "skip";
+          lastCompletedTurnWasSilent = silentTurn;
+          if (silentTurn) {
+            finalText = finalText.slice(0, turnTextStartIndex);
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText = state.activeRun.partialText.slice(
+                0,
+                turnPartialTextStartIndex,
+              );
+            }
+            pendingSilentTurnStartIndex = agent.state.messages.length - event.newMessages.length;
+          } else if (bufferNoReplyTurnText && pendingNoReplyTurnText.length > 0) {
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText += pendingNoReplyTurnText;
+            }
+            outputPublisher.publishText(pendingNoReplyTurnText);
+          }
+
+          pendingNoReplyTurnText = "";
+          bufferNoReplyTurnText = true;
+          turnTextStartIndex = finalText.length;
+          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
           stableFinalText = finalText;
           stablePartialText = state.activeRun?.partialText ?? stablePartialText;
 
@@ -4603,6 +4702,16 @@ export async function startBusAgentRunner(params: {
           transientRetryController.reset();
         }
 
+        if (event.type === "turn_abort") {
+          if (bufferNoReplyTurnText) {
+            finalText = finalText.slice(0, turnTextStartIndex);
+          }
+          pendingNoReplyTurnText = "";
+          bufferNoReplyTurnText = true;
+          turnTextStartIndex = finalText.length;
+          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
+        }
+
         if (event.type === "turn_retry") {
           outputPublisher.flush();
           assistantTextPartBoundaryState.lastTextPartId = null;
@@ -4612,6 +4721,10 @@ export async function startBusAgentRunner(params: {
           if (state.activeRun?.requestId === next.requestId) {
             state.activeRun.partialText = stablePartialText;
           }
+          pendingNoReplyTurnText = "";
+          bufferNoReplyTurnText = true;
+          turnTextStartIndex = stableFinalText.length;
+          turnPartialTextStartIndex = stablePartialText.length;
 
           if (retryAttemptHadReasoning) {
             reasoningChunkState.chunks.clear();
@@ -4659,11 +4772,23 @@ export async function startBusAgentRunner(params: {
           });
 
           finalText += delta;
-          if (state.activeRun && state.activeRun.requestId === next.requestId) {
-            state.activeRun.partialText += delta;
-          }
 
-          outputPublisher.publishText(delta);
+          if (bufferNoReplyTurnText) {
+            pendingNoReplyTurnText += delta;
+            if (!isPossibleNoReplyPrefix(pendingNoReplyTurnText)) {
+              bufferNoReplyTurnText = false;
+              if (state.activeRun?.requestId === next.requestId) {
+                state.activeRun.partialText += pendingNoReplyTurnText;
+              }
+              outputPublisher.publishText(pendingNoReplyTurnText);
+              pendingNoReplyTurnText = "";
+            }
+          } else {
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText += delta;
+            }
+            outputPublisher.publishText(delta);
+          }
         }
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_end") {
@@ -5005,7 +5130,10 @@ export async function startBusAgentRunner(params: {
 
       const isHeartbeatAckOnly =
         isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(finalText);
-      const delivery = resolveReplyDeliveryFromFinalText(finalText);
+      const delivery =
+        finalText.length === 0 && lastCompletedTurnWasSilent
+          ? "skip"
+          : resolveReplyDeliveryFromFinalText(finalText);
       if (!isCancelled && delivery !== "skip" && !isHeartbeatAckOnly && finalText.length === 0) {
         throw new Error(
           buildNoAssistantTextError({

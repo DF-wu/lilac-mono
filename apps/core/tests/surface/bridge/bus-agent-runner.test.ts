@@ -80,6 +80,7 @@ import {
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
   refreshSelectedLevel1Tools,
+  removeSilentAssistantTurnMessages,
   resolveAgentRunModel,
   resolveAgentRunModelFallbacks,
   selectNextNativeModelFallback,
@@ -231,6 +232,24 @@ function level1ToolCallStep(calls: readonly { toolCallId: string; toolName: stri
     stream: simulateReadableStream({
       chunks: [
         ...calls.map((call) => ({ type: "tool-call" as const, ...call, input: "{}" })),
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: level1ZeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function level1TextAndToolCallStep(text: string, call: { toolCallId: string; toolName: string }) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "text" },
+        { type: "text-delta" as const, id: "text", delta: text },
+        { type: "text-end" as const, id: "text" },
+        { type: "tool-call" as const, ...call, input: "{}" },
         {
           type: "finish" as const,
           finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
@@ -2260,6 +2279,91 @@ describe("startBusAgentRunner production path", () => {
     await lifecycle.stop();
     await runner.stop();
     await pluginManager.destroy();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("silences an intermediate NO_REPLY turn while preserving its tool exchange", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/silent-turn" };
+    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-silent-turn-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const modelPrompts: ModelMessage[][] = [];
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-silent-turn",
+      config,
+      pluginManager,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "silent-turn",
+            doStream: async (call) => {
+              modelPrompts.push([...call.prompt]);
+              modelCalls += 1;
+              return modelCalls === 1
+                ? level1TextAndToolCallStep("NO_REPLY", {
+                    toolCallId: "call-silent",
+                    toolName: "builtin",
+                  })
+                : level1TextStep("final answer");
+            },
+          }),
+        }),
+    });
+    const requestId = "github:silent-turn-session:request";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    const responsePublished = deferred<void>();
+    const outputEvents: Array<Message<unknown>> = [];
+    const outputSubscription = await bus.subscribeTopic(
+      outReqTopic(requestId),
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        outputEvents.push(message);
+        if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
+          responsePublished.resolve(undefined);
+        }
+        await context.commit();
+      },
+    );
+
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "silent-turn-session",
+      text: "wait for the work",
+    });
+
+    await expect(lifecycle.terminal).resolves.toBe("resolved");
+    await responsePublished.promise;
+    expect(modelCalls).toBe(2);
+    expect(JSON.stringify(outputEvents)).not.toContain("NO_REPLY");
+    expect(
+      outputEvents.find((message) => message.type === lilacEventTypes.EvtAgentOutputResponseText)
+        ?.data,
+    ).toMatchObject({ finalText: "final answer", delivery: "reply" });
+    const secondTurnAssistantMessages = modelPrompts[1]?.filter(
+      (message) => message.role === "assistant",
+    );
+    expect(JSON.stringify(secondTurnAssistantMessages)).not.toContain("NO_REPLY");
+    expect(JSON.stringify(secondTurnAssistantMessages)).toContain("call-silent");
+    const transcript = store.getRequestTranscript({ requestId });
+    expect(transcript?.finalText).toBe("final answer");
+    expect(JSON.stringify(transcript?.messages)).not.toContain("NO_REPLY");
+    expect(JSON.stringify(transcript?.messages)).toContain("call-silent");
+
+    await outputSubscription.stop();
+    await lifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    store.close();
     await bus.close();
     await rm(dataDir, { recursive: true, force: true });
   });
@@ -6151,6 +6255,75 @@ describe("withBlankLineBetweenTextParts", () => {
     });
 
     expect(out).toBe("Fresh reply.");
+  });
+});
+
+describe("silent assistant turn removal", () => {
+  it("drops pure assistant output only inside the completed turn range", () => {
+    const messages = [
+      { role: "user", content: "request" },
+      { role: "assistant", content: "NO_REPLY" },
+      { role: "assistant", content: "later answer" },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 1, messageCount: 1 })).toEqual(
+      [messages[0]!, messages[2]!],
+    );
+  });
+
+  it("removes sentinel text but preserves structural assistant parts", () => {
+    const messages = [
+      { role: "user", content: "request" },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private" },
+          { type: "text", text: "NO_REPLY" },
+          { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "builtin",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 1, messageCount: 1 })).toEqual(
+      [
+        messages[0]!,
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "private" },
+            { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+          ],
+        },
+        messages[2]!,
+      ],
+    );
+  });
+
+  it("drops reasoning when no structural assistant parts remain", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private" },
+          { type: "text", text: "NO_REPLY" },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
+      [],
+    );
   });
 });
 
