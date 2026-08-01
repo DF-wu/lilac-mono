@@ -1,10 +1,18 @@
 /**
  * Canonical event contracts for the Lilac monorepo.
  *
- * Compile-time only: there is no runtime validation/decoding.
+ * Most event data remains compile-time only. Runtime parsers are exported for
+ * contracts, such as Core primary lineage, that cross trust boundaries.
  */
 
-import type { ModelMessage } from "ai";
+import { modelMessageSchema, type ModelMessage } from "ai";
+import { z } from "zod";
+
+import {
+  corePrimaryLineageV1Schema,
+  parseCorePrimaryLineageV1,
+  type CorePrimaryLineageV1,
+} from "./core-primary-lineage";
 
 /**
  * Event type string constants (use for autocomplete).
@@ -84,6 +92,8 @@ export type RequestOrigin = {
 export type CmdRequestMessageData = {
   queue: RequestQueueMode;
   messages: ModelMessage[];
+  /** Core-owned canonical primary lineage; other producers may omit it. */
+  corePrimaryLineage?: CorePrimaryLineageV1;
   runPolicy?: RequestRunPolicy;
   origin?: RequestOrigin;
   /** Optional direct model ref (provider/model or alias from models.def). */
@@ -91,6 +101,30 @@ export type CmdRequestMessageData = {
   /** Raw adapter payload (platform event) if you need it later. */
   raw?: unknown;
 };
+
+const cmdRequestMessageDataShapeSchema = z.strictObject({
+  queue: z.enum(["prompt", "steer", "followUp", "interrupt"]),
+  messages: z.array(modelMessageSchema),
+  corePrimaryLineage: corePrimaryLineageV1Schema.optional(),
+  runPolicy: z.enum(["normal", "idle_only_session", "idle_only_global"]).optional(),
+  origin: z
+    .strictObject({
+      kind: z.literal("heartbeat"),
+      reason: z.enum(["interval", "retry"]),
+    })
+    .optional(),
+  modelOverride: z.string().optional(),
+  raw: z.unknown().optional(),
+});
+
+/** Parse request data and validate any supplied lineage against `messages`. */
+export function parseCmdRequestMessageData(value: unknown): CmdRequestMessageData {
+  const data = cmdRequestMessageDataShapeSchema.parse(value);
+  if (data.corePrimaryLineage) {
+    parseCorePrimaryLineageV1(data.corePrimaryLineage, data.messages);
+  }
+  return data;
+}
 
 /** Command: switch an active output relay to a new reply anchor. */
 export type CmdSurfaceOutputReanchorData = {

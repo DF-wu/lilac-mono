@@ -261,7 +261,24 @@ agent:
           tools: [read_file, glob, grep, fuzzy_search, batch]
           plugins: [builtin-local-tools]
         level2:
-          callables: [fetch, search, skills.list, skills.brief, skills.full, content.inspect, discovery.search, conversation.thread.search, surface.help, surface.sessions.listParticipants, surface.messages.list, surface.messages.read, surface.messages.search, surface.reactions.list, surface.reactions.listDetailed]
+          callables:
+            [
+              fetch,
+              search,
+              skills.list,
+              skills.brief,
+              skills.full,
+              content.inspect,
+              discovery.search,
+              conversation.thread.search,
+              surface.help,
+              surface.sessions.listParticipants,
+              surface.messages.list,
+              surface.messages.read,
+              surface.messages.search,
+              surface.reactions.list,
+              surface.reactions.listDetailed,
+            ]
           plugins: [web, skills, content.inspect, discovery, conversation.thread, surface]
         # Behavioral/tool-surface settings; these do not sandbox trusted Bash.
         network: true
@@ -321,6 +338,22 @@ agent:
 #   You are lilac.
 
 models:
+  # Local Claude subscription models use claude-code/<model>, for example:
+  # model: claude-code/claude-sonnet-4-6
+  # Local runs may use an installed Claude CLI with existing authenticated config
+  # or `claude auth login`. Core Docker can use the SDK-bundled executable with
+  # CLAUDE_CODE_OAUTH_TOKEN and/or a mounted authenticated Claude config.
+  # CLAUDE_CONFIG_DIR selects auth/config/native transcript storage and defaults
+  # to ~/.claude. When set, it must be a non-empty absolute writable path; mount
+  # it persistently in containers. A dedicated path separates operator storage,
+  # not same-user access or privacy.
+  # Stable named subagents require an exact canonical head; Discord primary
+  # requires a retained terminal request plus an exact complete-segment lineage
+  # prefix. First/missing/invalid/scope-mismatched state starts fresh persisted;
+  # only an exact compatible continuation forks. Fork-heavy storage may grow
+  # roughly quadratically and is not deleted by Core.
+  # Explicit cross-family selection uses lossy text replay. Automatic fallback
+  # never crosses provider families and is disabled for a Claude-headed run.
   # Optional preset registry to make model selection ergonomic.
   def: {}
   # def:
@@ -378,7 +411,9 @@ models:
     # Optional portable AI SDK reasoning effort.
     # reasoning: provider-default
     # Optional ordered fallback chain. A slot chain takes precedence over a chain
-    # declared by the models.def alias selected above.
+    # declared by the models.def alias selected above. Runtime fallback skips
+    # candidates outside the head model's provider family; a claude-code head
+    # does not run automatic fallback at all.
     # fallback:
     #   - openrouter/anthropic/claude-sonnet-4.5
     #   - model: openai/gpt-4o

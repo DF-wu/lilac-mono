@@ -1,4 +1,5 @@
 import type { ModelMessage } from "ai";
+import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
 
 import type { MsgRef } from "../../types";
 
@@ -8,6 +9,7 @@ export type RequestCompositionResult = {
   messages: ModelMessage[];
   chainMessageIds: string[];
   mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+  corePrimaryLineage: CorePrimaryLineageV1;
 };
 
 export type ComposeRecentChannelMessagesOpts = {
@@ -19,6 +21,7 @@ export type ComposeRecentChannelMessagesOpts = {
   limit: number;
   transcriptStore?: TranscriptStore;
   currentRequestId?: string;
+  currentMessageIds?: readonly string[];
   discordUserAliasById?: ReadonlyMap<string, string>;
   /** Optional trigger message to force-include (mention/reply). */
   triggerMsgRef?: MsgRef;
@@ -34,6 +37,8 @@ export type ComposeSingleMessageOpts = {
   botName: string;
   msgRef: MsgRef;
   discordUserAliasById?: ReadonlyMap<string, string>;
+  transcriptStore?: TranscriptStore;
+  currentMessageIds?: readonly string[];
   transformUserText?: (text: string) => string;
 };
 
@@ -43,6 +48,7 @@ export type ComposeRequestOpts = {
   botName: string;
   transcriptStore?: TranscriptStore;
   currentRequestId?: string;
+  currentMessageIds?: readonly string[];
   discordUserAliasById?: ReadonlyMap<string, string>;
   trigger: {
     type: "mention" | "reply";

@@ -15,7 +15,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createOpenAI } from "@ai-sdk/openai";
-import { attachAutoCompaction, type AutoCompactionOptions } from "@stanley2058/lilac-agent";
+import {
+  attachAutoCompaction,
+  type AutoCompactionOptions,
+  type HistoryProviderState,
+} from "@stanley2058/lilac-agent";
 import type {
   MiniLilacCancelCompactionResult,
   MiniLilacCompactionEvent,
@@ -412,6 +416,7 @@ function seedCompletedHistory(
   uiMessages: readonly MiniLilacUIMessage[],
   todos?: readonly MiniLilacTodo[],
   runId = `seed-run:${crypto.randomUUID()}`,
+  providerState?: HistoryProviderState,
 ): string {
   const currentModelMessages = store.getModelMessages(sessionId);
   const currentUiMessages = store.getUiMessages(sessionId);
@@ -462,6 +467,7 @@ function seedCompletedHistory(
     workspaceSnapshotId: null,
     workspaceStatus: "unavailable",
     workspaceUnavailableReason: "git-unavailable",
+    ...(providerState === undefined ? {} : { providerState }),
   });
   return runId;
 }
@@ -779,7 +785,7 @@ describe("MiniLilacSqliteStore", () => {
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, "runtime.sqlite");
     const original = new MiniLilacSqliteStore(databasePath);
-    original.database.exec("PRAGMA user_version = 8;");
+    original.database.exec("PRAGMA user_version = 9;");
     original.close();
 
     expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(MiniLilacDatabaseVersionError);
@@ -4111,7 +4117,7 @@ describe("SessionService", () => {
       attachCompaction: async (agent, options) => {
         thresholdInputSource = options.thresholdInputSource;
         const encoded = Buffer.alloc(4, 7).toString("base64");
-        const transformed = await options.baseTransformMessages?.(
+        const transformed = await options.prepareFullModelView?.(
           [
             {
               role: "tool",
@@ -4369,6 +4375,9 @@ describe("SessionService", () => {
         },
       ],
       [userMessage("visible prior request")],
+      undefined,
+      undefined,
+      { lastFamily: "ai-sdk", containsCrossFamilyTurns: false },
     );
 
     await collect(
@@ -7094,7 +7103,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("rolls back root setup when agent construction fails", async () => {
+  it("terminalizes an admitted root prompt when model preparation fails", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-setup-"));
     temporaryDirectories.push(directory);
@@ -7114,8 +7123,8 @@ describe("SessionService", () => {
       "model construction failed",
     );
     expect(service.store.getActiveRootRun(session.id)).toBeNull();
-    expect(service.getSnapshot(session.id).status).toBe("idle");
-    expect(service.getMessages(session.id)).toEqual([]);
+    expect(service.getSnapshot(session.id).status).toBe("error");
+    expect(JSON.stringify(service.getMessages(session.id))).toContain("should roll back");
     service.close();
   });
 
@@ -7194,7 +7203,13 @@ describe("SessionService", () => {
     await collect(started.stream);
 
     expect(service.store.getRun(started.runId).status).toBe("completed");
-    expect(delegatedRuns(service, session.id)).toEqual([]);
+    const childRun = delegatedRuns(service, session.id)[0];
+    expect(childRun).toMatchObject({
+      status: "error",
+      error: "Failed to prepare model runtime: child construction failed",
+    });
+    if (childRun === undefined) throw new Error("expected terminal child setup failure");
+    expect(service.store.getActiveRootRun(childRun.sessionId)).toBeNull();
     expect(service.getSnapshot(session.id).status).toBe("idle");
     service.close();
   });
@@ -7812,7 +7827,7 @@ describe("SessionService", () => {
       databasePath,
       modelResolver: () => model,
       attachCompaction: async (agent) => {
-        agent.setTransformMessages((messages) => [
+        agent.setPrepareFullModelView((messages) => [
           ...messages,
           { role: "user", content: "compaction-transform-marker" },
         ]);
@@ -8009,7 +8024,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       attachCompaction: async (agent) => {
-        agent.setTransformMessages((messages) => [
+        agent.setPrepareFullModelView((messages) => [
           ...messages,
           { role: "assistant", content: "invalid assistant tail" },
         ]);
@@ -8023,7 +8038,7 @@ describe("SessionService", () => {
     expect(model.doStreamCalls).toHaveLength(0);
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
-      error: "Cannot append todo context after an assistant message",
+      error: "Cannot append an ephemeral overlay after an assistant message",
     });
     service.close();
   });

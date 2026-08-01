@@ -390,6 +390,7 @@ export async function fetchMentionThreadContext(
 
 export function mergeChainByDiscordWindow(
   chainOldestToNewest: readonly ReplyChainMessage[],
+  hardBreakBeforeMessageIds: ReadonlySet<string> = new Set(),
 ): MergedChunk[] {
   if (chainOldestToNewest.length === 0) return [];
 
@@ -398,7 +399,7 @@ export function mergeChainByDiscordWindow(
       message: m,
       authorId: m.authorId,
       ts: m.ts,
-      hardBreakBefore: hasReplyTargetInRaw(m.raw),
+      hardBreakBefore: hasReplyTargetInRaw(m.raw) || hardBreakBeforeMessageIds.has(m.messageId),
     })),
   );
 

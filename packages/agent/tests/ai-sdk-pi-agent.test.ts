@@ -722,6 +722,70 @@ describe("AiSdkPiAgent streamText retries", () => {
     expect(model.doStreamCalls).toHaveLength(2);
   });
 
+  it("lets a replacement runtime disable AI SDK retries for only that call", async () => {
+    const originalModel = new MockLanguageModelV4({
+      doStream: async () => {
+        throw new Error("original runtime must not be invoked");
+      },
+    });
+    const replacementModel = new MockLanguageModelV4({
+      doStream: async () => {
+        throw retryableApiCallError();
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: originalModel,
+      streamTextMaxRetries: 1,
+      prepareModelCall: ({ payload }) => ({
+        runtime: {
+          model: replacementModel,
+          executionMode: "provider-tools",
+          streamTextMaxRetries: 0,
+        },
+        payload,
+      }),
+    });
+
+    await expect(agent.prompt("do not retry internally")).rejects.toBeInstanceOf(APICallError);
+
+    expect(originalModel.doStreamCalls).toHaveLength(0);
+    expect(replacementModel.doStreamCalls).toHaveLength(1);
+  });
+
+  it("lets an omitted replacement runtime retry limit inherit the constructor default", async () => {
+    let calls = 0;
+    const originalModel = new MockLanguageModelV4({
+      doStream: async () => {
+        throw new Error("original runtime must not be invoked");
+      },
+    });
+    const replacementModel = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls === 1) throw retryableApiCallError();
+        return textStream("answer", "recovered");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: originalModel,
+      streamTextMaxRetries: 1,
+      prepareModelCall: ({ payload }) => ({
+        runtime: {
+          model: replacementModel,
+          executionMode: "provider-tools",
+        },
+        payload,
+      }),
+    });
+
+    await agent.prompt("inherit retry default");
+
+    expect(originalModel.doStreamCalls).toHaveLength(0);
+    expect(replacementModel.doStreamCalls).toHaveLength(2);
+  });
+
   it("lets the agent handler control the exact call count when SDK retries are disabled", async () => {
     let calls = 0;
     let retries = 0;
@@ -746,6 +810,110 @@ describe("AiSdkPiAgent streamText retries", () => {
 
     expect(retries).toBe(2);
     expect(model.doStreamCalls).toHaveLength(3);
+  });
+
+  it("keeps provider-tool retry unsafe across outer calls of one persistent attempt", async () => {
+    const laterFailure = new Error("later same-attempt failure");
+    const retrySafety: boolean[] = [];
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls === 1) {
+          await agent.executeExternalToolCall({
+            toolCallId: "persistent-tool",
+            toolName: "external_tool",
+            input: {},
+          });
+          return textStream("first", "first response");
+        }
+        return {
+          stream: simulateReadableStream({ chunks: [{ type: "error", error: laterFailure }] }),
+        };
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        external_tool: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "completed",
+        }),
+      },
+      prepareModelCall: ({ payload }) => ({
+        runtime: {
+          model,
+          executionMode: "provider-tools",
+          persistentAttemptIdentity: "candidate-a",
+          streamTextMaxRetries: 0,
+        },
+        payload,
+      }),
+      turnBoundaryHandler: () =>
+        calls === 1 ? { append: [{ role: "user", content: "continue" }] } : {},
+      turnErrorHandler: (_error, context) => {
+        retrySafety.push(context.retrySafety.canRetry);
+        return "retry";
+      },
+    });
+
+    await expect(agent.prompt("start")).rejects.toBe(laterFailure);
+    expect(retrySafety).toEqual([false]);
+    expect(model.doStreamCalls).toHaveLength(2);
+  });
+
+  it("resets provider-tool retry safety after installing a distinct persistent attempt", async () => {
+    const nextAttemptFailure = new Error("new-attempt failure");
+    const retrySafety: boolean[] = [];
+    let attemptIdentity = "candidate-a";
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls === 1) {
+          await agent.executeExternalToolCall({
+            toolCallId: "first-attempt-tool",
+            toolName: "external_tool",
+            input: {},
+          });
+          return textStream("first", "first response");
+        }
+        return {
+          stream: simulateReadableStream({
+            chunks: [{ type: "error", error: nextAttemptFailure }],
+          }),
+        };
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        external_tool: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "completed",
+        }),
+      },
+      prepareModelCall: ({ payload }) => ({
+        runtime: {
+          model,
+          executionMode: "provider-tools",
+          persistentAttemptIdentity: attemptIdentity,
+          streamTextMaxRetries: 0,
+        },
+        payload,
+      }),
+      turnErrorHandler: (_error, context) => {
+        retrySafety.push(context.retrySafety.canRetry);
+        return "fail";
+      },
+    });
+
+    await agent.prompt("first attempt");
+    attemptIdentity = "candidate-b";
+    await expect(agent.prompt("second attempt")).rejects.toBe(nextAttemptFailure);
+    expect(retrySafety).toEqual([true]);
   });
 });
 
@@ -1746,14 +1914,13 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
           },
         }),
       },
-      transformMessages: async (messages) => {
+      canonicalModelCallPreflight: async (messages) => {
         transformCalls += 1;
         if (transformCalls === 2) {
           resumedInputs.push([...messages]);
           resumedTransformEntered.resolve();
           await releaseResumedTransform.promise;
         }
-        return [...messages];
       },
       beforeSteeringDelivery: ({ deliveryKind }) => {
         if (deliveryKind !== "interrupt") return;
@@ -1853,7 +2020,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model: fakeModel(),
-      transformMessages: async (messages) => {
+      prepareFullModelView: async (messages) => {
         transformEntered.resolve();
         await releaseTransform.promise;
         return [...messages];
@@ -1898,9 +2065,8 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model,
-      transformMessages: (messages) => {
+      canonicalModelCallPreflight: () => {
         expect(agent.acknowledgeSteeringDelivery(steeringId)).toBe(true);
-        return [...messages];
       },
     });
     steeringId = agent.steer("change direction");
@@ -1985,14 +2151,13 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model,
-      transformMessages: async (messages) => {
+      canonicalModelCallPreflight: async (messages) => {
         modelInputs.push(messages);
         transformCount += 1;
         if (transformCount === 1) {
           firstTransformEntered.resolve();
           await releaseFirstTransform.promise;
         }
-        return [...messages];
       },
     });
 
@@ -2058,14 +2223,13 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model,
-      transformMessages: async (messages) => {
+      canonicalModelCallPreflight: async (messages) => {
         modelInputs.push(messages);
         transformCount += 1;
         if (transformCount === 1) {
           firstTransformEntered.resolve();
           await releaseFirstTransform.promise;
         }
-        return [...messages];
       },
     });
     agent.subscribe((event) => {
@@ -2164,9 +2328,8 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
           },
         }),
       },
-      transformMessages: (messages) => {
+      canonicalModelCallPreflight: (messages) => {
         modelInputs.push(messages);
-        return [...messages];
       },
     });
     agent.subscribe((event) => {
@@ -2214,6 +2377,189 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     ]);
   });
 
+  it("prepares full budget context before selecting and independently preparing a replacement-runtime suffix", async () => {
+    const order: string[] = [];
+    const originalModel = new MockLanguageModelV4({
+      doStream: async () => {
+        throw new Error("original runtime must not be invoked");
+      },
+    });
+    const replacementModel = new MockLanguageModelV4({
+      doStream: async () => {
+        order.push("model");
+        return textStream("replacement", "replacement response");
+      },
+    });
+    let overlayRevision = 0;
+    const budgetInputs: Array<{ messages: ModelMessage[]; canonicalStartIndex?: number }> = [];
+    const payloadInputs: ModelMessage[][] = [];
+    const canonicalBefore: ModelMessage[] = [
+      { role: "user", content: "old request" },
+      { role: "assistant", content: "old response" },
+    ];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: originalModel,
+      modelSpecifier: "test/original",
+      messages: canonicalBefore,
+      prepareFullBudgetView: (messages, context) => {
+        budgetInputs.push({
+          messages: [...messages],
+          canonicalStartIndex: context.canonicalStartIndex,
+        });
+        order.push("prepare-budget");
+        return messages.map((message) =>
+          message.role === "user" && typeof message.content === "string"
+            ? { ...message, content: `${message.content} [budget]` }
+            : message,
+        );
+      },
+      prepareFullModelView: (messages) => {
+        payloadInputs.push([...messages]);
+        order.push("prepare-suffix");
+        return messages.map((message) =>
+          message.role === "user" && typeof message.content === "string"
+            ? { ...message, content: `${message.content} [prepared]` }
+            : message,
+        );
+      },
+      buildEphemeralOverlay: () => {
+        overlayRevision += 1;
+        order.push(`overlay-${overlayRevision}`);
+        return [{ role: "user", content: `overlay-${overlayRevision}` }];
+      },
+      prepareModelCall: ({ canonicalMessages, fullBudgetView }) => {
+        order.push("seam");
+        expect(canonicalMessages).toEqual([...canonicalBefore, { role: "user", content: "new" }]);
+        expect(JSON.stringify(fullBudgetView)).toContain("old request [budget]");
+        expect(JSON.stringify(fullBudgetView)).toContain("overlay-1");
+        return {
+          runtime: {
+            model: replacementModel,
+            modelSpecifier: "test/replacement",
+            executionMode: "provider-tools",
+          },
+          payload: { mode: "suffix", startIndex: 2 },
+        };
+      },
+      decorateRequestPayload: (payload) => {
+        order.push("decorate");
+        const last = payload.at(-1);
+        if (last?.role !== "user") throw new Error("expected overlay user message");
+        return [
+          ...payload.slice(0, -1),
+          { ...last, providerOptions: { test: { decorated: true } } },
+        ];
+      },
+    });
+
+    await agent.prompt("new");
+
+    expect(order).toEqual([
+      "prepare-budget",
+      "overlay-1",
+      "seam",
+      "prepare-suffix",
+      "overlay-2",
+      "decorate",
+      "model",
+    ]);
+    expect(budgetInputs).toEqual([
+      {
+        messages: [...canonicalBefore, { role: "user", content: "new" }],
+        canonicalStartIndex: 0,
+      },
+    ]);
+    expect(payloadInputs).toEqual([[{ role: "user", content: "new" }]]);
+    expect(originalModel.doStreamCalls).toHaveLength(0);
+    expect(replacementModel.doStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(replacementModel.doStreamCalls[0]?.prompt)).not.toContain("old request");
+    expect(JSON.stringify(replacementModel.doStreamCalls[0]?.prompt)).toContain("overlay-2");
+    expect(replacementModel.doStreamCalls[0]?.prompt.at(-1)?.providerOptions).toEqual({
+      test: { decorated: true },
+    });
+    expect(JSON.stringify(agent.state.messages)).not.toContain("overlay-");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("decorated");
+  });
+
+  it("re-enters model-call preparation from unchanged canonical history on a safe Agent retry", async () => {
+    const firstError = retryableApiCallError();
+    const firstModel = new MockLanguageModelV4({
+      doStream: async () => {
+        throw firstError;
+      },
+    });
+    const replacementModel = new MockLanguageModelV4({
+      doStream: async () => textStream("replacement", "replacement response"),
+    });
+    const canonicalBefore: ModelMessage[] = [
+      { role: "user", content: "old request" },
+      { role: "assistant", content: "old response" },
+    ];
+    const preparedCanonicalHistory: ModelMessage[][] = [];
+    const fullBudgetViews: ModelMessage[][] = [];
+    let preparations = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: firstModel,
+      modelSpecifier: "test/first",
+      streamTextMaxRetries: 0,
+      messages: canonicalBefore,
+      prepareFullModelView: (messages) =>
+        messages.map((message) =>
+          message.role === "user" && typeof message.content === "string"
+            ? { ...message, content: `${message.content} [prepared]` }
+            : message,
+        ),
+      buildEphemeralOverlay: () => [{ role: "user", content: "full-budget-overlay" }],
+      prepareModelCall: ({ canonicalMessages, fullBudgetView, runtime, payload }) => {
+        preparations += 1;
+        preparedCanonicalHistory.push([...canonicalMessages]);
+        fullBudgetViews.push([...fullBudgetView]);
+        if (preparations === 1) return { runtime, payload };
+        return {
+          runtime: {
+            model: replacementModel,
+            modelSpecifier: "test/replacement",
+            executionMode: "provider-tools",
+          },
+          payload: { mode: "suffix", startIndex: 2 },
+        };
+      },
+      turnErrorHandler: (error, context) => {
+        expect(error).toBe(firstError);
+        expect(context.retrySafety).toEqual({ canRetry: true });
+        return "retry";
+      },
+    });
+
+    await agent.prompt("new request");
+
+    const expectedCanonical: ModelMessage[] = [
+      ...canonicalBefore,
+      { role: "user", content: "new request" },
+    ];
+    expect(preparedCanonicalHistory).toEqual([expectedCanonical, expectedCanonical]);
+    expect(fullBudgetViews).toHaveLength(2);
+    for (const fullBudgetView of fullBudgetViews) {
+      expect(JSON.stringify(fullBudgetView)).toContain("old request [prepared]");
+      expect(JSON.stringify(fullBudgetView)).toContain("old response");
+      expect(JSON.stringify(fullBudgetView)).toContain("new request [prepared]");
+      expect(JSON.stringify(fullBudgetView)).toContain("full-budget-overlay");
+    }
+    expect(firstModel.doStreamCalls).toHaveLength(1);
+    expect(replacementModel.doStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(replacementModel.doStreamCalls[0]?.prompt)).not.toContain("old request");
+    expect(JSON.stringify(replacementModel.doStreamCalls[0]?.prompt)).toContain("new request");
+    expect(agent.state.messages).toEqual([
+      ...expectedCanonical,
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "replacement response" }],
+      },
+    ]);
+  });
+
   it("reports whether a turn error came from setup, transformation, or the model call", async () => {
     const phases: Array<string | undefined> = [];
     const handler = (_error: unknown, context: { phase?: string }) => {
@@ -2235,7 +2581,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const transformAgent = new AiSdkPiAgent({
       system: "test",
       model: fakeModel(),
-      transformMessages: () => {
+      prepareFullModelView: () => {
         throw transformError;
       },
       turnErrorHandler: handler,
@@ -2267,7 +2613,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       const agent = new AiSdkPiAgent({
         system: "test",
         model: fakeModel(),
-        transformMessages: () => {
+        prepareFullModelView: () => {
           throw originalError;
         },
         turnErrorHandler: async () => {
@@ -2308,7 +2654,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model: fakeModel(),
-      transformMessages: () => {
+      prepareFullModelView: () => {
         throw new Error("transient model error");
       },
       turnErrorHandler: async (_error, context) => {
@@ -2347,7 +2693,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model: fakeModel(),
-      transformMessages: () => {
+      prepareFullModelView: () => {
         throw new Error("original turn error");
       },
       turnErrorHandler: async () => {
@@ -2382,7 +2728,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     const agent = new AiSdkPiAgent({
       system: "test",
       model: fakeModel(),
-      transformMessages: () => {
+      prepareFullModelView: () => {
         throw new Error("original turn error");
       },
       turnErrorHandler: async () => {
@@ -2477,6 +2823,149 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     expect(model.doStreamCalls).toHaveLength(1);
     expect(retryReasons).toEqual(["provider-executed-tool"]);
     expect(agent.state.messages).toEqual([{ role: "user", content: "search" }]);
+  });
+
+  it("does not replay when external tool execution precedes provider tool stream activity", async () => {
+    const streamError = new Error("Provider failed before reporting external tool activity");
+    let executions = 0;
+    const retryReasons: string[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        await agent.executeExternalToolCall({
+          toolCallId: "external-call",
+          toolName: "external_tool",
+          input: {},
+        });
+        return {
+          stream: simulateReadableStream({ chunks: [{ type: "error", error: streamError }] }),
+        };
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        external_tool: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => {
+            executions += 1;
+            return "result";
+          },
+        }),
+      },
+      turnErrorHandler: async (_error, context) => {
+        if (!context.retrySafety.canRetry) retryReasons.push(context.retrySafety.reason);
+        return "retry" as const;
+      },
+    });
+
+    await expect(agent.prompt("run external tool")).rejects.toBe(streamError);
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(executions).toBe(1);
+    expect(retryReasons).toEqual(["provider-executed-tool"]);
+  });
+
+  it("resets the external tool latch for a newly started model attempt", async () => {
+    const streamError = new Error("New attempt failed without external tool activity");
+    let calls = 0;
+    let executions = 0;
+    const retrySafety: boolean[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls === 1) {
+          await agent.executeExternalToolCall({
+            toolCallId: "external-call",
+            toolName: "external_tool",
+            input: {},
+          });
+          return textStream("first-answer", "first");
+        }
+        if (calls === 2) {
+          return {
+            stream: simulateReadableStream({ chunks: [{ type: "error", error: streamError }] }),
+          };
+        }
+        return textStream("second-answer", "second");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        external_tool: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => {
+            executions += 1;
+            return "result";
+          },
+        }),
+      },
+      turnErrorHandler: (_error, context) => {
+        retrySafety.push(context.retrySafety.canRetry);
+        return context.retrySafety.canRetry ? "retry" : "fail";
+      },
+    });
+
+    await agent.prompt("first attempt");
+    await agent.prompt("second attempt");
+
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(executions).toBe(1);
+    expect(retrySafety).toEqual([true]);
+  });
+
+  it("clears prior external tool activity before the next attempt prepares", async () => {
+    const preparationError = new Error("Next attempt preparation failed");
+    let executions = 0;
+    let failPreparation = false;
+    const retrySafety: boolean[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        if (model.doStreamCalls.length === 1) {
+          await agent.executeExternalToolCall({
+            toolCallId: "external-call",
+            toolName: "external_tool",
+            input: {},
+          });
+          return textStream("first-answer", "first");
+        }
+        return textStream("second-answer", "second");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        external_tool: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => {
+            executions += 1;
+            return "result";
+          },
+        }),
+      },
+      prepareFullModelView: (messages) => {
+        if (failPreparation) {
+          failPreparation = false;
+          throw preparationError;
+        }
+        return [...messages];
+      },
+      turnErrorHandler: (error, context) => {
+        if (error === preparationError) retrySafety.push(context.retrySafety.canRetry);
+        return context.retrySafety.canRetry ? "retry" : "fail";
+      },
+    });
+
+    await agent.prompt("first attempt");
+    failPreparation = true;
+    await agent.prompt("second attempt");
+
+    expect(executions).toBe(1);
+    expect(retrySafety).toEqual([true]);
+    expect(model.doStreamCalls).toHaveLength(2);
   });
 
   it("does not replay after a provider-executed tool result", async () => {

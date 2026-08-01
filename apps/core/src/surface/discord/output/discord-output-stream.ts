@@ -324,10 +324,9 @@ export function buildDiscordProgressLines(input: {
   tools: readonly DiscordProgressEntry[];
   subagents: readonly DiscordProgressEntry[];
 }): string[] {
-  const rankedSubagents = [...input.subagents].sort((a, b) => {
-    const activeDelta = Number(b.update.status !== "end") - Number(a.update.status !== "end");
-    return activeDelta || b.updatedSeq - a.updatedSeq;
-  });
+  const rankedSubagents = input.subagents
+    .filter((entry) => entry.update.status !== "end")
+    .sort((a, b) => b.updatedSeq - a.updatedSeq);
   const visibleSubagents = rankedSubagents.slice(0, 3);
   const overflow = Math.max(0, rankedSubagents.length - visibleSubagents.length);
   const agentLines: string[] = [];
@@ -363,10 +362,20 @@ export function buildDiscordProgressLines(input: {
 
   let remainingToolLines = Math.max(0, PROGRESS_MAX_LINES - agentLines.length);
   const toolChunks: string[][] = [];
-  const toolsByRecency = [...input.tools].sort((a, b) => b.updatedSeq - a.updatedSeq);
-  for (const entry of toolsByRecency) {
+  const historyByRecency = [
+    ...input.tools.map((entry) => ({
+      entry,
+      rows: buildToolLine(entry.update).split("\n"),
+    })),
+    ...input.subagents
+      .filter((entry) => entry.update.status === "end")
+      .map((entry) => ({
+        entry,
+        rows: [buildSubagentHeader(entry, parseSubagentDisplay(entry.update.display), false)],
+      })),
+  ].sort((a, b) => b.entry.updatedSeq - a.entry.updatedSeq);
+  for (const { rows } of historyByRecency) {
     if (remainingToolLines === 0) break;
-    const rows = buildToolLine(entry.update).split("\n");
     const selectedRows =
       rows.length <= remainingToolLines
         ? rows

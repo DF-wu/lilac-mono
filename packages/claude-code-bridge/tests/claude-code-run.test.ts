@@ -91,6 +91,38 @@ describe("materializeClaudeCodeRun", () => {
     await run.dispose();
   });
 
+  it("keeps persistent initial and continuation settings separate", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const provider = createClaudeCode();
+    const sessionId = "22222222-2222-4222-8222-222222222222";
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd: process.cwd(),
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId },
+      execute: () => {
+        throw new Error("not called");
+      },
+      createModel: (modelId, modelSettings) => {
+        settings.push(modelSettings);
+        return provider(modelId, modelSettings);
+      },
+    });
+
+    expect(run.continuationModel).toBeDefined();
+    expect(settings[0]).toMatchObject({ persistSession: true, sessionId });
+    expect(settings[0]?.resume).toBeUndefined();
+    expect(settings[1]).toMatchObject({ persistSession: true, resume: sessionId });
+    expect(settings[1]?.sessionId).toBeUndefined();
+    expect(settings[1]?.forkSession).toBeUndefined();
+
+    run.createUtilityModel();
+    expect(settings[2]).toMatchObject({ persistSession: false, tools: [], settingSources: [] });
+    expect(settings[2]?.resume).toBeUndefined();
+    expect(settings[2]?.sessionId).toBeUndefined();
+    await run.dispose();
+  });
+
   it("preserves caller built-ins, appends ToolSearch once, and keeps utility tools empty", async () => {
     const settings: ClaudeCodeSettings[] = [];
     const provider = createClaudeCode();

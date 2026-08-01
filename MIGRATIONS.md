@@ -141,6 +141,71 @@ Clients that previously cancelled by aborting the request will no longer stop an
 `compacting` is a session status, and every admission path — prompts included — now requires
 `idle`/`error`. A prompt sent during a compaction is rejected rather than raced.
 
+## Mini Lilac Database Schema 7
+
+Schema 7 adds provider-family metadata to history states and pending finalizations, plus
+exact-history-state Claude bindings and bounded attempt records for Mini main sessions. Existing
+history has unknown provider-family metadata and no native binding, so its next Claude turn starts a
+fresh persisted session rather than guessing that native state is synchronized. The current schema 8
+startup path applies this step to schema 6 and older supported databases in the same transaction as
+the schema 8 step.
+
+Successful Claude turns promote a binding only with their committed terminal history state. Main
+bindings remain attached to retained history states, allowing restart, undo, redo, and branch
+navigation to select an exact clean native base. Active attempts left by a crash become uncertain at
+startup and are never promoted.
+
+## Mini Lilac Database Schema 8
+
+Mini Lilac migrates schema 7 databases to schema 8 transactionally at startup. Schema 8 adds one
+current Claude binding and bounded attempt records for named delegated sessions, together
+with pending-finalization promotion metadata. Existing named sessions receive no inferred native
+binding and start fresh on their next eligible Claude turn. Both caller-supplied and generated names
+are eligible; callers continue an automatically named child by reusing the returned name.
+
+Main-session schema 7 behavior is unchanged. Startup recovery marks interrupted named attempts
+uncertain and can finish a canonically verified pending success. Foreign keys are checked before
+`user_version` becomes 8. Fresh databases and supported schema 2 through 7 databases end at schema 8.
+
+## Core Transcript Database Schemas 1-5
+
+Core's `agent-transcripts.db` has its own `transcript_schema_migrations` sequence. These are internal
+SQLite migrations and do not change `core-config.yaml`; its current config contract remains
+`configVersion: 2`.
+
+- Transcript schema 1 records the baseline request transcript/cache tables and the current named
+  Claude binding/attempt substrate. Existing transcripts do not gain guessed native bindings.
+- Transcript schema 2 adds immutable first-seen surface projections, Core-owned attachment blobs,
+  request/checkpoint lineage references, primary lineage manifests, and canonical transcript digests.
+  Existing transcript rows are parsed and hashed during migration; an unreadable row aborts the
+  migration rather than receiving an unsafe digest.
+- Transcript schema 3 adds request-output alias references so split Discord output messages can point
+  to one canonical request atom without duplicating history.
+- Transcript schema 4 adds Discord-primary Claude bindings and bounded attempt records. A binding is
+  usable only when the current composed lineage proves the exact complete-segment prefix; existing
+  Discord history starts fresh until a successful current turn establishes that proof.
+- Transcript schema 5 adds `terminal_request_id` to every Discord-primary Claude binding. The ID
+  points to the exact retained request transcript and lineage manifest that produce the binding's
+  atom count, prefix digest, and canonical message count. Migration first considers matching retained
+  succeeded attempts, then scans retained durable transcript/manifest rows so a valid binding can be
+  backfilled even when bounded attempt retention already pruned its attempt. Every candidate is fully
+  recomputed and accepted only when its client/session, provider state, lineage version, atom count,
+  digest, and canonical count match exactly. Bindings without one exact durable terminal request are
+  deleted rather than guessed.
+
+Core applies missing versions in one immediate transaction, validates foreign keys, marks interrupted
+native attempts uncertain during startup recovery, and promotes recovered pending successes only
+after canonical transcript/lineage verification. Primary binding reads lazily reverify the identified
+terminal transcript and manifest. A missing, corrupt, or mismatched head is compare-and-delete retired;
+a concurrent replacement is re-read rather than deleted, and continuation safely starts fresh when no
+verified binding remains.
+
+Core also exposes aggregate retention diagnostics for named/primary binding counts, active/terminal
+attempt counts, unverifiable primary bindings, orphan succeeded attempts/manifests, unreferenced
+surface projections, total Core-owned blob bytes, and unreferenced blob counts/bytes. Bounded attempt
+pruning emits per-owner metadata-pruned diagnostics. These are internal retention/operational
+diagnostics and do not add a `core-config.yaml` key; the config contract remains `configVersion: 2`.
+
 ## Historical Workflow Schema 18
 
 Workflow capability review now stores a normalized maximum envelope with per-operation narrowing, exact Level-1 tools, concrete Level-2 callable IDs, destination-scoped origin surface operations, allowed roots, bounded reasoning, and explicit trusted executable authority.
@@ -186,7 +251,7 @@ The deterministic program child is spawned directly with `bun --smol workflow-sa
 
 The persisted state migration is a clean break rather than a reinterpretation:
 
-- The minimal durable dispatch policy is `{ runId, operationId, dispatchEpoch, profile, model, reasoning, resolvedModelRequest, cwd, originSession }`. Old `policy_json` is rewritten into this envelope; the former `canonicalCwd` becomes `cwd`, and canonical-root, inode, safety-mode, isolation, scratch-root, and control-token identity are dropped.
+- The minimal durable dispatch policy is `{ runId, operationId, dispatchEpoch, profile, model, reasoning, resolvedModelRequest, cwd, originSession, stableNamedContinuation? }`. The optional stable identity is present only for eligible live-parent named subagents and is verified against that run's persisted completion target. Old `policy_json` is rewritten into this envelope; the former `canonicalCwd` becomes `cwd`, and canonical-root, inode, safety-mode, isolation, scratch-root, and control-token identity are dropped.
 - Terminal runs, operations, journals, results, and receipts stay readable. Pinned resolved-model identity and dispatch fencing are preserved.
 - Nonterminal v20 runs and operations are quarantined with explicit reasons, then terminalized as `cancelled` with an explicit migration reason; their pending waits are cancelled.
 - Active and paused triggers are quarantined and cancelled; they must be recreated from current source by an authenticated trusted principal.

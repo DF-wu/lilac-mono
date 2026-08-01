@@ -245,6 +245,7 @@ function registration(
     mode: "deferred",
     profile: "explore",
     sessionName: "audit",
+    stableNamedContinuation: true,
     task: "Audit the authentication flow",
     idleTimeoutMs: 2_000,
     depth: 1,
@@ -337,6 +338,18 @@ describe("workflow subagent convergence", () => {
     expect(store.getLiveParentDeliverySnapshot("parent:1")).toEqual({
       pendingCompletionCount: 0,
       outstandingRunCount: 1,
+    });
+    store.close();
+  });
+
+  it("persists stable named eligibility for every generated delegation", async () => {
+    const { projectRoot, store, dispatcher } = await setup();
+    const generated = await dispatcher.delegate(registration(projectRoot, "parent:generated"));
+
+    expect(store.getRun(generated.runId)?.completionTarget).toMatchObject({
+      kind: "live_parent",
+      childSessionId: "sub:channel:1:named:audit",
+      stableNamedContinuation: true,
     });
     store.close();
   });

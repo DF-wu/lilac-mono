@@ -4,6 +4,11 @@ Source: `plan/claude-agent-sdk-ai-sdk-integration.md`
 
 Status key: `[ ]` pending, `[~]` in progress, `[x]` complete, `[-]` explicitly deferred.
 
+Historical clarification (2026-08-01): completed items below describe the initial Core integration.
+`plan/claude-code-native-session-continuation.md` later superseded the blanket persistence decision:
+eligible Core named and Discord-primary sessions now use exact-proof fresh/fork persistence, while
+utility and ineligible runs remain `persistSession: false`.
+
 ## Agreed Decisions
 
 - [x] Target Core first; defer Mini Lilac until the shared boundary is proven.
@@ -11,7 +16,8 @@ Status key: `[ ]` pending, `[~]` in progress, `[x]` complete, `[-]` explicitly d
 - [x] Keep authentication entirely in official local Claude tooling.
 - [x] Disable Claude built-ins with `tools: []`.
 - [x] Isolate ambient Claude settings with `settingSources: []`.
-- [x] Disable Claude transcript persistence with `persistSession: false`.
+- [x] Initially disable Claude transcript persistence with `persistSession: false` (later superseded
+      for exact-proof eligible sessions as noted above).
 - [x] Expose Lilac Level-1 tools through an in-process MCP server.
 - [x] Keep `batch` out of MCP and preserve `ToolExpansion` as outer-loop-only behavior.
 - [x] Target full observable tool execution parity.
@@ -24,7 +30,7 @@ Status key: `[ ]` pending, `[~]` in progress, `[x]` complete, `[-]` explicitly d
 - [x] Create this compaction-safe progress tracker.
 - [x] Confirm the worktree is clean before implementation.
 - [x] Inventory the existing agent execution, provider resolution, Core run wiring, compaction, and
-  control paths.
+      control paths.
 - [x] Confirm the upstream helper cannot preserve the agreed parity.
 - [x] Add exact provider/MCP dependencies and run a Bun import/model-construction smoke test.
 
@@ -36,18 +42,18 @@ installed directly in Core for the in-process bridge.
 
 - [x] Add a reusable atomic tool execution module under `packages/agent`.
 - [x] Move shared output conversion, invalid-input classification, async iterable handling, and
-  normalization behavior into the module.
+      normalization behavior into the module.
 - [x] Support caller-selected input validation and expansion capture/rejection.
 - [x] Preserve start/update/end events and pending-tool tracking.
 - [x] Replace the nested executor in `AiSdkPiAgent` without moving scheduling/transcript/expansion
-  orchestration.
+      orchestration.
 - [x] Keep all existing `ToolExpansion` and batch behavior passing unchanged.
 - [x] Add focused atomic executor tests.
 
 ## Stage 3: In-Process MCP Bridge
 
 - [x] Add a Core-side or shared bridge using `@modelcontextprotocol/sdk` and an Agent SDK-compatible
-  in-process server instance.
+      in-process server instance.
 - [x] Build declarations and validation through AI SDK `asSchema`.
 - [x] Expose all atomic Level-1 tools except `batch`.
 - [x] Reject direct calls to omitted or expansion-returning tools.
@@ -61,7 +67,7 @@ installed directly in Core for the in-process bridge.
 ## Stage 4: Provider And Model Resolution
 
 - [x] Register credentialless `claude-code` in `packages/utils/model-provider.ts` with isolated
-  no-tools defaults.
+      no-tools defaults.
 - [x] Add the `claude-code -> anthropic` model-capability alias.
 - [~] Verify direct refs, aliases, slots, and durable rehydration.
 - [x] Add focused provider/model-slot/model-capability tests.
@@ -71,11 +77,12 @@ installed directly in Core for the in-process bridge.
 - [x] Add a Core Claude materialization helper after Level-1 tool construction.
 - [x] Create a run-scoped tool-enabled model and separate no-tools utility model.
 - [x] Retain Level-1 tools for MCP execution while omitting ordinary AI SDK tool declarations from
-  Claude `streamText()` calls.
-- [x] Set cwd, isolated settings, disabled persistence, disabled built-ins, MCP server, correlation
-  callback, streaming input, and control callbacks.
+      Claude `streamText()` calls.
+- [x] Set cwd, isolated settings, initially disabled persistence, disabled built-ins, MCP server,
+      correlation callback, streaming input, and control callbacks (persistence was later enabled only
+      for exact-proof eligible sessions).
 - [x] Disable direct read-file attachment assumptions only if rich MCP output mapping cannot preserve
-  them.
+      them.
 - [x] Use the utility model for compaction and other utility generation.
 - [x] Add Core materialization tests.
 
@@ -115,7 +122,7 @@ installed directly in Core for the in-process bridge.
 ## Stage 9: Final Review
 
 - [x] Review the complete implementation for behavioral regressions, parity gaps, credential
-  handling, transcript corruption, and missing tests.
+      handling, transcript corruption, and missing tests.
 - [x] Fix concrete findings without adding hosted auth or Claude ambient behavior.
 - [x] Re-run focused tests, typechecks, lint, and formatting.
 - [x] Record validation results and residual risks here.

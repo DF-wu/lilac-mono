@@ -1,5 +1,3 @@
-import { type ModelMessage } from "ai";
-
 import {
   createLogger,
   extractAiErrorLogDetails,
@@ -9,6 +7,8 @@ import {
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import {
+  buildCoreLineageManifestV1,
+  createCorePrimaryLineageFreshOnlyV1,
   lilacEventTypes,
   type EvtAdapterMessageCreatedData,
   type LilacBus,
@@ -16,7 +16,7 @@ import {
 import type { SurfaceAdapter } from "../adapter";
 import type { MsgRef } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
-import { composeRequestMessages, composeSingleMessage } from "./request-composition";
+import { composeRequestMessages, composeSingleMessageWithLineage } from "./request-composition";
 import { formatDiscordMessageRequestId } from "./request-ids";
 
 import {
@@ -744,6 +744,7 @@ export async function startBusRequestRouter(params: {
         queue: "followUp",
         msgRef: item.msgRef,
         sessionMode: batch.sessionMode,
+        modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
       });
     }
@@ -771,6 +772,7 @@ export async function startBusRequestRouter(params: {
       botName: cfg.surface.discord.botName,
       transcriptStore: params.transcriptStore,
       currentRequestId: requestId,
+      currentMessageIds: batch.items.map((item) => item.msgRef.messageId),
       discordUserAliasById,
       transformUserText: transformPendingUserText(last),
       transformUserTextForMessageId: last.msgRef.messageId,
@@ -781,47 +783,100 @@ export async function startBusRequestRouter(params: {
     });
 
     const chainMessageIds = new Set(composed.chainMessageIds);
-    const extraMessages: ModelMessage[] = [];
+    const extraCompositions: Array<
+      NonNullable<Awaited<ReturnType<typeof composeSingleMessageWithLineage>>>
+    > = [];
     const batchParticipantUserIds: string[] = [];
 
     for (const item of batch.items) {
       const surfaceMessage = await adapter.readMsg(item.msgRef);
       if (surfaceMessage?.userId) batchParticipantUserIds.push(surfaceMessage.userId);
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
-      const extra = await composeSingleMessage(adapter, {
+      const extra = await composeSingleMessageWithLineage(adapter, {
         platform: "discord",
         botUserId: self.userId,
         botName: cfg.surface.discord.botName,
         msgRef: item.msgRef,
         discordUserAliasById,
+        transcriptStore: params.transcriptStore,
         transformUserText: transformPendingUserText(item),
       });
 
       if (!extra) continue;
-      extraMessages.push(extra);
+      extraCompositions.push(extra);
       chainMessageIds.add(item.msgRef.messageId);
     }
 
+    let baseInsertAt = composed.messages.length;
     const finalMessages = (() => {
+      const extraMessages = extraCompositions.flatMap((extra) => extra.messages);
       if (extraMessages.length === 0) return composed.messages;
 
-      let insertAt = -1;
       for (let i = composed.messages.length - 1; i >= 0; i--) {
         if (composed.messages[i]?.role === "user") {
-          insertAt = i;
+          baseInsertAt = i;
           break;
         }
       }
 
-      if (insertAt < 0) {
+      if (baseInsertAt === composed.messages.length) {
         return [...composed.messages, ...extraMessages];
       }
 
       return [
-        ...composed.messages.slice(0, insertAt),
+        ...composed.messages.slice(0, baseInsertAt),
         ...extraMessages,
-        ...composed.messages.slice(insertAt),
+        ...composed.messages.slice(baseInsertAt),
       ];
+    })();
+    const finalLineage = (() => {
+      if (extraCompositions.length === 0) return composed.corePrimaryLineage;
+      if (
+        composed.corePrimaryLineage.state !== "complete" ||
+        extraCompositions.some((extra) => extra.corePrimaryLineage.state !== "complete")
+      ) {
+        return createCorePrimaryLineageFreshOnlyV1(
+          "deferred-batch-incomplete-lineage",
+          Math.min(baseInsertAt, composed.corePrimaryLineage.currentCanonicalStart),
+        );
+      }
+      const baseSegments = composed.corePrimaryLineage.segments;
+      const insertSegmentIndex =
+        baseInsertAt === composed.messages.length
+          ? baseSegments.length
+          : baseSegments.findIndex((segment) => segment.canonicalStart === baseInsertAt);
+      if (insertSegmentIndex < 0) {
+        return createCorePrimaryLineageFreshOnlyV1(
+          "deferred-batch-unaligned-insertion",
+          composed.corePrimaryLineage.currentCanonicalStart,
+        );
+      }
+      const extraSegments = extraCompositions.flatMap((extra) =>
+        extra.corePrimaryLineage.state === "complete" ? extra.corePrimaryLineage.segments : [],
+      );
+      const combinedSegments = [
+        ...baseSegments.slice(0, insertSegmentIndex),
+        ...extraSegments,
+        ...baseSegments.slice(insertSegmentIndex),
+      ];
+      const baseCurrentSegment = baseSegments.findIndex(
+        (segment) => segment.canonicalStart === composed.corePrimaryLineage.currentCanonicalStart,
+      );
+      const currentSegmentIndex = Math.min(
+        insertSegmentIndex,
+        baseCurrentSegment < 0
+          ? insertSegmentIndex
+          : baseCurrentSegment +
+              (insertSegmentIndex <= baseCurrentSegment ? extraSegments.length : 0),
+      );
+      return buildCoreLineageManifestV1(
+        combinedSegments.map((segment) => ({
+          atoms: segment.atoms,
+          canonicalMessages: segment.canonicalMessages,
+          ...(segment.requestSource ? { requestSource: segment.requestSource } : {}),
+        })),
+        { currentSegmentIndex },
+      );
     })();
 
     await publishBusRequest({
@@ -834,6 +889,7 @@ export async function startBusRequestRouter(params: {
       sessionMode: batch.sessionMode,
       modelOverride: batch.modelOverride,
       messages: finalMessages,
+      corePrimaryLineage: finalLineage,
       raw: {
         triggerType: "reply",
         chainMessageIds: [...chainMessageIds],
@@ -904,6 +960,32 @@ export async function startBusRequestRouter(params: {
       continueCount,
     });
 
+    if (active && requestModelOverride) {
+      await publishActiveChannelPrompt({
+        adapter,
+        bus,
+        cfg,
+        requestId: formatDiscordMessageRequestId({
+          channelId: sessionId,
+          messageId: msgRef.messageId,
+        }),
+        sessionId,
+        triggerMsgRef: msgRef,
+        triggerType: replyToBot ? "reply" : mentionsBot ? "mention" : undefined,
+        sessionMode,
+        sessionConfigId,
+        modelOverride: requestModelOverride,
+        botMentionNames,
+        transformTriggerUserText: combineTextTransforms(
+          modelOverrideTransform,
+          continueDirectiveTransform,
+        ),
+        transformUserTextForMessageId: msgRef.messageId,
+        markActive: false,
+      });
+      return;
+    }
+
     if (active) {
       // While a request is running:
       // - Replies to the active output message chain stay in the active request.
@@ -943,6 +1025,7 @@ export async function startBusRequestRouter(params: {
             msgRef,
             sessionMode,
             sessionConfigId,
+            modelOverride,
             transformUserText: combineTextTransforms(
               modelOverrideTransform,
               continueDirectiveTransform,
@@ -968,6 +1051,7 @@ export async function startBusRequestRouter(params: {
           msgRef,
           sessionMode,
           sessionConfigId,
+          modelOverride,
           transformUserText: combineTextTransforms(
             modelOverrideTransform,
             continueDirectiveTransform,
@@ -1014,6 +1098,7 @@ export async function startBusRequestRouter(params: {
         msgRef,
         sessionMode,
         sessionConfigId,
+        modelOverride,
         transformUserText: continueDirectiveTransform,
       });
       return;
@@ -1113,6 +1198,33 @@ export async function startBusRequestRouter(params: {
       continueCount,
     });
 
+    if (active && requestModelOverride) {
+      await publishActiveChannelPrompt({
+        adapter,
+        bus,
+        cfg,
+        requestId: formatDiscordMessageRequestId({
+          channelId: sessionId,
+          messageId: msgRef.messageId,
+        }),
+        sessionId,
+        triggerMsgRef: msgRef,
+        triggerType: replyToBot ? "reply" : mentionsBot ? "mention" : undefined,
+        sessionMode,
+        sessionConfigId,
+        parentChannelId,
+        modelOverride: requestModelOverride,
+        botMentionNames,
+        transformTriggerUserText: combineTextTransforms(
+          modelOverrideTransform,
+          continueDirectiveTransform,
+        ),
+        transformUserTextForMessageId: msgRef.messageId,
+        markActive: false,
+      });
+      return;
+    }
+
     if (active) {
       // Active channels behave like group chats while a request is running.
       // - Replies to the active output message chain stay in the active request.
@@ -1156,6 +1268,7 @@ export async function startBusRequestRouter(params: {
             sessionMode,
             sessionConfigId,
             parentChannelId,
+            modelOverride,
             transformUserText: combineTextTransforms(
               modelOverrideTransform,
               continueDirectiveTransform,
@@ -1183,6 +1296,7 @@ export async function startBusRequestRouter(params: {
             sessionMode,
             sessionConfigId,
             parentChannelId,
+            modelOverride,
             transformUserText: combineTextTransforms(
               modelOverrideTransform,
               continueDirectiveTransform,
@@ -1453,6 +1567,7 @@ export async function startBusRequestRouter(params: {
       parentChannelId: b.parentChannelId,
       // Use newest message as the context anchor (not a reply trigger).
       triggerMsgRef: b.messages[b.messages.length - 1]?.msgRef,
+      currentMessageIds: b.messages.map((message) => message.msgRef.messageId),
       triggerType: undefined,
       sessionMode: "active",
       modelOverride,
@@ -1545,6 +1660,30 @@ export async function startBusRequestRouter(params: {
       messageId: msgRef.messageId,
     });
 
+    if (active && requestModelOverride) {
+      await publishComposedRequest({
+        adapter,
+        bus,
+        cfg,
+        requestId,
+        sessionId,
+        queue: "prompt",
+        triggerType,
+        msgRef,
+        userId,
+        sessionMode: input.sessionMode,
+        sessionConfigId: input.sessionConfigId,
+        parentChannelId,
+        modelOverride: requestModelOverride,
+        transformTriggerUserText: combineTextTransforms(
+          modelOverrideTransform,
+          continueDirectiveTransform,
+        ),
+        transformUserTextForMessageId: msgRef.messageId,
+      });
+      return;
+    }
+
     // Special case: if the user is replying to the currently active output message chain,
     // treat mention replies as steer/interrupt into the running request, and
     // queue plain replies into a deferred prompt batch.
@@ -1581,6 +1720,7 @@ export async function startBusRequestRouter(params: {
           sessionMode: input.sessionMode,
           sessionConfigId: input.sessionConfigId,
           parentChannelId,
+          modelOverride: input.modelOverride,
           transformUserText: combineTextTransforms(
             modelOverrideTransform,
             continueDirectiveTransform,
@@ -1714,6 +1854,7 @@ export async function startBusRequestRouter(params: {
       adapter,
       bus,
       cfg,
+      transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
     });
@@ -1733,6 +1874,7 @@ export async function startBusRequestRouter(params: {
       adapter,
       bus,
       cfg,
+      transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
     });

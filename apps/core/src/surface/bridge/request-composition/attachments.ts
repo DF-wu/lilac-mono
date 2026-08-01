@@ -4,6 +4,7 @@ import type { UserContent } from "ai";
 import { fileTypeFromBuffer } from "file-type";
 
 import { inferMimeTypeFromFilename } from "../../../shared/attachment-utils";
+import type { CoreOwnedBlobReference } from "../../../transcript/transcript-store";
 
 import type { DiscordAttachmentMeta } from "./types";
 
@@ -16,13 +17,39 @@ type DiscordAttachmentState = {
   downloadedTotalBytes: number;
   // URL -> downloaded bytes + inferred mime type
   cache: Map<string, { bytes: Uint8Array; mimeType?: string }>;
+  ownBlob?: (input: {
+    bytes: Uint8Array;
+    mediaType: string;
+    filename: string;
+  }) => CoreOwnedBlobReference;
+  ownedBlobs: Map<string, CoreOwnedBlobReference>;
+  currentBlobs: Map<string, CoreOwnedBlobReference>;
 };
 
-export function createDiscordAttachmentState(): DiscordAttachmentState {
+export function createDiscordAttachmentState(input?: {
+  ownBlob?: DiscordAttachmentState["ownBlob"];
+}): DiscordAttachmentState {
   return {
     downloadedTotalBytes: 0,
     cache: new Map(),
+    ownBlob: input?.ownBlob,
+    ownedBlobs: new Map(),
+    currentBlobs: new Map(),
   };
+}
+
+export function getDiscordOwnedBlobReferences(
+  state: DiscordAttachmentState,
+): CoreOwnedBlobReference[] {
+  return [...state.ownedBlobs.values()];
+}
+
+export function takeDiscordCurrentBlobReferences(
+  state: DiscordAttachmentState,
+): CoreOwnedBlobReference[] {
+  const references = [...state.currentBlobs.values()];
+  state.currentBlobs.clear();
+  return references;
 }
 
 function normalizeMimeType(mimeType: string | undefined): string | undefined {
@@ -142,6 +169,49 @@ async function downloadDiscordAttachment(url: URL): Promise<{
   };
 }
 
+function ownAttachmentBytes(input: {
+  state: DiscordAttachmentState;
+  bytes: Uint8Array;
+  mediaType: string;
+  filename?: string;
+  url: URL;
+}): void {
+  if (!input.state.ownBlob) return;
+  const reference = input.state.ownBlob({
+    bytes: input.bytes,
+    mediaType: input.mediaType,
+    filename: input.filename ?? input.url.pathname.split("/").pop() ?? "attachment",
+  });
+  input.state.ownedBlobs.set(reference.sha256, reference);
+  input.state.currentBlobs.set(reference.sha256, reference);
+}
+
+async function resolveOwnedFileData(input: {
+  state: DiscordAttachmentState;
+  url: URL;
+  mediaType: string;
+  filename?: string;
+}): Promise<URL | Uint8Array> {
+  if (!input.state.ownBlob) return input.url;
+  const cacheKey = input.url.toString();
+  const cached = input.state.cache.get(cacheKey);
+  const downloaded = cached ? null : await downloadDiscordAttachment(input.url);
+  const bytes = cached?.bytes ?? downloaded!.bytes;
+  if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+    throw new Error(`Attachment '${input.filename ?? cacheKey}' exceeds the ownership limit`);
+  }
+  if (!cached) {
+    const nextTotal = input.state.downloadedTotalBytes + bytes.byteLength;
+    if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
+      throw new Error("Discord attachments exceed the total ownership limit");
+    }
+    input.state.downloadedTotalBytes = nextTotal;
+    input.state.cache.set(cacheKey, { bytes, mimeType: input.mediaType });
+  }
+  ownAttachmentBytes({ ...input, bytes });
+  return bytes;
+}
+
 export async function appendDiscordAttachmentsToUserContent(
   parts: Exclude<UserContent, string>,
   attachments: readonly DiscordAttachmentMeta[],
@@ -164,14 +234,29 @@ export async function appendDiscordAttachmentsToUserContent(
     // - everything else => do not send as a file part; include URL in text
     if (mimeType) {
       if (isImageMimeType(mimeType)) {
-        parts.push({ type: "file", data: url, filename: att.filename, mediaType: mimeType });
+        parts.push({
+          type: "file",
+          data: await resolveOwnedFileData({
+            state,
+            url,
+            mediaType: mimeType,
+            filename: att.filename,
+          }),
+          filename: att.filename,
+          mediaType: mimeType,
+        });
         continue;
       }
 
       if (isPdfMimeType(mimeType)) {
         parts.push({
           type: "file",
-          data: url,
+          data: await resolveOwnedFileData({
+            state,
+            url,
+            mediaType: mimeType,
+            filename: att.filename,
+          }),
           filename: att.filename,
           mediaType: mimeType,
         });
@@ -246,6 +331,7 @@ export async function appendDiscordAttachmentsToUserContent(
           state.downloadedTotalBytes = nextTotal;
           state.cache.set(url.toString(), { bytes, mimeType });
         }
+        ownAttachmentBytes({ state, bytes, mediaType: mimeType, filename: att.filename, url });
 
         const decoded = decodeUtf8BestEffort(bytes);
         const header = formatDiscordAttachmentHeader({
@@ -269,7 +355,8 @@ export async function appendDiscordAttachmentsToUserContent(
           text: `${header}\n${decoded.text}${suffix}`,
         });
         continue;
-      } catch {
+      } catch (error) {
+        if (state.ownBlob) throw error;
         const header = formatDiscordAttachmentHeader({
           url,
           filename: att.filename,
@@ -287,14 +374,29 @@ export async function appendDiscordAttachmentsToUserContent(
     const inferred = bestEffortInferMimeType({ filename: att.filename, url });
 
     if (inferred && isImageMimeType(inferred)) {
-      parts.push({ type: "file", data: url, filename: att.filename, mediaType: inferred });
+      parts.push({
+        type: "file",
+        data: await resolveOwnedFileData({
+          state,
+          url,
+          mediaType: inferred,
+          filename: att.filename,
+        }),
+        filename: att.filename,
+        mediaType: inferred,
+      });
       continue;
     }
 
     if (inferred && isPdfMimeType(inferred)) {
       parts.push({
         type: "file",
-        data: url,
+        data: await resolveOwnedFileData({
+          state,
+          url,
+          mediaType: "application/pdf",
+          filename: att.filename,
+        }),
         filename: att.filename,
         mediaType: "application/pdf",
       });
@@ -355,6 +457,7 @@ export async function appendDiscordAttachmentsToUserContent(
           state.downloadedTotalBytes = nextTotal;
           state.cache.set(url.toString(), { bytes, mimeType: inferred });
         }
+        ownAttachmentBytes({ state, bytes, mediaType: inferred, filename: att.filename, url });
 
         const decoded = decodeUtf8BestEffort(bytes);
         const header = formatDiscordAttachmentHeader({
@@ -378,7 +481,8 @@ export async function appendDiscordAttachmentsToUserContent(
           text: `${header}\n${decoded.text}${suffix}`,
         });
         continue;
-      } catch {
+      } catch (error) {
+        if (state.ownBlob) throw error;
         const header = formatDiscordAttachmentHeader({
           url,
           filename: att.filename,
@@ -485,8 +589,8 @@ export async function appendDiscordAttachmentsToUserContent(
         }
 
         // Track only bytes we actually downloaded in this call.
-        state.downloadedTotalBytes += bytes.byteLength;
-        if (state.downloadedTotalBytes > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
+        const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
+        if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
           const fallback =
             bestEffortInferMimeType({ filename: att.filename, url }) ?? "application/octet-stream";
           if (isImageMimeType(fallback)) {
@@ -515,6 +619,7 @@ export async function appendDiscordAttachmentsToUserContent(
           });
           continue;
         }
+        state.downloadedTotalBytes = nextTotal;
 
         const buf = Buffer.from(bytes);
         const detected = await fileTypeFromBuffer(buf);
@@ -526,8 +631,17 @@ export async function appendDiscordAttachmentsToUserContent(
           bestEffortInferMimeType({ filename: att.filename, url }) ||
           "application/octet-stream";
 
+        ownAttachmentBytes({
+          state,
+          bytes,
+          mediaType: resolvedMimeType,
+          filename: att.filename,
+          url,
+        });
+
         state.cache.set(url.toString(), { bytes, mimeType: resolvedMimeType });
-      } catch {
+      } catch (error) {
+        if (state.ownBlob) throw error;
         // Best-effort: fall back to URL-based attachment.
         const header = formatDiscordAttachmentHeader({
           url,
