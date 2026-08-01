@@ -124,7 +124,7 @@ export class WorkflowLiveParentBridge {
   private readonly protectedParents = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly childActivitySubscriptions = new Map<string, ChildActivityForwarding>();
   private subscription: { stop(): Promise<void> } | null = null;
-  private fallbacksEnabled = false;
+  private orphanHandlingEnabled = false;
 
   constructor(
     private readonly input: {
@@ -175,27 +175,27 @@ export class WorkflowLiveParentBridge {
     this.childActivitySubscriptions.clear();
   }
 
-  async enableFallbacks(options?: {
+  async enableOrphanHandling(options?: {
     protectedParentRequestIds?: readonly string[];
     protectionMs?: number;
   }): Promise<void> {
-    this.fallbacksEnabled = true;
+    this.orphanHandlingEnabled = true;
     for (const parentRequestId of options?.protectedParentRequestIds ?? []) {
       if (this.parents.has(parentRequestId) || this.protectedParents.has(parentRequestId)) continue;
       const timer = setTimeout(() => {
         this.protectedParents.delete(parentRequestId);
-        void this.fallbackParentCompletions(parentRequestId);
+        void this.reconcileOrphans().catch((error: unknown) => {
+          this.logger.error(
+            "live-parent orphan reconciliation failed after parent protection expired",
+            { parentRequestId },
+            error,
+          );
+        });
       }, options?.protectionMs ?? 120_000);
       timer.unref?.();
       this.protectedParents.set(parentRequestId, timer);
     }
-    for (const run of this.input.store.listOrphanedLiveParentCompletions()) {
-      const parentRequestId =
-        run.completionTarget.kind === "live_parent" ? run.completionTarget.parentRequestId : "";
-      if (!this.parents.has(parentRequestId) && !this.protectedParents.has(parentRequestId)) {
-        await this.fallback(run);
-      }
-    }
+    await this.reconcileOrphans();
   }
 
   registerParent(input: {
@@ -319,6 +319,8 @@ export class WorkflowLiveParentBridge {
             input.recoverSynchronousDeliveries,
           )
           .map((run) => toCompletionIdentity(run, this.input.store)),
+      isPending: (runId: string): boolean =>
+        this.input.store.getLiveParentDeliveryState(runId) === "pending",
       listPendingSettledAsync: async (): Promise<
         Array<
           | { loaded: true; completion: WorkflowLiveParentCompletion }
@@ -381,15 +383,14 @@ export class WorkflowLiveParentBridge {
         });
       },
       cancelAll: async (detail: string) => {
-        const runs = this.input.store.listActiveLiveParentRuns(input.parentRequestId);
-        for (const run of runs) await this.cancelRun(run, detail);
-        for (const completion of this.input.store.listPendingLiveParentCompletions(
-          input.parentRequestId,
-          1_000,
-          true,
-        )) {
-          this.input.store.markLiveParentCompletionDelivered(completion.runId, this.now());
-          await this.stopChildActivityForRun(completion.runId);
+        const transitions = this.input.store.cancelLiveParentRunsAndSuppress({
+          parentRequestId: input.parentRequestId,
+          now: this.now(),
+          detail,
+        });
+        for (const transition of transitions) {
+          await this.stopChildActivityForRun(transition.run.runId);
+          await this.publishRunCancelled(transition.run, transition.previousState, detail);
         }
         this.notify(signal);
       },
@@ -442,11 +443,10 @@ export class WorkflowLiveParentBridge {
       return;
     }
     if (
-      this.fallbacksEnabled &&
-      !this.protectedParents.has(run.completionTarget.parentRequestId) &&
-      isTerminalRun(run)
+      this.orphanHandlingEnabled &&
+      !this.protectedParents.has(run.completionTarget.parentRequestId)
     ) {
-      await this.fallback(run);
+      await this.reconcileOrphans();
     }
   }
 
@@ -815,48 +815,33 @@ export class WorkflowLiveParentBridge {
     }
   }
 
-  private async fallbackParentCompletions(parentRequestId: string): Promise<void> {
-    if (this.parents.has(parentRequestId)) return;
-    for (const run of this.input.store.listPendingLiveParentCompletions(
-      parentRequestId,
-      1_000,
-      true,
-    )) {
-      await this.fallback(run);
+  private async reconcileOrphans(): Promise<void> {
+    const resolvableParentRequestIds = [...this.parents.keys(), ...this.protectedParents.keys()];
+    const orphaned = this.input.store.reconcileOrphanedLiveParentRuns({
+      resolvableParentRequestIds,
+      now: this.now(),
+      detail: "Orphaned subagent: parent request could not be restored",
+    });
+    for (const transition of orphaned) {
+      await this.stopChildActivityForRun(transition.run.runId);
+      if (!transition.cancelled) continue;
+      await this.publishRunCancelled(
+        transition.run,
+        transition.previousState,
+        transition.run.terminalDetail ?? "Orphaned subagent",
+      ).catch((error: unknown) => {
+        this.logger.warn(
+          "orphaned workflow cancellation event publication failed",
+          { runId: transition.run.runId },
+          error,
+        );
+      });
     }
-  }
-
-  private async fallback(run: WorkflowRun): Promise<void> {
-    await toCompletion(
-      run,
-      this.input.store,
-      this.input.dataDir ?? env.dataDir,
-      this.input.toolResultArtifacts,
-    );
-    if (run.completionTarget.kind !== "live_parent") return;
-    const parentRequestId = run.completionTarget.parentRequestId;
-    // Parent ownership is process-local. With no await before the immediate SQLite transaction,
-    // registerParent cannot interleave with this recheck in this runtime. Cross-runtime ownership
-    // would require a durable parent lease, which this single-runtime bridge does not provide.
-    if (this.parents.has(parentRequestId) || this.protectedParents.has(parentRequestId)) return;
-    const updated = this.input.store.activateLiveParentFallback(run.runId, this.now());
-    if (!updated) return;
-    await this.stopChildActivityForRun(run.runId);
-    if (updated.progressTarget) {
-      await this.input.bus
-        .publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-          runId: updated.runId,
-          revisionId: updated.revisionId,
-          reason: "reconcile",
-          ts: this.now(),
-        })
-        .catch((error: unknown) => {
-          this.logger.warn(
-            "live-parent fallback progress publish failed; projector reconciliation will recover",
-            { runId: updated.runId },
-            error,
-          );
-        });
+    if (orphaned.length > 0) {
+      this.logger.warn("orphaned live-parent subagent workflows", {
+        runIds: orphaned.map((transition) => transition.run.runId),
+        cancelledCount: orphaned.filter((transition) => transition.cancelled).length,
+      });
     }
   }
 
@@ -867,11 +852,19 @@ export class WorkflowLiveParentBridge {
       detail,
     });
     if (cancelled?.state !== "cancelled") return;
+    await this.publishRunCancelled(cancelled, run.state, detail);
+  }
+
+  private async publishRunCancelled(
+    run: WorkflowRun,
+    previousState: WorkflowRun["state"],
+    detail: string,
+  ): Promise<void> {
     await this.input.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
       runId: run.runId,
       revisionId: run.revisionId,
       state: "cancelled",
-      previousState: run.state,
+      previousState,
       detail,
       ts: this.now(),
     });

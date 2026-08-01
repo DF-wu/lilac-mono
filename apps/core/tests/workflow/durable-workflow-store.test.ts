@@ -84,6 +84,32 @@ function run(id = "run-1", revisionId = "revision-1"): WorkflowRun {
   };
 }
 
+function liveParentRun(id: string, parentRequestId: string): WorkflowRun {
+  return {
+    ...run(id),
+    completionTarget: {
+      kind: "live_parent",
+      parentRequestId,
+      parentSessionId: "session-1",
+      parentRequestClient: "discord",
+      parentToolCallId: `tool-${id}`,
+      childRequestId: `child-${id}`,
+      childSessionId: `child-session-${id}`,
+      profile: "general",
+      sessionName: `session-${id}`,
+      depth: 1,
+      reasoning: null,
+      fallbackToSurface: true,
+      fallbackProgressTarget: {
+        platform: "discord",
+        channelId: "session-1",
+        replyToMessageId: null,
+      },
+      deferredDelivery: true,
+    },
+  };
+}
+
 function operation(runId: string, operationId: string): WorkflowOperation {
   const input = { prompt: "inspect", options: { profile: "general", cwd: "/workspace" } };
   return {
@@ -271,8 +297,8 @@ describe("durable workflow store minimal dispatch schema", () => {
         "running",
       );
       expect(store.listMigrations().at(-1)).toMatchObject({
-        version: 23,
-        name: "unbounded workflow v4 contract",
+        version: 24,
+        name: "durable orphaned live-parent delivery",
       });
     } finally {
       store.close();
@@ -339,6 +365,112 @@ describe("durable workflow store minimal dispatch schema", () => {
       ]);
     } finally {
       db.close();
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("atomically orphans unreachable live-parent runs while retaining reachable chains", () => {
+    const file = dbPath("live-parent-orphans");
+    const store = new DurableWorkflowStore(file);
+    try {
+      store.createRevision(revision());
+      expect(store.createRun(liveParentRun("reachable", "root-parent"))).toBe(true);
+      expect(store.createRun(liveParentRun("nested", "workflow-request"))).toBe(true);
+      expect(store.createRun(liveParentRun("active-orphan", "missing-parent"))).toBe(true);
+      expect(store.createRun(liveParentRun("terminal-orphan", "missing-parent"))).toBe(true);
+
+      expect(
+        store.tryClaimRun({ runId: "reachable", claimerId: "worker", now: 20 }),
+      ).not.toBeNull();
+      expect(
+        store.createOperation(
+          {
+            ...operation("reachable", "agent-op"),
+            state: "running",
+            requestId: "workflow-request",
+          },
+          "worker",
+        ),
+      ).toBe(true);
+      expect(
+        store.transitionRun({
+          runId: "terminal-orphan",
+          from: "queued",
+          to: "running",
+          now: 21,
+        }),
+      ).toBe(true);
+      expect(
+        store.transitionRun({
+          runId: "terminal-orphan",
+          from: "running",
+          to: "succeeded",
+          now: 22,
+          result: "completed without a parent",
+        }),
+      ).toBe(true);
+
+      const orphaned = store.reconcileOrphanedLiveParentRuns({
+        resolvableParentRequestIds: ["root-parent"],
+        now: 30,
+        detail: "parent request unavailable",
+      });
+
+      expect(orphaned.map((entry) => entry.run.runId)).toEqual([
+        "active-orphan",
+        "terminal-orphan",
+      ]);
+      expect(store.getRun("reachable")?.state).toBe("running");
+      expect(store.getRun("nested")?.state).toBe("queued");
+      expect(store.getRun("active-orphan")).toMatchObject({
+        state: "cancelled",
+        terminalDetail: "parent request unavailable",
+      });
+      expect(store.getRun("terminal-orphan")).toMatchObject({
+        state: "succeeded",
+        result: "completed without a parent",
+      });
+      expect(store.getLiveParentDeliveryState("reachable")).toBe("pending");
+      expect(store.getLiveParentDeliveryState("nested")).toBe("pending");
+      expect(store.getLiveParentDeliveryState("active-orphan")).toBe("orphaned");
+      expect(store.getLiveParentDeliveryState("terminal-orphan")).toBe("orphaned");
+      expect(
+        store.reconcileOrphanedLiveParentRuns({
+          resolvableParentRequestIds: ["root-parent"],
+          now: 31,
+          detail: "parent request unavailable",
+        }),
+      ).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("retires previously committed live-parent surface fallbacks during migration", () => {
+    const file = dbPath("retire-live-parent-fallback");
+    const initial = new DurableWorkflowStore(file);
+    initial.createRevision(revision());
+    expect(initial.createRun(liveParentRun("legacy-fallback", "missing-parent"))).toBe(true);
+    initial.close();
+
+    const db = new Database(file);
+    db.run(
+      `UPDATE workflow_completion_deliveries SET state = 'fallback', delivered_at = 20
+       WHERE run_id = 'legacy-fallback'`,
+    );
+    db.run(`UPDATE workflow_runs SET progress_target_json = ? WHERE run_id = 'legacy-fallback'`, [
+      JSON.stringify({ platform: "discord", channelId: "session-1", replyToMessageId: null }),
+    ]);
+    downgradeSchemaToV21(db);
+    db.close();
+
+    const migrated = new DurableWorkflowStore(file);
+    try {
+      expect(migrated.getLiveParentDeliveryState("legacy-fallback")).toBe("orphaned");
+      expect(migrated.getRun("legacy-fallback")?.progressTarget).toBeNull();
+    } finally {
+      migrated.close();
       rmSync(file, { force: true });
     }
   });

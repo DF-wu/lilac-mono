@@ -1380,7 +1380,56 @@ const WORKFLOW_MIGRATIONS: readonly WorkflowMigration[] = [
       `DROP TABLE workflow_request_dispatches`,
       `ALTER TABLE workflow_request_dispatches_v23 RENAME TO workflow_request_dispatches`,
       `CREATE INDEX idx_workflow_request_dispatches_active
-       ON workflow_request_dispatches(active, owner_heartbeat_at)`,
+        ON workflow_request_dispatches(active, owner_heartbeat_at)`,
+    ],
+  },
+  {
+    version: 24,
+    name: "durable orphaned live-parent delivery",
+    statements: [
+      `DROP TRIGGER workflow_completion_delivery_after_run_insert`,
+      `UPDATE workflow_runs SET progress_target_json = NULL
+       WHERE run_id IN (
+         SELECT run_id FROM workflow_completion_deliveries WHERE state = 'fallback'
+       ) AND json_extract(completion_target_json, '$.kind') = 'live_parent'`,
+      `CREATE TABLE workflow_completion_deliveries_v24 (
+        run_id TEXT PRIMARY KEY REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+        parent_request_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'fallback', 'orphaned')),
+        delivered_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        materialization_attempt_count INTEGER NOT NULL DEFAULT 0,
+        materialization_error TEXT
+      )`,
+      `INSERT INTO workflow_completion_deliveries_v24 (
+         run_id, parent_request_id, state, delivered_at, created_at, updated_at,
+         materialization_attempt_count, materialization_error
+       )
+       SELECT run_id, parent_request_id,
+         CASE WHEN state = 'fallback' THEN 'orphaned' ELSE state END,
+         delivered_at, created_at, updated_at,
+         materialization_attempt_count, materialization_error
+       FROM workflow_completion_deliveries`,
+      `DROP TABLE workflow_completion_deliveries`,
+      `ALTER TABLE workflow_completion_deliveries_v24 RENAME TO workflow_completion_deliveries`,
+      `CREATE INDEX idx_workflow_completion_deliveries_parent_state
+        ON workflow_completion_deliveries(parent_request_id, state, created_at, run_id)`,
+      `CREATE TRIGGER workflow_completion_delivery_after_run_insert
+        AFTER INSERT ON workflow_runs
+        WHEN json_extract(NEW.completion_target_json, '$.kind') = 'live_parent'
+        BEGIN
+          INSERT INTO workflow_completion_deliveries (
+            run_id, parent_request_id, state, delivered_at, created_at, updated_at
+          ) VALUES (
+            NEW.run_id,
+            json_extract(NEW.completion_target_json, '$.parentRequestId'),
+            'pending',
+            NULL,
+            NEW.created_at,
+            NEW.created_at
+          );
+        END`,
     ],
   },
 ];

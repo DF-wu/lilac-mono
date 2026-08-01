@@ -30,6 +30,7 @@ import {
   getCoreConfig,
   isRecord,
   ModelCapability,
+  openAIMessagePhase,
   resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
@@ -115,7 +116,7 @@ import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
-import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
+import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
@@ -359,6 +360,45 @@ export function consumeAssistantTextDelta(params: {
   }
   params.state.lastTextPartId = params.partId;
   return nextDelta;
+}
+
+export function removeSilentAssistantTurnMessages(input: {
+  messages: readonly ModelMessage[];
+  startIndex: number;
+  messageCount: number;
+}): ModelMessage[] {
+  const endIndex = input.startIndex + input.messageCount;
+  const messages: ModelMessage[] = [];
+
+  for (let index = 0; index < input.messages.length; index += 1) {
+    const message = input.messages[index]!;
+    if (index < input.startIndex || index >= endIndex || message.role !== "assistant") {
+      messages.push(message);
+      continue;
+    }
+
+    const text = (() => {
+      if (typeof message.content === "string") return message.content;
+      const textParts = message.content.filter((part) => part.type === "text");
+      const finalAnswerParts = textParts.filter(
+        (part) => openAIMessagePhase(part.providerOptions) === "final_answer",
+      );
+      return (finalAnswerParts.length > 0 ? finalAnswerParts : textParts)
+        .map((part) => part.text)
+        .join("\n\n");
+    })();
+    if (resolveReplyDeliveryFromFinalText(text) !== "skip") {
+      messages.push(message);
+      continue;
+    }
+    if (typeof message.content === "string") continue;
+
+    const content = message.content.filter((part) => part.type !== "text");
+    if (content.every((part) => part.type === "reasoning")) continue;
+    messages.push({ ...message, content });
+  }
+
+  return messages;
 }
 
 export type ReasoningChunkState = {
@@ -1222,6 +1262,14 @@ export type AgentRunnerRecoveryEntry = {
     partialText: string;
   };
 };
+
+export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): boolean {
+  return (
+    parseWorkflowRequestHintFromRaw(entry.raw) !== null ||
+    entry.requestId.startsWith("wfr:") ||
+    entry.sessionId.startsWith("workflow:")
+  );
+}
 
 export function validateCorePrimaryLineageAtRunnerIntake(input: {
   requestClient: AdapterPlatform;
@@ -2609,6 +2657,30 @@ export async function startBusAgentRunner(params: {
     if (entries.length === 0) return;
 
     for (const entry of entries) {
+      if (isWorkflowAgentRecoveryEntry(entry)) {
+        const hint = parseWorkflowRequestHintFromRaw(entry.raw);
+        const authorized =
+          hint && params.durableWorkflowStore
+            ? params.durableWorkflowStore.authorizeWorkflowRequest({
+                requestId: entry.requestId,
+                sessionId: entry.sessionId,
+                platform: entry.requestClient,
+              })
+            : null;
+        if (
+          !hint ||
+          !authorized ||
+          authorized.policy.runId !== hint.runId ||
+          authorized.policy.operationId !== hint.operationId ||
+          authorized.policy.dispatchEpoch !== hint.dispatchEpoch
+        ) {
+          logger.warn("discarded stale workflow-owned agent recovery entry", {
+            requestId: entry.requestId,
+            sessionId: entry.sessionId,
+          });
+          continue;
+        }
+      }
       const state =
         bySession.get(entry.sessionId) ??
         ({
@@ -4318,6 +4390,7 @@ export async function startBusAgentRunner(params: {
           }
 
           if (completion) {
+            if (!liveParentSession.isPending(completion.runId)) continue;
             liveParentSession.clearMaterializationFailure(completion.runId);
             completions.push(completion);
             continue;
@@ -4344,6 +4417,7 @@ export async function startBusAgentRunner(params: {
             materializationError,
           );
           if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS) continue;
+          if (!liveParentSession.isPending(identity.runId)) continue;
 
           completions.push({
             ...identity,
@@ -4354,24 +4428,18 @@ export async function startBusAgentRunner(params: {
           });
         }
 
-        const plan = planDeferredSubagentBoundary({
+        const deliverableCompletions = completions.filter((completion) =>
+          liveParentSession.isPending(completion.runId),
+        );
+
+        const provisionalPlan = planDeferredSubagentBoundary({
           canonicalMessages: agent.state.messages,
           modelInputMessages: input.modelInputMessages,
-          completions,
+          completions: deliverableCompletions,
         });
-        if (
-          plan.append.length > 0 &&
-          runProfile === "primary" &&
-          next.requestClient === "discord"
-        ) {
-          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
-            "deferred-result-insertion",
-            agent.state.messages.length,
-          );
-          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        }
 
-        for (const completion of completions) {
+        for (const completion of deliverableCompletions) {
+          if (!liveParentSession.isPending(completion.runId)) continue;
           if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
           try {
             await outputPublisher.publishToolCall({
@@ -4393,15 +4461,65 @@ export async function startBusAgentRunner(params: {
           }
         }
 
-        if (plan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
-          await liveParentSession.acknowledge(plan.consumedRunIds);
+        if (provisionalPlan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
+          await liveParentSession.acknowledge(provisionalPlan.consumedRunIds);
         }
 
-        return { append: plan.append, forceNextTurn: plan.forceNextTurn };
+        const finalPlan = planDeferredSubagentBoundary({
+          canonicalMessages: agent.state.messages,
+          modelInputMessages: input.modelInputMessages,
+          completions: deliverableCompletions.filter((completion) =>
+            liveParentSession.isPending(completion.runId),
+          ),
+        });
+        if (
+          finalPlan.append.length > 0 &&
+          runProfile === "primary" &&
+          next.requestClient === "discord"
+        ) {
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "deferred-result-insertion",
+            agent.state.messages.length,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
+
+        return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
       };
+      let pendingSilentTurnStartIndex: number | null = null;
+      const removePendingSilentTurn = () => {
+        if (pendingSilentTurnStartIndex === null) return;
+        const startIndex = pendingSilentTurnStartIndex;
+        pendingSilentTurnStartIndex = null;
+        const hasAssistantMessage = agent.state.messages
+          .slice(startIndex)
+          .some((message) => message.role === "assistant");
+        if (!hasAssistantMessage) return;
+
+        const messages = removeSilentAssistantTurnMessages({
+          messages: agent.state.messages,
+          startIndex,
+          messageCount: agent.state.messages.length - startIndex,
+        });
+        if (runProfile === "primary" && next.requestClient === "discord") {
+          const currentCanonicalStart =
+            state.activeRun?.corePrimaryLineage?.currentCanonicalStart ??
+            next.corePrimaryLineage?.currentCanonicalStart ??
+            startIndex;
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "silent-turn-removal",
+            currentCanonicalStart,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
+        agent.replaceMessages(messages);
+      };
+
       agent.setTurnBoundaryHandler(async (context) => {
         await coreNamedClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
         await corePrimaryClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
+        removePendingSilentTurn();
+
         lastBoundaryModelInputMessages = context.modelInputMessages;
         return await drainDeferredCompletions({
           modelInputMessages: context.modelInputMessages,
@@ -4414,9 +4532,46 @@ export async function startBusAgentRunner(params: {
       let finalText = "";
       let stableFinalText = "";
       let stablePartialText = state.activeRun?.partialText ?? "";
+      let turnTextStartIndex = 0;
+      let turnPartialTextStartIndex = stablePartialText.length;
+      let pendingNoReplyTurnText = "";
+      let pendingNoReplyTurnOutputs: Array<{
+        delta: string;
+        phase?: ReturnType<typeof openAIMessagePhase>;
+        phaseBoundaryPrefixChars: number;
+      }> = [];
+      let bufferNoReplyTurnText = true;
+      let lastCompletedTurnWasSilent = false;
+      let turnFinalAnswerText = "";
+      let turnHasFinalAnswerPhase = false;
+      let lastCompletedTurnFinalAnswerText: string | undefined;
+      let currentTextPhase: ReturnType<typeof openAIMessagePhase>;
+      let retainedTextPhase: ReturnType<typeof openAIMessagePhase>;
+      const assistantTextPhaseByPartId = new Map<
+        string,
+        NonNullable<ReturnType<typeof openAIMessagePhase>>
+      >();
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
         next.recovery?.partialText,
       );
+      const appendPendingNoReplyOutput = (
+        delta: string,
+        phase: ReturnType<typeof openAIMessagePhase>,
+        phaseBoundaryPrefixChars: number,
+      ): void => {
+        const previous = pendingNoReplyTurnOutputs.at(-1);
+        if (previous !== undefined && previous.phase === phase && phaseBoundaryPrefixChars === 0) {
+          previous.delta += delta;
+          return;
+        }
+        pendingNoReplyTurnOutputs.push({ delta, phase, phaseBoundaryPrefixChars });
+      };
+      const publishPendingNoReplyOutputs = (): void => {
+        for (const output of pendingNoReplyTurnOutputs) {
+          outputPublisher.publishText(output.delta, output.phase, output.phaseBoundaryPrefixChars);
+        }
+        pendingNoReplyTurnOutputs = [];
+      };
       const reasoningChunkState: ReasoningChunkState = {
         chunks: new Map<string, string>(),
         seq: 0,
@@ -4513,9 +4668,53 @@ export async function startBusAgentRunner(params: {
           runStats.finalMessages = event.messages;
         }
 
+        if (event.type === "messages_reset") {
+          removePendingSilentTurn();
+        }
+
         if (event.type === "turn_end") {
           transientRetryController.reset();
           retryAttemptHadReasoning = false;
+          const turnText = finalText.slice(turnTextStartIndex);
+          const turnDeliveryText = turnHasFinalAnswerPhase ? turnFinalAnswerText : turnText;
+          const silentTurn = resolveReplyDeliveryFromFinalText(turnDeliveryText) === "skip";
+          lastCompletedTurnWasSilent = silentTurn;
+          lastCompletedTurnFinalAnswerText = turnHasFinalAnswerPhase
+            ? turnFinalAnswerText
+            : undefined;
+          if (silentTurn) {
+            finalText = finalText.slice(0, turnTextStartIndex);
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText = state.activeRun.partialText.slice(
+                0,
+                turnPartialTextStartIndex,
+              );
+            }
+            void outputPublisher.publishTextReset({
+              text:
+                state.activeRun?.requestId === next.requestId
+                  ? state.activeRun.partialText
+                  : `${next.recovery?.partialText ?? ""}${finalText}`,
+              ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
+            });
+            pendingSilentTurnStartIndex = agent.state.messages.length - event.newMessages.length;
+          } else if (bufferNoReplyTurnText && pendingNoReplyTurnText.length > 0) {
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText += pendingNoReplyTurnText;
+            }
+            publishPendingNoReplyOutputs();
+          }
+          if (!silentTurn) retainedTextPhase = currentTextPhase ?? retainedTextPhase;
+
+          pendingNoReplyTurnText = "";
+          pendingNoReplyTurnOutputs = [];
+          bufferNoReplyTurnText = true;
+          turnFinalAnswerText = "";
+          turnHasFinalAnswerPhase = false;
+          currentTextPhase = undefined;
+          assistantTextPhaseByPartId.clear();
+          turnTextStartIndex = finalText.length;
+          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
           stableFinalText = finalText;
           stablePartialText = state.activeRun?.partialText ?? stablePartialText;
 
@@ -4556,6 +4755,21 @@ export async function startBusAgentRunner(params: {
           transientRetryController.reset();
         }
 
+        if (event.type === "turn_abort") {
+          if (bufferNoReplyTurnText) {
+            finalText = finalText.slice(0, turnTextStartIndex);
+          }
+          pendingNoReplyTurnText = "";
+          pendingNoReplyTurnOutputs = [];
+          bufferNoReplyTurnText = true;
+          turnFinalAnswerText = "";
+          turnHasFinalAnswerPhase = false;
+          currentTextPhase = undefined;
+          assistantTextPhaseByPartId.clear();
+          turnTextStartIndex = finalText.length;
+          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
+        }
+
         if (event.type === "turn_retry") {
           outputPublisher.flush();
           assistantTextPartBoundaryState.lastTextPartId = null;
@@ -4565,6 +4779,15 @@ export async function startBusAgentRunner(params: {
           if (state.activeRun?.requestId === next.requestId) {
             state.activeRun.partialText = stablePartialText;
           }
+          pendingNoReplyTurnText = "";
+          pendingNoReplyTurnOutputs = [];
+          bufferNoReplyTurnText = true;
+          turnFinalAnswerText = "";
+          turnHasFinalAnswerPhase = false;
+          currentTextPhase = undefined;
+          assistantTextPhaseByPartId.clear();
+          turnTextStartIndex = stableFinalText.length;
+          turnPartialTextStartIndex = stablePartialText.length;
 
           if (retryAttemptHadReasoning) {
             reasoningChunkState.chunks.clear();
@@ -4594,6 +4817,10 @@ export async function startBusAgentRunner(params: {
         }
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_start") {
+          const phase = openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata);
+          if (phase !== undefined) {
+            assistantTextPhaseByPartId.set(event.assistantMessageEvent.id, phase);
+          }
           markAssistantTextPartStarted(
             assistantTextPartBoundaryState,
             event.assistantMessageEvent.id,
@@ -4602,6 +4829,20 @@ export async function startBusAgentRunner(params: {
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
           runStats.firstTextDeltaAt ??= Date.now();
+          const phase =
+            openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata) ??
+            assistantTextPhaseByPartId.get(event.assistantMessageEvent.id);
+          if (phase === "final_answer" && currentTextPhase === "commentary") {
+            if (pendingNoReplyTurnText.length > 0) {
+              if (state.activeRun?.requestId === next.requestId) {
+                state.activeRun.partialText += pendingNoReplyTurnText;
+              }
+              publishPendingNoReplyOutputs();
+              pendingNoReplyTurnText = "";
+            }
+            bufferNoReplyTurnText = true;
+          }
+          currentTextPhase = phase ?? currentTextPhase;
 
           const delta = consumeAssistantTextDelta({
             state: assistantTextPartBoundaryState,
@@ -4610,13 +4851,34 @@ export async function startBusAgentRunner(params: {
             partId: event.assistantMessageEvent.id,
             delta: event.assistantMessageEvent.delta,
           });
+          const phaseBoundaryPrefixChars = Math.max(
+            0,
+            delta.length - event.assistantMessageEvent.delta.length,
+          );
 
           finalText += delta;
-          if (state.activeRun && state.activeRun.requestId === next.requestId) {
-            state.activeRun.partialText += delta;
+          if (phase === "final_answer") {
+            turnHasFinalAnswerPhase = true;
+            turnFinalAnswerText += event.assistantMessageEvent.delta;
           }
 
-          outputPublisher.publishText(delta);
+          if (bufferNoReplyTurnText) {
+            pendingNoReplyTurnText += delta;
+            appendPendingNoReplyOutput(delta, phase, phaseBoundaryPrefixChars);
+            if (!isPossibleNoReplyPrefix(pendingNoReplyTurnText)) {
+              bufferNoReplyTurnText = false;
+              if (state.activeRun?.requestId === next.requestId) {
+                state.activeRun.partialText += pendingNoReplyTurnText;
+              }
+              publishPendingNoReplyOutputs();
+              pendingNoReplyTurnText = "";
+            }
+          } else {
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText += delta;
+            }
+            outputPublisher.publishText(delta, phase, phaseBoundaryPrefixChars);
+          }
         }
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_end") {
@@ -4624,6 +4886,7 @@ export async function startBusAgentRunner(params: {
             assistantTextPartBoundaryState,
             event.assistantMessageEvent.id,
           );
+          assistantTextPhaseByPartId.delete(event.assistantMessageEvent.id);
         }
 
         if (
@@ -4956,9 +5219,15 @@ export async function startBusAgentRunner(params: {
         finalText = "Cancelled.";
       }
 
+      const terminalDeliveryText = isCancelled
+        ? finalText
+        : (lastCompletedTurnFinalAnswerText ?? finalText);
       const isHeartbeatAckOnly =
-        isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(finalText);
-      const delivery = resolveReplyDeliveryFromFinalText(finalText);
+        isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(terminalDeliveryText);
+      const delivery =
+        finalText.length === 0 && lastCompletedTurnWasSilent
+          ? "skip"
+          : resolveReplyDeliveryFromFinalText(terminalDeliveryText);
       if (!isCancelled && delivery !== "skip" && !isHeartbeatAckOnly && finalText.length === 0) {
         throw new Error(
           buildNoAssistantTextError({

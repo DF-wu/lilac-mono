@@ -116,6 +116,44 @@ describe("request-local agent output publisher", () => {
     });
   });
 
+  it("preserves OpenAI phase boundaries while coalescing text", async () => {
+    const raw = createRecordingRawBus();
+    const publisher = createPublisher(raw);
+
+    publisher.publishText("commentary ", "commentary");
+    publisher.publishText("continues", "commentary");
+    publisher.publishText(" ", "final_answer");
+    publisher.publishText("\n\nfinal ", "final_answer", 2);
+    publisher.publishText("answer", "final_answer");
+    await publisher.drain();
+
+    expect(raw.messages.map((message) => message.data)).toEqual([
+      { delta: "commentary continues", phase: "commentary" },
+      { delta: " ", phase: "final_answer" },
+      {
+        delta: "\n\nfinal answer",
+        phase: "final_answer",
+        phaseBoundaryPrefixChars: 2,
+      },
+    ]);
+  });
+
+  it("orders text rollback after pending deltas", async () => {
+    const raw = createRecordingRawBus();
+    const publisher = createPublisher(raw);
+
+    publisher.publishText("transient commentary", "commentary");
+    await publisher.publishTextReset({ text: "" });
+
+    expect(raw.messages.map((message) => ({ type: message.type, data: message.data }))).toEqual([
+      {
+        type: lilacEventTypes.EvtAgentOutputDeltaText,
+        data: { delta: "transient commentary", phase: "commentary" },
+      },
+      { type: lilacEventTypes.EvtAgentOutputTextReset, data: { text: "" } },
+    ]);
+  });
+
   it("flushes at 4KiB and keeps a following tool barrier ordered behind text", async () => {
     const textPublishStarted = deferred<void>();
     const releaseTextPublish = deferred<void>();

@@ -567,6 +567,12 @@ export type WorkflowActionOutboxEntry = {
   updatedAt: number;
 };
 
+export type OrphanedLiveParentRun = {
+  run: WorkflowRun;
+  previousState: WorkflowRunState;
+  cancelled: boolean;
+};
+
 export class DurableWorkflowStore {
   private readonly db: Database;
 
@@ -996,18 +1002,133 @@ export class DurableWorkflowStore {
     return rows.map(parseRun);
   }
 
-  listOrphanedLiveParentCompletions(limit = 1_000): WorkflowRun[] {
-    const rows = this.db
-      .query(
-        `SELECT workflow_runs.* FROM workflow_runs
-         JOIN workflow_completion_deliveries
-           ON workflow_completion_deliveries.run_id = workflow_runs.run_id
-         WHERE workflow_completion_deliveries.state = 'pending'
-            AND workflow_runs.state IN ('succeeded', 'failed', 'cancelled')
-         ORDER BY workflow_runs.terminal_at, workflow_runs.created_at, workflow_runs.run_id LIMIT ?`,
+  getLiveParentDeliveryState(
+    runId: string,
+  ): "pending" | "delivered" | "fallback" | "orphaned" | null {
+    const row = this.db
+      .query<{ state: string }, [string]>(
+        "SELECT state FROM workflow_completion_deliveries WHERE run_id = ?",
       )
-      .all(boundedLimit(limit));
-    return rows.map(parseRun);
+      .get(runId);
+    if (!row) return null;
+    return z.enum(["pending", "delivered", "fallback", "orphaned"]).parse(row.state);
+  }
+
+  reconcileOrphanedLiveParentRuns(input: {
+    resolvableParentRequestIds: readonly string[];
+    now: number;
+    detail: string;
+  }): OrphanedLiveParentRun[] {
+    const reconcile = this.db.transaction(() => {
+      const pendingRows = this.db
+        .query(
+          `SELECT workflow_runs.* FROM workflow_runs
+           JOIN workflow_completion_deliveries
+             ON workflow_completion_deliveries.run_id = workflow_runs.run_id
+           WHERE workflow_completion_deliveries.state = 'pending'
+           ORDER BY workflow_runs.created_at, workflow_runs.run_id`,
+        )
+        .all();
+      const pendingRuns = pendingRows.map(parseRun);
+      const resolvableRequestIds = new Set(input.resolvableParentRequestIds);
+      const retainedRunIds = new Set<string>();
+
+      const durableRootRequestRows = this.db
+        .query<{ request_id: string }, []>(
+          `SELECT workflow_operations.request_id FROM workflow_operations
+           JOIN workflow_runs ON workflow_runs.run_id = workflow_operations.run_id
+           WHERE workflow_operations.kind = 'agent'
+             AND workflow_operations.request_id IS NOT NULL
+             AND workflow_operations.state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+             AND workflow_runs.state NOT IN ('succeeded', 'failed', 'cancelled')
+             AND json_extract(workflow_runs.completion_target_json, '$.kind') <> 'live_parent'`,
+        )
+        .all();
+      for (const row of durableRootRequestRows) resolvableRequestIds.add(row.request_id);
+      const liveParentRequestRows = this.db
+        .query<{ run_id: string; request_id: string }, []>(
+          `SELECT workflow_operations.run_id, workflow_operations.request_id
+           FROM workflow_operations
+           JOIN workflow_completion_deliveries
+             ON workflow_completion_deliveries.run_id = workflow_operations.run_id
+           WHERE workflow_completion_deliveries.state = 'pending'
+             AND workflow_operations.kind = 'agent'
+             AND workflow_operations.request_id IS NOT NULL
+             AND workflow_operations.state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')`,
+        )
+        .all();
+      const activeRequestIdsByRun = new Map<string, string[]>();
+      for (const row of liveParentRequestRows) {
+        const requestIds = activeRequestIdsByRun.get(row.run_id) ?? [];
+        requestIds.push(row.request_id);
+        activeRequestIdsByRun.set(row.run_id, requestIds);
+      }
+
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const run of pendingRuns) {
+          if (
+            retainedRunIds.has(run.runId) ||
+            run.completionTarget.kind !== "live_parent" ||
+            !resolvableRequestIds.has(run.completionTarget.parentRequestId)
+          ) {
+            continue;
+          }
+          retainedRunIds.add(run.runId);
+          changed = true;
+          if (["succeeded", "failed", "cancelled"].includes(run.state)) continue;
+          for (const requestId of activeRequestIdsByRun.get(run.runId) ?? []) {
+            resolvableRequestIds.add(requestId);
+          }
+        }
+      }
+
+      const orphaned: OrphanedLiveParentRun[] = [];
+      for (const run of pendingRuns) {
+        if (retainedRunIds.has(run.runId)) continue;
+        const terminal = ["succeeded", "failed", "cancelled"].includes(run.state);
+        if (!terminal) {
+          this.db.run(
+            `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
+             claimed_by = NULL, claimed_at = NULL, updated_at = ?
+             WHERE run_id = ? AND state IN ('queued', 'dispatched', 'running', 'blocked')`,
+            [input.detail, input.now, input.now, run.runId],
+          );
+          this.db.run(
+            `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
+             resolved_at = ?, updated_at = ?
+             WHERE run_id = ? AND state IN ('pending', 'claimed')`,
+            [input.now, input.now, run.runId],
+          );
+          this.db.run(
+            `UPDATE workflow_request_dispatches SET active = 0, owner_id = NULL,
+             owner_heartbeat_at = NULL, updated_at = ?
+             WHERE run_id = ? AND active = 1`,
+            [input.now, run.runId],
+          );
+          this.db.run(
+            `UPDATE workflow_runs SET state = 'cancelled', terminal_detail = ?, terminal_at = ?,
+             claimed_by = NULL, claimed_at = NULL, updated_at = ?
+             WHERE run_id = ? AND state = ?`,
+            [input.detail, input.now, input.now, run.runId, run.state],
+          );
+        }
+        const delivery = this.db
+          .query(
+            `UPDATE workflow_completion_deliveries
+             SET state = 'orphaned', delivered_at = ?, updated_at = ?
+             WHERE run_id = ? AND state = 'pending'`,
+          )
+          .run(input.now, input.now, run.runId);
+        if (delivery.changes !== 1) continue;
+        const updated = this.getRun(run.runId);
+        if (!updated) throw new Error(`Orphaned workflow run disappeared: ${run.runId}`);
+        orphaned.push({ run: updated, previousState: run.state, cancelled: !terminal });
+      }
+      return orphaned;
+    });
+    return reconcile.immediate();
   }
 
   markLiveParentCompletionDelivered(runId: string, now: number): boolean {
@@ -1059,30 +1180,6 @@ export class DurableWorkflowStore {
         )
         .run(now, runId).changes === 1
     );
-  }
-
-  activateLiveParentFallback(runId: string, now: number): WorkflowRun | null {
-    const activate = this.db.transaction(() => {
-      const run = this.getRun(runId);
-      if (!run || run.completionTarget.kind !== "live_parent") return null;
-      const changed = this.db
-        .query(
-          `UPDATE workflow_completion_deliveries
-           SET state = 'fallback', delivered_at = ?, updated_at = ?
-           WHERE run_id = ? AND state = 'pending'`,
-        )
-        .run(now, now, runId);
-      if (changed.changes !== 1) return null;
-      if (run.completionTarget.fallbackToSurface && run.completionTarget.fallbackProgressTarget) {
-        this.db
-          .query(
-            `UPDATE workflow_runs SET progress_target_json = ?, updated_at = ? WHERE run_id = ?`,
-          )
-          .run(JSON.stringify(run.completionTarget.fallbackProgressTarget), now, runId);
-      }
-      return this.getRun(runId);
-    });
-    return activate.immediate();
   }
 
   transitionRun(input: {
@@ -1207,36 +1304,82 @@ export class DurableWorkflowStore {
   }
 
   cancelRunAndChildren(input: { runId: string; now: number; detail: string }): WorkflowRun | null {
+    const cancel = this.db.transaction(() => this.cancelRunAndChildrenInTransaction(input));
+    return cancel.immediate();
+  }
+
+  cancelLiveParentRunsAndSuppress(input: {
+    parentRequestId: string;
+    now: number;
+    detail: string;
+  }): OrphanedLiveParentRun[] {
     const cancel = this.db.transaction(() => {
-      const run = this.getRun(input.runId);
-      if (!run || ["succeeded", "failed", "rejected", "cancelled"].includes(run.state)) {
-        return run;
+      const rows = this.db
+        .query(
+          `SELECT workflow_runs.* FROM workflow_runs
+           JOIN workflow_completion_deliveries
+             ON workflow_completion_deliveries.run_id = workflow_runs.run_id
+           WHERE workflow_completion_deliveries.parent_request_id = ?
+             AND workflow_completion_deliveries.state = 'pending'
+             AND workflow_runs.state NOT IN ('succeeded', 'failed', 'cancelled')
+           ORDER BY workflow_runs.created_at, workflow_runs.run_id`,
+        )
+        .all(input.parentRequestId);
+      const runs = rows.map(parseRun);
+      const cancelled: OrphanedLiveParentRun[] = [];
+      for (const run of runs) {
+        const updated = this.cancelRunAndChildrenInTransaction({
+          runId: run.runId,
+          now: input.now,
+          detail: input.detail,
+        });
+        if (updated?.state === "cancelled") {
+          cancelled.push({ run: updated, previousState: run.state, cancelled: true });
+        }
       }
       this.db.run(
-        `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
-         updated_at = ? WHERE run_id = ? AND state IN ('queued', 'dispatched', 'running', 'blocked')`,
-        [input.detail, input.now, input.now, input.runId],
+        `UPDATE workflow_completion_deliveries
+         SET state = 'delivered', delivered_at = ?, updated_at = ?
+         WHERE parent_request_id = ? AND state = 'pending'`,
+        [input.now, input.now, input.parentRequestId],
       );
-      this.db.run(
-        `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
-         resolved_at = ?, updated_at = ?
-         WHERE run_id = ? AND state IN ('pending', 'claimed')`,
-        [input.now, input.now, input.runId],
-      );
-      this.db.run(
-        `UPDATE workflow_request_dispatches SET active = 0, updated_at = ?
-         WHERE run_id = ? AND active = 1`,
-        [input.now, input.runId],
-      );
-      const changed = this.db
-        .query(
-          `UPDATE workflow_runs SET state = 'cancelled', terminal_detail = ?, terminal_at = ?,
-           updated_at = ? WHERE run_id = ? AND state = ?`,
-        )
-        .run(input.detail, input.now, input.now, input.runId, run.state);
-      return changed.changes === 1 ? this.getRun(input.runId) : null;
+      return cancelled;
     });
     return cancel.immediate();
+  }
+
+  private cancelRunAndChildrenInTransaction(input: {
+    runId: string;
+    now: number;
+    detail: string;
+  }): WorkflowRun | null {
+    const run = this.getRun(input.runId);
+    if (!run || ["succeeded", "failed", "cancelled"].includes(run.state)) return run;
+    this.db.run(
+      `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
+       claimed_by = NULL, claimed_at = NULL, updated_at = ?
+       WHERE run_id = ? AND state IN ('queued', 'dispatched', 'running', 'blocked')`,
+      [input.detail, input.now, input.now, input.runId],
+    );
+    this.db.run(
+      `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
+       resolved_at = ?, updated_at = ?
+       WHERE run_id = ? AND state IN ('pending', 'claimed')`,
+      [input.now, input.now, input.runId],
+    );
+    this.db.run(
+      `UPDATE workflow_request_dispatches SET active = 0, owner_id = NULL,
+       owner_heartbeat_at = NULL, updated_at = ? WHERE run_id = ? AND active = 1`,
+      [input.now, input.runId],
+    );
+    const changed = this.db
+      .query(
+        `UPDATE workflow_runs SET state = 'cancelled', terminal_detail = ?, terminal_at = ?,
+         claimed_by = NULL, claimed_at = NULL, updated_at = ?
+         WHERE run_id = ? AND state = ?`,
+      )
+      .run(input.detail, input.now, input.now, input.runId, run.state);
+    return changed.changes === 1 ? this.getRun(input.runId) : null;
   }
 
   pauseRunAndChildren(input: { runId: string; now: number; detail: string }): WorkflowRun | null {

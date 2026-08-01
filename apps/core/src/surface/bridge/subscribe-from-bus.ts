@@ -184,9 +184,18 @@ export type BusToAdapterRelaySnapshot = {
   routerSessionMode?: "mention" | "active";
   replyTo?: MsgRef;
   createdOutputRefs: MsgRef[];
+  activeOutputRefs?: MsgRef[];
   visibleText: string;
   totalTextChars?: number;
   streamTextPrefixChars?: number;
+  streamPhaseBoundaryPrefixChars?: number;
+  streamPhaseBoundaryOffsetChars?: number;
+  streamPhaseBoundaryPrefix?: string;
+  awaitingFinalPhaseBoundaryPrefix?: boolean;
+  textPhase?: "commentary" | "final_answer";
+  commentaryText?: string;
+  finalAnswerText?: string;
+  phaseSegmentsValid?: boolean;
   reasoning?: {
     startedAtMs: number;
     frozenAtMs?: number;
@@ -600,13 +609,44 @@ export async function bridgeBusToAdapter(params: {
 
     let totalTextChars = input.restore?.totalTextChars ?? input.restore?.visibleText.length ?? 0;
     let streamTextPrefixChars = input.restore?.streamTextPrefixChars ?? 0;
+    let streamPhaseBoundaryPrefixChars = input.restore?.streamPhaseBoundaryPrefixChars ?? 0;
+    let streamPhaseBoundaryOffsetChars = input.restore?.streamPhaseBoundaryOffsetChars ?? 0;
+    let streamPhaseBoundaryPrefix = input.restore?.streamPhaseBoundaryPrefix;
+    let awaitingFinalPhaseBoundaryPrefix = input.restore?.awaitingFinalPhaseBoundaryPrefix ?? false;
     let visibleTextAcc = input.restore?.visibleText ?? "";
+    let textPhase = input.restore?.textPhase;
+    let commentaryText = input.restore?.commentaryText ?? "";
+    let finalAnswerText = input.restore?.finalAnswerText ?? "";
+    let phaseSegmentsValid = input.restore?.phaseSegmentsValid ?? true;
     let reasoningStartedAtMs = input.restore?.reasoning?.startedAtMs;
     let reasoningFrozenAtMs = input.restore?.reasoning?.frozenAtMs;
     let reasoningDetailText = input.restore?.reasoning?.detailText ?? "";
     let pendingNoReplyPrefix = "";
     let bufferNoReplyPrefix = true;
     let streamHasVisibleOutput = false;
+    const withoutStreamPhaseBoundary = (text: string, textOffsetChars = 0): string => {
+      if (streamPhaseBoundaryPrefixChars === 0) return text;
+      const boundaryStart = Math.min(
+        Math.max(0, streamPhaseBoundaryOffsetChars - textOffsetChars),
+        text.length,
+      );
+      const possibleBoundaryPrefix = text.slice(
+        boundaryStart,
+        boundaryStart + streamPhaseBoundaryPrefixChars,
+      );
+      const matchesKnownBoundary =
+        streamPhaseBoundaryPrefix !== undefined &&
+        possibleBoundaryPrefix === streamPhaseBoundaryPrefix;
+      if (
+        possibleBoundaryPrefix.length !== streamPhaseBoundaryPrefixChars ||
+        !matchesKnownBoundary
+      ) {
+        return text;
+      }
+      return `${text.slice(0, boundaryStart)}${text.slice(
+        boundaryStart + streamPhaseBoundaryPrefixChars,
+      )}`;
+    };
     const toolStatusById = new Map<string, SurfaceToolStatusUpdate>();
     if (input.restore) {
       for (const update of input.restore.toolStatus) {
@@ -625,6 +665,10 @@ export async function bridgeBusToAdapter(params: {
         createdOutputRefs.push(ref);
       }
     }
+    let activeOutputRefs = input.restore?.activeOutputRefs?.slice() ?? createdOutputRefs.slice();
+    let activeOutputRefKeys = new Set(
+      activeOutputRefs.map((ref) => `${ref.platform}:${ref.channelId}:${ref.messageId}`),
+    );
     let lastOutCursor = input.restore?.outCursor;
 
     const recordCreatedOutputRef = (msgRef: MsgRef) => {
@@ -650,6 +694,11 @@ export async function bridgeBusToAdapter(params: {
       // This prevents a reanchor from temporarily treating "frozen" follow-up messages
       // (e.g. attachment flushes) as the active streaming target.
       if (token !== streamToken) return;
+      const key = `${msgRef.platform}:${msgRef.channelId}:${msgRef.messageId}`;
+      if (!activeOutputRefKeys.has(key)) {
+        activeOutputRefKeys.add(key);
+        activeOutputRefs.push(msgRef);
+      }
 
       bus
         .publish(
@@ -688,7 +737,7 @@ export async function bridgeBusToAdapter(params: {
         ...(useResumeOpts
           ? {
               resume: {
-                created: createdOutputRefs.slice(),
+                created: activeOutputRefs.slice(),
               },
             }
           : {}),
@@ -738,6 +787,58 @@ export async function bridgeBusToAdapter(params: {
         await out.push({ type: "text.set", text: visibleTextAcc });
         streamHasVisibleOutput = true;
       }
+      if (
+        textPhase !== "final_answer" &&
+        platform === "discord" &&
+        typeof reasoningStartedAtMs === "number"
+      ) {
+        await out.push({
+          type: "reasoning.status",
+          update: {
+            startedAtMs: reasoningStartedAtMs,
+            frozenAtMs: reasoningFrozenAtMs,
+            detailText: reasoningDetailText,
+          },
+        });
+        streamHasVisibleOutput = true;
+      }
+      if (textPhase !== "final_answer") {
+        for (const update of toolStatusById.values()) {
+          await out.push({ type: "tool.status", update });
+          streamHasVisibleOutput = true;
+        }
+      }
+    }
+
+    const switchOutputLane = async (lane: {
+      replyTo?: MsgRef;
+      resolveReplyToAfterAbort?: () => MsgRef | undefined;
+      abortReason: "reanchor" | "reanchor_interrupt";
+      replayStatus: boolean;
+    }): Promise<void> => {
+      // Make the new stream active before abort can create follow-up messages.
+      streamToken += 1;
+      activeOutputRefs = [];
+      activeOutputRefKeys = new Set();
+      await out.abort(lane.abortReason).catch(() => undefined);
+
+      const nextReplyTo = lane.resolveReplyToAfterAbort?.() ?? lane.replyTo;
+      currentReplyTo = nextReplyTo;
+      streamTextPrefixChars = Math.max(0, totalTextChars - pendingNoReplyPrefix.length);
+      streamPhaseBoundaryPrefixChars = 0;
+      streamPhaseBoundaryOffsetChars = 0;
+      streamPhaseBoundaryPrefix = undefined;
+      awaitingFinalPhaseBoundaryPrefix = false;
+      textPhase = undefined;
+      commentaryText = "";
+      finalAnswerText = "";
+      phaseSegmentsValid = true;
+      visibleTextAcc = "";
+      streamHasVisibleOutput = false;
+      out = await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken));
+      finalTextMode = out.getFinalTextMode?.() ?? "continuation";
+
+      if (!lane.replayStatus) return;
       if (platform === "discord" && typeof reasoningStartedAtMs === "number") {
         await out.push({
           type: "reasoning.status",
@@ -753,7 +854,7 @@ export async function bridgeBusToAdapter(params: {
         await out.push({ type: "tool.status", update });
         streamHasVisibleOutput = true;
       }
-    }
+    };
 
     let typing: TypingIndicatorSubscription | null = null;
 
@@ -959,6 +1060,45 @@ export async function bridgeBusToAdapter(params: {
               }
 
               case lilacEventTypes.EvtAgentOutputDeltaText: {
+                const incomingPhase = outMsg.data.phase;
+                const visibleDelta = outMsg.data.delta;
+                let phasedDelta = outMsg.data.delta;
+                if (incomingPhase === "commentary" && textPhase === "final_answer") {
+                  phaseSegmentsValid = false;
+                }
+                if (incomingPhase === "final_answer" && textPhase === "commentary") {
+                  streamPhaseBoundaryPrefixChars = 0;
+                  streamPhaseBoundaryOffsetChars = 0;
+                  streamPhaseBoundaryPrefix = undefined;
+                  awaitingFinalPhaseBoundaryPrefix = true;
+                }
+                const boundaryPrefixChars = Math.max(
+                  0,
+                  Math.min(outMsg.data.phaseBoundaryPrefixChars ?? 0, outMsg.data.delta.length),
+                );
+                if (
+                  incomingPhase === "final_answer" &&
+                  awaitingFinalPhaseBoundaryPrefix &&
+                  boundaryPrefixChars > 0
+                ) {
+                  streamPhaseBoundaryOffsetChars = Math.max(
+                    0,
+                    totalTextChars - streamTextPrefixChars,
+                  );
+                  streamPhaseBoundaryPrefixChars = boundaryPrefixChars;
+                  streamPhaseBoundaryPrefix = outMsg.data.delta.slice(0, boundaryPrefixChars);
+                  phasedDelta = outMsg.data.delta.slice(boundaryPrefixChars);
+                  awaitingFinalPhaseBoundaryPrefix = false;
+                } else if (
+                  incomingPhase === "final_answer" &&
+                  awaitingFinalPhaseBoundaryPrefix &&
+                  /\S/u.test(outMsg.data.delta)
+                ) {
+                  awaitingFinalPhaseBoundaryPrefix = false;
+                }
+                if (incomingPhase === "commentary") commentaryText += phasedDelta;
+                if (incomingPhase === "final_answer") finalAnswerText += phasedDelta;
+                textPhase = incomingPhase ?? textPhase;
                 totalTextChars += outMsg.data.delta.length;
 
                 if (
@@ -970,12 +1110,12 @@ export async function bridgeBusToAdapter(params: {
                 }
 
                 if (!bufferNoReplyPrefix) {
-                  part = { type: "text.delta", delta: outMsg.data.delta };
-                  visibleTextAcc += outMsg.data.delta;
+                  part = { type: "text.delta", delta: visibleDelta };
+                  visibleTextAcc += visibleDelta;
                   break;
                 }
 
-                pendingNoReplyPrefix += outMsg.data.delta;
+                pendingNoReplyPrefix += visibleDelta;
                 if (isPossibleNoReplyPrefix(pendingNoReplyPrefix)) {
                   lastOutCursor = outCtx.cursor;
                   break;
@@ -985,6 +1125,47 @@ export async function bridgeBusToAdapter(params: {
                 part = { type: "text.delta", delta: pendingNoReplyPrefix };
                 visibleTextAcc += pendingNoReplyPrefix;
                 pendingNoReplyPrefix = "";
+                lastOutCursor = outCtx.cursor;
+                break;
+              }
+
+              case lilacEventTypes.EvtAgentOutputTextReset: {
+                const clampedStreamPrefixChars = Math.max(
+                  0,
+                  Math.min(streamTextPrefixChars, outMsg.data.text.length),
+                );
+                const laneText = outMsg.data.text.slice(clampedStreamPrefixChars);
+                totalTextChars = outMsg.data.text.length;
+                visibleTextAcc = laneText;
+                pendingNoReplyPrefix = "";
+                bufferNoReplyPrefix = true;
+                textPhase = outMsg.data.phase;
+                if (outMsg.data.phase === "commentary") {
+                  commentaryText = laneText;
+                  finalAnswerText = "";
+                  phaseSegmentsValid = true;
+                } else if (outMsg.data.phase === "final_answer") {
+                  phaseSegmentsValid =
+                    phaseSegmentsValid &&
+                    (commentaryText.length === 0 || laneText.startsWith(commentaryText));
+                  finalAnswerText = laneText.startsWith(commentaryText)
+                    ? withoutStreamPhaseBoundary(
+                        laneText.slice(commentaryText.length),
+                        commentaryText.length,
+                      )
+                    : laneText;
+                } else {
+                  commentaryText = "";
+                  finalAnswerText = "";
+                  phaseSegmentsValid = true;
+                }
+                if (outMsg.data.phase !== "final_answer") {
+                  streamPhaseBoundaryPrefixChars = 0;
+                  streamPhaseBoundaryOffsetChars = 0;
+                  streamPhaseBoundaryPrefix = undefined;
+                }
+                awaitingFinalPhaseBoundaryPrefix = false;
+                part = { type: "text.set", text: laneText };
                 lastOutCursor = outCtx.cursor;
                 break;
               }
@@ -1079,6 +1260,12 @@ export async function bridgeBusToAdapter(params: {
                     ? finalText
                     : finalText.slice(clampedStreamPrefixChars);
 
+                const hasTrackedPhasedText =
+                  commentaryText.trim().length > 0 && finalAnswerText.trim().length > 0;
+                if (!hasTrackedPhasedText) {
+                  streamFinalText = withoutStreamPhaseBoundary(streamFinalText);
+                }
+
                 // On recovery resumes, the agent may emit only the continuation suffix
                 // (instead of the full final text). In that case, preserve already visible
                 // stream text and append the new suffix with overlap-aware merge.
@@ -1125,7 +1312,26 @@ export async function bridgeBusToAdapter(params: {
                 ) {
                   reasoningFrozenAtMs = outMsg.ts;
                 }
-                await out.push({ type: "text.set", text: streamFinalText });
+                const preservesCommentaryPrefix = streamFinalText.startsWith(commentaryText);
+                const authoritativeFinalAnswer = preservesCommentaryPrefix
+                  ? withoutStreamPhaseBoundary(
+                      streamFinalText.slice(commentaryText.length),
+                      commentaryText.length,
+                    )
+                  : "";
+                const finalSegments =
+                  phaseSegmentsValid &&
+                  commentaryText.trim().length > 0 &&
+                  finalAnswerText.trim().length > 0 &&
+                  authoritativeFinalAnswer.startsWith(finalAnswerText) &&
+                  authoritativeFinalAnswer.trim().length > 0
+                    ? [commentaryText, authoritativeFinalAnswer]
+                    : undefined;
+                await out.push({
+                  type: "text.set",
+                  text: streamFinalText,
+                  ...(finalSegments === undefined ? {} : { finalSegments }),
+                });
                 streamHasVisibleOutput = true;
                 const res = await out.finish();
 
@@ -1226,40 +1432,11 @@ export async function bridgeBusToAdapter(params: {
           const nextReplyTo = reanchorInput.inheritReplyTo ? currentReplyTo : reanchorInput.replyTo;
           const reanchorAbortReason =
             reanchorInput.mode === "interrupt" ? "reanchor_interrupt" : "reanchor";
-
-          // Make the new stream active immediately so any messages created during abort
-          // do not get published as "active output".
-          streamToken += 1;
-
-          // Freeze the current output chain in-place.
-          await out.abort(reanchorAbortReason).catch(() => undefined);
-
-          currentReplyTo = nextReplyTo;
-          streamTextPrefixChars = Math.max(0, totalTextChars - pendingNoReplyPrefix.length);
-          visibleTextAcc = "";
-          streamHasVisibleOutput = false;
-
-          // Start a new output stream and prime it with current state.
-          out = await adapter.startOutput(sessionRef, buildStartOpts(nextReplyTo, streamToken));
-          finalTextMode = out.getFinalTextMode?.() ?? "continuation";
-
-          if (platform === "discord" && typeof reasoningStartedAtMs === "number") {
-            await out.push({
-              type: "reasoning.status",
-              update: {
-                startedAtMs: reasoningStartedAtMs,
-                frozenAtMs: reasoningFrozenAtMs,
-                detailText: reasoningDetailText,
-              },
-            });
-            streamHasVisibleOutput = true;
-          }
-
-          // Replay tool status lines so the new stream shows current Actions.
-          for (const u of toolStatusById.values()) {
-            await out.push({ type: "tool.status", update: u });
-            streamHasVisibleOutput = true;
-          }
+          await switchOutputLane({
+            replyTo: nextReplyTo,
+            abortReason: reanchorAbortReason,
+            replayStatus: true,
+          });
         });
       },
       snapshot: () => ({
@@ -1271,9 +1448,18 @@ export async function bridgeBusToAdapter(params: {
         routerSessionMode: input.routerSessionMode,
         replyTo: currentReplyTo,
         createdOutputRefs: createdOutputRefs.slice(),
+        activeOutputRefs: activeOutputRefs.slice(),
         visibleText: visibleTextAcc,
         totalTextChars,
         streamTextPrefixChars,
+        streamPhaseBoundaryPrefixChars,
+        streamPhaseBoundaryOffsetChars,
+        ...(streamPhaseBoundaryPrefix === undefined ? {} : { streamPhaseBoundaryPrefix }),
+        awaitingFinalPhaseBoundaryPrefix,
+        ...(textPhase === undefined ? {} : { textPhase }),
+        ...(commentaryText.length === 0 ? {} : { commentaryText }),
+        ...(finalAnswerText.length === 0 ? {} : { finalAnswerText }),
+        phaseSegmentsValid,
         reasoning:
           typeof reasoningStartedAtMs === "number"
             ? {

@@ -48,6 +48,7 @@ export type LilacMessageForTopic<TTopic extends LilacTopic> = LilacMessage<
 type OutputEventType =
   | typeof lilacEventTypes.EvtAgentOutputDeltaReasoning
   | typeof lilacEventTypes.EvtAgentOutputDeltaText
+  | typeof lilacEventTypes.EvtAgentOutputTextReset
   | typeof lilacEventTypes.EvtAgentOutputResponseText
   | typeof lilacEventTypes.EvtAgentOutputResponseBinary
   | typeof lilacEventTypes.EvtAgentOutputToolCall
@@ -57,6 +58,7 @@ function isOutputEventType(type: LilacEventType): type is OutputEventType {
   return (
     type === lilacEventTypes.EvtAgentOutputDeltaReasoning ||
     type === lilacEventTypes.EvtAgentOutputDeltaText ||
+    type === lilacEventTypes.EvtAgentOutputTextReset ||
     type === lilacEventTypes.EvtAgentOutputResponseText ||
     type === lilacEventTypes.EvtAgentOutputResponseBinary ||
     type === lilacEventTypes.EvtAgentOutputToolCall ||
@@ -112,6 +114,7 @@ function getTopicForType<TType extends LilacEventType>(
   switch (type) {
     case lilacEventTypes.EvtAgentOutputDeltaReasoning:
     case lilacEventTypes.EvtAgentOutputDeltaText:
+    case lilacEventTypes.EvtAgentOutputTextReset:
     case lilacEventTypes.EvtAgentOutputResponseText:
     case lilacEventTypes.EvtAgentOutputResponseBinary:
     case lilacEventTypes.EvtAgentOutputToolCall:
@@ -140,6 +143,7 @@ function getKeyForType<TType extends LilacEventType>(
     case lilacEventTypes.EvtSurfaceOutputMessageCreated:
     case lilacEventTypes.EvtAgentOutputDeltaReasoning:
     case lilacEventTypes.EvtAgentOutputDeltaText:
+    case lilacEventTypes.EvtAgentOutputTextReset:
     case lilacEventTypes.EvtAgentOutputResponseText:
     case lilacEventTypes.EvtAgentOutputResponseBinary:
     case lilacEventTypes.EvtAgentOutputToolCall:
