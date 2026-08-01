@@ -250,6 +250,46 @@ Consumes `cmd.request` and runs the LLM.
     - `evt.agent.output.response.binary`
     - `evt.agent.output.toolcall`
 
+Claude Code agent runs use the official Claude runtime and operator-provided authentication. Local
+runs may use an installed CLI with existing authenticated config or `claude auth login`. Core's Docker
+image can use the SDK-bundled executable with `CLAUDE_CODE_OAUTH_TOKEN`, a mounted authenticated
+config, or both. Container deployments must give `CLAUDE_CONFIG_DIR` a writable persistent mount when
+native continuation must survive replacement. Lilac does not own the authentication flow. Eligible
+sessions continue through native Claude transcripts across turns and restarts: the first or any
+incompatible attempt starts fresh persisted, while only an exact compatible continuation forks the
+last clean session rather than advancing it in place.
+
+Native continuation requires product-specific proof:
+
+- Mini main: the binding owns the exact selected history-state ID, so undo, redo, and branching can
+  select the matching retained native history.
+- Mini named subagent: the binding owns that child's current exact history state/hash. The stable
+  identity may be caller-supplied or generated and returned by `subagent_delegate`.
+- Core named subagent: the delegation supplied a stable continuation identity and the marked
+  request-client/session transcript has the exact canonical hash and message count.
+- Core primary: only Discord is eligible. The binding names the terminal request whose retained
+  transcript and lineage manifest recompute its exact clean head, and the current lineage must be an
+  exact complete-segment extension of that ordered prefix digest.
+
+Execution scope, cwd, Claude storage namespace, and native metadata must also match. Missing or
+externally mutated native state, compaction, or any failed proof starts a fresh persisted Claude
+session from Lilac's canonical history. Native session IDs remain internal operational data.
+
+Core transcript schema 5 makes that primary terminal request identity explicit. Its migration
+backfills a schema-4 binding only from exact retained durable proof, scanning retained transcript and
+lineage rows when the matching succeeded attempt was already pruned; a binding with no exact proof is
+removed. Binding lookup repeats terminal transcript/manifest verification and compare-and-delete
+retires a stale binding without deleting a concurrently installed replacement. The next request then
+uses the ordinary fresh path. `getCoreRetentionDiagnostics()` provides an internal aggregate snapshot
+of named/primary bindings, active/terminal attempts, unverifiable bindings, orphan succeeded attempts
+and manifests, unreferenced projections, and owned/unreferenced blob bytes.
+
+Explicit model selection can cross the `claude-code` boundary only at a new-turn boundary. Historical
+context is then lowered to lossy text: visible conversation text and bounded, labeled historical tool
+facts remain, while hidden reasoning, provider metadata, binary history, and historical executable
+tool protocol do not. Core automatic fallback is provider-family-local; a Core run whose head model
+is `claude-code` has automatic fallback disabled. Mini does not implement that Core fallback chain.
+
 ### Reply Relay (Bus -> Surface)
 
 When `evt.request.reply` arrives for a request, the relay subscribes to `out.req.<request_id>` and streams output to the adapter.
@@ -289,20 +329,20 @@ There are three tool “levels”. They all serve the agent; higher levels are u
    - Shared Level 1 names, input schemas, local adapters, patch parsing, `AGENTS.md` discovery/rendering, and batch expansion/preflight live in `packages/coding-tools`. Core-specific SSH/restricted execution, artifacts, attachments, instruction result adaptation, logging, and bus delegation adapters live under `apps/core/src/tools/*`; built-ins are exposed through `apps/core/src/plugins/builtin/*`.
    - External plugins are discovered from `DATA_DIR/plugins/*`.
    - Key ones:
-      - `bash` (`apps/core/src/tools/bash.ts`), guarded by `apps/core/src/tools/bash-safety/*` unless `dangerouslyAllow=true`.
-        - Bash safety is an evidence-only accidental-damage guardrail. It blocks statically identified destructive operations and sensitive-path access, including direct static access to `DATA_DIR/secret`, but parsing failures, unsupported syntax, and runtime-dependent behavior fail open. Dynamic `rm -rf` targets are the deliberate exception and remain blocked because their deletion scope cannot be verified.
-        - Child env always includes request context vars (`LILAC_REQUEST_ID`, `LILAC_SESSION_ID`, `LILAC_REQUEST_CLIENT`, `LILAC_CWD`) and VCS vars (`GIT_CONFIG_GLOBAL`, `GNUPGHOME`, with color forced off via `NO_COLOR=1`).
-        - Trusted local bash also loads `$DATA_DIR/secret/tool-env.jsonc` before each process. This overlay is not used for restricted bash or SSH execution.
-        - Bash path denial and output redaction are best-effort accidental-leak prevention, not a security boundary. Trusted local commands can evade static analysis and read, transform, or transmit their environment and same-user files; use restricted bash or OS-level isolation when commands must not access secrets.
-        - When GitHub outbound auth is configured, bash also injects GitHub auth vars from `apps/core/src/github/github-auth.ts`:
-          - Canonical: `GH_TOKEN`, `GITHUB_TOKEN` (prefer user token when configured, otherwise app token).
-          - Optional host: `GH_HOST`.
-          - Explicit alternates: `LILAC_GITHUB_USER_TOKEN`, `LILAC_GITHUB_USER_HOST`, `LILAC_GITHUB_APP_TOKEN`, `LILAC_GITHUB_APP_HOST`.
-          - This allows command-level override to app auth when needed (for example: `GH_TOKEN="$LILAC_GITHUB_APP_TOKEN" gh ...`).
-      - `read_file`, `glob`, `grep` (`apps/core/src/tools/fs/fs.ts`) (normal-operation denylists include `DATA_DIR/secret`, including MCP OAuth credentials, plus `~/.ssh`, `~/.aws`, and `~/.gnupg` unless `dangerouslyAllow=true`).
-      - `apply_patch` (`apps/core/src/tools/apply-patch/index.ts`) (format docs: `apps/core/src/tools/apply-patch/README.md`; remote denylist can be bypassed with `dangerouslyAllow=true`).
-      - `batch` (`apps/core/src/tools/batch.ts`) expands one call into ordinary synthetic Level 1 tool-call/result pairs.
-      - `subagent_delegate` (`apps/core/src/tools/subagent.ts`) when `agent.subagents` is enabled and depth limits allow delegation. Its model argument is generated from agent-selectable `models.def` aliases, with optional per-call reasoning overrides and config-authored routing guidance.
+     - `bash` (`apps/core/src/tools/bash.ts`), guarded by `apps/core/src/tools/bash-safety/*` unless `dangerouslyAllow=true`.
+       - Bash safety is an evidence-only accidental-damage guardrail. It blocks statically identified destructive operations and sensitive-path access, including direct static access to `DATA_DIR/secret`, but parsing failures, unsupported syntax, and runtime-dependent behavior fail open. Dynamic `rm -rf` targets are the deliberate exception and remain blocked because their deletion scope cannot be verified.
+       - Child env always includes request context vars (`LILAC_REQUEST_ID`, `LILAC_SESSION_ID`, `LILAC_REQUEST_CLIENT`, `LILAC_CWD`) and VCS vars (`GIT_CONFIG_GLOBAL`, `GNUPGHOME`, with color forced off via `NO_COLOR=1`).
+       - Trusted local bash also loads `$DATA_DIR/secret/tool-env.jsonc` before each process. This overlay is not used for restricted bash or SSH execution.
+       - Bash path denial and output redaction are best-effort accidental-leak prevention, not a security boundary. Trusted local commands can evade static analysis and read, transform, or transmit their environment and same-user files; use restricted bash or OS-level isolation when commands must not access secrets.
+       - When GitHub outbound auth is configured, bash also injects GitHub auth vars from `apps/core/src/github/github-auth.ts`:
+         - Canonical: `GH_TOKEN`, `GITHUB_TOKEN` (prefer user token when configured, otherwise app token).
+         - Optional host: `GH_HOST`.
+         - Explicit alternates: `LILAC_GITHUB_USER_TOKEN`, `LILAC_GITHUB_USER_HOST`, `LILAC_GITHUB_APP_TOKEN`, `LILAC_GITHUB_APP_HOST`.
+         - This allows command-level override to app auth when needed (for example: `GH_TOKEN="$LILAC_GITHUB_APP_TOKEN" gh ...`).
+     - `read_file`, `glob`, `grep` (`apps/core/src/tools/fs/fs.ts`) (normal-operation denylists include `DATA_DIR/secret`, including MCP OAuth credentials, plus `~/.ssh`, `~/.aws`, and `~/.gnupg` unless `dangerouslyAllow=true`).
+     - `apply_patch` (`apps/core/src/tools/apply-patch/index.ts`) (format docs: `apps/core/src/tools/apply-patch/README.md`; remote denylist can be bypassed with `dangerouslyAllow=true`).
+     - `batch` (`apps/core/src/tools/batch.ts`) expands one call into ordinary synthetic Level 1 tool-call/result pairs.
+     - `subagent_delegate` (`apps/core/src/tools/subagent.ts`) when `agent.subagents` is enabled and depth limits allow delegation. Its model argument is generated from agent-selectable `models.def` aliases, with optional per-call reasoning overrides and config-authored routing guidance.
 
 2. Level 2: tool server tools + the `tools` CLI
    - Served by Elysia from `apps/core/src/tool-server/create-tool-server.ts`.
@@ -366,6 +406,16 @@ Expected contents over time:
 - `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home, and `mcp-oauth/<server-id>.json`)
 - `workspace/` (default working directory for bash/fs tools in the core runtime)
 
+Native Claude continuation is separate from `DATA_DIR`. Claude stores its own conversation
+transcripts under `CLAUDE_CONFIG_DIR`, or `~/.claude` when unset. An explicit value must be a
+non-empty absolute path. It must be writable and, in a container, persistently mounted for restart
+continuation. A dedicated directory is operator-controlled storage separation, not an access-control
+or privacy boundary from the same service user. Fresh persisted attempts are used without an exact
+binding; exact continuations create retained forks, so fork-heavy history may grow roughly
+quadratically. Attempt records are bounded. Core primary/named owners and Mini named children keep one
+current binding. Mini main historical bindings remain with retained history states
+and may grow with that history. Lilac does not delete native transcript files.
+
 Onboarding-related tools may also create additional persisted directories under `DATA_DIR` (for example `bin/`, `.bun/`, `.npm-global/`, `.config/`, `tmp/`).
 
 ### Prompts
@@ -411,7 +461,8 @@ Key sections:
 
 ### Environment variables
 
-Parsed in `packages/utils/env.ts`. The important ones:
+Most Core environment variables are parsed in `packages/utils/env.ts`. Important parsed values
+include:
 
 - `REDIS_URL` (required by core runtime)
 - `SQLITE_URL` (workflow store sqlite path; default: `${DATA_DIR}/data.sqlite3`)
@@ -422,6 +473,7 @@ Parsed in `packages/utils/env.ts`. The important ones:
 Workflow project scope is selected per invocation. Run the Level-2 workflow command from the intended
 Level-1 `bash` cwd; the generic request capability carries that resolved cwd independently from the main
 agent's default workspace.
+
 - `GITHUB_WEBHOOK_SECRET`, `GITHUB_WEBHOOK_PORT`, `GITHUB_WEBHOOK_PATH` (enable GitHub webhook ingress)
 - Provider keys/base URLs (`OPENAI_*`, `OPENROUTER_*`, `ANTHROPIC_*`, `GEMINI_*`, `AI_GATEWAY_*`, etc.)
 - `TAVILY_API_KEY`, `EXA_API_KEY`, and/or `FIRECRAWL_API_KEY` (enable configured web providers)
@@ -429,6 +481,13 @@ agent's default workspace.
 - `FIRECRAWL_API_BASE_URL` (optional Firecrawl API endpoint override)
 - `TAVILY_API_BASE_URL` (optional Tavily API endpoint override)
 - `DISCORD_TOKEN` (or whatever `surface.discord.tokenEnv` points to)
+
+The Claude runtime integration and official SDK consume these directly rather than through
+`packages/utils/env.ts`:
+
+- `CLAUDE_CODE_OAUTH_TOKEN` (optional Core/SDK Claude authentication, including Docker deployments)
+- `CLAUDE_CONFIG_DIR` (Claude auth/config/native transcript root; defaults to `~/.claude`; when set,
+  must be a non-empty absolute writable path and should be persistently mounted in containers)
 
 ---
 

@@ -1135,18 +1135,21 @@ describe("request-composition mention thread context", () => {
     });
 
     expect(out.chainMessageIds).toEqual(["root", "m1", "m2", "m3"]);
-    expect(out.mergedGroups.length).toBe(2);
+    expect(out.mergedGroups.length).toBe(3);
     expect(out.mergedGroups[0]?.messageIds).toEqual(["root"]);
-    expect(out.mergedGroups[1]?.messageIds).toEqual(["m1", "m2", "m3"]);
+    expect(out.mergedGroups[1]?.messageIds).toEqual(["m1", "m2"]);
+    expect(out.mergedGroups[2]?.messageIds).toEqual(["m3"]);
 
-    expect(out.messages.length).toBe(2);
+    expect(out.messages.length).toBe(3);
 
     const merged = out.messages[1]?.content;
+    const current = out.messages[2]?.content;
     expect(typeof merged).toBe("string");
+    expect(typeof current).toBe("string");
     expect(merged as string).toContain("user msg 1");
     expect(merged as string).toContain("user msg 2");
-    expect(merged as string).toContain("user msg 3");
-    expect(merged as string).toContain("<@bot>");
+    expect(current as string).toContain("user msg 3");
+    expect(current as string).toContain("<@bot>");
   });
 
   it("walks mention context via merged-group heads", async () => {
@@ -1221,10 +1224,11 @@ describe("request-composition mention thread context", () => {
     expect(out.mergedGroups).toEqual([
       { authorId: "uB", messageIds: ["b0"] },
       { authorId: "uA", messageIds: ["a1", "a2"] },
-      { authorId: "uB", messageIds: ["b1", "b2"] },
+      { authorId: "uB", messageIds: ["b1"] },
+      { authorId: "uB", messageIds: ["b2"] },
     ]);
 
-    expect(out.messages.length).toBe(3);
+    expect(out.messages.length).toBe(4);
   });
 
   it("treats maxDepth as merged-group count when walking reply chains", async () => {
@@ -1299,7 +1303,8 @@ describe("request-composition mention thread context", () => {
     expect(out.chainMessageIds).toEqual(["a1", "a2", "b1", "b2"]);
     expect(out.mergedGroups).toEqual([
       { authorId: "uA", messageIds: ["a1", "a2"] },
-      { authorId: "uB", messageIds: ["b1", "b2"] },
+      { authorId: "uB", messageIds: ["b1"] },
+      { authorId: "uB", messageIds: ["b2"] },
     ]);
   });
 

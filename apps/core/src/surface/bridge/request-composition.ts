@@ -1,4 +1,14 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { ModelMessage, UserContent } from "ai";
+import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
+import {
+  buildCoreLineageManifestV1,
+  createCorePrimaryLineageFreshOnlyV1,
+  type CoreLineageAtomV1,
+  type CoreLineageSegmentInputV1,
+  type CorePrimaryLineageV1,
+} from "@stanley2058/lilac-event-bus";
 import type { SurfaceAdapter } from "../adapter";
 import type { MsgRef, SurfaceMessage } from "../types";
 
@@ -12,14 +22,21 @@ import {
   isDiscordSessionDividerText,
 } from "../discord/discord-session-divider";
 
-import type { TranscriptSnapshot, TranscriptStore } from "../../transcript/transcript-store";
+import {
+  CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  type CoreOwnedBlobReference,
+  type CoreSurfaceProjection,
+  type TranscriptSnapshot,
+  type TranscriptStore,
+} from "../../transcript/transcript-store";
 import {
   appendDiscordAttachmentsToUserContent,
   createDiscordAttachmentState,
+  getDiscordOwnedBlobReferences,
+  takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
 import { selectNewestReachableCheckpoint } from "./request-composition/checkpoint-selection";
 import {
-  buildAssistantOnlyMessageFromTranscript,
   formatDiscordAttributionHeader,
   normalizeAssistantContextText,
   normalizeText,
@@ -51,6 +68,526 @@ export type {
 } from "./request-composition/types";
 
 const DISCORD_REFERENCE_TYPE_FORWARD = 1;
+const DISCORD_SURFACE_ID_PREFIX = "discord:";
+
+type ProjectionCapableStore = TranscriptStore &
+  Required<
+    Pick<
+      TranscriptStore,
+      | "admitCoreSurfaceProjection"
+      | "getCoreSurfaceProjection"
+      | "putCoreOwnedBlob"
+      | "getCoreOwnedBlob"
+      | "deleteCoreOwnedBlobIfUnreferenced"
+    >
+  >;
+
+function isProjectionCapableStore(
+  store: TranscriptStore | undefined,
+): store is ProjectionCapableStore {
+  return Boolean(
+    store?.admitCoreSurfaceProjection &&
+    store.getCoreSurfaceProjection &&
+    store.putCoreOwnedBlob &&
+    store.getCoreOwnedBlob &&
+    store.deleteCoreOwnedBlobIfUnreferenced,
+  );
+}
+
+function surfaceIdForDiscordSession(sessionId: string): string {
+  return `${DISCORD_SURFACE_ID_PREFIX}${sessionId}`;
+}
+
+function surfaceProjectionKey(sessionId: string, messageId: string) {
+  return {
+    requestClient: "discord" as const,
+    surfaceId: surfaceIdForDiscordSession(sessionId),
+    sessionId,
+    messageId,
+    projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  };
+}
+
+function mergeProjectedSurfaceMessages(messages: readonly ModelMessage[]): ModelMessage[] {
+  if (messages.length <= 1) return [...messages];
+  const role = messages[0]?.role;
+  if (role === "assistant" && messages.every((message) => message.role === "assistant")) {
+    const content = messages
+      .map((message) =>
+        typeof message.content === "string"
+          ? message.content
+          : message.content
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("\n\n"),
+      )
+      .filter(Boolean)
+      .join("\n\n");
+    return [{ role: "assistant", content }];
+  }
+  if (role !== "user" || !messages.every((message) => message.role === "user")) {
+    return [...messages];
+  }
+
+  const multipart = messages.some((message) => typeof message.content !== "string");
+  if (!multipart) {
+    return [
+      {
+        role: "user",
+        content: messages
+          .map((message) => (typeof message.content === "string" ? message.content : ""))
+          .join("\n\n"),
+      },
+    ];
+  }
+
+  const parts: UserContent = [];
+  for (const [index, message] of messages.entries()) {
+    if (index > 0) parts.push({ type: "text", text: "\n\n" });
+    if (typeof message.content === "string") parts.push({ type: "text", text: message.content });
+    else parts.push(...message.content);
+  }
+  return [{ role: "user", content: parts }];
+}
+
+function storedProjectionSegmentIds(projection: CoreSurfaceProjection | null): string[] | null {
+  const value = projection?.sourceFacts["segmentMessageIds"];
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) return null;
+  return value;
+}
+
+function storedStringFact(
+  projection: CoreSurfaceProjection | null,
+  key: string,
+  fallback: string,
+): string {
+  const value = projection?.sourceFacts[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+function storedNumberFact(
+  projection: CoreSurfaceProjection | null,
+  key: string,
+  fallback: number,
+): number {
+  const value = projection?.sourceFacts[key];
+  return typeof value === "number" ? value : fallback;
+}
+
+function collectStoredBoundaryBreaks(input: {
+  chain: readonly ReplyChainMessage[];
+  sessionId: string;
+  projections: ReadonlyMap<string, CoreSurfaceProjection | null>;
+  transcriptStore?: TranscriptStore;
+}): Set<string> {
+  const boundaryKeys = input.chain.map((message) => {
+    const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
+      surfaceProjectionKey(input.sessionId, message.messageId),
+    );
+    if (stored) return `${stored.requestId}:${stored.segmentIndex}`;
+    const admittedIds = storedProjectionSegmentIds(
+      input.projections.get(message.messageId) ?? null,
+    );
+    return admittedIds ? `admitted:${admittedIds.join("\u0000")}` : null;
+  });
+  const breaks = new Set<string>();
+  for (let index = 1; index < input.chain.length; index += 1) {
+    const previous = boundaryKeys[index - 1];
+    const current = boundaryKeys[index];
+    if ((previous || current) && previous !== current) {
+      breaks.add(input.chain[index]!.messageId);
+    }
+  }
+  return breaks;
+}
+
+function appendPersistedSyntheticSuffix(input: {
+  segmentInputs: CoreLineageSegmentInputV1[];
+  requestId: string;
+  transcriptStore?: TranscriptStore;
+}): boolean {
+  const manifest = input.transcriptStore?.getCorePrimaryLineageManifest?.({
+    requestId: input.requestId,
+  });
+  if (!manifest || !manifest.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")) {
+    return true;
+  }
+  if (input.segmentInputs.length > manifest.segments.length) return false;
+
+  const prefixMatches = input.segmentInputs.every((segment, index) => {
+    const stored = manifest.segments[index];
+    return (
+      stored !== undefined &&
+      isDeepStrictEqual(segment.atoms, stored.atoms) &&
+      isDeepStrictEqual(segment.canonicalMessages, stored.canonicalMessages) &&
+      isDeepStrictEqual(segment.requestSource, stored.requestSource)
+    );
+  });
+  const suffix = manifest.segments.slice(input.segmentInputs.length);
+  if (!prefixMatches || suffix.some((segment) => segment.atoms[0]?.kind !== "synthetic")) {
+    return false;
+  }
+
+  input.segmentInputs.push(
+    ...suffix.map((segment) => ({
+      atoms: segment.atoms,
+      canonicalMessages: segment.canonicalMessages,
+    })),
+  );
+  return true;
+}
+
+async function renderSurfaceProjectionCandidate(input: {
+  message: ReplyChainMessage;
+  isBot: boolean;
+  sessionId: string;
+  reactions: readonly string[];
+  discordUserAliasById?: ReadonlyMap<string, string>;
+  attachmentState: ReturnType<typeof createDiscordAttachmentState>;
+}): Promise<{ messages: ModelMessage[]; ownedBlobs: CoreOwnedBlobReference[] }> {
+  const normalized = normalizeText(input.message.text, {});
+  if (input.isBot) {
+    return {
+      messages: [
+        {
+          role: "assistant",
+          content: normalizeAssistantContextText(normalized),
+        },
+      ],
+      ownedBlobs: [],
+    };
+  }
+
+  const header = formatDiscordAttributionHeader({
+    authorId: input.message.authorId,
+    authorName: input.message.authorName,
+    userAlias: input.discordUserAliasById?.get(input.message.authorId),
+    messageId: input.message.messageId,
+    messageTs: input.message.ts,
+    reactions: input.reactions,
+  });
+  const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
+  if (input.message.attachments.length === 0) {
+    return { messages: [{ role: "user", content: mainText }], ownedBlobs: [] };
+  }
+
+  const parts: UserContent = [{ type: "text", text: mainText }];
+  await appendDiscordAttachmentsToUserContent(
+    parts,
+    input.message.attachments,
+    input.attachmentState,
+  );
+  return {
+    messages: [{ role: "user", content: parts }],
+    ownedBlobs: takeDiscordCurrentBlobReferences(input.attachmentState),
+  };
+}
+
+async function composeSelectedDiscordChain(input: {
+  adapter: SurfaceAdapter;
+  sessionId: string;
+  botUserId: string;
+  chain: readonly ReplyChainMessage[];
+  checkpointSelection: ReturnType<typeof selectNewestReachableCheckpoint<ReplyChainMessage>>;
+  currentMessageIds: readonly string[];
+  transcriptStore?: TranscriptStore;
+  discordUserAliasById?: ReadonlyMap<string, string>;
+}): Promise<{
+  messages: ModelMessage[];
+  mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+  corePrimaryLineage: CorePrimaryLineageV1;
+}> {
+  const projectionStore = isProjectionCapableStore(input.transcriptStore)
+    ? input.transcriptStore
+    : undefined;
+  const attachmentState = createDiscordAttachmentState({
+    ownBlob: projectionStore
+      ? ({ bytes, mediaType, filename }) =>
+          projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename })
+      : undefined,
+  });
+  try {
+    const projections = new Map<string, CoreSurfaceProjection | null>();
+    for (const message of input.chain) {
+      projections.set(
+        message.messageId,
+        projectionStore?.getCoreSurfaceProjection(
+          surfaceProjectionKey(input.sessionId, message.messageId),
+        ) ?? null,
+      );
+    }
+    const immutableChain = input.chain.map((message) => {
+      const projection = projections.get(message.messageId) ?? null;
+      if (!projection) return message;
+      return {
+        ...message,
+        authorId: storedStringFact(projection, "authorId", message.authorId),
+        authorName: storedStringFact(projection, "authorName", message.authorName),
+        ts: storedNumberFact(projection, "messageTs", message.ts),
+      };
+    });
+    const hardBreaks = collectStoredBoundaryBreaks({
+      chain: immutableChain,
+      sessionId: input.sessionId,
+      projections,
+      transcriptStore: input.transcriptStore,
+    });
+    const currentMessageIds = new Set(input.currentMessageIds);
+    const firstCurrentMessage = immutableChain.find((message) =>
+      currentMessageIds.has(message.messageId),
+    );
+    if (firstCurrentMessage) hardBreaks.add(firstCurrentMessage.messageId);
+    const merged = mergeChainByDiscordWindow(immutableChain, hardBreaks);
+    const messageById = new Map(immutableChain.map((message) => [message.messageId, message]));
+    const unknownUserRefs = immutableChain
+      .filter(
+        (message) => message.authorId !== input.botUserId && !projections.get(message.messageId),
+      )
+      .map(
+        (message) =>
+          ({
+            platform: "discord",
+            channelId: input.sessionId,
+            messageId: message.messageId,
+          }) satisfies MsgRef,
+      );
+    const reactionsByMessageId = await getReactionsByMessageId({
+      adapter: input.adapter,
+      refs: unknownUserRefs,
+    });
+    const projectedByMessageId = new Map<string, readonly ModelMessage[]>();
+    const candidateOwnedBlobsByMessageId = new Map<string, readonly CoreOwnedBlobReference[]>();
+    let lineageComplete = Boolean(projectionStore);
+    const transcriptSnapshotByMessageId = new Map<string, TranscriptSnapshot>();
+    const aliasMessageIdsByRequestId = new Map<string, string[]>();
+    if (input.transcriptStore) {
+      for (const message of immutableChain) {
+        if (message.authorId !== input.botUserId) continue;
+        const snapshot = resolveTranscriptSnapshot({
+          platform: "discord",
+          channelId: input.sessionId,
+          messageId: message.messageId,
+          transcriptStore: input.transcriptStore,
+          resolvedSnapshotsBySurfaceMessageId:
+            input.checkpointSelection.resolvedSnapshotsBySurfaceMessageId,
+        });
+        if (!snapshot) continue;
+        if (snapshot.requestClient !== "discord" || snapshot.sessionId !== input.sessionId) {
+          lineageComplete = false;
+          continue;
+        }
+        transcriptSnapshotByMessageId.set(message.messageId, snapshot);
+        const aliases = aliasMessageIdsByRequestId.get(snapshot.requestId) ?? [];
+        aliases.push(message.messageId);
+        aliasMessageIdsByRequestId.set(snapshot.requestId, aliases);
+      }
+    }
+
+    for (const chunk of merged) {
+      for (const messageId of chunk.messageIds) {
+        const stored = projections.get(messageId);
+        if (stored) {
+          projectedByMessageId.set(messageId, stored.canonicalMessages);
+          continue;
+        }
+        const source = messageById.get(messageId);
+        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        const candidate = await renderSurfaceProjectionCandidate({
+          message: source,
+          isBot: source.authorId === input.botUserId,
+          sessionId: input.sessionId,
+          reactions: reactionsByMessageId.get(messageId) ?? [],
+          discordUserAliasById: input.discordUserAliasById,
+          attachmentState,
+        });
+        if (!projectionStore) {
+          projectedByMessageId.set(messageId, candidate.messages);
+          continue;
+        }
+        projectedByMessageId.set(messageId, candidate.messages);
+        candidateOwnedBlobsByMessageId.set(messageId, candidate.ownedBlobs);
+      }
+
+      const projectionSegmentIdsByMessageId = new Map<string, readonly string[]>();
+      if (chunk.authorId !== input.botUserId) {
+        for (const messageId of chunk.messageIds) {
+          projectionSegmentIdsByMessageId.set(messageId, chunk.messageIds);
+        }
+      } else {
+        let unresolvedIds: string[] = [];
+        const flushUnresolved = (): void => {
+          for (const unresolvedId of unresolvedIds) {
+            projectionSegmentIdsByMessageId.set(unresolvedId, unresolvedIds);
+          }
+          unresolvedIds = [];
+        };
+        for (const messageId of chunk.messageIds) {
+          if (transcriptSnapshotByMessageId.has(messageId)) {
+            flushUnresolved();
+            projectionSegmentIdsByMessageId.set(messageId, [messageId]);
+          } else {
+            unresolvedIds.push(messageId);
+          }
+        }
+        flushUnresolved();
+      }
+      for (const messageId of chunk.messageIds) {
+        if (projections.get(messageId) || !projectionStore) continue;
+        const source = messageById.get(messageId);
+        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        const segmentMessageIds = projectionSegmentIdsByMessageId.get(messageId) ?? [messageId];
+        const segmentMessages = mergeProjectedSurfaceMessages(
+          segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
+        );
+        const admitted = projectionStore.admitCoreSurfaceProjection({
+          ...surfaceProjectionKey(input.sessionId, messageId),
+          canonicalMessages: projectedByMessageId.get(messageId) ?? [],
+          sourceFacts: {
+            authorId: source.authorId,
+            authorName: source.authorName,
+            messageTs: source.ts,
+            reactions: [...(reactionsByMessageId.get(messageId) ?? [])],
+            attachments: source.attachments.map((attachment) => ({ ...attachment })),
+            segmentMessageIds: [...segmentMessageIds],
+            segmentDigest: hashCanonicalMessagesV1(segmentMessages).hash,
+          },
+          ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
+        });
+        projectedByMessageId.set(messageId, admitted.canonicalMessages);
+      }
+    }
+
+    const segmentInputs: CoreLineageSegmentInputV1[] = [];
+    if (input.checkpointSelection.checkpoint) {
+      const checkpoint = input.checkpointSelection.checkpoint;
+      const digest =
+        checkpoint.transcriptDigest ?? hashCanonicalMessagesV1(checkpoint.messages).hash;
+      segmentInputs.push({
+        atoms: [{ kind: "checkpoint", requestId: checkpoint.requestId, transcriptDigest: digest }],
+        canonicalMessages: checkpoint.messages,
+      });
+    }
+
+    const seenRequestIds = new Set<string>(
+      input.checkpointSelection.checkpoint ? [input.checkpointSelection.checkpoint.requestId] : [],
+    );
+    for (const chunk of merged) {
+      const appendSurfaceSegment = (messageIds: readonly string[]): void => {
+        if (messageIds.length === 0) return;
+        const atoms = messageIds.map(
+          (messageId) =>
+            ({
+              kind: "surface",
+              requestClient: "discord",
+              surfaceId: surfaceIdForDiscordSession(input.sessionId),
+              sessionId: input.sessionId,
+              messageId,
+            }) satisfies CoreLineageAtomV1,
+        );
+        const canonicalMessages = mergeProjectedSurfaceMessages(
+          messageIds.flatMap((messageId) => projectedByMessageId.get(messageId) ?? []),
+        );
+        segmentInputs.push({ atoms, canonicalMessages });
+      };
+
+      const pendingSurfaceIds: string[] = [];
+      for (const messageId of chunk.messageIds) {
+        const snapshot = transcriptSnapshotByMessageId.get(messageId);
+        if (!snapshot) {
+          pendingSurfaceIds.push(messageId);
+          continue;
+        }
+        appendSurfaceSegment(pendingSurfaceIds.splice(0));
+        if (seenRequestIds.has(snapshot.requestId)) continue;
+
+        seenRequestIds.add(snapshot.requestId);
+        if (
+          !appendPersistedSyntheticSuffix({
+            segmentInputs,
+            requestId: snapshot.requestId,
+            transcriptStore: input.transcriptStore,
+          })
+        ) {
+          lineageComplete = false;
+        }
+        const metadata = input.transcriptStore?.getCoreRequestAtomMetadata?.({
+          requestId: snapshot.requestId,
+        });
+        if (!metadata) lineageComplete = false;
+        const requestAtom: CoreLineageAtomV1 = {
+          kind: "request",
+          requestId: snapshot.requestId,
+          transcriptDigest:
+            metadata?.transcriptDigest ??
+            snapshot.transcriptDigest ??
+            hashCanonicalMessagesV1(snapshot.messages).hash,
+          providerFamily:
+            metadata?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
+          containsCrossFamilyTurns:
+            metadata?.containsCrossFamilyTurns ??
+            snapshot.providerState?.containsCrossFamilyTurns ??
+            true,
+        };
+        const aliases = [...new Set(aliasMessageIdsByRequestId.get(snapshot.requestId) ?? [])].map(
+          (aliasMessageId) => ({
+            requestClient: "discord",
+            surfaceId: surfaceIdForDiscordSession(input.sessionId),
+            sessionId: input.sessionId,
+            messageId: aliasMessageId,
+          }),
+        );
+        segmentInputs.push({
+          atoms: [requestAtom],
+          canonicalMessages: snapshot.messages,
+          requestSource: { aliases },
+        });
+      }
+      appendSurfaceSegment(pendingSurfaceIds);
+    }
+
+    const messages = segmentInputs.flatMap((segment) => segment.canonicalMessages);
+    const currentSegmentIndex = segmentInputs.findIndex((segment) =>
+      segment.atoms.some(
+        (atom) => atom.kind === "surface" && currentMessageIds.has(atom.messageId),
+      ),
+    );
+    if (currentSegmentIndex < 0) lineageComplete = false;
+    const currentCanonicalStart =
+      currentSegmentIndex < 0
+        ? Math.max(
+            0,
+            messages.findLastIndex((message) => message.role === "user"),
+          )
+        : segmentInputs
+            .slice(0, currentSegmentIndex)
+            .reduce((count, segment) => count + segment.canonicalMessages.length, 0);
+    const corePrimaryLineage =
+      lineageComplete && segmentInputs.length > 0
+        ? buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex })
+        : createCorePrimaryLineageFreshOnlyV1(
+            currentSegmentIndex < 0
+              ? "current-input-boundary-unreachable"
+              : projectionStore
+                ? "incomplete-request-metadata"
+                : "projection-store-unavailable",
+            currentCanonicalStart,
+          );
+    return {
+      messages,
+      mergedGroups: merged.map((chunk) => ({
+        authorId: chunk.authorId,
+        messageIds: [...chunk.messageIds],
+      })),
+      corePrimaryLineage,
+    };
+  } finally {
+    if (projectionStore) {
+      for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
+        projectionStore.deleteCoreOwnedBlobIfUnreferenced({ sha256: reference.sha256 });
+      }
+    }
+  }
+}
 
 function resolveTranscriptSnapshot(input: {
   messageId: string;
@@ -365,7 +902,6 @@ const ACTIVE_BURST_HISTORY_CAP = 200;
 const ACTIVE_BURST_HISTORY_TARGETS = [16, 48, 112, ACTIVE_BURST_HISTORY_CAP] as const;
 const ACTIVE_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 const ACTIVE_MAX_GAP_MS = 2 * 60 * 60 * 1000;
-const ACTIVE_TRANSCRIPT_MAX_AGE_MS = 1 * 60 * 60 * 1000;
 
 type ActiveBurstSelection = {
   selected: SurfaceMessage[];
@@ -688,7 +1224,12 @@ export async function composeRequestMessages(
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
   if (!triggerMsg) {
-    return { messages: [], chainMessageIds: [], mergedGroups: [] };
+    return {
+      messages: [],
+      chainMessageIds: [],
+      mergedGroups: [],
+      corePrimaryLineage: createCorePrimaryLineageFreshOnlyV1("empty-selection"),
+    };
   }
 
   const chain =
@@ -746,105 +1287,22 @@ export async function composeRequestMessages(
     getMessageId: (message) => message.messageId,
   });
 
-  // Step 2: merge descendants by Discord window rules (same author + <= 7 min).
-  const merged = mergeChainByDiscordWindow(checkpointSelection.descendants);
-
-  // Phase 3: normalize to ModelMessage[] with attribution headers.
-  const attState = createDiscordAttachmentState();
-
-  const modelMessages: ModelMessage[] = [...checkpointSelection.checkpointMessages];
-  const seenTranscriptRequestIds = new Set<string>(
-    checkpointSelection.checkpoint ? [checkpointSelection.checkpoint.requestId] : [],
-  );
-
-  const reactionRefs = merged
-    .filter((chunk) => chunk.authorId !== opts.botUserId)
-    .map((chunk) => {
-      const messageId = chunk.messageIds[chunk.messageIds.length - 1]!;
-      return {
-        platform: opts.platform,
-        channelId: opts.trigger.msgRef.channelId,
-        messageId,
-      } satisfies MsgRef;
-    });
-
-  const reactionsByMessageId = await getReactionsByMessageId({
+  const composed = await composeSelectedDiscordChain({
     adapter,
-    refs: reactionRefs,
-    concurrency: 8,
+    sessionId: opts.trigger.msgRef.channelId,
+    botUserId: opts.botUserId,
+    chain: checkpointSelection.descendants,
+    checkpointSelection,
+    currentMessageIds: opts.currentMessageIds ?? [opts.trigger.msgRef.messageId],
+    transcriptStore: opts.transcriptStore,
+    discordUserAliasById: opts.discordUserAliasById,
   });
 
-  for (const chunk of merged) {
-    const isBot = chunk.authorId === opts.botUserId;
-
-    const messageId = chunk.messageIds[chunk.messageIds.length - 1]!;
-
-    if (isBot && opts.transcriptStore) {
-      const snap = resolveTranscriptSnapshot({
-        platform: opts.platform,
-        channelId: opts.trigger.msgRef.channelId,
-        messageId,
-        transcriptStore: opts.transcriptStore,
-        resolvedSnapshotsBySurfaceMessageId:
-          checkpointSelection.resolvedSnapshotsBySurfaceMessageId,
-      });
-
-      if (snap) {
-        if (!seenTranscriptRequestIds.has(snap.requestId)) {
-          modelMessages.push(...snap.messages);
-          seenTranscriptRequestIds.add(snap.requestId);
-        }
-        continue;
-      }
-    }
-
-    const normalized = normalizeText(chunk.text, {
-      // We currently rely on adapter text already being normalized (mentions rewritten).
-      // If/when adapters expose richer raw mentions, we can do a more faithful rewrite.
-    });
-
-    if (isBot) {
-      modelMessages.push({
-        role: "assistant",
-        content: normalizeAssistantContextText(normalized),
-      } satisfies ModelMessage);
-      continue;
-    }
-
-    const reactions = reactionsByMessageId.get(messageId) ?? [];
-
-    const header = formatDiscordAttributionHeader({
-      authorId: chunk.authorId,
-      authorName: chunk.authorName,
-      userAlias: opts.discordUserAliasById?.get(chunk.authorId),
-      messageId,
-      messageTs: chunk.tsEnd,
-      reactions,
-    });
-
-    const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
-
-    if (chunk.attachments.length === 0) {
-      modelMessages.push({
-        role: "user",
-        content: mainText,
-      } satisfies ModelMessage);
-      continue;
-    }
-
-    const parts: UserContent = [{ type: "text", text: mainText }];
-    await appendDiscordAttachmentsToUserContent(parts, chunk.attachments, attState);
-
-    modelMessages.push({ role: "user", content: parts } satisfies ModelMessage);
-  }
-
   return {
-    messages: modelMessages,
+    messages: composed.messages,
     chainMessageIds: transformedChain.map((m) => m.messageId),
-    mergedGroups: merged.map((m) => ({
-      authorId: m.authorId,
-      messageIds: [...m.messageIds],
-    })),
+    mergedGroups: composed.mergedGroups,
+    corePrimaryLineage: composed.corePrimaryLineage,
   };
 }
 
@@ -930,96 +1388,22 @@ export async function composeRecentChannelMessages(
           getAuthorId: (message) => message.authorId,
           getMessageId: (message) => message.messageId,
         });
-        const merged = mergeChainByDiscordWindow(checkpointSelection.descendants);
-        const attState = createDiscordAttachmentState();
-
-        const modelMessages: ModelMessage[] = [...checkpointSelection.checkpointMessages];
-        const seenTranscriptRequestIds = new Set<string>(
-          checkpointSelection.checkpoint ? [checkpointSelection.checkpoint.requestId] : [],
-        );
-
-        const reactionRefs = merged
-          .filter((chunk) => chunk.authorId !== opts.botUserId)
-          .map((chunk) => {
-            const messageId = chunk.messageIds[chunk.messageIds.length - 1]!;
-            return {
-              platform: opts.platform,
-              channelId: opts.sessionId,
-              messageId,
-            } satisfies MsgRef;
-          });
-
-        const reactionsByMessageId = await getReactionsByMessageId({
+        const composed = await composeSelectedDiscordChain({
           adapter,
-          refs: reactionRefs,
-          concurrency: 8,
+          sessionId: opts.sessionId,
+          botUserId: opts.botUserId,
+          chain: checkpointSelection.descendants,
+          checkpointSelection,
+          currentMessageIds: opts.currentMessageIds ?? [triggerMsg.ref.messageId],
+          transcriptStore: opts.transcriptStore,
+          discordUserAliasById: opts.discordUserAliasById,
         });
 
-        for (const chunk of merged) {
-          const isBot = chunk.authorId === opts.botUserId;
-          const messageId = chunk.messageIds[chunk.messageIds.length - 1]!;
-
-          if (isBot && opts.transcriptStore) {
-            const snap = resolveTranscriptSnapshot({
-              platform: opts.platform,
-              channelId: opts.sessionId,
-              messageId,
-              transcriptStore: opts.transcriptStore,
-              resolvedSnapshotsBySurfaceMessageId:
-                checkpointSelection.resolvedSnapshotsBySurfaceMessageId,
-            });
-            if (snap) {
-              if (!seenTranscriptRequestIds.has(snap.requestId)) {
-                modelMessages.push(...snap.messages);
-                seenTranscriptRequestIds.add(snap.requestId);
-              }
-              continue;
-            }
-          }
-
-          const normalized = normalizeText(chunk.text, {});
-
-          if (isBot) {
-            modelMessages.push({
-              role: "assistant",
-              content: normalizeAssistantContextText(normalized),
-            } satisfies ModelMessage);
-            continue;
-          }
-
-          const reactions = reactionsByMessageId.get(messageId) ?? [];
-
-          const header = formatDiscordAttributionHeader({
-            authorId: chunk.authorId,
-            authorName: chunk.authorName,
-            userAlias: opts.discordUserAliasById?.get(chunk.authorId),
-            messageId,
-            messageTs: chunk.tsEnd,
-            reactions,
-          });
-
-          const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
-
-          if (chunk.attachments.length === 0) {
-            modelMessages.push({
-              role: "user",
-              content: mainText,
-            } satisfies ModelMessage);
-            continue;
-          }
-
-          const parts: UserContent = [{ type: "text", text: mainText }];
-          await appendDiscordAttachmentsToUserContent(parts, chunk.attachments, attState);
-          modelMessages.push({ role: "user", content: parts } satisfies ModelMessage);
-        }
-
         return {
-          messages: modelMessages,
+          messages: composed.messages,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
-          mergedGroups: merged.map((m) => ({
-            authorId: m.authorId,
-            messageIds: [...m.messageIds],
-          })),
+          mergedGroups: composed.mergedGroups,
+          corePrimaryLineage: composed.corePrimaryLineage,
         };
       }
     }
@@ -1165,114 +1549,28 @@ export async function composeRecentChannelMessages(
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
-  const merged = mergeChainByDiscordWindow(checkpointSelection.descendants);
-
-  const attState = createDiscordAttachmentState();
-
-  const modelMessages: ModelMessage[] = [...checkpointSelection.checkpointMessages];
-  const seenTranscriptRequestIds = new Set<string>(
-    checkpointSelection.checkpoint ? [checkpointSelection.checkpoint.requestId] : [],
-  );
-
-  const reactionRefs = merged
-    .filter((chunk) => chunk.authorId !== opts.botUserId)
-    .map((chunk) => {
-      const messageId = chunk.messageIds[chunk.messageIds.length - 1]!;
-      return {
-        platform: opts.platform,
-        channelId: opts.sessionId,
-        messageId,
-      } satisfies MsgRef;
-    });
-
-  const reactionsByMessageId = await getReactionsByMessageId({
+  const composed = await composeSelectedDiscordChain({
     adapter,
-    refs: reactionRefs,
-    concurrency: 8,
+    sessionId: opts.sessionId,
+    botUserId: opts.botUserId,
+    chain: checkpointSelection.descendants,
+    checkpointSelection,
+    currentMessageIds:
+      opts.currentMessageIds ??
+      (opts.triggerMsgRef
+        ? [opts.triggerMsgRef.messageId]
+        : selectedNoDivider.length > 0
+          ? [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId]
+          : []),
+    transcriptStore: opts.transcriptStore,
+    discordUserAliasById: opts.discordUserAliasById,
   });
 
-  for (const chunk of merged) {
-    const isBot = chunk.authorId === opts.botUserId;
-    const messageId = chunk.messageIds[chunk.messageIds.length - 1]!;
-
-    const anchorTsForTranscript = shouldApplyActiveBurstRules ? (activeAnchor?.ts ?? null) : null;
-    const transcriptAgeMs =
-      anchorTsForTranscript !== null ? anchorTsForTranscript - chunk.tsEnd : null;
-    const allowTranscriptExpansion =
-      !shouldApplyActiveBurstRules ||
-      transcriptAgeMs === null ||
-      transcriptAgeMs <= ACTIVE_TRANSCRIPT_MAX_AGE_MS;
-
-    let botTranscriptSnap: TranscriptSnapshot | null = null;
-    if (isBot && opts.transcriptStore) {
-      botTranscriptSnap = resolveTranscriptSnapshot({
-        platform: opts.platform,
-        channelId: opts.sessionId,
-        messageId,
-        transcriptStore: opts.transcriptStore,
-        resolvedSnapshotsBySurfaceMessageId:
-          checkpointSelection.resolvedSnapshotsBySurfaceMessageId,
-      });
-    }
-
-    if (botTranscriptSnap && !seenTranscriptRequestIds.has(botTranscriptSnap.requestId)) {
-      if (allowTranscriptExpansion) {
-        modelMessages.push(...botTranscriptSnap.messages);
-        seenTranscriptRequestIds.add(botTranscriptSnap.requestId);
-        continue;
-      }
-
-      const assistantOnly = buildAssistantOnlyMessageFromTranscript(botTranscriptSnap);
-      if (assistantOnly) {
-        modelMessages.push(assistantOnly);
-        seenTranscriptRequestIds.add(botTranscriptSnap.requestId);
-        continue;
-      }
-    }
-
-    const normalized = normalizeText(chunk.text, {});
-
-    if (isBot) {
-      modelMessages.push({
-        role: "assistant",
-        content: normalizeAssistantContextText(normalized),
-      } satisfies ModelMessage);
-      continue;
-    }
-
-    const reactions = reactionsByMessageId.get(messageId) ?? [];
-
-    const header = formatDiscordAttributionHeader({
-      authorId: chunk.authorId,
-      authorName: chunk.authorName,
-      userAlias: opts.discordUserAliasById?.get(chunk.authorId),
-      messageId,
-      messageTs: chunk.tsEnd,
-      reactions,
-    });
-
-    const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
-
-    if (chunk.attachments.length === 0) {
-      modelMessages.push({
-        role: "user",
-        content: mainText,
-      } satisfies ModelMessage);
-      continue;
-    }
-
-    const parts: UserContent = [{ type: "text", text: mainText }];
-    await appendDiscordAttachmentsToUserContent(parts, chunk.attachments, attState);
-    modelMessages.push({ role: "user", content: parts } satisfies ModelMessage);
-  }
-
   return {
-    messages: modelMessages,
+    messages: composed.messages,
     chainMessageIds: chain.map((m) => m.messageId),
-    mergedGroups: merged.map((m) => ({
-      authorId: m.authorId,
-      messageIds: [...m.messageIds],
-    })),
+    mergedGroups: composed.mergedGroups,
+    corePrimaryLineage: composed.corePrimaryLineage,
   };
 }
 
@@ -1280,6 +1578,14 @@ export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
 ): Promise<ModelMessage | null> {
+  const composed = await composeSingleMessageWithLineage(adapter, opts);
+  return composed?.messages[0] ?? null;
+}
+
+export async function composeSingleMessageWithLineage(
+  adapter: SurfaceAdapter,
+  opts: ComposeSingleMessageOpts,
+): Promise<RequestCompositionResult | null> {
   if (opts.platform !== "discord") {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
@@ -1299,31 +1605,35 @@ export async function composeSingleMessage(
     text = contentTransform(text);
   }
 
-  if (m.userId === opts.botUserId) {
-    return {
-      role: "assistant",
-      content: normalizeAssistantContextText(normalizeText(text, {})),
-    } satisfies ModelMessage;
-  }
-
-  const header = formatDiscordAttributionHeader({
-    authorId: m.userId,
-    authorName: m.userName ?? `user_${m.userId}`,
-    userAlias: opts.discordUserAliasById?.get(m.userId),
-    messageId: m.ref.messageId,
-    messageTs: m.ts,
-    reactions: await safeListReactions(adapter, m.ref),
+  const chain = [
+    toReplyChainMessage(m, {
+      overrideText: text,
+      authorNameFallback: `user_${m.userId}`,
+    }),
+  ];
+  const checkpointSelection = selectNewestReachableCheckpoint({
+    chainOldestToNewest: chain,
+    botUserId: opts.botUserId,
+    platform: "discord",
+    channelId: opts.msgRef.channelId,
+    transcriptStore: opts.transcriptStore,
+    getAuthorId: (message) => message.authorId,
+    getMessageId: (message) => message.messageId,
   });
-
-  const mainText = `${header}\n${escapeSurfaceMetadataTags(normalizeText(text, {}))}`.trimEnd();
-
-  const attachments = toReplyChainMessage(m).attachments;
-  if (attachments.length === 0) {
-    return { role: "user", content: mainText } satisfies ModelMessage;
-  }
-
-  const parts: UserContent = [{ type: "text", text: mainText }];
-  await appendDiscordAttachmentsToUserContent(parts, attachments, createDiscordAttachmentState());
-
-  return { role: "user", content: parts } satisfies ModelMessage;
+  const composed = await composeSelectedDiscordChain({
+    adapter,
+    sessionId: opts.msgRef.channelId,
+    botUserId: opts.botUserId,
+    chain: checkpointSelection.descendants,
+    checkpointSelection,
+    currentMessageIds: opts.currentMessageIds ?? [m.ref.messageId],
+    transcriptStore: opts.transcriptStore,
+    discordUserAliasById: opts.discordUserAliasById,
+  });
+  return {
+    messages: composed.messages,
+    chainMessageIds: [m.ref.messageId],
+    mergedGroups: composed.mergedGroups,
+    corePrimaryLineage: composed.corePrimaryLineage,
+  };
 }

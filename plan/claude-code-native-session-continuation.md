@@ -2,20 +2,29 @@
 
 ## Status
 
-Proposed.
+Stages 0 through 8 and the implementation were completed on 2026-08-01, with Mini database schema v8
+and Core transcript schema v5; `core-config.yaml` remains at `configVersion: 2`. Local authenticated
+validation passed for Mini main and named continuation. External Discord and
+alternate-provider scenarios unavailable in the local validation environment remain recorded in the
+companion tracker.
+
+Implementation clarification: Core automatic fallback remains within the head model's provider
+family, and a `claude-code` head disables Core automatic fallback entirely. Mini does not implement
+that Core fallback chain. This is separate from explicit model selection at a new-turn boundary,
+which may cross families through the lossy text projection below.
 
 This plan is the narrow alternative to Stages 1 through 3 of
 `plan/claude-code-portable-replay-and-fallback.md`.
 
 The earlier plan's Stage 0 remains a prerequisite. This plan replaces its capability-aware structured
 cross-provider replay with a deliberately lossy plain-text projection. Explicit model selection may
-cross the `claude-code` boundary at a new-turn boundary; automatic fallback may not. Consecutive
+cross the `claude-code` boundary at a new-turn boundary; Core automatic fallback may not. Consecutive
 Claude-backed turns use Claude's native persisted transcript for efficient continuation.
 
 The implementation intentionally chooses the simple, storage-heavy safety model:
 
-- Every admitted Claude-backed turn starts a fresh Claude session or forks the last clean Claude
-  session.
+- A first turn or one with no exact compatible binding starts a fresh persisted Claude session; only
+  an exact compatible continuation forks the last clean Claude session.
 - Lilac never advances a clean Claude session in place.
 - Successful forks become clean bindings only after Lilac commits canonical history.
 - Old Mini main-session forks remain available for history navigation.
@@ -85,22 +94,23 @@ The implementation intentionally chooses the simple, storage-heavy safety model:
    explicitly labeled as prior activity, retains bounded tool name/input/result text, and cannot be
    interpreted as a pending tool request.
 10. **Surface message identity is ID-based.** Once Core has admitted a surface message ID, its
-   first-seen canonical projection is immutable for that lineage. Later edits do nothing.
+    first-seen canonical projection is immutable for that lineage. Later edits do nothing.
 11. **Ignoring an edit applies to all future uses.** Fresh replay, compaction, budgeting, and prefix
-   reconstruction use the stored first-seen projection, not newly fetched edited text.
+    reconstruction use the stored first-seen projection, not newly fetched edited text.
 12. **A missing, deleted, reordered, or differently selected surface ID is not an edit.** It changes
-     the lineage and may force a fresh Claude session.
+    the lineage and may force a fresh Claude session.
 13. **Core starts fresh on prefix mismatch.** V1 keeps only one current clean Core primary binding;
-     it does not search retained historical branches.
+    it does not search retained historical branches.
 14. **Mini main history is branch-aware.** A clean native binding is attached to the exact Mini
-     history state it represents. Undo and redo select bindings by history state.
-15. **Mini and Core named subagents use one current clean binding.** Their public workflows do not
-     expose historical rewind, so old bindings are not selected again.
+    history state it represents. Undo and redo select bindings by history state.
+15. **Mini named subagents and Core named subagents use one current clean binding.** A Mini name may
+    be caller-supplied or generated and returned by `subagent_delegate`. Eligible named workflows do
+    not expose historical rewind, so old bindings are not selected again.
 16. **Lilac compaction breaks native synchronization.** The compacted canonical state starts a fresh
-     persisted Claude session. It never resumes a pre-compaction native session as if the summary
-     were the same prefix.
+    persisted Claude session. It never resumes a pre-compaction native session as if the summary
+    were the same prefix.
 17. **V1 accepts native storage growth.** Native cleanup is conservative and never scans or deletes
-     Claude sessions that Lilac cannot prove it owns.
+    Claude sessions that Lilac cannot prove it owns.
 
 ## Required Stage 0 Foundation
 
@@ -150,14 +160,14 @@ filesystem, network, or MCP side effects.
 
 ## Session Support Matrix
 
-| Session type | Native ownership key | Historical bindings | Prefix policy |
-| --- | --- | --- | --- |
-| Mini main | Mini session ID + history state ID | Retained per bound history state | Exact history state |
-| Mini named subagent | Named child Mini session ID | Current clean binding only | Exact current history state |
-| Core named subagent | Request client + named subagent session ID | Current clean binding only | Exact canonical transcript head |
-| Core primary Discord | Request client + Core session ID | Current clean binding only | Exact ordered lineage prefix |
-| Core primary without lineage manifest | None | None | Fresh ephemeral or fresh persisted call only |
-| Utility/title/summary | None | None | Always ephemeral |
+| Session type                          | Native ownership key                       | Historical bindings              | Prefix policy                                |
+| ------------------------------------- | ------------------------------------------ | -------------------------------- | -------------------------------------------- |
+| Mini main                             | Mini session ID + history state ID         | Retained per bound history state | Exact history state                          |
+| Mini named subagent                   | Named child Mini session ID                | Current clean binding only       | Exact current history state                  |
+| Core named subagent                   | Request client + named subagent session ID | Current clean binding only       | Exact canonical transcript head              |
+| Core primary Discord                  | Request client + Core session ID           | Current clean binding only       | Exact ordered lineage prefix                 |
+| Core primary without lineage manifest | None                                       | None                             | Fresh ephemeral or fresh persisted call only |
+| Utility/title/summary                 | None                                       | None                             | Always ephemeral                             |
 
 ## Shared Native Session Model
 
@@ -246,15 +256,15 @@ Create the fork with the currently selected Claude model. Continue passing Lilac
 
 The installed `ai-sdk-provider-claude-code` maps:
 
-| Lilac reasoning | Claude behavior |
-| --- | --- |
-| `none` | Thinking disabled |
-| `minimal` | Low effort |
-| `low` | Low effort |
-| `medium` | Medium effort |
-| `high` | High effort |
-| `xhigh` | Extra-high effort |
-| `provider-default` | Provider default |
+| Lilac reasoning    | Claude behavior   |
+| ------------------ | ----------------- |
+| `none`             | Thinking disabled |
+| `minimal`          | Low effort        |
+| `low`              | Low effort        |
+| `medium`           | Medium effort     |
+| `high`             | High effort       |
+| `xhigh`            | Extra-high effort |
+| `provider-default` | Provider default  |
 
 Do not use the live query controller's `setModel` as the cross-turn mechanism. The controller exists
 only while one query is active. A new Lilac turn materializes a new fork with the selected model and
@@ -569,9 +579,10 @@ next normal GPT prompt -> fresh GPT turn from text(H2)
 
 The old Claude native binding owns H2 only. It cannot continue the later GPT head.
 
-Automatic model fallback does not use text replay in v1. Cross-family fallback candidates remain
-rejected or skipped before execution. This section applies only to explicit/configured model
-selection at a new-turn boundary.
+Core automatic model fallback does not use text replay in v1. Cross-family fallback candidates remain
+rejected or skipped before execution, and a Claude-headed Core run does not automatically fall back.
+Mini has no equivalent automatic model-fallback chain. This section applies only to
+explicit/configured model selection at a new-turn boundary.
 
 ### Plain-Text Boundary Projection
 
@@ -731,9 +742,10 @@ Each named child keeps its own Lilac session ID:
 sub:<parent-session-id>:named:<session-name>
 ```
 
-Use that child session ID as the native ownership key. Reusing the name selects the child's current
-clean binding when the requested model is Claude; a cross-boundary selection starts fresh through
-text replay.
+Use that child session ID as the native ownership key whether `sessionName` was caller-supplied or
+generated. When the caller omits it, Mini returns the generated name used by the persisted child;
+supplying that name on a later delegation selects the child's current clean binding when the requested
+model is Claude. A cross-boundary selection starts fresh through text replay.
 
 Parent undo does not rewind the named child. This matches current Mini semantics. Strict
 parent-branch-to-child-branch isolation remains deferred.
@@ -859,6 +871,14 @@ Composition emits segments rather than one flat ID list:
 type CoreLineageSegmentV1 = {
   readonly atoms: readonly CoreLineageAtomV1[];
   readonly canonicalMessages: readonly ModelMessage[];
+  readonly requestSource?: {
+    readonly aliases: readonly {
+      readonly requestClient: string;
+      readonly surfaceId: string;
+      readonly sessionId: string;
+      readonly messageId: string;
+    }[];
+  };
   readonly canonicalStart: number;
   readonly canonicalEnd: number;
   readonly cumulativePrefixDigest: string;
@@ -871,6 +891,11 @@ A segment is the smallest safe suffix boundary. Never resume or slice through:
 - One expanded Core request transcript.
 - A complete assistant/tool exchange.
 - A compaction checkpoint.
+
+Request segments contain exactly one request atom. Their output message aliases are validated source
+metadata rather than additional lineage atoms, so split delivery remains one canonical request
+expansion. Surface segments contain only unique ordered surface atoms; checkpoint and synthetic
+segments each contain exactly one atom of their respective kind.
 
 Once an existing surface segment is synchronized, adding a new adjacent same-author surface message
 must append a new segment rather than regroup or rewrite the synchronized segment.
@@ -969,6 +994,13 @@ Extend `SqliteTranscriptStore` with:
 - Current clean native bindings.
 - Bounded native attempt metadata.
 
+Shipped Core transcript schema 5 adds the terminal request ID to the primary binding itself. Migration
+accepts a schema-4 binding only when a retained request transcript and lineage manifest recompute the
+exact stored head. It searches exact succeeded attempts first and retained durable lineage second, so
+attempt pruning does not discard an otherwise provable binding; an unprovable binding is retired.
+Normal binding lookup repeats that verification and compare-and-delete retires stale state without
+removing a concurrent replacement.
+
 Core primary may continue storing response-slice transcripts, but a request atom must carry and later
 resolve the exact persisted response transcript digest. Named subagents continue storing complete
 transcripts.
@@ -1022,20 +1054,30 @@ Lilac generates every candidate UUID and records ownership before invocation. Mi
 or externally modified sessions are invalidated and replaced through fresh replay. Mixed-family
 history uses the plain-text boundary projection on that fresh path.
 
-A dedicated Lilac-owned `CLAUDE_CONFIG_DIR` is recommended when practical. Optimistic
-`lastModified` checks detect external mutation but do not lock arbitrary external Claude processes.
+`CLAUDE_CONFIG_DIR` falls back to `~/.claude`; an explicit value must be a non-empty absolute writable
+path and must be persistently mounted when container replacement should preserve continuation. A
+dedicated operator-controlled directory separates storage and retention, not same-user access or
+privacy. Optimistic `lastModified` checks detect external mutation but do not lock arbitrary external
+Claude processes. Local runs may use existing authenticated config or `claude auth login`. Core
+Docker may use the SDK-bundled executable with `CLAUDE_CODE_OAUTH_TOKEN`, mounted authenticated
+config, or both; the published single-file Mini bundle instead requires an external `claude`
+executable on `PATH`.
 
 ## Retention And Storage
 
 V1 explicitly accepts native storage growth.
 
-- Mini main history bindings remain while their Mini history states remain retained.
-- Core and named-subagent metadata retain only their current selectable binding plus bounded attempt
-  history.
+- Mini main history bindings remain while their Mini history states remain retained and may grow with
+  that history.
+- Caller-explicit Mini named and Core named/primary owners retain only their current selectable
+  binding. Attempt history is bounded.
 - Superseded native files may remain on disk and are not reused without a retained binding.
 - Let Claude's own cleanup policy own JSONL retention initially.
 - Prune Lilac binding/attempt metadata with the corresponding Mini session/history state or Core
   transcript retention.
+- Core exposes aggregate internal retention diagnostics for bindings, active/terminal attempts,
+  unverifiable/orphan metadata, unreferenced projections, total owned-blob bytes, and unreferenced
+  blob counts/bytes; bounded attempt pruning also logs per-owner counts.
 - A missing file always degrades to a fresh persisted session.
 - Future cleanup may call `deleteSession` only for Lilac-generated UUIDs with durable ownership
   records.
@@ -1154,7 +1196,8 @@ User-facing model-switch confirmation should distinguish:
 
 ### Mini Named Subagents
 
-- Reusing a name forks the child's current clean binding.
+- Reusing either a caller-supplied name or a returned generated name forks the child's exact compatible
+  current clean binding.
 - Model and effort overrides continue the same native lineage.
 - Parent undo does not change the named child's selected binding.
 - Child failure/cancellation leaves its clean base unchanged.
@@ -1203,14 +1246,16 @@ User-facing model-switch confirmation should distinguish:
 - A model-changing request is queued rather than injected as steering into a differently bound active
   runtime.
 - Mixed and legacy history without trustworthy family metadata uses conservative text replay.
-- Cross-family fallback candidates remain rejected/skipped; fallback never invokes text replay.
+- Core cross-family fallback candidates remain rejected/skipped; Core fallback never invokes text
+  replay. Mini has no automatic model-fallback chain.
 
 ### Authenticated Validation
 
 - Continue one Mini main session through three forks and a process restart.
 - Switch model and effort on the continued Mini session.
 - Undo and branch from a historical Mini state.
-- Continue one Mini named subagent through multiple requests.
+- Continue one Mini named subagent through multiple requests, including reusing a generated name
+  returned after `sessionName` was omitted.
 - Continue one Core named subagent through multiple requests.
 - Continue one Core primary Discord reply chain with exact prefix matches.
 - Switch one Core session GPT to Claude to GPT with `!m` and inspect both text-only boundary payloads.
@@ -1245,7 +1290,7 @@ User-facing model-switch confirmation should distinguish:
 18. Integrate Core primary fresh/fork/text-replay selection and mismatch-to-fresh behavior.
 19. Make model-changing `!m`/session overrides queue a new turn instead of steering an incompatible
     active runtime.
-20. Keep automatic fallback within its current runtime-compatible provider family.
+20. Keep Core automatic fallback within its current runtime-compatible provider family.
 21. Add bounded metadata retention and conservative orphan diagnostics.
 22. Update config examples, migration docs, provider documentation, and superseded plan references.
 23. Run package tests/typechecks, root lint/format, full tests, and authenticated validation.

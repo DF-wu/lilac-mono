@@ -2,12 +2,13 @@
 
 ## Status
 
-Proposed, revised after architecture review.
+Superseded 2026-08-01 by `plan/claude-code-native-session-continuation.md`.
 
-This plan supersedes the earlier decision in `plan/claude-code-provider-mini-lilac.md` to disable
-Claude Agent SDK transcript persistence for every agent run. Native persistence is now an accepted
-`claude-code` tradeoff where Lilac can consume it safely. Lilac canonical transcripts remain the
-cross-provider and recovery authority.
+Only Stage 0 remains authoritative as the historical prerequisite that established canonical/model
+view separation and retry safety. The proposed Stages 1 through 3 below must not be used as current
+behavior or implementation guidance: the replacement plan ships deliberately lossy text replay,
+fork-only native continuation for a broader exact-proof session matrix, and no cross-family automatic
+fallback. This document is retained to preserve the architecture history.
 
 The work is intentionally sequential:
 
