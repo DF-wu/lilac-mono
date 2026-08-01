@@ -389,12 +389,14 @@ const conversationSchemaV2 = z
             enabled: z.boolean().default(false),
             model: z.string().trim().min(1).default("fast"),
             concurrency: z.number().int().min(1).max(128).default(1),
+            batchSize: z.number().int().min(1).max(10_000).default(32),
             includePromptContext: z.boolean().default(false),
           })
           .default({
             enabled: false,
             model: "fast",
             concurrency: 1,
+            batchSize: 32,
             includePromptContext: false,
           }),
         embedding: z
@@ -429,6 +431,7 @@ const conversationSchemaV2 = z
           enabled: false,
           model: "fast",
           concurrency: 1,
+          batchSize: 32,
           includePromptContext: false,
         },
         embedding: { enabled: false, model: "openai/text-embedding-3-small" },
@@ -449,6 +452,7 @@ const conversationSchemaV2 = z
         enabled: false,
         model: "fast",
         concurrency: 1,
+        batchSize: 32,
         includePromptContext: false,
       },
       embedding: { enabled: false, model: "openai/text-embedding-3-small" },

@@ -675,13 +675,43 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           if (conversationThreadSummarizationStopping) {
             throw new Error("conversation thread summarization is stopping");
           }
+          const trigger = input?.trigger ?? "manual";
           const runner =
             input?.dryRun === true || !stopConversationThreadSummarizationWorker
               ? threadService
               : stopConversationThreadSummarizationWorker;
+          const flushStartedAt = Date.now();
+          if (trigger === "periodic") {
+            logger.info("conversation thread periodic summarization dispatch started", {
+              limit: input?.limit,
+            });
+          }
           await conversationThreadMaterializer?.flush();
+          if (trigger === "periodic") {
+            logger.info("conversation thread periodic summarization materialization flushed", {
+              durationMs: Date.now() - flushStartedAt,
+            });
+          }
           if (conversationThreadSummarizationStopping) {
             throw new Error("conversation thread summarization is stopping");
+          }
+          if (
+            trigger === "periodic" &&
+            (await getCoreConfig()).conversation.thread.summarization.enabled !== true
+          ) {
+            logger.info("conversation thread periodic summarization cancelled after flush");
+            return {
+              dryRun: false,
+              refreshed: { channels: 0, threads: 0, messages: 0 },
+              eligible: 0,
+              eligibleTotal: 0,
+              eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+              cleared: 0,
+              summarized: 0,
+              failed: 0,
+              failures: [],
+              threadIds: [],
+            };
           }
           return await runner.runSummarization(input);
         },

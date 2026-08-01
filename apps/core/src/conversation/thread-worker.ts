@@ -6,6 +6,15 @@ import type {
 } from "./thread-service";
 
 const CHECK_INTERVAL_MS = 10 * 60 * 1000;
+const INITIAL_CHECK_DELAY_MS = 10_000;
+
+export type ConversationThreadWorkerScheduler = (task: () => void, delayMs: number) => () => void;
+
+function defaultScheduler(task: () => void, delayMs: number): () => void {
+  const timer = setTimeout(task, delayMs);
+  timer.unref?.();
+  return () => clearTimeout(timer);
+}
 
 export type ConversationThreadSummarizationRunner = {
   runSummarization(
@@ -36,6 +45,8 @@ function queuedResult(jobId: string): ConversationThreadRunSummarizationResult {
     dryRun: false,
     refreshed: { channels: 0, threads: 0, messages: 0 },
     eligible: 0,
+    eligibleTotal: 0,
+    eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
     cleared: 0,
     summarized: 0,
     failed: 0,
@@ -143,6 +154,8 @@ export function startConversationThreadSummarizationWorker(params: {
         threadId: input.threadId,
         beforeTs: input.beforeTs,
         afterTs: input.afterTs,
+        limit: input.limit,
+        trigger: input.trigger ?? "manual",
       });
       if (wait) {
         const result = await new Promise<ConversationThreadRunSummarizationResult>(
@@ -185,33 +198,38 @@ export function startConversationThreadSummarizationWorker(params: {
 export function startConversationThreadWorker(params: {
   runner: ConversationThreadSummarizationRunner;
   getConfig: () => Promise<CoreConfig>;
+  schedule?: ConversationThreadWorkerScheduler;
+  checkIntervalMs?: number;
+  initialCheckDelayMs?: number;
 }): { stop(): Promise<void> } {
   const logger = createLogger({ module: "conversation-thread-worker" });
+  const scheduler = params.schedule ?? defaultScheduler;
+  const checkIntervalMs = params.checkIntervalMs ?? CHECK_INTERVAL_MS;
   logger.debug("conversation thread periodic worker started", {
-    checkIntervalMs: CHECK_INTERVAL_MS,
+    checkIntervalMs,
   });
   let stopped = false;
   let running = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let cancelScheduledTick: (() => void) | null = null;
   let tickPromise: Promise<void> | null = null;
 
   const schedule = (delayMs: number) => {
     if (stopped) return;
-    timer = setTimeout(() => {
+    cancelScheduledTick = scheduler(() => {
+      cancelScheduledTick = null;
       const current = tick();
       tickPromise = current;
       void current.finally(() => {
         if (tickPromise === current) tickPromise = null;
       });
     }, delayMs);
-    timer.unref?.();
   };
 
   const tick = async () => {
     if (stopped) return;
     if (running) {
       logger.debug("conversation thread summarization tick skipped: previous tick still running");
-      schedule(CHECK_INTERVAL_MS);
+      schedule(checkIntervalMs);
       return;
     }
 
@@ -224,9 +242,14 @@ export function startConversationThreadWorker(params: {
       }
 
       logger.debug("conversation thread summarization tick started");
-      const result = await params.runner.runSummarization({ wait: true });
+      const result = await params.runner.runSummarization({
+        wait: true,
+        limit: cfg.conversation.thread.summarization.batchSize,
+        trigger: "periodic",
+      });
       logger.debug("conversation thread summarization tick completed", {
         eligible: result.eligible,
+        eligibleTotal: result.eligibleTotal,
         summarized: result.summarized,
         failed: result.failed,
         refreshed: result.refreshed,
@@ -235,17 +258,18 @@ export function startConversationThreadWorker(params: {
       logger.error("conversation thread summarization tick failed", e);
     } finally {
       running = false;
-      schedule(CHECK_INTERVAL_MS);
+      schedule(checkIntervalMs);
     }
   };
 
-  schedule(10_000);
+  schedule(params.initialCheckDelayMs ?? INITIAL_CHECK_DELAY_MS);
 
   return {
     async stop() {
       logger.debug("conversation thread periodic worker stopping");
       stopped = true;
-      if (timer) clearTimeout(timer);
+      cancelScheduledTick?.();
+      cancelScheduledTick = null;
       await tickPromise;
       logger.debug("conversation thread periodic worker stopped");
     },

@@ -744,6 +744,7 @@ export function parseCoreConfigV1ToUniversal(
           enabled: false,
           model: "fast",
           concurrency: 1,
+          batchSize: 32,
           includePromptContext: false,
         },
         embedding: {
