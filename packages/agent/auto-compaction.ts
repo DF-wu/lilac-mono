@@ -5,6 +5,7 @@ import type {
   BuildEphemeralOverlay,
   CanonicalModelCallPreflight,
   DecorateRequestPayload,
+  PrepareFullBudgetView,
   PrepareFullModelView,
   TransformMessagesContext,
   TurnErrorHandler,
@@ -929,6 +930,13 @@ type AutoCompactionEndEvent = AutoCompactionStartEvent & {
   status: "completed" | "cancelled" | "failed";
   /** The summary the engine actually persisted after the refinement chain. */
   summary?: string;
+  canonicalReplacement?: {
+    mode: "local" | "server";
+    originalMessageCount: number;
+    originalSuffixStart: number;
+    replacementMessageCount: number;
+    replacementSuffixStart: number;
+  };
   error?: unknown;
 };
 
@@ -1269,11 +1277,17 @@ export type AutoCompactionOptions = {
   /** Builds the full provider-facing view of canonical history. */
   prepareFullModelView?: PrepareFullModelView;
 
+  /** Builds the target-protocol-safe complete view used only for estimates and compaction. */
+  prepareFullBudgetView?: PrepareFullBudgetView;
+
   /** Builds request-only messages included in estimates and regenerated for payloads. */
   buildEphemeralOverlay?: BuildEphemeralOverlay;
 
   /** Optional conservative floor for provider-native input occupancy. */
   inputEstimateFloor?: AutoCompactionInputEstimateFloor;
+
+  /** Earliest current-input offset that compaction must retain canonically. */
+  resolveCurrentInputCanonicalStart?: (canonicalMessages: readonly ModelMessage[]) => number | null;
 
   /** Applies provider-specific metadata only to the final selected request payload. */
   decorateRequestPayload?: DecorateRequestPayload;
@@ -1785,6 +1799,7 @@ async function chooseCanonicalRetainedTailStart(params: {
   keepRecentTokens: number;
   keepRecentTurns: number;
   minimumStart?: number;
+  canonicalStartIndex?: number;
 }): Promise<number> {
   const tokenCap = Math.max(0, Math.floor(params.keepRecentTokens));
   const turnCap = Math.max(0, Math.floor(params.keepRecentTurns));
@@ -1803,7 +1818,10 @@ async function chooseCanonicalRetainedTailStart(params: {
     if (!isValidSuffix(params.canonicalMessages, start)) continue;
     const preparedSuffix = await params.prepareFullModelView(
       params.canonicalMessages.slice(start),
-      params.context,
+      {
+        ...params.context,
+        canonicalStartIndex: (params.canonicalStartIndex ?? 0) + start,
+      },
     );
     if (estimateMessagesTokens(preparedSuffix) <= tokenCap) return start;
   }
@@ -1816,6 +1834,7 @@ type CompactCanonicalMessagesResult = {
   readonly preparedMessages: ModelMessage[];
   readonly summary: string;
   readonly usesServerCompaction: boolean;
+  readonly originalCanonicalSuffixStart: number;
 };
 
 async function compactCanonicalMessages(options: {
@@ -1839,6 +1858,7 @@ async function compactCanonicalMessages(options: {
   abortSignal?: AbortSignal;
   onProgress?: CompactionStreamHooks["onProgress"];
   onSummaryDelta?: CompactionStreamHooks["onSummaryDelta"];
+  maximumCanonicalSuffixStart?: number;
 }): Promise<CompactCanonicalMessagesResult | null> {
   const overlayTokens = estimateMessagesTokens(options.overlay);
   if (overlayTokens >= options.budget.inputBudget) {
@@ -1868,15 +1888,27 @@ async function compactCanonicalMessages(options: {
         minimumStart: 1,
       });
     }
+    if (
+      options.maximumCanonicalSuffixStart !== undefined &&
+      suffixStart > options.maximumCanonicalSuffixStart
+    ) {
+      suffixStart = options.maximumCanonicalSuffixStart;
+    }
     if (suffixStart === 0) return null;
 
     const canonicalPrefix = options.canonicalMessages.slice(0, suffixStart);
     const canonicalSuffix = options.canonicalMessages.slice(suffixStart);
     const transformedPrefix = repairTranscriptForCompaction(
-      await options.prepareFullModelView(canonicalPrefix, options.context),
+      await options.prepareFullModelView(canonicalPrefix, {
+        ...options.context,
+        canonicalStartIndex: 0,
+      }),
     ).messages;
     if (transformedPrefix.length === 0) return null;
-    const transformedSuffix = await options.prepareFullModelView(canonicalSuffix, options.context);
+    const transformedSuffix = await options.prepareFullModelView(canonicalSuffix, {
+      ...options.context,
+      canonicalStartIndex: suffixStart,
+    });
     const suffixAndOverlayTokens = estimateMessagesTokens([
       ...transformedSuffix,
       ...options.overlay,
@@ -1912,11 +1944,9 @@ async function compactCanonicalMessages(options: {
     });
     if (!compactedPrefix) return null;
 
-    const canonicalMessages = [
-      buildCompactionSummaryMessage(compactedPrefix.summary),
-      ...cloneMessages(canonicalSuffix),
-    ];
-    const localPrepared = await options.prepareFullModelView(canonicalMessages, options.context);
+    const summaryMessage = buildCompactionSummaryMessage(compactedPrefix.summary);
+    const canonicalMessages = [summaryMessage, ...cloneMessages(canonicalSuffix)];
+    const localPrepared = [summaryMessage, ...transformedSuffix];
     const preparedMessages = compactedPrefix.serverMessages
       ? [...compactedPrefix.serverMessages, ...transformedSuffix]
       : localPrepared;
@@ -1930,6 +1960,7 @@ async function compactCanonicalMessages(options: {
         preparedMessages,
         summary: compactedPrefix.summary,
         usesServerCompaction: compactedPrefix.serverMessages !== undefined,
+        originalCanonicalSuffixStart: suffixStart,
       };
     }
     retainedTokenCap = Math.max(0, Math.floor(retainedTokenCap * 0.6));
@@ -2118,6 +2149,7 @@ export async function attachAutoCompaction(
   });
 
   const prepareBase: PrepareFullModelView = options.prepareFullModelView ?? cloneMessages;
+  const prepareBudgetBase: PrepareFullBudgetView = options.prepareFullBudgetView ?? prepareBase;
   let nativeCompactionView:
     | {
         canonicalPrefix: ModelMessage[];
@@ -2133,7 +2165,11 @@ export async function attachAutoCompaction(
       (message, index) => stringifyUnknown(message) === stringifyUnknown(messages[index]),
     );
 
-  const preparePreparedModelView: PrepareFullModelView = async (messages, context) => {
+  const prepareCachedModelView = async (
+    messages: readonly ModelMessage[],
+    context: TransformMessagesContext,
+    prepare: PrepareFullModelView,
+  ): Promise<ModelMessage[]> => {
     if (
       nativeCompactionView &&
       options.serverCompactionEnabled?.() !== false &&
@@ -2145,10 +2181,14 @@ export async function attachAutoCompaction(
       ];
       // Replay preparation owns current-key activation and lowers artifacts
       // that are incompatible with the active target to their portable summary.
-      return await prepareBase(cachedView, context);
+      return await prepare(cachedView, context);
     }
-    return await prepareBase(messages, context);
+    return await prepare(messages, context);
   };
+  const preparePreparedModelView: PrepareFullBudgetView = (messages, context) =>
+    prepareCachedModelView(messages, context, prepareBudgetBase);
+  const preparePayloadModelView: PrepareFullModelView = (messages, context) =>
+    prepareCachedModelView(messages, context, prepareBase);
 
   const resolveInputEstimate = async (input: {
     readonly canonicalMessages: readonly ModelMessage[];
@@ -2279,7 +2319,7 @@ export async function attachAutoCompaction(
       );
       const boundary = await chooseCanonicalRetainedTailStart({
         canonicalMessages: compactableMessages,
-        prepareFullModelView: prepareBase,
+        prepareFullModelView: prepareBudgetBase,
         context,
         keepRecentTokens: retainedTailTokenCap,
         keepRecentTurns,
@@ -2313,7 +2353,10 @@ export async function attachAutoCompaction(
     try {
       options.onCompactionStart?.(compactionEventBase);
 
-      const preparedTrailer = await prepareBase(separated.trailer, context);
+      const preparedTrailer = await prepareBudgetBase(separated.trailer, {
+        ...context,
+        canonicalStartIndex: separated.messages.length,
+      });
       const trailerTokens = estimateMessagesTokens(preparedTrailer);
       if (trailerTokens >= activeBudget.inputBudget) {
         throw new Error("Compaction continuation trailer exceeds the input budget.");
@@ -2333,7 +2376,7 @@ export async function attachAutoCompaction(
       });
       const compactionOutcome = await compactCanonicalMessages({
         canonicalMessages: compactableMessages,
-        prepareFullModelView: prepareBase,
+        prepareFullModelView: prepareBudgetBase,
         overlay,
         context,
         budget: contentBudget,
@@ -2357,6 +2400,20 @@ export async function attachAutoCompaction(
         onProgress: options.onProgress,
         onSummaryDelta: options.onSummaryDelta,
         abortSignal: context.abortSignal,
+        maximumCanonicalSuffixStart: (() => {
+          const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
+          if (currentStart === null || currentStart === undefined) return undefined;
+          if (
+            !Number.isSafeInteger(currentStart) ||
+            currentStart < 0 ||
+            currentStart > canonicalMessages.length
+          ) {
+            throw new RangeError(
+              "Current-input canonical start is outside the compaction transcript",
+            );
+          }
+          return Math.min(currentStart, compactableMessages.length);
+        })(),
       });
 
       if (!compactionOutcome) {
@@ -2403,6 +2460,13 @@ export async function attachAutoCompaction(
         estimatedInputTokensAfter: refreshedEventEstimate,
         status: "completed",
         summary: compactionOutcome.summary,
+        canonicalReplacement: {
+          mode: compactionOutcome.usesServerCompaction ? "server" : "local",
+          originalMessageCount: canonicalMessages.length,
+          originalSuffixStart: compactionOutcome.originalCanonicalSuffixStart,
+          replacementMessageCount: compacted.length,
+          replacementSuffixStart: 1,
+        },
       });
       return;
     } catch (error) {
@@ -2421,7 +2485,8 @@ export async function attachAutoCompaction(
     }
   };
 
-  agent.setPrepareFullModelView(preparePreparedModelView);
+  agent.setPrepareFullModelView(preparePayloadModelView);
+  agent.setPrepareFullBudgetView(preparePreparedModelView);
   agent.setCanonicalModelCallPreflight(canonicalModelCallPreflight);
   agent.setBuildEphemeralOverlay(options.buildEphemeralOverlay);
   agent.setDecorateRequestPayload(options.decorateRequestPayload);
@@ -2430,6 +2495,7 @@ export async function attachAutoCompaction(
   return () => {
     unsubscribe();
     agent.setPrepareFullModelView(options.prepareFullModelView);
+    agent.setPrepareFullBudgetView(options.prepareFullBudgetView);
     agent.setCanonicalModelCallPreflight(undefined);
     agent.setBuildEphemeralOverlay(options.buildEphemeralOverlay);
     agent.setDecorateRequestPayload(options.decorateRequestPayload);

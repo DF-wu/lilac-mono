@@ -2319,7 +2319,8 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       },
     });
     let overlayRevision = 0;
-    const preparedInputs: ModelMessage[][] = [];
+    const budgetInputs: Array<{ messages: ModelMessage[]; canonicalStartIndex?: number }> = [];
+    const payloadInputs: ModelMessage[][] = [];
     const canonicalBefore: ModelMessage[] = [
       { role: "user", content: "old request" },
       { role: "assistant", content: "old response" },
@@ -2329,9 +2330,21 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       model: originalModel,
       modelSpecifier: "test/original",
       messages: canonicalBefore,
+      prepareFullBudgetView: (messages, context) => {
+        budgetInputs.push({
+          messages: [...messages],
+          canonicalStartIndex: context.canonicalStartIndex,
+        });
+        order.push("prepare-budget");
+        return messages.map((message) =>
+          message.role === "user" && typeof message.content === "string"
+            ? { ...message, content: `${message.content} [budget]` }
+            : message,
+        );
+      },
       prepareFullModelView: (messages) => {
-        preparedInputs.push([...messages]);
-        order.push(messages.length === 3 ? "prepare-full" : "prepare-suffix");
+        payloadInputs.push([...messages]);
+        order.push("prepare-suffix");
         return messages.map((message) =>
           message.role === "user" && typeof message.content === "string"
             ? { ...message, content: `${message.content} [prepared]` }
@@ -2346,7 +2359,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       prepareModelCall: ({ canonicalMessages, fullBudgetView }) => {
         order.push("seam");
         expect(canonicalMessages).toEqual([...canonicalBefore, { role: "user", content: "new" }]);
-        expect(JSON.stringify(fullBudgetView)).toContain("old request [prepared]");
+        expect(JSON.stringify(fullBudgetView)).toContain("old request [budget]");
         expect(JSON.stringify(fullBudgetView)).toContain("overlay-1");
         return {
           runtime: {
@@ -2371,7 +2384,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     await agent.prompt("new");
 
     expect(order).toEqual([
-      "prepare-full",
+      "prepare-budget",
       "overlay-1",
       "seam",
       "prepare-suffix",
@@ -2379,10 +2392,13 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       "decorate",
       "model",
     ]);
-    expect(preparedInputs).toEqual([
-      [...canonicalBefore, { role: "user", content: "new" }],
-      [{ role: "user", content: "new" }],
+    expect(budgetInputs).toEqual([
+      {
+        messages: [...canonicalBefore, { role: "user", content: "new" }],
+        canonicalStartIndex: 0,
+      },
     ]);
+    expect(payloadInputs).toEqual([[{ role: "user", content: "new" }]]);
     expect(originalModel.doStreamCalls).toHaveLength(0);
     expect(replacementModel.doStreamCalls).toHaveLength(1);
     expect(JSON.stringify(replacementModel.doStreamCalls[0]?.prompt)).not.toContain("old request");

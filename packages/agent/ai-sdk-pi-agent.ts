@@ -370,12 +370,17 @@ export type TransformMessagesContext = {
   tools: ToolSet;
   /** Abort signal for this turn (if present). */
   abortSignal?: AbortSignal;
+  /** Canonical offset for full-budget subset preparation; payload transforms normally omit it. */
+  canonicalStartIndex?: number;
 };
 
 export type PrepareFullModelView = (
   canonicalMessages: readonly ModelMessage[],
   context: TransformMessagesContext,
 ) => ModelMessage[] | Promise<ModelMessage[]>;
+
+/** Prepares the complete target-protocol view used for estimation and compaction only. */
+export type PrepareFullBudgetView = PrepareFullModelView;
 
 export type CanonicalModelCallPreflight = (
   canonicalMessages: readonly ModelMessage[],
@@ -500,6 +505,7 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   /** Optional initial transcript (defaults to empty). */
   messages?: ModelMessage[];
   prepareFullModelView?: PrepareFullModelView;
+  prepareFullBudgetView?: PrepareFullBudgetView;
   canonicalModelCallPreflight?: CanonicalModelCallPreflight;
   buildEphemeralOverlay?: BuildEphemeralOverlay;
   decorateRequestPayload?: DecorateRequestPayload;
@@ -1036,6 +1042,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private abortRequestedReason: TurnAbortReason | null = null;
 
   private prepareFullModelView: PrepareFullModelView | undefined;
+  private prepareFullBudgetView: PrepareFullBudgetView | undefined;
   private canonicalModelCallPreflight: CanonicalModelCallPreflight | undefined;
   private buildEphemeralOverlay: BuildEphemeralOverlay | undefined;
   private decorateRequestPayload: DecorateRequestPayload | undefined;
@@ -1062,6 +1069,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   /** Create a new agent instance. */
   constructor(options: AiSdkPiAgentOptions<TOOLS>) {
     this.prepareFullModelView = options.prepareFullModelView;
+    this.prepareFullBudgetView = options.prepareFullBudgetView;
     this.canonicalModelCallPreflight = options.canonicalModelCallPreflight;
     this.buildEphemeralOverlay = options.buildEphemeralOverlay;
     this.decorateRequestPayload = options.decorateRequestPayload;
@@ -1290,6 +1298,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
   setPrepareFullModelView(prepareFullModelView: PrepareFullModelView | undefined) {
     this.prepareFullModelView = prepareFullModelView;
+  }
+
+  setPrepareFullBudgetView(prepareFullBudgetView: PrepareFullBudgetView | undefined) {
+    this.prepareFullBudgetView = prepareFullBudgetView;
   }
 
   setCanonicalModelCallPreflight(
@@ -2421,9 +2433,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
     await this.canonicalModelCallPreflight?.(canonicalMessages, preparationContext);
     canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
-    preparedCanonical = this.prepareFullModelView
-      ? await this.prepareFullModelView(canonicalMessages, preparationContext)
-      : canonicalMessages;
+    preparedCanonical = this.prepareFullBudgetView
+      ? await this.prepareFullBudgetView(canonicalMessages, {
+          ...preparationContext,
+          canonicalStartIndex: 0,
+        })
+      : this.prepareFullModelView
+        ? await this.prepareFullModelView(canonicalMessages, preparationContext)
+        : canonicalMessages;
     preparedCanonical = normalizeReplayMessages(preparedCanonical);
     throwIfPreparationAborted();
 
