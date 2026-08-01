@@ -158,6 +158,7 @@ export type UniversalCoreConfig = {
         enabled: boolean;
         model: string;
         concurrency: number;
+        batchSize: number;
         includePromptContext: boolean;
       };
       embedding: {

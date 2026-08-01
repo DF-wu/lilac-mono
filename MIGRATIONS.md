@@ -55,6 +55,7 @@ New v2 fields:
 - `conversation.thread.summarization.enabled`: default-false gate for background conversation thread summarization.
 - `conversation.thread.summarization.model`: model used for conversation thread summaries; defaults to `fast`.
 - `conversation.thread.summarization.concurrency`: number of threads to summarize concurrently inside one run; defaults to `1`.
+- `conversation.thread.summarization.batchSize`: maximum threads processed by one periodic run; defaults to `32`. Manual runs remain unbounded unless they provide a limit. Frozen v1 configs receive the same universal fallback but cannot override it.
 - `conversation.thread.summarization.includePromptContext`: default-false option to include `MEMORY.md`, `USER.md`, and optional `ENTITIES.md` as background-only summarization context.
 - `conversation.thread.embedding.enabled` and `conversation.thread.embedding.model`: default-false semantic thread embedding generation using an AI SDK embedding model ref.
 - `conversation.thread.autoInject.plannerModel`: optional model used for request-time auto-inject query planning; when unset, it inherits `conversation.thread.summarization.model`.

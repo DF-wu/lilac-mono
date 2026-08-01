@@ -72,6 +72,13 @@ const runSummarizationInputSchema = z.object({
     .describe(
       "When a background worker is available, wait for completion instead of returning a queued job id.",
     ),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(10_000)
+    .optional()
+    .describe("Optional maximum threads to process. Manual runs are unbounded by default."),
   threadId: z.string().min(1).optional().describe("Optional single thread id."),
   beforeTs: z.coerce
     .number()
