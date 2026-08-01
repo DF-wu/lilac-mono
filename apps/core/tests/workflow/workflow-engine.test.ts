@@ -1046,6 +1046,7 @@ describe("WorkflowEngine", () => {
         childSessionId: "child-session",
         profile: "explore",
         sessionName: "crash-test",
+        stableNamedContinuation: true,
         depth: 1,
         reasoning: null,
         fallbackToSurface: false,
@@ -1098,6 +1099,10 @@ describe("WorkflowEngine", () => {
         platform: "unknown",
       });
       if (!authorized) throw new Error("Workflow command was not authorized");
+      expect(authorized.policy.stableNamedContinuation).toEqual({
+        sessionId: "child-session",
+        requestClient: "discord",
+      });
       expect(
         store.claimWorkflowRequest({
           requestId,

@@ -54,6 +54,20 @@ export const workflowRequestPolicySchema = z.strictObject({
   resolvedModelRequest: workflowResolvedModelRequestSchema,
   cwd: z.string().min(1).max(4_096),
   originSession: workflowOriginSessionSchema,
+  stableNamedContinuation: z
+    .strictObject({
+      sessionId: z.string().min(1).max(4_096),
+      requestClient: z.enum([
+        "discord",
+        "github",
+        "whatsapp",
+        "slack",
+        "telegram",
+        "web",
+        "unknown",
+      ]),
+    })
+    .optional(),
 });
 
 export type WorkflowRequestPolicy = z.infer<typeof workflowRequestPolicySchema>;

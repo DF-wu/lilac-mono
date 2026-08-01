@@ -749,6 +749,90 @@ describe("durable workflow store minimal dispatch schema", () => {
     }
   });
 
+  it("binds stable named continuation authority to the durable completion target", () => {
+    const file = dbPath("stable-named-policy");
+    const store = new DurableWorkflowStore(file);
+    try {
+      const childSessionId = "sub:parent-session:named:generated";
+      const namedRun: WorkflowRun = {
+        ...run(),
+        completionTarget: {
+          kind: "live_parent",
+          parentRequestId: "parent-request",
+          parentSessionId: "parent-session",
+          parentRequestClient: "discord",
+          parentToolCallId: "parent-tool",
+          childRequestId: "child-request",
+          childSessionId,
+          profile: "general",
+          sessionName: "generated",
+          stableNamedContinuation: true,
+          depth: 1,
+          reasoning: null,
+          fallbackToSurface: false,
+          fallbackProgressTarget: null,
+          deferredDelivery: true,
+        },
+      };
+      store.createInvocation({ revision: revision(), run: namedRun });
+      store.tryClaimRun({ runId: "run-1", claimerId: "worker-1", now: 20 });
+      store.createOperation(operation("run-1", "operation-1"), "worker-1");
+      const policy = {
+        runId: "run-1",
+        operationId: "operation-1",
+        dispatchEpoch: "a".repeat(32),
+        profile: "general" as const,
+        model: null,
+        reasoning: null,
+        resolvedModelRequest: {
+          spec: "provider/model-a",
+          provider: "provider",
+          modelId: "model-a",
+          reasoningDisplay: "simple" as const,
+        },
+        cwd: "/workspace",
+        originSession: {
+          requestId: namedRun.origin.requestId,
+          sessionId: namedRun.origin.sessionId,
+          client: namedRun.origin.client,
+          userId: namedRun.origin.userId,
+        },
+      };
+      const authorize = (stableNamedContinuation?: {
+        sessionId: string;
+        requestClient: "discord" | "github";
+      }) =>
+        store.authorizeAgentDispatch({
+          requestId: "agent-request",
+          runId: "run-1",
+          operationId: "operation-1",
+          runOwnerId: "worker-1",
+          sessionId: childSessionId,
+          platform: "unknown",
+          policy: { ...policy, stableNamedContinuation },
+          now: 21,
+          staleOwnerBefore: 21,
+        });
+
+      expect(authorize()).toBeNull();
+      expect(
+        authorize({
+          sessionId: childSessionId,
+          requestClient: "github",
+        }),
+      ).toBeNull();
+      expect(
+        authorize({
+          sessionId: childSessionId,
+          requestClient: "discord",
+        }),
+      ).toMatchObject({ state: "dispatched" });
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+
   it("decodes legacy and flat fallback model requests but rejects recursive fallbacks", () => {
     const legacy = {
       spec: "provider/model-a",

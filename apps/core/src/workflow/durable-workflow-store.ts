@@ -1574,6 +1574,20 @@ export class DurableWorkflowStore {
     const operationInput = resolvedWorkflowAgentInputSchema.safeParse(operation.input);
     if (!operationInput.success) return false;
     const options = operationInput.data.options;
+    const expectedStableNamedContinuation =
+      run.completionTarget.kind === "live_parent" &&
+      run.completionTarget.stableNamedContinuation === true
+        ? {
+            sessionId: run.completionTarget.childSessionId,
+            requestClient: run.completionTarget.parentRequestClient,
+          }
+        : undefined;
+    const stableNamedContinuationMatches =
+      expectedStableNamedContinuation === undefined
+        ? policy.stableNamedContinuation === undefined
+        : policy.stableNamedContinuation?.sessionId === expectedStableNamedContinuation.sessionId &&
+          policy.stableNamedContinuation.requestClient ===
+            expectedStableNamedContinuation.requestClient;
     return (
       policy.runId === run.runId &&
       policy.operationId === operation.operationId &&
@@ -1584,7 +1598,8 @@ export class DurableWorkflowStore {
       policy.originSession.requestId === run.origin.requestId &&
       policy.originSession.sessionId === run.origin.sessionId &&
       policy.originSession.client === run.origin.client &&
-      policy.originSession.userId === run.origin.userId
+      policy.originSession.userId === run.origin.userId &&
+      stableNamedContinuationMatches
     );
   }
 

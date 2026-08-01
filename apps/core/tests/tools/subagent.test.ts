@@ -377,6 +377,7 @@ describe("subagent_delegate tool", () => {
       childRequestId: string;
       childSessionId: string;
       task: string;
+      stableNamedContinuation: true;
     }> = [];
 
     const tools = subagentTools({
@@ -389,6 +390,7 @@ describe("subagent_delegate tool", () => {
           childRequestId: registration.childRequestId,
           childSessionId: registration.childSessionId,
           task: registration.task,
+          stableNamedContinuation: registration.stableNamedContinuation,
         });
         return {
           runId: "run:deferred-1",
@@ -428,6 +430,7 @@ describe("subagent_delegate tool", () => {
         childRequestId: expect.stringMatching(/^sub:r:deferred-1:/u),
         childSessionId: `sub:s:deferred-1:named:${res.sessionName}`,
         task: "Map auth flow",
+        stableNamedContinuation: true,
       },
     ]);
   });
@@ -925,6 +928,7 @@ describe("subagent_delegate tool", () => {
       maxDepth: 1,
       onDelegate: async (registration) => {
         seenChildSessionId = registration.childSessionId;
+        seenStableNamedContinuation = registration.stableNamedContinuation;
         return {
           runId: "run:continued-session",
           completion: Promise.resolve({ status: "resolved", finalText: "continued" }),
@@ -936,6 +940,7 @@ describe("subagent_delegate tool", () => {
     const sessionName = "session-1";
     const expectedSessionId = `sub:s:parent:named:${sessionName}`;
     let seenChildSessionId: string | null = null;
+    let seenStableNamedContinuation = false;
 
     await bus.subscribeTopic(
       "cmd.request",
@@ -1022,6 +1027,79 @@ describe("subagent_delegate tool", () => {
     expect(res.status).toBe("resolved");
     expect(res.sessionName).toBe(sessionName);
     expect(seenChildSessionId === expectedSessionId).toBe(true);
+    expect(seenStableNamedContinuation).toBe(true);
+  });
+
+  it("makes a generated child name reusable for stable continuation", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const launches: Array<{ sessionName: string; childSessionId: string; stable: true }> = [];
+    const tools = subagentTools({
+      bus,
+      idleTimeoutMs: 2_000,
+      maxDepth: 1,
+      onDelegate: async (registration) => {
+        launches.push({
+          sessionName: registration.sessionName,
+          childSessionId: registration.childSessionId,
+          stable: registration.stableNamedContinuation,
+        });
+        return {
+          runId: `run:generated-stable-${launches.length}`,
+          completion: Promise.resolve({ status: "resolved", finalText: "done" }),
+          cancel: async () => {},
+        };
+      },
+    });
+
+    const generated = await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        { profile: "explore", task: "One-off utility run", mode: "deferred" },
+        {
+          toolCallId: "tool-generated-fresh-only",
+          messages: [],
+          context: {
+            requestId: "r:generated-fresh-only",
+            sessionId: "s:generated-fresh-only",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    );
+
+    await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        {
+          profile: "explore",
+          task: "Continue the utility run",
+          mode: "deferred",
+          sessionName: generated.sessionName,
+        },
+        {
+          toolCallId: "tool-generated-stable-continuation",
+          messages: [],
+          context: {
+            requestId: "r:generated-stable-continuation",
+            sessionId: "s:generated-fresh-only",
+            requestClient: "discord",
+            subagentDepth: 0,
+          },
+        },
+      ),
+    );
+
+    expect(launches).toEqual([
+      {
+        sessionName: generated.sessionName,
+        childSessionId: `sub:s:generated-fresh-only:named:${generated.sessionName}`,
+        stable: true,
+      },
+      {
+        sessionName: generated.sessionName,
+        childSessionId: `sub:s:generated-fresh-only:named:${generated.sessionName}`,
+        stable: true,
+      },
+    ]);
   });
 
   it("rejects invalid continuation session names", async () => {

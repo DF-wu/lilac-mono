@@ -895,6 +895,15 @@ export class WorkflowEngine {
           client: run.origin.client,
           userId: run.origin.userId,
         },
+        ...(run.completionTarget.kind === "live_parent" &&
+        run.completionTarget.stableNamedContinuation === true
+          ? {
+              stableNamedContinuation: {
+                sessionId: run.completionTarget.childSessionId,
+                requestClient: run.completionTarget.parentRequestClient,
+              },
+            }
+          : {}),
       } satisfies WorkflowRequestPolicy;
       const policy: WorkflowRequestPolicy =
         handoff.status === "live"
