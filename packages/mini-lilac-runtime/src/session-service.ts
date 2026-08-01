@@ -165,7 +165,9 @@ import {
   type StoredHistoryTransition,
   type StoredHistoryWorkspaceOutcome,
   type MiniMainClaudeSessionBinding,
+  type MiniNamedClaudeSessionBinding,
   type PromoteMiniMainClaudeSessionBinding,
+  type PromoteMiniNamedClaudeSessionBinding,
   type StoredUIMessageChunk,
   type StoredWorkspace,
   type WorkspaceHistoryAvailabilityOwner,
@@ -198,6 +200,7 @@ const DEFAULT_TOOL_RESULT_OUTPUT_CONFIG = {
 } satisfies ToolResultOutputNormalizerConfig;
 const MAX_PRELIMINARY_TOOL_OUTPUT_BYTES = 40 * 1024;
 const MINI_MAIN_CLAUDE_REQUEST_CLIENT = "mini-main";
+const MINI_NAMED_CLAUDE_REQUEST_CLIENT = "mini-named";
 const TEXT_REPLAY_TOOL_INPUT_CHARS = 20_000;
 const TEXT_REPLAY_TOOL_RESULT_CHARS = 40_000;
 const TITLE_GENERATION_INSTRUCTIONS = `You generate retrieval titles for conversations. Output ONLY one title and nothing else.
@@ -431,6 +434,7 @@ type StartPromptOptions = {
   depth?: number;
   profileId?: string;
   idleTimeoutMs?: number;
+  namedContinuation?: boolean;
 };
 
 type Subscriber = ReadableStreamDefaultController<MiniLilacRuntimeChunk>;
@@ -466,6 +470,7 @@ type RunContext = {
   profileId: string;
   deferred: DeferredChild[];
   idleTimeoutMs?: number;
+  namedContinuation: boolean;
   reportActivity?: () => void;
 };
 
@@ -491,9 +496,13 @@ type MiniMainClaudeRuntime = {
   finalize(
     outcome: "completed" | "cancelled" | "error",
     canonicalMessages: readonly ModelMessage[],
-  ): Promise<PromoteMiniMainClaudeSessionBinding | null>;
+  ): Promise<MiniClaudeBindingPromotion | null>;
   retireForCanonicalReplacement(): Promise<void>;
 };
+
+type MiniClaudeBindingPromotion =
+  | { readonly owner: "main"; readonly value: PromoteMiniMainClaudeSessionBinding }
+  | { readonly owner: "named"; readonly value: PromoteMiniNamedClaudeSessionBinding };
 
 type CreatedAgent = {
   agent: AiSdkPiAgent<ToolSet>;
@@ -557,6 +566,7 @@ type DelegatedSessionRequest = {
   parentRunId: string;
   parentToolCallId: string;
   sessionName: string;
+  namedContinuation: boolean;
   profileId: string;
   prompt: string;
   depth: number;
@@ -1371,6 +1381,7 @@ class SessionActor {
         profileId,
         deferred: [],
         idleTimeoutMs: options.idleTimeoutMs,
+        namedContinuation: options.namedContinuation ?? false,
       };
       this.store.reserveCommand(this.snapshot.id, clientCommandId, command);
       let admitted = false;
@@ -1386,7 +1397,7 @@ class SessionActor {
       let started = false;
       try {
         let created: CreatedAgent | undefined;
-        if (context.depth > 0) {
+        if (context.depth > 0 && !context.namedContinuation) {
           created = await this.createAgent(
             profileId,
             context,
@@ -1688,7 +1699,7 @@ class SessionActor {
       tools.websearch !== undefined || claudeBuiltInTools.includes("WebSearch"),
     );
     const shouldReplayHistoricalPrefix =
-      context.depth === 0 &&
+      (context.depth === 0 || context.namedContinuation) &&
       messages.length > 0 &&
       (sourceHistoryState.providerState === null ||
         sourceHistoryState.providerState.containsCrossFamilyTurns ||
@@ -1744,7 +1755,7 @@ class SessionActor {
     let materializedAgent: AiSdkPiAgent<ToolSet> | undefined;
     let claudeRuntime: MiniMainClaudeRuntime | null = null;
     let directClaudeCodeRun: MaterializedClaudeCodeRun | null = null;
-    if (isClaudeCode && context.depth > 0) {
+    if (isClaudeCode && context.depth > 0 && !context.namedContinuation) {
       directClaudeCodeRun = await this.materializeClaudeCode({
         modelId: parseModelRef(modelSpecifier).modelId,
         cwd: this.snapshot.cwd,
@@ -1759,12 +1770,44 @@ class SessionActor {
         },
       });
     }
-    if (isClaudeCode && context.depth === 0) {
-      const source = this.store.getMiniMainClaudeState({
+    if (isClaudeCode && (context.depth === 0 || context.namedContinuation)) {
+      const bindingOwner = context.depth === 0 ? "main" : "named";
+      const sourceBinding =
+        bindingOwner === "main"
+          ? this.store.getMiniMainClaudeState({
+              sessionId: this.snapshot.id,
+              historyStateId: sourceHistoryState.id,
+              providerId,
+            }).binding
+          : this.store.getMiniNamedClaudeState({
+              sessionId: this.snapshot.id,
+              providerId,
+            }).binding;
+      const requestClient =
+        bindingOwner === "main"
+          ? MINI_MAIN_CLAUDE_REQUEST_CLIENT
+          : MINI_NAMED_CLAUDE_REQUEST_CLIENT;
+      const lifecycleFields = {
+        requestId: context.runId,
         sessionId: this.snapshot.id,
-        historyStateId: sourceHistoryState.id,
+        requestClient,
         providerId,
-      });
+        model: modelSpecifier,
+        reasoning,
+        bindingHead: sourceBinding?.historyStateId ?? null,
+        bindingRevision: sourceBinding?.revision ?? null,
+        owner: bindingOwner,
+      } as const;
+      const lifecycleOperationalFields = {
+        requestId: context.runId,
+        sessionId: this.snapshot.id,
+        requestClient,
+        providerId,
+        model: modelSpecifier,
+        reasoning,
+        bindingRevision: sourceBinding?.revision ?? null,
+        owner: bindingOwner,
+      } as const;
       const nativeStorageNamespace = path.resolve(
         process.env["CLAUDE_CONFIG_DIR"] ?? path.join(homedir(), ".claude"),
       );
@@ -1789,13 +1832,15 @@ class SessionActor {
           builtInTools: [...claudeBuiltInTools].sort(),
         }),
       });
+      type CompatibleBinding = MiniMainClaudeSessionBinding | MiniNamedClaudeSessionBinding;
       const bindingIsCompatible = (
-        binding: MiniMainClaudeSessionBinding | null,
+        binding: CompatibleBinding | null,
         canonicalMessages: readonly ModelMessage[],
-      ): binding is MiniMainClaudeSessionBinding =>
+      ): binding is CompatibleBinding =>
         binding !== null &&
-        source.providerState?.lastFamily === "claude-code" &&
-        binding.requestClient === MINI_MAIN_CLAUDE_REQUEST_CLIENT &&
+        sourceHistoryState.providerState?.lastFamily === "claude-code" &&
+        binding.historyStateId === sourceHistoryState.id &&
+        binding.requestClient === requestClient &&
         binding.executionScopeHashVersion === executionScope.version &&
         binding.executionScopeHash === executionScope.hash &&
         binding.nativeCwd === this.snapshot.cwd &&
@@ -1807,23 +1852,34 @@ class SessionActor {
       const recordAttemptOutcome = (state: "succeeded" | "failed" | "cancelled"): void => {
         const attempt = currentAttempt;
         if (attempt === null) return;
-        this.store.recordMiniMainClaudeSessionAttemptOutcome({
+        const outcome = {
           providerId: attempt.providerId,
           lilacSessionId: this.snapshot.id,
           requestId: context.runId,
           attemptIndex: attempt.attemptIndex,
           state,
+        } as const;
+        if (bindingOwner === "main") {
+          this.store.recordMiniMainClaudeSessionAttemptOutcome(outcome);
+        } else {
+          this.store.recordMiniNamedClaudeSessionAttemptOutcome(outcome);
+        }
+        logger.debug("mini_claude.attempt_outcome", {
+          ...lifecycleFields,
+          outcome: state,
+          attemptIndex: attempt.attemptIndex,
+          candidateSessionId: attempt.candidateSessionId,
         });
         currentAttempt = null;
       };
       const materializeAttempt = async (input: {
         readonly attemptIndex: number;
-        readonly binding: MiniMainClaudeSessionBinding | null;
+        readonly binding: CompatibleBinding | null;
       }) => {
         const candidateSessionId = crypto.randomUUID();
-        const attempt = this.store.reserveMiniMainClaudeSessionAttempt({
+        const attemptInput = {
           providerId,
-          requestClient: MINI_MAIN_CLAUDE_REQUEST_CLIENT,
+          requestClient,
           lilacSessionId: this.snapshot.id,
           sourceHistoryStateId: sourceHistoryState.id,
           executionScopeHashVersion: executionScope.version,
@@ -1832,13 +1888,28 @@ class SessionActor {
           attemptIndex: input.attemptIndex,
           candidateSessionId,
           sourceSessionId: input.binding?.claudeSessionId ?? null,
-          expectedBindingRevision: input.binding?.revision ?? null,
-        });
+          expectedBindingRevision:
+            bindingOwner === "named"
+              ? (sourceBinding?.revision ?? null)
+              : (input.binding?.revision ?? null),
+        } as const;
+        const attempt =
+          bindingOwner === "main"
+            ? this.store.reserveMiniMainClaudeSessionAttempt(attemptInput)
+            : this.store.reserveMiniNamedClaudeSessionAttempt(attemptInput);
         currentAttempt = {
           providerId,
           attemptIndex: attempt.attemptIndex,
           candidateSessionId,
         };
+        logger.debug("mini_claude.attempt_materialized", {
+          ...lifecycleFields,
+          mode: input.binding === null ? "fresh" : "fork",
+          reason: input.binding === null ? "fresh-selection" : "exact-binding",
+          attemptIndex: attempt.attemptIndex,
+          sourceSessionId: input.binding?.claudeSessionId ?? null,
+          candidateSessionId,
+        });
         try {
           const run = await this.materializeClaudeCode({
             modelId: parseModelRef(modelSpecifier).modelId,
@@ -1879,9 +1950,22 @@ class SessionActor {
         factoryInputs: null,
         createCandidate: async ({ attemptIndex, prepareContext }) => {
           const persistedAttemptIndex = attemptIndex * 2;
-          const binding = bindingIsCompatible(source.binding, prepareContext.canonicalMessages)
-            ? source.binding
+          const binding = bindingIsCompatible(sourceBinding, prepareContext.canonicalMessages)
+            ? sourceBinding
             : null;
+          logger.debug("mini_claude.selection", {
+            ...lifecycleFields,
+            mode:
+              binding !== null ? "fork" : shouldReplayHistoricalPrefix ? "text-replay" : "fresh",
+            reason:
+              binding !== null
+                ? "exact-binding"
+                : sourceBinding === null
+                  ? shouldReplayHistoricalPrefix
+                    ? "provider-history-replay"
+                    : "missing-binding"
+                  : "binding-mismatch",
+          });
           if (binding !== null) {
             try {
               return await materializeAttempt({
@@ -1891,10 +1975,9 @@ class SessionActor {
             } catch (error) {
               if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
               logger.warn("Claude native source validation failed; starting fresh", {
-                requestId: context.runId,
-                sessionId: this.snapshot.id,
-                providerId,
-                sourceHistoryStateId: sourceHistoryState.id,
+                ...lifecycleOperationalFields,
+                mode: "fresh",
+                reason: "native-source-invalid",
                 issues: error.issues.map((issue) => issue.code),
               });
             }
@@ -1934,8 +2017,8 @@ class SessionActor {
         prepareModelCall,
         currentRun: () => owner.currentCandidate?.run ?? null,
         inputEstimateFloor: ({ canonicalMessages, overlay, estimateMessagesTokens }) => {
-          const binding = bindingIsCompatible(source.binding, canonicalMessages)
-            ? source.binding
+          const binding = bindingIsCompatible(sourceBinding, canonicalMessages)
+            ? sourceBinding
             : null;
           if (binding === null) return null;
           return owner.getNativeInputEstimateFloor({
@@ -1955,9 +2038,9 @@ class SessionActor {
             recordAttemptOutcome("failed");
             await owner.retireForCanonicalReplacement();
             logger.warn("Claude native candidate lost continuation observability", {
-              requestId: context.runId,
-              sessionId: this.snapshot.id,
-              providerId,
+              ...lifecycleOperationalFields,
+              mode: "fresh",
+              reason: "native-observability-lost",
               error: error instanceof Error ? error.message : String(error),
             });
           }
@@ -1989,9 +2072,8 @@ class SessionActor {
           ) {
             recordAttemptOutcome("failed");
             logger.warn("Claude native candidate does not match the committed canonical head", {
-              requestId: context.runId,
-              sessionId: this.snapshot.id,
-              providerId,
+              ...lifecycleOperationalFields,
+              reason: "canonical-head-mismatch",
               synchronizedMessageCount: cursor?.canonicalMessageCount ?? null,
               committedMessageCount: canonicalMessages.length,
             });
@@ -2007,15 +2089,14 @@ class SessionActor {
             ) {
               recordAttemptOutcome("failed");
               logger.warn("Claude native candidate was not promotable", {
-                requestId: context.runId,
-                sessionId: this.snapshot.id,
-                providerId,
+                ...lifecycleOperationalFields,
+                reason: "native-finalization-unpromotable",
                 issues: finalized.issues.map((issue) => issue.code),
               });
               return null;
             }
             recordAttemptOutcome("succeeded");
-            return {
+            const value = {
               providerId,
               requestId: context.runId,
               attemptIndex: attempt.attemptIndex,
@@ -2026,12 +2107,21 @@ class SessionActor {
               lastModelSpecifier: modelSpecifier,
               lastReasoning: reasoning,
             };
+            return bindingOwner === "main"
+              ? { owner: "main", value }
+              : {
+                  owner: "named",
+                  value: {
+                    ...value,
+                    canonicalMessageCount: canonicalMessages.length,
+                    canonicalHeadHash: cursor.canonicalPrefixHash,
+                  },
+                };
           } catch (error) {
             recordAttemptOutcome("failed");
             logger.warn("Claude native candidate finalization failed", {
-              requestId: context.runId,
-              sessionId: this.snapshot.id,
-              providerId,
+              ...lifecycleOperationalFields,
+              reason: "native-finalization-failed",
               error: error instanceof Error ? error.message : String(error),
             });
             return null;
@@ -2781,6 +2871,7 @@ class SessionActor {
         parentRunId: parent.runId,
         parentToolCallId: toolCallId,
         sessionName,
+        namedContinuation: true,
         profileId,
         prompt,
         depth: parent.depth + 1,
@@ -3010,7 +3101,7 @@ class SessionActor {
         agent.getRecoverableMessages(),
         "run ended",
       );
-      const claudeBindingPromotion =
+      const claudePromotion =
         active.claudeRuntime === null
           ? null
           : await active.claudeRuntime.finalize(runStatus, finalMessages);
@@ -3025,7 +3116,12 @@ class SessionActor {
         uiMessages,
         inputTokens: active.inputTokens,
         providerState: active.providerState,
-        ...(claudeBindingPromotion === null ? {} : { claudeBindingPromotion }),
+        ...(claudePromotion?.owner === "main"
+          ? { claudeBindingPromotion: claudePromotion.value }
+          : {}),
+        ...(claudePromotion?.owner === "named"
+          ? { namedClaudeBindingPromotion: claudePromotion.value }
+          : {}),
       });
       this.terminalReplay = undefined;
     } catch (finalizationError) {
@@ -3085,6 +3181,7 @@ class SessionActor {
       readonly inputTokens: number | null;
       readonly providerState?: HistoryProviderState;
       readonly claudeBindingPromotion?: PromoteMiniMainClaudeSessionBinding;
+      readonly namedClaudeBindingPromotion?: PromoteMiniNamedClaudeSessionBinding;
     },
   ): Promise<MiniLilacSessionSnapshot> {
     return await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
@@ -3104,6 +3201,9 @@ class SessionActor {
           ...(input.claudeBindingPromotion === undefined
             ? {}
             : { claudeBindingPromotion: input.claudeBindingPromotion }),
+          ...(input.namedClaudeBindingPromotion === undefined
+            ? {}
+            : { namedClaudeBindingPromotion: input.namedClaudeBindingPromotion }),
         });
       }
       assertWorkspaceHistoryAvailable(this.store, input.sessionId, "finalize-run", {
@@ -3135,12 +3235,50 @@ class SessionActor {
           ...(input.claudeBindingPromotion === undefined
             ? {}
             : { claudeBindingPromotion: input.claudeBindingPromotion }),
+          ...(input.namedClaudeBindingPromotion === undefined
+            ? {}
+            : { namedClaudeBindingPromotion: input.namedClaudeBindingPromotion }),
           ...workspace,
         });
+        const promotion = input.claudeBindingPromotion ?? input.namedClaudeBindingPromotion;
+        const owner = input.claudeBindingPromotion ? "main" : "named";
+        if (promotion !== undefined) {
+          const fields = {
+            requestId: input.runId,
+            sessionId: input.sessionId,
+            requestClient:
+              owner === "main" ? MINI_MAIN_CLAUDE_REQUEST_CLIENT : MINI_NAMED_CLAUDE_REQUEST_CLIENT,
+            providerId: promotion.providerId,
+            owner,
+            mode: "canonical-publication",
+            model: promotion.lastModelSpecifier,
+            reasoning: promotion.lastReasoning,
+          } as const;
+          logger.info("mini_claude.canonical_published", {
+            ...fields,
+            reason: "committed-history-state",
+          });
+          if (committed.bindingPromotion === "promoted") {
+            logger.info("mini_claude.binding_promotion", {
+              ...fields,
+              mode: "cas",
+              reason: "binding-promoted",
+            });
+          }
+        }
         if (committed.bindingPromotion === "cas-failed") {
           logger.warn("Claude native binding promotion lost its compare-and-swap fence", {
             requestId: input.runId,
             sessionId: input.sessionId,
+            requestClient:
+              input.claudeBindingPromotion !== undefined
+                ? MINI_MAIN_CLAUDE_REQUEST_CLIENT
+                : MINI_NAMED_CLAUDE_REQUEST_CLIENT,
+            providerId: promotion?.providerId,
+            mode: "cas",
+            reason: "binding-cas-lost",
+            model: promotion?.lastModelSpecifier,
+            reasoning: promotion?.lastReasoning,
           });
         }
         return committed.snapshot;
@@ -4549,6 +4687,7 @@ class SessionActor {
           depth: 0,
           profileId,
           deferred: [],
+          namedContinuation: false,
         },
         modelSpecifier,
         readFileMediaSupported,
@@ -5589,6 +5728,7 @@ export class SessionService {
           depth: request.depth,
           profileId: request.profileId,
           idleTimeoutMs: this.options.config.agent.subagents.idleTimeoutMs,
+          namedContinuation: request.namedContinuation,
         },
       );
       return {

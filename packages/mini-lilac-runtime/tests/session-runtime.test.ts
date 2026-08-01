@@ -785,7 +785,7 @@ describe("MiniLilacSqliteStore", () => {
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, "runtime.sqlite");
     const original = new MiniLilacSqliteStore(databasePath);
-    original.database.exec("PRAGMA user_version = 8;");
+    original.database.exec("PRAGMA user_version = 9;");
     original.close();
 
     expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(MiniLilacDatabaseVersionError);
@@ -7203,7 +7203,13 @@ describe("SessionService", () => {
     await collect(started.stream);
 
     expect(service.store.getRun(started.runId).status).toBe("completed");
-    expect(delegatedRuns(service, session.id)).toEqual([]);
+    const childRun = delegatedRuns(service, session.id)[0];
+    expect(childRun).toMatchObject({
+      status: "error",
+      error: "Failed to prepare model runtime: child construction failed",
+    });
+    if (childRun === undefined) throw new Error("expected terminal child setup failure");
+    expect(service.store.getActiveRootRun(childRun.sessionId)).toBeNull();
     expect(service.getSnapshot(session.id).status).toBe("idle");
     service.close();
   });

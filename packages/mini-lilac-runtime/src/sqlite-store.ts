@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 
+import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
+import { createLogger } from "@stanley2058/lilac-utils";
 import type {
   MiniLilacTodo,
   MiniLilacTodoState,
@@ -46,8 +48,10 @@ import { z } from "zod";
 
 const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
-export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 7;
+export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 8;
 export const MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
+export const MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
+const logger = createLogger({ module: "mini-lilac-runtime:sqlite-store" });
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -277,11 +281,20 @@ const miniMainClaudeAttemptRowSchema = z.object({
   created_at: z.string(),
   updated_at: z.string(),
 });
+const miniNamedClaudeBindingRowSchema = miniMainClaudeBindingRowSchema;
+const miniNamedClaudeAttemptRowSchema = miniMainClaudeAttemptRowSchema;
 const miniMainClaudeStateLookupSchema = z.strictObject({
   sessionId: z.string().min(1),
   historyStateId: z.string().min(1),
   providerId: z.string().min(1),
 });
+const miniNamedSessionIdSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => value.startsWith("sub:") && value.lastIndexOf(":named:") > "sub:".length,
+    "Expected a named delegated Mini session ID",
+  );
 const reserveMiniMainClaudeSessionAttemptSchema = z.strictObject({
   providerId: z.string().min(1),
   requestClient: z.string().min(1),
@@ -316,6 +329,39 @@ const promoteMiniMainClaudeSessionBindingSchema = z.strictObject({
   lastModelSpecifier: z.string().min(1),
   lastReasoning: z.string().min(1),
 });
+const miniNamedClaudeStateLookupSchema = z.strictObject({
+  sessionId: miniNamedSessionIdSchema,
+  providerId: z.string().min(1),
+});
+const reserveMiniNamedClaudeSessionAttemptSchema = z.strictObject({
+  providerId: z.string().min(1),
+  requestClient: z.string().min(1),
+  lilacSessionId: miniNamedSessionIdSchema,
+  sourceHistoryStateId: z.string().min(1),
+  executionScopeHashVersion: z.literal(1),
+  executionScopeHash: z.string().min(1),
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+  candidateSessionId: z.string().uuid(),
+  sourceSessionId: z.string().uuid().nullable(),
+  expectedBindingRevision: z.number().int().positive().nullable(),
+});
+const miniNamedClaudeSessionAttemptKeySchema = z.strictObject({
+  providerId: z.string().min(1),
+  lilacSessionId: miniNamedSessionIdSchema,
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+});
+const recordMiniNamedClaudeSessionAttemptOutcomeSchema =
+  miniNamedClaudeSessionAttemptKeySchema.extend({
+    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
+  });
+const promoteMiniNamedClaudeSessionBindingSchema = promoteMiniMainClaudeSessionBindingSchema.extend(
+  {
+    canonicalMessageCount: z.number().int().nonnegative(),
+    canonicalHeadHash: z.string().min(1),
+  },
+);
 const historyTransitionRowSchema = z.object({
   id: z.string(),
   session_id: z.string(),
@@ -376,6 +422,7 @@ const pendingRunFinalizationRowSchema = z.object({
   last_provider_family: historyProviderFamilySchema.nullable(),
   contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
   claude_binding_promotion_json: z.string().nullable(),
+  named_claude_binding_promotion_json: z.string().nullable(),
   prepared_at: z.string(),
 });
 const historyAccountingRowSchema = z.object({
@@ -1102,6 +1149,7 @@ export type PendingStoredRunFinalization = {
   readonly inputTokens: number | null;
   readonly providerState: HistoryProviderState | null;
   readonly claudeBindingPromotion: PromoteMiniMainClaudeSessionBinding | null;
+  readonly namedClaudeBindingPromotion: PromoteMiniNamedClaudeSessionBinding | null;
   readonly preparedAt: string;
 };
 
@@ -1126,6 +1174,7 @@ export type ReservePendingStoredRunFinalization = {
   readonly inputTokens: number | null;
   readonly providerState?: HistoryProviderState;
   readonly claudeBindingPromotion?: PromoteMiniMainClaudeSessionBinding;
+  readonly namedClaudeBindingPromotion?: PromoteMiniNamedClaudeSessionBinding;
 };
 
 export type CommitPendingStoredRunFinalization = StoredHistoryWorkspaceOutcome & {
@@ -1133,6 +1182,7 @@ export type CommitPendingStoredRunFinalization = StoredHistoryWorkspaceOutcome &
   readonly destinationStateId: string;
   readonly providerState?: HistoryProviderState;
   readonly claudeBindingPromotion?: PromoteMiniMainClaudeSessionBinding;
+  readonly namedClaudeBindingPromotion?: PromoteMiniNamedClaudeSessionBinding;
 };
 
 export type CommittedPendingStoredRunFinalization = {
@@ -1220,6 +1270,38 @@ export type PromoteMiniMainClaudeSessionBinding = {
   readonly nativeContextMaxTokens: number;
   readonly lastModelSpecifier: string;
   readonly lastReasoning: string;
+};
+
+export type MiniNamedClaudeSessionBinding = MiniMainClaudeSessionBinding;
+
+export type MiniNamedClaudeSessionAttempt = MiniMainClaudeSessionAttempt;
+
+export type MiniClaudeRetentionDiagnostics = {
+  readonly mainBindingCount: number;
+  readonly namedBindingCount: number;
+  readonly activeAttemptCount: number;
+  readonly terminalAttemptCount: number;
+  readonly orphanBindingCount: number;
+  readonly orphanAttemptCount: number;
+};
+
+export type MiniNamedClaudeState = {
+  readonly binding: MiniNamedClaudeSessionBinding | null;
+};
+
+export type ReserveMiniNamedClaudeSessionAttempt = Omit<
+  ReserveMiniMainClaudeSessionAttempt,
+  "sourceSessionId" | "expectedBindingRevision"
+> & {
+  readonly sourceSessionId: string | null;
+  readonly expectedBindingRevision: number | null;
+};
+
+export type RecordMiniNamedClaudeSessionAttemptOutcome = RecordMiniMainClaudeSessionAttemptOutcome;
+
+export type PromoteMiniNamedClaudeSessionBinding = PromoteMiniMainClaudeSessionBinding & {
+  readonly canonicalMessageCount: number;
+  readonly canonicalHeadHash: string;
 };
 
 export type CommitStoredHistoryCompaction = StoredHistoryWorkspaceOutcome & {
@@ -1442,6 +1524,14 @@ function toMiniMainClaudeAttempt(rowValue: unknown): MiniMainClaudeSessionAttemp
   };
 }
 
+function toMiniNamedClaudeBinding(rowValue: unknown): MiniNamedClaudeSessionBinding {
+  return toMiniMainClaudeBinding(miniNamedClaudeBindingRowSchema.parse(rowValue));
+}
+
+function toMiniNamedClaudeAttempt(rowValue: unknown): MiniNamedClaudeSessionAttempt {
+  return toMiniMainClaudeAttempt(miniNamedClaudeAttemptRowSchema.parse(rowValue));
+}
+
 function toHistoryTransition(rowValue: unknown): StoredHistoryTransition {
   const row = historyTransitionRowSchema.parse(rowValue);
   return {
@@ -1533,6 +1623,12 @@ function toPendingRunFinalization(rowValue: unknown): PendingStoredRunFinalizati
         ? null
         : promoteMiniMainClaudeSessionBindingSchema.parse(
             deserialize(row.claude_binding_promotion_json),
+          ),
+    namedClaudeBindingPromotion:
+      row.named_claude_binding_promotion_json === null
+        ? null
+        : promoteMiniNamedClaudeSessionBindingSchema.parse(
+            deserialize(row.named_claude_binding_promotion_json),
           ),
     preparedAt: row.prepared_at,
   };
@@ -1661,7 +1757,8 @@ export class MiniLilacSqliteStore {
       version !== 3 &&
       version !== 4 &&
       version !== 5 &&
-      version !== 6
+      version !== 6 &&
+      version !== 7
     ) {
       throw new MiniLilacDatabaseVersionError(version);
     }
@@ -1679,7 +1776,8 @@ export class MiniLilacSqliteStore {
           if (version === 2 || version === 3 || version === 4) this.migrateSchemaV4ToV5();
           if (version === 5) this.migrateSchemaV5ToV6();
         }
-        this.migrateSchemaV6ToV7();
+        if (version <= 6) this.migrateSchemaV6ToV7();
+        this.migrateSchemaV7ToV8();
         const violations = this.database.query("PRAGMA foreign_key_check").all();
         if (violations.length > 0) {
           throw new Error(
@@ -2159,6 +2257,68 @@ export class MiniLilacSqliteStore {
       );
       CREATE INDEX mini_main_claude_attempts_owner
         ON mini_main_claude_attempts(session_id, provider_id, updated_at);
+    `);
+  }
+
+  private migrateSchemaV7ToV8(): void {
+    this.database.exec(`
+      ALTER TABLE pending_run_finalizations
+        ADD COLUMN named_claude_binding_promotion_json TEXT;
+
+      CREATE TABLE mini_named_claude_bindings (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        history_state_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        binding_protocol_version INTEGER NOT NULL CHECK(binding_protocol_version = 1),
+        provider_family TEXT NOT NULL CHECK(provider_family = 'claude-code'),
+        request_client TEXT NOT NULL,
+        canonical_message_count INTEGER NOT NULL CHECK(canonical_message_count >= 0),
+        execution_scope_hash_version INTEGER NOT NULL CHECK(execution_scope_hash_version = 1),
+        execution_scope_hash TEXT NOT NULL,
+        claude_session_id TEXT NOT NULL UNIQUE,
+        native_cwd TEXT NOT NULL,
+        native_last_modified REAL NOT NULL CHECK(native_last_modified >= 0),
+        native_context_tokens INTEGER NOT NULL CHECK(native_context_tokens >= 0),
+        native_context_max_tokens INTEGER NOT NULL CHECK(native_context_max_tokens > 0),
+        last_model_specifier TEXT NOT NULL,
+        last_reasoning TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0 AND revision <= 9007199254740991),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, provider_id),
+        FOREIGN KEY(history_state_id, session_id)
+          REFERENCES history_states(id, session_id) ON DELETE CASCADE
+      );
+      CREATE INDEX mini_named_claude_bindings_state
+        ON mini_named_claude_bindings(history_state_id, session_id);
+
+      CREATE TABLE mini_named_claude_attempts (
+        id INTEGER PRIMARY KEY,
+        product TEXT NOT NULL DEFAULT 'mini' CHECK(product = 'mini'),
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_history_state_id TEXT NOT NULL,
+        source_canonical_message_count INTEGER NOT NULL
+          CHECK(source_canonical_message_count >= 0),
+        provider_id TEXT NOT NULL,
+        request_client TEXT NOT NULL,
+        execution_scope_hash_version INTEGER NOT NULL CHECK(execution_scope_hash_version = 1),
+        execution_scope_hash TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL CHECK(attempt_index >= 0),
+        candidate_session_id TEXT NOT NULL UNIQUE,
+        source_session_id TEXT,
+        expected_binding_revision INTEGER
+          CHECK(expected_binding_revision IS NULL OR expected_binding_revision > 0),
+        state TEXT NOT NULL
+          CHECK(state IN ('active', 'succeeded', 'failed', 'cancelled', 'uncertain')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(session_id, provider_id, request_id, attempt_index),
+        FOREIGN KEY(source_history_state_id, session_id)
+          REFERENCES history_states(id, session_id) ON DELETE CASCADE,
+        CHECK(source_session_id IS NULL OR expected_binding_revision IS NOT NULL)
+      );
+      CREATE INDEX mini_named_claude_attempts_owner
+        ON mini_named_claude_attempts(session_id, provider_id, updated_at);
     `);
   }
 
@@ -3458,6 +3618,204 @@ export class MiniLilacSqliteStore {
     });
   }
 
+  getMiniNamedClaudeState(inputValue: {
+    readonly sessionId: string;
+    readonly providerId: string;
+  }): MiniNamedClaudeState {
+    const input = miniNamedClaudeStateLookupSchema.parse(inputValue);
+    const session = this.database.query("SELECT 1 FROM sessions WHERE id = ?").get(input.sessionId);
+    if (!session) throw new Error(`Session '${input.sessionId}' was not found`);
+    const row = this.database
+      .query(
+        `SELECT * FROM mini_named_claude_bindings
+         WHERE session_id = ? AND provider_id = ?`,
+      )
+      .get(input.sessionId, input.providerId);
+    return { binding: row ? toMiniNamedClaudeBinding(row) : null };
+  }
+
+  getMiniNamedClaudeSessionAttempt(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): MiniNamedClaudeSessionAttempt | null {
+    const input = miniNamedClaudeSessionAttemptKeySchema.parse(inputValue);
+    const row = this.database
+      .query(
+        `SELECT * FROM mini_named_claude_attempts
+         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+      )
+      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+    return row ? toMiniNamedClaudeAttempt(row) : null;
+  }
+
+  getMiniClaudeRetentionDiagnostics(): MiniClaudeRetentionDiagnostics {
+    const count = (sql: string) =>
+      z.object({ count: z.number().int().nonnegative() }).parse(this.database.query(sql).get())
+        .count;
+    return {
+      mainBindingCount: count("SELECT COUNT(*) AS count FROM mini_main_claude_bindings"),
+      namedBindingCount: count("SELECT COUNT(*) AS count FROM mini_named_claude_bindings"),
+      activeAttemptCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state = 'active') +
+           (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state = 'active') AS count`,
+      ),
+      terminalAttemptCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state <> 'active') +
+           (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state <> 'active') AS count`,
+      ),
+      orphanBindingCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_bindings AS binding
+            LEFT JOIN history_states AS state
+              ON state.id = binding.history_state_id AND state.session_id = binding.session_id
+            WHERE state.id IS NULL) +
+           (SELECT COUNT(*) FROM mini_named_claude_bindings AS binding
+            LEFT JOIN history_states AS state
+              ON state.id = binding.history_state_id AND state.session_id = binding.session_id
+            WHERE state.id IS NULL) AS count`,
+      ),
+      orphanAttemptCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_attempts AS attempt
+            LEFT JOIN history_states AS state
+              ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
+            WHERE state.id IS NULL) +
+           (SELECT COUNT(*) FROM mini_named_claude_attempts AS attempt
+            LEFT JOIN history_states AS state
+              ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
+            WHERE state.id IS NULL) AS count`,
+      ),
+    };
+  }
+
+  reserveMiniNamedClaudeSessionAttempt(
+    inputValue: ReserveMiniNamedClaudeSessionAttempt,
+  ): MiniNamedClaudeSessionAttempt {
+    const input = reserveMiniNamedClaudeSessionAttemptSchema.parse(inputValue);
+    return this.runImmediateTransaction(() => {
+      const source = this.getHistoryState(input.sourceHistoryStateId);
+      if (source.sessionId !== input.lilacSessionId) {
+        throw new Error(
+          `History state '${input.sourceHistoryStateId}' does not belong to session '${input.lilacSessionId}'`,
+        );
+      }
+      const binding = this.getMiniNamedClaudeState({
+        sessionId: input.lilacSessionId,
+        providerId: input.providerId,
+      }).binding;
+      if (input.expectedBindingRevision === null) {
+        if (binding !== null) {
+          throw new Error("Named Claude attempt source binding changed before reservation");
+        }
+      } else if (
+        binding === null ||
+        binding.revision !== input.expectedBindingRevision ||
+        binding.requestClient !== input.requestClient ||
+        (input.sourceSessionId !== null &&
+          (binding.claudeSessionId !== input.sourceSessionId ||
+            binding.historyStateId !== input.sourceHistoryStateId ||
+            binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
+            binding.executionScopeHash !== input.executionScopeHash))
+      ) {
+        throw new Error("Named Claude attempt source binding changed before reservation");
+      }
+      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
+        this.database
+          .query(
+            `SELECT COUNT(*) AS count FROM mini_named_claude_attempts
+             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+          )
+          .get(input.lilacSessionId, input.providerId),
+      ).count;
+      if (activeCount >= MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        throw new Error("Too many active Mini named Claude attempts are retained");
+      }
+      const now = new Date().toISOString();
+      this.database
+        .query(
+          `INSERT INTO mini_named_claude_attempts
+            (product, session_id, source_history_state_id, source_canonical_message_count,
+             provider_id, request_client, execution_scope_hash_version, execution_scope_hash,
+             request_id, attempt_index, candidate_session_id, source_session_id,
+             expected_binding_revision, state, created_at, updated_at)
+           VALUES ('mini', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        )
+        .run(
+          input.lilacSessionId,
+          input.sourceHistoryStateId,
+          this.getHistoryStateCanonicalMessageCount(input.sourceHistoryStateId),
+          input.providerId,
+          input.requestClient,
+          input.executionScopeHashVersion,
+          input.executionScopeHash,
+          input.requestId,
+          input.attemptIndex,
+          input.candidateSessionId,
+          input.sourceSessionId,
+          input.expectedBindingRevision,
+          now,
+          now,
+        );
+      this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
+      const attempt = this.getMiniNamedClaudeSessionAttempt({
+        providerId: input.providerId,
+        lilacSessionId: input.lilacSessionId,
+        requestId: input.requestId,
+        attemptIndex: input.attemptIndex,
+      });
+      if (attempt === null) throw new Error("Reserved named Claude attempt was not retained");
+      return attempt;
+    });
+  }
+
+  recordMiniNamedClaudeSessionAttemptOutcome(
+    inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
+  ): MiniNamedClaudeSessionAttempt {
+    const input = recordMiniNamedClaudeSessionAttemptOutcomeSchema.parse(inputValue);
+    return this.runImmediateTransaction(() => {
+      const attemptKey = {
+        providerId: input.providerId,
+        lilacSessionId: input.lilacSessionId,
+        requestId: input.requestId,
+        attemptIndex: input.attemptIndex,
+      };
+      const current = this.getMiniNamedClaudeSessionAttempt(attemptKey);
+      if (current === null)
+        throw new Error(`Named Claude attempt '${input.requestId}' was not found`);
+      if (current.state !== "active") {
+        if (current.state === input.state) return current;
+        throw new Error(
+          `Named Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+        );
+      }
+      const updated = this.database
+        .query(
+          `UPDATE mini_named_claude_attempts SET state = ?, updated_at = ?
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?
+             AND state = 'active'`,
+        )
+        .run(
+          input.state,
+          new Date().toISOString(),
+          input.lilacSessionId,
+          input.providerId,
+          input.requestId,
+          input.attemptIndex,
+        );
+      if (updated.changes !== 1)
+        throw new Error("Named Claude attempt outcome lost its active fence");
+      this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
+      const attempt = this.getMiniNamedClaudeSessionAttempt(attemptKey);
+      if (attempt === null)
+        throw new Error("Updated named Claude attempt exceeded retention immediately");
+      return attempt;
+    });
+  }
+
   getSessionHistory(sessionId: string): StoredSessionHistory {
     const row = this.database
       .query("SELECT * FROM session_history WHERE session_id = ?")
@@ -4685,7 +5043,17 @@ export class MiniLilacSqliteStore {
       input.claudeBindingPromotion === undefined
         ? null
         : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
-    if (promotion !== null && providerState?.lastFamily !== "claude-code") {
+    const namedPromotion =
+      input.namedClaudeBindingPromotion === undefined
+        ? null
+        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
+    if (promotion !== null && namedPromotion !== null) {
+      throw new Error("A run cannot promote both main and named Claude bindings");
+    }
+    if (
+      (promotion !== null || namedPromotion !== null) &&
+      providerState?.lastFamily !== "claude-code"
+    ) {
       throw new Error("A Claude binding promotion requires Claude provider-state metadata");
     }
     if (input.inputTokens !== null) z.number().int().nonnegative().parse(input.inputTokens);
@@ -4749,8 +5117,8 @@ export class MiniLilacSqliteStore {
             (run_id, session_id, workspace_id, open_transition_id, model_head_id, ui_head_id,
              run_status, session_status, error, terminal_result_json, input_tokens,
              last_provider_family, contains_cross_family_turns, claude_binding_promotion_json,
-             prepared_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             named_claude_binding_promotion_json, prepared_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.runId,
@@ -4767,6 +5135,7 @@ export class MiniLilacSqliteStore {
           providerState?.lastFamily ?? null,
           providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
           promotion === null ? null : serialize(promotion),
+          namedPromotion === null ? null : serialize(namedPromotion),
           now,
         );
       const pending = this.getPendingRunFinalization(input.runId);
@@ -4833,9 +5202,50 @@ export class MiniLilacSqliteStore {
   recoverInterruptedRuntimeState(): void {
     const now = new Date().toISOString();
     this.runImmediateTransaction(() => {
+      const interruptedAttempts = z
+        .array(
+          z.object({
+            product: z.enum(["main", "named"]),
+            request_id: z.string(),
+            session_id: z.string(),
+            provider_id: z.string(),
+            request_client: z.string(),
+            source_history_state_id: z.string(),
+            expected_binding_revision: z.number().int().positive().nullable(),
+            model: z.string(),
+            reasoning: z.string(),
+          }),
+        )
+        .parse(
+          this.database
+            .query(
+              `SELECT 'main' AS product, attempt.request_id, attempt.session_id,
+                      attempt.provider_id, attempt.request_client,
+                      attempt.source_history_state_id, attempt.expected_binding_revision,
+                      session.model, session.reasoning
+               FROM mini_main_claude_attempts AS attempt
+               JOIN sessions AS session ON session.id = attempt.session_id
+               WHERE attempt.state = 'active'
+               UNION ALL
+               SELECT 'named' AS product, attempt.request_id, attempt.session_id,
+                      attempt.provider_id, attempt.request_client,
+                      attempt.source_history_state_id, attempt.expected_binding_revision,
+                      session.model, session.reasoning
+               FROM mini_named_claude_attempts AS attempt
+               JOIN sessions AS session ON session.id = attempt.session_id
+               WHERE attempt.state = 'active'`,
+            )
+            .all(),
+        );
       this.database
         .query(
           `UPDATE mini_main_claude_attempts SET state = 'uncertain', updated_at = ?
+           WHERE state = 'active'`,
+        )
+        .run(now);
+      this.database
+        .query(
+          `UPDATE mini_named_claude_attempts SET state = 'uncertain', updated_at = ?
            WHERE state = 'active'`,
         )
         .run(now);
@@ -4879,6 +5289,41 @@ export class MiniLilacSqliteStore {
       for (const owner of owners) {
         this.pruneMiniMainClaudeAttempts(owner.session_id, owner.provider_id);
       }
+      const namedOwners = z
+        .array(z.object({ session_id: z.string(), provider_id: z.string() }))
+        .parse(
+          this.database
+            .query(
+              `SELECT DISTINCT session_id, provider_id FROM mini_named_claude_attempts
+               ORDER BY session_id, provider_id`,
+            )
+            .all(),
+        );
+      for (const owner of namedOwners) {
+        this.pruneMiniNamedClaudeAttempts(owner.session_id, owner.provider_id);
+      }
+      for (const attempt of interruptedAttempts) {
+        logger.debug("mini_claude.attempt_recovered", {
+          requestId: attempt.request_id,
+          sessionId: attempt.session_id,
+          providerId: attempt.provider_id,
+          requestClient: attempt.request_client,
+          owner: attempt.product,
+          mode: "recovery",
+          outcome: "uncertain",
+          reason: "runtime-restart",
+          bindingHead: attempt.source_history_state_id,
+          bindingRevision: attempt.expected_binding_revision,
+          model: attempt.model,
+          reasoning: attempt.reasoning,
+        });
+      }
+      const diagnostics = this.getMiniClaudeRetentionDiagnostics();
+      if (diagnostics.orphanBindingCount > 0 || diagnostics.orphanAttemptCount > 0) {
+        logger.warn("mini_claude.retention_orphans_detected", diagnostics);
+      } else {
+        logger.debug("mini_claude.retention_diagnostics", diagnostics);
+      }
     });
   }
 
@@ -4894,6 +5339,10 @@ export class MiniLilacSqliteStore {
       input.claudeBindingPromotion === undefined
         ? null
         : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
+    const requestedNamedPromotion =
+      input.namedClaudeBindingPromotion === undefined
+        ? null
+        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
     return this.runImmediateTransaction(() => {
       const pending = this.getPendingRunFinalization(input.runId);
       if (pending === null)
@@ -4912,9 +5361,25 @@ export class MiniLilacSqliteStore {
       ) {
         throw new Error("Pending finalization Claude promotion metadata changed before commit");
       }
+      if (
+        requestedNamedPromotion !== null &&
+        pending.namedClaudeBindingPromotion !== null &&
+        !canonicalValuesEqual(requestedNamedPromotion, pending.namedClaudeBindingPromotion)
+      ) {
+        throw new Error(
+          "Pending finalization named Claude promotion metadata changed before commit",
+        );
+      }
       const providerState = requestedProviderState ?? pending.providerState;
       const promotion = requestedPromotion ?? pending.claudeBindingPromotion;
-      if (promotion !== null && providerState?.lastFamily !== "claude-code") {
+      const namedPromotion = requestedNamedPromotion ?? pending.namedClaudeBindingPromotion;
+      if (promotion !== null && namedPromotion !== null) {
+        throw new Error("A run cannot promote both main and named Claude bindings");
+      }
+      if (
+        (promotion !== null || namedPromotion !== null) &&
+        providerState?.lastFamily !== "claude-code"
+      ) {
         throw new Error("A Claude binding promotion requires Claude provider-state metadata");
       }
       this.assertWorkspaceHistoryAvailableForOwner(pending.workspaceId, pending.sessionId, {
@@ -4976,16 +5441,25 @@ export class MiniLilacSqliteStore {
         throw new Error(`Run '${pending.runId}' is not active for session '${pending.sessionId}'`);
       }
       const bindingPromotion =
-        promotion === null
-          ? "not-requested"
-          : this.promoteMiniMainClaudeBinding(
+        promotion !== null
+          ? this.promoteMiniMainClaudeBinding(
+              pending,
+              this.getRootPromptSourceStateId(pending),
+              destination.id,
+              promotion,
+            )
+            ? "promoted"
+            : "cas-failed"
+          : namedPromotion !== null
+            ? this.promoteMiniNamedClaudeBinding(
                 pending,
                 this.getRootPromptSourceStateId(pending),
                 destination.id,
-                promotion,
+                namedPromotion,
               )
-            ? "promoted"
-            : "cas-failed";
+              ? "promoted"
+              : "cas-failed"
+            : "not-requested";
       this.deletePendingRunFinalizationRow(pending.runId);
       return {
         pending,
@@ -5100,6 +5574,119 @@ export class MiniLilacSqliteStore {
     return inserted.changes === 1;
   }
 
+  private promoteMiniNamedClaudeBinding(
+    pending: PendingStoredRunFinalization,
+    sourceHistoryStateId: string,
+    destinationHistoryStateId: string,
+    promotion: PromoteMiniNamedClaudeSessionBinding,
+  ): boolean {
+    if (
+      pending.runStatus !== "completed" ||
+      !miniNamedSessionIdSchema.safeParse(pending.sessionId).success ||
+      this.getRun(pending.runId).depth === 0
+    ) {
+      return false;
+    }
+    const attempt = this.getMiniNamedClaudeSessionAttempt({
+      providerId: promotion.providerId,
+      lilacSessionId: pending.sessionId,
+      requestId: promotion.requestId,
+      attemptIndex: promotion.attemptIndex,
+    });
+    if (
+      attempt === null ||
+      attempt.state !== "succeeded" ||
+      attempt.requestId !== pending.runId ||
+      attempt.sourceHistoryStateId !== sourceHistoryStateId ||
+      attempt.sourceCanonicalMessageCount !==
+        this.getHistoryStateCanonicalMessageCount(sourceHistoryStateId)
+    ) {
+      return false;
+    }
+    const destinationMessages = this.getHistoryStateModelMessages(destinationHistoryStateId);
+    if (
+      destinationMessages.length !== promotion.canonicalMessageCount ||
+      hashCanonicalMessagesV1(destinationMessages).hash !== promotion.canonicalHeadHash
+    ) {
+      return false;
+    }
+    const current = this.getMiniNamedClaudeState({
+      sessionId: pending.sessionId,
+      providerId: promotion.providerId,
+    }).binding;
+    if (
+      (attempt.expectedBindingRevision === null && current !== null) ||
+      (attempt.expectedBindingRevision !== null &&
+        (current === null || current.revision !== attempt.expectedBindingRevision))
+    ) {
+      return false;
+    }
+    if (
+      attempt.sourceSessionId !== null &&
+      (current === null ||
+        current.historyStateId !== sourceHistoryStateId ||
+        current.claudeSessionId !== attempt.sourceSessionId ||
+        current.requestClient !== attempt.requestClient ||
+        current.executionScopeHashVersion !== attempt.executionScopeHashVersion ||
+        current.executionScopeHash !== attempt.executionScopeHash)
+    ) {
+      return false;
+    }
+    const revision = (attempt.expectedBindingRevision ?? 0) + 1;
+    if (!Number.isSafeInteger(revision)) return false;
+    const values = [
+      destinationHistoryStateId,
+      attempt.requestClient,
+      promotion.canonicalMessageCount,
+      attempt.executionScopeHashVersion,
+      attempt.executionScopeHash,
+      attempt.candidateSessionId,
+      promotion.nativeCwd,
+      promotion.nativeLastModified,
+      promotion.nativeContextTokens,
+      promotion.nativeContextMaxTokens,
+      promotion.lastModelSpecifier,
+      promotion.lastReasoning,
+      revision,
+      new Date().toISOString(),
+    ] as const;
+    if (current === null) {
+      return (
+        this.database
+          .query(
+            `INSERT INTO mini_named_claude_bindings
+              (session_id, history_state_id, provider_id, binding_protocol_version, provider_family,
+               request_client, canonical_message_count, execution_scope_hash_version,
+               execution_scope_hash, claude_session_id, native_cwd, native_last_modified,
+               native_context_tokens, native_context_max_tokens, last_model_specifier,
+               last_reasoning, revision, updated_at)
+             VALUES (?, ?, ?, 1, 'claude-code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id, provider_id) DO NOTHING`,
+          )
+          .run(
+            pending.sessionId,
+            destinationHistoryStateId,
+            promotion.providerId,
+            ...values.slice(1),
+          ).changes === 1
+      );
+    }
+    return (
+      this.database
+        .query(
+          `UPDATE mini_named_claude_bindings
+           SET history_state_id = ?, request_client = ?, canonical_message_count = ?,
+               execution_scope_hash_version = ?, execution_scope_hash = ?, claude_session_id = ?,
+               native_cwd = ?, native_last_modified = ?, native_context_tokens = ?,
+               native_context_max_tokens = ?, last_model_specifier = ?, last_reasoning = ?,
+               revision = ?, updated_at = ?
+           WHERE session_id = ? AND provider_id = ? AND revision = ?`,
+        )
+        .run(...values, pending.sessionId, promotion.providerId, attempt.expectedBindingRevision)
+        .changes === 1
+    );
+  }
+
   private getRootPromptSourceStateId(pending: PendingStoredRunFinalization): string {
     const row = z.object({ from_state_id: z.string().min(1) }).parse(
       this.database
@@ -5116,17 +5703,61 @@ export class MiniLilacSqliteStore {
   }
 
   private pruneMiniMainClaudeAttempts(sessionId: string, providerId: string): void {
-    this.database
+    const pruned = this.database
       .query(
         `DELETE FROM mini_main_claude_attempts
          WHERE session_id = ? AND provider_id = ? AND state <> 'active' AND id NOT IN (
            SELECT id FROM mini_main_claude_attempts
-           WHERE session_id = ? AND provider_id = ?
-           ORDER BY CASE WHEN state = 'active' THEN 0 ELSE 1 END, updated_at DESC, id DESC
+           WHERE session_id = ? AND provider_id = ? AND state <> 'active'
+           ORDER BY updated_at DESC, id DESC
            LIMIT ?
          )`,
       )
-      .run(sessionId, providerId, sessionId, providerId, MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT);
+      .run(
+        sessionId,
+        providerId,
+        sessionId,
+        providerId,
+        MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT,
+      ).changes;
+    if (pruned > 0) {
+      logger.info("mini_claude.orphan_metadata_pruned", {
+        sessionId,
+        providerId,
+        owner: "main",
+        attemptCount: pruned,
+        reason: "terminal-count-bound",
+      });
+    }
+  }
+
+  private pruneMiniNamedClaudeAttempts(sessionId: string, providerId: string): void {
+    const pruned = this.database
+      .query(
+        `DELETE FROM mini_named_claude_attempts
+         WHERE session_id = ? AND provider_id = ? AND state <> 'active' AND id NOT IN (
+           SELECT id FROM mini_named_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND state <> 'active'
+           ORDER BY updated_at DESC, id DESC
+           LIMIT ?
+         )`,
+      )
+      .run(
+        sessionId,
+        providerId,
+        sessionId,
+        providerId,
+        MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT,
+      ).changes;
+    if (pruned > 0) {
+      logger.info("mini_claude.orphan_metadata_pruned", {
+        sessionId,
+        providerId,
+        owner: "named",
+        attemptCount: pruned,
+        reason: "terminal-count-bound",
+      });
+    }
   }
 
   private requireQuiescentHistorySession(

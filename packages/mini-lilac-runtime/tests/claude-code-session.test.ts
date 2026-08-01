@@ -59,6 +59,40 @@ function textResult(id: string, text: string) {
   };
 }
 
+function delegateResult(
+  prompt: string,
+  overrides: {
+    readonly model?: string;
+    readonly effort?: string;
+    readonly sessionName?: string | null;
+  } = {},
+) {
+  const { sessionName = "research", ...bindings } = overrides;
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        {
+          type: "tool-call" as const,
+          toolCallId: `delegate-${prompt}`,
+          toolName: "subagent_delegate",
+          input: JSON.stringify({
+            profile: "child",
+            prompt,
+            mode: "sync",
+            ...(sessionName === null ? {} : { sessionName }),
+            ...bindings,
+          }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 /**
  * A Claude built-in: the model reports the call and its result inline, and the
  * MCP bridge never sees it, so no Lilac execution events are emitted.
@@ -201,6 +235,22 @@ function config(profileTools: readonly string[] = ["read_file", "websearch"]): R
           description: "Read-only main agent",
           subagentOnly: false,
           tools: [...profileTools],
+          execution: false,
+          workspaceWrites: false,
+          delegation: false,
+        },
+        delegate: {
+          description: "Delegating main agent",
+          subagentOnly: false,
+          tools: ["subagent_delegate"],
+          execution: false,
+          workspaceWrites: false,
+          delegation: true,
+        },
+        child: {
+          description: "Named child",
+          subagentOnly: true,
+          tools: ["read_file"],
           execution: false,
           workspaceWrites: false,
           delegation: false,
@@ -429,6 +479,34 @@ async function temporaryRuntime(options: {
   return { directory, service, session };
 }
 
+async function temporaryNamedRuntime(options: {
+  rootModel: LanguageModel;
+  claudeModel: LanguageModel;
+  calls?: MaterializeCall[];
+  runs?: FakeClaudeRun[];
+}) {
+  const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-named-claude-"));
+  temporaryDirectories.push(directory);
+  const service = new SessionService({
+    config: config(),
+    databasePath: path.join(directory, "runtime.sqlite"),
+    providers: hybridProviders(),
+    modelResolver: () => options.rootModel,
+    materializeClaudeCodeRun: fakeClaudeCode({
+      agentModel: options.claudeModel,
+      calls: options.calls,
+      runs: options.runs,
+    }),
+  });
+  const session = await service.createSession({
+    cwd: directory,
+    model: "openai/gpt-5",
+    profile: "delegate",
+    reasoning: "high",
+  });
+  return { directory, service, session };
+}
+
 async function collect(stream: ReadableStream<MiniLilacRuntimeChunk>) {
   const values: MiniLilacRuntimeChunk[] = [];
   for await (const value of stream) values.push(value);
@@ -536,6 +614,357 @@ describe("claude-code sessions", () => {
       mode: "fork",
       baseSessionId: firstBinding.claudeSessionId,
     });
+    service.close();
+  });
+
+  it("continues one current named-child binding across parent undo, overrides, and restart", async () => {
+    const rootModel = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("first", { model: "claude/claude-sonnet-4-6", effort: "high" }),
+        textResult("root-1", "first done"),
+        delegateResult("second", { model: "claude/claude-opus-4-1", effort: "low" }),
+        textResult("root-2", "second done"),
+      ],
+    });
+    const calls: MaterializeCall[] = [];
+    const first = await temporaryNamedRuntime({
+      rootModel,
+      claudeModel: new MockLanguageModelV4({
+        doStream: [textResult("child-1", "first child"), textResult("child-2", "second child")],
+      }),
+      calls,
+    });
+    await collect(
+      (await first.service.startPrompt(first.session.id, userMessage("first root"))).stream,
+    );
+    const childSessionId = `sub:${first.session.id}:named:research`;
+    const firstBinding = first.service.store.getMiniNamedClaudeState({
+      sessionId: childSessionId,
+      providerId: "claude",
+    }).binding;
+    if (firstBinding === null) throw new Error("expected first named Claude binding");
+
+    await first.service.undo({
+      sessionId: first.session.id,
+      clientCommandId: crypto.randomUUID(),
+    });
+    expect(
+      first.service.store.getMiniNamedClaudeState({
+        sessionId: childSessionId,
+        providerId: "claude",
+      }).binding?.claudeSessionId,
+    ).toBe(firstBinding.claudeSessionId);
+    await collect(
+      (await first.service.startPrompt(first.session.id, userMessage("branch after undo"))).stream,
+    );
+    const secondBinding = first.service.store.getMiniNamedClaudeState({
+      sessionId: childSessionId,
+      providerId: "claude",
+    }).binding;
+    if (secondBinding === null) throw new Error("expected second named Claude binding");
+    expect(calls.map((call) => call.nativeSession)).toEqual([
+      { mode: "fresh", sessionId: firstBinding.claudeSessionId },
+      {
+        mode: "fork",
+        baseSessionId: firstBinding.claudeSessionId,
+        sessionId: secondBinding.claudeSessionId,
+        expectedSourceLastModified: firstBinding.nativeLastModified,
+      },
+    ]);
+    expect(calls[1]).toMatchObject({ modelId: "claude-opus-4-1", reasoning: "low" });
+    expect(secondBinding.revision).toBe(2);
+    expect(
+      first.service.store.database
+        .query("SELECT COUNT(*) AS count FROM mini_named_claude_bindings WHERE session_id = ?")
+        .get(childSessionId),
+    ).toEqual({ count: 1 });
+    first.service.close();
+
+    const resumedCalls: MaterializeCall[] = [];
+    const resumed = new SessionService({
+      config: config(),
+      databasePath: path.join(first.directory, "runtime.sqlite"),
+      providers: hybridProviders(),
+      modelResolver: () =>
+        new MockLanguageModelV4({
+          doStream: [delegateResult("third"), textResult("root-3", "third done")],
+        }),
+      materializeClaudeCodeRun: fakeClaudeCode({
+        agentModel: new MockLanguageModelV4({ doStream: [textResult("child-3", "third child")] }),
+        calls: resumedCalls,
+      }),
+    });
+    await resumed.initialize();
+    await collect(
+      (await resumed.startPrompt(first.session.id, userMessage("after restart"))).stream,
+    );
+    expect(resumedCalls[0]?.nativeSession).toMatchObject({
+      mode: "fork",
+      baseSessionId: secondBinding.claudeSessionId,
+    });
+    resumed.close();
+  });
+
+  it("starts named children fresh with text replay across provider boundaries", async () => {
+    const childApiModel = new MockLanguageModelV4({
+      doStream: [
+        textResult("api-child", "ordinary child answer"),
+        textResult("api-child-again", "ordinary child again"),
+      ],
+    });
+    const rootModel = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("ordinary", { model: "openai/child" }),
+        textResult("root-1", "ordinary done"),
+        delegateResult("claude", { model: "claude/claude-sonnet-4-6" }),
+        textResult("root-2", "claude done"),
+        delegateResult("ordinary-again", { model: "openai/child" }),
+        textResult("root-3", "ordinary again done"),
+      ],
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-named-boundary-"));
+    temporaryDirectories.push(directory);
+    const calls: MaterializeCall[] = [];
+    const claudeModel = new MockLanguageModelV4({
+      doStream: [textResult("claude-child", "claude child answer")],
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers: hybridProviders(),
+      modelResolver: (specifier) => (specifier === "openai/child" ? childApiModel : rootModel),
+      materializeClaudeCodeRun: fakeClaudeCode({ agentModel: claudeModel, calls }),
+    });
+    const session = await service.createSession({
+      cwd: directory,
+      model: "openai/gpt-5",
+      profile: "delegate",
+      reasoning: "high",
+    });
+    await collect((await service.startPrompt(session.id, userMessage("ordinary root"))).stream);
+    await collect((await service.startPrompt(session.id, userMessage("claude root"))).stream);
+
+    const childSessionId = `sub:${session.id}:named:research`;
+    expect(calls[0]?.nativeSession?.mode).toBe("fresh");
+    expect(service.store.getCurrentHistoryState(childSessionId).providerState).toEqual({
+      lastFamily: "claude-code",
+      containsCrossFamilyTurns: true,
+    });
+    const payload = claudeModel.doStreamCalls[0]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    expect(JSON.stringify(payload)).toContain("ordinary");
+    expect(JSON.stringify(payload)).toContain("ordinary child answer");
+    expect(JSON.stringify(payload)).toContain("claude");
+    expect(
+      payload?.every(
+        (message) =>
+          typeof message.content === "string" ||
+          message.content.every((part) => part.type === "text"),
+      ),
+    ).toBe(true);
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("ordinary again root"))).stream,
+    );
+    const returnPayload = childApiModel.doStreamCalls[1]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    expect(JSON.stringify(returnPayload)).toContain("claude child answer");
+    expect(
+      returnPayload?.every(
+        (message) =>
+          typeof message.content === "string" ||
+          message.content.every((part) => part.type === "text"),
+      ),
+    ).toBe(true);
+    expect(service.store.getCurrentHistoryState(childSessionId).providerState).toEqual({
+      lastFamily: "ai-sdk",
+      containsCrossFamilyTurns: true,
+    });
+    service.close();
+  });
+
+  it("does not replace a named child's clean binding after child failure", async () => {
+    let childCall = 0;
+    const rootModel = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("first", { model: "claude/claude-sonnet-4-6" }),
+        textResult("root-1", "first done"),
+        delegateResult("failing"),
+        textResult("root-2", "failure handled"),
+      ],
+    });
+    const { service, session } = await temporaryNamedRuntime({
+      rootModel,
+      claudeModel: new MockLanguageModelV4({
+        doStream: async () => {
+          childCall += 1;
+          if (childCall === 1) return textResult("child-1", "clean child");
+          throw new Error("child failed");
+        },
+      }),
+    });
+    await collect((await service.startPrompt(session.id, userMessage("first"))).stream);
+    const childSessionId = `sub:${session.id}:named:research`;
+    const cleanBinding = service.store.getMiniNamedClaudeState({
+      sessionId: childSessionId,
+      providerId: "claude",
+    }).binding;
+    if (cleanBinding === null) throw new Error("expected clean named binding");
+
+    await collect((await service.startPrompt(session.id, userMessage("fail child"))).stream);
+    expect(
+      service.store.getMiniNamedClaudeState({
+        sessionId: childSessionId,
+        providerId: "claude",
+      }).binding,
+    ).toEqual(cleanBinding);
+    expect(service.store.getLatestSelectedRootRun(childSessionId)?.status).toBe("error");
+    service.close();
+  });
+
+  it("does not replace a named child's clean binding after cancellation", async () => {
+    const childEntered = Promise.withResolvers<void>();
+    let childCall = 0;
+    const rootModel = new MockLanguageModelV4({
+      doStream: [
+        delegateResult("first", { model: "claude/claude-sonnet-4-6" }),
+        textResult("root-1", "first done"),
+        delegateResult("cancelled"),
+      ],
+    });
+    const { service, session } = await temporaryNamedRuntime({
+      rootModel,
+      claudeModel: new MockLanguageModelV4({
+        doStream: async ({ abortSignal }) => {
+          childCall += 1;
+          if (childCall === 1) return textResult("child-1", "clean child");
+          return {
+            stream: new ReadableStream({
+              start(controller) {
+                childEntered.resolve();
+                const abort = () => controller.error(new DOMException("cancelled", "AbortError"));
+                if (abortSignal?.aborted) abort();
+                else abortSignal?.addEventListener("abort", abort, { once: true });
+              },
+            }),
+          };
+        },
+      }),
+    });
+    await collect((await service.startPrompt(session.id, userMessage("first"))).stream);
+    const childSessionId = `sub:${session.id}:named:research`;
+    const cleanBinding = service.store.getMiniNamedClaudeState({
+      sessionId: childSessionId,
+      providerId: "claude",
+    }).binding;
+    if (cleanBinding === null) throw new Error("expected clean named binding");
+
+    const started = await service.startPrompt(session.id, userMessage("cancel child"));
+    const completion = collect(started.stream);
+    await childEntered.promise;
+    await service.cancel({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: crypto.randomUUID(),
+    });
+    await completion;
+    expect(
+      service.store.getMiniNamedClaudeState({
+        sessionId: childSessionId,
+        providerId: "claude",
+      }).binding,
+    ).toEqual(cleanBinding);
+    expect(service.store.getLatestSelectedRootRun(childSessionId)?.status).toBe("cancelled");
+    service.close();
+  });
+
+  it("persists a generated delegated Claude session and forks when its returned name is reused", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-unnamed-claude-"));
+    temporaryDirectories.push(directory);
+    let generatedSessionName: string | undefined;
+    let rootCall = 0;
+    const rootModel = new MockLanguageModelV4({
+      doStream: async () => {
+        rootCall += 1;
+        if (rootCall === 1) {
+          return delegateResult("first", {
+            model: "claude/claude-sonnet-4-6",
+            sessionName: null,
+          });
+        }
+        if (rootCall === 2) return textResult("root-1", "first done");
+        if (rootCall === 3) {
+          if (generatedSessionName === undefined)
+            throw new Error("expected generated session name");
+          return delegateResult("second", {
+            model: "claude/claude-sonnet-4-6",
+            sessionName: generatedSessionName,
+          });
+        }
+        return textResult("root-2", "second done");
+      },
+    });
+    const childModel = new MockLanguageModelV4({
+      doStream: [textResult("child-1", "first answer"), textResult("child-2", "second answer")],
+    });
+    const calls: MaterializeCall[] = [];
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers: hybridProviders(),
+      modelResolver: () => rootModel,
+      materializeClaudeCodeRun: fakeClaudeCode({ agentModel: childModel, calls }),
+    });
+    const session = await service.createSession({
+      cwd: directory,
+      model: "openai/gpt-5",
+      profile: "delegate",
+      reasoning: "high",
+    });
+    const firstChunks = await collect(
+      (await service.startPrompt(session.id, userMessage("delegate first"))).stream,
+    );
+
+    const childPrefix = `sub:${session.id}:named:`;
+    const child = service.store
+      .listSessions()
+      .find((candidate) => candidate.id.startsWith(childPrefix));
+    if (child === undefined) throw new Error("expected generated child session");
+    generatedSessionName = child.id.slice(childPrefix.length);
+    expect(generatedSessionName).toMatch(/^child-[0-9a-f]{8}$/u);
+    expect(JSON.stringify(firstChunks)).toContain(`"sessionName":"${generatedSessionName}"`);
+    const firstBinding = service.store.getMiniNamedClaudeState({
+      sessionId: child.id,
+      providerId: "claude",
+    }).binding;
+    if (firstBinding === null) throw new Error("expected generated child binding");
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("reuse returned name"))).stream,
+    );
+
+    const secondBinding = service.store.getMiniNamedClaudeState({
+      sessionId: child.id,
+      providerId: "claude",
+    }).binding;
+    if (secondBinding === null) throw new Error("expected continued generated child binding");
+    expect(calls.map((call) => call.nativeSession)).toEqual([
+      { mode: "fresh", sessionId: firstBinding.claudeSessionId },
+      {
+        mode: "fork",
+        baseSessionId: firstBinding.claudeSessionId,
+        sessionId: secondBinding.claudeSessionId,
+        expectedSourceLastModified: firstBinding.nativeLastModified,
+      },
+    ]);
+    const suffix = childModel.doStreamCalls[1]?.prompt.filter(
+      (message) => message.role !== "system",
+    );
+    expect(suffix).toHaveLength(1);
+    expect(JSON.stringify(suffix)).toContain("second");
+    expect(JSON.stringify(suffix)).not.toContain("first");
     service.close();
   });
 
