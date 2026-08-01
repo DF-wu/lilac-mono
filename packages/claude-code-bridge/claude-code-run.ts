@@ -6,7 +6,10 @@ import {
   getSessionInfo,
   type ClaudeCodeSettings,
   type MessageInjector,
+  type SpawnedProcess,
+  type SpawnOptions,
 } from "ai-sdk-provider-claude-code";
+import { spawn } from "node:child_process";
 import { z } from "zod";
 
 import {
@@ -20,6 +23,9 @@ import {
 const MAX_CALLBACK_ERROR_CHARS = 2_000;
 const MAX_PROVIDER_WARNINGS = 32;
 const MAX_PROVIDER_WARNING_CHARS = 1_000;
+// Agent SDK cleanup waits 2s before SIGTERM and schedules SIGKILL 5s later.
+// This outer bound leaves 3s for the OS exit event; expiry fails promotion closed.
+const PROCESS_EXIT_PROOF_TIMEOUT_MS = 10_000;
 
 const uuidSchema = z.uuid();
 const nativeSessionStartSchema = z.discriminatedUnion("mode", [
@@ -71,6 +77,11 @@ const sessionInfoSchema = z.object({
 });
 
 type CreateClaudeCodeModel = (modelId: string, settings: ClaudeCodeSettings) => LanguageModel;
+type SpawnClaudeCodeProcess = NonNullable<ClaudeCodeSettings["spawnClaudeCodeProcess"]>;
+
+type TrackedClaudeProcess = {
+  readonly waitForExit: () => Promise<void>;
+};
 
 export type ClaudeNativeSessionStart =
   | {
@@ -201,6 +212,8 @@ export type MaterializedClaudeCodeRun = {
 export type ClaudeNativeQueryController = {
   getContextUsage(): Promise<unknown>;
   interrupt(): Promise<void>;
+  /** End the query and prove its tracked subprocess emitted `exit`. */
+  settle(): Promise<void>;
 };
 
 export type ClaudeNativeSessionInfoReader = (
@@ -217,6 +230,65 @@ type SessionReadResult =
 function boundedText(value: unknown, maxChars: number): string {
   const text = value instanceof Error ? value.message : String(value);
   return text.length <= maxChars ? text : `${text.slice(0, maxChars - 3)}...`;
+}
+
+function invokeAsync<T>(callback: () => T | PromiseLike<T>): Promise<T> {
+  return Promise.resolve().then(callback);
+}
+
+function spawnLocalClaudeCodeProcess(options: SpawnOptions): SpawnedProcess {
+  return spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env,
+    signal: options.signal,
+    stdio: ["pipe", "pipe", "ignore"],
+    windowsHide: true,
+  });
+}
+
+function waitForProcessExitProof(exit: Promise<void>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(`Claude process exit was not observed within ${PROCESS_EXIT_PROOF_TIMEOUT_MS}ms`),
+      );
+    }, PROCESS_EXIT_PROOF_TIMEOUT_MS);
+    timer.unref();
+    exit.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function settleQueryAndProcess(input: {
+  readonly settleQuery: () => Promise<void>;
+  readonly process: TrackedClaudeProcess | undefined;
+}): Promise<void> {
+  const errors: unknown[] = [];
+  try {
+    await input.settleQuery();
+  } catch (error) {
+    errors.push(error);
+  }
+  if (input.process === undefined) {
+    errors.push(new Error("Claude query has no tracked subprocess exit proof"));
+  } else {
+    try {
+      await input.process.waitForExit();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Claude query settlement could not prove subprocess exit");
+  }
 }
 
 function nativeSettings(
@@ -294,6 +366,8 @@ export async function materializeClaudeCodeRun(options: {
   createModel?: CreateClaudeCodeModel;
   getSessionInfo?: ClaudeNativeSessionInfoReader;
   controller?: ClaudeNativeQueryController;
+  spawnClaudeCodeProcess?: SpawnClaudeCodeProcess;
+  waitForProcessExit?: (exit: Promise<void>) => Promise<void>;
   onSdkMessage?: (message: unknown) => void | PromiseLike<void>;
 }): Promise<MaterializedClaudeCodeRun> {
   const start = nativeSessionStartSchema.parse(options.nativeSession ?? { mode: "ephemeral" });
@@ -357,8 +431,14 @@ export async function materializeClaudeCodeRun(options: {
   const initSessionIds = new Set<string>();
   const resultSessionIds = new Set<string>();
   const pendingObservabilityCallbacks = new Set<Promise<void>>();
+  const injectors = new Set<MessageInjector>();
+  const queryControllers = new Set<ClaudeNativeQueryController>();
+  const settledQueryControllers = new Set<ClaudeNativeQueryController>();
+  const trackedProcesses: TrackedClaudeProcess[] = [];
+  const unclaimedProcesses: TrackedClaudeProcess[] = [];
   let injector: MessageInjector | null = null;
   let controller: ClaudeNativeQueryController | null = options.controller ?? null;
+  if (controller) queryControllers.add(controller);
   let initSessionId: string | null = null;
   let resultSessionId: string | null = null;
   let latestInitSessionId: string | null = null;
@@ -378,6 +458,7 @@ export async function materializeClaudeCodeRun(options: {
   let pendingContextCapture: Promise<void> | null = null;
   let invoked = controller !== null;
   let disposed = false;
+  let acceptingProcesses = true;
   let disposalPromise: Promise<void> | null = null;
   let finalizationPromise: Promise<ClaudeNativeSessionFinalization> | null = null;
 
@@ -545,6 +626,50 @@ export async function materializeClaudeCodeRun(options: {
     };
   };
 
+  const spawnTrackedProcess: SpawnClaudeCodeProcess = (spawnOptions) => {
+    if (!acceptingProcesses) {
+      throw new Error("Cannot spawn a Claude process after run disposal started");
+    }
+    const spawned = (options.spawnClaudeCodeProcess ?? spawnLocalClaudeCodeProcess)(spawnOptions);
+    const exited = Promise.withResolvers<void>();
+    const process = {
+      waitForExit: (() => {
+        let proof: Promise<void> | null = null;
+        return () => {
+          proof ??= invokeAsync(() =>
+            (options.waitForProcessExit ?? waitForProcessExitProof)(exited.promise),
+          );
+          return proof;
+        };
+      })(),
+    } satisfies TrackedClaudeProcess;
+    spawned.once("exit", () => exited.resolve());
+    if (spawned.exitCode !== null) exited.resolve();
+    trackedProcesses.push(process);
+    unclaimedProcesses.push(process);
+    return spawned;
+  };
+
+  const drainQueryControllers = async (): Promise<void> => {
+    const errors: unknown[] = [];
+    for (;;) {
+      const batch = [...queryControllers].filter(
+        (queryController) => !settledQueryControllers.has(queryController),
+      );
+      if (batch.length === 0) break;
+      batch.forEach((queryController) => settledQueryControllers.add(queryController));
+      const settlements = await Promise.allSettled(
+        batch.map((queryController) => invokeAsync(() => queryController.settle())),
+      );
+      for (const settlement of settlements) {
+        if (settlement.status === "rejected") errors.push(settlement.reason);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "One or more Claude queries failed to settle");
+    }
+  };
+
   const control: ClaudeCodeRunControl = {
     inject(message, onResult) {
       if (disposed || !injector) return false;
@@ -563,20 +688,81 @@ export async function materializeClaudeCodeRun(options: {
       }
     },
     clear() {
-      injector?.close();
+      const errors: unknown[] = [];
+      for (const activeInjector of injectors) {
+        try {
+          activeInjector.close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      injectors.clear();
       injector = null;
       controller = null;
-      bridge.clear();
+      try {
+        bridge.clear();
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(errors, "Claude run controls could not be cleared cleanly");
+      }
     },
   };
 
   const dispose = (): Promise<void> => {
     if (disposalPromise) return disposalPromise;
     disposed = true;
+    acceptingProcesses = false;
     disposalPromise = (async () => {
-      await waitForObservability();
-      control.clear();
-      await bridge.close();
+      const errors: unknown[] = [];
+      const collectQueryDrain = async () => {
+        try {
+          await drainQueryControllers();
+        } catch (error) {
+          errors.push(error);
+        }
+      };
+      const collectExitProofs = async () => {
+        const exitProofs = await Promise.allSettled(
+          trackedProcesses.map((process) => invokeAsync(() => process.waitForExit())),
+        );
+        for (const exitProof of exitProofs) {
+          if (exitProof.status === "rejected") errors.push(exitProof.reason);
+        }
+      };
+      try {
+        await waitForObservability();
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        control.clear();
+      } catch (error) {
+        errors.push(error);
+      }
+      // The spawn gate is now closed. Re-drain after every awaited phase so a
+      // controller registered by an already-spawned query joins this disposal.
+      await collectQueryDrain();
+      await collectExitProofs();
+      await collectQueryDrain();
+      try {
+        await bridge.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      await collectQueryDrain();
+      if (unclaimedProcesses.length > 0) {
+        errors.push(
+          new Error(
+            `${unclaimedProcesses.length} Claude subprocess(es) exited without query-controller registration`,
+          ),
+        );
+      }
+      queryControllers.clear();
+      if (errors.length > 0) {
+        throw new AggregateError(errors, "Claude run disposal could not prove clean settlement");
+      }
     })();
     return disposalPromise;
   };
@@ -647,6 +833,11 @@ export async function materializeClaudeCodeRun(options: {
             message: requiredObservabilityError,
           });
         }
+
+        // The provider closes its AI SDK output stream at the result message while
+        // Agent SDK query cleanup may still append to the persisted transcript.
+        // Disposal combines Query.return() with the tracked child's actual exit.
+        await dispose();
 
         const reads = await Promise.all([
           readSessionInfo(readInfo, start.sessionId, options.cwd),
@@ -725,6 +916,7 @@ export async function materializeClaudeCodeRun(options: {
       settingSources: [],
       mcpServers: bridge.mcpServers,
       canUseTool: bridge.canUseTool,
+      spawnClaudeCodeProcess: spawnTrackedProcess,
       streamingInput: "always",
       hooks: { Stop: [{ hooks: [stopHook] }] },
       onSdkMessage: observeSdkMessage,
@@ -734,11 +926,26 @@ export async function materializeClaudeCodeRun(options: {
           nextInjector.close();
           return;
         }
+        injectors.add(nextInjector);
         injector = nextInjector;
       },
       onQueryControllerCreated: (nextController) => {
         invoked = true;
-        if (!disposed) controller = nextController;
+        const process = unclaimedProcesses.shift();
+        let settlement: Promise<void> | null = null;
+        const queryController: ClaudeNativeQueryController = {
+          getContextUsage: () => nextController.getContextUsage(),
+          interrupt: () => nextController.interrupt(),
+          settle: () => {
+            settlement ??= settleQueryAndProcess({
+              settleQuery: () => nextController.rawQuery.return(undefined).then(() => undefined),
+              process,
+            });
+            return settlement;
+          },
+        };
+        queryControllers.add(queryController);
+        if (!disposed) controller = queryController;
       },
     } satisfies ClaudeCodeSettings;
     const agentModel = createModel(options.modelId, {

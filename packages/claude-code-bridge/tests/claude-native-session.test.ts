@@ -1,5 +1,12 @@
-import { describe, expect, it } from "bun:test";
-import { createClaudeCode, type ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
+import { describe, expect, it, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import {
+  createClaudeCode,
+  type ClaudeCodeSettings,
+  type SpawnedProcess,
+  type SpawnOptions,
+} from "ai-sdk-provider-claude-code";
 
 import {
   ClaudeNativeSessionPreflightError,
@@ -10,6 +17,23 @@ import {
 
 const SOURCE_ID = "11111111-1111-4111-8111-111111111111";
 const CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
+
+class FakeSpawnedProcess extends EventEmitter implements SpawnedProcess {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  killed = false;
+  exitCode: number | null = null;
+
+  kill(): boolean {
+    this.killed = true;
+    return true;
+  }
+
+  exit(code = 0, signal: NodeJS.Signals | null = null): void {
+    this.exitCode = code;
+    this.emit("exit", code, signal);
+  }
+}
 
 function createModelCapture(settings: ClaudeCodeSettings[]) {
   const provider = createClaudeCode();
@@ -32,6 +56,43 @@ async function runStopHook(settings: ClaudeCodeSettings): Promise<void> {
     { hook_event_name: "Stop" },
     undefined,
     { signal: new AbortController().signal },
+  ]);
+}
+
+function spawnTrackedProcess(settings: ClaudeCodeSettings, cwd: string): SpawnedProcess {
+  const spawnProcess = settings.spawnClaudeCodeProcess;
+  if (!spawnProcess) throw new Error("spawnClaudeCodeProcess was not installed");
+  const options = {
+    command: "claude",
+    args: [],
+    cwd,
+    env: {},
+    signal: new AbortController().signal,
+  } satisfies SpawnOptions;
+  return spawnProcess(options);
+}
+
+async function emitQueryController(
+  settings: ClaudeCodeSettings,
+  options: {
+    readonly getContextUsage?: () => Promise<unknown>;
+    readonly returnQuery: () => Promise<void>;
+  },
+): Promise<void> {
+  const callback = settings.onQueryControllerCreated;
+  if (!callback) throw new Error("onQueryControllerCreated was not installed");
+  await Reflect.apply(callback, undefined, [
+    {
+      rawQuery: {
+        return: async () => {
+          await options.returnQuery();
+          return { done: true, value: undefined };
+        },
+      },
+      getContextUsage:
+        options.getContextUsage ?? (async () => ({ totalTokens: 700, maxTokens: 100_000 })),
+      interrupt: async () => undefined,
+    },
   ]);
 }
 
@@ -99,6 +160,7 @@ describe("Claude native session lifecycle", () => {
           return { totalTokens: 1_250, maxTokens: 200_000 };
         },
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId, options) => {
         expect(options).toEqual({ dir: cwd });
@@ -187,6 +249,7 @@ describe("Claude native session lifecycle", () => {
         interrupt: async () => {
           interrupts += 1;
         },
+        settle: async () => undefined,
       },
       createModel: createModelCapture(settings),
     });
@@ -219,6 +282,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 5_000, maxTokens: 200_000 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId, options) => {
         reads.push(sessionId);
@@ -268,12 +332,13 @@ describe("Claude native session lifecycle", () => {
     expect(reads).toEqual([SOURCE_ID, CANDIDATE_ID, SOURCE_ID]);
   });
 
-  it("awaits pending live context capture before reading sessions and disposing", async () => {
+  it("settles the native query before taking the promotable snapshot", async () => {
     const settings: ClaudeCodeSettings[] = [];
     const cwd = process.cwd();
     const usage = Promise.withResolvers<unknown>();
     const events: string[] = [];
     let injectorClosed = false;
+    let lastModified = 30;
     const run = await materializeClaudeCodeRun({
       modelId: "sonnet",
       cwd,
@@ -288,10 +353,14 @@ describe("Claude native session lifecycle", () => {
           return usage.promise;
         },
         interrupt: async () => undefined,
+        settle: async () => {
+          events.push("query-settled");
+          lastModified = 31;
+        },
       },
       getSessionInfo: async (sessionId) => {
         events.push("session-read");
-        return { sessionId, cwd, lastModified: 30 };
+        return { sessionId, cwd, lastModified };
       },
       createModel: createModelCapture(settings),
     });
@@ -316,7 +385,377 @@ describe("Claude native session lifecycle", () => {
     usage.resolve({ totalTokens: 700, maxTokens: 100_000 });
     const finalization = await finalizationPromise;
     expect(finalization.status).toBe("promotable");
-    expect(events).toEqual(["usage-requested", "session-read", "injector-closed"]);
+    expect(finalization.candidate?.lastModified).toBe(31);
+    expect(events).toEqual(["usage-requested", "injector-closed", "query-settled", "session-read"]);
+  });
+
+  it("waits for actual process exit after timed-out Query.return cleanup resolves", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    const childProcess = new FakeSpawnedProcess();
+    const queryReturned = Promise.withResolvers<void>();
+    let metadataReads = 0;
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd,
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+      execute: () => {
+        throw new Error("not called");
+      },
+      spawnClaudeCodeProcess: () => childProcess,
+      getSessionInfo: async (sessionId) => {
+        metadataReads += 1;
+        return { sessionId, cwd, lastModified: 31 };
+      },
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    expect(spawnTrackedProcess(agentSettings, cwd)).toBe(childProcess);
+    await emitQueryController(agentSettings, {
+      returnQuery: async () => {
+        queryReturned.resolve();
+      },
+    });
+    await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+    await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+    await runStopHook(agentSettings);
+
+    const finalization = nativeSession(run).finalize();
+    await queryReturned.promise;
+    expect(metadataReads).toBe(0);
+
+    childProcess.exit();
+    await expect(finalization).resolves.toMatchObject({ status: "promotable" });
+    expect(metadataReads).toBe(1);
+  });
+
+  it("fails closed without process exit proof and never reads native metadata", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    const childProcess = new FakeSpawnedProcess();
+    let metadataReads = 0;
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd,
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+      execute: () => {
+        throw new Error("not called");
+      },
+      spawnClaudeCodeProcess: () => childProcess,
+      waitForProcessExit: async () => {
+        throw new Error("test exit proof unavailable");
+      },
+      getSessionInfo: async (sessionId) => {
+        metadataReads += 1;
+        return { sessionId, cwd, lastModified: 31 };
+      },
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    spawnTrackedProcess(agentSettings, cwd);
+    await emitQueryController(agentSettings, { returnQuery: async () => undefined });
+    await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+    await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+    await runStopHook(agentSettings);
+
+    await expect(nativeSession(run).finalize()).rejects.toThrow(
+      "Claude run disposal could not prove clean settlement",
+    );
+    expect(metadataReads).toBe(0);
+  });
+
+  it("drains a query controller registered while disposal is settling", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    const firstProcess = new FakeSpawnedProcess();
+    const secondProcess = new FakeSpawnedProcess();
+    const processes = [firstProcess, secondProcess];
+    const events: string[] = [];
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd,
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+      execute: () => {
+        throw new Error("not called");
+      },
+      spawnClaudeCodeProcess: () => {
+        const process = processes.shift();
+        if (!process) throw new Error("unexpected process spawn");
+        return process;
+      },
+      getSessionInfo: async (sessionId) => {
+        events.push("metadata-read");
+        return { sessionId, cwd, lastModified: 31 };
+      },
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    spawnTrackedProcess(agentSettings, cwd);
+    spawnTrackedProcess(agentSettings, cwd);
+    await emitQueryController(agentSettings, {
+      returnQuery: async () => {
+        events.push("first-query-returned");
+        await emitQueryController(agentSettings, {
+          returnQuery: async () => {
+            events.push("late-query-returned");
+            secondProcess.exit();
+          },
+        });
+        firstProcess.exit();
+      },
+    });
+    await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+    await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+    await runStopHook(agentSettings);
+
+    await expect(nativeSession(run).finalize()).resolves.toMatchObject({ status: "promotable" });
+    expect(events).toEqual(["first-query-returned", "late-query-returned", "metadata-read"]);
+  });
+
+  it("closes injectors and MCP when query settlement rejects", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    const childProcess = new FakeSpawnedProcess();
+    let injectorClosed = false;
+    let metadataReads = 0;
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd,
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+      execute: () => {
+        throw new Error("not called");
+      },
+      spawnClaudeCodeProcess: () => childProcess,
+      getSessionInfo: async (sessionId) => {
+        metadataReads += 1;
+        return { sessionId, cwd, lastModified: 31 };
+      },
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    const mcp = agentSettings.mcpServers?.["lilac"];
+    if (mcp?.type !== "sdk") throw new Error("Lilac SDK MCP server was not installed");
+    const closeSpy = spyOn(mcp.instance, "close");
+    try {
+      agentSettings.onStreamStart?.({
+        inject: () => undefined,
+        close: () => {
+          injectorClosed = true;
+        },
+      });
+      spawnTrackedProcess(agentSettings, cwd);
+      await emitQueryController(agentSettings, {
+        returnQuery: async () => {
+          childProcess.exit();
+          throw new Error("query settlement failed");
+        },
+      });
+      await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+      await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+      await runStopHook(agentSettings);
+
+      const finalization = nativeSession(run).finalize();
+      await expect(finalization).rejects.toThrow(
+        "Claude run disposal could not prove clean settlement",
+      );
+      await expect(run.dispose()).rejects.toBeInstanceOf(AggregateError);
+      expect(injectorClosed).toBe(true);
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(metadataReads).toBe(0);
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
+
+  it("attempts every injector and controller after a synchronous settle throw", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    const childProcess = new FakeSpawnedProcess();
+    const events: string[] = [];
+    let metadataReads = 0;
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd,
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+      execute: () => {
+        throw new Error("not called");
+      },
+      controller: {
+        getContextUsage: async () => ({ totalTokens: 700, maxTokens: 100_000 }),
+        interrupt: async () => undefined,
+        settle: () => {
+          events.push("injected-settle");
+          throw new Error("synchronous settle failure");
+        },
+      },
+      spawnClaudeCodeProcess: () => childProcess,
+      getSessionInfo: async (sessionId) => {
+        metadataReads += 1;
+        return { sessionId, cwd, lastModified: 31 };
+      },
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    const mcp = agentSettings.mcpServers?.["lilac"];
+    if (mcp?.type !== "sdk") throw new Error("Lilac SDK MCP server was not installed");
+    const closeSpy = spyOn(mcp.instance, "close");
+    try {
+      agentSettings.onStreamStart?.({
+        inject: () => undefined,
+        close: () => {
+          events.push("first-injector-close");
+          throw new Error("synchronous injector close failure");
+        },
+      });
+      agentSettings.onStreamStart?.({
+        inject: () => undefined,
+        close: () => {
+          events.push("later-injector-close");
+        },
+      });
+      spawnTrackedProcess(agentSettings, cwd);
+      await emitQueryController(agentSettings, {
+        returnQuery: async () => {
+          events.push("runtime-settle");
+          childProcess.exit();
+        },
+      });
+      await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+      await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+      await runStopHook(agentSettings);
+
+      const error = await nativeSession(run)
+        .finalize()
+        .then(() => undefined)
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AggregateError);
+      expect(events).toEqual([
+        "first-injector-close",
+        "later-injector-close",
+        "injected-settle",
+        "runtime-settle",
+      ]);
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(metadataReads).toBe(0);
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
+
+  it("attempts every process exit wait after a synchronous callback throw", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    const processes = [new FakeSpawnedProcess(), new FakeSpawnedProcess()];
+    let exitWaitCalls = 0;
+    let metadataReads = 0;
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd,
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId: CANDIDATE_ID },
+      execute: () => {
+        throw new Error("not called");
+      },
+      controller: {
+        getContextUsage: async () => ({ totalTokens: 700, maxTokens: 100_000 }),
+        interrupt: async () => undefined,
+        settle: async () => undefined,
+      },
+      spawnClaudeCodeProcess: () => {
+        const childProcess = processes.shift();
+        if (!childProcess) throw new Error("unexpected process spawn");
+        return childProcess;
+      },
+      waitForProcessExit: () => {
+        exitWaitCalls += 1;
+        throw new Error(`synchronous exit wait failure ${exitWaitCalls}`);
+      },
+      getSessionInfo: async (sessionId) => {
+        metadataReads += 1;
+        return { sessionId, cwd, lastModified: 31 };
+      },
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    const mcp = agentSettings.mcpServers?.["lilac"];
+    if (mcp?.type !== "sdk") throw new Error("Lilac SDK MCP server was not installed");
+    const closeSpy = spyOn(mcp.instance, "close");
+    try {
+      spawnTrackedProcess(agentSettings, cwd);
+      spawnTrackedProcess(agentSettings, cwd);
+      await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+      await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+      await runStopHook(agentSettings);
+
+      const error = await nativeSession(run)
+        .finalize()
+        .then(() => undefined)
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AggregateError);
+      expect(exitWaitCalls).toBe(2);
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(metadataReads).toBe(0);
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
+
+  it("rejects source mutation that occurs while the candidate query settles", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const cwd = process.cwd();
+    let sourceLastModified = 10;
+    const run = await materializeClaudeCodeRun({
+      modelId: "opus",
+      cwd,
+      tools: {},
+      nativeSession: {
+        mode: "fork",
+        baseSessionId: SOURCE_ID,
+        sessionId: CANDIDATE_ID,
+        expectedSourceLastModified: sourceLastModified,
+      },
+      execute: () => {
+        throw new Error("not called");
+      },
+      controller: {
+        getContextUsage: async () => ({ totalTokens: 700, maxTokens: 100_000 }),
+        interrupt: async () => undefined,
+        settle: async () => {
+          sourceLastModified += 1;
+        },
+      },
+      getSessionInfo: async (sessionId) => ({
+        sessionId,
+        cwd,
+        lastModified: sessionId === SOURCE_ID ? sourceLastModified : 20,
+      }),
+      createModel: createModelCapture(settings),
+    });
+    const agentSettings = settings[0];
+    if (!agentSettings) throw new Error("agent settings were not captured");
+    await emitSdkMessage(agentSettings, successfulInit(CANDIDATE_ID));
+    await emitSdkMessage(agentSettings, successfulResult(CANDIDATE_ID));
+    await runStopHook(agentSettings);
+
+    const finalization = await nativeSession(run).finalize();
+
+    expect(finalization.status).toBe("unpromotable");
+    expect(finalization.issues.map(({ code }) => code)).toEqual(["source-last-modified-changed"]);
+    expect(finalization.sourcePreflight?.lastModified).toBe(10);
+    expect(finalization.sourceFinal?.lastModified).toBe(11);
   });
 
   it("reports source mutation and native identity conflicts without throwing", async () => {
@@ -339,6 +778,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 800, maxTokens: 100_000 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId) => {
         if (sessionId === SOURCE_ID) sourceReadCount += 1;
@@ -459,6 +899,7 @@ describe("Claude native session lifecycle", () => {
           throw new Error(longError);
         },
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async () => undefined,
       onSdkMessage: () => {
@@ -511,6 +952,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 10, maxTokens: 1_000 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId) => ({ sessionId, cwd, lastModified: 100 }),
       createModel: createModelCapture(settings),
@@ -548,6 +990,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 10, maxTokens: 1_000 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId) => ({ sessionId, cwd, lastModified: 100 }),
       createModel: createModelCapture(settings),
@@ -582,6 +1025,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 10, maxTokens: 1_000 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId) => ({ sessionId, cwd, lastModified: 100 }),
       onSdkMessage: () => {
@@ -616,6 +1060,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 1, maxTokens: 10 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async () => ({
         sessionId: SOURCE_ID,
@@ -662,6 +1107,7 @@ describe("Claude native session lifecycle", () => {
           return { totalTokens: 12, maxTokens: 1_000 };
         },
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId) => ({ sessionId, cwd, lastModified: 100 }),
       createModel: createModelCapture(settings),
@@ -711,6 +1157,7 @@ describe("Claude native session lifecycle", () => {
       controller: {
         getContextUsage: async () => ({ totalTokens: 25, maxTokens: 1_000 }),
         interrupt: async () => undefined,
+        settle: async () => undefined,
       },
       getSessionInfo: async (sessionId) => ({ sessionId, cwd, lastModified: 100 }),
       createModel: createModelCapture(settings),
