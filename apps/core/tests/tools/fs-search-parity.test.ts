@@ -4,24 +4,43 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  decodeRemoteEditResponseJson,
+  decodeRemoteGlobResponseJson,
+  decodeRemoteGrepResponseJson,
+  decodeRemoteReadTextResponseJson,
   FileSystem,
-  type EditFileResult,
-  type GlobResult,
+  type BundledRemoteRunnerRequest,
   type GrepResult,
-  type ReadFileResult,
+  type RemoteEditResponse,
+  type RemoteGlobResponse,
+  type RemoteGrepResponse,
+  type RemoteReadTextResponse,
 } from "@stanley2058/lilac-fs";
 
 const runnerPath = path.resolve(import.meta.dir, "../../src/ssh/remote-js/remote-runner.cjs");
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-async function runRemoteOp<T>(params: {
+type FsTestRequest = Exclude<BundledRemoteRunnerRequest, { op: "apply_patch" | "fs.fuzzy_search" }>;
+type TestRequestParams<TRequest extends FsTestRequest> = Omit<TRequest, "denyPaths"> & {
   cwd: string;
-  op: string;
-  input: Record<string, unknown>;
-}): Promise<T> {
+  denyPaths?: string[];
+};
+type ReadTextParams = TestRequestParams<Extract<FsTestRequest, { op: "fs.read_text" }>>;
+type GlobParams = TestRequestParams<Extract<FsTestRequest, { op: "fs.glob" }>>;
+type GrepParams = TestRequestParams<Extract<FsTestRequest, { op: "fs.grep" }>>;
+type EditParams = TestRequestParams<Extract<FsTestRequest, { op: "fs.edit" }>>;
+type FsTestResponse =
+  | RemoteReadTextResponse
+  | RemoteGlobResponse
+  | RemoteGrepResponse
+  | RemoteEditResponse;
+
+function runRemoteOp(params: ReadTextParams): Promise<RemoteReadTextResponse>;
+function runRemoteOp(params: GlobParams): Promise<RemoteGlobResponse>;
+function runRemoteOp(params: GrepParams): Promise<RemoteGrepResponse>;
+function runRemoteOp(params: EditParams): Promise<RemoteEditResponse>;
+async function runRemoteOp(
+  params: ReadTextParams | GlobParams | GrepParams | EditParams,
+): Promise<FsTestResponse> {
   const proc = Bun.spawn(["bun", runnerPath], {
     cwd: params.cwd,
     stdin: "pipe",
@@ -35,7 +54,7 @@ async function runRemoteOp<T>(params: {
 
   const payload = JSON.stringify({
     op: params.op,
-    denyPaths: [],
+    denyPaths: params.denyPaths ?? [],
     input: params.input,
   });
   proc.stdin.write(payload);
@@ -49,18 +68,22 @@ async function runRemoteOp<T>(params: {
     throw new Error(`remote runner exited with code ${exitCode}: ${stderrText || stdoutText}`);
   }
 
-  const parsed = JSON.parse(stdoutText) as unknown;
-  if (!isRecord(parsed)) {
-    throw new Error("remote runner returned invalid JSON envelope");
+  const decoded = (() => {
+    switch (params.op) {
+      case "fs.read_text":
+        return decodeRemoteReadTextResponseJson(stdoutText);
+      case "fs.glob":
+        return decodeRemoteGlobResponseJson(stdoutText);
+      case "fs.grep":
+        return decodeRemoteGrepResponseJson(stdoutText);
+      case "fs.edit":
+        return decodeRemoteEditResponseJson(stdoutText);
+    }
+  })();
+  if (decoded.status === "error") {
+    throw new Error(`remote runner op failed: ${decoded.error.message}`);
   }
-
-  const ok = parsed["ok"];
-  if (ok !== true) {
-    const error = parsed["error"];
-    throw new Error(`remote runner op failed: ${typeof error === "string" ? error : "unknown"}`);
-  }
-
-  return parsed["value"] as T;
+  return decoded.value;
 }
 
 function normalizePathPrefix(p: string): string {
@@ -132,7 +155,7 @@ describe("fs search parity (local vs remote runner)", () => {
     ]) {
       const input = { path: "src/unicode.txt", start, maxCharacters: 2 };
       const local = await fsTool.readFile(input);
-      const remote = await runRemoteOp<ReadFileResult>({ cwd: baseDir, op: "fs.read_text", input });
+      const remote = await runRemoteOp({ cwd: baseDir, op: "fs.read_text", input });
       expect(remote).toEqual(local);
       if (!local.success || !local.nextStart) throw new Error("expected continuation");
 
@@ -142,7 +165,7 @@ describe("fs search parity (local vs remote runner)", () => {
         maxCharacters: 2,
       };
       const localContinuation = await fsTool.readFile(continuationInput);
-      const remoteContinuation = await runRemoteOp<ReadFileResult>({
+      const remoteContinuation = await runRemoteOp({
         cwd: baseDir,
         op: "fs.read_text",
         input: continuationInput,
@@ -156,7 +179,7 @@ describe("fs search parity (local vs remote runner)", () => {
       patterns: ["src/**/*.ts"],
       mode: "default",
     });
-    const remoteLean = await runRemoteOp<GlobResult>({
+    const remoteLean = await runRemoteOp({
       cwd: baseDir,
       op: "fs.glob",
       input: { patterns: ["src/**/*.ts"], mode: "default" },
@@ -176,7 +199,7 @@ describe("fs search parity (local vs remote runner)", () => {
       patterns: ["src/**/*.ts"],
       mode: "detailed",
     });
-    const remoteVerbose = await runRemoteOp<GlobResult>({
+    const remoteVerbose = await runRemoteOp({
       cwd: baseDir,
       op: "fs.glob",
       input: { patterns: ["src/**/*.ts"], mode: "detailed" },
@@ -217,7 +240,7 @@ describe("fs search parity (local vs remote runner)", () => {
       patterns: ["**/*.ts", "src/**/*.ts", "!**/node_modules/**"],
       mode: "default",
     });
-    const remote = await runRemoteOp<GlobResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.glob",
       input: {
@@ -245,7 +268,7 @@ describe("fs search parity (local vs remote runner)", () => {
       patterns: [absolutePattern],
       mode: "default",
     });
-    const remote = await runRemoteOp<GlobResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.glob",
       input: { patterns: [absolutePattern], mode: "default" },
@@ -268,7 +291,7 @@ describe("fs search parity (local vs remote runner)", () => {
       fileExtensions: ["ts"],
       mode: "default",
     });
-    const remoteLean = await runRemoteOp<GrepResult>({
+    const remoteLean = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -293,7 +316,7 @@ describe("fs search parity (local vs remote runner)", () => {
       fileExtensions: ["ts"],
       mode: "detailed",
     });
-    const remoteVerbose = await runRemoteOp<GrepResult>({
+    const remoteVerbose = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -322,7 +345,7 @@ describe("fs search parity (local vs remote runner)", () => {
       baseDir: "src/a.ts",
       mode: "hashline",
     });
-    const remote = await runRemoteOp<GrepResult>({
+    const remote = await runRemoteOp({
       cwd: path.join(baseDir, "src"),
       op: "fs.grep",
       input: {
@@ -348,7 +371,7 @@ describe("fs search parity (local vs remote runner)", () => {
       mode: "default",
       maxResults: 3,
     });
-    const exactRemote = await runRemoteOp<GrepResult>({
+    const exactRemote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -375,7 +398,7 @@ describe("fs search parity (local vs remote runner)", () => {
       mode: "detailed",
       maxResults: 3,
     });
-    const overflowRemote = await runRemoteOp<GrepResult>({
+    const overflowRemote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -408,7 +431,7 @@ describe("fs search parity (local vs remote runner)", () => {
       pattern: "AGENTS.md",
       mode: "default",
     });
-    const remote = await runRemoteOp<GrepResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -431,7 +454,7 @@ describe("fs search parity (local vs remote runner)", () => {
 
   it("read hashline output matches between local and remote", async () => {
     const local = await fsTool.readFile({ path: "src/a.ts", format: "hashline" });
-    const remote = await runRemoteOp<Awaited<ReturnType<FileSystem["readFile"]>>>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.read_text",
       input: { path: "src/a.ts", format: "hashline" },
@@ -457,7 +480,7 @@ describe("fs search parity (local vs remote runner)", () => {
       fileExtensions: ["ts"],
       mode: "hashline",
     });
-    const remote = await runRemoteOp<GrepResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -486,7 +509,7 @@ describe("fs search parity (local vs remote runner)", () => {
       mode: "hashline",
       maxResults: 1,
     });
-    const remote = await runRemoteOp<GrepResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -524,7 +547,7 @@ describe("fs search parity (local vs remote runner)", () => {
       path: "hash-edit.ts",
       edits: [{ op: "replace", pos: anchor, lines: ["gamma"] }],
     });
-    const remoteRead2 = await runRemoteOp<Awaited<ReturnType<FileSystem["readFile"]>>>({
+    const remoteRead2 = await runRemoteOp({
       cwd: baseDir,
       op: "fs.read_text",
       input: { path: "hash-edit-remote.ts", format: "hashline" },
@@ -532,7 +555,7 @@ describe("fs search parity (local vs remote runner)", () => {
     if (!remoteRead2.success || remoteRead2.format !== "hashline") {
       throw new Error("expected remote hashline read");
     }
-    const remote = await runRemoteOp<EditFileResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.edit",
       input: {
@@ -564,7 +587,7 @@ describe("fs search parity (local vs remote runner)", () => {
       throw new Error("expected local hashline read");
     }
 
-    const remoteRead = await runRemoteOp<Awaited<ReturnType<FileSystem["readFile"]>>>({
+    const remoteRead = await runRemoteOp({
       cwd: baseDir,
       op: "fs.read_text",
       input: { path: "hash-stale-remote.ts", format: "hashline" },
@@ -581,7 +604,7 @@ describe("fs search parity (local vs remote runner)", () => {
       edits: [{ op: "replace", pos: localRead.hashlineContent.split("\n")[1]!, lines: ["gamma"] }],
     });
 
-    const remote = await runRemoteOp<EditFileResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.edit",
       input: {
@@ -617,7 +640,7 @@ describe("fs search parity (local vs remote runner)", () => {
       throw new Error("expected local hashline grep");
     }
 
-    const remoteGrep = await runRemoteOp<GrepResult>({
+    const remoteGrep = await runRemoteOp({
       cwd: baseDir,
       op: "fs.grep",
       input: {
@@ -644,7 +667,7 @@ describe("fs search parity (local vs remote runner)", () => {
       path: "grep-edit-local.ts",
       edits: [{ op: "replace", pos: localMatch.text, lines: ["gamma"] }],
     });
-    const remote = await runRemoteOp<EditFileResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.edit",
       input: {
@@ -679,17 +702,14 @@ describe("fs search parity (local vs remote runner)", () => {
       ],
     });
 
-    const remoteRead = await runRemoteOp<{
-      success: true;
-      fileHash: string;
-      resolvedPath: string;
-    }>({
+    const remoteRead = await runRemoteOp({
       cwd: baseDir,
       op: "fs.read_text",
       input: { path: "edit-remote.ts" },
     });
+    if (!remoteRead.success) throw new Error("remote read failed");
 
-    const remote = await runRemoteOp<EditFileResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.edit",
       input: {
@@ -735,17 +755,14 @@ describe("fs search parity (local vs remote runner)", () => {
       ],
     });
 
-    const remoteRead = await runRemoteOp<{
-      success: true;
-      fileHash: string;
-      resolvedPath: string;
-    }>({
+    const remoteRead = await runRemoteOp({
       cwd: baseDir,
       op: "fs.read_text",
       input: { path: "edit-error.ts" },
     });
+    if (!remoteRead.success) throw new Error("remote read failed");
 
-    const remote = await runRemoteOp<EditFileResult>({
+    const remote = await runRemoteOp({
       cwd: baseDir,
       op: "fs.edit",
       input: {

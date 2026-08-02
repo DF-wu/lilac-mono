@@ -1,15 +1,23 @@
 import type { ToolSet } from "ai";
-import { z } from "zod";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
 import {
   ToolPluginManager,
+  decodeLevel1ExecutableMetadata,
+  invokeLevel1CreateTool,
+  invokeLevel1EditTargets,
+  invokeLevel1IsEnabled,
+  type Level1ContributionInfo,
   type Level1ExecutionRequestContext,
   type Level1RunProfile,
+  type Level1ToolSpecCapabilitySnapshot,
   type ServerTool,
 } from "@stanley2058/lilac-plugin-runtime";
+import type { Result as ResultType } from "better-result";
+
 import {
   createLogger,
   deriveSubagentIdleTimeoutMs,
+  formatTaggedErrorForLog,
   getCoreConfig,
   profileIncludes,
   resolveCoreConfigPath,
@@ -37,7 +45,7 @@ import {
 } from "./types";
 
 function isStructurallyAllowed(
-  spec: CoreLevel1ToolSpec,
+  specName: string,
   contribution: import("@stanley2058/lilac-plugin-runtime").Level1ContributionInfo | undefined,
   params: Pick<BuildLevel1ToolsetParams, "runProfile">,
   config: CoreConfig,
@@ -46,10 +54,10 @@ function isStructurallyAllowed(
   if (!contribution) return false;
   const profile = resolveNativeSubagentProfile(config, params.runProfile);
   if (!profileIncludes(profile.level1.plugins, contribution.pluginId)) return false;
-  if (!profileIncludes(profile.level1.tools, spec.name)) return false;
-  if (spec.name === "bash" && !profile.execution) return false;
-  if (["edit_file", "apply_patch"].includes(spec.name) && !profile.workspaceWrites) return false;
-  if (spec.name === "subagent_delegate" && !profile.delegation) return false;
+  if (!profileIncludes(profile.level1.tools, specName)) return false;
+  if (specName === "bash" && !profile.execution) return false;
+  if (["edit_file", "apply_patch"].includes(specName) && !profile.workspaceWrites) return false;
+  if (specName === "subagent_delegate" && !profile.delegation) return false;
   return true;
 }
 
@@ -70,11 +78,6 @@ function isMcpStructurallyAllowed(params: {
     profileIncludes(profile.level1.tools, params.modelName) ||
     profileIncludes(profile.level1.tools, params.rawName)
   );
-}
-
-async function listServerToolCallableIds(tool: ServerTool): Promise<readonly string[]> {
-  const entries = await tool.list();
-  return entries.map((entry: Awaited<ReturnType<ServerTool["list"]>>[number]) => entry.callableId);
 }
 
 export type BuildLevel1ToolsetParams = {
@@ -109,11 +112,14 @@ export type BuiltLevel1Toolset = {
   catalogMetadata: ClaudeCodeToolCatalogMetadataMap;
   /** Refresh the run-scoped batch child mapping before freezing step authority. */
   updateActiveBatchTools(activeToolNames: ReadonlySet<string>): void;
+  contributionInfo: ReadonlyMap<CoreLevel1ToolSpec, Level1ContributionInfo>;
   genericOutputNormalizerBypassTools: ReadonlySet<string>;
   aggregateOutputBudgetExemptTools: ReadonlySet<string>;
 };
 
-export type CoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
+type CreatedCoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
+export type CoreToolPluginManager = Omit<CreatedCoreToolPluginManager, "getLevel2Capabilities"> &
+  Partial<Pick<CreatedCoreToolPluginManager, "getLevel2Capabilities">>;
 
 export function createCoreToolPluginManager(params: {
   runtime: CoreToolPluginRuntime;
@@ -126,6 +132,27 @@ export function createCoreToolPluginManager(params: {
   const resolveConfig = async () =>
     params.runtime.config ?? params.runtime.getConfig?.() ?? (await getCoreConfig());
 
+  const failPluginOperation = (
+    operation: string,
+    error: import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError,
+  ): never => {
+    const formatted = formatTaggedErrorForLog(error);
+    logger.error("tool plugin operation failed", { operation, ...formatted });
+    throw new Error(`Tool plugin ${operation} failed: ${formatted.errorMessage}`);
+  };
+
+  const failPluginInvariant = (message: string): never => {
+    throw new Error(message);
+  };
+
+  const requirePluginResult = <T>(
+    operation: string,
+    result: ResultType<T, import("@stanley2058/lilac-plugin-runtime").ToolPluginManagerError>,
+  ): T => {
+    if (result.status === "error") return failPluginOperation(operation, result.error);
+    return result.value;
+  };
+
   const manager = new ToolPluginManager<CoreToolPluginRuntime, CoreLevel1ToolSpec, ServerTool>({
     runtime: params.runtime,
     dataDir: params.dataDir,
@@ -135,18 +162,12 @@ export function createCoreToolPluginManager(params: {
     getDisabledPluginIds: async () => (await resolveConfig()).plugins?.disabled ?? [],
     getPluginConfig: async (pluginId: string) =>
       (await resolveConfig()).plugins?.config?.[pluginId],
-    getLevel1RegistrationKey: (spec, contribution) =>
+    getLevel1RegistrationKey: (_spec, contribution, capturedName) =>
       contribution.source === "builtin"
-        ? spec.name
-        : JSON.stringify([contribution.pluginId, spec.name]),
-    getLevel1Name: (spec) => spec.name,
-    getLevel2CallableIds: listServerToolCallableIds,
-    initLevel2Item: async (tool) => {
-      await tool.init();
-    },
-    destroyLevel2Item: async (tool) => {
-      await tool.destroy();
-    },
+        ? capturedName
+        : JSON.stringify([contribution.pluginId, capturedName]),
+    adaptLevel1Item: (spec) => spec,
+    adaptLevel2Item: (tool) => tool,
   });
 
   return {
@@ -157,8 +178,18 @@ export function createCoreToolPluginManager(params: {
     getStatuses: () => manager.getStatuses(),
     getLevel2Tools: () => manager.getLevel2Items(),
     getLevel2ContributionInfo: () => manager.getLevel2ContributionInfo(),
+    getLevel2Capabilities: () => manager.getLevel2Capabilities(),
     async buildLevel1Toolset(buildParams: BuildLevel1ToolsetParams): Promise<BuiltLevel1Toolset> {
-      await manager.ensureFresh();
+      const fresh = await manager.ensureFresh();
+      if (fresh.status === "error") {
+        if (fresh.error._tag !== "ToolPluginReloadCommittedCleanupError") {
+          failPluginOperation("ensureFresh", fresh.error);
+        }
+        logger.error("tool plugin refresh committed with cleanup failure", {
+          operation: "ensureFresh",
+          ...formatTaggedErrorForLog(fresh.error),
+        });
+      }
       const resolvedConfig = await resolveConfig();
 
       const tools: ToolSet = {} as ToolSet;
@@ -166,6 +197,15 @@ export function createCoreToolPluginManager(params: {
       const specs = new Map<string, CoreLevel1ToolSpec>();
       const directSpecs = new Map<string, CoreLevel1ToolSpec>();
       const contributionInfo = manager.getLevel1ContributionInfo();
+      const level1Capabilities = manager.getLevel1Capabilities();
+      const capabilityForSpec = (
+        spec: CoreLevel1ToolSpec,
+      ): Level1ToolSpecCapabilitySnapshot<CoreToolPluginRuntime> => {
+        const capability = level1Capabilities.get(spec);
+        if (!capability) return failPluginInvariant("Missing captured Level 1 plugin capability");
+        return capability;
+      };
+      const nameForSpec = (spec: CoreLevel1ToolSpec): string => capabilityForSpec(spec).name;
       const runContext = {
         runtime: {
           ...params.runtime,
@@ -185,13 +225,26 @@ export function createCoreToolPluginManager(params: {
         requestContext: buildParams.requestContext,
       };
 
-      const enabledSpecs = manager
-        .getLevel1Items()
-        .filter(
-          (spec) =>
-            spec.isEnabled(runContext) &&
-            isStructurallyAllowed(spec, contributionInfo.get(spec), buildParams, resolvedConfig),
+      const enabledSpecs: CoreLevel1ToolSpec[] = [];
+      for (const spec of manager.getLevel1Items()) {
+        const contribution = contributionInfo.get(spec);
+        const specName = nameForSpec(spec);
+        if (!contribution)
+          return failPluginInvariant(`Missing contribution identity for '${specName}'`);
+        const enabled = requirePluginResult(
+          "level1.isEnabled",
+          invokeLevel1IsEnabled({
+            pluginId: contribution.pluginId,
+            source: contribution.source,
+            spec,
+            capability: capabilityForSpec(spec),
+            context: runContext,
+          }),
         );
+        if (enabled && isStructurallyAllowed(specName, contribution, buildParams, resolvedConfig)) {
+          enabledSpecs.push(spec);
+        }
+      }
 
       const builtinSpecs = enabledSpecs.filter(
         (spec) => contributionInfo.get(spec)?.source === "builtin",
@@ -203,26 +256,28 @@ export function createCoreToolPluginManager(params: {
       const identities = [
         ...externalSpecs.map((spec) => {
           const contribution = contributionInfo.get(spec);
-          if (!contribution) throw new Error(`Missing contribution identity for '${spec.name}'`);
+          const specName = nameForSpec(spec);
+          if (!contribution)
+            return failPluginInvariant(`Missing contribution identity for '${specName}'`);
           return {
             source: "plugin",
             sourceId: contribution.pluginId,
-            rawToolName: spec.name,
+            rawToolName: specName,
           } as const;
         }),
         ...allMcpTools.map((entry) => entry.identity),
       ];
-      const directToolNames = new Set(builtinSpecs.map((spec) => spec.name));
+      const directToolNames = new Set(builtinSpecs.map(nameForSpec));
       const reservedNames = new Set(
         manager
           .getLevel1Items()
           .filter((spec) => contributionInfo.get(spec)?.source === "builtin")
-          .map((spec) => spec.name),
+          .map(nameForSpec),
       );
       reservedNames.add("tool_search");
       const nameAssignment = assignCatalogToolNames(identities, reservedNames);
       if (nameAssignment.collisions.length > 0) {
-        throw new Error(
+        return failPluginInvariant(
           `Unable to assign unique deferred catalog tool names: ${nameAssignment.collisions
             .map(
               (collision) =>
@@ -235,7 +290,8 @@ export function createCoreToolPluginManager(params: {
       }
       const mcpTools = allMcpTools.filter((entry) => {
         const modelName = nameAssignment.byStableId.get(entry.stableId);
-        if (!modelName) throw new Error(`MCP tool did not receive a model name: ${entry.stableId}`);
+        if (!modelName)
+          return failPluginInvariant(`MCP tool did not receive a model name: ${entry.stableId}`);
         return isMcpStructurallyAllowed({
           serverId: entry.serverId,
           rawName: entry.rawName,
@@ -246,59 +302,105 @@ export function createCoreToolPluginManager(params: {
       });
 
       for (const spec of builtinSpecs) {
-        specs.set(spec.name, spec);
-        directSpecs.set(spec.name, spec);
+        const specName = nameForSpec(spec);
+        specs.set(specName, spec);
+        directSpecs.set(specName, spec);
       }
       for (const spec of externalSpecs) {
         const contribution = contributionInfo.get(spec);
-        if (!contribution) throw new Error(`Missing contribution identity for '${spec.name}'`);
+        const specName = nameForSpec(spec);
+        if (!contribution)
+          return failPluginInvariant(`Missing contribution identity for '${specName}'`);
         const stableId = catalogToolStableId({
           source: "plugin",
           sourceId: contribution.pluginId,
-          rawToolName: spec.name,
+          rawToolName: specName,
         });
         const modelName = nameAssignment.byStableId.get(stableId);
         if (!modelName)
-          throw new Error(`External plugin tool did not receive a model name: ${stableId}`);
-        specs.set(modelName, { ...spec, name: modelName });
+          return failPluginInvariant(
+            `External plugin tool did not receive a model name: ${stableId}`,
+          );
+        specs.set(modelName, spec);
       }
 
       const buildContext = {
         ...runContext,
         getTools: () => batchTools,
         getLevel1ToolSpecs: () => directSpecs,
+        resolveEditTargets: async (
+          spec: CoreLevel1ToolSpec,
+          args: unknown,
+          context: { cwd: string },
+        ) => {
+          const contribution = contributionInfo.get(spec);
+          const specName = nameForSpec(spec);
+          if (!contribution)
+            return failPluginInvariant(`Missing contribution identity for '${specName}'`);
+          const resolved = requirePluginResult(
+            "level1.editTargets",
+            await invokeLevel1EditTargets({
+              pluginId: contribution.pluginId,
+              source: contribution.source,
+              spec,
+              capability: capabilityForSpec(spec),
+              args,
+              cwd: context.cwd,
+            }),
+          );
+          return resolved ?? [];
+        },
         reportToolStatus: buildParams.reportToolStatus,
       };
 
       for (const spec of builtinSpecs) {
-        const executable = spec.createTool(buildContext);
-        (tools as Record<string, unknown>)[spec.name] = executable;
-        (batchTools as Record<string, unknown>)[spec.name] = executable;
+        const contribution = contributionInfo.get(spec);
+        const specName = nameForSpec(spec);
+        if (!contribution)
+          return failPluginInvariant(`Missing contribution identity for '${specName}'`);
+        const executable = requirePluginResult(
+          "level1.createTool",
+          invokeLevel1CreateTool({
+            pluginId: contribution.pluginId,
+            source: contribution.source,
+            spec,
+            capability: capabilityForSpec(spec),
+            context: buildContext,
+          }),
+        );
+        (tools as Record<string, unknown>)[specName] = executable;
+        (batchTools as Record<string, unknown>)[specName] = executable;
       }
 
-      const candidateMetadataSchema = z.object({
-        title: z.string().optional(),
-        description: z.string().optional(),
-      });
       const candidates: CatalogToolCandidate[] = [];
       for (const spec of externalSpecs) {
         const contribution = contributionInfo.get(spec);
-        if (!contribution) throw new Error(`Missing contribution identity for '${spec.name}'`);
+        const specName = nameForSpec(spec);
+        if (!contribution)
+          return failPluginInvariant(`Missing contribution identity for '${specName}'`);
         const identity = {
           source: "plugin",
           sourceId: contribution.pluginId,
-          rawToolName: spec.name,
+          rawToolName: specName,
         } as const;
-        const executable = spec.createTool(buildContext);
-        const metadata = candidateMetadataSchema.safeParse(executable);
+        const executable = requirePluginResult(
+          "level1.createTool",
+          invokeLevel1CreateTool({
+            pluginId: contribution.pluginId,
+            source: contribution.source,
+            spec,
+            capability: capabilityForSpec(spec),
+            context: buildContext,
+          }),
+        );
+        const metadata = requirePluginResult(
+          "level1.executableMetadata",
+          decodeLevel1ExecutableMetadata(contribution.pluginId, executable),
+        );
         candidates.push({
           identity,
-          ...(metadata.success && metadata.data.title !== undefined
-            ? { title: metadata.data.title }
-            : {}),
-          ...(metadata.success && metadata.data.description !== undefined
-            ? { description: metadata.data.description }
-            : {}),
+          ...(metadata.title === undefined ? {} : { title: metadata.title }),
+          ...(metadata.description === undefined ? {} : { description: metadata.description }),
           tool: executable,
         });
       }
@@ -352,7 +454,20 @@ export function createCoreToolPluginManager(params: {
         const nextBatchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
         if (nextBatchAuthorityKey === batchAuthorityKey) return;
         batchAuthorityKey = nextBatchAuthorityKey;
-        const executable = batchSpec.createTool(buildContext);
+        const contribution = contributionInfo.get(batchSpec);
+        const batchSpecName = nameForSpec(batchSpec);
+        if (!contribution)
+          return failPluginInvariant(`Missing contribution identity for '${batchSpecName}'`);
+        const executable = requirePluginResult(
+          "level1.createTool",
+          invokeLevel1CreateTool({
+            pluginId: contribution.pluginId,
+            source: contribution.source,
+            spec: batchSpec,
+            capability: capabilityForSpec(batchSpec),
+            context: buildContext,
+          }),
+        );
         (tools as Record<string, unknown>).batch = executable;
         (batchTools as Record<string, unknown>).batch = executable;
       };
@@ -364,6 +479,7 @@ export function createCoreToolPluginManager(params: {
         catalog: catalog.entries,
         catalogMetadata: catalog.catalogMetadata,
         updateActiveBatchTools,
+        contributionInfo,
         genericOutputNormalizerBypassTools: new Set(
           [...specs.entries()]
             .filter(([, spec]) => hasBoundedBuiltinOutput(spec))

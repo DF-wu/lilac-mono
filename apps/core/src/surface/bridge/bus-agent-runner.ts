@@ -9,6 +9,7 @@ import {
   type ToolSet,
   type UserContent,
 } from "ai";
+import type { Panic } from "better-result";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type {
   ConfiguredModelChainEntry,
@@ -29,6 +30,7 @@ import {
   findWorkspaceRoot,
   formatAvailableSkillsSection,
   getCoreConfig,
+  isPanic,
   isRecord,
   ModelCapability,
   openAIMessagePhase,
@@ -186,7 +188,10 @@ import {
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "./bus-request-router/common";
-import type { CustomCommandManager } from "../../custom-commands/manager";
+import type {
+  CustomCommandExecutionError,
+  CustomCommandManager,
+} from "../../custom-commands/manager";
 import {
   createCoreNamedClaudeRuntime,
   hashCoreNamedExecutionScope,
@@ -266,6 +271,60 @@ function supportsReadFileDirectAttachments(info: ModelCapabilityInfo | null): bo
 
 function consumerId(prefix: string): string {
   return `${prefix}:${process.pid}:${Math.random().toString(16).slice(2)}`;
+}
+
+export function rethrowBusAgentRunnerPanic(
+  cause: unknown,
+  beforeRethrow?: (panic: Panic) => void,
+): void {
+  if (!isPanic(cause)) return;
+  beforeRethrow?.(cause);
+  throw cause;
+}
+
+export async function rethrowBusAgentRunnerCleanupDefect(
+  cleanup: () => void | Promise<void>,
+): Promise<void> {
+  await cleanup();
+}
+
+export type BusAgentRunnerTerminalCleanup = {
+  readonly label:
+    | "workflow-claim-timer-clear"
+    | "control-capability-expire"
+    | "workflow-request-expire"
+    | "run-idle-watchdog-stop"
+    | "agent-unsubscribe"
+    | "compaction-unsubscribe"
+    | "output-publisher-drain"
+    | "core-named-retire"
+    | "core-primary-retire"
+    | "claude-dispose"
+    | "live-close";
+  readonly run: () => void | Promise<void>;
+};
+
+export type BusAgentRunnerTerminalCleanupOperation = {
+  readonly label: BusAgentRunnerTerminalCleanup["label"];
+  readonly operation: Promise<void>;
+};
+
+export type BusAgentRunnerTerminalCleanupBatch = {
+  readonly operations: readonly BusAgentRunnerTerminalCleanupOperation[];
+  readonly completion: Promise<void>;
+};
+
+export function startBusAgentRunnerTerminalCleanup(
+  cleanups: readonly BusAgentRunnerTerminalCleanup[],
+): BusAgentRunnerTerminalCleanupBatch {
+  const operations = cleanups.map((cleanup) => {
+    const operation = rethrowBusAgentRunnerCleanupDefect(cleanup.run);
+    return { label: cleanup.label, operation };
+  });
+  const completion = Promise.allSettled(operations.map(({ operation }) => operation)).then(
+    () => undefined,
+  );
+  return { operations, completion };
 }
 
 function buildResumePrompt(partialText: string): ModelMessage {
@@ -673,6 +732,17 @@ export function buildCustomCommandFailureFinalText(params: {
       ? params.normalizedOutput.value
       : "Custom command failed.";
   return `Error running ${params.commandText}: ${normalizedError}`;
+}
+
+export function customCommandExecutionErrorText(error: CustomCommandExecutionError): string {
+  switch (error._tag) {
+    case "CustomCommandImportError":
+    case "CustomCommandExecuteMissingError":
+    case "CustomCommandExecuteThrownError":
+    case "CustomCommandExecuteRejectedError":
+    case "CustomCommandResultInvalidError":
+      return error.message;
+  }
 }
 
 const AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME = "conversation_thread_search";
@@ -1500,6 +1570,7 @@ class PreAgentRunCancelledError extends Error {
 }
 
 const AGENT_TIMEOUT_ABORT_GRACE_MS = 5_000;
+const TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS = 4_000;
 const LIVE_PARENT_RECONCILE_MS = 1_000;
 const SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS = 3;
 export const WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS = 10_000;
@@ -2012,6 +2083,7 @@ export async function startBusAgentRunner(params: {
   createAgent?: (options: AiSdkPiAgentOptions<ToolSet>) => AiSdkPiAgent<ToolSet>;
   /** Injection seam for deterministic Claude native lifecycle/observation coverage. */
   materializeClaudeCodeRun?: typeof materializeClaudeCodeRun;
+  reportFatalPanic: (panic: Panic) => void;
 }) {
   const { bus, subscriptionId } = params;
 
@@ -2058,6 +2130,25 @@ export async function startBusAgentRunner(params: {
   const restartAbortRequestIds = new Set<string>();
   const forcedRecoveryByRequestId = new Map<string, AgentRunnerRecoveryEntry>();
   let draining = false;
+  let terminalPanic: Panic | null = null;
+  let activeDrainOperation: Promise<void> | null = null;
+  let terminalCleanupOperations: readonly BusAgentRunnerTerminalCleanupOperation[] = [];
+  let terminalCleanupCompletion: Promise<void> | null = null;
+
+  function startSessionQueueDrain(
+    sessionId: string,
+    state: SessionQueue,
+    requestId?: string,
+  ): void {
+    const superviseDetachedDrain = (error: unknown): void => {
+      rethrowBusAgentRunnerPanic(error, params.reportFatalPanic);
+      logger.error("drainSessionQueue failed", { sessionId, requestId }, error);
+    };
+    const observeSupervisedDrainRejection = (): void => undefined;
+    const operation = drainSessionQueue(sessionId, state).catch(superviseDetachedDrain);
+    activeDrainOperation = operation;
+    void operation.catch(observeSupervisedDrainRejection);
+  }
 
   const sub = await bus.subscribeTopic(
     "cmd.request",
@@ -2080,6 +2171,7 @@ export async function startBusAgentRunner(params: {
       if (!requestId || !sessionId) {
         throw new Error("cmd.request.message missing required headers.request_id/session_id");
       }
+      rethrowBusAgentRunnerPanic(terminalPanic);
 
       if (env.perf.log) {
         const lagMs = Date.now() - msg.ts;
@@ -2292,9 +2384,7 @@ export async function startBusAgentRunner(params: {
           });
 
           if (!state.running) {
-            drainSessionQueue(sessionId, state).catch((e: unknown) => {
-              logger.error("drainSessionQueue failed", { sessionId, requestId }, e);
-            });
+            startSessionQueueDrain(sessionId, state, requestId);
           }
 
           await ctx.commit();
@@ -2378,9 +2468,7 @@ export async function startBusAgentRunner(params: {
           queueDepthAfter: state.queue.length,
           reason: "start_when_idle",
         });
-        drainSessionQueue(sessionId, state).catch((e: unknown) => {
-          logger.error("drainSessionQueue failed", { sessionId, requestId }, e);
-        });
+        startSessionQueueDrain(sessionId, state, requestId);
       } else {
         if (
           state.activeRequestId === requestId &&
@@ -2745,14 +2833,13 @@ export async function startBusAgentRunner(params: {
       });
 
       if (!state.running) {
-        drainSessionQueue(entry.sessionId, state).catch((e: unknown) => {
-          logger.error("drainSessionQueue failed", { sessionId: entry.sessionId }, e);
-        });
+        startSessionQueueDrain(entry.sessionId, state);
       }
     }
   }
 
   async function drainSessionQueue(sessionId: string, state: SessionQueue) {
+    rethrowBusAgentRunnerPanic(terminalPanic);
     if (state.running) return;
 
     const queueDepthBefore = state.queue.length;
@@ -3206,13 +3293,13 @@ export async function startBusAgentRunner(params: {
         }
 
         if (!customError && command && params.customCommands) {
+          if (cancelledByRequestId.has(headers.request_id)) {
+            throw new PreAgentRunCancelledError();
+          }
+          customCommandAbortController = new AbortController();
+          runIdleWatchdog?.start();
           try {
-            if (cancelledByRequestId.has(headers.request_id)) {
-              throw new PreAgentRunCancelledError();
-            }
-            customCommandAbortController = new AbortController();
-            runIdleWatchdog?.start();
-            output = await waitForPreAgent(
+            const executed = await waitForPreAgent(
               waitForRun(
                 params.customCommands.execute({
                   command,
@@ -3230,14 +3317,11 @@ export async function startBusAgentRunner(params: {
                 }),
               ),
             );
-          } catch (error) {
-            if (
-              error instanceof AgentIdleTimeoutError ||
-              error instanceof PreAgentRunCancelledError
-            ) {
-              throw error;
+            if (executed.status === "error") {
+              customError = customCommandExecutionErrorText(executed.error);
+            } else {
+              output = executed.value;
             }
-            customError = error instanceof Error ? error.message : String(error);
           } finally {
             runIdleWatchdog?.pause();
             customCommandAbortController = null;
@@ -5692,6 +5776,9 @@ export async function startBusAgentRunner(params: {
         costEstimateReason: resolvedCostEstimateReason,
       });
     } catch (e) {
+      rethrowBusAgentRunnerPanic(e, (panic) => {
+        terminalPanic = panic;
+      });
       runIdleWatchdog?.stop();
 
       if (e instanceof RestartDrainingAbort) {
@@ -5892,51 +5979,122 @@ export async function startBusAgentRunner(params: {
         e,
       );
     } finally {
-      if (workflowClaimTimer) clearInterval(workflowClaimTimer);
-      if (controlCapability) params.expireControlCapability?.(next.requestId);
-      if (workflowHint && !preserveWorkflowClaim) {
-        params.durableWorkflowStore?.expireWorkflowRequest(
-          next.requestId,
-          Date.now(),
-          workflowRunnerOwnerId,
+      if (terminalPanic) {
+        rejectPreAgentCancellation = null;
+        const terminalCleanups: BusAgentRunnerTerminalCleanup[] = [];
+        if (workflowClaimTimer) {
+          const timer = workflowClaimTimer;
+          terminalCleanups.push({
+            label: "workflow-claim-timer-clear",
+            run: () => clearInterval(timer),
+          });
+        }
+        if (params.expireControlCapability) {
+          const expireControlCapability = params.expireControlCapability;
+          terminalCleanups.push({
+            label: "control-capability-expire",
+            run: () => expireControlCapability(next.requestId),
+          });
+        }
+        if (workflowHint && !preserveWorkflowClaim && params.durableWorkflowStore) {
+          const durableWorkflowStore = params.durableWorkflowStore;
+          terminalCleanups.push({
+            label: "workflow-request-expire",
+            run: () => {
+              durableWorkflowStore.expireWorkflowRequest(
+                next.requestId,
+                Date.now(),
+                workflowRunnerOwnerId,
+              );
+            },
+          });
+        }
+        if (runIdleWatchdog) {
+          const watchdog = runIdleWatchdog;
+          terminalCleanups.push({
+            label: "run-idle-watchdog-stop",
+            run: () => watchdog.stop(),
+          });
+        }
+        terminalCleanups.push(
+          { label: "agent-unsubscribe", run: unsubscribe },
+          { label: "compaction-unsubscribe", run: unsubscribeCompaction },
+          { label: "output-publisher-drain", run: () => outputPublisher.drain() },
         );
+        if (coreNamedClaudeRuntime) {
+          const runtime = coreNamedClaudeRuntime;
+          terminalCleanups.push({
+            label: "core-named-retire",
+            run: () => runtime.retireAtRunEnd(),
+          });
+        }
+        if (corePrimaryClaudeRuntime) {
+          const runtime = corePrimaryClaudeRuntime;
+          terminalCleanups.push({
+            label: "core-primary-retire",
+            run: () => runtime.retireAtRunEnd(),
+          });
+        }
+        if (claudeCodeRun) {
+          const run = claudeCodeRun;
+          terminalCleanups.push({ label: "claude-dispose", run: () => run.dispose() });
+        }
+        if (liveParentSession) {
+          const session = liveParentSession;
+          terminalCleanups.push({ label: "live-close", run: () => session.close() });
+        }
+        const cleanupBatch = startBusAgentRunnerTerminalCleanup(terminalCleanups);
+        terminalCleanupOperations = [...terminalCleanupOperations, ...cleanupBatch.operations];
+        terminalCleanupCompletion = terminalCleanupCompletion
+          ? Promise.all([terminalCleanupCompletion, cleanupBatch.completion]).then(() => undefined)
+          : cleanupBatch.completion;
+      } else {
+        if (workflowClaimTimer) clearInterval(workflowClaimTimer);
+        if (controlCapability) params.expireControlCapability?.(next.requestId);
+        if (workflowHint && !preserveWorkflowClaim) {
+          params.durableWorkflowStore?.expireWorkflowRequest(
+            next.requestId,
+            Date.now(),
+            workflowRunnerOwnerId,
+          );
+        }
+        runIdleWatchdog?.stop();
+        rejectPreAgentCancellation = null;
+        unsubscribe();
+        unsubscribeCompaction();
+        await outputPublisher.drain();
+        await coreNamedClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
+          logger.warn(
+            "failed to retire Core named Claude runtime",
+            { requestId: headers.request_id, sessionId: headers.session_id },
+            e,
+          );
+        });
+        await corePrimaryClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
+          logger.warn(
+            "failed to retire Core primary Claude runtime",
+            { requestId: headers.request_id, sessionId: headers.session_id },
+            e,
+          );
+        });
+        await claudeCodeRun?.dispose().catch((e: unknown) => {
+          logger.warn(
+            "failed to dispose Claude Code run resources",
+            { requestId: headers.request_id, sessionId: headers.session_id },
+            e,
+          );
+        });
+        await liveParentSession?.close();
       }
-      runIdleWatchdog?.stop();
-      rejectPreAgentCancellation = null;
-      unsubscribe();
-      unsubscribeCompaction();
-      await outputPublisher.drain();
-      await coreNamedClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
-        logger.warn(
-          "failed to retire Core named Claude runtime",
-          { requestId: headers.request_id, sessionId: headers.session_id },
-          e,
-        );
-      });
-      await corePrimaryClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
-        logger.warn(
-          "failed to retire Core primary Claude runtime",
-          { requestId: headers.request_id, sessionId: headers.session_id },
-          e,
-        );
-      });
-      await claudeCodeRun?.dispose().catch((e: unknown) => {
-        logger.warn(
-          "failed to dispose Claude Code run resources",
-          { requestId: headers.request_id, sessionId: headers.session_id },
-          e,
-        );
-      });
-      await liveParentSession?.close();
       state.agent = null;
       state.activeRequestId = null;
       state.activeRun = null;
       state.running = false;
       cancelledByRequestId.delete(headers.request_id);
       restartAbortRequestIds.delete(headers.request_id);
-      drainSessionQueue(sessionId, state).catch((e: unknown) => {
-        logger.error("drainSessionQueue failed", { sessionId }, e);
-      });
+      if (!terminalPanic) {
+        startSessionQueueDrain(sessionId, state);
+      }
     }
   }
 
@@ -5974,8 +6132,28 @@ export async function startBusAgentRunner(params: {
     getActiveLevel1Work,
     snapshotRecoverables,
     restoreRecoverables,
+    getActiveDrainOperation: () => activeDrainOperation,
+    getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {
       await stopSubscription();
+      if (terminalCleanupCompletion) {
+        let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+        const completed = await Promise.race([
+          terminalCleanupCompletion.then(() => true),
+          new Promise<false>((resolve) => {
+            deadlineTimer = setTimeout(() => resolve(false), TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS);
+            deadlineTimer.unref?.();
+          }),
+        ]).finally(() => {
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+        });
+        if (!completed) {
+          logger.warn("terminal agent-runner cleanup exceeded shutdown wait", {
+            timeoutMs: TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS,
+            pendingLabels: terminalCleanupOperations.map(({ label }) => label),
+          });
+        }
+      }
       bySession.clear();
       forcedRecoveryByRequestId.clear();
       restartAbortRequestIds.clear();

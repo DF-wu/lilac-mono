@@ -72,7 +72,10 @@ import {
   resolveRepliedToMessageText as resolveRepliedToMessageTextImpl,
 } from "./bus-request-router/context";
 import { decideActiveRequestRoute } from "./bus-request-router/decisions";
-import type { CustomCommandManager } from "../../custom-commands/manager";
+import {
+  customCommandInvocationErrorText,
+  type CustomCommandManager,
+} from "../../custom-commands/manager";
 
 type ActiveSessionState = {
   requestId: string;
@@ -494,40 +497,41 @@ export async function startBusRequestRouter(params: {
             };
           }
 
-          try {
-            const parsed = customCommands?.parseText(msg.data.text);
-            if (!parsed) {
-              return {
-                customCommand: {
-                  name: customName,
-                  args: [],
-                  text: msg.data.text,
-                  source: "text",
-                  error: `Unknown custom command '${customName}'.`,
-                },
-              };
-            }
-
-            return {
-              customCommand: {
-                name: parsed.command.def.name,
-                args: parsed.args,
-                ...(parsed.prompt ? { prompt: parsed.prompt } : {}),
-                text: parsed.text,
-                source: parsed.source,
-              },
-            };
-          } catch (error) {
+          const parsed = customCommands?.parseText(msg.data.text);
+          if (!parsed || parsed.status === "error") {
             return {
               customCommand: {
                 name: customName,
                 args: [],
                 text: msg.data.text,
                 source: "text",
-                error: error instanceof Error ? error.message : String(error),
+                error: parsed
+                  ? customCommandInvocationErrorText(parsed.error)
+                  : `Unknown custom command '${customName}'.`,
               },
             };
           }
+          if (!parsed.value) {
+            return {
+              customCommand: {
+                name: customName,
+                args: [],
+                text: msg.data.text,
+                source: "text",
+                error: `Unknown custom command '${customName}'.`,
+              },
+            };
+          }
+
+          return {
+            customCommand: {
+              name: parsed.value.command.def.name,
+              args: parsed.value.args,
+              ...(parsed.value.prompt ? { prompt: parsed.value.prompt } : {}),
+              text: parsed.value.text,
+              source: parsed.value.source,
+            },
+          };
         })();
 
         await publishSingleMessagePrompt({

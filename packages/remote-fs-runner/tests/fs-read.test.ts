@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { ReadFileStart } from "@stanley2058/lilac-fs";
+import type { ReadFileStart, RemoteFsDaemonRequest } from "@stanley2058/lilac-fs";
 
 import { handleRequest } from "../src/cli";
 
@@ -13,9 +13,10 @@ type ReadOutput = {
   content?: string;
   nextStart?: ReadFileStart;
 };
+type ReadTextInput = Extract<RemoteFsDaemonRequest, { op: "fs.read_text" }>["input"];
 
-async function runRead(cwd: string, input: Record<string, unknown>): Promise<ReadOutput> {
-  return (await handleRequest({ op: "fs.read_text", input, denyPaths: [], cwd })) as ReadOutput;
+async function runRead(cwd: string, input: ReadTextInput): Promise<ReadOutput> {
+  return await handleRequest({ op: "fs.read_text", input, denyPaths: [], cwd });
 }
 
 describe("remote fs runner reads", () => {
@@ -83,16 +84,17 @@ describe("remote fs runner reads", () => {
   it("rejects byte reads over the limit before returning base64", async () => {
     await writeFile(path.join(baseDir, "large.pdf"), Buffer.alloc(32));
 
-    const output = (await handleRequest({
+    const output = await handleRequest({
       op: "fs.read_bytes",
       input: { path: "large.pdf", maxBytes: 16 },
       denyPaths: [],
       cwd: baseDir,
-    })) as { ok: boolean; error?: string; base64?: string };
+    });
 
     expect(output.ok).toBe(false);
+    if (output.ok) throw new Error("expected oversized byte read to fail");
     expect(output.error).toContain("too large to inline");
     expect(output.error).not.toContain("Remote file too large");
-    expect(output.base64).toBeUndefined();
+    expect("base64" in output).toBeFalse();
   });
 });

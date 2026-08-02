@@ -6,7 +6,7 @@ type ProcessExitFn = (code: number) => never;
 
 export type ProcessHandlerParams = {
   logger: Logger;
-  stop: () => Promise<void>;
+  stop: (fatalError?: Error) => Promise<void>;
   recordUnhandledRejection?: (reason: unknown, promise: Promise<unknown>) => void;
   getExitCode?: () => number | undefined;
   setExitCode?: (code: number) => void;
@@ -16,6 +16,7 @@ export type ProcessHandlerParams = {
 
 export type ProcessHandlers = {
   handleSignal(signal: ProcessSignal): Promise<void>;
+  reportFatalError(error: Error): void;
   handleUncaughtException(error: unknown): void;
   handleUnhandledRejection(reason: unknown, promise: Promise<unknown>): void;
 };
@@ -54,13 +55,13 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
     forceExitTimer.unref?.();
   }
 
-  async function handleSignal(signal: ProcessSignal): Promise<void> {
+  async function handleSignal(signal: ProcessSignal, fatalError?: Error): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
 
     params.logger.info(`Received ${signal}, shutting down...`);
     try {
-      await params.stop();
+      await params.stop(fatalError);
     } catch (e) {
       params.logger.error("Shutdown failed", e);
       setExitCode(1);
@@ -89,7 +90,7 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
     scheduleForceExit(trigger);
 
     try {
-      await handleSignal("SIGTERM");
+      await handleSignal("SIGTERM", error instanceof Error ? error : undefined);
     } catch (e) {
       params.logger.error("Fatal shutdown handler failed", { trigger }, e);
       clearForceExitTimer();
@@ -100,6 +101,9 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
   return {
     async handleSignal(signal: ProcessSignal) {
       await handleSignal(signal);
+    },
+    reportFatalError(error: Error) {
+      void handleFatal("fatalReporter", error);
     },
     handleUncaughtException(error: unknown) {
       void handleFatal("uncaughtException", error).catch((e) => {

@@ -34,31 +34,82 @@ const ATTACHMENT_MIME_TYPES: ReadonlyMap<string, string> = new Map([
   [".webp", "image/webp"],
   [".pdf", "application/pdf"],
 ] as const);
-const readFileFailureSchema = z.object({ success: z.literal(false) }).passthrough();
 const searchFailureSchema = z.object({ error: z.string() }).passthrough();
 
-type ReadFileAttachmentOutput = {
-  success: true;
-  kind: "attachment";
-  resolvedPath: string;
-  fileHash: string;
-  filename: string;
-  mimeType: string;
-  bytes: number;
-  loadedInstructions?: readonly string[];
-  instructionsText?: string;
+const readFileStartSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("offset"), offset: z.number() }),
+  z.strictObject({ type: z.literal("line"), line: z.number(), column: z.number().optional() }),
+]);
+const readFileInstructionsShape = {
+  loadedInstructions: z.array(z.string()).optional(),
+  instructionsText: z.string().optional(),
 };
-
-function isReadFileAttachmentOutput(output: unknown): output is ReadFileAttachmentOutput {
-  return (
-    typeof output === "object" &&
-    output !== null &&
-    "success" in output &&
-    output.success === true &&
-    "kind" in output &&
-    output.kind === "attachment"
-  );
-}
+const readFileSuccessShape = {
+  success: z.literal(true),
+  resolvedPath: z.string(),
+  fileHash: z.string(),
+  startLine: z.number(),
+  endLine: z.number(),
+  totalLines: z.number(),
+  hasMoreLines: z.boolean(),
+  truncatedByChars: z.boolean(),
+  nextStart: readFileStartSchema.optional(),
+  warnings: z
+    .array(
+      z.strictObject({
+        code: z.literal("LINE_TOO_LONG_FOR_HASHLINE"),
+        message: z.string(),
+        line: z.number(),
+        maxLength: z.number(),
+        actualLength: z.number(),
+      }),
+    )
+    .optional(),
+  degradedFromHashline: z.boolean().optional(),
+  ...readFileInstructionsShape,
+};
+const readFileCallbackOutputSchema = z.union([
+  z.strictObject({
+    success: z.literal(false),
+    resolvedPath: z.string(),
+    error: z.strictObject({
+      code: z.enum(["NOT_FOUND", "PERMISSION", "UNKNOWN"]),
+      message: z.string(),
+    }),
+  }),
+  z.strictObject({ ...readFileSuccessShape, format: z.literal("raw"), content: z.string() }),
+  z.strictObject({
+    ...readFileSuccessShape,
+    format: z.literal("numbered"),
+    numberedContent: z.string(),
+  }),
+  z.strictObject({
+    ...readFileSuccessShape,
+    format: z.literal("hashline"),
+    hashlineContent: z.string(),
+  }),
+  z.strictObject({
+    success: z.literal(true),
+    kind: z.literal("artifact"),
+    resolvedPath: z.string(),
+    content: z.string(),
+    startOffset: z.number(),
+    endOffset: z.number(),
+    totalCharacters: z.number(),
+    nextStart: readFileStartSchema.optional(),
+    hasMore: z.boolean(),
+  }),
+  z.strictObject({
+    success: z.literal(true),
+    kind: z.literal("attachment"),
+    resolvedPath: z.string(),
+    fileHash: z.string(),
+    filename: z.string(),
+    mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]),
+    bytes: z.number(),
+    ...readFileInstructionsShape,
+  }),
+]);
 
 function inlineMediaLimitMessage(filename: string, mimeType: string, maxBytes: number): string {
   const guidance = mimeType.startsWith("image/")
@@ -255,33 +306,37 @@ export function createFilesystemTools(params: {
         };
       },
       toModelOutput: ({ toolCallId, output }) => {
-        if (readFileFailureSchema.safeParse(output).success) {
+        const decoded = readFileCallbackOutputSchema.safeParse(output);
+        if (!decoded.success) return { type: "json", value: output };
+        if (!decoded.data.success) {
           return { type: "error-json", value: output };
         }
-        if (!isReadFileAttachmentOutput(output)) return { type: "json", value: output };
+        if (!("kind" in decoded.data) || decoded.data.kind !== "attachment") {
+          return { type: "json", value: output };
+        }
 
         const bytes = binaryCacheByToolCallId.get(toolCallId);
         binaryCacheByToolCallId.delete(toolCallId);
         if (bytes === undefined) {
           return {
             type: "error-text",
-            value: `Failed to read attachment bytes for '${output.filename}'.`,
+            value: `Failed to read attachment bytes for '${decoded.data.filename}'.`,
           };
         }
 
-        const instructions = output.instructionsText?.trim();
+        const instructions = decoded.data.instructionsText?.trim();
         return {
           type: "content",
           value: [
             {
               type: "text",
-              text: `Attached file from read_file: ${output.filename} (${output.mimeType}, ${output.bytes} bytes).`,
+              text: `Attached file from read_file: ${decoded.data.filename} (${decoded.data.mimeType}, ${decoded.data.bytes} bytes).`,
             },
             ...(instructions ? [{ type: "text" as const, text: instructions }] : []),
             {
               type: "file",
-              mediaType: output.mimeType,
-              filename: output.filename,
+              mediaType: decoded.data.mimeType,
+              filename: decoded.data.filename,
               data: { type: "data", data: bytes.toString("base64") },
             },
           ],

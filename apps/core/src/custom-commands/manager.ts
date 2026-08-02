@@ -1,25 +1,210 @@
 import { pathToFileURL } from "node:url";
 
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   buildCustomCommandTextName,
   CUSTOM_COMMAND_TEXT_PREFIX,
   CUSTOM_COMMAND_TOOL_NAME,
+  decodeCustomCommandResult,
   discoverCustomCommands,
-  isValidCustomCommandResult,
+  isPanic,
+  isRecord,
+  opaqueErrorCause,
+  opaqueErrorMessage,
   type CustomCommandArgDef,
   type CustomCommandContext,
-  type CustomCommandModule,
+  type CustomCommandDiscoveryDependencies,
+  type CustomCommandDiscoveryError,
   type CustomCommandResult,
   type DiscoveredCustomCommand,
 } from "@stanley2058/lilac-utils";
 
-function validateArgChoice(arg: CustomCommandArgDef, value: unknown): unknown {
-  if (arg.type !== "string" || typeof value !== "string" || !arg.choices?.length) {
-    return value;
-  }
-  if (arg.choices.includes(value)) return value;
+type CustomCommandErrorDetails = {
+  readonly commandName: string;
+  readonly entrypointPath: string;
+  readonly message: string;
+};
 
-  throw new Error(`Argument '${arg.key}' must be one of: ${arg.choices.join(", ")}.`);
+export class CustomCommandImportError extends TaggedError("CustomCommandImportError")<
+  CustomCommandErrorDetails & { readonly cause: unknown }
+> {}
+
+export class CustomCommandExecuteMissingError extends TaggedError(
+  "CustomCommandExecuteMissingError",
+)<CustomCommandErrorDetails> {}
+
+export class CustomCommandExecuteThrownError extends TaggedError("CustomCommandExecuteThrownError")<
+  CustomCommandErrorDetails & { readonly cause: unknown }
+> {}
+
+export class CustomCommandExecuteRejectedError extends TaggedError(
+  "CustomCommandExecuteRejectedError",
+)<CustomCommandErrorDetails & { readonly cause: unknown }> {}
+
+export class CustomCommandResultInvalidError extends TaggedError(
+  "CustomCommandResultInvalidError",
+)<CustomCommandErrorDetails> {}
+
+export type CustomCommandExecutionError =
+  | CustomCommandImportError
+  | CustomCommandExecuteMissingError
+  | CustomCommandExecuteThrownError
+  | CustomCommandExecuteRejectedError
+  | CustomCommandResultInvalidError;
+
+export class CustomCommandUnknownError extends TaggedError("CustomCommandUnknownError")<{
+  readonly commandName: string;
+  readonly message: string;
+}> {}
+
+export class CustomCommandUnterminatedQuoteError extends TaggedError(
+  "CustomCommandUnterminatedQuoteError",
+)<{
+  readonly quote: "'" | '"';
+  readonly message: string;
+}> {}
+
+export class CustomCommandNumberArgumentError extends TaggedError(
+  "CustomCommandNumberArgumentError",
+)<{
+  readonly token: string;
+  readonly message: string;
+}> {}
+
+export class CustomCommandBooleanArgumentError extends TaggedError(
+  "CustomCommandBooleanArgumentError",
+)<{
+  readonly token: string;
+  readonly message: string;
+}> {}
+
+export class CustomCommandArgumentChoiceError extends TaggedError(
+  "CustomCommandArgumentChoiceError",
+)<{
+  readonly argumentKey: string;
+  readonly choices: readonly string[];
+  readonly value: string;
+  readonly message: string;
+}> {}
+
+export class CustomCommandUnknownArgumentError extends TaggedError(
+  "CustomCommandUnknownArgumentError",
+)<{
+  readonly argumentKey: string;
+  readonly commandTextName: string;
+  readonly message: string;
+}> {}
+
+export class CustomCommandRequiredArgumentError extends TaggedError(
+  "CustomCommandRequiredArgumentError",
+)<{
+  readonly argumentKey: string;
+  readonly message: string;
+}> {}
+
+type CustomCommandArgumentValueError =
+  | CustomCommandNumberArgumentError
+  | CustomCommandBooleanArgumentError;
+export type CustomCommandArgumentValue = string | number | boolean;
+export type CustomCommandInvocationError =
+  | CustomCommandUnknownError
+  | CustomCommandUnterminatedQuoteError
+  | CustomCommandArgumentValueError
+  | CustomCommandArgumentChoiceError
+  | CustomCommandUnknownArgumentError
+  | CustomCommandRequiredArgumentError;
+
+export function customCommandInvocationErrorText(error: CustomCommandInvocationError): string {
+  switch (error._tag) {
+    case "CustomCommandUnknownError":
+    case "CustomCommandUnterminatedQuoteError":
+    case "CustomCommandNumberArgumentError":
+    case "CustomCommandBooleanArgumentError":
+    case "CustomCommandArgumentChoiceError":
+    case "CustomCommandUnknownArgumentError":
+    case "CustomCommandRequiredArgumentError":
+      return error.message;
+  }
+}
+
+async function importCustomCommandModule(params: {
+  commandName: string;
+  entrypointPath: string;
+}): Promise<ResultType<unknown, CustomCommandImportError>> {
+  try {
+    return Result.ok(await import(pathToFileURL(params.entrypointPath).href));
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command import failure");
+    return Result.err(
+      new CustomCommandImportError({
+        ...params,
+        cause,
+        message: `Failed to import command '${params.commandName}': ${opaqueErrorMessage(cause, "Opaque custom-command import failure")}`,
+      }),
+    );
+  }
+}
+
+function invokeCustomCommand(params: {
+  commandName: string;
+  entrypointPath: string;
+  run: () => unknown;
+}): ResultType<unknown, CustomCommandExecuteThrownError> {
+  try {
+    return Result.ok(params.run());
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command execution failure");
+    return Result.err(
+      new CustomCommandExecuteThrownError({
+        commandName: params.commandName,
+        entrypointPath: params.entrypointPath,
+        cause,
+        message: `Command '${params.commandName}' threw while executing: ${opaqueErrorMessage(cause, "Opaque custom-command execution failure")}`,
+      }),
+    );
+  }
+}
+
+async function settleCustomCommand(params: {
+  commandName: string;
+  entrypointPath: string;
+  execution: unknown;
+}): Promise<ResultType<unknown, CustomCommandExecuteRejectedError>> {
+  try {
+    return Result.ok(await params.execution);
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    const cause = opaqueErrorCause(caught, "Opaque custom-command rejection");
+    return Result.err(
+      new CustomCommandExecuteRejectedError({
+        commandName: params.commandName,
+        entrypointPath: params.entrypointPath,
+        cause,
+        message: `Command '${params.commandName}' rejected while executing: ${opaqueErrorMessage(cause, "Opaque custom-command rejection")}`,
+      }),
+    );
+  }
+}
+
+function validateArgChoice(
+  arg: CustomCommandArgDef,
+  value: CustomCommandArgumentValue,
+): ResultType<CustomCommandArgumentValue, CustomCommandArgumentChoiceError> {
+  if (arg.type !== "string" || typeof value !== "string" || !arg.choices?.length) {
+    return Result.ok(value);
+  }
+  if (arg.choices.includes(value)) return Result.ok(value);
+
+  return Result.err(
+    new CustomCommandArgumentChoiceError({
+      argumentKey: arg.key,
+      choices: arg.choices,
+      value,
+      message: `Argument '${arg.key}' must be one of: ${arg.choices.join(", ")}.`,
+    }),
+  );
 }
 
 function parseStringToken(token: string): string {
@@ -33,28 +218,41 @@ function parseStringToken(token: string): string {
   return token;
 }
 
-function parseNumberToken(token: string): number {
+function parseNumberToken(token: string): ResultType<number, CustomCommandNumberArgumentError> {
   const value = Number(token);
   if (!Number.isFinite(value)) {
-    throw new Error(`Expected a number, got '${token}'.`);
+    return Result.err(
+      new CustomCommandNumberArgumentError({
+        token,
+        message: `Expected a number, got '${token}'.`,
+      }),
+    );
   }
-  return value;
+  return Result.ok(value);
 }
 
-function parseBooleanToken(token: string): boolean {
+function parseBooleanToken(token: string): ResultType<boolean, CustomCommandBooleanArgumentError> {
   const value = token.trim().toLowerCase();
-  if (["true", "1", "yes", "y", "on"].includes(value)) return true;
-  if (["false", "0", "no", "n", "off"].includes(value)) return false;
-  throw new Error(`Expected a boolean, got '${token}'.`);
+  if (["true", "1", "yes", "y", "on"].includes(value)) return Result.ok(true);
+  if (["false", "0", "no", "n", "off"].includes(value)) return Result.ok(false);
+  return Result.err(
+    new CustomCommandBooleanArgumentError({
+      token,
+      message: `Expected a boolean, got '${token}'.`,
+    }),
+  );
 }
 
-function parseArgValue(type: "string" | "number" | "boolean", raw: string): unknown {
-  if (type === "string") return parseStringToken(raw);
+function parseArgValue(
+  type: "string" | "number" | "boolean",
+  raw: string,
+): ResultType<CustomCommandArgumentValue, CustomCommandArgumentValueError> {
+  if (type === "string") return Result.ok(parseStringToken(raw));
   if (type === "number") return parseNumberToken(raw);
   return parseBooleanToken(raw);
 }
 
-function tokenize(text: string): string[] {
+function tokenize(text: string): ResultType<string[], CustomCommandUnterminatedQuoteError> {
   const out: string[] = [];
   let cur = "";
   let quote: "'" | '"' | null = null;
@@ -89,10 +287,15 @@ function tokenize(text: string): string[] {
   }
 
   if (quote) {
-    throw new Error(`Unterminated ${quote} quote in command input.`);
+    return Result.err(
+      new CustomCommandUnterminatedQuoteError({
+        quote,
+        message: `Unterminated ${quote} quote in command input.`,
+      }),
+    );
   }
   if (cur.length > 0) out.push(cur);
-  return out;
+  return Result.ok(out);
 }
 
 export type LoadedCustomCommand = DiscoveredCustomCommand & {
@@ -117,13 +320,21 @@ export class CustomCommandManager {
   private readonly byName = new Map<string, LoadedCustomCommand>();
   private readonly warnings: string[] = [];
 
-  constructor(private readonly dataDir: string) {}
+  constructor(
+    private readonly dataDir: string,
+    private readonly discoveryDependencies?: Partial<CustomCommandDiscoveryDependencies>,
+  ) {}
 
-  async init(): Promise<void> {
+  async init(): Promise<ResultType<void, CustomCommandDiscoveryError>> {
     this.byName.clear();
     this.warnings.length = 0;
 
-    for (const entry of await discoverCustomCommands({ dataDir: this.dataDir })) {
+    const discovered = await discoverCustomCommands({
+      dataDir: this.dataDir,
+      dependencies: this.discoveryDependencies,
+    });
+    if (discovered.status === "error") return discovered;
+    for (const entry of discovered.value) {
       if (entry.type === "invalid") {
         this.warnings.push(`${entry.invalid.dir}: ${entry.invalid.reason}`);
         continue;
@@ -144,6 +355,7 @@ export class CustomCommandManager {
         textName: buildCustomCommandTextName(cmd.def.name),
       });
     }
+    return Result.ok(undefined);
   }
 
   list(): LoadedCustomCommand[] {
@@ -167,51 +379,70 @@ export class CustomCommandManager {
     return name.length > 0 ? name : null;
   }
 
-  parseText(text: string): ParsedCustomCommandInvocation | null {
+  parseText(
+    text: string,
+  ): ResultType<ParsedCustomCommandInvocation | null, CustomCommandInvocationError> {
     const trimmed = text.trim();
-    if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return null;
+    if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return Result.ok(null);
 
-    const tokens = tokenize(trimmed.slice(1));
+    const tokenized = tokenize(trimmed.slice(1));
+    if (tokenized.status === "error") return tokenized;
+    const tokens = tokenized.value;
     const head = tokens.shift();
-    if (!head || !head.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return null;
+    if (!head || !head.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return Result.ok(null);
 
     const name = head.slice(CUSTOM_COMMAND_TEXT_PREFIX.length);
     const command = this.get(name);
-    if (!command) return null;
+    if (!command) return Result.ok(null);
     const parsed = this.parseArgsAndPrompt(command, tokens);
+    if (parsed.status === "error") return parsed;
 
-    return {
+    return Result.ok({
       command,
-      args: parsed.args,
-      prompt: parsed.prompt,
+      args: parsed.value.args,
+      prompt: parsed.value.prompt,
       text: trimmed,
       source: "text",
-    };
+    });
   }
 
   parseSlash(params: {
     name: string;
-    rawArgs: Record<string, unknown>;
+    rawArgs: Record<string, CustomCommandArgumentValue>;
     prompt?: string | null;
-  }): ParsedCustomCommandInvocation {
+  }): ResultType<ParsedCustomCommandInvocation, CustomCommandInvocationError> {
     const { name, rawArgs } = params;
     const command = this.get(name);
     if (!command) {
-      throw new Error(`Unknown custom command '${name}'.`);
+      return Result.err(
+        new CustomCommandUnknownError({
+          commandName: name,
+          message: `Unknown custom command '${name}'.`,
+        }),
+      );
     }
 
-    const args = command.def.args.map((arg) => {
+    const args: unknown[] = [];
+    for (const arg of command.def.args) {
       const value = rawArgs[arg.key];
       if (value === undefined || value === null) {
         if (arg.required) {
-          throw new Error(`Missing required argument '${arg.key}'.`);
+          return Result.err(
+            new CustomCommandRequiredArgumentError({
+              argumentKey: arg.key,
+              message: `Missing required argument '${arg.key}'.`,
+            }),
+          );
         }
-        return undefined;
+        args.push(undefined);
+        continue;
       }
-      return validateArgChoice(arg, value);
-    });
+      const choice = validateArgChoice(arg, value);
+      if (choice.status === "error") return choice;
+      args.push(choice.value);
+    }
 
-    return {
+    return Result.ok({
       command,
       args,
       prompt: params.prompt?.trim() ? params.prompt.trim() : null,
@@ -225,28 +456,55 @@ export class CustomCommandManager {
         params.prompt ?? null,
       ),
       source: "discord-slash",
-    };
+    });
   }
 
   async execute(params: {
     command: LoadedCustomCommand;
     args: unknown[];
     context: CustomCommandContext;
-  }): Promise<CustomCommandResult> {
-    const mod = (await import(
-      pathToFileURL(params.command.entrypointPath).href
-    )) as Partial<CustomCommandModule>;
-    if (typeof mod.execute !== "function") {
-      throw new Error(`Command '${params.command.def.name}' must export async execute(args, ctx).`);
-    }
+  }): Promise<ResultType<CustomCommandResult, CustomCommandExecutionError>> {
+    const commandName = params.command.def.name;
+    const entrypointPath = params.command.entrypointPath;
+    const imported = await importCustomCommandModule({ commandName, entrypointPath });
+    if (imported.status === "error") return imported;
 
-    const result = await mod.execute(params.args, params.context);
-    if (!isValidCustomCommandResult(result)) {
-      throw new Error(
-        `Command '${params.command.def.name}' returned an invalid tool result payload.`,
+    if (!isRecord(imported.value) || typeof imported.value["execute"] !== "function") {
+      return Result.err(
+        new CustomCommandExecuteMissingError({
+          commandName,
+          entrypointPath,
+          message: `Command '${commandName}' must export async execute(args, ctx).`,
+        }),
       );
     }
-    return result;
+
+    const execute = imported.value["execute"];
+    const execution = invokeCustomCommand({
+      commandName,
+      entrypointPath,
+      run: () => execute.call(imported.value, params.args, params.context),
+    });
+    if (execution.status === "error") return execution;
+
+    const settled = await settleCustomCommand({
+      commandName,
+      entrypointPath,
+      execution: execution.value,
+    });
+    if (settled.status === "error") return settled;
+
+    const decoded: CustomCommandResult | null = decodeCustomCommandResult(settled.value);
+    if (decoded === null) {
+      return Result.err(
+        new CustomCommandResultInvalidError({
+          commandName,
+          entrypointPath,
+          message: `Command '${commandName}' returned an invalid tool result payload.`,
+        }),
+      );
+    }
+    return Result.ok(decoded);
   }
 
   formatPreview(invocation: ParsedCustomCommandInvocation): string {
@@ -278,8 +536,8 @@ export class CustomCommandManager {
   private parseArgsAndPrompt(
     command: LoadedCustomCommand,
     tokens: readonly string[],
-  ): ParsedArgsAndPrompt {
-    const out = Array.from({ length: command.def.args.length }, () => undefined as unknown);
+  ): ResultType<ParsedArgsAndPrompt, CustomCommandInvocationError> {
+    const out: unknown[] = Array.from({ length: command.def.args.length });
     let pos = 0;
     let promptStartIndex: number | null = null;
 
@@ -291,12 +549,20 @@ export class CustomCommandManager {
         const raw = token.slice(eq + 1);
         const index = command.def.args.findIndex((arg) => arg.key === key);
         if (index < 0) {
-          throw new Error(`Unknown argument '${key}' for /${command.textName}.`);
+          return Result.err(
+            new CustomCommandUnknownArgumentError({
+              argumentKey: key,
+              commandTextName: command.textName,
+              message: `Unknown argument '${key}' for /${command.textName}.`,
+            }),
+          );
         }
-        out[index] = validateArgChoice(
-          command.def.args[index]!,
-          parseArgValue(command.def.args[index]!.type, raw),
-        );
+        const arg = command.def.args[index]!;
+        const parsedValue = parseArgValue(arg.type, raw);
+        if (parsedValue.status === "error") return parsedValue;
+        const choice = validateArgChoice(arg, parsedValue.value);
+        if (choice.status === "error") return choice;
+        out[index] = choice.value;
         continue;
       }
 
@@ -309,29 +575,34 @@ export class CustomCommandManager {
         break;
       }
 
-      let parsedValue: unknown;
-      try {
-        parsedValue = parseArgValue(arg.type, token);
-      } catch (error) {
-        if (arg.required) throw error;
+      const parsedValue = parseArgValue(arg.type, token);
+      if (parsedValue.status === "error") {
+        if (arg.required) return parsedValue;
         promptStartIndex = i;
         break;
       }
-      out[pos] = validateArgChoice(arg, parsedValue);
+      const choice = validateArgChoice(arg, parsedValue.value);
+      if (choice.status === "error") return choice;
+      out[pos] = choice.value;
       pos += 1;
     }
 
     for (let i = 0; i < command.def.args.length; i += 1) {
       const arg = command.def.args[i]!;
       if (arg.required && out[i] === undefined) {
-        throw new Error(`Missing required argument '${arg.key}'.`);
+        return Result.err(
+          new CustomCommandRequiredArgumentError({
+            argumentKey: arg.key,
+            message: `Missing required argument '${arg.key}'.`,
+          }),
+        );
       }
     }
 
-    return {
+    return Result.ok({
       args: out,
       prompt: promptStartIndex === null ? null : tokens.slice(promptStartIndex).join(" "),
-    };
+    });
   }
 }
 

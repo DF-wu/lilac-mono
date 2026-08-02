@@ -6,6 +6,7 @@ import {
   type PatchHunk,
   type UpdateFileChunk,
 } from "@stanley2058/lilac-coding-tools/apply-patch";
+import { canonicalizePathAsFarAsExists } from "@stanley2058/lilac-fs";
 
 export { parsePatch };
 
@@ -168,10 +169,12 @@ async function applyUpdateHunk(params: {
   resolvedPath: string;
   moveToResolvedPath?: string;
   chunks: UpdateFileChunk[];
+  signal?: AbortSignal;
 }): Promise<{ modifiedPath: string }> {
-  const { resolvedPath, moveToResolvedPath, chunks } = params;
+  const { resolvedPath, moveToResolvedPath, chunks, signal } = params;
 
-  const originalContent = await readFile(resolvedPath, "utf-8");
+  signal?.throwIfAborted();
+  const originalContent = await readFile(resolvedPath, { encoding: "utf-8", signal });
   let originalLines = originalContent.split("\n");
   if (originalLines.length > 0 && originalLines[originalLines.length - 1] === "") {
     originalLines.pop();
@@ -185,10 +188,13 @@ async function applyUpdateHunk(params: {
   const newContent = newLines.join("\n");
 
   const target = moveToResolvedPath ?? resolvedPath;
+  signal?.throwIfAborted();
   await mkdir(path.dirname(target), { recursive: true });
-  await writeFile(target, newContent, "utf-8");
+  signal?.throwIfAborted();
+  await writeFile(target, newContent, { encoding: "utf-8", signal });
 
   if (moveToResolvedPath && moveToResolvedPath !== resolvedPath) {
+    signal?.throwIfAborted();
     await rm(resolvedPath, { force: true });
   }
 
@@ -204,38 +210,58 @@ function isDeniedPath(resolvedPath: string, denyAbs: readonly string[]): boolean
   return false;
 }
 
-function assertAllowed(resolvedPath: string, denyAbs: readonly string[], operation: string): void {
+async function assertAllowed(
+  resolvedPath: string,
+  denyAbs: readonly string[],
+  operation: string,
+): Promise<void> {
   if (denyAbs.length === 0) return;
-  if (!isDeniedPath(resolvedPath, denyAbs)) return;
+  if (!isDeniedPath(resolvedPath, denyAbs)) {
+    const canonicalPath = await canonicalizePathAsFarAsExists(resolvedPath);
+    if (!isDeniedPath(canonicalPath, denyAbs)) return;
+  }
   throw new Error(`Access denied: '${resolvedPath}' is blocked for ${operation}`);
 }
 
 export async function applyHunks(
   baseDir: string,
   hunks: PatchHunk[],
-  options?: { denyPaths?: readonly string[] },
+  options?: { denyPaths?: readonly string[]; signal?: AbortSignal },
 ): Promise<string> {
+  options?.signal?.throwIfAborted();
   const baseResolved = path.resolve(expandTilde(baseDir));
-  const denyAbs = (options?.denyPaths ?? []).map((p) => path.resolve(expandTilde(p)));
+  const denyAbs = (
+    await Promise.all(
+      (options?.denyPaths ?? []).map(async (p) => {
+        const resolvedPath = path.resolve(expandTilde(p));
+        const canonicalPath = await canonicalizePathAsFarAsExists(resolvedPath);
+        return canonicalPath === resolvedPath ? [resolvedPath] : [resolvedPath, canonicalPath];
+      }),
+    )
+  ).flat();
   const touched: string[] = [];
 
   for (const hunk of hunks) {
+    options?.signal?.throwIfAborted();
     if (hunk.type === "add") {
       const dst = resolvePath(baseResolved, hunk.path);
-      assertAllowed(dst, denyAbs, "apply_patch");
+      await assertAllowed(dst, denyAbs, "apply_patch");
+      options?.signal?.throwIfAborted();
       await mkdir(path.dirname(dst), { recursive: true });
-      await writeFile(dst, hunk.contents, "utf-8");
+      options?.signal?.throwIfAborted();
+      await writeFile(dst, hunk.contents, { encoding: "utf-8", signal: options?.signal });
       touched.push(`A ${toDisplayPath(dst, baseResolved)}`);
       continue;
     }
 
     if (hunk.type === "delete") {
       const target = resolvePath(baseResolved, hunk.path);
-      assertAllowed(target, denyAbs, "apply_patch");
+      await assertAllowed(target, denyAbs, "apply_patch");
       const s = await stat(target).catch(() => null);
       if (s?.isDirectory()) {
         throw new Error(`Refusing to delete directory: ${hunk.path}`);
       }
+      options?.signal?.throwIfAborted();
       await rm(target, { force: true });
       touched.push(`D ${toDisplayPath(target, baseResolved)}`);
       continue;
@@ -244,14 +270,15 @@ export async function applyHunks(
     if (hunk.type === "update") {
       const src = resolvePath(baseResolved, hunk.path);
       const moveTo = hunk.movePath ? resolvePath(baseResolved, hunk.movePath) : undefined;
-      assertAllowed(src, denyAbs, "apply_patch");
+      await assertAllowed(src, denyAbs, "apply_patch");
       if (moveTo) {
-        assertAllowed(moveTo, denyAbs, "apply_patch");
+        await assertAllowed(moveTo, denyAbs, "apply_patch");
       }
       const { modifiedPath } = await applyUpdateHunk({
         resolvedPath: src,
         moveToResolvedPath: moveTo,
         chunks: hunk.chunks,
+        signal: options?.signal,
       });
       touched.push(`M ${toDisplayPath(modifiedPath, baseResolved)}`);
       continue;

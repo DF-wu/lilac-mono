@@ -4,12 +4,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic, Result } from "better-result";
 
 import {
   buildThreadSummaryInstructions,
   ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
 } from "../../src/conversation/thread-service";
+import { ConversationThreadSummarizationRemoteError } from "../../src/conversation/thread-worker";
 import type { ConversationThreadEmbeddingAdapter } from "../../src/conversation/thread-embedding";
 import {
   classifyConversationThreadMessageUpdate,
@@ -22,7 +24,10 @@ import {
 } from "../../src/surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../../src/surface/store/discord-surface-store";
 import type { SurfaceMessage } from "../../src/surface/types";
-import { ConversationThread } from "../../src/tool-server/tools/conversation-thread";
+import {
+  ConversationThread,
+  resolveConversationThreadSummarizationToolOperation,
+} from "../../src/tool-server/tools/conversation-thread";
 
 const tmpDirs: string[] = [];
 
@@ -1354,6 +1359,25 @@ describe("conversation thread store", () => {
     const dryRun = await service.runSummarization({ dryRun: true, now: eligibleNow });
     expect(dryRun.eligible).toBe(1);
     expect(dryRun.summarized).toBe(0);
+    expect(
+      await resolveConversationThreadSummarizationToolOperation(Promise.resolve(Result.ok(dryRun))),
+    ).toBe(dryRun);
+
+    const remoteFailure = new ConversationThreadSummarizationRemoteError({
+      jobId: "job-failed",
+      remoteMessage: "provider unavailable",
+      message: "provider unavailable",
+    });
+    const failedToolOperation = resolveConversationThreadSummarizationToolOperation(
+      Promise.resolve(Result.err(remoteFailure)),
+    );
+    await expect(failedToolOperation).rejects.toThrow("provider unavailable");
+    await expect(failedToolOperation).rejects.not.toBe(remoteFailure);
+
+    const panic = new Panic({ message: "summarization invariant failed" });
+    await expect(
+      resolveConversationThreadSummarizationToolOperation(Promise.reject(panic)),
+    ).rejects.toBe(panic);
 
     const run = await service.runSummarization({ now: eligibleNow });
     expect(run.summarized).toBe(1);

@@ -10,7 +10,11 @@ import {
 import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
 import { failureFlowBaseline } from "./failure-flow.baseline.ts";
 import type { ArchitectureManifest } from "./manifest.ts";
-import { architectureManifest, assertArchitectureManifestIntegrity } from "./manifest.ts";
+import {
+  architectureManifest,
+  assertArchitectureManifestIntegrity,
+  STAGE_3_MODULES,
+} from "./manifest.ts";
 import type { ArchitectureDiagnostic } from "./model.ts";
 import { ARCHITECTURE_RULES } from "./model.ts";
 import { createWorkspaceProgram, type WorkspaceProgram } from "./program.ts";
@@ -112,6 +116,7 @@ async function main(): Promise<void> {
     boundaryValidationBaseline,
     failureFlowBaseline,
     migratedWorkspaceNames(manifest),
+    STAGE_3_MODULES,
   );
   for (const diagnostic of evaluated.diagnostics) printDiagnostic(diagnostic);
   if (evaluated.diagnostics.some((diagnostic) => diagnostic.severity === "error"))

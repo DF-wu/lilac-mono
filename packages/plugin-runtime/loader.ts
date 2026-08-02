@@ -2,7 +2,17 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import type { LilacToolPlugin } from "./types";
+import { Result, type Result as ResultType } from "better-result";
+
+import {
+  decodeDynamicToolPluginModule,
+  isPluginPanic,
+  opaquePluginExceptionMessage,
+  safePluginExceptionCause,
+  type ToolPluginCapabilitySnapshot,
+} from "./capabilities";
+import { ToolPluginCapabilityError, ToolPluginModuleLoadError } from "./errors";
+import type { Level1ToolSpec, LilacToolPlugin, ServerTool } from "./types";
 
 async function copyDirectoryTree(sourceDir: string, targetDir: string): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
@@ -32,60 +42,72 @@ async function copyDirectoryTree(sourceDir: string, targetDir: string): Promise<
   }
 }
 
-export async function loadToolPluginModule(params: {
+async function createSnapshot(params: {
   entrypointPath: string;
   pluginDir?: string;
   cacheBustKey: string;
-}): Promise<LilacToolPlugin<unknown, unknown, unknown>> {
-  const snapshotPath = await (async () => {
-    if (!params.pluginDir) {
-      const parsedPath = path.parse(params.entrypointPath);
-      const extension = parsedPath.ext || ".js";
-      const nextPath = path.join(
-        parsedPath.dir,
-        `.${parsedPath.name}.lilac-${params.cacheBustKey}${extension}`,
-      );
+}): Promise<string> {
+  if (!params.pluginDir) {
+    const parsedPath = path.parse(params.entrypointPath);
+    const extension = parsedPath.ext || ".js";
+    const nextPath = path.join(
+      parsedPath.dir,
+      `.${parsedPath.name}.lilac-${params.cacheBustKey}${extension}`,
+    );
 
-      const source = await fs.readFile(params.entrypointPath);
-      await fs.writeFile(nextPath, source);
-      return nextPath;
-    }
-
-    const snapshotDir = path.join(params.pluginDir, `.lilac-${params.cacheBustKey}`);
-    await fs.rm(snapshotDir, { recursive: true, force: true });
-    await copyDirectoryTree(params.pluginDir, snapshotDir);
-    return path.join(snapshotDir, path.relative(params.pluginDir, params.entrypointPath));
-  })();
-
-  const url = pathToFileURL(snapshotPath);
-
-  const mod = await import(url.toString());
-  const importedDefault = mod.default;
-  const plugin: unknown = importedDefault;
-  if (
-    typeof plugin !== "object" ||
-    plugin === null ||
-    Array.isArray(plugin) ||
-    !("meta" in plugin) ||
-    !("create" in plugin)
-  ) {
-    throw new Error("Plugin entrypoint must default export a LilacToolPlugin");
+    const source = await fs.readFile(params.entrypointPath);
+    await fs.writeFile(nextPath, source);
+    return nextPath;
   }
 
-  const meta = plugin.meta;
-  if (
-    typeof meta !== "object" ||
-    meta === null ||
-    Array.isArray(meta) ||
-    !("id" in meta) ||
-    typeof meta.id !== "string" ||
-    meta.id.trim().length === 0 ||
-    ("name" in meta && meta.name !== undefined && typeof meta.name !== "string") ||
-    ("version" in meta && meta.version !== undefined && typeof meta.version !== "string") ||
-    typeof plugin.create !== "function"
-  ) {
-    throw new Error("Plugin entrypoint must default export a LilacToolPlugin");
+  const snapshotDir = path.join(params.pluginDir, `.lilac-${params.cacheBustKey}`);
+  await fs.rm(snapshotDir, { recursive: true, force: true });
+  await copyDirectoryTree(params.pluginDir, snapshotDir);
+  return path.join(snapshotDir, path.relative(params.pluginDir, params.entrypointPath));
+}
+
+async function importDynamicModule(specifier: string): Promise<unknown> {
+  return import(specifier);
+}
+
+export type ToolPluginLoaderError = ToolPluginModuleLoadError | ToolPluginCapabilityError;
+
+export async function loadToolPluginModuleCapability<TRuntimeContext = unknown>(params: {
+  entrypointPath: string;
+  pluginDir?: string;
+  cacheBustKey: string;
+}): Promise<ResultType<ToolPluginCapabilitySnapshot<TRuntimeContext>, ToolPluginLoaderError>> {
+  let imported: unknown;
+  try {
+    const snapshotPath = await createSnapshot(params);
+    imported = await importDynamicModule(pathToFileURL(snapshotPath).toString());
+  } catch (cause) {
+    if (isPluginPanic(cause)) throw cause;
+    return Result.err(
+      new ToolPluginModuleLoadError({
+        entrypointPath: params.entrypointPath,
+        cause: safePluginExceptionCause(cause),
+        message: `Failed to load plugin module at ${params.entrypointPath}: ${opaquePluginExceptionMessage(cause)}`,
+      }),
+    );
   }
 
-  return importedDefault;
+  const decoded = decodeDynamicToolPluginModule<TRuntimeContext>(imported);
+  if (decoded.status === "error") return decoded;
+  return Result.ok(decoded.value.plugin);
+}
+
+export async function loadToolPluginModule<TRuntimeContext = unknown>(params: {
+  entrypointPath: string;
+  pluginDir?: string;
+  cacheBustKey: string;
+}): Promise<
+  ResultType<
+    LilacToolPlugin<TRuntimeContext, Level1ToolSpec<TRuntimeContext>, ServerTool>,
+    ToolPluginLoaderError
+  >
+> {
+  const loaded = await loadToolPluginModuleCapability<TRuntimeContext>(params);
+  if (loaded.status === "error") return loaded;
+  return Result.ok(loaded.value.plugin);
 }

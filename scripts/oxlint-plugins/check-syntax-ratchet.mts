@@ -1,7 +1,11 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { architectureManifest, type ArchitectureManifest } from "../architecture/manifest.ts";
+import {
+  architectureManifest,
+  type ArchitectureManifest,
+  STAGE_3_MODULES,
+} from "../architecture/manifest.ts";
 import { validateWorkspaceInventory } from "../architecture/workspace-inventory.ts";
 import {
   findExceptionFlowViolations,
@@ -73,6 +77,7 @@ export function evaluateSyntaxRatchet(
   findings: readonly SyntaxFinding[],
   baseline: SyntaxBaseline,
   migratedWorkspaces: ReadonlySet<string>,
+  zeroBaselineModules: ReadonlyMap<string, readonly string[]> = new Map(),
 ): SyntaxRatchetEvaluation {
   const available = new Map<string, SyntaxBaselineEntry[]>();
   const diagnostics: SyntaxRatchetDiagnostic[] = [];
@@ -94,6 +99,16 @@ export function evaluateSyntaxRatchet(
         workspace: partitionWorkspace,
         entry,
         message: `Baseline workspace field '${entry.workspace}' does not match partition '${partitionWorkspace}'`,
+      });
+      continue;
+    }
+    if (zeroBaselineModules.get(partitionWorkspace)?.includes(entry.module)) {
+      diagnostics.push({
+        severity: "error",
+        rule,
+        workspace: partitionWorkspace,
+        entry,
+        message: "Migrated modules must keep active syntax-rule baselines at zero",
       });
       continue;
     }
@@ -244,7 +259,13 @@ async function main(): Promise<void> {
       .filter((workspace) => workspace.status === "migrated")
       .map((workspace) => workspace.root),
   );
-  const evaluation = evaluateSyntaxRatchet(findings, syntaxBaseline, migrated);
+  const stage3SyntaxModules = new Map(
+    [...STAGE_3_MODULES].map(([workspace, modules]) => [
+      workspace,
+      modules.map((module) => module.replace(/\.(?:[cm]?[jt]sx?)$/u, "")),
+    ]),
+  );
+  const evaluation = evaluateSyntaxRatchet(findings, syntaxBaseline, migrated, stage3SyntaxModules);
   for (const diagnostic of evaluation.diagnostics) {
     const output = diagnostic.severity === "error" ? console.error : console.warn;
     output(formatDiagnostic(diagnostic));

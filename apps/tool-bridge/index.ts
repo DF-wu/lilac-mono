@@ -17,6 +17,7 @@ const pluginManager = createCoreToolPluginManager({
 const server = createToolServer({
   pluginManager,
   logger,
+  reportFatalToolCallDefect: (defect) => handlers.reportFatalError(defect),
   onUnhealthy: async (snapshot) => {
     logger.error("Tool bridge unhealthy; exiting", {
       checks: snapshot.checks.filter((check) => !check.ok),

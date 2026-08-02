@@ -5,14 +5,25 @@ import ts from "typescript-codegen";
 
 import { analyzeWorkspace, declarationPackageName } from "./analyzer.ts";
 import { applyBaselines, baselineFromFindings, formatBaselineModule } from "./baseline.ts";
+import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
+import { failureFlowBaseline } from "./failure-flow.baseline.ts";
 import { createFingerprint } from "./fingerprint.ts";
 import type {
   ArchitectureManifest,
   OpenProtocolAdapter,
   WorkspaceArchitecture,
 } from "./manifest.ts";
-import { architectureManifest, assertArchitectureManifestIntegrity } from "./manifest.ts";
-import type { ArchitectureDiagnostic, ArchitectureRule } from "./model.ts";
+import {
+  architectureManifest,
+  assertArchitectureManifestIntegrity,
+  STAGE_3_MODULES,
+} from "./manifest.ts";
+import type {
+  ArchitectureBaseline,
+  ArchitectureDiagnostic,
+  ArchitectureRule,
+  BaselineEntry,
+} from "./model.ts";
 import { createWorkspaceProgram } from "./program.ts";
 import { analyzeArchitecture } from "./runner.ts";
 import { isProductionFileName } from "./source-policy.ts";
@@ -20,6 +31,11 @@ import {
   assertWorkspaceInventoryMatches,
   compareWorkspaceInventory,
 } from "./workspace-inventory.ts";
+import { syntaxBaseline } from "../oxlint-plugins/syntax-baseline.mts";
+import type {
+  SyntaxBaseline,
+  SyntaxBaselineEntry,
+} from "../oxlint-plugins/check-syntax-ratchet.mts";
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dir, "../..");
 const FIXTURE_ROOT = path.join(import.meta.dir, "fixtures/stage0");
@@ -107,6 +123,19 @@ describe("boundary validation rules", () => {
     expect(findings.some((finding) => finding.location?.line === 13)).toBeTrue();
     expect(findings.some((finding) => finding.location?.line === 17)).toBeFalse();
     expect(findings.some((finding) => finding.location?.line === 21)).toBeFalse();
+  });
+
+  test("matches reasoned opaque interface methods without exempting their module", () => {
+    const findings = findingsFor("architecture/no-domain-unknown", "domain.ts", {
+      opaqueUnknown: [
+        {
+          identity: { module: "domain.ts", exportName: "OpaqueContract.accept" },
+          reason: "Fixture interface method deliberately accepts an opaque extension value.",
+        },
+      ],
+    });
+    expect(findings.some((finding) => finding.location?.line === 51)).toBeFalse();
+    expect(findings.some((finding) => finding.location?.line === 52)).toBeTrue();
   });
 
   test("exception adapters exempt only their exact callable unknown parameters", () => {
@@ -522,6 +551,9 @@ describe("Stage 2 union rules", () => {
     const remoteRunner = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "packages/remote-fs-runner",
     );
+    const fs = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/fs",
+    );
     const tui = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/mini-lilac-tui",
     );
@@ -550,17 +582,42 @@ describe("Stage 2 union rules", () => {
         category: "request",
       },
     ]);
-    expect(remoteRunner?.boundaryDecoders).toEqual([
+    expect(remoteRunner?.boundaryDecoders).toEqual([]);
+    expect(fs?.boundaryDecoders).toEqual([
       {
-        identity: { module: "src/cli.ts", exportName: "ordinaryFileStartOrUndefined" },
-        category: "projection",
-      },
-      {
-        identity: { module: "src/cli.ts", exportName: "parseEnvelope" },
+        identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeJson" },
         category: "wire",
       },
       {
-        identity: { module: "src/cli.ts", exportName: "decodeDaemonResponseEnvelope" },
+        identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeRequest" },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeBundledRemoteRunnerRequest",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeRemoteFsRequest",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeRemoteFsDaemonRequest",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeRemoteRunnerResponse",
+        },
         category: "wire",
       },
     ]);
@@ -618,6 +675,377 @@ describe("Stage 2 union rules", () => {
         reason: "Reports an invalid chat response through the ChatTransport rejection contract.",
       },
     ]);
+  });
+
+  test("registers exact Stage 3 decoders, opaque inputs, capabilities, and adapters", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    const coding = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/coding-tools",
+    );
+    const plugins = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/plugin-runtime",
+    );
+    const utils = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/utils",
+    );
+    const remoteRunner = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/remote-fs-runner",
+    );
+
+    expect(core?.status).toBe("migrating");
+    expect(coding?.status).toBe("migrating");
+    expect(plugins?.status).toBe("migrating");
+    expect(utils?.status).toBe("migrating");
+    expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
+      "decodeThreadSummarizationWorkerRequest",
+    );
+    expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
+      "decodeThreadSummarizationWorkerResponse",
+    );
+    expect(coding?.boundaryDecoders).toContainEqual({
+      identity: { module: "src/filesystem.ts", exportName: "createFilesystemTools.toModelOutput" },
+      category: "projection",
+    });
+    expect(utils?.boundaryDecoders).toContainEqual({
+      identity: { module: "custom-commands.ts", exportName: "decodeCustomCommandResult" },
+      category: "plugin",
+    });
+    expect(utils?.boundaryDecoders).toContainEqual({
+      identity: { module: "custom-commands.ts", exportName: "readCustomCommandDefinition" },
+      category: "plugin",
+    });
+    expect(plugins?.capabilityPredicates).toEqual([
+      {
+        identity: { module: "capabilities.ts", exportName: "isFunctionCapability" },
+        reason:
+          "Checks one exact runtime capability without interpreting plugin-owned domain data.",
+      },
+      {
+        identity: { module: "capabilities.ts", exportName: "isPluginPanic" },
+        reason:
+          "Checks one exact runtime capability without interpreting plugin-owned domain data.",
+      },
+    ]);
+    expect(utils?.capabilityPredicates).toContainEqual({
+      identity: { module: "runtime-utils.ts", exportName: "isPanic" },
+      reason:
+        "Checks exact Panic identity while treating hostile classifier inspection as ordinary opaque failure.",
+    });
+    expect(utils?.exceptionAdapters).toContainEqual({
+      identity: { module: "runtime-utils.ts", exportName: "isPanic" },
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic.is" },
+      direction: "observe-panic",
+      reason:
+        "Recognizes genuine Panic while containing hostile proxy classification traps as ordinary opaque failure.",
+    });
+    expect(
+      plugins?.boundaryDecoders.some(
+        (decoder) => decoder.identity.exportName === "decodeDynamicToolPluginModule",
+      ),
+    ).toBeTrue();
+    expect(
+      plugins?.opaqueUnknown.some(
+        (entry) => entry.identity.exportName === "Level1ToolSpec.formatArgs",
+      ),
+    ).toBeTrue();
+    expect(
+      plugins?.opaqueUnknown.some((entry) => entry.identity.exportName === "<module>"),
+    ).toBeFalse();
+    expect(
+      plugins?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName === "loadToolPluginModuleCapability" &&
+          adapter.direction === "capture-external",
+      ),
+    ).toBeTrue();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) => adapter.identity.exportName === "CustomCommandManager.execute",
+      ),
+    ).toBeFalse();
+    expect(
+      core?.exceptionAdapters.filter((adapter) =>
+        [
+          "rethrowConversationThreadWorkerPanic",
+          "rethrowBusAgentRunnerPanic",
+          "rethrowBundledRemoteRunnerPanic",
+        ].includes(adapter.identity.exportName),
+      ),
+    ).toHaveLength(3);
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName ===
+            "startConversationThreadSummarizationWorker.handleWorkerPanic" &&
+          adapter.category === "defect-supervisor" &&
+          adapter.direction === "observe-panic",
+      ),
+    ).toBeTrue();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.module === "src/tool-server/tools/conversation-thread.ts" &&
+          adapter.identity.exportName === "ConversationThread.call" &&
+          adapter.category === "result-to-framework" &&
+          adapter.externalApi.exportName === "ServerTool.call" &&
+          adapter.direction === "signal-host",
+      ),
+    ).toBeTrue();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.module === "src/runtime/create-core-runtime.ts" &&
+          adapter.identity.exportName === "adaptCustomCommandInitializationResultToStartup" &&
+          adapter.category === "result-to-framework" &&
+          adapter.direction === "signal-host" &&
+          adapter.reason.includes("host startup"),
+      ),
+    ).toBeTrue();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName === "signalConversationThreadWorkerPanicToProcess" &&
+          adapter.category === "result-to-framework" &&
+          adapter.direction === "signal-host",
+      ),
+    ).toBeTrue();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) => adapter.identity.exportName === "startBusAgentRunner.drainSessionQueue",
+      ),
+    ).toBeFalse();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName ===
+            "startBusAgentRunner.startSessionQueueDrain.superviseDetachedDrain" &&
+          adapter.category === "defect-supervisor" &&
+          adapter.direction === "observe-panic",
+      ),
+    ).toBeTrue();
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName === "createProcessHandlers.reportFatalError" &&
+          adapter.category === "result-to-framework" &&
+          adapter.direction === "signal-host",
+      ),
+    ).toBeTrue();
+    expect(
+      remoteRunner?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName === "preservePanic" &&
+          adapter.category === "defect-supervisor",
+      ),
+    ).toBeTrue();
+    const remoteRunnerCaptureAdapters = remoteRunner?.exceptionAdapters
+      .filter((adapter) => adapter.direction === "capture-external")
+      .map((adapter) => adapter.identity.exportName);
+    expect(remoteRunnerCaptureAdapters).toContain("spawnDaemon");
+    expect(remoteRunnerCaptureAdapters).toContain("releaseStartupLock");
+    expect(remoteRunnerCaptureAdapters).not.toContain("tryAcquireStartupLock");
+    expect(
+      core?.exceptionAdapters.find(
+        (adapter) => adapter.identity.exportName === "decodeRemoteFsRunnerPackageSpec",
+      ),
+    ).toMatchObject({ category: "external-to-result", direction: "capture-external" });
+    expect(
+      core?.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName === "decodeRemoteFsRunnerPackageSpec" &&
+          adapter.category === "result-to-framework",
+      ),
+    ).toBeFalse();
+  });
+
+  test("activates exact Stage 3 Result and boundary zones and APIs", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    const plugins = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/plugin-runtime",
+    );
+    const remoteRunner = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/remote-fs-runner",
+    );
+    if (!core || !plugins || !remoteRunner) throw new Error("Stage 3 workspace missing");
+
+    for (const rule of [
+      "architecture/no-unhandled-exception-contract",
+      "architecture/no-unredacted-tagged-error-log",
+      "architecture/fallible-api-result",
+    ] as const) {
+      expect(core.ruleZones[rule]).toContainEqual({
+        include: "src/conversation/thread-worker.ts",
+      });
+      expect(plugins.ruleZones[rule]).toContainEqual({ include: "manager.ts" });
+      expect(remoteRunner.ruleZones[rule]).toEqual([{ include: "src/cli.ts" }]);
+    }
+    expect(core.ruleZones["architecture/no-domain-unknown"]).toContainEqual({
+      include: "src/custom-commands/manager.ts",
+    });
+    expect(core.operationalResultApis).toContainEqual({
+      module: "src/custom-commands/manager.ts",
+      exportName: "CustomCommandManager.execute",
+    });
+    for (const decoder of [
+      { exportName: "decodeToolRequestHeaders", category: "request" },
+      { exportName: "decodeToolPayload", category: "plugin" },
+      { exportName: "projectUnhandledRejectionReason", category: "projection" },
+      {
+        exportName: "createToolServer.recordUnhandledRejectionAtBoundary",
+        category: "projection",
+      },
+      { exportName: "projectFatalToolCallDefect", category: "projection" },
+    ] as const) {
+      expect(core.boundaryDecoders).toContainEqual({
+        identity: {
+          module: "src/tool-server/create-tool-server.ts",
+          exportName: decoder.exportName,
+        },
+        category: decoder.category,
+      });
+    }
+    for (const exportName of [
+      "validateToolServerOptions",
+      "createToolServer.authenticateContext",
+      "createToolServer.resolveSafetyMode",
+      "createToolServer.lookupTool",
+    ]) {
+      expect(core.operationalResultApis).toContainEqual({
+        module: "src/tool-server/create-tool-server.ts",
+        exportName,
+      });
+    }
+    for (const exportName of [
+      "adaptToolServerOptionsResultToHost",
+      "adaptToolAuthenticationResultToElysia",
+      "adaptSafetyModeResultToElysia",
+      "adaptToolRouteResultToElysia",
+      "adaptPluginLifecycleResultToHost",
+      "adaptPluginListResultToElysia",
+    ]) {
+      expect(core.exceptionAdapters).toContainEqual(
+        expect.objectContaining({
+          identity: { module: "src/tool-server/create-tool-server.ts", exportName },
+          category: "result-to-framework",
+          direction: "signal-host",
+        }),
+      );
+    }
+    for (const registration of [
+      {
+        exportName: "observeToolCallRejection",
+        category: "defect-supervisor",
+        direction: "observe-panic",
+      },
+      {
+        exportName: "superviseToolCallRejections",
+        category: "defect-supervisor",
+        direction: "observe-panic",
+      },
+      {
+        exportName: "signalFatalToolCallDefectToProcess",
+        category: "result-to-framework",
+        direction: "signal-host",
+      },
+    ] as const) {
+      expect(core.exceptionAdapters).toContainEqual(
+        expect.objectContaining({
+          identity: {
+            module: "src/tool-server/create-tool-server.ts",
+            exportName: registration.exportName,
+          },
+          category: registration.category,
+          direction: registration.direction,
+        }),
+      );
+    }
+    expect(plugins.operationalResultApis).toContainEqual({
+      module: "manager.ts",
+      exportName: "ToolPluginManager.reload",
+    });
+    expect(remoteRunner.operationalResultApis).toContainEqual({
+      module: "src/cli.ts",
+      exportName: "tryAcquireStartupLock",
+    });
+    expect(remoteRunner.operationalResultApis).toContainEqual({
+      module: "src/cli.ts",
+      exportName: "runRequest",
+    });
+  });
+
+  test("keeps every declared Stage 3 module out of semantic and syntax baselines", () => {
+    const semanticBaselines: readonly ArchitectureBaseline[] = [
+      boundaryValidationBaseline,
+      failureFlowBaseline,
+    ];
+    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
+    const stage3Debt: Array<{
+      readonly workspace: string;
+      readonly module: string;
+      readonly semanticDebt: readonly BaselineEntry[];
+      readonly syntaxDebt: readonly SyntaxBaselineEntry[];
+    }> = [];
+    for (const [workspace, modules] of STAGE_3_MODULES) {
+      const semanticEntries = semanticBaselines.flatMap((baseline) =>
+        Object.values(baseline[workspace] ?? {}).flatMap((entries) => entries ?? []),
+      );
+      const syntaxEntries = Object.values(typedSyntaxBaseline[workspace] ?? {}).flatMap(
+        (entries) => entries ?? [],
+      );
+      for (const module of modules) {
+        const syntaxModule = module.replace(/\.(?:[cm]?[jt]sx?)$/u, "");
+        const moduleDebt = {
+          workspace,
+          module,
+          semanticDebt: semanticEntries.filter((entry) => entry.location.file === module),
+          syntaxDebt: syntaxEntries.filter((entry) => entry.module === syntaxModule),
+        };
+        if (moduleDebt.semanticDebt.length || moduleDebt.syntaxDebt.length) {
+          stage3Debt.push(moduleDebt);
+        }
+      }
+    }
+    expect(stage3Debt).toEqual([]);
+  });
+
+  test("requires exact reasoned and exception-adapter registrations", () => {
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...BASE_WORKSPACE,
+            opaqueUnknown: [
+              { identity: { module: "domain.ts", exportName: "<module>" }, reason: "broad" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("must name an exact symbol");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...BASE_WORKSPACE,
+            exceptionAdapters: [
+              {
+                identity: { module: "adapter.ts", exportName: "capture.catch" },
+                category: "external-to-result",
+                externalApi: { package: "fixture", exportName: "operation" },
+                direction: "capture-external",
+                reason: "",
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("reason must be nonempty");
   });
 
   test("excludes the generated Core remote runner bundle but not its source", () => {
@@ -781,12 +1209,12 @@ describe("real declaration integration", () => {
     expect(resultLeaks.every((finding) => finding.message.includes("JSON.stringify"))).toBeTrue();
   });
 
-  test("registers only converted Core Stage 1 pilot symbols", () => {
+  test("retains converted Core Stage 1 pilot symbols alongside later stages", () => {
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/core",
     );
     if (!core) throw new Error("core workspace missing");
-    expect(core.operationalResultApis).toEqual([
+    expect(core.operationalResultApis.filter((api) => api.module.startsWith("src/mcp/"))).toEqual([
       { module: "src/mcp/config-file.ts", exportName: "readMcpConfigFile" },
       { module: "src/mcp/config-file.ts", exportName: "writeMcpConfigFileAtomic" },
       { module: "src/mcp/config-file.ts", exportName: "mutateMcpConfigFile" },
@@ -795,7 +1223,7 @@ describe("real declaration integration", () => {
       { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSourceMap" },
       { module: "src/mcp/value-source.ts", exportName: "validateHttpHeaders" },
     ]);
-    expect(core.ruleZones["architecture/fallible-api-result"]).toEqual([
+    expect(core.ruleZones["architecture/fallible-api-result"]?.slice(0, 2)).toEqual([
       { include: "src/mcp/value-source.ts" },
       { include: "src/mcp/config-file.ts" },
     ]);
@@ -1046,6 +1474,21 @@ describe("ratchet infrastructure", () => {
     expect(migrated.diagnostics.some((diagnostic) => diagnostic.severity === "error")).toBeTrue();
     expect(
       migrated.diagnostics.some((diagnostic) => diagnostic.message.includes("Migrated package")),
+    ).toBeTrue();
+    const migratedModule = applyBaselines(
+      [finding],
+      boundary,
+      {},
+      new Set(),
+      new Map([["fixture", ["domain.ts"]]]),
+    );
+    expect(
+      migratedModule.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+    ).toBeTrue();
+    expect(
+      migratedModule.diagnostics.some((diagnostic) =>
+        diagnostic.message.includes("Migrated module"),
+      ),
     ).toBeTrue();
   });
 

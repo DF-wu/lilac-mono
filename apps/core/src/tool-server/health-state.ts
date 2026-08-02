@@ -1,4 +1,5 @@
 import type { Logger } from "@stanley2058/simple-module-logger";
+import type { ToolPluginStatus } from "@stanley2058/lilac-plugin-runtime";
 import { performance } from "node:perf_hooks";
 
 import {
@@ -88,7 +89,7 @@ export type ToolServerHealthSnapshot = {
         overdueMs: number;
         requestId?: string;
       }>;
-      pluginStatuses?: readonly unknown[];
+      pluginStatuses?: readonly ToolPluginStatus[];
     };
     external?: Record<string, unknown>;
     unhandledRejection?: {
@@ -109,7 +110,7 @@ type ToolCallEntry = {
 };
 
 type ToolPluginManagerLike = {
-  getStatuses?(): readonly unknown[];
+  getStatuses?(): readonly ToolPluginStatus[];
 };
 
 export type ToolServerHealthConfig = {
@@ -407,10 +408,7 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
 
     const pluginStatuses = options.pluginManager?.getStatuses?.();
     if (pluginStatuses) {
-      const failedPlugins = pluginStatuses.filter((status) => {
-        if (!status || typeof status !== "object") return false;
-        return (status as { state?: unknown }).state === "failed";
-      });
+      const failedPlugins = pluginStatuses.filter((status) => status.state === "failed");
       checks.push({
         name: "plugins.load",
         ok: failedPlugins.length === 0,

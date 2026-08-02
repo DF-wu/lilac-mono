@@ -1,6 +1,11 @@
 import { asSchema, type FlexibleSchema } from "ai";
 import { z } from "zod";
-import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import {
+  getLevel1ContributionSnapshot,
+  invokeLevel1FormatArgs,
+  type Level1ContributionInfo,
+  type Level1ToolSpec,
+} from "@stanley2058/lilac-plugin-runtime";
 import { isRecord } from "@stanley2058/lilac-utils";
 
 import { formatRemoteDisplayPath, parseSshCwdTarget } from "../ssh/ssh-cwd";
@@ -276,14 +281,22 @@ export function formatToolArgsForDisplayWithSpecs(
   toolName: string,
   args: unknown,
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>,
+  contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>,
 ): string {
   const spec = toolSpecs?.get(toolName);
-  if (spec?.formatArgs) {
-    try {
-      return spec.formatArgs(args);
-    } catch {
-      return "";
-    }
+  if (spec) {
+    const contribution = contributionInfo?.get(spec) ??
+      getLevel1ContributionSnapshot(spec) ?? {
+        pluginId: `level1:${toolName}`,
+        source: "builtin",
+      };
+    const formatted = invokeLevel1FormatArgs({
+      pluginId: contribution.pluginId,
+      source: contribution.source,
+      spec,
+      args,
+    });
+    return formatted.status === "ok" ? (formatted.value ?? "") : "";
   }
 
   const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];

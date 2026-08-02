@@ -74,6 +74,11 @@ export function batchTool(params: {
   defaultCwd: string;
   getTools: () => ToolSet;
   getToolSpecs?: () => ReadonlyMap<string, Level1ToolSpec<unknown>>;
+  resolveEditTargets?: (
+    spec: Level1ToolSpec<unknown>,
+    input: unknown,
+    context: { cwd: string },
+  ) => Promise<Iterable<string>>;
   editingMode?: EditingToolMode | "none";
   maxCalls?: number;
 }) {
@@ -81,6 +86,7 @@ export function batchTool(params: {
     cwd: params.defaultCwd,
     getTools: params.getTools,
     getToolSpecs: params.getToolSpecs,
+    resolveEditTargets: params.resolveEditTargets,
     editingMode: params.editingMode,
     maxCalls: params.maxCalls,
     resolvePathKey: resolveTouchedPathKey,

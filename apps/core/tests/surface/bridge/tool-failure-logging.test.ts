@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import { Panic } from "better-result";
 
 import {
   formatToolLogPreview,
@@ -75,6 +76,64 @@ describe("summarizeToolFailure", () => {
     });
 
     expect(res).toEqual({ ok: false, failureKind: "soft", error: "custom failure" });
+  });
+
+  it("falls back when plugin summarizers fail or return malformed results", () => {
+    const failed: Level1ToolSpec<unknown> = {
+      name: "failed",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      summarizeFailure() {
+        throw new Error("summary boom");
+      },
+    };
+    const malformed: Level1ToolSpec<unknown> = {
+      name: "malformed",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      summarizeFailure: () => ({ ok: true }),
+    };
+    Object.defineProperty(malformed, "summarizeFailure", { value: () => ({ failureKind: "bad" }) });
+
+    expect(
+      summarizeToolFailure({
+        toolName: "failed",
+        isError: false,
+        result: {},
+        toolSpecs: new Map([["failed", failed]]),
+      }),
+    ).toEqual({ ok: true });
+    expect(
+      summarizeToolFailure({
+        toolName: "malformed",
+        isError: false,
+        result: {},
+        toolSpecs: new Map([["malformed", malformed]]),
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("propagates Panic from plugin summarizers", () => {
+    const panic = new Panic({ message: "summary invariant" });
+    const spec: Level1ToolSpec<unknown> = {
+      name: "panic",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      summarizeFailure() {
+        throw panic;
+      },
+    };
+    try {
+      summarizeToolFailure({
+        toolName: "panic",
+        isError: false,
+        result: {},
+        toolSpecs: new Map([["panic", spec]]),
+      });
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
   });
 });
 

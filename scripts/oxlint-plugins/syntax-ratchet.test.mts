@@ -96,4 +96,21 @@ describe("repository syntax ratchet", () => {
     expect(evaluation.diagnostics.every((item) => item.severity === "error")).toBe(true);
     expect(evaluation.diagnostics[0]?.message).toContain("baselines at zero");
   });
+
+  it("enforces a zero baseline for migrated modules", () => {
+    const baseline: SyntaxBaseline = {
+      "apps/example": { "lilac/no-exception-flow": [entry()] },
+    };
+    const evaluation = evaluateSyntaxRatchet(
+      [finding()],
+      baseline,
+      new Set(),
+      new Map([["apps/example", ["src/first"]]]),
+    );
+
+    expect(evaluation.matched).toBe(0);
+    expect(evaluation.diagnostics).toHaveLength(2);
+    expect(evaluation.diagnostics.every((item) => item.severity === "error")).toBe(true);
+    expect(evaluation.diagnostics[0]?.message).toContain("modules");
+  });
 });

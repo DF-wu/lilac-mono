@@ -46,3 +46,8 @@ export function overloaded(value: unknown): boolean {
 export const filtered = ["value" as unknown].filter((value: unknown): value is DomainValue =>
   isDomain(value),
 );
+
+export interface OpaqueContract {
+  accept(value: unknown): void;
+  reject(value: unknown): void;
+}

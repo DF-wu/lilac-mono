@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import path from "node:path";
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
@@ -27,6 +27,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import { jsonSchema, tool, type ModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Panic, Result } from "better-result";
 import {
   AiSdkPiAgent,
   attachAutoCompaction,
@@ -51,6 +52,7 @@ import {
   appendAdditionalSessionMemoBlock,
   buildAutoInjectedThreadSearchOverlay,
   buildCustomCommandFailureFinalText,
+  customCommandExecutionErrorText,
   consumeAssistantTextDelta,
   consumeReasoningChunkEvent,
   completeLevel1ToolMapping,
@@ -90,6 +92,7 @@ import {
   shouldCancelIdleOnlyGlobalRequest,
   shouldUsePersistentCoreClaudeRuntime,
   startBusAgentRunner,
+  startBusAgentRunnerTerminalCleanup,
   shouldEnableAnthropicPromptCache,
   selectPersistedTranscriptMessages,
   selectedLevel1ToolNames,
@@ -102,7 +105,17 @@ import {
   withReasoningSummaryDefaultForOpenAIModels,
   WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS,
   validateCorePrimaryLineageAtRunnerIntake,
+  type BusAgentRunnerTerminalCleanup,
 } from "../../../src/surface/bridge/bus-agent-runner";
+import {
+  CustomCommandExecuteMissingError,
+  CustomCommandExecuteRejectedError,
+  CustomCommandExecuteThrownError,
+  CustomCommandImportError,
+  CustomCommandResultInvalidError,
+  CustomCommandManager,
+  type CustomCommandExecutionError,
+} from "../../../src/custom-commands/manager";
 import { createCorePrimaryClaudeRuntime } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
 import {
   createCoreToolPluginManager,
@@ -175,6 +188,7 @@ function level1TestToolset(params?: {
   return {
     tools,
     specs: new Map(),
+    contributionInfo: new Map(),
     directToolNames: new Set(["builtin", "tool_search"]),
     catalog: [
       {
@@ -404,6 +418,7 @@ describe("runner Level 1 catalog selection", () => {
     const toolset: BuiltLevel1Toolset = {
       tools,
       specs: new Map(),
+      contributionInfo: new Map(),
       directToolNames: new Set(["batch"]),
       catalog: [
         {
@@ -1866,10 +1881,14 @@ function deferred<T>() {
   let resolvePromise: (value: T) => void = () => {
     throw new Error("deferred promise was not initialized");
   };
-  const promise = new Promise<T>((resolve) => {
+  let rejectPromise: (reason?: unknown) => void = () => {
+    throw new Error("deferred promise was not initialized");
+  };
+  const promise = new Promise<T>((resolve, reject) => {
     resolvePromise = resolve;
+    rejectPromise = reject;
   });
-  return { promise, resolve: resolvePromise };
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 type ProductionPathOutput = {
@@ -2120,7 +2139,244 @@ async function publishRunnerRequest(input: {
   );
 }
 
+describe("bus agent runner terminal cleanup", () => {
+  const synchronousLabels = [
+    "workflow-claim-timer-clear",
+    "control-capability-expire",
+    "workflow-request-expire",
+    "run-idle-watchdog-stop",
+    "agent-unsubscribe",
+    "compaction-unsubscribe",
+    "output-publisher-drain",
+  ] as const satisfies readonly BusAgentRunnerTerminalCleanup["label"][];
+
+  for (const failingLabel of synchronousLabels) {
+    it.each([
+      ["an ordinary Error", () => new Error(`${failingLabel} failed`)],
+      ["a Panic", () => new Panic({ message: `${failingLabel} invariant failed` })],
+    ] as const)(
+      `captures ${failingLabel} throwing %s without preventing cleanup`,
+      async (_, cause) => {
+        const failure = cause();
+        const originalPanic = new Panic({ message: "custom command invariant failed" });
+        const started: BusAgentRunnerTerminalCleanup["label"][] = [];
+        let nextQueueStarts = 0;
+        let operations: ReturnType<typeof startBusAgentRunnerTerminalCleanup>["operations"] = [];
+        const terminalOperation = (async () => {
+          try {
+            throw originalPanic;
+          } finally {
+            operations = startBusAgentRunnerTerminalCleanup(
+              synchronousLabels.map((label) => ({
+                label,
+                run: () => {
+                  started.push(label);
+                  if (label === failingLabel) throw failure;
+                },
+              })),
+            ).operations;
+          }
+        })();
+        const drainOperation = terminalOperation.then(() => {
+          nextQueueStarts += 1;
+        });
+        const drainRejection = drainOperation.then(
+          () => null,
+          (error: unknown) => error,
+        );
+        const observed = operations.map(({ operation }) =>
+          operation.then(
+            () => null,
+            (error: unknown) => error,
+          ),
+        );
+
+        expect(started).toEqual([...synchronousLabels]);
+        expect(await drainRejection).toBe(originalPanic);
+        expect(await Promise.all(observed)).toEqual(
+          synchronousLabels.map((label) => (label === failingLabel ? failure : null)),
+        );
+        expect(nextQueueStarts).toBe(0);
+      },
+    );
+  }
+
+  it.each([
+    ["ordinary errors", () => new Error("cleanup failed")],
+    ["Panics", () => new Panic({ message: "cleanup invariant failed" })],
+  ] as const)("supervises retire, dispose, and live-close %s independently", async (_, cause) => {
+    const labels = [
+      "core-named-retire",
+      "core-primary-retire",
+      "claude-dispose",
+      "live-close",
+    ] as const;
+    const started: BusAgentRunnerTerminalCleanup["label"][] = [];
+    const failures = labels.map(cause);
+    const cleanupGates = labels.map(() => deferred<void>());
+    const cleanupBatch = startBusAgentRunnerTerminalCleanup(
+      labels.map((label, index) => ({
+        label,
+        run: () => {
+          started.push(label);
+          return cleanupGates[index]?.promise;
+        },
+      })),
+    );
+    const operations = cleanupBatch.operations;
+    const observed = operations.map(({ operation }) =>
+      operation.then(
+        () => null,
+        (error: unknown) => error,
+      ),
+    );
+
+    expect(operations.map(({ label }) => label)).toEqual([...labels]);
+    expect(started).toEqual([...labels]);
+    for (const [index, gate] of cleanupGates.entries()) gate.reject(failures[index]);
+    expect(await Promise.all(observed)).toEqual(failures);
+    await expect(cleanupBatch.completion).resolves.toBeUndefined();
+  });
+});
+
 describe("startBusAgentRunner production path", () => {
+  it.each([
+    ["an ordinary Error", () => new Error("capability expiration failed")],
+    ["a Panic", () => new Panic({ message: "capability expiration invariant failed" })],
+  ] as const)(
+    "propagates custom command Panic when terminal cleanup throws %s",
+    async (_, cause) => {
+      const config = parseCoreConfigV1ToUniversal({});
+      const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-custom-panic-"));
+      const commandDir = path.join(dataDir, "cmds", "panic");
+      const commandStarted = deferred<void>();
+      const releaseCommand = deferred<void>();
+      await mkdir(commandDir, { recursive: true });
+      await writeFile(
+        path.join(commandDir, "def.json"),
+        JSON.stringify({ name: "panic", description: "Raise a test Panic" }),
+        "utf8",
+      );
+      await writeFile(
+        path.join(commandDir, "index.ts"),
+        "export async function execute() { return { type: 'json', value: null }; }\n",
+        "utf8",
+      );
+      const customCommands = new CustomCommandManager(dataDir);
+      const customCommandsInit = await customCommands.init();
+      if (customCommandsInit.status === "error") throw customCommandsInit.error;
+      customCommands.execute = async (input) => {
+        commandStarted.resolve(undefined);
+        await releaseCommand.promise;
+        throw input.args[0];
+      };
+      const pluginManager = corePrimaryTestPluginManager();
+      const bus = createLilacBus(createInMemoryRawBus());
+      let nextWorkStarts = 0;
+      const cleanupFailure = cause();
+      const fatalPanicReported = deferred<Panic>();
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: "production-custom-command-panic",
+        reportFatalPanic: fatalPanicReported.resolve,
+        config,
+        pluginManager,
+        customCommands,
+        issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+        expireControlCapability: () => {
+          throw cleanupFailure;
+        },
+        createAgent: () => {
+          nextWorkStarts += 1;
+          throw new Error("custom command Panic must stop before agent creation");
+        },
+      });
+      const requestId = "github:custom-panic:request";
+      const queuedRequestId = "github:custom-panic:queued";
+      const lifecycle = await observeRequestLifecycle(bus, requestId);
+      const queuedLifecycle = await observeRequestLifecycle(bus, queuedRequestId);
+      const panic = new Panic({ message: "custom command invariant failed" });
+
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          sessionId: "custom-panic",
+          text: "/lilac:panic",
+          raw: {
+            customCommand: {
+              name: "panic",
+              args: [panic],
+              text: "/lilac:panic",
+              source: "text",
+            },
+          },
+        });
+        const startedDrainOperation = runner.getActiveDrainOperation();
+        if (!startedDrainOperation) throw new Error("Expected the request to start a queue drain");
+        expect(
+          await Promise.race([
+            commandStarted.promise.then(() => "command-started" as const),
+            lifecycle.terminal,
+          ]),
+        ).toBe("command-started");
+        await publishRunnerRequest({
+          bus,
+          requestId: queuedRequestId,
+          sessionId: "custom-panic",
+          text: "must not start",
+        });
+        expect(queuedLifecycle.states).toEqual(["queued"]);
+
+        const activeDrainOperation = runner.getActiveDrainOperation();
+        if (!activeDrainOperation) throw new Error("Expected an active detached drain operation");
+        const rejectionObserved = activeDrainOperation.then(
+          () => null,
+          (error: unknown) => error,
+        );
+        releaseCommand.resolve(undefined);
+        expect(await rejectionObserved).toBe(panic);
+        expect(await fatalPanicReported.promise).toBe(panic);
+        const cleanupOperations = runner.getTerminalCleanupOperations();
+        const cleanupResults = await Promise.all(
+          cleanupOperations.map(({ operation }) =>
+            operation.then(
+              () => null,
+              (error: unknown) => error,
+            ),
+          ),
+        );
+        expect(cleanupOperations.map(({ label }) => label)).toEqual([
+          "control-capability-expire",
+          "run-idle-watchdog-stop",
+          "agent-unsubscribe",
+          "compaction-unsubscribe",
+          "output-publisher-drain",
+        ]);
+        expect(cleanupResults).toEqual([cleanupFailure, null, null, null, null]);
+        expect(lifecycle.states).toEqual(["running"]);
+        expect(queuedLifecycle.states).toEqual(["queued"]);
+        expect(nextWorkStarts).toBe(0);
+        await expect(
+          publishRunnerRequest({
+            bus,
+            requestId: "github:custom-panic:after-defect",
+            sessionId: "custom-panic",
+            text: "must be rejected",
+          }),
+        ).rejects.toBe(panic);
+      } finally {
+        releaseCommand.resolve(undefined);
+        await lifecycle.stop();
+        await queuedLifecycle.stop();
+        await runner.stop();
+        await pluginManager.destroy();
+        await bus.close();
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("latches the active model, applies an unqualified follow-up, and queues an explicit change", async () => {
     const config = parseCoreConfigV1ToUniversal({});
     config.models.main = { model: "openai/initial" };
@@ -2138,6 +2394,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-model-latch",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2222,6 +2479,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-cancel",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2285,6 +2543,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-fallback",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2334,6 +2593,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-phased-output",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       issueControlCapability: () => ({ capability: "test-capability", principal: null }),
@@ -2450,6 +2710,7 @@ describe("startBusAgentRunner production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-silent-turn",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager,
       transcriptStore: store,
@@ -2526,10 +2787,10 @@ describe("startBusAgentRunner production path", () => {
 function corePrimaryTestPluginManager(): CoreToolPluginManager {
   const toolset = level1TestToolset();
   return {
-    init: async () => {},
-    destroy: async () => {},
-    reload: async () => {},
-    ensureFresh: async () => {},
+    init: async () => Result.ok(),
+    destroy: async () => Result.ok(),
+    reload: async () => Result.ok(),
+    ensureFresh: async () => Result.ok(),
     getStatuses: () => [],
     getLevel2Tools: () => [],
     getLevel2ContributionInfo: () => new Map(),
@@ -2728,6 +2989,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-primary-auto-inject",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
@@ -3123,6 +3385,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-primary-claude",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
@@ -3447,6 +3710,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     const runner = await startBusAgentRunner({
       bus,
       subscriptionId: "production-primary-no-fallback",
+      reportFatalPanic: () => undefined,
       config,
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
@@ -6782,6 +7046,42 @@ describe("mergeToSingleUserMessage", () => {
 });
 
 describe("custom command failures", () => {
+  it.each([
+    new CustomCommandImportError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      cause: new Error("import cause"),
+      message: "safe import failure",
+    }),
+    new CustomCommandExecuteMissingError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      message: "safe missing execute failure",
+    }),
+    new CustomCommandExecuteThrownError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      cause: new Error("throw cause"),
+      message: "safe synchronous failure",
+    }),
+    new CustomCommandExecuteRejectedError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      cause: new Error("rejection cause"),
+      message: "safe rejection failure",
+    }),
+    new CustomCommandResultInvalidError({
+      commandName: "fixture",
+      entrypointPath: "/fixture/index.ts",
+      message: "safe malformed result failure",
+    }),
+  ] satisfies readonly CustomCommandExecutionError[])(
+    "maps $._tag to its compatibility error text",
+    (error) => {
+      expect(customCommandExecutionErrorText(error)).toBe(error.message);
+    },
+  );
+
   it("builds persisted finalText from the bounded normalized error", () => {
     const finalText = buildCustomCommandFailureFinalText({
       commandText: "/fixture",

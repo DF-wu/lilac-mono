@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import { Panic } from "better-result";
 
 import {
   formatToolArgsForDisplay,
@@ -165,5 +166,48 @@ describe("formatToolArgsForDisplay", () => {
     expect(formatToolArgsForDisplayWithSpecs("custom_tool", { anything: true }, specs)).toBe(
       " custom-display",
     );
+  });
+
+  it("omits malformed and failed plugin formatter output", () => {
+    const malformed: Level1ToolSpec<unknown> = {
+      name: "malformed",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      formatArgs: () => "valid",
+    };
+    Object.defineProperty(malformed, "formatArgs", { value: () => 42 });
+    const failed: Level1ToolSpec<unknown> = {
+      name: "failed",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      formatArgs() {
+        throw new Error("formatter boom");
+      },
+    };
+    const specs = new Map([
+      ["malformed", malformed],
+      ["failed", failed],
+    ]);
+
+    expect(formatToolArgsForDisplayWithSpecs("malformed", {}, specs)).toBe("");
+    expect(formatToolArgsForDisplayWithSpecs("failed", {}, specs)).toBe("");
+  });
+
+  it("propagates Panic from plugin formatters", () => {
+    const panic = new Panic({ message: "formatter invariant" });
+    const spec: Level1ToolSpec<unknown> = {
+      name: "panic",
+      createTool: () => ({}),
+      isEnabled: () => true,
+      formatArgs() {
+        throw panic;
+      },
+    };
+    try {
+      formatToolArgsForDisplayWithSpecs("panic", {}, new Map([["panic", spec]]));
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
   });
 });

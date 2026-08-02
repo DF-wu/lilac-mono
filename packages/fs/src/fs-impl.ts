@@ -38,6 +38,34 @@ export function expandTilde(input: string) {
   return input;
 }
 
+export async function canonicalizePathAsFarAsExists(inputPath: string): Promise<string> {
+  let current = resolve(inputPath);
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      return resolve(await fs.realpath(current), ...missingSegments);
+    } catch (error: unknown) {
+      const code = getErrorCode(error);
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+
+      const stats = await fs.lstat(current).catch(() => undefined);
+      if (stats?.isSymbolicLink()) {
+        const linkTarget = await fs.readlink(current);
+        current = isAbsolute(linkTarget)
+          ? resolve(linkTarget)
+          : resolve(dirname(current), linkTarget);
+        continue;
+      }
+
+      const parent = dirname(current);
+      if (parent === current) return resolve(current, ...missingSegments);
+      missingSegments.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
 function getErrorCode(e: unknown): string | undefined {
   if (!e || typeof e !== "object" || !("code" in e)) return undefined;
   const code = e.code;
@@ -634,34 +662,6 @@ export class FileSystem {
     throw err;
   }
 
-  private async canonicalizeAsFarAsExists(resolvedPath: string): Promise<string> {
-    let current = resolve(resolvedPath);
-    const missingSegments: string[] = [];
-
-    while (true) {
-      try {
-        return resolve(await fs.realpath(current), ...missingSegments);
-      } catch (error: unknown) {
-        const code = getErrorCode(error);
-        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
-
-        const stats = await fs.lstat(current).catch(() => undefined);
-        if (stats?.isSymbolicLink()) {
-          const linkTarget = await fs.readlink(current);
-          current = isAbsolute(linkTarget)
-            ? resolve(linkTarget)
-            : resolve(dirname(current), linkTarget);
-          continue;
-        }
-
-        const parent = dirname(current);
-        if (parent === current) return resolve(current, ...missingSegments);
-        missingSegments.unshift(basename(current));
-        current = parent;
-      }
-    }
-  }
-
   private resolvePath(inputPath: string, cwd?: string) {
     const expandedInput = expandTilde(inputPath);
     if (isAbsolute(expandedInput)) return resolve(expandedInput);
@@ -1059,7 +1059,7 @@ export class FileSystem {
 
     try {
       this.assertAllowed(resolvedPath, "writeFile");
-      const canonicalPath = await this.canonicalizeAsFarAsExists(resolvedPath);
+      const canonicalPath = await canonicalizePathAsFarAsExists(resolvedPath);
       this.assertAllowed(canonicalPath, "writeFile");
 
       let existed = true;

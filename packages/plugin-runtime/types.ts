@@ -95,6 +95,11 @@ export type Level1ToolRunContext<TRuntimeContext> = {
 export type Level1ToolBuildContext<TRuntimeContext> = Level1ToolRunContext<TRuntimeContext> & {
   getTools(): ToolSet;
   getLevel1ToolSpecs(): ReadonlyMap<string, Level1ToolSpec<TRuntimeContext>>;
+  resolveEditTargets(
+    spec: Level1ToolSpec<TRuntimeContext>,
+    args: unknown,
+    context: { cwd: string },
+  ): Promise<readonly string[]>;
   reportToolStatus?: (update: {
     toolCallId: string;
     status: "start" | "update" | "end";

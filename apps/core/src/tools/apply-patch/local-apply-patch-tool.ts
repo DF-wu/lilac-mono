@@ -56,13 +56,17 @@ export function localApplyPatchTool(
         "Apply a patch in '*** Begin Patch' format (*** Add/Update/Delete File, optional *** Move to:, @@ context blocks). Remote denylisted paths require dangerouslyAllow=true.",
       inputSchema: applyPatchInputSchema,
       outputSchema,
-      execute: async (input: PatchInput, { context }: { context?: unknown }) => {
+      execute: async (
+        input: PatchInput,
+        { context, abortSignal }: { context?: unknown; abortSignal?: AbortSignal },
+      ) => {
         const ctx =
           context && typeof context === "object" ? (context as Partial<ToolContext>) : undefined;
         try {
           const cwd = input.cwd ?? defaultCwd;
           const cwdTarget = parseSshCwdTarget(cwd);
           const hunks = parsePatch(input.patchText);
+          abortSignal?.throwIfAborted();
 
           logger.info("apply_patch start", {
             requestId: ctx?.requestId,
@@ -101,6 +105,7 @@ export function localApplyPatchTool(
               cwd: cwdTarget.cwd,
               patchText: input.patchText,
               dangerouslyAllow: input.dangerouslyAllow,
+              signal: abortSignal,
             });
             if (!remoteRes.ok) {
               throw new Error(remoteRes.error);
@@ -124,7 +129,10 @@ export function localApplyPatchTool(
             return { status: "completed" as const, output: remoteRes.output };
           }
 
-          const output = await applyHunks(cwd, hunks, { denyPaths: options?.denyPaths });
+          const output = await applyHunks(cwd, hunks, {
+            denyPaths: options?.denyPaths,
+            signal: abortSignal,
+          });
 
           const outputLines = output.split("\n");
           const changedLines = outputLines

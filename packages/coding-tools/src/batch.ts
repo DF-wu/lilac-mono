@@ -122,9 +122,9 @@ function enabledToolNames(
   specs?: ReadonlyMap<string, BatchToolSpec>,
 ): [string, ...string[]] {
   const names = specs?.size
-    ? [...specs.values()]
-        .filter((spec) => spec.name !== "batch" && spec.supportsBatch !== false)
-        .map((spec) => spec.name)
+    ? [...specs.entries()]
+        .filter(([name, spec]) => name !== "batch" && spec.supportsBatch !== false)
+        .map(([name]) => name)
     : Object.keys(tools).filter((name) => name !== "batch");
   if (names.length === 0) {
     throw new Error("batch requires at least one enabled Level-1 tool that has not opted out");
@@ -132,10 +132,15 @@ function enabledToolNames(
   return [names[0]!, ...names.slice(1)];
 }
 
-export function createBatchTool(params: {
+export function createBatchTool<TToolSpec extends BatchToolSpec = BatchToolSpec>(params: {
   cwd: string;
   getTools: () => ToolSet;
-  getToolSpecs?: () => ReadonlyMap<string, BatchToolSpec>;
+  getToolSpecs?: () => ReadonlyMap<string, TToolSpec>;
+  resolveEditTargets?: (
+    spec: TToolSpec,
+    input: unknown,
+    context: { cwd: string },
+  ) => Promise<Iterable<string>>;
   editingMode?: "apply_patch" | "edit_file" | "none";
   maxCalls?: number;
   resolvePathKey?: (cwd: string, targetPath: string) => string;
@@ -234,7 +239,9 @@ export function createBatchTool(params: {
           let touched: Iterable<string>;
           if (spec?.editTargets) {
             try {
-              touched = await spec.editTargets(child.input, { cwd });
+              touched = params.resolveEditTargets
+                ? await params.resolveEditTargets(spec, child.input, { cwd })
+                : await spec.editTargets(child.input, { cwd });
             } catch (error: unknown) {
               const message = error instanceof Error ? error.message : String(error);
               throw new Error(

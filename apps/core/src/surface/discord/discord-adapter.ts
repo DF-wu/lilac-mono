@@ -120,7 +120,10 @@ import {
   resolveEffectiveSessionModelOverride,
 } from "./discord-session-model";
 import type { MarkdownTableRenderOptions } from "../../shared/markdown-table-renderer";
-import type { CustomCommandManager } from "../../custom-commands/manager";
+import {
+  customCommandInvocationErrorText,
+  type CustomCommandManager,
+} from "../../custom-commands/manager";
 import { getSessionMode, resolveSessionConfigId } from "../bridge/bus-request-router/common";
 
 export {
@@ -1981,11 +1984,19 @@ export class DiscordAdapter implements SurfaceAdapter {
         }),
       );
       const prompt = interaction.options.getString(CUSTOM_COMMAND_PROMPT_ARG_KEY);
-      const parsed = this.opts!.customCommands!.parseSlash({
+      const parsedResult = this.opts!.customCommands!.parseSlash({
         name: custom.def.name,
         rawArgs,
         prompt,
       });
+      if (parsedResult.status === "error") {
+        await tryEditOrReplyEphemeral(
+          interaction,
+          `Failed to run custom command: ${customCommandInvocationErrorText(parsedResult.error)}`,
+        );
+        return;
+      }
+      const parsed = parsedResult.value;
       const preview = this.opts!.customCommands!.formatPreview(parsed);
       const parentChannelId = this.getParentChannelIdFromInteractionChannel(interaction);
       const sessionMode = getSessionMode(cfg, channelId, parentChannelId);

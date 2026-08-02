@@ -5,7 +5,7 @@ import path from "node:path";
 import { asSchema, jsonSchema, tool } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 
 import { createCoreToolPluginManager } from "../../src/plugins";
 import { McpRegistry } from "../../src/mcp";
@@ -705,6 +705,51 @@ export default {
     expect(callableIds).toContain("fixture.echo");
   });
 
+  it("captures hostile executable metadata getters at the plugin boundary", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "hostile-metadata",
+      entryBody: `const hostile = new Proxy({}, {
+  getPrototypeOf() { throw new Error("hostile prototype trap"); },
+  get() { throw new Error("hostile property trap"); },
+});
+export default {
+  meta: { id: "hostile-metadata" },
+  create() {
+    return { level1: [{
+      name: "hostile_metadata",
+      createTool() {
+        const executable = { execute() {} };
+        Object.defineProperty(executable, "title", { get() { throw hostile; } });
+        return executable;
+      },
+      isEnabled() { return true; },
+    }] };
+  },
+};`,
+    });
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    try {
+      await manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents!,
+      });
+      throw new Error("expected hostile metadata failure");
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(Error);
+      expect(cause instanceof Error ? cause.message : "").toContain("level1.executableMetadata");
+    }
+  });
+
   it("qualifies external registration keys by plugin while preserving raw status names", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -1086,5 +1131,71 @@ export default {
     });
     expect(direct.specs.has("plugin_profile_fixture_fixture_write")).toBe(true);
     await enabled.destroy();
+  });
+
+  it("turns malformed Level 1 hook results into a plain Core boundary failure", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "malformed-level1",
+      entryBody: `export default {
+  meta: { id: "malformed-level1" },
+  create() { return { level1: [{
+    name: "malformed",
+    createTool() { return {}; },
+    isEnabled() { return "yes"; },
+  }] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    await expect(
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+      }),
+    ).rejects.toThrow("Invalid hook result for plugin 'malformed-level1'");
+  });
+
+  it("propagates Panic from a Level 1 hook", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "panic-level1",
+      entryBody: `import { Panic } from ${JSON.stringify(import.meta.resolve("better-result"))};
+export default {
+  meta: { id: "panic-level1" },
+  create() { return { level1: [{
+    name: "panic",
+    createTool() { return {}; },
+    isEnabled() { throw new Panic({ message: "level1 invariant" }); },
+  }] }; },
+};`,
+    });
+    const cfg = testConfig({});
+    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
+    const initialized = await manager.init();
+    expect(initialized.status).toBe("ok");
+
+    try {
+      await manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: "primary",
+        editingToolMode: "none",
+        subagentDepth: 0,
+        subagentConfig: cfg.agent.subagents,
+      });
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
   });
 });

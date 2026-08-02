@@ -17,6 +17,7 @@ export function applyBaselines(
   boundaryValidation: ArchitectureBaseline,
   failureFlow: ArchitectureBaseline,
   migratedWorkspaces: ReadonlySet<string> = new Set(),
+  zeroBaselineModules: ReadonlyMap<string, readonly string[]> = new Map(),
 ): BaselineEvaluation {
   const byFingerprint = new Map(findings.map((finding) => [finding.fingerprint, finding]));
   const baselineFingerprints = new Set<string>();
@@ -30,6 +31,20 @@ export function applyBaselines(
       for (const rule of ARCHITECTURE_RULES) {
         if (RULE_GROUPS[rule] !== group) continue;
         for (const entry of rules[rule] ?? []) {
+          if (zeroBaselineModules.get(workspace)?.includes(entry.location.file)) {
+            stale.push({
+              rule,
+              severity: "error",
+              workspace,
+              message: `Migrated module retains a ${group} baseline entry: ${entry.reason}`,
+              suggestion:
+                "Fix the production violation and remove the baseline entry; migrated modules must keep hard-rule baselines at zero.",
+              identity: entry.identity,
+              fingerprint: `migrated-module-baseline:${entry.fingerprint}`,
+              location: entry.location,
+            });
+            continue;
+          }
           if (migratedWorkspaces.has(workspace)) {
             stale.push({
               rule,

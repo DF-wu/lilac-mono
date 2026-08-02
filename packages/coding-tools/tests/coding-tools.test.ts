@@ -706,15 +706,33 @@ describe("coding tools", () => {
   });
 
   it("read_file keeps image and PDF bytes out of its canonical result and attaches them for models", async () => {
-    const image = Buffer.from(
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
-      "base64",
+    const attachments = [
+      {
+        filename: "pixel.png",
+        mimeType: "image/png",
+        data: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+          "base64",
+        ),
+      },
+      { filename: "photo.jpg", mimeType: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff]) },
+      {
+        filename: "photo.jpeg",
+        mimeType: "image/jpeg",
+        data: Buffer.from([0xff, 0xd8, 0xff]),
+      },
+      { filename: "old.gif", mimeType: "image/gif", data: Buffer.from("GIF87a") },
+      { filename: "new.gif", mimeType: "image/gif", data: Buffer.from("GIF89a") },
+      {
+        filename: "image.webp",
+        mimeType: "image/webp",
+        data: Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]),
+      },
+      { filename: "notes.pdf", mimeType: "application/pdf", data: Buffer.from("%PDF-1.4") },
+    ] as const;
+    await Promise.all(
+      attachments.map(({ filename, data }) => writeFile(path.join(cwd, filename), data)),
     );
-    const pdf = Buffer.from("%PDF-1.4\n%%EOF\n");
-    await Promise.all([
-      writeFile(path.join(cwd, "pixel.png"), image),
-      writeFile(path.join(cwd, "notes.pdf"), pdf),
-    ]);
     const tools = createCodingToolset({
       cwd,
       readFileDirectAttachmentSupported: true,
@@ -722,17 +740,77 @@ describe("coding tools", () => {
     });
     const read = executable(tools, "read_file");
 
-    const imageResult = await read.execute({ path: "pixel.png" }, options("image-read"));
-    expect(imageResult).toMatchObject({
-      success: true,
-      kind: "attachment",
-      filename: "pixel.png",
-      mimeType: "image/png",
-      bytes: image.byteLength,
-    });
-    expect(JSON.stringify(imageResult)).not.toContain(image.toString("base64"));
+    for (const [index, attachment] of attachments.entries()) {
+      const toolCallId = `attachment-${index}`;
+      const result = await read.execute({ path: attachment.filename }, options(toolCallId));
+      expect(result).toMatchObject({
+        success: true,
+        kind: "attachment",
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        bytes: attachment.data.byteLength,
+      });
+      expect(JSON.stringify(result)).not.toContain(attachment.data.toString("base64"));
+      expect(
+        await toModelOutput(tools, "read_file", toolCallId, { path: attachment.filename }, result),
+      ).toEqual({
+        type: "content",
+        value: [
+          {
+            type: "text",
+            text: `Attached file from read_file: ${attachment.filename} (${attachment.mimeType}, ${attachment.data.byteLength} bytes).`,
+          },
+          {
+            type: "file",
+            mediaType: attachment.mimeType,
+            filename: attachment.filename,
+            data: { type: "data", data: attachment.data.toString("base64") },
+          },
+        ],
+      });
+    }
+    expect(tools.read_file?.description).toContain("native visual or document analysis");
+  });
+
+  it("read_file preserves attachment instructions and reports consumed attachment bytes", async () => {
+    const nestedDirectory = path.join(cwd, "nested");
+    const image = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    await mkdir(nestedDirectory);
+    await Promise.all([
+      writeFile(path.join(nestedDirectory, "AGENTS.md"), "Inspect images carefully.\n"),
+      writeFile(path.join(nestedDirectory, "pixel.png"), image),
+    ]);
+    const tools = createCodingToolset({ cwd, readFileDirectAttachmentSupported: true });
+    const attachment = z
+      .object({
+        success: z.literal(true),
+        kind: z.literal("attachment"),
+        filename: z.string(),
+        mimeType: z.string(),
+        bytes: z.number(),
+        loadedInstructions: z.array(z.string()),
+        instructionsText: z.string(),
+      })
+      .passthrough()
+      .parse(
+        await executable(tools, "read_file").execute(
+          { path: "nested/pixel.png" },
+          options("attachment-instructions"),
+        ),
+      );
+
+    expect(attachment.loadedInstructions).toEqual([path.join(nestedDirectory, "AGENTS.md")]);
     expect(
-      await toModelOutput(tools, "read_file", "image-read", { path: "pixel.png" }, imageResult),
+      await toModelOutput(
+        tools,
+        "read_file",
+        "attachment-instructions",
+        { path: "nested/pixel.png" },
+        attachment,
+      ),
     ).toEqual({
       type: "content",
       value: [
@@ -740,6 +818,7 @@ describe("coding tools", () => {
           type: "text",
           text: `Attached file from read_file: pixel.png (image/png, ${image.byteLength} bytes).`,
         },
+        { type: "text", text: attachment.instructionsText.trim() },
         {
           type: "file",
           mediaType: "image/png",
@@ -748,23 +827,85 @@ describe("coding tools", () => {
         },
       ],
     });
-
-    const pdfResult = await read.execute({ path: "notes.pdf" }, options("pdf-read"));
     expect(
-      await toModelOutput(tools, "read_file", "pdf-read", { path: "notes.pdf" }, pdfResult),
-    ).toMatchObject({
-      type: "content",
-      value: [
-        expect.anything(),
-        {
-          type: "file",
-          mediaType: "application/pdf",
-          filename: "notes.pdf",
-          data: { type: "data", data: pdf.toString("base64") },
-        },
-      ],
+      await toModelOutput(
+        tools,
+        "read_file",
+        "attachment-instructions",
+        { path: "nested/pixel.png" },
+        attachment,
+      ),
+    ).toEqual({
+      type: "error-text",
+      value: "Failed to read attachment bytes for 'pixel.png'.",
     });
-    expect(tools.read_file?.description).toContain("native visual or document analysis");
+  });
+
+  it("read_file does not access or consume attachment state for malformed callback outputs", async () => {
+    const image = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    await writeFile(path.join(cwd, "pixel.png"), image);
+    const tools = createCodingToolset({
+      cwd,
+      loadInstructions: false,
+      readFileDirectAttachmentSupported: true,
+    });
+    const read = executable(tools, "read_file");
+    const validOutput = {
+      success: true as const,
+      kind: "attachment" as const,
+      resolvedPath: path.join(cwd, "pixel.png"),
+      fileHash: "hash",
+      filename: "pixel.png",
+      mimeType: "image/png" as const,
+      bytes: image.byteLength,
+    };
+    const malformedOutputs = [
+      { ...validOutput, success: "true" },
+      { ...validOutput, kind: "file" },
+      { ...validOutput, resolvedPath: 1 },
+      { ...validOutput, fileHash: 1 },
+      { ...validOutput, filename: 1 },
+      { ...validOutput, mimeType: "application/octet-stream" },
+      { ...validOutput, bytes: `${image.byteLength}` },
+      { ...validOutput, loadedInstructions: [1] },
+      { ...validOutput, instructionsText: 1 },
+      { ...validOutput, unexpected: true },
+    ];
+
+    for (const [index, malformedOutput] of malformedOutputs.entries()) {
+      const toolCallId = `malformed-attachment-${index}`;
+      await read.execute({ path: "pixel.png" }, options(toolCallId));
+      expect(
+        await toModelOutput(tools, "read_file", toolCallId, { path: "pixel.png" }, malformedOutput),
+      ).toEqual({ type: "json", value: malformedOutput });
+      expect(
+        await toModelOutput(tools, "read_file", toolCallId, { path: "pixel.png" }, validOutput),
+      ).toMatchObject({
+        type: "content",
+        value: [
+          expect.anything(),
+          { type: "file", data: { type: "data", data: image.toString("base64") } },
+        ],
+      });
+    }
+
+    const malformedFailure = {
+      success: false,
+      resolvedPath: path.join(cwd, "missing.txt"),
+      error: { code: "INVALID", message: "missing" },
+    };
+    expect(
+      await toModelOutput(
+        tools,
+        "read_file",
+        "malformed-failure",
+        { path: "missing.txt" },
+        malformedFailure,
+      ),
+    ).toEqual({ type: "json", value: malformedFailure });
   });
 
   it("read_file rejects mislabeled attachments and projects structured failures as errors", async () => {

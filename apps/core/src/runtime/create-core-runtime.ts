@@ -6,6 +6,8 @@ import {
   errorMessage,
   formatTaggedErrorForLog,
   getCoreConfig,
+  isPanic,
+  opaqueErrorMessage,
   readCoreConfigVersion,
   resolveDiscordDbPath,
   resolveCoreConfigPath,
@@ -15,10 +17,12 @@ import {
   resolveTranscriptDbPath,
   toDurableResolvedModelRequest,
   toDurableResolvedModelPlan,
+  type CustomCommandDiscoveryError,
 } from "@stanley2058/lilac-utils";
 import path from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   createLilacBus,
   createRedisStreamsBus,
@@ -45,6 +49,7 @@ import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscoveryService } from "../discovery/discovery-service";
 import {
   ConversationThreadService,
+  type ConversationThreadRunSummarizationInput,
   type ConversationThreadToolService,
 } from "../conversation/thread-service";
 import { ConversationThreadStore } from "../conversation/thread-store";
@@ -56,6 +61,9 @@ import {
 import {
   startConversationThreadSummarizationWorker,
   startConversationThreadWorker,
+  ConversationThreadSummarizationRuntimeError,
+  ConversationThreadSummarizationTransportError,
+  type ConversationThreadSummarizationRuntimeOperation,
   type ConversationThreadSummarizationRunner,
 } from "../conversation/thread-worker";
 
@@ -77,6 +85,7 @@ import { WorkflowLiveParentBridge } from "../workflow/workflow-live-parent-bridg
 import { WorkflowSubagentDispatcher } from "../workflow/workflow-subagent-dispatcher";
 
 import { createToolServer } from "../tool-server/create-tool-server";
+import { resolveConversationThreadSummarizationToolOperation } from "../tool-server/tools/conversation-thread";
 import {
   HEARTBEAT_LEVEL2_CALLABLES,
   RequestControlAuthority,
@@ -110,7 +119,7 @@ import {
 
 export type CoreRuntime = {
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(priorPanic?: Panic | null): Promise<void>;
   recordUnhandledRejection(reason: unknown): void;
 };
 
@@ -123,7 +132,56 @@ export type CoreRuntimeOptions = {
   /** Override log level. Default: LOG_LEVEL env or "info". */
   logLevel?: LogLevel;
   onUnhealthy?: (snapshot: ToolServerHealthSnapshot) => void | Promise<void>;
+  reportFatalError: (error: Error) => void;
 };
+
+export function adaptCustomCommandInitializationResultToStartup(
+  result: ResultType<void, CustomCommandDiscoveryError>,
+  manager: CustomCommandManager,
+): CustomCommandManager {
+  if (result.status === "ok") return manager;
+  throw new Error(result.error.message);
+}
+
+export type CoreRuntimeCleanupFailure = {
+  readonly label: string;
+  readonly error: string;
+  readonly panic: boolean;
+};
+
+export type CoreRuntimeCleanupSupervisor = {
+  readonly failures: readonly CoreRuntimeCleanupFailure[];
+  run(label: string, cleanup: (() => Promise<void>) | undefined): Promise<void>;
+  finish(): void;
+};
+
+export function createCoreRuntimeCleanupSupervisor(
+  priorPanic: Panic | null,
+): CoreRuntimeCleanupSupervisor {
+  const failures: CoreRuntimeCleanupFailure[] = [];
+  let cleanupPanic: Panic | null = null;
+
+  async function run(label: string, cleanup: (() => Promise<void>) | undefined): Promise<void> {
+    if (!cleanup) return;
+    try {
+      await cleanup();
+    } catch (cause) {
+      const panic = isPanic(cause);
+      if (panic && !cleanupPanic) cleanupPanic = cause;
+      failures.push({
+        label,
+        error: opaqueErrorMessage(cause, "Opaque cleanup failure"),
+        panic,
+      });
+    }
+  }
+
+  function finish(): void {
+    if (!priorPanic && cleanupPanic) throw cleanupPanic;
+  }
+
+  return { failures, run, finish };
+}
 
 type CoreMcpStartupLogger = {
   info(message: string, details: Readonly<Record<string, unknown>>): void;
@@ -192,7 +250,7 @@ function fffCacheDir(): string {
   return path.join(env.dataDir, ".cache", "fff");
 }
 
-export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<CoreRuntime> {
+export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreRuntime> {
   const logger = createLogger({
     logLevel: opts.logLevel,
     module: "core-runtime",
@@ -251,8 +309,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
   const bus: LilacBus = createLilacBus(raw);
 
-  const customCommands = new CustomCommandManager(env.dataDir);
-  await customCommands.init();
+  const customCommandManager = new CustomCommandManager(env.dataDir);
+  const customCommands = adaptCustomCommandInitializationResultToStartup(
+    await customCommandManager.init(),
+    customCommandManager,
+  );
   const loadedCustomCommands = customCommands.list();
   const customCommandWarnings = customCommands.listWarnings();
   logger.info("custom commands initialized", {
@@ -599,6 +660,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
   async function start(): Promise<void> {
     if (started) return;
     started = true;
+    conversationThreadSummarizationStopping = false;
 
     try {
       logger.info("Core runtime starting...");
@@ -671,6 +733,27 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         entityMapper: conversationThreadEntityMapper,
       });
       conversationThreadService = threadService;
+      const captureSummarizationRuntimeOperation = async <T>(
+        operation: ConversationThreadSummarizationRuntimeOperation,
+        effect: () => Promise<T>,
+      ): Promise<ResultType<T, ConversationThreadSummarizationRuntimeError>> => {
+        try {
+          return Result.ok(await effect());
+        } catch (cause) {
+          rethrowPanic(cause);
+          return Result.err(
+            new ConversationThreadSummarizationRuntimeError({
+              operation,
+              cause,
+              message: errorMessage(cause),
+            }),
+          );
+        }
+      };
+      const runInProcessSummarization = (input: ConversationThreadRunSummarizationInput = {}) =>
+        captureSummarizationRuntimeOperation("in-process", () =>
+          threadService.runSummarization(input),
+        );
       stopConversationThreadSummarizationWorker = startConversationThreadSummarizationWorker({
         searchDbPath: discordSearchDbPath,
         surfaceDbPath: discordSurfaceDbPath,
@@ -678,47 +761,65 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       conversationThreadSummarizationRunner = {
         async runSummarization(input) {
           if (conversationThreadSummarizationStopping) {
-            throw new Error("conversation thread summarization is stopping");
+            return Result.err(
+              new ConversationThreadSummarizationTransportError({
+                operation: "stopped",
+                message: "conversation thread summarization is stopping",
+              }),
+            );
           }
           const trigger = input?.trigger ?? "manual";
-          const runner =
-            input?.dryRun === true || !stopConversationThreadSummarizationWorker
-              ? threadService
-              : stopConversationThreadSummarizationWorker;
           const flushStartedAt = Date.now();
           if (trigger === "periodic") {
             logger.info("conversation thread periodic summarization dispatch started", {
               limit: input?.limit,
             });
           }
-          await conversationThreadMaterializer?.flush();
+          const flushed = await captureSummarizationRuntimeOperation(
+            "materializer-flush",
+            async () => {
+              await conversationThreadMaterializer?.flush();
+            },
+          );
+          if (flushed.status === "error") return Result.err(flushed.error);
           if (trigger === "periodic") {
             logger.info("conversation thread periodic summarization materialization flushed", {
               durationMs: Date.now() - flushStartedAt,
             });
           }
           if (conversationThreadSummarizationStopping) {
-            throw new Error("conversation thread summarization is stopping");
+            return Result.err(
+              new ConversationThreadSummarizationTransportError({
+                operation: "stopped",
+                message: "conversation thread summarization is stopping",
+              }),
+            );
           }
-          if (
-            trigger === "periodic" &&
-            (await getCoreConfig()).conversation.thread.summarization.enabled !== true
-          ) {
-            logger.info("conversation thread periodic summarization cancelled after flush");
-            return {
-              dryRun: false,
-              refreshed: { channels: 0, threads: 0, messages: 0 },
-              eligible: 0,
-              eligibleTotal: 0,
-              eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
-              cleared: 0,
-              summarized: 0,
-              failed: 0,
-              failures: [],
-              threadIds: [],
-            };
+          if (trigger === "periodic") {
+            const config = await captureSummarizationRuntimeOperation("configuration", () =>
+              getCoreConfig(),
+            );
+            if (config.status === "error") return Result.err(config.error);
+            if (config.value.conversation.thread.summarization.enabled !== true) {
+              logger.info("conversation thread periodic summarization cancelled after flush");
+              return Result.ok({
+                dryRun: false,
+                refreshed: { channels: 0, threads: 0, messages: 0 },
+                eligible: 0,
+                eligibleTotal: 0,
+                eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+                cleared: 0,
+                summarized: 0,
+                failed: 0,
+                failures: [],
+                threadIds: [],
+              });
+            }
           }
-          return await runner.runSummarization(input);
+          if (input?.dryRun === true || !stopConversationThreadSummarizationWorker) {
+            return await runInProcessSummarization(input);
+          }
+          return await stopConversationThreadSummarizationWorker.runSummarization(input);
         },
       };
       discoveryService = new DiscoveryService({
@@ -870,9 +971,13 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
                 read: (input) => service.read(input),
                 planAutoInjectSearch: (input) => service.planAutoInjectSearch(input),
                 runSummarization: (input) =>
-                  summarizationRunner
-                    ? summarizationRunner.runSummarization(input)
-                    : service.runSummarization(input),
+                  resolveConversationThreadSummarizationToolOperation(
+                    summarizationRunner
+                      ? summarizationRunner.runSummarization(input)
+                      : captureSummarizationRuntimeOperation("in-process", () =>
+                          service.runSummarization(input),
+                        ),
+                  ),
               };
             })()
           : undefined;
@@ -899,6 +1004,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
       toolServer = createToolServer({
         pluginManager,
+        reportFatalToolCallDefect: opts.reportFatalError,
         logger: createLogger({
           module: "tool-server",
         }),
@@ -1019,6 +1125,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       stopAgentRunner = await startBusAgentRunner({
         bus,
         subscriptionId: subId(subscriptionPrefix, "agent-runner"),
+        reportFatalPanic: opts.reportFatalError,
         pluginManager,
         customCommands,
         cwd: canonicalWorkspaceRoot,
@@ -1147,28 +1254,24 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         `Core runtime started (tool-server port=${toolServerPort}, subscriptionPrefix=${subscriptionPrefix})`,
       );
     } catch (e) {
-      const msg = errorMessage(e);
-      logger.error(`Core runtime start failed: ${msg}`, e);
+      const msg = opaqueErrorMessage(e, "Opaque core runtime startup failure");
+      logger.error(`Core runtime start failed: ${msg}`, { error: msg });
+      if (isPanic(e)) {
+        await stop(e);
+        throw e;
+      }
       await stop();
       throw e;
     }
   }
 
-  async function stop(): Promise<void> {
+  async function stop(priorPanic: Panic | null = null): Promise<void> {
     if (!started) return;
     started = false;
     conversationThreadSummarizationStopping = true;
 
-    const stopErrors: unknown[] = [];
-
-    async function safe(label: string, fn: (() => Promise<void>) | undefined) {
-      if (!fn) return;
-      try {
-        await fn();
-      } catch (e) {
-        stopErrors.push({ label, error: e });
-      }
-    }
+    const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
+    const safe = cleanup.run;
 
     if (runtimeFullyStarted && stopAgentRunner && gracefulRestartStore) {
       const agentRunner = stopAgentRunner;
@@ -1376,10 +1479,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
 
     runtimeFullyStarted = false;
 
-    if (stopErrors.length > 0) {
-      logger.error({ stopErrors });
+    if (cleanup.failures.length > 0) {
+      logger.error({ stopErrors: cleanup.failures });
     }
 
+    cleanup.finish();
     logger.info("Core runtime stopped");
   }
 

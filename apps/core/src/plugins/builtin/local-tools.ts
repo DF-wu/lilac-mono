@@ -323,11 +323,19 @@ export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
       name: "batch",
       supportsBatch: false,
       isEnabled: () => true,
-      createTool: ({ cwd, editingToolMode, getTools, getLevel1ToolSpecs, runtime }) =>
+      createTool: ({
+        cwd,
+        editingToolMode,
+        getTools,
+        getLevel1ToolSpecs,
+        resolveEditTargets,
+        runtime,
+      }) =>
         batchTool({
           defaultCwd: cwd,
           getTools,
           getToolSpecs: getLevel1ToolSpecs,
+          resolveEditTargets,
           editingMode: editingToolMode,
           maxCalls: runtime.config?.tools.batch.maxCalls ?? 8,
         }).batch,

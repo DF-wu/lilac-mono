@@ -48,6 +48,7 @@ import {
   remoteReadFileBytes,
   remoteReadTextFile,
   toRemoteDebugPath,
+  type RemoteFuzzySearchOutput,
 } from "./remote-fs";
 
 const readErrorCodeSchema = z.enum(READ_ERROR_CODES);
@@ -840,28 +841,6 @@ export function fsTool(
     return { resolvedPath, hash };
   }
 
-  function isAttachmentOutput(
-    output: ReadFileOutput,
-  ): output is Extract<ReadFileOutput, { success: true; kind: "attachment" }> {
-    if (!output || typeof output !== "object") return false;
-    const o = output as unknown as Record<string, unknown>;
-    return (
-      o["success"] === true && o["kind"] === "attachment" && typeof o["resolvedPath"] === "string"
-    );
-  }
-
-  function isReadTextOutput(
-    output: ReadFileOutput,
-  ): output is Extract<ReadFileOutput, { success: true; format: "raw" | "numbered" | "hashline" }> {
-    if (!output || typeof output !== "object") return false;
-    const o = output as Record<string, unknown>;
-    return (
-      o["success"] === true &&
-      (o["format"] === "raw" || o["format"] === "numbered" || o["format"] === "hashline") &&
-      typeof o["resolvedPath"] === "string"
-    );
-  }
-
   const baseTools = {
     read_file: tool({
       description: buildReadFileDescription(),
@@ -932,7 +911,7 @@ export function fsTool(
         const ext = path.extname(input.path).toLowerCase();
         const wantsAttachment = readFileDirectAttachmentSupported && attachmentExts.has(ext);
 
-        const res = await (async () => {
+        const res: ReadFileOutput = await (async (): Promise<ReadFileOutput> => {
           if (wantsAttachment) {
             if (cwdTarget.kind === "ssh") {
               const bytesRes = await remoteReadFileBytes({
@@ -941,19 +920,28 @@ export function fsTool(
                 filePath: input.path,
                 denyPaths: remoteDenyPaths,
                 maxBytes: maxInlineMediaBytesPerPart,
+                signal: options.abortSignal,
               });
 
-              if (!bytesRes.ok) {
+              if (bytesRes.status === "error") {
+                return {
+                  success: false,
+                  resolvedPath: toRemoteDebugPath(cwdTarget.host, input.path),
+                  error: { code: "UNKNOWN", message: bytesRes.error.message },
+                };
+              }
+              const bytesOutput = bytesRes.value;
+              if (!bytesOutput.ok) {
                 const filename = path.basename(input.path);
                 const mimeType = inferMimeTypeFromFilename(filename);
-                const message = /too large|media limit|maximum \d+ bytes/i.test(bytesRes.error)
+                const message = /too large|media limit|maximum \d+ bytes/i.test(bytesOutput.error)
                   ? buildInlineMediaLimitMessage({
                       filename,
                       mimeType,
                       maxBytes: maxInlineMediaBytesPerPart,
-                      detail: bytesRes.error,
+                      detail: bytesOutput.error,
                     })
-                  : bytesRes.error;
+                  : bytesOutput.error;
                 return {
                   success: false as const,
                   resolvedPath: toRemoteDebugPath(cwdTarget.host, input.path),
@@ -964,16 +952,19 @@ export function fsTool(
                 };
               }
 
-              const bytes = Buffer.from(bytesRes.base64, "base64");
-              const remoteResolvedPath = toRemoteDebugPath(cwdTarget.host, bytesRes.resolvedPath);
+              const bytes = Buffer.from(bytesOutput.base64, "base64");
+              const remoteResolvedPath = toRemoteDebugPath(
+                cwdTarget.host,
+                bytesOutput.resolvedPath,
+              );
               recordRemoteFileAccess({
                 host: cwdTarget.host,
                 remoteCwd: cwdTarget.cwd,
                 inputPath: input.path,
-                resolvedPath: bytesRes.resolvedPath,
-                fileHash: bytesRes.fileHash,
+                resolvedPath: bytesOutput.resolvedPath,
+                fileHash: bytesOutput.fileHash,
               });
-              const filename = path.basename(bytesRes.resolvedPath);
+              const filename = path.basename(bytesOutput.resolvedPath);
 
               const detected = await fileTypeFromBuffer(bytes);
               if (!detected || !attachmentMimeTypes.has(detected.mime)) {
@@ -993,17 +984,17 @@ export function fsTool(
                 filename,
                 mimeType,
                 bytes,
-                fileHash: bytesRes.fileHash,
+                fileHash: bytesOutput.fileHash,
               });
 
               return {
                 success: true as const,
                 kind: "attachment" as const,
                 resolvedPath: remoteResolvedPath,
-                fileHash: bytesRes.fileHash,
+                fileHash: bytesOutput.fileHash,
                 filename,
                 mimeType,
-                bytes: bytesRes.bytesLength,
+                bytes: bytesOutput.bytesLength,
               };
             }
 
@@ -1094,17 +1085,26 @@ export function fsTool(
                 maxBytes: maxOutputBytes,
               },
               denyPaths: remoteDenyPaths,
+              signal: options.abortSignal,
             });
-            if (remoteRes.success) {
+            if (remoteRes.status === "error") {
+              return {
+                success: false,
+                resolvedPath: input.path,
+                error: { code: "UNKNOWN", message: remoteRes.error.message },
+              };
+            }
+            const remoteOutput = remoteRes.value;
+            if (remoteOutput.success) {
               recordRemoteFileAccess({
                 host: cwdTarget.host,
                 remoteCwd: cwdTarget.cwd,
                 inputPath: input.path,
-                resolvedPath: remoteRes.resolvedPath,
-                fileHash: remoteRes.fileHash,
+                resolvedPath: remoteOutput.resolvedPath,
+                fileHash: remoteOutput.fileHash,
               });
             }
-            return remoteRes;
+            return remoteOutput;
           }
           return await fileSystem.readFile(
             {
@@ -1119,16 +1119,28 @@ export function fsTool(
 
         const resQualified = (() => {
           if (cwdTarget.kind !== "ssh") return res;
-          if (isAttachmentOutput(res)) return res;
+          if (res.success && "kind" in res) {
+            switch (res.kind) {
+              case "artifact":
+              case "attachment":
+                return res;
+            }
+          }
           return {
             ...res,
             resolvedPath: toRemoteDebugPath(cwdTarget.host, res.resolvedPath),
-          } as ReadFileOutput;
+          };
         })();
 
         const withInstructions = await (async () => {
           if (!resQualified.success) return resQualified;
-          if (isAttachmentOutput(resQualified)) return resQualified;
+          if ("kind" in resQualified) {
+            switch (resQualified.kind) {
+              case "artifact":
+              case "attachment":
+                return resQualified;
+            }
+          }
           if (cwdTarget.kind === "ssh") {
             // Skip instruction auto-loading for remote reads for now.
             return resQualified;
@@ -1158,7 +1170,7 @@ export function fsTool(
             : 0;
 
         let textReadSummary;
-        if (isReadTextOutput(withInstructions)) {
+        if (withInstructions.success && !("kind" in withInstructions)) {
           let returnedChars: number;
           switch (withInstructions.format) {
             case "raw":
@@ -1183,14 +1195,19 @@ export function fsTool(
           };
         }
 
-        const attachmentSummary = isAttachmentOutput(withInstructions)
-          ? {
-              kind: "attachment" as const,
-              mimeType: withInstructions.mimeType,
-              filename: withInstructions.filename,
-              bytes: withInstructions.bytes,
-            }
-          : undefined;
+        let attachmentSummary;
+        if (
+          withInstructions.success &&
+          "kind" in withInstructions &&
+          withInstructions.kind === "attachment"
+        ) {
+          attachmentSummary = {
+            kind: "attachment" as const,
+            mimeType: withInstructions.mimeType,
+            filename: withInstructions.filename,
+            bytes: withInstructions.bytes,
+          };
+        }
 
         logger.info("fs.readFile done", {
           path: withInstructions.resolvedPath,
@@ -1206,9 +1223,14 @@ export function fsTool(
       },
       toModelOutput: async ({ toolCallId, output }) => {
         if (!output.success) return { type: "error-json", value: output };
-        if (!isAttachmentOutput(output)) {
-          // Preserve existing behavior for text reads and errors.
+        if (!("kind" in output)) {
           return { type: "json", value: output };
+        }
+        switch (output.kind) {
+          case "artifact":
+            return { type: "json", value: output };
+          case "attachment":
+            break;
         }
 
         const cached = binaryCacheByToolCallId.get(toolCallId);
@@ -1288,7 +1310,7 @@ export function fsTool(
         "Match filesystem paths using glob patterns. Recommended mode='default' for paths only; use mode='detailed' only when you need type/size. Denylisted paths require dangerouslyAllow=true.",
       inputSchema: globInputZod,
       outputSchema: globOutputZod,
-      execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GlobInput) => {
+      execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GlobInput, options) => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
         const mode = input.mode ?? "default";
         const cwdTarget = parseSshCwdTarget(opCwd);
@@ -1304,7 +1326,7 @@ export function fsTool(
         });
 
         if (cwdTarget.kind === "ssh") {
-          const res = await remoteGlob({
+          const remoteResult = await remoteGlob({
             host: cwdTarget.host,
             cwd: cwdTarget.cwd,
             patterns: input.patterns,
@@ -1312,7 +1334,15 @@ export function fsTool(
             mode,
             denyPaths: remoteDenyPaths,
             fsBackend,
+            signal: options.abortSignal,
           });
+          const res = (() => {
+            if (remoteResult.status === "ok") return remoteResult.value;
+            if (mode === "default") {
+              return { mode, truncated: false, paths: [], error: remoteResult.error.message };
+            }
+            return { mode, truncated: false, entries: [], error: remoteResult.error.message };
+          })();
 
           logger.info("fs.glob done", {
             entryCount: countGlobItems(res),
@@ -1366,7 +1396,10 @@ export function fsTool(
               "Fuzzy-ranked file/path search powered by FFF. Use this when you know an approximate filename, symbol-adjacent path, or path fragment and want likely files. Use grep instead when searching file contents or exact text inside files. Supports SSH cwd targets when the remote fff runner can be installed. Denylisted paths require dangerouslyAllow=true.",
             inputSchema: fuzzySearchInputZod,
             outputSchema: fuzzySearchOutputZod,
-            execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: FuzzySearchInput) => {
+            execute: async (
+              { cwd: opCwd, dangerouslyAllow, ...input }: FuzzySearchInput,
+              options,
+            ) => {
               if (opts?.enforceDenylist) dangerouslyAllow = false;
               const cwdTarget = parseSshCwdTarget(opCwd);
 
@@ -1380,7 +1413,7 @@ export function fsTool(
 
               if (cwdTarget.kind === "ssh") {
                 const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
-                const res = await remoteFuzzySearch({
+                const remoteResult = await remoteFuzzySearch({
                   host: cwdTarget.host,
                   cwd: cwdTarget.cwd,
                   input: {
@@ -1388,7 +1421,20 @@ export function fsTool(
                     maxResults: input.maxResults,
                   },
                   denyPaths: remoteDenyPaths,
+                  signal: options.abortSignal,
                 });
+                let res: RemoteFuzzySearchOutput;
+                if (remoteResult.status === "ok") {
+                  res = remoteResult.value;
+                } else {
+                  res = {
+                    results: [],
+                    totalMatched: 0,
+                    totalFiles: 0,
+                    truncated: false,
+                    error: `remote fff fuzzy_search unavailable: ${remoteResult.error.message}`,
+                  };
+                }
 
                 logger.info("fs.fuzzySearch done", {
                   resultCount: res.results.length,
@@ -1432,7 +1478,7 @@ export function fsTool(
         : "Search file contents. Recommended mode='default'; use mode='detailed' only when you need column/submatches metadata. Denylisted paths require dangerouslyAllow=true.",
       inputSchema: grepInputSchema,
       outputSchema: grepOutputSchema,
-      execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GrepInput) => {
+      execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: GrepInput, options) => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
         const mode = input.mode ?? "default";
         const cwdTarget = parseSshCwdTarget(opCwd);
@@ -1451,7 +1497,7 @@ export function fsTool(
         });
 
         if (cwdTarget.kind === "ssh") {
-          const res = await remoteGrep({
+          const remoteResult = await remoteGrep({
             host: cwdTarget.host,
             cwd: cwdTarget.cwd,
             input: {
@@ -1464,7 +1510,34 @@ export function fsTool(
             },
             denyPaths: remoteDenyPaths,
             fsBackend,
+            signal: options.abortSignal,
           });
+          const res = (() => {
+            if (remoteResult.status === "ok") return remoteResult.value;
+            switch (mode) {
+              case "default":
+                return {
+                  mode,
+                  truncated: false,
+                  results: [],
+                  error: remoteResult.error.message,
+                };
+              case "detailed":
+                return {
+                  mode,
+                  truncated: false,
+                  results: [],
+                  error: remoteResult.error.message,
+                };
+              case "hashline":
+                return {
+                  mode,
+                  truncated: false,
+                  results: [],
+                  error: remoteResult.error.message,
+                };
+            }
+          })();
 
           if (res.mode === "hashline") {
             for (const match of res.results) {
@@ -1529,7 +1602,10 @@ export function fsTool(
         : "Edit a file by find-and-replace. By default, oldText must be unique in the file. Set replaceAll=true to update all matches. Denylisted paths require dangerouslyAllow=true.",
       inputSchema: editFileSchema,
       outputSchema: editFileOutputZod,
-      execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: EditFileInput) => {
+      execute: async (
+        { cwd: opCwd, dangerouslyAllow, ...input }: EditFileInput,
+        options: { abortSignal?: AbortSignal },
+      ) => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
         const cwdTarget = parseSshCwdTarget(opCwd);
         const remoteDenyPaths = resolveRemoteDenyPaths(dangerouslyAllow);
@@ -1585,14 +1661,29 @@ export function fsTool(
                     expectedHash,
                   },
                   denyPaths: remoteDenyPaths,
+                  signal: options.abortSignal,
                 });
-                if (remoteRes.success) {
+                if (remoteRes.status === "error") {
+                  if (resolvedPathHint) {
+                    remoteResolvedPathByLookup.set(
+                      remoteLookupKey(cwdTarget.host, cwdTarget.cwd, hashlineInput.path),
+                      resolvedPathHint,
+                    );
+                  }
+                  return normalizeEditOutput({
+                    success: false,
+                    resolvedPath: toRemoteDebugPath(cwdTarget.host, hashlineInput.path),
+                    error: { code: "UNKNOWN", message: remoteRes.error.message },
+                  });
+                }
+                const remoteOutput = remoteRes.value;
+                if (remoteOutput.success) {
                   recordRemoteFileAccess({
                     host: cwdTarget.host,
                     remoteCwd: cwdTarget.cwd,
                     inputPath: hashlineInput.path,
-                    resolvedPath: remoteRes.resolvedPath,
-                    fileHash: remoteRes.newHash,
+                    resolvedPath: remoteOutput.resolvedPath,
+                    fileHash: remoteOutput.newHash,
                   });
                 } else if (resolvedPathHint) {
                   remoteResolvedPathByLookup.set(
@@ -1601,8 +1692,8 @@ export function fsTool(
                   );
                 }
                 return normalizeEditOutput({
-                  ...remoteRes,
-                  resolvedPath: toRemoteDebugPath(cwdTarget.host, remoteRes.resolvedPath),
+                  ...remoteOutput,
+                  resolvedPath: toRemoteDebugPath(cwdTarget.host, remoteOutput.resolvedPath),
                 });
               }
 
@@ -1674,15 +1765,30 @@ export function fsTool(
                     mode: "legacy",
                   },
                   denyPaths: remoteDenyPaths,
+                  signal: options.abortSignal,
                 });
+                if (remoteRes.status === "error") {
+                  if (resolvedPathHint) {
+                    remoteResolvedPathByLookup.set(
+                      remoteLookupKey(cwdTarget.host, cwdTarget.cwd, legacyInput.path),
+                      resolvedPathHint,
+                    );
+                  }
+                  return normalizeEditOutput({
+                    success: false,
+                    resolvedPath: toRemoteDebugPath(cwdTarget.host, legacyInput.path),
+                    error: { code: "UNKNOWN", message: remoteRes.error.message },
+                  });
+                }
+                const remoteOutput = remoteRes.value;
 
-                if (remoteRes.success) {
+                if (remoteOutput.success) {
                   recordRemoteFileAccess({
                     host: cwdTarget.host,
                     remoteCwd: cwdTarget.cwd,
                     inputPath: legacyInput.path,
-                    resolvedPath: remoteRes.resolvedPath,
-                    fileHash: remoteRes.newHash,
+                    resolvedPath: remoteOutput.resolvedPath,
+                    fileHash: remoteOutput.newHash,
                   });
                 } else if (resolvedPathHint) {
                   remoteResolvedPathByLookup.set(
@@ -1692,8 +1798,8 @@ export function fsTool(
                 }
 
                 return normalizeEditOutput({
-                  ...remoteRes,
-                  resolvedPath: toRemoteDebugPath(cwdTarget.host, remoteRes.resolvedPath),
+                  ...remoteOutput,
+                  resolvedPath: toRemoteDebugPath(cwdTarget.host, remoteOutput.resolvedPath),
                 });
               }
 

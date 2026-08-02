@@ -261,6 +261,21 @@ function identityMatches(owner: SymbolIdentity, candidate: NodeIdentity): boolea
   return owner.module === candidate.module && owner.exportName === candidate.symbolPath;
 }
 
+function parameterContractIdentity(
+  node: ts.ParameterDeclaration,
+  workspaceRoot: string,
+): NodeIdentity | undefined {
+  const signature = node.parent;
+  if (
+    !ts.isMethodSignature(signature) &&
+    !ts.isCallSignatureDeclaration(signature) &&
+    !ts.isFunctionTypeNode(signature)
+  ) {
+    return undefined;
+  }
+  return nodeIdentity(signature, workspaceRoot);
+}
+
 function isUnknown(type: ts.Type): boolean {
   return (type.flags & ts.TypeFlags.Unknown) !== 0;
 }
@@ -1136,6 +1151,7 @@ function analyzeResultContract(
   if (
     activeRules.has("architecture/fallible-api-result") &&
     workspace.operationalResultApis.some((api) => identityMatches(api, identity)) &&
+    !ts.isFunctionTypeNode(node) &&
     !isFallibleResultContract(returnType, checker, packageRoots) &&
     !reported.has(`fallible:${key}`)
   ) {
@@ -1200,6 +1216,12 @@ function analyzeParameter(
   if (workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)))
     return;
   if (
+    workspace.capabilityPredicates.some((predicate) =>
+      identityMatches(predicate.identity, identity),
+    )
+  )
+    return;
+  if (
     workspace.exceptionAdapters.some(
       (adapter) =>
         adapter.direction !== "signal-host" && identityMatches(adapter.identity, identity),
@@ -1207,7 +1229,14 @@ function analyzeParameter(
   ) {
     return;
   }
-  if (workspace.opaqueUnknown.some((exception) => identityMatches(exception.identity, identity)))
+  const contractIdentity = parameterContractIdentity(node, workspaceRoot);
+  if (
+    workspace.opaqueUnknown.some(
+      (exception) =>
+        identityMatches(exception.identity, identity) ||
+        (contractIdentity !== undefined && identityMatches(exception.identity, contractIdentity)),
+    )
+  )
     return;
   diagnostics.push(
     makeDiagnostic(

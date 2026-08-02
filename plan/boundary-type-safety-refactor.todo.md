@@ -11,7 +11,7 @@
 
 ## Current Stage
 
-Stages 0 through 2 complete. Next: Stage 3, High-Risk Process And Extension Boundaries.
+Stages 0 through 3 complete. Next: Stage 4, Typed Event-Bus Codec And Delivery Registry.
 
 ## Stage 0
 
@@ -50,11 +50,30 @@ Stages 0 through 2 complete. Next: Stage 3, High-Risk Process And Extension Boun
 - [x] Run partitioned independent reviews and resolve all blocking behavioral and enforcement findings.
 - [x] Run focused tests, root typecheck, full tests, lint, architecture ratchets, and formatting.
 
+## Stage 3
+
+- [x] Migrate summarization worker messages to a shared, fully decoded protocol and typed Result flow.
+- [x] Migrate remote filesystem runner requests, responses, socket handling, cancellation, cleanup, and
+  deployment/version boundaries to complete codecs and typed Results.
+- [x] Migrate plugin discovery, capability snapshots, hooks, lifecycle, reload cleanup, and late-Panic
+  supervision while preserving plugin identity and external contracts.
+- [x] Decode every custom-command result variant and migrate discovery, import, initialization, argument
+  parsing, and execution to typed Results.
+- [x] Replace attachment and tool-output assertions with complete schemas or owned typed narrowing.
+- [x] Migrate all declared Stage 3 debt in SSH execution, tool-server routing, and conversation-thread
+  dispatch rather than retaining module-local semantic or syntax baseline entries.
+- [x] Preserve original-Panic precedence and independently supervise terminal worker, bus, remote-runner,
+  plugin, startup-lock, and synchronous cleanup failures.
+- [x] Enforce zero semantic and syntax baseline debt across every declared Stage 3 module.
+- [x] Run final independent Stage 3 acceptance and defect reviews and resolve all blocking findings.
+- [x] Run focused builds/tests plus root typecheck, full tests, lint, architecture ratchets, and formatting.
+- [x] Commit the validated Stage 3 changes separately with a conventional commit.
+
 ## Later Stages
 
 - [x] Stage 1: `better-result` foundation and pilot migrations.
 - [x] Stage 2: mechanical union, predicate, and failure guardrails.
-- [ ] Stage 3: high-risk process and extension boundaries.
+- [x] Stage 3: high-risk process and extension boundaries.
 - [ ] Stage 4: typed event-bus codec and delivery registry.
 - [ ] Stage 5: TUI tool-observation projection.
 - [ ] Stage 6: versioned persistence codecs and transaction Results.
@@ -95,3 +114,23 @@ Stages 0 through 2 complete. Next: Stage 3, High-Risk Process And Extension Boun
 - 2026-08-02: Stage 2 validation passed: `bun run typecheck`, `bun run test:all`, `bun run lint:fix`,
   `bun run fmt`, `bun run lint`, `bun run fmt:check`, and `git diff --check`. The strengthened syntax
   ratchet matched all 2,799 reviewed findings with zero new errors.
+- 2026-08-02: Stage 3 migrated worker, remote-fs, plugin-runtime, custom-command, attachment, and
+  tool-output boundaries to complete decoding and typed failure values. Exact decoder, capability,
+  opaque-input, exception-adapter, and migrating-workspace registrations now enforce the converted
+  paths without broad module exemptions.
+- 2026-08-03: Final Stage 3 review enforcement registered the exact worker, bus, and remote-runner
+  Panic supervisors; immediate Result adapters; operational Result APIs; wire projections; and exact
+  Stage 3 rule zones. Reviews exposed and drove fixes for Panic consumption and cleanup masking, plugin
+  hostile getters and identity compatibility, remote symlink/cancellation/deployment behavior, complete
+  custom-command variants, and exact startup/host adapters.
+- 2026-08-03: Strengthened Stage 3 acceptance from symbol-scoped checks to module-wide zero-debt
+  enforcement. This exposed and resolved remaining SSH execution, tool-server routing, and
+  conversation-thread dispatch debt. The integrated architecture and syntax ratchets now pass with
+  2,690 reviewed syntax findings; final repository validation and independent acceptance remain.
+- 2026-08-03: Three independent final reviews accepted Stage 3 with no blocker, high, or medium
+  findings after fixes for explicit fatal supervision, original-Panic cleanup precedence, hostile value
+  classification, dynamic plugin catalogs, custom-command compatibility, and deterministic SSH
+  cancellation. Final validation passed both remote-runner builds, `bun run test:all` including 1,611
+  Core tests, `bun run typecheck`, `bun run lint:fix`, `bun run fmt`, `bun run lint`,
+  `bun run fmt:check`, and `git diff --check`. The syntax ratchet contains 2,686 reviewed findings with
+  zero errors, and every declared Stage 3 module has zero semantic and syntax baseline debt.

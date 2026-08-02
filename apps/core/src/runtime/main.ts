@@ -1,4 +1,5 @@
 import { createLogger } from "@stanley2058/lilac-utils";
+import { Panic } from "better-result";
 
 import { createCoreRuntime } from "./create-core-runtime";
 import { createProcessHandlers } from "./process-handlers";
@@ -10,8 +11,8 @@ const logger = createLogger({
 let runtime: Awaited<ReturnType<typeof createCoreRuntime>> | null = null;
 const handlers = createProcessHandlers({
   logger,
-  stop: async () => {
-    await runtime?.stop();
+  stop: async (fatalError) => {
+    await runtime?.stop(fatalError && Panic.is(fatalError) ? fatalError : null);
   },
   recordUnhandledRejection: (reason) => {
     runtime?.recordUnhandledRejection(reason);
@@ -28,6 +29,7 @@ process.on("uncaughtException", (error) => {
 
 try {
   runtime = await createCoreRuntime({
+    reportFatalError: (error) => handlers.reportFatalError(error),
     onUnhealthy: async (snapshot) => {
       logger.error("Core runtime unhealthy; exiting", {
         checks: snapshot.checks.filter((check) => !check.ok),

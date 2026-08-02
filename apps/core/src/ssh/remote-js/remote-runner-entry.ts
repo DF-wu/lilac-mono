@@ -1,82 +1,43 @@
 import fssync from "node:fs";
-import fs from "node:fs/promises";
-import crypto from "node:crypto";
-import path from "node:path";
-import { z } from "zod";
 import {
+  decodeBundledRemoteRunnerRequestJson,
   FileSystem,
+  type RemoteEditResponse,
+  type RemoteGlobResponse,
+  type RemoteGrepResponse,
+  type RemoteReadBytesResponse,
+  type RemoteReadTextResponse,
   type EditFileResult,
-  type FileEdit,
-  type HashlineEdit,
-  type ReadFileStart,
+  type BundledRemoteRunnerRequest,
 } from "@stanley2058/lilac-fs";
 
 import { applyHunks, parsePatch } from "../../tools/apply-patch/apply-patch-core";
+import {
+  bundledRemoteRunnerErrorMessage,
+  rethrowBundledRemoteRunnerPanic,
+} from "./bundled-runner-failure";
 
-function ok(value: unknown): void {
+type ReadTextRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.read_text" }>;
+type ReadBytesRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.read_bytes" }>;
+type GlobRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.glob" }>;
+type GrepRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.grep" }>;
+type EditRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.edit" }>;
+type ApplyPatchRequest = Extract<BundledRemoteRunnerRequest, { op: "apply_patch" }>;
+
+type BundledRunnerSuccessValue =
+  | RemoteReadTextResponse
+  | RemoteReadBytesResponse
+  | RemoteGlobResponse
+  | RemoteGrepResponse
+  | RemoteEditResponse
+  | string;
+
+function ok(value: BundledRunnerSuccessValue): void {
   process.stdout.write(JSON.stringify({ ok: true, value }));
 }
 
-function fail(error: unknown): void {
-  process.stdout.write(JSON.stringify({ ok: false, error: String(error) }));
-}
-
-function expandTilde(inputPath: string): string {
-  if (inputPath !== "~" && !inputPath.startsWith("~/")) return inputPath;
-  const home = process.env.HOME ?? "";
-  if (inputPath === "~") return home;
-  return path.join(home, inputPath.slice(2));
-}
-
-function resolveInputPath(inputPath: string): string {
-  const expanded = expandTilde(inputPath);
-  if (path.isAbsolute(expanded)) {
-    return path.resolve(expanded);
-  }
-  return path.resolve(process.cwd(), expanded);
-}
-
-function isDeniedPath(resolvedPath: string, denyAbs: readonly string[]): boolean {
-  const normalized = path.resolve(resolvedPath);
-  for (const deny of denyAbs) {
-    if (normalized === deny) return true;
-    if (normalized.startsWith(`${deny}${path.sep}`)) return true;
-  }
-  return false;
-}
-
-const remoteRunnerEnvelopeSchema = z.object({
-  op: z.string(),
-  input: z.record(z.string(), z.unknown()).optional().default({}),
-  denyPaths: z.array(z.string()).optional().default([]),
-});
-
-function numberOrUndefined(value: unknown): number | undefined {
-  if (!Number.isFinite(value)) return undefined;
-  return Number(value);
-}
-
-function ordinaryFileStartOrUndefined(value: unknown): ReadFileStart | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-
-  const start = value as Record<string, unknown>;
-  if (start["type"] === "offset") {
-    const offset = start["offset"];
-    return typeof offset === "number" && Number.isFinite(offset)
-      ? { type: "offset", offset }
-      : undefined;
-  }
-
-  const line = start["line"];
-  const column = start["column"];
-  if (start["type"] !== "line" || typeof line !== "number" || !Number.isFinite(line)) {
-    return undefined;
-  }
-  if (column !== undefined && (typeof column !== "number" || !Number.isFinite(column))) {
-    return undefined;
-  }
-
-  return column === undefined ? { type: "line", line } : { type: "line", line, column };
+function fail(error: { readonly message: string }): void {
+  process.stdout.write(JSON.stringify({ ok: false, error: error.message }));
 }
 
 function normalizeEditOutput(result: EditFileResult): EditFileResult {
@@ -99,145 +60,75 @@ function normalizeEditOutput(result: EditFileResult): EditFileResult {
   };
 }
 
-async function opReadText(input: Record<string, unknown>, fsTool: FileSystem): Promise<unknown> {
-  const start = ordinaryFileStartOrUndefined(input["start"]);
-  let format: "numbered" | "hashline" | "raw";
-  switch (input["format"]) {
-    case "numbered":
-      format = "numbered";
-      break;
-    case "hashline":
-      format = "hashline";
-      break;
-    default:
-      format = "raw";
-  }
+async function opReadText(input: ReadTextRequest["input"], fsTool: FileSystem) {
   const readRes = await fsTool.readFile({
-    path: String(input["path"] ?? ""),
-    start,
-    maxLines: numberOrUndefined(input["maxLines"]),
-    maxCharacters: numberOrUndefined(input["maxCharacters"]),
-    maxBytes: numberOrUndefined(input["maxBytes"]),
-    format,
+    path: input.path,
+    start: input.start,
+    maxLines: input.maxLines,
+    maxCharacters: input.maxCharacters,
+    maxBytes: input.maxBytes,
+    format: input.format ?? "raw",
   });
   return readRes;
 }
 
 async function opReadBytes(
-  input: Record<string, unknown>,
-  denyAbs: readonly string[],
-): Promise<unknown> {
-  const resolvedPath = resolveInputPath(String(input["path"] ?? ""));
-  if (isDeniedPath(resolvedPath, denyAbs)) {
-    return {
-      ok: false,
-      resolvedPath,
-      error: `Access denied: '${resolvedPath}' is blocked for readFile`,
-    };
-  }
-
-  const maxBytes = numberOrUndefined(input["maxBytes"]) ?? 10_000_000;
-  try {
-    const stats = await fs.stat(resolvedPath);
-    if (stats.size > maxBytes) {
-      return {
-        ok: false,
-        resolvedPath,
-        error: `Remote file too large (${stats.size} bytes). Max allowed is ${maxBytes}.`,
-      };
-    }
-
-    const bytes = await fs.readFile(resolvedPath);
-    const fileHash = crypto.createHash("sha256").update(bytes).digest("hex");
-    return {
-      ok: true,
-      resolvedPath,
-      fileHash,
-      bytesLength: bytes.byteLength,
-      base64: Buffer.from(bytes).toString("base64"),
-    };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, resolvedPath, error: msg };
-  }
-}
-
-async function opGlob(input: Record<string, unknown>, fsTool: FileSystem): Promise<unknown> {
-  const patterns = Array.isArray(input["patterns"]) ? input["patterns"].map((p) => String(p)) : [];
-  const maxEntries = numberOrUndefined(input["maxEntries"]);
-  const mode = input["mode"] === "detailed" ? "detailed" : "default";
-  return await fsTool.glob({
-    patterns,
-    maxEntries,
-    mode,
-  });
-}
-
-async function opGrep(input: Record<string, unknown>, fsTool: FileSystem): Promise<unknown> {
-  const fileExtensions = Array.isArray(input["fileExtensions"])
-    ? input["fileExtensions"].map((e) => String(e).replace(/^\./, ""))
-    : [];
-  let mode: "detailed" | "hashline" | "default";
-  switch (input["mode"]) {
-    case "detailed":
-      mode = "detailed";
-      break;
-    case "hashline":
-      mode = "hashline";
-      break;
-    default:
-      mode = "default";
-  }
-
-  return await fsTool.grep({
-    pattern: String(input["pattern"] ?? ""),
-    baseDir: typeof input["baseDir"] === "string" ? input["baseDir"] : undefined,
-    reportedFilePath:
-      typeof input["reportedFilePath"] === "string" ? input["reportedFilePath"] : undefined,
-    regex: Boolean(input["regex"]),
-    maxResults: numberOrUndefined(input["maxResults"]),
-    fileExtensions,
-    includeContextLines: numberOrUndefined(input["includeContextLines"]),
-    mode,
-  });
-}
-
-async function opEdit(
-  input: Record<string, unknown>,
+  input: ReadBytesRequest["input"],
   fsTool: FileSystem,
-  denyAbs: readonly string[],
-): Promise<unknown> {
-  const pathInput = String(input["path"] ?? "");
-  const resolvedPath = resolveInputPath(pathInput);
-  if (isDeniedPath(resolvedPath, denyAbs)) {
-    return {
-      success: false,
-      resolvedPath,
-      error: {
-        code: "PERMISSION",
-        message: `Access denied: '${resolvedPath}' is blocked for editFile`,
-      },
-    };
+): Promise<RemoteReadBytesResponse> {
+  const result = await fsTool.readFileBytes({
+    path: input.path,
+    maxBytes: input.maxBytes ?? 10_000_000,
+  });
+  if (!result.success) {
+    return { ok: false, resolvedPath: result.resolvedPath, error: result.error.message };
   }
+  return {
+    ok: true,
+    resolvedPath: result.resolvedPath,
+    fileHash: result.fileHash,
+    bytesLength: result.bytesLength,
+    base64: Buffer.from(result.bytes).toString("base64"),
+  };
+}
 
-  const edits = Array.isArray(input["edits"]) ? (input["edits"] as FileEdit[]) : [];
-  const hashlineEdits = Array.isArray(input["edits"]) ? (input["edits"] as HashlineEdit[]) : [];
-  const expectedHashRaw = input["expectedHash"];
+async function opGlob(input: GlobRequest["input"], fsTool: FileSystem) {
+  return await fsTool.glob({
+    patterns: input.patterns,
+    maxEntries: input.maxEntries,
+    mode: input.mode ?? "default",
+  });
+}
+
+async function opGrep(input: GrepRequest["input"], fsTool: FileSystem) {
+  return await fsTool.grep({
+    pattern: input.pattern,
+    baseDir: input.baseDir,
+    reportedFilePath: input.reportedFilePath,
+    regex: input.regex,
+    maxResults: input.maxResults,
+    fileExtensions: input.fileExtensions?.map((extension) => extension.replace(/^\./, "")),
+    includeContextLines: input.includeContextLines,
+    mode: input.mode ?? "default",
+  });
+}
+
+async function opEdit(input: EditRequest["input"], fsTool: FileSystem): Promise<EditFileResult> {
+  const pathInput = input.path;
   const expectedHash =
-    typeof expectedHashRaw === "string" && expectedHashRaw.length > 0 ? expectedHashRaw : undefined;
-  const mode = input["mode"] === "hashline" ? "hashline" : "legacy";
+    input.expectedHash && input.expectedHash.length > 0 ? input.expectedHash : undefined;
 
-  if (mode === "hashline") {
+  if (input.mode === "hashline") {
     const editRes = await fsTool.hashlineEditFile({
       path: pathInput,
-      edits: hashlineEdits,
+      edits: input.edits,
       expectedHash,
     });
     return normalizeEditOutput(editRes);
   }
 
   if (expectedHash) {
-    const editRes = await fsTool.editFile({ path: pathInput, edits, expectedHash });
+    const editRes = await fsTool.editFile({ path: pathInput, edits: input.edits, expectedHash });
     return normalizeEditOutput(editRes);
   }
 
@@ -254,65 +145,59 @@ async function opEdit(
 
   const editRes = await fsTool.editFile({
     path: pathInput,
-    edits,
+    edits: input.edits,
     expectedHash: readRes.fileHash,
   });
   return normalizeEditOutput(editRes);
 }
 
 async function opApplyPatch(
-  input: Record<string, unknown>,
+  input: ApplyPatchRequest["input"],
   denyPaths: readonly string[],
-): Promise<unknown> {
-  const patchText = String(input["patchText"] ?? "");
-  const hunks = parsePatch(patchText);
+): Promise<string> {
+  const hunks = parsePatch(input.patchText);
   return await applyHunks(process.cwd(), hunks, { denyPaths });
 }
 
-function readJsonFromStdin(): unknown {
-  const raw = fssync.readFileSync(0, "utf8");
-  if (!raw || raw.trim().length === 0) return {};
-  return JSON.parse(raw);
+function readTextFromStdin(): string {
+  return fssync.readFileSync(0, "utf8");
 }
 
 async function main(): Promise<void> {
   try {
-    const parsed = remoteRunnerEnvelopeSchema.parse(readJsonFromStdin());
-    const input = parsed.input;
-    const op = parsed.op;
-    const denyPaths = parsed.denyPaths;
-    const denyAbs = denyPaths.map((p) => path.resolve(expandTilde(p)));
+    const parsed = decodeBundledRemoteRunnerRequestJson(readTextFromStdin());
+    if (parsed.status === "error") {
+      fail(parsed.error);
+      return;
+    }
+    const request = parsed.value;
+    const denyPaths = request.denyPaths;
 
     const fsTool = new FileSystem(process.cwd(), { denyPaths });
 
-    if (op === "fs.read_text") {
-      ok(await opReadText(input, fsTool));
-      return;
+    switch (request.op) {
+      case "fs.read_text":
+        ok(await opReadText(request.input, fsTool));
+        return;
+      case "fs.read_bytes":
+        ok(await opReadBytes(request.input, fsTool));
+        return;
+      case "fs.glob":
+        ok(await opGlob(request.input, fsTool));
+        return;
+      case "fs.grep":
+        ok(await opGrep(request.input, fsTool));
+        return;
+      case "fs.edit":
+        ok(await opEdit(request.input, fsTool));
+        return;
+      case "apply_patch":
+        ok(await opApplyPatch(request.input, denyPaths));
+        return;
     }
-    if (op === "fs.read_bytes") {
-      ok(await opReadBytes(input, denyAbs));
-      return;
-    }
-    if (op === "fs.glob") {
-      ok(await opGlob(input, fsTool));
-      return;
-    }
-    if (op === "fs.grep") {
-      ok(await opGrep(input, fsTool));
-      return;
-    }
-    if (op === "fs.edit") {
-      ok(await opEdit(input, fsTool, denyAbs));
-      return;
-    }
-    if (op === "apply_patch") {
-      ok(await opApplyPatch(input, denyPaths));
-      return;
-    }
-
-    fail(`Unknown op: ${op}`);
   } catch (e) {
-    fail(e instanceof Error ? e.message : String(e));
+    rethrowBundledRemoteRunnerPanic(e);
+    fail({ message: bundledRemoteRunnerErrorMessage(e) });
   }
 }
 

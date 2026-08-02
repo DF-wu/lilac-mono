@@ -1,4 +1,10 @@
-import type { Level1ToolFailureSummary, Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import {
+  getLevel1ContributionSnapshot,
+  invokeLevel1SummarizeFailure,
+  type Level1ContributionInfo,
+  type Level1ToolFailureSummary,
+  type Level1ToolSpec,
+} from "@stanley2058/lilac-plugin-runtime";
 import { isRecord } from "@stanley2058/lilac-utils";
 
 import { redactSecrets } from "../../../tools/bash-safety/format";
@@ -206,8 +212,9 @@ export function summarizeToolFailure(params: {
   isError: boolean;
   result: unknown;
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>;
+  contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>;
 }): ToolFailureSummary {
-  const { toolName, isError, result, toolSpecs } = params;
+  const { toolName, isError, result, toolSpecs, contributionInfo } = params;
 
   if (isError) {
     return {
@@ -217,9 +224,20 @@ export function summarizeToolFailure(params: {
     };
   }
 
-  const specSummary = toolSpecs?.get(toolName)?.summarizeFailure;
-  if (specSummary) {
-    return specSummary({ isError: false, result });
+  const spec = toolSpecs?.get(toolName);
+  if (spec) {
+    const contribution = contributionInfo?.get(spec) ??
+      getLevel1ContributionSnapshot(spec) ?? {
+        pluginId: `level1:${toolName}`,
+        source: "builtin",
+      };
+    const summary = invokeLevel1SummarizeFailure({
+      pluginId: contribution.pluginId,
+      source: contribution.source,
+      spec,
+      value: { isError: false, result },
+    });
+    if (summary.status === "ok" && summary.value) return summary.value;
   }
 
   const builtin = BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS[toolName];

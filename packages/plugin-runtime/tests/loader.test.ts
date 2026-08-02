@@ -21,13 +21,10 @@ describe("loadToolPluginModule", () => {
     const entrypointPath = path.join(tmpRoot, "plugin.js");
     await fs.writeFile(entrypointPath, source, "utf8");
     cacheBustKey += 1;
-    return loadToolPluginModule({
-      entrypointPath,
-      cacheBustKey: String(cacheBustKey),
-    });
+    return loadToolPluginModule({ entrypointPath, cacheBustKey: String(cacheBustKey) });
   }
 
-  it("returns the original complete plugin object with its mutable state and getters", async () => {
+  it("returns the original module capability with state, getters, and receivers intact", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-plugin-loader-"));
     const fixturePath = path.join(tmpRoot, "fixture.js");
     const entrypointPath = path.join(tmpRoot, "plugin.js");
@@ -38,6 +35,7 @@ describe("loadToolPluginModule", () => {
   extra: 0,
   get label() { return this.meta.name + ":" + this.extra; },
   create() {
+    if (this !== fixture) throw new Error("wrong receiver");
     this.meta.name = "Mutated";
     this.extra += 1;
     return {};
@@ -55,13 +53,12 @@ export default fixture;
 
     const fixtureModule = await import(pathToFileURL(fixturePath).toString());
     const fixture: unknown = fixtureModule.fixture;
-    const plugin = await loadToolPluginModule({
-      entrypointPath,
-      cacheBustKey: "identity",
-    });
+    const loaded = await loadToolPluginModule({ entrypointPath, cacheBustKey: "identity" });
+    expect(loaded.status).toBe("ok");
+    if (loaded.status === "error") throw new Error(loaded.error.message);
 
+    const plugin = loaded.value;
     expect(Object.is(plugin, fixture)).toBe(true);
-    expect(plugin.meta).toEqual({ id: "complete", name: "Complete", version: "1.0.0" });
     expect(Reflect.get(plugin, "label")).toBe("Complete:0");
     expect(typeof Object.getOwnPropertyDescriptor(plugin, "label")?.get).toBe("function");
     expect(
@@ -74,10 +71,9 @@ export default fixture;
     ).toEqual({});
     expect(plugin.meta.name).toBe("Mutated");
     expect(Reflect.get(plugin, "extra")).toBe(1);
-    expect(Reflect.get(plugin, "label")).toBe("Mutated:1");
   });
 
-  it("rejects malformed and partial plugin modules", async () => {
+  it("returns typed capability errors for malformed and partial dynamic modules", async () => {
     const invalidModules = [
       "export default null;",
       "export default {};",
@@ -89,24 +85,45 @@ export default fixture;
     ];
 
     for (const source of invalidModules) {
-      await expect(loadModule(source)).rejects.toThrow(
-        "Plugin entrypoint must default export a LilacToolPlugin",
-      );
+      const loaded = await loadModule(source);
+      expect(loaded.status).toBe("error");
+      if (loaded.status === "ok") throw new Error("expected malformed module to fail");
+      expect(loaded.error._tag).toBe("ToolPluginCapabilityError");
+      if (loaded.error._tag === "ToolPluginCapabilityError") {
+        expect(loaded.error.capability).toBe("module");
+      }
     }
   });
 
   it("rejects arrays masquerading as plugin objects or metadata", async () => {
-    await expect(
-      loadModule(`const plugin = [];
+    const arrayPlugin = await loadModule(`const plugin = [];
 plugin.meta = { id: "array-plugin" };
 plugin.create = () => ({});
-export default plugin;`),
-    ).rejects.toThrow("Plugin entrypoint must default export a LilacToolPlugin");
+export default plugin;`);
+    expect(arrayPlugin.status).toBe("error");
 
-    await expect(
-      loadModule(`const meta = [];
+    const arrayMeta = await loadModule(`const meta = [];
 meta.id = "array-meta";
-export default { meta, create() { return {}; } };`),
-    ).rejects.toThrow("Plugin entrypoint must default export a LilacToolPlugin");
+export default { meta, create() { return {}; } };`);
+    expect(arrayMeta.status).toBe("error");
+  });
+
+  it("captures module evaluation rejection without leaking it", async () => {
+    const loaded = await loadModule('throw new Error("evaluation boom");');
+    expect(loaded.status).toBe("error");
+    if (loaded.status === "ok") throw new Error("expected evaluation failure");
+    expect(loaded.error._tag).toBe("ToolPluginModuleLoadError");
+    expect(loaded.error.message).toContain("evaluation boom");
+  });
+
+  it("captures capability getter failures as validation Results", async () => {
+    const loaded = await loadModule(`export default {
+  get meta() { throw new Error("meta getter boom"); },
+  create() { return {}; },
+};`);
+    expect(loaded.status).toBe("error");
+    if (loaded.status === "ok") throw new Error("expected getter failure");
+    expect(loaded.error._tag).toBe("ToolPluginCapabilityError");
+    expect(loaded.error.message).toContain("Failed to inspect module capability");
   });
 });

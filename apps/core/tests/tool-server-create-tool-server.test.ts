@@ -5,11 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import {
+  ToolPluginCleanupError,
+  ToolPluginHookError,
   ToolPluginManager,
   type Level1ToolSpec,
   type RequestContext,
 } from "@stanley2058/lilac-plugin-runtime";
 import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError } from "better-result";
 
 import {
   createToolServer,
@@ -96,6 +99,89 @@ async function writePluginServerTool(params: {
 }
 
 describe("createToolServer", () => {
+  it("rejects an invalid operator-token digest through the host option adapter", () => {
+    expect(() => createToolServer({ operatorTokenSha256: "not-a-sha256-digest" })).toThrow(
+      "operatorTokenSha256 must be a SHA-256 hex digest",
+    );
+  });
+
+  it("redacts nested sensitive JSON fields before ordinary tool-input logging", async () => {
+    const chunks: string[] = [];
+    const secret = "ordinary-tool-secret";
+    const tool: ServerTool = {
+      id: "preview-redaction",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "preview.redaction",
+            name: "Preview redaction",
+            description: "Tests input logging",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return { ok: true };
+      },
+    };
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "tool-preview-redaction-test",
+        logLevel: "debug",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            callableId: "preview.redaction",
+            input: { nested: { authorization: secret }, visible: "retained" },
+          }),
+        }),
+      );
+      expect(await response.json()).toEqual({ isError: false, output: { ok: true } });
+      const logged = chunks.join("\n");
+      expect(logged).toContain("<redacted>");
+      expect(logged).toContain("retained");
+      expect(logged).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("projects opaque unhandled rejections without serializing TaggedError fields", async () => {
+    class SecretUnhandledRejection extends TaggedError("SecretUnhandledRejection")<{
+      readonly token: string;
+      readonly message: string;
+    }> {}
+    const secret = "unhandled-rejection-secret";
+    const server = createToolServer({ tools: [] });
+    await server.init();
+    try {
+      server.recordUnhandledRejection(
+        new SecretUnhandledRejection({ token: secret, message: `token=${secret}` }),
+      );
+      const snapshot = await server.getHealthSnapshot();
+      expect(snapshot.info.unhandledRejection).toMatchObject({
+        count: 1,
+        lastReason: "External tagged error",
+      });
+      expect(JSON.stringify(snapshot.info.unhandledRejection)).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("uses the same request capability and native profile context for direct and workflow children", async () => {
     const contexts: RequestContext[] = [];
     const authority = new RequestControlAuthority();
@@ -223,10 +309,18 @@ describe("createToolServer", () => {
       },
     };
     const pluginManager = {
-      async init() {},
-      async destroy() {},
-      async reload() {},
-      async ensureFresh() {},
+      async init() {
+        return Result.ok();
+      },
+      async destroy() {
+        return Result.ok();
+      },
+      async reload() {
+        return Result.ok();
+      },
+      async ensureFresh() {
+        return Result.ok();
+      },
       getLevel2Tools: () => [tool],
       getLevel2ContributionInfo: () =>
         new Map([[tool, { pluginId: "profile-plugin", source: "builtin" as const }]]),
@@ -1100,8 +1194,8 @@ describe("createToolServer", () => {
     >({
       runtime: {},
       dataDir,
-      getLevel1Name: (spec) => spec.name,
-      getLevel2CallableIds: async (tool) => (await tool.list()).map((entry) => entry.callableId),
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (tool) => tool,
     });
 
     const server = createToolServer({
@@ -1178,6 +1272,132 @@ describe("createToolServer", () => {
     await server.stop();
   });
 
+  it("reads initialization-dependent and dynamic Level 2 catalogs at runtime", async () => {
+    let listCalls = 0;
+    let initialized = false;
+    let callableId = "dynamic.call.v1";
+    const tool: ServerTool = {
+      id: "stateful-list",
+      async init() {
+        initialized = true;
+      },
+      async destroy() {},
+      async list() {
+        if (!initialized) throw new Error("list called before init");
+        listCalls += 1;
+        return [{ callableId, name: callableId, description: callableId, shortInput: [] }];
+      },
+      async call(callableId) {
+        return { callableId };
+      },
+    };
+    const pluginManager = new ToolPluginManager<
+      Record<string, never>,
+      Level1ToolSpec<Record<string, never>>,
+      ServerTool
+    >({
+      runtime: {},
+      dataDir: "/tmp/tool-server-stateful-list-unused",
+      builtinPlugins: [{ meta: { id: "stateful-list" }, create: () => ({ level2: [tool] }) }],
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (item) => item,
+    });
+    const server = createToolServer({ pluginManager });
+
+    await server.init();
+    expect(listCalls).toBe(2);
+    callableId = "dynamic.call.v2";
+    const listed = await server.app.handle(new Request("http://localhost/list"));
+    expect(await listed.json()).toMatchObject({ tools: [{ callableId: "dynamic.call.v2" }] });
+    expect(
+      (await server.app.handle(new Request("http://localhost/help/dynamic.call.v2"))).status,
+    ).toBe(200);
+    const called = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "dynamic.call.v2", input: {} }),
+      }),
+    );
+    expect(await called.json()).toEqual({
+      isError: false,
+      output: { callableId: "dynamic.call.v2" },
+    });
+    expect(listCalls).toBe(7);
+    await server.stop();
+  });
+
+  it("refreshes routing after a committed reload whose previous-state cleanup fails", async () => {
+    const chunks: string[] = [];
+    let generation = 0;
+    const pluginManager = new ToolPluginManager<
+      Record<string, never>,
+      Level1ToolSpec<Record<string, never>>,
+      ServerTool
+    >({
+      runtime: {},
+      dataDir: "/tmp/tool-server-committed-cleanup-unused",
+      builtinPlugins: [
+        {
+          meta: { id: "committed-cleanup" },
+          create() {
+            generation += 1;
+            const current = generation;
+            const callableId = `committed.call.${current}`;
+            return {
+              level2: [
+                {
+                  id: `committed-${current}`,
+                  async init() {},
+                  async destroy() {},
+                  async list() {
+                    return [
+                      { callableId, name: callableId, description: callableId, shortInput: [] },
+                    ];
+                  },
+                  async call() {
+                    return { generation: current };
+                  },
+                },
+              ],
+              async destroy() {
+                if (current === 1) throw new Error("previous cleanup failed");
+              },
+            };
+          },
+        },
+      ],
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (item) => item,
+    });
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      pluginManager,
+      logger: createLogger({
+        module: "committed-cleanup-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+    });
+
+    await server.init();
+    const reload = await server.app.handle(
+      new Request("http://localhost/reload", { method: "POST" }),
+    );
+    expect(await reload.json()).toEqual({ ok: true });
+    const called = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "committed.call.2", input: {} }),
+      }),
+    );
+    expect(await called.json()).toEqual({ isError: false, output: { generation: 2 } });
+    expect(chunks.join("\n")).toContain("reload committed");
+    await server.stop();
+  });
+
   it("refreshes plugin-backed call mapping on list/help/call without explicit reload", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-tool-server-plugin-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -1196,14 +1416,8 @@ describe("createToolServer", () => {
     >({
       runtime: {},
       dataDir,
-      getLevel1Name: (spec) => spec.name,
-      getLevel2CallableIds: async (tool) => (await tool.list()).map((entry) => entry.callableId),
-      initLevel2Item: async (tool) => {
-        await tool.init();
-      },
-      destroyLevel2Item: async (tool) => {
-        await tool.destroy();
-      },
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (tool) => tool,
     });
 
     const server = createToolServer({ pluginManager });
@@ -1272,14 +1486,8 @@ describe("createToolServer", () => {
     >({
       runtime: {},
       dataDir,
-      getLevel1Name: (spec) => spec.name,
-      getLevel2CallableIds: async (tool) => (await tool.list()).map((entry) => entry.callableId),
-      initLevel2Item: async (tool) => {
-        await tool.init();
-      },
-      destroyLevel2Item: async (tool) => {
-        await tool.destroy();
-      },
+      adaptLevel1Item: (spec) => spec,
+      adaptLevel2Item: (tool) => tool,
     });
 
     const server = createToolServer({ pluginManager });
@@ -1504,6 +1712,268 @@ describe("createToolServer", () => {
     await server.stop();
   });
 
+  it("reports an immediate Level 2 Panic to the fatal supervisor", async () => {
+    const panic = new Panic({ message: "immediate tool invariant" });
+    const observed = Promise.withResolvers<unknown>();
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const tool: ServerTool = {
+      id: "immediate-panic",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "immediate-panic.call",
+            name: "Immediate Panic",
+            description: "rejects immediately with Panic",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        throw panic;
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "immediate-panic-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+      reportFatalToolCallDefect: observed.resolve,
+    });
+
+    await server.init();
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "immediate-panic.call", input: {} }),
+      }),
+    );
+    expect(response.status).toBe(500);
+    expect(await observed.promise).toBe(panic);
+    await server.stop();
+  });
+
+  it("invokes the fatal supervisor for a late Panic without changing the timeout response", async () => {
+    const panic = new Panic({ message: "late tool invariant" });
+    const observed = Promise.withResolvers<Panic>();
+    let fatalReports = 0;
+    const tool: ServerTool = {
+      id: "late-panic",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "late-panic.call",
+            name: "Late Panic",
+            description: "rejects with Panic after cancellation",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        return await new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () => reject(panic), { once: true });
+        });
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      toolCallTimeouts: { defaultTimeoutMs: 10 },
+      reportFatalToolCallDefect: (reported) => {
+        fatalReports += 1;
+        if (Panic.is(reported)) observed.resolve(reported);
+      },
+    });
+
+    await server.init();
+    // test-wait-justification: verifies Panic observation after the real tool-call deadline wins
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "late-panic.call", input: {} }),
+      }),
+    );
+    expect(await response.json()).toEqual({
+      isError: true,
+      output: "Tool call timed out after 10ms",
+    });
+    expect(await observed.promise).toBe(panic);
+    expect(fatalReports).toBe(1);
+    await server.stop();
+  });
+
+  it("reports a late non-Panic rejection to the fatal supervisor", async () => {
+    const defect = new Error("late logging defect");
+    const observed = Promise.withResolvers<unknown>();
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const logger = createLogger({
+      module: "late-error-test",
+      outputFormat: "jsonl",
+      stdout: output,
+      stderr: output,
+    });
+    Object.defineProperty(logger, "error", {
+      value(message: string) {
+        if (message === "tool plugin operation failed") throw defect;
+      },
+    });
+    const tool: ServerTool = {
+      id: "late-error",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "late-error.call",
+            name: "Late Error",
+            description: "settles through a broken logger after cancellation",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        return await new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("expected plugin cancellation failure")),
+            { once: true },
+          );
+        });
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      logger,
+      toolCallTimeouts: { defaultTimeoutMs: 10 },
+      reportFatalToolCallDefect: observed.resolve,
+    });
+
+    await server.init();
+    // test-wait-justification: verifies non-Panic defect observation after the real tool-call deadline
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "late-error.call", input: {} }),
+      }),
+    );
+    expect(await response.json()).toEqual({
+      isError: true,
+      output: "Tool call timed out after 10ms",
+    });
+    expect(await observed.promise).toMatchObject({ message: defect.message });
+    await server.stop();
+  });
+
+  it("does not report an ordinary Level 2 completion after timeout", async () => {
+    const release = Promise.withResolvers<void>();
+    const settled = Promise.withResolvers<void>();
+    let fatalReports = 0;
+    const tool: ServerTool = {
+      id: "late-success",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "late-success.call",
+            name: "Late Success",
+            description: "resolves after the caller deadline",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        await release.promise;
+        settled.resolve();
+        return { late: true };
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      toolCallTimeouts: { defaultTimeoutMs: 10 },
+      reportFatalToolCallDefect: () => {
+        fatalReports += 1;
+      },
+    });
+
+    await server.init();
+    // test-wait-justification: verifies ordinary completion after the real tool-call deadline
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "late-success.call", input: {} }),
+      }),
+    );
+    expect(await response.json()).toEqual({
+      isError: true,
+      output: "Tool call timed out after 10ms",
+    });
+    release.resolve();
+    await settled.promise;
+    await Promise.resolve();
+    expect(fatalReports).toBe(0);
+    await server.stop();
+  });
+
+  it("leaves internal result-orchestration defects on the framework error path", async () => {
+    const defect = new Error("result logging defect");
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const logger = createLogger({
+      module: "result-orchestration-defect-test",
+      outputFormat: "jsonl",
+      stdout: output,
+      stderr: output,
+    });
+    Object.defineProperty(logger, "info", {
+      value(message: string) {
+        if (message === "tool.call.result") throw defect;
+      },
+    });
+    const tool: ServerTool = {
+      id: "orchestration-defect",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "orchestration-defect.call",
+            name: "Orchestration Defect",
+            description: "completes before internal result logging fails",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({ tools: [tool], logger });
+
+    await server.init();
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "orchestration-defect.call", input: {} }),
+      }),
+    );
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toContain('"isError":true');
+    await server.stop();
+  });
+
   it("does not leak active tool calls when tool.call throws synchronously", async () => {
     const tool: ServerTool = {
       id: "sync-throw",
@@ -1572,6 +2042,56 @@ describe("createToolServer", () => {
     expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(true);
     expect(healthBody.info.toolServer.activeCalls).toEqual([]);
 
+    await server.stop();
+  });
+
+  it("wraps external TaggedErrors without returning or logging their causes or secrets", async () => {
+    class ExternalPluginSecretError extends TaggedError("ExternalPluginSecretError")<{
+      readonly token: string;
+      readonly message: string;
+    }> {}
+    const chunks: string[] = [];
+    const secret = "plugin-tagged-secret-value";
+    const tool: ServerTool = {
+      id: "tagged-secret",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "tagged-secret.fail",
+            name: "Tagged Secret",
+            description: "throws an external TaggedError",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        throw new ExternalPluginSecretError({ token: secret, message: `token=${secret}` });
+      },
+    };
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "tagged-plugin-error-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+    });
+
+    await server.init();
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callableId: "tagged-secret.fail", input: {} }),
+      }),
+    );
+    const body = await response.json();
+    expect(body).toEqual({ isError: true, output: "External tagged error" });
+    expect(`${JSON.stringify(body)}\n${chunks.join("\n")}`).not.toContain(secret);
     await server.stop();
   });
 
@@ -1812,6 +2332,137 @@ describe("createToolServer", () => {
     expect(body.output).not.toContain("validate.runtime has invalid input.");
 
     await server.stop();
+  });
+
+  it("keeps plugin startup failure fatal without leaking TaggedError", async () => {
+    const failure = new ToolPluginHookError({
+      pluginId: "startup",
+      source: "builtin",
+      hook: "plugin.create",
+      cause: new Error("startup boom"),
+      message: "startup boom",
+    });
+    const pluginManager = {
+      init: async () => Result.err(failure),
+      destroy: async () => Result.ok(),
+      reload: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      getLevel2Tools: () => [],
+      getStatuses: () => [],
+    };
+    const server = createToolServer({ pluginManager });
+
+    try {
+      await server.init();
+      throw new Error("expected startup failure");
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(Error);
+      expect(cause).not.toBe(failure);
+      expect(cause instanceof Error ? cause.message : "").toContain("startup boom");
+    }
+  });
+
+  it("omits tools whose list hook fails while retaining healthy tools", async () => {
+    const healthy: ServerTool = {
+      id: "healthy",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          { callableId: "healthy.call", name: "Healthy", description: "Healthy", shortInput: [] },
+        ];
+      },
+      async call() {},
+    };
+    const broken: ServerTool = {
+      id: "broken",
+      async init() {},
+      async destroy() {},
+      async list() {
+        throw new Error("list boom");
+      },
+      async call() {},
+    };
+    const server = createToolServer({ tools: [healthy, broken] });
+    await server.init();
+    const response = await server.app.handle(new Request("http://localhost/list"));
+    expect(await response.json()).toEqual({
+      tools: [
+        {
+          callableId: "healthy.call",
+          name: "Healthy",
+          description: "Healthy",
+          shortInput: [],
+          hidden: undefined,
+        },
+      ],
+    });
+    await server.stop();
+  });
+
+  it("propagates Panic from Level 2 hooks", async () => {
+    const panic = new Panic({ message: "list invariant" });
+    const tool: ServerTool = {
+      id: "panic",
+      async init() {},
+      async destroy() {},
+      async list() {
+        throw panic;
+      },
+      async call() {},
+    };
+    const server = createToolServer({ tools: [tool] });
+    try {
+      await server.init();
+      throw new Error("expected Panic");
+    } catch (cause) {
+      expect(Panic.is(cause)).toBe(true);
+    }
+  });
+
+  it("continues shutdown after aggregated plugin cleanup failure", async () => {
+    const hookFailure = new ToolPluginHookError({
+      pluginId: "cleanup",
+      source: "builtin",
+      hook: "instance.destroy",
+      cause: new Error("cleanup boom"),
+      message: "cleanup boom",
+    });
+    const cleanupFailure = new ToolPluginCleanupError({
+      failures: [hookFailure],
+      message: "cleanup boom",
+    });
+    const pluginManager = {
+      init: async () => Result.ok(),
+      destroy: async () => Result.err(cleanupFailure),
+      reload: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      getLevel2Tools: () => [],
+      getStatuses: () => [],
+    };
+    const server = createToolServer({ pluginManager });
+    await server.init();
+    await expect(server.stop()).resolves.toBeUndefined();
+  });
+
+  it("stops the host and surfaces plugin cleanup Panic identity", async () => {
+    const panic = new Panic({ message: "plugin cleanup invariant" });
+    const pluginManager = {
+      init: async () => Result.ok(),
+      destroy: async () => {
+        throw panic;
+      },
+      reload: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      getLevel2Tools: () => [],
+      getStatuses: () => [],
+    };
+    const server = createToolServer({ pluginManager });
+    await server.init();
+    await server.start(0);
+
+    await expect(server.stop()).rejects.toBe(panic);
+    expect(server.app.server).toBeNull();
   });
 
   it("invokes the unhealthy watchdog after repeated live failures", async () => {
