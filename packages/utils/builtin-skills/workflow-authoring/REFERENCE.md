@@ -90,17 +90,19 @@ Cron expressions have five fields. Timezone defaults to UTC. Optional `startAt` 
 
 Creation pins the immutable workflow revision and origin snapshot. Each successfully admitted occurrence creates a distinct queued run. Coalescing and global capacity may skip or defer an occurrence. Cancelling a trigger does not cancel runs it already created.
 
+For a Telegram-origin trigger with durable progress, the target must be the authenticated originating Telegram session. The scheduler reloads current config before committing each due occurrence. If the chat is no longer in `allowedChatIds`, no run is created and the occurrence is not advanced; restoring authorization permits a later reconciliation to retry it. Progress delivery independently rechecks authorization before every send, edit, and deleted-card recreation.
+
 Use `sleep()` instead when the delay belongs inside one already-created run.
 
 ## Reply Wait Details
 
-Reply waits require an authenticated Discord origin. `platform`, `channelId`, and `fromUserId` default to and, when supplied, must match that origin. `fromUserId` is the input match filter; the resolved event reports that value as `userId`. `platform` may only be `"discord"`. Supplying `messageId` requires a direct reply to that message. A timeout is optional; without one, the wait remains pending until a matching reply or cancellation.
+Reply waits require an authenticated Discord or Telegram origin. `platform`, `channelId`, and `fromUserId` default to and, when supplied, must match that origin. `fromUserId` is the input match filter; the resolved event reports that value as `userId`. `platform` may be `"discord"` or `"telegram"`, but it cannot differ from the run origin. Supplying `messageId` requires a direct reply to that message. A timeout is optional; without one, the wait remains pending until a matching reply or cancellation. A matching adapter event is reserved while pending, and an exact consumed-event suppression record remains for five minutes. The router normally suppresses both from ordinary Discord or Telegram routing, but deliberately fails open if the suppression hook itself errors.
 
 Resolved value:
 
 ```js
 {
-  platform: "discord",
+  platform: "telegram", // or "discord", matching the authenticated origin
   channelId: "...",
   messageId: "...",
   userId: "...",

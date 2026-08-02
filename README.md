@@ -63,7 +63,7 @@ The runtime exposes three capability layers:
 
 ### 4. Durable workflows
 
-The repo includes workflow services for wait-for-reply, send-and-wait, scheduling, cancellation, and resume. This is built into the runtime rather than bolted on as a separate job system.
+The repo includes workflow services for wait-for-reply, send-and-wait, scheduling, cancellation, and resume. Discord and Telegram reply waits are bound to the authenticated originating session and user; Telegram workflow delivery also rechecks the current chat allowlist before firing and before every progress-card write. This is built into the runtime rather than bolted on as a separate job system.
 
 ### 5. Operator tooling
 
@@ -177,6 +177,7 @@ If you persist `/data`, the `smart-search` config and provider credentials persi
 - [`PROJECT.md`](./PROJECT.md): architecture, terminology, and runtime flow
 - [`AGENTS.md`](./AGENTS.md): repo-specific coding and validation rules
 - [`apps/acp-controller/README.md`](./apps/acp-controller/README.md): ACP controller usage details
+- [`docs/telegram-surface.md`](./docs/telegram-surface.md): Telegram setup, allowlists, workflow authorization, verification, and troubleshooting
 - [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md): routing `generate.image` through an OpenAI-compatible provider
 
 ### Runtime and deployment smoke commands
