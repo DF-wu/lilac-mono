@@ -11,6 +11,7 @@ export * from "./skills";
 export * from "./find-root";
 export * from "./build-info";
 export * from "./logging";
+export * from "./tagged-error-log";
 export * from "./vcs-env";
 export * from "./model-edit-mode";
 export * from "./tool-call-input-normalization";

@@ -140,8 +140,73 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - Use Panic only for an individually registered unrecoverable defect or hard invariant. Never convert a Panic to an ordinary Err.
 - Do not wrap total helpers in Result or flatten meaningful state-machine outcomes such as cancelled, stale, expired, or skipped into generic success/error.
 - Do not serialize `better-result` objects or TaggedErrors onto existing contracts. Map them to the existing wire, storage, tool, or plugin representation at its compatibility adapter.
-- Never pass a TaggedError to implicit `JSON.stringify` or generic structured logging because `toJSON()` includes `cause`. Emit only an approved tag, message, and explicitly safe fields. Until the Stage 1 repository formatter lands, construct that safe representation explicitly; afterward, use the formatter.
+- Never pass a TaggedError to implicit `JSON.stringify` or generic structured logging because `toJSON()` includes `cause`. Use `formatTaggedErrorForLog(error)` and log only its redacted projection plus explicitly safe context fields.
 - Avoid leaking secrets in logs; redact tokens and keys when printing command or environment data.
+
+Compact positive patterns:
+
+```ts
+class ConfigMissing extends TaggedError("ConfigMissing")<{
+  readonly configPath: string;
+  readonly message: string;
+}> {}
+
+class ConfigReadFailed extends TaggedError("ConfigReadFailed")<{
+  readonly configPath: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class ConfigInvalid extends TaggedError("ConfigInvalid")<{
+  readonly message: string;
+}> {}
+
+// Domain failure: construct the owned variant and return it as a value.
+return Result.err(
+  new ConfigMissing({ configPath, message: `Configuration not found at ${configPath}` }),
+);
+
+// Immediate external adapter: preserve Panic and map every other thrown value.
+return Result.tryPromise({
+  try: () => readTextFile(configPath),
+  catch: (cause) => {
+    if (Panic.is(cause)) throw cause;
+    return new ConfigReadFailed({ configPath, cause, message: "Configuration read failed" });
+  },
+});
+
+// One-step flow: better-result 3.0 statuses are "ok" and "error".
+const loaded = await loadConfig(configPath);
+if (loaded.status === "error") return Result.err(loaded.error);
+return Result.ok(loaded.value.endpoint);
+
+// Linear flow: keep effects named and await Result-returning promises explicitly.
+return Result.gen(async function* () {
+  const text = yield* Result.await(readConfigText(configPath));
+  const config = yield* Result.await(decodeConfigText(text));
+  return Result.ok(config.endpoint);
+});
+
+// Policy boundary: map success and every member of the closed error union.
+function toDeliveryDisposition(
+  result: ResultType<Config, ConfigMissing | ConfigReadFailed | ConfigInvalid>,
+): "commit" | "park-pending" | "dead-letter" {
+  if (result.status === "ok") return "commit";
+  switch (result.error._tag) {
+    case "ConfigMissing":
+    case "ConfigReadFailed":
+      return "park-pending";
+    case "ConfigInvalid":
+      return "dead-letter";
+  }
+}
+
+// Logging boundary: pass only the redacted projection and approved context.
+logger.warn("Configuration load failed", {
+  configPath,
+  ...formatTaggedErrorForLog(configError),
+});
+```
 
 ### Framework edges
 

@@ -57,10 +57,18 @@ function architectureResolutionDiagnostics(
   for (const output of workspace.compatibilityOutputs) {
     if (output.sink.kind === "external") criticalPackages.add(output.sink.package);
   }
+  for (const logger of workspace.structuredLoggers) {
+    if (logger.sink.kind === "external") criticalPackages.add(logger.sink.package);
+  }
+  for (const formatter of workspace.taggedErrorFormatters) {
+    if (formatter.kind === "external") criticalPackages.add(formatter.package);
+  }
   const localSinkModules = new Set(
-    workspace.compatibilityOutputs.flatMap((output) =>
-      output.sink.kind === "local" ? [output.sink.module] : [],
-    ),
+    [
+      ...workspace.compatibilityOutputs.map((output) => output.sink),
+      ...workspace.structuredLoggers.map((logger) => logger.sink),
+      ...workspace.taggedErrorFormatters,
+    ].flatMap((sink) => (sink.kind === "local" ? [sink.module] : [])),
   );
   const checker = program.getTypeChecker();
   const diagnostics: ts.Diagnostic[] = [];

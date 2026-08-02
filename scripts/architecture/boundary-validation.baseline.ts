@@ -1936,30 +1936,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fmcp%2Fconfig-file.ts%23isMissingFileError%5BParameter%5D%401|sha256=b79e999ab72a9d7b9af5fef62d82075479deec0dba65dc80beea903969f3b79f",
-        identity: "src/mcp/config-file.ts#isMissingFileError[Parameter]@1",
-        location: {
-          file: "src/mcp/config-file.ts",
-          line: 51,
-          column: 29,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fmcp%2Fvalue-source.ts%23resolveJsonPointer%5BParameter%5D%401|sha256=9eb4d9c4abdcc27a15af766704e2fdba1ededbd5e026177155cfa4aac5e08d60",
-        identity: "src/mcp/value-source.ts#resolveJsonPointer[Parameter]@1",
-        location: {
-          file: "src/mcp/value-source.ts",
-          line: 35,
-          column: 36,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fssh%2Fssh-exec.ts%23isResponseBodyInit%5BParameter%5D%401|sha256=8c105de64bd34156e22222c49cd9819c6a2e28c752a79d4e896c6989995ede3f",
         identity: "src/ssh/ssh-exec.ts#isResponseBodyInit[Parameter]@1",
         location: {
@@ -3029,37 +3005,12 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fmcp%2Fregistry.ts%23configErrorStatus%5BParameter%5D%401|sha256=dea2ff82f6ca86714f744f32fc8c91c7c6eaccce6ec921d1180d6e2b00f00335",
-        identity: "src/mcp/registry.ts#configErrorStatus[Parameter]@1",
-        location: {
-          file: "src/mcp/registry.ts",
-          line: 178,
-          column: 3,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fmcp%2Fregistry.ts%23isOptionalHttpInboundSseError%5BParameter%5D%401|sha256=f24f56fdee6c85d00ea2415f76058920d5bec771ed3f6aed49288e108ffc4473",
         identity: "src/mcp/registry.ts#isOptionalHttpInboundSseError[Parameter]@1",
         location: {
           file: "src/mcp/registry.ts",
           line: 227,
           column: 3,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fmcp%2Fregistry.ts%23McpRegistry.initializeCandidate.%3Ccallback%3E.onUncaughtError%5BParameter%5D%401|sha256=a29f9308eeff1daf21e6ad8af1c2fba7b928d4d2daefe4329644df0a793885a0",
-        identity:
-          "src/mcp/registry.ts#McpRegistry.initializeCandidate.<callback>.onUncaughtError[Parameter]@1",
-        location: {
-          file: "src/mcp/registry.ts",
-          line: 564,
-          column: 31,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -3088,6 +3039,19 @@ export const boundaryValidationBaseline = {
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
+      },
+      {
+        fingerprint:
+          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fmcp%2Fregistry.ts%23McpRegistry.initializeCandidate.%3Ccallback%3E.onUncaughtError%5BParameter%5D%401|sha256=a29f9308eeff1daf21e6ad8af1c2fba7b928d4d2daefe4329644df0a793885a0",
+        identity:
+          "src/mcp/registry.ts#McpRegistry.initializeCandidate.<callback>.onUncaughtError[Parameter]@1",
+        location: {
+          file: "src/mcp/registry.ts",
+          line: 580,
+          column: 31,
+        },
+        reason:
+          "Existing domain-bearing unknown SDK callback pending its later registry migration.",
       },
       {
         fingerprint:
@@ -7642,54 +7606,6 @@ export const boundaryValidationBaseline = {
           file: "src/mcp/config.ts",
           line: 221,
           column: 18,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmcp%2Fconfig-file.ts%23isMissingFileError%5BCallExpression%5D%401|sha256=8b3de2fe28139f52a02154fe82221038cd361a37f8d19fe99d379f9020b61644",
-        identity: "src/mcp/config-file.ts#isMissingFileError[CallExpression]@1",
-        location: {
-          file: "src/mcp/config-file.ts",
-          line: 52,
-          column: 18,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmcp%2Fconfig-file.ts%23mutateMcpConfigFile.%3Ccallback%3E%5BCallExpression%5D%401|sha256=e9150100d866cc4c6215488b98d5ca6de9a967bedaea84180c3f83eea93a9b89",
-        identity: "src/mcp/config-file.ts#mutateMcpConfigFile.<callback>[CallExpression]@1",
-        location: {
-          file: "src/mcp/config-file.ts",
-          line: 134,
-          column: 7,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmcp%2Fconfig-file.ts%23mutateMcpConfigFile.%3Ccallback%3E%5BCallExpression%5D%401|sha256=ba3a2486c875afa9646ddb0681db66aa885f35ca808c00516a0af8e040717b64",
-        identity: "src/mcp/config-file.ts#mutateMcpConfigFile.<callback>[CallExpression]@1",
-        location: {
-          file: "src/mcp/config-file.ts",
-          line: 137,
-          column: 7,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmcp%2Fvalue-source.ts%23resolveMcpValueSource%5BCallExpression%5D%401|sha256=f882600866f1971ddd95deb7cd27ed76ae538d96bfd3d8e07a476119a7124f8a",
-        identity: "src/mcp/value-source.ts#resolveMcpValueSource[CallExpression]@1",
-        location: {
-          file: "src/mcp/value-source.ts",
-          line: 100,
-          column: 16,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",

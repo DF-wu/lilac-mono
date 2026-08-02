@@ -33,6 +33,8 @@ const BASE_WORKSPACE = {
   exceptionAdapters: [],
   panicSites: [],
   compatibilityOutputs: [],
+  structuredLoggers: [],
+  taggedErrorFormatters: [],
   operationalResultApis: [],
   baselines: {
     boundaryValidation: "boundary-validation.baseline.ts",
@@ -85,6 +87,23 @@ describe("boundary validation rules", () => {
     expect(findings.some((finding) => finding.location?.line === 13)).toBeTrue();
     expect(findings.some((finding) => finding.location?.line === 17)).toBeFalse();
     expect(findings.some((finding) => finding.location?.line === 21)).toBeFalse();
+  });
+
+  test("exception adapters exempt only their exact callable unknown parameters", () => {
+    const findings = findingsFor("architecture/no-domain-unknown", "exception-adapter.ts", {
+      exceptionAdapters: [
+        {
+          identity: { module: "exception-adapter.ts", exportName: "exactExceptionAdapter" },
+          category: "external-to-result",
+          externalApi: { package: "fixture", exportName: "operation" },
+          direction: "capture-external",
+          reason: "Fixture exact exception adapter.",
+        },
+      ],
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("payload");
+    expect(findings[0]?.identity).toContain("exactExceptionAdapter.inspectNested");
   });
 
   test("rejects only structured assertions whose resolved source is unknown", () => {
@@ -225,6 +244,208 @@ describe("real declaration integration", () => {
     expect(
       findings.filter((finding) => finding.rule === "architecture/no-unmapped-result-capture"),
     ).toHaveLength(1);
+  });
+
+  test("enforces Stage 1 contracts and TaggedError redaction against real better-result declarations", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-stage1",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: Object.fromEntries(
+        [
+          "architecture/no-unhandled-exception-contract",
+          "architecture/no-unredacted-tagged-error-log",
+          "architecture/fallible-api-result",
+          "architecture/no-result-wire-leak",
+        ].map((rule) => [rule, [{ include: "stage1.ts" }]]),
+      ),
+      structuredLoggers: [
+        {
+          sink: { kind: "local", module: "stage1.ts", exportName: "structuredLog" },
+          reason: "Fixture logger accepts arbitrary structured fields.",
+        },
+        {
+          sink: {
+            kind: "external",
+            package: "@stanley2058/simple-module-logger",
+            exportName: "error",
+          },
+          reason: "Real logger accepts arbitrary structured fields.",
+        },
+      ],
+      taggedErrorFormatters: [
+        {
+          kind: "external",
+          package: "@stanley2058/lilac-utils",
+          exportName: "formatTaggedErrorForLog",
+        },
+      ],
+      operationalResultApis: [
+        { module: "stage1.ts", exportName: "rejectingFallibleApi" },
+        { module: "stage1.ts", exportName: "resultFallibleApi" },
+        { module: "stage1.ts", exportName: "directResultFallibleApi" },
+        { module: "stage1.ts", exportName: "resultFallibleStream" },
+        { module: "stage1.ts", exportName: "inferredResultFallibleStream" },
+        { module: "stage1.ts", exportName: "wrongResultFallibleStream" },
+      ],
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program, [
+      { packageName: workspace.packageName, root: workspaceProgram.root },
+      {
+        packageName: "@stanley2058/lilac-utils",
+        root: path.join(REPOSITORY_ROOT, "packages/utils"),
+      },
+    ]);
+
+    expect(
+      findings.filter((finding) => finding.rule === "architecture/no-unhandled-exception-contract"),
+    ).toHaveLength(7);
+    const unhandledMessages = findings
+      .filter((finding) => finding.rule === "architecture/no-unhandled-exception-contract")
+      .map((finding) => finding.message);
+    const unhandledIdentities = findings
+      .filter((finding) => finding.rule === "architecture/no-unhandled-exception-contract")
+      .map((finding) => finding.identity);
+    expect(new Set(unhandledIdentities).size).toBe(7);
+    expect(
+      unhandledMessages.some((message) => message.includes("UnhandledService.load")),
+    ).toBeTrue();
+    expect(
+      unhandledMessages.some((message) => message.includes("UnhandledCallableService.<call>")),
+    ).toBeTrue();
+    expect(
+      unhandledMessages.some((message) => message.includes("UnhandledHandler.<call>")),
+    ).toBeTrue();
+    expect(
+      unhandledMessages.some((message) => message.includes("laterExportedContract")),
+    ).toBeTrue();
+    const redactionFindings = findings.filter(
+      (finding) => finding.rule === "architecture/no-unredacted-tagged-error-log",
+    );
+    expect(redactionFindings).toHaveLength(13);
+    expect(
+      redactionFindings.filter((finding) =>
+        finding.identity.includes("destructureTaggedErrorMessage"),
+      ),
+    ).toHaveLength(2);
+    expect(
+      redactionFindings.filter((finding) => finding.identity.includes("assignTaggedErrorMessage")),
+    ).toHaveLength(2);
+    expect(
+      redactionFindings.some((finding) => finding.message.includes("JSON.stringify")),
+    ).toBeTrue();
+    expect(redactionFindings.some((finding) => finding.message.includes("toJSON"))).toBeTrue();
+    expect(
+      redactionFindings.some((finding) => finding.message.includes("structured logger")),
+    ).toBeTrue();
+    expect(
+      redactionFindings.every((finding) => finding.suggestion.includes("redacting")),
+    ).toBeTrue();
+    const fallibleFindings = findings.filter(
+      (finding) => finding.rule === "architecture/fallible-api-result",
+    );
+    expect(fallibleFindings).toHaveLength(2);
+    expect(fallibleFindings[0]?.message).toContain("rejectingFallibleApi");
+    expect(
+      fallibleFindings.some((finding) => finding.message.includes("wrongResultFallibleStream")),
+    ).toBeTrue();
+    expect(
+      fallibleFindings.every((finding) => finding.suggestion.includes("Promise<Result<T, E>>")),
+    ).toBeTrue();
+    const resultLeaks = findings.filter(
+      (finding) => finding.rule === "architecture/no-result-wire-leak",
+    );
+    expect(resultLeaks).toHaveLength(2);
+    expect(resultLeaks.every((finding) => finding.message.includes("JSON.stringify"))).toBeTrue();
+  });
+
+  test("registers only converted Core Stage 1 pilot symbols", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    if (!core) throw new Error("core workspace missing");
+    expect(core.operationalResultApis).toEqual([
+      { module: "src/mcp/config-file.ts", exportName: "readMcpConfigFile" },
+      { module: "src/mcp/config-file.ts", exportName: "writeMcpConfigFileAtomic" },
+      { module: "src/mcp/config-file.ts", exportName: "mutateMcpConfigFile" },
+      { module: "src/mcp/value-source.ts", exportName: "resolveJsonPointer" },
+      { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSource" },
+      { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSourceMap" },
+      { module: "src/mcp/value-source.ts", exportName: "validateHttpHeaders" },
+    ]);
+    expect(core.ruleZones["architecture/fallible-api-result"]).toEqual([
+      { include: "src/mcp/value-source.ts" },
+      { include: "src/mcp/config-file.ts" },
+    ]);
+    expect(
+      core.exceptionAdapters
+        .filter((adapter) =>
+          ["McpOAuthProvider.clientInformationForSdkAttempt", "resultToMcpToolValue"].includes(
+            adapter.identity.exportName,
+          ),
+        )
+        .map((adapter) => ({
+          identity: adapter.identity,
+          category: adapter.category,
+          externalApi: adapter.externalApi,
+          direction: adapter.direction,
+        })),
+    ).toEqual([
+      {
+        identity: {
+          module: "src/mcp/oauth-provider.ts",
+          exportName: "McpOAuthProvider.clientInformationForSdkAttempt",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@ai-sdk/mcp",
+          exportName: "OAuthClientProvider.clientInformation",
+        },
+        direction: "signal-host",
+      },
+      {
+        identity: {
+          module: "src/tool-server/tools/mcp.ts",
+          exportName: "resultToMcpToolValue",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-plugin-runtime",
+          exportName: "ServerTool",
+        },
+        direction: "signal-host",
+      },
+    ]);
+    expect(
+      core.exceptionAdapters.some(
+        (adapter) => adapter.identity.exportName === "McpRegistry.reconcileServer",
+      ),
+    ).toBeFalse();
+    expect(
+      core.exceptionAdapters.some(
+        (adapter) => adapter.identity.exportName === "McpRegistry.initializeCandidate",
+      ),
+    ).toBeFalse();
+    expect(
+      core.exceptionAdapters.find(
+        (adapter) => adapter.identity.exportName === "opaqueErrorMessage",
+      ),
+    ).toMatchObject({
+      identity: { module: "src/mcp/error-format.ts", exportName: "opaqueErrorMessage" },
+      category: "compatibility",
+      externalApi: { package: "global", exportName: "Error.message" },
+      direction: "capture-external",
+    });
+    const nonPilot = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/tool-bridge",
+    );
+    if (!nonPilot) throw new Error("non-pilot workspace missing");
+    expect(nonPilot.ruleZones["architecture/no-unhandled-exception-contract"]).toEqual([]);
+    expect(nonPilot.ruleZones["architecture/no-unredacted-tagged-error-log"]).toEqual([]);
+    expect(nonPilot.ruleZones["architecture/fallible-api-result"]).toEqual([]);
   });
 
   test("resolves Bun-realpathed cross-workspace declarations to package identities", () => {

@@ -5,8 +5,11 @@ export const ARCHITECTURE_RULES = [
   "architecture/no-rich-unknown-predicate",
   "architecture/no-production-unwrap",
   "architecture/no-unmapped-result-capture",
+  "architecture/no-unhandled-exception-contract",
   "architecture/registered-panic-site",
   "architecture/no-result-wire-leak",
+  "architecture/no-unredacted-tagged-error-log",
+  "architecture/fallible-api-result",
 ] as const;
 
 export type ArchitectureRule = (typeof ARCHITECTURE_RULES)[number];
@@ -20,8 +23,11 @@ export const RULE_GROUPS = {
   "architecture/no-rich-unknown-predicate": "boundary-validation",
   "architecture/no-production-unwrap": "failure-flow",
   "architecture/no-unmapped-result-capture": "failure-flow",
+  "architecture/no-unhandled-exception-contract": "failure-flow",
   "architecture/registered-panic-site": "failure-flow",
   "architecture/no-result-wire-leak": "failure-flow",
+  "architecture/no-unredacted-tagged-error-log": "failure-flow",
+  "architecture/fallible-api-result": "failure-flow",
 } as const satisfies Readonly<Record<ArchitectureRule, RuleGroup>>;
 
 export interface SourceLocation {

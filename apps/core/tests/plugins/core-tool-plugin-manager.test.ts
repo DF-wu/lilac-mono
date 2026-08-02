@@ -5,6 +5,7 @@ import path from "node:path";
 import { asSchema, jsonSchema, tool } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import { createCoreToolPluginManager } from "../../src/plugins";
 import { McpRegistry } from "../../src/mcp";
@@ -829,7 +830,7 @@ export default {
         mcpRegistry: {
           async init() {},
           async reload() {
-            return [];
+            return Result.ok([]);
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
@@ -945,7 +946,7 @@ export default {
         mcpRegistry: {
           async init() {},
           async reload() {
-            return [];
+            return Result.ok([]);
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],

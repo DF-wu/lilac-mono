@@ -9,6 +9,7 @@ import {
   type OAuthClientProvider,
   type OAuthTokens,
 } from "@ai-sdk/mcp";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   readMcpOAuthCredentialFile,
@@ -18,8 +19,10 @@ import {
 import {
   type McpAuthorizationCodeAuth,
   type McpServerDefinition,
+  type McpValueSource,
   type UniversalMcpConfig,
 } from "./config-types";
+import { rethrowPanic } from "./error-format";
 import { resolveMcpValueSource, type McpValueResolutionContext } from "./value-source";
 
 export const MCP_OAUTH_CALLBACK_URL = "http://localhost:1456/mcp/oauth/callback";
@@ -59,6 +62,15 @@ export class McpOAuthProviderError extends Error {
     this.name = "McpOAuthProviderError";
   }
 }
+
+export class McpOAuthCredentialResolutionError extends TaggedError(
+  "McpOAuthCredentialResolutionError",
+)<{
+  readonly serverId: string;
+  readonly field: "client_id" | "client_secret";
+  readonly cause: Error;
+  readonly message: string;
+}> {}
 
 export class McpOAuthProvider implements OAuthClientProvider {
   readonly serverId: string;
@@ -131,7 +143,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   }
 
   async clientInformation(): Promise<OAuthClientInformation | undefined> {
-    const information = await this.clientInformationForAuthorization();
+    const information = await this.clientInformationForSdkAttempt();
     if (this.authConfig.client.type === "dynamic" && information === undefined) {
       throw new UnauthorizedError("Interactive MCP authorization requires explicit mcp.auth");
     }
@@ -142,7 +154,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
     this.rejectImplicitAuthorization();
   }
 
-  private async clientInformationForAuthorization(): Promise<OAuthClientInformation | undefined> {
+  private async clientInformationForAuthorization(): Promise<
+    ResultType<OAuthClientInformation | undefined, McpOAuthCredentialResolutionError>
+  > {
     if (this.authConfig.client.type === "dynamic") {
       const information = (await this.readCredential())?.clientInformation;
       if (
@@ -150,24 +164,46 @@ export class McpOAuthProvider implements OAuthClientProvider {
         information.client_secret_expires_at !== 0 &&
         information.client_secret_expires_at <= this.now() / 1000
       ) {
-        return undefined;
+        return Result.ok(undefined);
       }
-      return information;
+      return Result.ok(information);
     }
 
-    const clientId = await resolveMcpValueSource(
-      this.authConfig.client.clientId,
-      this.valueContext,
-    );
-    if (!clientId.ok) throw new McpOAuthProviderError(this.serverId, "credentials");
-    if (this.authConfig.client.clientSecret === undefined) return { client_id: clientId.value };
+    const client = this.authConfig.client;
+    const resolveStaticCredential = this.resolveStaticCredential.bind(this);
+    return Result.gen(async function* () {
+      const clientId = yield* Result.await(resolveStaticCredential(client.clientId, "client_id"));
+      if (client.clientSecret === undefined) return Result.ok({ client_id: clientId });
 
-    const clientSecret = await resolveMcpValueSource(
-      this.authConfig.client.clientSecret,
-      this.valueContext,
+      const clientSecret = yield* Result.await(
+        resolveStaticCredential(client.clientSecret, "client_secret"),
+      );
+      return Result.ok({ client_id: clientId, client_secret: clientSecret });
+    });
+  }
+
+  private async clientInformationForSdkAttempt(): Promise<OAuthClientInformation | undefined> {
+    const result = await this.clientInformationForAuthorization();
+    if (result.status === "error") {
+      throw new McpOAuthProviderError(this.serverId, "credentials");
+    }
+    return result.value;
+  }
+
+  private async resolveStaticCredential(
+    source: McpValueSource,
+    field: "client_id" | "client_secret",
+  ): Promise<ResultType<string, McpOAuthCredentialResolutionError>> {
+    const resolved = await resolveMcpValueSource(source, this.valueContext);
+    if (resolved.status === "ok") return resolved;
+    return Result.err(
+      new McpOAuthCredentialResolutionError({
+        serverId: this.serverId,
+        field,
+        cause: resolved.error,
+        message: `Could not resolve OAuth ${field === "client_id" ? "client ID" : "client secret"} for MCP server ${JSON.stringify(this.serverId)}`,
+      }),
     );
-    if (!clientSecret.ok) throw new McpOAuthProviderError(this.serverId, "credentials");
-    return { client_id: clientId.value, client_secret: clientSecret.value };
   }
 
   async authorizationServerInformation(): Promise<OAuthAuthorizationServerInformation | undefined> {
@@ -228,8 +264,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
         authorizationUrl,
         callbackUrl: this.redirectUrl,
       };
-    } catch {
+    } catch (error) {
       this.deletePending(pending);
+      rethrowPanic(error);
       throw new McpOAuthProviderError(this.serverId, "start");
     }
   }
@@ -252,8 +289,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
       });
       if (result !== "AUTHORIZED") throw new McpOAuthProviderError(this.serverId, "complete");
       this.deletePending(pending);
-    } catch {
+    } catch (error) {
       if (this.isActive(pending)) pending.status = "pending";
+      rethrowPanic(error);
       throw new McpOAuthProviderError(this.serverId, "complete");
     }
   }
@@ -320,7 +358,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
         }
         return pending.codeVerifier;
       },
-      clientInformation: () => this.clientInformationForAuthorization(),
+      clientInformation: () => this.clientInformationForSdkAttempt(),
       saveClientInformation: async (clientInformation: OAuthClientInformation) => {
         this.assertActive(pending, "start");
         await this.updateCredentialForAttempt(pending, "start", (credential) => ({

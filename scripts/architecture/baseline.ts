@@ -110,10 +110,16 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing unsafe Result extraction awaiting explicit success/error policy handling.";
     case "architecture/no-unmapped-result-capture":
       return "Existing generic Result capture awaiting mapping to a domain-owned error.";
+    case "architecture/no-unhandled-exception-contract":
+      return "Existing UnhandledException contract awaiting a specific domain-owned error mapping.";
     case "architecture/registered-panic-site":
       return "Existing Panic callsite awaiting reviewed hard-invariant registration.";
     case "architecture/no-result-wire-leak":
       return "Existing Result or TaggedError envelope awaiting compatibility-boundary mapping.";
+    case "architecture/no-unredacted-tagged-error-log":
+      return "Existing TaggedError serialization awaiting approved redaction.";
+    case "architecture/fallible-api-result":
+      return "Existing fallible API awaiting a typed Result return contract.";
   }
 }
 

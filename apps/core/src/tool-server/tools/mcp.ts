@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { Result } from "better-result";
 
 import {
   MCP_CONFIG_VERSION,
@@ -74,6 +75,12 @@ function safeReloadOutcomes(outcomes: readonly McpReloadOutcome[]): readonly Mcp
   }));
 }
 
+function resultToMcpToolValue<T, E extends Error>(result: Result<T, E>): T {
+  if (result.status === "ok") return result.value;
+  // ServerTool reports failures through the host's exception channel; never throw the TaggedError.
+  throw new Error(result.error.message);
+}
+
 export class McpManagement implements ServerTool {
   id = "mcp";
   private mutationQueue: Promise<void> = Promise.resolve();
@@ -147,7 +154,7 @@ export class McpManagement implements ServerTool {
   async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
     if (callableId === "mcp.list") {
       parseToolInput({ callableId, input: rawInput, schema: emptyInputSchema });
-      const snapshot = await readMcpConfigFile(this.params.configPath);
+      const snapshot = resultToMcpToolValue(await readMcpConfigFile(this.params.configPath));
       return {
         servers: Object.values(snapshot.config.servers)
           .sort((left, right) => left.id.localeCompare(right.id))
@@ -180,13 +187,17 @@ export class McpManagement implements ServerTool {
       if (!server) throw new Error(`Could not normalize MCP server ${JSON.stringify(serverId)}`);
 
       return await this.enqueueManagementOperation(async () => {
-        const mutation = await mutateMcpConfigFile({
-          configPath: this.params.configPath,
-          mutation: { type: "upsert", server },
-        });
+        const mutation = resultToMcpToolValue(
+          await mutateMcpConfigFile({
+            configPath: this.params.configPath,
+            mutation: { type: "upsert", server },
+          }),
+        );
         await this.waitUntilRegistryInitialized();
         this.params.providers.reconcile(mutation.config);
-        const reload = safeReloadOutcomes(await this.params.registry.reload(serverId));
+        const reload = safeReloadOutcomes(
+          resultToMcpToolValue(await this.params.registry.reload(serverId)),
+        );
         return {
           mutation: {
             type: "upsert" as const,
@@ -210,13 +221,17 @@ export class McpManagement implements ServerTool {
         schema: serverIdInputSchema,
       });
       return await this.enqueueManagementOperation(async () => {
-        const mutation = await mutateMcpConfigFile({
-          configPath: this.params.configPath,
-          mutation: { type: "remove", serverId },
-        });
+        const mutation = resultToMcpToolValue(
+          await mutateMcpConfigFile({
+            configPath: this.params.configPath,
+            mutation: { type: "remove", serverId },
+          }),
+        );
         await this.waitUntilRegistryInitialized();
         this.params.providers.reconcile(mutation.config);
-        const reload = safeReloadOutcomes(await this.params.registry.reload(serverId));
+        const reload = safeReloadOutcomes(
+          resultToMcpToolValue(await this.params.registry.reload(serverId)),
+        );
         return {
           mutation: {
             type: "remove" as const,
@@ -284,14 +299,15 @@ export class McpManagement implements ServerTool {
       });
       return await this.enqueueManagementOperation(async () => {
         await this.waitUntilRegistryInitialized();
-        let snapshot: McpConfigFileSnapshot;
-        try {
-          snapshot = await readMcpConfigFile(this.params.configPath);
-        } catch {
-          return { reload: safeReloadOutcomes(await this.params.registry.reload(serverId)) };
+        const read = await readMcpConfigFile(this.params.configPath);
+        if (read.status === "error") {
+          const reload = resultToMcpToolValue(await this.params.registry.reload(serverId));
+          return { reload: safeReloadOutcomes(reload) };
         }
+        const snapshot: McpConfigFileSnapshot = read.value;
         this.params.providers.reconcile(snapshot.config);
-        return { reload: safeReloadOutcomes(await this.params.registry.reload(serverId)) };
+        const reload = resultToMcpToolValue(await this.params.registry.reload(serverId));
+        return { reload: safeReloadOutcomes(reload) };
       });
     }
 

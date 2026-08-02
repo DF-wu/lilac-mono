@@ -4,12 +4,14 @@
 
 - Use subagents for edits and review; parallelize work when it is independent.
 - Maintain this todo file alongside `plan/boundary-type-safety-refactor.md`.
+- Complete the remaining plan stage by stage, in order, until every stage is complete.
+- Commit each stage separately after its exit criteria, validation, and review are complete.
 - Keep changes scoped to the agreed plan. Document residual review findings here and defer them unless
   they block the current stage.
 
 ## Current Stage
 
-Stage 0 complete. Next: Stage 1, `better-result` Foundation And Pilot.
+Stages 0 and 1 complete. Next: Stage 2, Mechanical Union, Predicate, And Failure Guardrails.
 
 ## Stage 0
 
@@ -25,9 +27,21 @@ Stage 0 complete. Next: Stage 1, `better-result` Foundation And Pilot.
 - [x] Run Stage 0 focused tests, repository typecheck, lint, formatting, and full tests.
 - [x] Run an independent Stage 0 review and resolve blocking or high-severity in-scope findings.
 
+## Stage 1
+
+- [x] Migrate MCP value-source and config-file expected failures to domain-owned `better-result` values.
+- [x] Preserve MCP YAML, registry status, OAuth SDK, tool output, and atomic-file compatibility.
+- [x] Prove direct branching, generator composition, exact-signal cancellation, retry abort behavior,
+  cleanup precedence, and Panic supervision under Bun and TypeScript 7.
+- [x] Add the canonical redacting TaggedError log projection and focused leak tests.
+- [x] Add Stage 1 Result-contract, serialization, redaction, and syntax enforcement with real-library fixtures.
+- [x] Remove repaired pilot baseline debt while retaining reviewed unrelated migration debt.
+- [x] Run independent Core, enforcement, and exit-criteria reviews and resolve all blocking findings.
+- [x] Run focused tests, root typecheck, full tests, lint, architecture ratchets, and formatting.
+
 ## Later Stages
 
-- [ ] Stage 1: `better-result` foundation and pilot migrations.
+- [x] Stage 1: `better-result` foundation and pilot migrations.
 - [ ] Stage 2: mechanical union, predicate, and failure guardrails.
 - [ ] Stage 3: high-risk process and extension boundaries.
 - [ ] Stage 4: typed event-bus codec and delivery registry.
@@ -56,3 +70,10 @@ Stage 0 complete. Next: Stage 1, `better-result` Foundation And Pilot.
 - 2026-08-02: Stage 0 validation passed: `bun run typecheck`, `bun run test:all`, `bun run lint:fix`,
   `bun run fmt`, `bun run lint`, `bun run fmt:check`, and `git diff --check`. The active syntax ratchet
   matched all 2,620 reviewed findings with zero new errors.
+- 2026-08-02: Stage 1 migrated MCP value/config failure flow to typed Results, added safe TaggedError
+  logging, cancellation/retry and cleanup proofs, and activated focused Result/redaction enforcement.
+  Independent reviews found and drove fixes for Panic cleanup/state conversion, hidden auth rejection,
+  direct Result serialization, overbroad adapter registration, formatter leaks, and provenance bypasses.
+- 2026-08-02: Stage 1 validation passed: `bun run typecheck`, `bun run test:all`, `bun run lint:fix`,
+  `bun run fmt`, `bun run lint`, `bun run fmt:check`, and `git diff --check`. The syntax ratchet matched
+  all 2,593 reviewed findings with zero new errors.

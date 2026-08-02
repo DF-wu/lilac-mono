@@ -30,6 +30,8 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): Architectu
         exceptionAdapters: adapters,
         panicSites: [],
         compatibilityOutputs: [],
+        structuredLoggers: [],
+        taggedErrorFormatters: [],
         operationalResultApis: [],
         baselines: { boundaryValidation: "unused", failureFlow: "unused" },
       },
@@ -181,6 +183,37 @@ describe("production exception syntax", () => {
       "stream-error-signal",
       "stream-error-signal",
       "stream-error-signal",
+    ]);
+  });
+
+  it("owns Stage 1 TaggedError throws, broad catches, and rejected Result promises", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { TaggedError, type Result } from "better-result";
+        class Failure extends TaggedError("Failure") {}
+        export function throwsTaggedError(): Result<string, Failure> {
+          throw new Failure();
+        }
+        export function broadCatch(): Result<string, Failure> {
+          try { return operation(); } catch (cause) { return mapCause(cause); }
+        }
+        export function rejectsResultPromise(): Promise<Result<string, Failure>> {
+          return Promise.reject(new Failure());
+        }
+      `,
+      "apps/example/src/stage1.ts",
+      policyWith(),
+    );
+
+    expect(violations.map((violation) => violation.kind)).toEqual([
+      "throw",
+      "catch-clause",
+      "promise-reject",
+    ]);
+    expect(violations.map((violation) => violation.message)).toEqual([
+      "Return a typed Result error; throw only in an exactly registered adapter",
+      "Capture the external exception in an exactly registered adapter; try/finally remains allowed",
+      "Return Result.err instead of Promise.reject",
     ]);
   });
 

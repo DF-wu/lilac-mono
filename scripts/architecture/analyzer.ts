@@ -88,7 +88,13 @@ function callCandidateNames(
   }
   if (activeRules.has("architecture/registered-panic-site")) names.add("panic");
   if (activeRules.has("architecture/no-result-wire-leak")) {
+    names.add("stringify");
     for (const output of workspace.compatibilityOutputs) names.add(output.sink.exportName);
+  }
+  if (activeRules.has("architecture/no-unredacted-tagged-error-log")) {
+    names.add("stringify");
+    names.add("toJSON");
+    for (const logger of workspace.structuredLoggers) names.add(logger.sink.exportName);
   }
 
   const aliases: Array<readonly [source: string, target: string]> = [];
@@ -210,10 +216,35 @@ function nodeIdentity(node: ts.Node, workspaceRoot: string): NodeIdentity {
     const part = callablePart(current);
     if (part) parts.unshift(part);
   }
-  const symbolPath = parts.join(".") || "<module>";
+  let signatureContractPath: string | undefined;
+  if (
+    ts.isMethodSignature(node) ||
+    ts.isCallSignatureDeclaration(node) ||
+    ts.isFunctionTypeNode(node)
+  ) {
+    let container: ts.Node | undefined = node.parent;
+    while (
+      container &&
+      !ts.isInterfaceDeclaration(container) &&
+      !ts.isTypeAliasDeclaration(container)
+    ) {
+      container = container.parent;
+    }
+    if (
+      container &&
+      (ts.isInterfaceDeclaration(container) || ts.isTypeAliasDeclaration(container))
+    ) {
+      const member = ts.isMethodSignature(node) ? node.name.getText() : "<call>";
+      signatureContractPath = `${container.name.text}.${member}`;
+    }
+  }
+  const declaredContractName =
+    ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) ? node.name.text : undefined;
+  const symbolPath = parts.join(".") || signatureContractPath || declaredContractName || "<module>";
   return {
     module: relativeModulePath(workspaceRoot, node.getSourceFile()),
-    exportName: parts[0] ?? "<module>",
+    exportName:
+      parts[0] ?? signatureContractPath?.split(".")[0] ?? declaredContractName ?? "<module>",
     symbolPath,
   };
 }
@@ -265,6 +296,13 @@ function typeArguments(type: ts.Type, checker: ts.TypeChecker): readonly ts.Type
   return [...argumentsFromAlias, ...checker.getTypeArguments(objectType as ts.TypeReference)];
 }
 
+function baseTypes(type: ts.Type): readonly ts.BaseType[] {
+  if ((type.flags & ts.TypeFlags.Object) === 0) return [];
+  const objectType = type as ts.ObjectType;
+  if ((objectType.objectFlags & (ts.ObjectFlags.Class | ts.ObjectFlags.Interface)) === 0) return [];
+  return objectType.getBaseTypes() ?? [];
+}
+
 function typeContainsPackageType(
   type: ts.Type,
   checker: ts.TypeChecker,
@@ -307,6 +345,23 @@ function typeContainsPackageType(
     typeArguments(type, checker).some((argument) =>
       typeContainsPackageType(
         argument,
+        checker,
+        packageRoots,
+        packageName,
+        symbolNames,
+        location,
+        state,
+        depth + 1,
+      ),
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    baseTypes(type).some((baseType) =>
+      typeContainsPackageType(
+        baseType,
         checker,
         packageRoots,
         packageName,
@@ -401,6 +456,22 @@ function typeContainsBetterResult(
   return Boolean(tag && symbolComesFromPackage(match, "better-result", packageRoots));
 }
 
+function typeContainsResult(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  location: ts.Node,
+): boolean {
+  return typeContainsPackageType(
+    type,
+    checker,
+    packageRoots,
+    "better-result",
+    new Set(["Err", "Ok", "Result"]),
+    location,
+  );
+}
+
 function typeContainsUnhandledException(
   type: ts.Type,
   checker: ts.TypeChecker,
@@ -415,6 +486,119 @@ function typeContainsUnhandledException(
     new Set(["UnhandledException"]),
     location,
   );
+}
+
+function typeContainsTaggedError(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  location: ts.Node,
+): boolean {
+  if (
+    typeContainsPackageType(
+      type,
+      checker,
+      packageRoots,
+      "better-result",
+      new Set(["AnyTaggedError", "TaggedErrorInstance"]),
+      location,
+    )
+  ) {
+    return true;
+  }
+  const toJSON = type.getProperty("toJSON");
+  return Boolean(
+    type.getProperty("_tag") && symbolComesFromPackage(toJSON, "better-result", packageRoots),
+  );
+}
+
+function typeIsTaggedError(
+  type: ts.Type,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seen: Set<ts.Type> = new Set(),
+): boolean {
+  if (seen.has(type)) return false;
+  seen.add(type);
+  if (
+    typeIsPackageType(
+      type,
+      "better-result",
+      new Set(["AnyTaggedError", "TaggedErrorInstance"]),
+      packageRoots,
+    )
+  ) {
+    return true;
+  }
+  const toJSON = type.getProperty("toJSON");
+  if (type.getProperty("_tag") && symbolComesFromPackage(toJSON, "better-result", packageRoots)) {
+    return true;
+  }
+  if (
+    type.isUnionOrIntersection() &&
+    type.types.some((member) => typeIsTaggedError(member, packageRoots, seen))
+  ) {
+    return true;
+  }
+  return baseTypes(type).some((baseType) => typeIsTaggedError(baseType, packageRoots, seen));
+}
+
+function typeIsPackageType(
+  type: ts.Type,
+  packageName: string,
+  symbolNames: ReadonlySet<string>,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const symbols = [type.aliasSymbol, type.getSymbol()];
+  return symbols.some((symbol) => {
+    const name = symbol?.getName();
+    return Boolean(
+      name && symbolNames.has(name) && symbolComesFromPackage(symbol, packageName, packageRoots),
+    );
+  });
+}
+
+function isDirectResultType(type: ts.Type, packageRoots: readonly WorkspacePackageRoot[]): boolean {
+  if (typeIsPackageType(type, "better-result", new Set(["Err", "Ok", "Result"]), packageRoots)) {
+    return true;
+  }
+  return (
+    type.isUnion() &&
+    type.types.length > 0 &&
+    type.types.every((member) =>
+      typeIsPackageType(member, "better-result", new Set(["Err", "Ok"]), packageRoots),
+    )
+  );
+}
+
+function isFallibleResultContract(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (isDirectResultType(type, packageRoots)) return true;
+  const symbolName = type.aliasSymbol?.getName() ?? type.getSymbol()?.getName();
+  if (
+    symbolName !== "Promise" &&
+    symbolName !== "AsyncIterable" &&
+    symbolName !== "AsyncGenerator"
+  ) {
+    return baseTypes(type).some((baseType) =>
+      isFallibleResultContract(baseType, checker, packageRoots),
+    );
+  }
+  const [valueType] = typeArguments(type, checker);
+  return Boolean(valueType && isDirectResultType(valueType, packageRoots));
+}
+
+function callReceiver(node: ts.CallExpression): ts.Expression | undefined {
+  if (ts.isPropertyAccessExpression(node.expression)) return node.expression.expression;
+  if (ts.isElementAccessExpression(node.expression)) return node.expression.expression;
+  return undefined;
+}
+
+function isDefaultLibraryDeclaration(node: ts.Node | undefined): boolean {
+  if (!node) return false;
+  return /(?:^|\/)lib\.[^/]+\.d\.ts$/u.test(normalizedPath(node.getSourceFile().fileName));
 }
 
 function outputIdentityMatches(
@@ -433,6 +617,179 @@ function outputIdentityMatches(
     case "local":
       return identityMatches(identity, nodeIdentity(signature.declaration, workspaceRoot));
   }
+}
+
+function isRegisteredFormatterCall(
+  node: ts.CallExpression,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const signature = checker.getResolvedSignature(node);
+  return workspace.taggedErrorFormatters.some((formatter) =>
+    outputIdentityMatches(formatter, signature, workspaceRoot, packageRoots),
+  );
+}
+
+function bindingElementSource(
+  element: ts.BindingElement,
+  checker: ts.TypeChecker,
+): ts.Expression | undefined {
+  const selectors: Array<
+    | { readonly kind: "array"; readonly index: number }
+    | { readonly kind: "object"; readonly name: string }
+  > = [];
+  let current = element;
+  while (true) {
+    const pattern = current.parent;
+    if (ts.isObjectBindingPattern(pattern)) {
+      const name = current.propertyName ?? current.name;
+      if (!ts.isIdentifier(name) && !ts.isStringLiteral(name) && !ts.isNumericLiteral(name)) {
+        return undefined;
+      }
+      selectors.unshift({ kind: "object", name: name.text });
+    } else if (ts.isArrayBindingPattern(pattern)) {
+      const index = pattern.elements.indexOf(current);
+      if (index < 0) return undefined;
+      selectors.unshift({ kind: "array", index });
+    } else {
+      return undefined;
+    }
+
+    if (!ts.isBindingElement(pattern.parent)) {
+      if (!ts.isVariableDeclaration(pattern.parent) || !pattern.parent.initializer)
+        return undefined;
+      let source: ts.Expression = pattern.parent.initializer;
+      const expandedSymbols = new Set<ts.Symbol>();
+      for (const selector of selectors) {
+        while (ts.isIdentifier(source)) {
+          const sourceSymbol = checker.getSymbolAtLocation(source);
+          if (!sourceSymbol || expandedSymbols.has(sourceSymbol)) break;
+          expandedSymbols.add(sourceSymbol);
+          const declaration = sourceSymbol.declarations?.find(
+            (candidate): candidate is ts.VariableDeclaration =>
+              ts.isVariableDeclaration(candidate) && candidate.initializer !== undefined,
+          );
+          if (!declaration?.initializer) break;
+          source = declaration.initializer;
+        }
+        if (selector.kind === "object" && ts.isObjectLiteralExpression(source)) {
+          const property = source.properties.find((candidate) => {
+            if (
+              !ts.isPropertyAssignment(candidate) &&
+              !ts.isShorthandPropertyAssignment(candidate)
+            ) {
+              return false;
+            }
+            const propertyName = candidate.name;
+            return (
+              (ts.isIdentifier(propertyName) ||
+                ts.isStringLiteral(propertyName) ||
+                ts.isNumericLiteral(propertyName)) &&
+              propertyName.text === selector.name
+            );
+          });
+          if (property && ts.isPropertyAssignment(property)) {
+            source = property.initializer;
+            continue;
+          }
+          if (property && ts.isShorthandPropertyAssignment(property)) {
+            source = property.name;
+            continue;
+          }
+          return source;
+        }
+        if (selector.kind === "array" && ts.isArrayLiteralExpression(source)) {
+          const selected = source.elements[selector.index];
+          if (!selected || ts.isOmittedExpression(selected) || ts.isSpreadElement(selected)) {
+            return source;
+          }
+          source = selected;
+          continue;
+        }
+        return source;
+      }
+      return source;
+    }
+    current = pattern.parent;
+  }
+}
+
+function latestSymbolSource(
+  symbol: ts.Symbol,
+  use: ts.Identifier,
+  checker: ts.TypeChecker,
+): ts.Expression | undefined {
+  let latest: { readonly position: number; readonly expression: ts.Expression } | undefined;
+  for (const declaration of symbol.declarations ?? []) {
+    let expression: ts.Expression | undefined;
+    if (ts.isVariableDeclaration(declaration)) expression = declaration.initializer;
+    if (ts.isBindingElement(declaration)) expression = bindingElementSource(declaration, checker);
+    if (expression && declaration.getStart() < use.getStart()) {
+      latest = { position: declaration.getStart(), expression };
+    }
+  }
+  const sourceFile = use.getSourceFile();
+  const visit = (node: ts.Node): void => {
+    if (node.getStart(sourceFile) >= use.getStart()) return;
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left) &&
+      checker.getSymbolAtLocation(node.left) === symbol &&
+      (!latest || node.getStart(sourceFile) > latest.position)
+    ) {
+      latest = { position: node.getStart(sourceFile), expression: node.right };
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return latest?.expression;
+}
+
+function expressionContainsUnformattedTaggedError(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  const visit = (node: ts.Node): boolean => {
+    if (
+      ts.isCallExpression(node) &&
+      isRegisteredFormatterCall(node, checker, workspace, workspaceRoot, packageRoots)
+    ) {
+      return false;
+    }
+    if (ts.isExpression(node)) {
+      const type = checker.getTypeAtLocation(node);
+      if (
+        typeIsTaggedError(type, packageRoots) ||
+        (!typeContainsResult(type, checker, packageRoots, node) &&
+          typeContainsTaggedError(type, checker, packageRoots, node))
+      ) {
+        return true;
+      }
+    }
+    if (ts.isIdentifier(node)) {
+      const symbol = ts.isShorthandPropertyAssignment(node.parent)
+        ? checker.getShorthandAssignmentValueSymbol(node.parent)
+        : checker.getSymbolAtLocation(node);
+      if (symbol && !seenSymbols.has(symbol)) {
+        seenSymbols.add(symbol);
+        const source = latestSymbolSource(symbol, node, checker);
+        if (source && visit(source)) return true;
+      }
+    }
+    let found = false;
+    ts.forEachChild(node, (child) => {
+      if (!found && visit(child)) found = true;
+    });
+    return found;
+  };
+  return visit(expression);
 }
 
 function makeDiagnostic(
@@ -559,6 +916,25 @@ function analyzeCall(
   }
 
   if (activeRules.has("architecture/no-result-wire-leak")) {
+    const intrinsicStringify =
+      member === "stringify" && isDefaultLibraryDeclaration(signature?.declaration);
+    const serialized = node.arguments[0];
+    if (
+      intrinsicStringify &&
+      serialized &&
+      typeContainsResult(checker.getTypeAtLocation(serialized), checker, packageRoots, serialized)
+    ) {
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/no-result-wire-leak",
+          serialized,
+          "JSON.stringify would serialize a Result object instead of an existing wire representation.",
+          "Branch on result.status and serialize an explicit compatibility payload.",
+        ),
+      );
+    }
     const output = workspace.compatibilityOutputs.find((candidate) =>
       outputIdentityMatches(candidate.sink, signature, workspaceRoot, packageRoots),
     );
@@ -586,6 +962,230 @@ function analyzeCall(
       }
     }
   }
+
+  if (activeRules.has("architecture/no-unredacted-tagged-error-log")) {
+    const receiver = callReceiver(node);
+    const intrinsicStringify =
+      member === "stringify" && isDefaultLibraryDeclaration(signature?.declaration);
+    if (intrinsicStringify) {
+      const value = node.arguments[0];
+      if (
+        value &&
+        expressionContainsUnformattedTaggedError(
+          value,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+        )
+      ) {
+        diagnostics.push(
+          makeDiagnostic(
+            workspace,
+            workspaceRoot,
+            "architecture/no-unredacted-tagged-error-log",
+            value,
+            "JSON.stringify receives data manually derived from a TaggedError and may expose its cause or message.",
+            "Pass the redacting formatter formatTaggedErrorForLog(error) output to JSON.stringify instead.",
+          ),
+        );
+      }
+    } else if (
+      member === "toJSON" &&
+      receiver &&
+      typeContainsTaggedError(checker.getTypeAtLocation(receiver), checker, packageRoots, receiver)
+    ) {
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/no-unredacted-tagged-error-log",
+          node,
+          "Direct TaggedError.toJSON() exposes the external cause.",
+          "Use the approved redacting TaggedError formatter and log only its safe fields.",
+        ),
+      );
+    }
+
+    const logger = workspace.structuredLoggers.find((candidate) =>
+      outputIdentityMatches(candidate.sink, signature, workspaceRoot, packageRoots),
+    );
+    if (logger) {
+      for (const argument of node.arguments) {
+        if (
+          !expressionContainsUnformattedTaggedError(
+            argument,
+            checker,
+            workspace,
+            workspaceRoot,
+            packageRoots,
+          )
+        ) {
+          continue;
+        }
+        diagnostics.push(
+          makeDiagnostic(
+            workspace,
+            workspaceRoot,
+            "architecture/no-unredacted-tagged-error-log",
+            argument,
+            `TaggedError is passed directly to structured logger ${logger.sink.exportName}.`,
+            "Pass the redacting formatter formatTaggedErrorForLog(error) output and omit manual TaggedError fields.",
+          ),
+        );
+      }
+    }
+  }
+}
+
+function canonicalSymbol(symbol: ts.Symbol, checker: ts.TypeChecker): ts.Symbol {
+  return (symbol.flags & ts.SymbolFlags.Alias) !== 0 ? checker.getAliasedSymbol(symbol) : symbol;
+}
+
+function exportedSymbols(
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker,
+): ReadonlySet<ts.Symbol> {
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (!moduleSymbol) return new Set();
+  return new Set(
+    checker.getExportsOfModule(moduleSymbol).map((symbol) => canonicalSymbol(symbol, checker)),
+  );
+}
+
+function contractOwnerSymbol(node: ts.Node, checker: ts.TypeChecker): ts.Symbol | undefined {
+  if (
+    (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) &&
+    ts.isVariableDeclaration(node.parent)
+  ) {
+    return checker.getSymbolAtLocation(node.parent.name);
+  }
+  if (
+    ts.isMethodDeclaration(node) ||
+    ts.isMethodSignature(node) ||
+    ts.isCallSignatureDeclaration(node)
+  ) {
+    const owner = node.parent;
+    if (ts.isClassDeclaration(owner) || ts.isInterfaceDeclaration(owner)) {
+      return owner.name && checker.getSymbolAtLocation(owner.name);
+    }
+  }
+  if (ts.isFunctionTypeNode(node)) {
+    let owner: ts.Node | undefined = node.parent;
+    while (owner && !ts.isTypeAliasDeclaration(owner)) owner = owner.parent;
+    if (owner && ts.isTypeAliasDeclaration(owner)) return checker.getSymbolAtLocation(owner.name);
+  }
+  if (
+    (ts.isFunctionDeclaration(node) ||
+      ts.isClassDeclaration(node) ||
+      ts.isInterfaceDeclaration(node) ||
+      ts.isTypeAliasDeclaration(node)) &&
+    node.name
+  ) {
+    return checker.getSymbolAtLocation(node.name);
+  }
+  return undefined;
+}
+
+function isExportedContract(
+  node: ts.Node,
+  checker: ts.TypeChecker,
+  exports: ReadonlySet<ts.Symbol>,
+): boolean {
+  const symbol = contractOwnerSymbol(node, checker);
+  return Boolean(symbol && exports.has(canonicalSymbol(symbol, checker)));
+}
+
+function analyzeResultContract(
+  node: ts.SignatureDeclaration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  activeRules: ReadonlySet<ArchitectureRule>,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+  reported: Set<string>,
+  exports: ReadonlySet<ts.Symbol>,
+): void {
+  const signature = checker.getSignatureFromDeclaration(node);
+  if (!signature) return;
+  const returnType = checker.getReturnTypeOfSignature(signature);
+  const identity = nodeIdentity(node, workspaceRoot);
+  const key = `${identity.module}#${identity.symbolPath}`;
+
+  if (
+    activeRules.has("architecture/no-unhandled-exception-contract") &&
+    (isExportedContract(node, checker, exports) ||
+      workspace.operationalResultApis.some((api) => identityMatches(api, identity))) &&
+    typeContainsUnhandledException(returnType, checker, packageRoots, node) &&
+    !reported.has(`unhandled:${key}`)
+  ) {
+    reported.add(`unhandled:${key}`);
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-unhandled-exception-contract",
+        node,
+        `API ${identity.symbolPath} exposes better-result UnhandledException in its return contract.`,
+        "Use mapped Result.try/Result.tryPromise capture and return a specific domain-owned error.",
+      ),
+    );
+  }
+
+  if (
+    activeRules.has("architecture/fallible-api-result") &&
+    workspace.operationalResultApis.some((api) => identityMatches(api, identity)) &&
+    !isFallibleResultContract(returnType, checker, packageRoots) &&
+    !reported.has(`fallible:${key}`)
+  ) {
+    reported.add(`fallible:${key}`);
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/fallible-api-result",
+        node,
+        `Registered fallible API ${identity.symbolPath} does not return Result, Promise<Result>, or AsyncIterable<Result>.`,
+        "Return a typed Result value; asynchronous APIs should resolve Promise<Result<T, E>> rather than reject.",
+      ),
+    );
+  }
+}
+
+function analyzeDeclaredResultContract(
+  node: ts.InterfaceDeclaration | ts.TypeAliasDeclaration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+  reported: Set<string>,
+): void {
+  if (
+    ts.isTypeAliasDeclaration(node) &&
+    (ts.isFunctionTypeNode(node.type) ||
+      (ts.isTypeLiteralNode(node.type) &&
+        node.type.members.some((member) => ts.isCallSignatureDeclaration(member))))
+  ) {
+    return;
+  }
+  const type = checker.getTypeAtLocation(node.name);
+  if (!typeContainsUnhandledException(type, checker, packageRoots, node)) return;
+  const identity = nodeIdentity(node, workspaceRoot);
+  const key = `unhandled:${identity.module}#${identity.symbolPath}`;
+  if (reported.has(key)) return;
+  reported.add(key);
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/no-unhandled-exception-contract",
+      node,
+      `Declared contract ${identity.symbolPath} exposes better-result UnhandledException.`,
+      "Replace it with a specific domain-owned error type produced by mapped external capture.",
+    ),
+  );
 }
 
 function analyzeParameter(
@@ -599,6 +1199,14 @@ function analyzeParameter(
   const identity = nodeIdentity(node, workspaceRoot);
   if (workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)))
     return;
+  if (
+    workspace.exceptionAdapters.some(
+      (adapter) =>
+        adapter.direction !== "signal-host" && identityMatches(adapter.identity, identity),
+    )
+  ) {
+    return;
+  }
   if (workspace.opaqueUnknown.some((exception) => identityMatches(exception.identity, identity)))
     return;
   diagnostics.push(
@@ -688,6 +1296,7 @@ export function analyzeWorkspace(
   const checker = program.getTypeChecker();
   const diagnostics: ArchitectureDiagnostic[] = [];
   const reportedPredicates = new Set<string>();
+  const reportedContracts = new Set<string>();
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!isProductionSource(sourceFile, workspaceRoot)) continue;
@@ -696,6 +1305,9 @@ export function analyzeWorkspace(
       ARCHITECTURE_RULES.filter((rule) => ruleApplies(workspace, rule, module)),
     );
     const candidateNames = callCandidateNames(sourceFile, workspace, activeRules);
+    const sourceExports = activeRules.has("architecture/no-unhandled-exception-contract")
+      ? exportedSymbols(sourceFile, checker)
+      : new Set<ts.Symbol>();
 
     const visit = (node: ts.Node): void => {
       if (ts.isCallExpression(node) && candidateNames.has(expressionName(node.expression) ?? "")) {
@@ -720,6 +1332,37 @@ export function analyzeWorkspace(
       }
       if (activeRules.has("architecture/no-rich-unknown-predicate") && ts.isFunctionLike(node)) {
         analyzePredicate(node, checker, workspace, workspaceRoot, diagnostics, reportedPredicates);
+      }
+      if (
+        ts.isFunctionLike(node) &&
+        (activeRules.has("architecture/no-unhandled-exception-contract") ||
+          activeRules.has("architecture/fallible-api-result"))
+      ) {
+        analyzeResultContract(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          activeRules,
+          packageRoots,
+          diagnostics,
+          reportedContracts,
+          sourceExports,
+        );
+      }
+      if (
+        activeRules.has("architecture/no-unhandled-exception-contract") &&
+        (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node))
+      ) {
+        analyzeDeclaredResultContract(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+          diagnostics,
+          reportedContracts,
+        );
       }
       ts.forEachChild(node, visit);
     };

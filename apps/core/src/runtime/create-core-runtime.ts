@@ -4,6 +4,7 @@ import {
   createLogger,
   env,
   errorMessage,
+  formatTaggedErrorForLog,
   getCoreConfig,
   readCoreConfigVersion,
   resolveDiscordDbPath,
@@ -101,6 +102,7 @@ import {
   McpOAuthProviderService,
   McpRegistry,
   readMcpConfigFile,
+  rethrowPanic,
   resolveMcpConfigPath,
   type McpOAuthCallbackListenerStatus,
   type UniversalMcpConfig,
@@ -142,12 +144,13 @@ export async function startCoreMcpServices(
   options: CoreMcpStartupOptions,
 ): Promise<{ readonly registryInit: Promise<void> }> {
   let config = createEmptyMcpConfig();
-  try {
-    config = (await (options.readConfig ?? readMcpConfigFile)(options.configPath)).config;
-  } catch (error) {
+  const configResult = await (options.readConfig ?? readMcpConfigFile)(options.configPath);
+  if (configResult.status === "ok") {
+    config = configResult.value.config;
+  } else {
     options.logger.warn("MCP OAuth providers reconciled to empty configuration", {
       path: options.configPath,
-      error: errorMessage(error),
+      error: formatTaggedErrorForLog(configResult.error).errorMessage,
     });
   }
   options.providers.reconcile(config);
@@ -166,6 +169,7 @@ export async function startCoreMcpServices(
         path: options.configPath,
         error: errorMessage(error),
       });
+      rethrowPanic(error);
     });
 
   return { registryInit };

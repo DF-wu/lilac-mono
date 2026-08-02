@@ -9,11 +9,13 @@ import {
   type MCPTransport,
 } from "@ai-sdk/mcp";
 import { Experimental_StdioMCPTransport } from "@ai-sdk/mcp/mcp-stdio";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { catalogToolStableId, type CatalogToolIdentity } from "./catalog-identity";
 import type { McpServerDefinition } from "./config-types";
-import { McpConfigError, readMcpConfigFile, type McpConfigFileSnapshot } from "./config-file";
+import { McpConfigError, readMcpConfigFile } from "./config-file";
+import { rethrowPanic, safeMcpErrorText } from "./error-format";
 import type {
   McpCatalogTool,
   McpConvertedTool,
@@ -30,7 +32,6 @@ import type {
 import { resolveMcpValueSourceMap, validateHttpHeaders } from "./value-source";
 
 const DEFAULT_INIT_DEADLINE_MS = 30_000;
-const MAX_SAFE_ERROR_LENGTH = 1_000;
 const mcpApplicationErrorSchema = z.object({
   name: z.literal("MCPClientError"),
   code: z.number(),
@@ -73,6 +74,38 @@ type CandidateResult =
       readonly error: string;
     };
 
+export class McpRegistryReloadError extends TaggedError("McpRegistryReloadError")<{
+  readonly configPath: string;
+  readonly cause: McpConfigError;
+  readonly message: string;
+}> {}
+
+class McpRegistryTransportConfigurationError extends TaggedError(
+  "McpRegistryTransportConfigurationError",
+)<{
+  readonly serverId: string;
+  readonly cause: Error;
+  readonly message: string;
+}> {}
+
+class McpRegistryAuthProviderCreateError extends TaggedError("McpRegistryAuthProviderCreateError")<{
+  readonly serverId: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class McpRegistryAuthTokensReadError extends TaggedError("McpRegistryAuthTokensReadError")<{
+  readonly serverId: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+type McpRegistryTransportError =
+  | McpRegistryTransportConfigurationError
+  | McpRegistryAuthProviderCreateError
+  | McpRegistryAuthTokensReadError
+  | McpAuthenticationRequiredError;
+
 class McpRegistryDeadlineError extends Error {
   constructor(serverId: string, deadlineMs: number) {
     super(`MCP server ${JSON.stringify(serverId)} initialization exceeded ${deadlineMs}ms`);
@@ -87,10 +120,15 @@ class McpRegistryCloseDeadlineError extends Error {
   }
 }
 
-export class McpAuthenticationRequiredError extends Error {
+export class McpAuthenticationRequiredError extends TaggedError("McpAuthenticationRequiredError")<{
+  readonly serverId: string;
+  readonly message: string;
+}> {
   constructor(serverId: string) {
-    super(`MCP server ${JSON.stringify(serverId)} requires authentication`);
-    this.name = "McpAuthenticationRequiredError";
+    super({
+      serverId,
+      message: `MCP server ${JSON.stringify(serverId)} requires authentication`,
+    });
   }
 }
 
@@ -138,53 +176,13 @@ function freezeOutcome(outcome: McpReloadOutcome): McpReloadOutcome {
   return Object.freeze(outcome);
 }
 
-function redactUrl(raw: string): string {
-  try {
-    const url = new URL(raw);
-    if (url.username) url.username = "<redacted>";
-    if (url.password) url.password = "<redacted>";
-    url.search = "";
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return "<redacted-url>";
-  }
-}
-
 function safeErrorText(error: unknown, sensitiveValues: readonly string[] = []): string {
-  let message =
-    error instanceof Error ? error.message : typeof error === "string" ? error : "Unknown error";
-
-  for (const value of sensitiveValues) {
-    if (value.length > 0) message = message.replaceAll(value, "<redacted>");
-  }
-  message = message.replace(/https?:\/\/[^\s"'<>]+/gi, redactUrl);
-  message = message.replace(
-    /(authorization\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\s,;]+/gi,
-    "$1<redacted>",
-  );
-  message = message.replace(/\b(bearer|basic)\s+[^\s,;]+/gi, "$1 <redacted>");
-  message = message.replace(/([?&](?:code|state|token|key|secret)=)[^&\s]+/gi, "$1<redacted>");
-  message = message.replace(
-    /\b(token|secret|password|api[_-]?key|code|state)\s*[:=]\s*[^\s,;]+/gi,
-    "$1=<redacted>",
-  );
-  return message.length <= MAX_SAFE_ERROR_LENGTH
-    ? message
-    : `${message.slice(0, MAX_SAFE_ERROR_LENGTH)}...`;
+  return safeMcpErrorText(error, sensitiveValues);
 }
 
 function configErrorStatus(
-  error: unknown,
+  error: McpConfigError,
 ): Extract<McpRegistryConfigStatus, { readonly status: "invalid" }> {
-  if (!(error instanceof McpConfigError)) {
-    return Object.freeze({
-      status: "invalid",
-      error:
-        "Could not read MCP configuration. Check the file syntax and permissions, then run mcp.reload.",
-    });
-  }
-
   const detail =
     error.issues.length === 0
       ? "The configuration is invalid."
@@ -278,15 +276,14 @@ export class McpRegistry implements McpRegistryApi {
       if (this.stopped) throw new Error("MCP registry has been shut down");
       if (this.initialized) return;
 
-      let snapshot: McpConfigFileSnapshot;
-      try {
-        snapshot = await this.readConfig(this.configPath);
-        this.configStatus = Object.freeze({ status: "valid" });
-      } catch (error) {
-        this.configStatus = configErrorStatus(error);
+      const read = await this.readConfig(this.configPath);
+      if (read.status === "error") {
+        this.configStatus = configErrorStatus(read.error);
         this.initialized = true;
         return;
       }
+      const snapshot = read.value;
+      this.configStatus = Object.freeze({ status: "valid" });
       const definitions = Object.values(snapshot.config.servers).sort((left, right) =>
         left.id.localeCompare(right.id),
       );
@@ -308,18 +305,25 @@ export class McpRegistry implements McpRegistryApi {
     });
   }
 
-  reload(serverId?: string): Promise<readonly McpReloadOutcome[]> {
+  reload(
+    serverId?: string,
+  ): Promise<ResultType<readonly McpReloadOutcome[], McpRegistryReloadError>> {
     return this.runLifecycle(async () => {
       this.assertRunning();
-      let snapshot: McpConfigFileSnapshot;
-      try {
-        snapshot = await this.readConfig(this.configPath);
-        this.configStatus = Object.freeze({ status: "valid" });
-      } catch (error) {
-        const configStatus = configErrorStatus(error);
+      const read = await this.readConfig(this.configPath);
+      if (read.status === "error") {
+        const configStatus = configErrorStatus(read.error);
         this.configStatus = configStatus;
-        throw new Error(configStatus.error);
+        return Result.err(
+          new McpRegistryReloadError({
+            configPath: this.configPath,
+            cause: read.error,
+            message: configStatus.error,
+          }),
+        );
       }
+      const snapshot = read.value;
+      this.configStatus = Object.freeze({ status: "valid" });
       const ids = new Set<string>();
       if (serverId === undefined) {
         for (const id of this.entries.keys()) ids.add(id);
@@ -332,7 +336,7 @@ export class McpRegistry implements McpRegistryApi {
         [...ids].sort().map((id) => this.reconcileServer(id, snapshot.config.servers[id])),
       );
       this.publishSnapshots();
-      return Object.freeze(outcomes);
+      return Result.ok(Object.freeze(outcomes));
     });
   }
 
@@ -411,16 +415,16 @@ export class McpRegistry implements McpRegistryApi {
     let reconciliation = this.classifyReconciliation(current, definition);
     let resolvedTransport: ResolvedTransport | undefined;
     if (reconciliation === "unchanged" && current) {
-      try {
-        resolvedTransport = await this.resolveTransport(definition);
-      } catch (error) {
+      const resolution = await this.resolveTransport(definition);
+      if (resolution.status === "error") {
         return freezeOutcome({
           serverId,
           reconciliation,
           result: "retained",
-          error: safeErrorText(error, current.sensitiveValues),
+          error: safeErrorText(resolution.error, current.sensitiveValues),
         });
       }
+      resolvedTransport = resolution.value;
       if (current.transportFingerprint !== transportFingerprint(resolvedTransport.input)) {
         reconciliation = "changed";
       }
@@ -455,6 +459,7 @@ export class McpRegistry implements McpRegistryApi {
         this.publishSnapshots();
         return freezeOutcome({ serverId, reconciliation, result: "available" });
       } catch (error) {
+        rethrowPanic(error);
         const latest = this.entries.get(serverId);
         if (!latest || latest.client !== retainedClient || latest.status.status !== "available") {
           return freezeOutcome({
@@ -547,7 +552,18 @@ export class McpRegistry implements McpRegistryApi {
     } = {};
 
     try {
-      const resolved = prefetchedTransport ?? (await this.resolveTransport(definition));
+      const resolution = prefetchedTransport
+        ? Result.ok(prefetchedTransport)
+        : await this.resolveTransport(definition);
+      if (resolution.status === "error") {
+        return {
+          ok: false,
+          status: this.failureStatus(definition, resolution.error),
+          phase,
+          error: safeErrorText(resolution.error),
+        };
+      }
+      const resolved = resolution.value;
       sensitiveValues = resolved.sensitiveValues;
       const transport = observeHttpSessionExpiration(this.createTransport(resolved.input), () => {
         holder.sessionExpired = true;
@@ -597,6 +613,7 @@ export class McpRegistry implements McpRegistryApi {
       if (client) {
         this.closeClientInBackground(client);
       }
+      rethrowPanic(error);
       return {
         ok: false,
         status: this.failureStatus(definition, error),
@@ -606,57 +623,104 @@ export class McpRegistry implements McpRegistryApi {
     }
   }
 
-  private async resolveTransport(definition: McpServerDefinition): Promise<ResolvedTransport> {
+  private async resolveTransport(
+    definition: McpServerDefinition,
+  ): Promise<ResultType<ResolvedTransport, McpRegistryTransportError>> {
     const config = definition.transportConfig;
     if (config.transport === "stdio") {
       const resolved = await resolveMcpValueSourceMap(config.env, this.valueContext);
-      if (!resolved.ok) throw new Error(`Failed to resolve stdio environment: ${resolved.error}`);
-      return {
+      if (resolved.status === "error") {
+        return Result.err(
+          new McpRegistryTransportConfigurationError({
+            serverId: definition.id,
+            cause: resolved.error,
+            message: `Failed to resolve stdio environment: ${resolved.error.message}`,
+          }),
+        );
+      }
+      return Result.ok({
         input: {
           transport: "stdio",
           command: config.command,
           args: config.args,
           ...(config.cwd === undefined ? {} : { cwd: config.cwd }),
-          env: resolved.values,
+          env: resolved.value,
         },
-        sensitiveValues: Object.freeze(Object.values(resolved.values)),
-      };
+        sensitiveValues: Object.freeze(Object.values(resolved.value)),
+      });
     }
 
     const resolved = await resolveMcpValueSourceMap(config.headers, this.valueContext);
-    if (!resolved.ok) throw new Error(`Failed to resolve HTTP headers: ${resolved.error}`);
-    const validHeaders = validateHttpHeaders(resolved.values);
-    if (!validHeaders.ok) throw new Error(`Invalid HTTP headers: ${validHeaders.error}`);
+    if (resolved.status === "error") {
+      return Result.err(
+        new McpRegistryTransportConfigurationError({
+          serverId: definition.id,
+          cause: resolved.error,
+          message: `Failed to resolve HTTP headers: ${resolved.error.message}`,
+        }),
+      );
+    }
+    const validHeaders = validateHttpHeaders(resolved.value);
+    if (validHeaders.status === "error") {
+      return Result.err(
+        new McpRegistryTransportConfigurationError({
+          serverId: definition.id,
+          cause: validHeaders.error,
+          message: `Invalid HTTP headers: ${validHeaders.error.message}`,
+        }),
+      );
+    }
 
     let authProvider;
     if (config.auth) {
-      authProvider = await this.createAuthProvider?.({
-        server: definition,
-        configPath: this.configPath,
-        valueContext: this.valueContext,
+      const providerResult = await Result.tryPromise({
+        try: async () =>
+          await this.createAuthProvider?.({
+            server: definition,
+            configPath: this.configPath,
+            valueContext: this.valueContext,
+          }),
+        catch: (cause) => {
+          rethrowPanic(cause);
+          return new McpRegistryAuthProviderCreateError({
+            serverId: definition.id,
+            cause,
+            message: `Failed to create OAuth provider for MCP server ${JSON.stringify(definition.id)}`,
+          });
+        },
       });
+      if (providerResult.status === "error") return providerResult;
+      authProvider = providerResult.value;
       if (!authProvider) {
-        if (config.auth.grant === "authorization_code") {
-          throw new McpAuthenticationRequiredError(definition.id);
-        }
-        throw new Error(
-          `No OAuth provider is configured for MCP server ${JSON.stringify(definition.id)}`,
-        );
+        return Result.err(new McpAuthenticationRequiredError(definition.id));
       }
-      if (config.auth.grant === "authorization_code" && !(await authProvider.tokens())) {
-        throw new McpAuthenticationRequiredError(definition.id);
+      const provider = authProvider;
+      const tokensResult = await Result.tryPromise({
+        try: async () => await provider.tokens(),
+        catch: (cause) => {
+          rethrowPanic(cause);
+          return new McpRegistryAuthTokensReadError({
+            serverId: definition.id,
+            cause,
+            message: `Failed to read OAuth tokens for MCP server ${JSON.stringify(definition.id)}`,
+          });
+        },
+      });
+      if (tokensResult.status === "error") return tokensResult;
+      if (!tokensResult.value) {
+        return Result.err(new McpAuthenticationRequiredError(definition.id));
       }
     }
 
-    return {
+    return Result.ok({
       input: {
         transport: "http",
         url: config.url,
-        headers: resolved.values,
+        headers: resolved.value,
         ...(authProvider === undefined ? {} : { authProvider }),
       },
-      sensitiveValues: Object.freeze(Object.values(resolved.values)),
-    };
+      sensitiveValues: Object.freeze(Object.values(resolved.value)),
+    });
   }
 
   private async listAllTools(
@@ -847,6 +911,7 @@ export class McpRegistry implements McpRegistryApi {
   }
 
   private handleTerminalFailure(serverId: string, client: McpRegistryClient, error: unknown): void {
+    rethrowPanic(error);
     const current = this.entries.get(serverId);
     if (!current || current.client !== client || current.status.status !== "available") return;
 

@@ -9,6 +9,7 @@ import {
   type OAuthTokens,
 } from "@ai-sdk/mcp";
 import { Experimental_StdioMCPTransport } from "@ai-sdk/mcp/mcp-stdio";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
 import {
@@ -35,6 +36,12 @@ const mcpHttpRequestSchema = z.object({
   method: z.string(),
 });
 
+async function reloadRegistry(registry: McpRegistry, serverId?: string) {
+  const result = await registry.reload(serverId);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
+
 function fakeAuthProvider(tokens: OAuthTokens | undefined): OAuthClientProvider {
   return {
     tokens: async () => tokens,
@@ -55,10 +62,12 @@ describe("McpRegistry startup and discovery", () => {
       configPath: "/data/mcp-config.yaml",
       dependencies: {
         readConfig: async () => {
-          throw new McpConfigError({
-            configPath: "/data/mcp-config.yaml",
-            issues: ["<root>: failed to parse YAML: Unexpected token"],
-          });
+          return Result.err(
+            new McpConfigError({
+              configPath: "/data/mcp-config.yaml",
+              issues: ["<root>: failed to parse YAML: Unexpected token"],
+            }),
+          );
         },
         createClient: async () => {
           createCount += 1;
@@ -121,6 +130,45 @@ describe("McpRegistry startup and discovery", () => {
     expect(readPaths).toEqual(["/data/mcp-config.yaml"]);
     expect(registry.list().map((status) => status.status)).toEqual(["available", "available"]);
     await registry.shutdown();
+  });
+
+  it("propagates Panic from value-source resolution", async () => {
+    const panic = new Panic({ message: "value-source invariant failed" });
+    const baseDefinition = stdioDefinition("panic");
+    const definition = {
+      ...baseDefinition,
+      transportConfig: {
+        ...baseDefinition.transportConfig,
+        env: { TOKEN: { file: "token.txt" } },
+      },
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      readTextFile: () => Promise.reject(panic),
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([definition])),
+      },
+    });
+
+    await expect(registry.init()).rejects.toBeInstanceOf(Panic);
+  });
+
+  it("initiates client cleanup before propagating a discovery Panic", async () => {
+    const panic = new Panic({ message: "discovery invariant failed" });
+    const client = new FakeMcpClient();
+    client.listTools = async () => {
+      throw panic;
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("panic")])),
+        createClient: async () => client,
+      },
+    });
+
+    await expect(registry.init()).rejects.toBe(panic);
+    expect(client.closeCount).toBe(1);
   });
 
   it("uses SDK HTTP and stdio transports, resolved values, and maxRetries zero", async () => {
@@ -382,8 +430,159 @@ describe("McpRegistry startup and discovery", () => {
     expect(tokenCalls).toBe(1);
     expect(transportInputs).toEqual([]);
     expect(clientCalls).toBe(0);
-    expect(registry.list()[0]).toMatchObject({ status: "authentication_required" });
+    expect(registry.list()[0]).toMatchObject({
+      status: "authentication_required",
+      phase: "configuration",
+      error: 'MCP server "auth" requires authentication',
+    });
     await registry.shutdown();
+  });
+
+  it("returns auth adapter failures as retained outcomes and propagates Panic", async () => {
+    type AuthState =
+      | "authorized"
+      | "provider_absent"
+      | "tokens_absent"
+      | "provider_error"
+      | "tokens_error"
+      | "provider_hostile"
+      | "provider_panic"
+      | "tokens_panic";
+    let authState: AuthState = "authorized";
+    const panic = new Panic({ message: "auth invariant failed" });
+    const secretSentinel = "auth-cause-secret-sentinel";
+    const hostileCause = {
+      toString: () => {
+        throw new Error("must not coerce rejection");
+      },
+      [Symbol.toPrimitive]: () => {
+        throw new Error("must not coerce rejection");
+      },
+    };
+    const client = new FakeMcpClient();
+    const authServer = {
+      id: "auth",
+      transportConfig: {
+        transport: "http" as const,
+        url: "https://example.invalid/mcp",
+        headers: {},
+        auth: {
+          type: "oauth" as const,
+          grant: "authorization_code" as const,
+          client: { type: "dynamic" as const },
+        },
+      },
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([authServer])),
+        createAuthProvider: async () => {
+          if (authState === "provider_absent") return undefined;
+          if (authState === "provider_error") {
+            throw new Error(`provider resolution failed ${secretSentinel}`);
+          }
+          if (authState === "provider_hostile") throw hostileCause;
+          if (authState === "provider_panic") throw panic;
+          const provider = fakeAuthProvider(undefined);
+          return {
+            ...provider,
+            tokens: async () => {
+              if (authState === "tokens_error") {
+                throw new Error(`token resolution failed ${secretSentinel}`);
+              }
+              if (authState === "tokens_panic") throw panic;
+              return authState === "authorized"
+                ? { access_token: "access-token", token_type: "Bearer" }
+                : undefined;
+            },
+          };
+        },
+        createClient: async () => client,
+      },
+    });
+    await registry.init();
+    const retainedStatus = registry.list()[0];
+
+    authState = "provider_absent";
+    expect(await reloadRegistry(registry, "auth")).toEqual([
+      {
+        serverId: "auth",
+        reconciliation: "unchanged",
+        result: "retained",
+        error: 'MCP server "auth" requires authentication',
+      },
+    ]);
+
+    authState = "tokens_absent";
+    expect(await reloadRegistry(registry, "auth")).toEqual([
+      {
+        serverId: "auth",
+        reconciliation: "unchanged",
+        result: "retained",
+        error: 'MCP server "auth" requires authentication',
+      },
+    ]);
+
+    authState = "provider_error";
+    const providerFailureOutcome = await reloadRegistry(registry, "auth");
+    expect(providerFailureOutcome).toEqual([
+      {
+        serverId: "auth",
+        reconciliation: "unchanged",
+        result: "retained",
+        error: 'Failed to create OAuth provider for MCP server "auth"',
+      },
+    ]);
+    expect(JSON.stringify(providerFailureOutcome)).not.toContain(secretSentinel);
+
+    authState = "tokens_error";
+    const tokenFailureOutcome = await reloadRegistry(registry, "auth");
+    expect(tokenFailureOutcome).toEqual([
+      {
+        serverId: "auth",
+        reconciliation: "unchanged",
+        result: "retained",
+        error: 'Failed to read OAuth tokens for MCP server "auth"',
+      },
+    ]);
+    expect(JSON.stringify(tokenFailureOutcome)).not.toContain(secretSentinel);
+
+    authState = "provider_hostile";
+    expect(await reloadRegistry(registry, "auth")).toEqual([
+      {
+        serverId: "auth",
+        reconciliation: "unchanged",
+        result: "retained",
+        error: 'Failed to create OAuth provider for MCP server "auth"',
+      },
+    ]);
+
+    authState = "provider_panic";
+    await expect(registry.reload("auth")).rejects.toBeInstanceOf(Panic);
+    authState = "tokens_panic";
+    await expect(registry.reload("auth")).rejects.toBeInstanceOf(Panic);
+    expect(registry.list()[0]).toBe(retainedStatus);
+    expect(client.closeCount).toBe(0);
+    await registry.shutdown();
+
+    const failedRegistry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([authServer])),
+        createAuthProvider: async () => {
+          throw new Error(`provider initialization failed ${secretSentinel}`);
+        },
+      },
+    });
+    await failedRegistry.init();
+    expect(failedRegistry.list()[0]).toMatchObject({
+      status: "unavailable",
+      phase: "configuration",
+      error: 'Failed to create OAuth provider for MCP server "auth"',
+    });
+    expect(JSON.stringify(failedRegistry.list())).not.toContain(secretSentinel);
+    await failedRegistry.shutdown();
   });
 
   it("passes stored authorization-code tokens to the SDK so it can refresh them", async () => {
@@ -712,6 +911,53 @@ describe("McpRegistry startup and discovery", () => {
 });
 
 describe("McpRegistry reload and terminal failures", () => {
+  it("retains an unchanged server for a transport Err and propagates Panic", async () => {
+    const panic = new Panic({ message: "transport resolution invariant failed" });
+    let readMode: "ok" | "error" | "panic" = "ok";
+    const definition = {
+      id: "resolved",
+      transportConfig: {
+        transport: "stdio" as const,
+        command: "bun",
+        args: [],
+        env: { VALUE: { file: "value.txt" } },
+      },
+    };
+    const client = new FakeMcpClient();
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      readTextFile: async () => {
+        if (readMode === "panic") throw panic;
+        if (readMode === "error") throw new Error("credential file unavailable");
+        return "secret";
+      },
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([definition])),
+        createClient: async () => client,
+      },
+    });
+    await registry.init();
+    const retainedStatus = registry.list()[0];
+
+    readMode = "error";
+    expect(await reloadRegistry(registry, "resolved")).toEqual([
+      {
+        serverId: "resolved",
+        reconciliation: "unchanged",
+        result: "retained",
+        error:
+          "Failed to resolve stdio environment: VALUE: failed to read value.txt: credential file unavailable",
+      },
+    ]);
+    expect(registry.list()[0]).toBe(retainedStatus);
+    expect(client.closeCount).toBe(0);
+
+    readMode = "panic";
+    await expect(registry.reload("resolved")).rejects.toBeInstanceOf(Panic);
+    expect(registry.list()[0]).toBe(retainedStatus);
+    await registry.shutdown();
+  });
+
   it("preserves healthy state on invalid reload and clears the diagnostic after repair", async () => {
     const secret = "config-secret-value";
     const healthyConfig = mcpConfig([stdioDefinition("healthy")]);
@@ -723,13 +969,15 @@ describe("McpRegistry reload and terminal failures", () => {
       dependencies: {
         readConfig: async () => {
           if (readResult === "invalid") {
-            throw new McpConfigError({
-              configPath: "/data/mcp-config.yaml",
-              issues: [
-                `servers.healthy.headers.Authorization: Bearer ${secret}`,
-                "servers.healthy.transport: Invalid option: expected one of stdio|http",
-              ],
-            });
+            return Result.err(
+              new McpConfigError({
+                configPath: "/data/mcp-config.yaml",
+                issues: [
+                  `servers.healthy.headers.Authorization: Bearer ${secret}`,
+                  "servers.healthy.transport: Invalid option: expected one of stdio|http",
+                ],
+              }),
+            );
           }
           return configSnapshot(healthyConfig);
         },
@@ -744,7 +992,11 @@ describe("McpRegistry reload and terminal failures", () => {
     const retainedTools = registry.getTools();
 
     readResult = "invalid";
-    await expect(registry.reload()).rejects.toThrow("Fix the file, then run mcp.reload");
+    const invalidReload = await registry.reload();
+    expect(invalidReload.status).toBe("error");
+    if (invalidReload.status === "error") {
+      expect(invalidReload.error.message).toContain("Fix the file, then run mcp.reload");
+    }
     expect(registry.list()).toBe(retainedStatus);
     expect(registry.getTools()).toBe(retainedTools);
     const configStatus = registry.getConfigStatus();
@@ -756,7 +1008,7 @@ describe("McpRegistry reload and terminal failures", () => {
     expect(createCount).toBe(1);
 
     readResult = "valid";
-    expect(await registry.reload()).toEqual([
+    expect(await reloadRegistry(registry)).toEqual([
       { serverId: "healthy", reconciliation: "unchanged", result: "available" },
     ]);
     expect(registry.getConfigStatus()).toEqual({ status: "valid" });
@@ -785,7 +1037,7 @@ describe("McpRegistry reload and terminal failures", () => {
       first: { tools: [mcpToolDefinition("keep")], nextCursor: "second" },
       second: { tools: [mcpToolDefinition("add")] },
     });
-    expect(await registry.reload("stable")).toEqual([
+    expect(await reloadRegistry(registry, "stable")).toEqual([
       { serverId: "stable", reconciliation: "unchanged", result: "available" },
     ]);
     expect(registry.getTools().map((entry) => entry.rawName)).toEqual(["keep", "add"]);
@@ -802,7 +1054,7 @@ describe("McpRegistry reload and terminal failures", () => {
       first: { tools: [mcpToolDefinition("partial")], nextCursor: "loop" },
       loop: { tools: [mcpToolDefinition("ignored")], nextCursor: "loop" },
     });
-    expect(await registry.reload("stable")).toEqual([
+    expect(await reloadRegistry(registry, "stable")).toEqual([
       expect.objectContaining({
         serverId: "stable",
         reconciliation: "unchanged",
@@ -816,6 +1068,16 @@ describe("McpRegistry reload and terminal failures", () => {
     expect(registry.list()[0]).toBe(retainedStatus);
     expect(createCount).toBe(1);
     expect(client.closeCount).toBe(0);
+
+    const toolsBeforePanic = registry.getTools();
+    const statusBeforePanic = registry.list()[0];
+    const panic = new Panic({ message: "refresh invariant failed" });
+    client.listTools = async () => {
+      throw panic;
+    };
+    await expect(registry.reload("stable")).rejects.toBe(panic);
+    expect(registry.getTools()).toBe(toolsBeforePanic);
+    expect(registry.list()[0]).toBe(statusBeforePanic);
     await registry.shutdown();
   });
 
@@ -853,7 +1115,7 @@ describe("McpRegistry reload and terminal failures", () => {
     await registry.init();
 
     secret = "second-secret";
-    expect(await registry.reload("resolved")).toEqual([
+    expect(await reloadRegistry(registry, "resolved")).toEqual([
       { serverId: "resolved", reconciliation: "changed", result: "available" },
     ]);
     expect(transportInputs).toEqual([
@@ -894,7 +1156,7 @@ describe("McpRegistry reload and terminal failures", () => {
       throw new Error("refresh list rejected");
     };
 
-    expect(await registry.reload("stable")).toEqual([
+    expect(await reloadRegistry(registry, "stable")).toEqual([
       {
         serverId: "stable",
         reconciliation: "unchanged",
@@ -953,7 +1215,7 @@ describe("McpRegistry reload and terminal failures", () => {
       throw error;
     };
 
-    expect(await registry.reload("auth")).toEqual([
+    expect(await reloadRegistry(registry, "auth")).toEqual([
       {
         serverId: "auth",
         reconciliation: "unchanged",
@@ -1008,7 +1270,7 @@ describe("McpRegistry reload and terminal failures", () => {
     await closeStarted.promise;
 
     captureDeadline = deferred<() => void>();
-    const reloading = registry.reload("retry");
+    const reloading = reloadRegistry(registry, "retry");
     const deadlineCallback = await captureDeadline.promise;
     deadlineCallback();
     expect(await reloading).toEqual([
@@ -1036,7 +1298,7 @@ describe("McpRegistry reload and terminal failures", () => {
     });
     await registry.init();
 
-    expect(await registry.reload("absent")).toEqual([
+    expect(await reloadRegistry(registry, "absent")).toEqual([
       { serverId: "absent", reconciliation: "not_found", result: "not_found" },
     ]);
     await registry.shutdown();
@@ -1085,7 +1347,7 @@ describe("McpRegistry reload and terminal failures", () => {
       stdioDefinition("stable"),
     ]);
 
-    const outcomes = await registry.reload();
+    const outcomes = await reloadRegistry(registry);
     expect(outcomes).toEqual([
       expect.objectContaining({
         serverId: "changed",
@@ -1110,7 +1372,7 @@ describe("McpRegistry reload and terminal failures", () => {
       first: { tools: [mcpToolDefinition("replacement-tool")] },
     });
     factory.enqueue("changed", changedNew);
-    expect(await registry.reload("changed")).toEqual([
+    expect(await reloadRegistry(registry, "changed")).toEqual([
       { serverId: "changed", reconciliation: "changed", result: "available" },
     ]);
     expect(changedOld.closeCount).toBe(1);
@@ -1229,6 +1491,44 @@ describe("McpRegistry reload and terminal failures", () => {
     await registry.shutdown();
   });
 
+  it("propagates callback and wrapped tool Panics without changing available state", async () => {
+    let clientConfig: MCPClientConfig | undefined;
+    const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("run")] } });
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("local")])),
+        createClient: async (config) => {
+          clientConfig = config;
+          return client;
+        },
+      },
+    });
+    await registry.init();
+    const availableStatus = registry.list()[0];
+    const availableTools = registry.getTools();
+
+    const callbackPanic = new Panic({ message: "callback invariant failed" });
+    expect(() => clientConfig?.onUncaughtError?.(callbackPanic)).toThrow(callbackPanic);
+    expect(registry.list()[0]).toBe(availableStatus);
+    expect(registry.getTools()).toBe(availableTools);
+    expect(client.closeCount).toBe(0);
+
+    const execute = registry.getTools()[0]?.tool.execute;
+    if (!execute) throw new Error("Expected converted MCP tool to be executable");
+    const toolPanic = new Panic({ message: "tool invariant failed" });
+    client.executeTool = async () => {
+      throw toolPanic;
+    };
+    await expect(execute({}, { toolCallId: "panic", messages: [], context: {} })).rejects.toBe(
+      toolPanic,
+    );
+    expect(registry.list()[0]).toBe(availableStatus);
+    expect(registry.getTools()).toBe(availableTools);
+    expect(client.closeCount).toBe(0);
+    await registry.shutdown();
+  });
+
   it("terminally removes tools on uncaught errors and retries only on explicit reload", async () => {
     const token = "super-secret-token";
     let config: MCPClientConfig | undefined;
@@ -1274,7 +1574,7 @@ describe("McpRegistry reload and terminal failures", () => {
     expect(first.closeCount).toBe(1);
     expect(createCount).toBe(1);
 
-    expect(await registry.reload("remote")).toEqual([
+    expect(await reloadRegistry(registry, "remote")).toEqual([
       { serverId: "remote", reconciliation: "unavailable", result: "available" },
     ]);
     expect(createCount).toBe(2);

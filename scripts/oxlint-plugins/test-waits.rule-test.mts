@@ -44,6 +44,21 @@ ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
       filename: productionFile,
       errors: [{ message: /external-to-result adapter/u, line: 1, column: 0 }],
     },
+    {
+      code: 'import { TaggedError } from "better-result"; class Failure extends TaggedError("Failure") {} function run() { throw new Failure(); }',
+      filename: productionFile,
+      errors: [{ message: /Return a typed Result error/u, line: 1 }],
+    },
+    {
+      code: "function run() { try { operation(); } catch (cause) { return mapCause(cause); } }",
+      filename: productionFile,
+      errors: [{ message: /exactly registered adapter/u, line: 1 }],
+    },
+    {
+      code: 'import type { Result } from "better-result"; function run(): Promise<Result<string, Error>> { return Promise.reject(new Error("bad")); }',
+      filename: productionFile,
+      errors: [{ message: /Return Result\.err instead of Promise\.reject/u, line: 1 }],
+    },
   ],
 });
 
