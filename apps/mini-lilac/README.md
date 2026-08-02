@@ -4,18 +4,20 @@ The installable Mini Lilac command. It bundles the terminal client and server be
 entry point:
 
 ```sh
-mini-lilac                         # terminal client
-mini-lilac tui --session <id>      # explicit terminal client
-mini-lilac server                  # server
-mini-lilac server auth codex       # server administration
+./dist/main.js                         # terminal client
+./dist/main.js tui --session <id>      # explicit terminal client
+./dist/main.js server                  # server
+./dist/main.js server auth codex       # server administration
 ```
 
-Install it with Bun or npm. Bun remains the runtime because the server uses Bun APIs:
+The package is not currently published to the public npm registry. Build the current checkout with
+Bun, which remains the runtime because the server uses Bun APIs:
 
 ```sh
-bun add --global @stanley2058/mini-lilac
-# or
-npm install --global @stanley2058/mini-lilac
+bun install --frozen-lockfile
+cd apps/mini-lilac
+bun run build
+./dist/main.js --help
 ```
 
 ## First Run
@@ -23,21 +25,21 @@ npm install --global @stanley2058/mini-lilac
 Create the default server configuration, authenticate with Codex, and start the server:
 
 ```sh
-mini-lilac server init
-mini-lilac server auth codex
-mini-lilac server
+./dist/main.js server init
+./dist/main.js server auth codex
+./dist/main.js server
 ```
 
 In another terminal, start the client from the workspace you want Mini Lilac to use:
 
 ```sh
 cd /path/to/your/project
-mini-lilac
+/path/to/lilac-mono/apps/mini-lilac/dist/main.js
 ```
 
 `server init` writes `config.yaml`, `providers.yaml`, and `auth.json` under
 `$XDG_STATE_HOME/mini-lilac` (or `~/.local/state/mini-lilac`). Existing files are skipped; use
-`mini-lilac server init --force` to replace them.
+`./dist/main.js server init --force` to replace them.
 
 Build and exercise the publication-ready package from this directory:
 
@@ -51,11 +53,9 @@ npm pack ./dist
 `bun run pack:npm` creates the npm tarball. `bun run publish:npm` publishes the staged `dist/`
 package, leaving workspace-only source, scripts, and dependencies out of the registry metadata.
 
-To build, pack, and globally reinstall the current checkout in one step:
-
-```sh
-bun run install:local
-```
+The `install:local` maintainer helper currently assumes an older `npm pack --json` output shape and
+is not a supported installation path with npm 12. Use the direct built executable above until the
+package is published or the helper is updated.
 
 The client, server, their internal workspace dependencies, and the patched `@opentui/core`
 JavaScript are bundled into `dist/main.js`. `@opentui/core` remains a package dependency so the
