@@ -26,6 +26,17 @@ tools:
   media:
     maxInlineBytesPerPart: 10MiB
     maxInlineBytesTotal: 20MiB
+  generate:
+    image:
+      # Transport routing switch for generate.image.
+      # - default: use built-in provider-aware aliases.
+      # - openai-compatible: route all generate.image calls through the
+      #   OpenAI-compatible provider configured via OPENAI_COMPATIBLE_BASE_URL
+      #   and OPENAI_COMPATIBLE_API_KEY.
+      # Aliases and adapters remain unchanged; all aliases route together.
+      # Canonical model IDs are fixed. Selecting third-party routing has no
+      # automatic fallback.
+      provider: default
 
 plugins:
   disabled: []
@@ -47,6 +58,9 @@ conversation:
       model: fast
       # Number of threads to summarize concurrently inside one run.
       concurrency: 1
+      # Maximum threads processed by one periodic run. Manual runs are unbounded
+      # unless they provide an explicit limit.
+      batchSize: 32
       # Include MEMORY.md, USER.md, and optional ENTITIES.md as background-only
       # context for disambiguation during summarization.
       includePromptContext: false
@@ -320,7 +334,24 @@ agent:
           tools: [read_file, glob, grep, fuzzy_search, batch]
           plugins: [builtin-local-tools]
         level2:
-          callables: [fetch, search, skills.list, skills.brief, skills.full, content.inspect, discovery.search, conversation.thread.search, surface.help, surface.sessions.listParticipants, surface.messages.list, surface.messages.read, surface.messages.search, surface.reactions.list, surface.reactions.listDetailed]
+          callables:
+            [
+              fetch,
+              search,
+              skills.list,
+              skills.brief,
+              skills.full,
+              content.inspect,
+              discovery.search,
+              conversation.thread.search,
+              surface.help,
+              surface.sessions.listParticipants,
+              surface.messages.list,
+              surface.messages.read,
+              surface.messages.search,
+              surface.reactions.list,
+              surface.reactions.listDetailed,
+            ]
           plugins: [web, skills, content.inspect, discovery, conversation.thread, surface]
         # Behavioral/tool-surface settings; these do not sandbox trusted Bash.
         network: true
@@ -331,6 +362,12 @@ agent:
         # model: "openrouter/openai/gpt-4o"
         # Optional portable reasoning override for this subagent profile.
         # reasoning: low
+        # Optional ordered fallback chain. A profile chain takes precedence over
+        # the selected model slot or models.def alias chain.
+        # fallback:
+        #   - sonnet
+        #   - model: openrouter/openai/gpt-4o-mini
+        #     reasoning: none
         # options:
         #   temperature: 0.0
         # Optional extra prompt fragment appended in explore mode.
@@ -374,6 +411,22 @@ agent:
 #   You are lilac.
 
 models:
+  # Local Claude subscription models use claude-code/<model>, for example:
+  # model: claude-code/claude-sonnet-4-6
+  # Local runs may use an installed Claude CLI with existing authenticated config
+  # or `claude auth login`. Core Docker can use the SDK-bundled executable with
+  # CLAUDE_CODE_OAUTH_TOKEN and/or a mounted authenticated Claude config.
+  # CLAUDE_CONFIG_DIR selects auth/config/native transcript storage and defaults
+  # to ~/.claude. When set, it must be a non-empty absolute writable path; mount
+  # it persistently in containers. A dedicated path separates operator storage,
+  # not same-user access or privacy.
+  # Stable named subagents require an exact canonical head; Discord primary
+  # requires a retained terminal request plus an exact complete-segment lineage
+  # prefix. First/missing/invalid/scope-mismatched state starts fresh persisted;
+  # only an exact compatible continuation forks. Fork-heavy storage may grow
+  # roughly quadratically and is not deleted by Core.
+  # Explicit cross-family selection uses lossy text replay. Automatic fallback
+  # never crosses provider families and is disabled for a Claude-headed run.
   # Optional preset registry to make model selection ergonomic.
   def: {}
   # def:
@@ -391,6 +444,12 @@ models:
   #     # exact provider-native reasoning controls.
   #     options:
   #       reasoningEffort: high
+  #     # Ordered fallback entries can be aliases, provider/model refs, or objects
+  #     # with per-candidate reasoning/options overrides.
+  #     fallback:
+  #       - sonnet
+  #       - model: openrouter/openai/gpt-4o
+  #         reasoning: medium
   # def:
   #   opus:
   #     model: vercel/anthropic/claude-opus-4.8
@@ -424,6 +483,14 @@ models:
     model: "openrouter/openai/gpt-4o"
     # Optional portable AI SDK reasoning effort.
     # reasoning: provider-default
+    # Optional ordered fallback chain. A slot chain takes precedence over a chain
+    # declared by the models.def alias selected above. Runtime fallback skips
+    # candidates outside the head model's provider family; a claude-code head
+    # does not run automatic fallback at all.
+    # fallback:
+    #   - openrouter/anthropic/claude-sonnet-4.5
+    #   - model: openai/gpt-4o
+    #     reasoning: medium
     # For non-official OpenAI-compatible upstreams, use:
     # model: "openai-compatible/your-model-id"
     # options:
@@ -431,6 +498,8 @@ models:
     #   # For direct openai/codex providers, append commentary/final_answer
     #   # channel guidance to the end of the system prompt.
     #   response_commentary: true
+    #   # Allow this direct openai/codex model to use OpenAI server-side compaction.
+    #   openai_server_compaction: true
     #   # For openai/codex providers, parallelToolCalls defaults to true.
     #   # Set false to force sequential provider-side tool calling.
     #   openai:
@@ -444,6 +513,7 @@ models:
     model: "openrouter/openai/gpt-4o-mini"
     # Optional: disable reasoning for lightweight gate/router work.
     # reasoning: none
+    # fallback: [openrouter/openai/gpt-4o]
     # options:
     #   temperature: 0.0
 

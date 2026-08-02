@@ -2,30 +2,46 @@
 
 ## Status
 
-Implemented 2026-07-26. Follow-up to `plan/claude-agent-sdk-ai-sdk-integration.md`, which implemented
-the `claude-code` provider in Core and explicitly deferred Mini Lilac. Sections below describe the
-shipped behavior; "Implementation note" callouts record where the built result diverged from the
-original design.
+> **Historical and partially superseded.** This records the Mini provider implementation completed
+> 2026-07-26. It is not the authority for current persistence, built-in-tool, or deployment behavior.
+> Sections below preserve the original design and validation context even where later work changed
+> it. Current behavior is documented in `apps/mini-lilac-server/README.md` and
+> `plan/claude-code-native-session-continuation.md`.
+
+This was a follow-up to `plan/claude-agent-sdk-ai-sdk-integration.md`, which implemented the
+`claude-code` provider in Core and explicitly deferred Mini Lilac.
 
 Authenticated pass done against a live Claude subscription: streaming, a `read_file` call through the
 MCP bridge under Claude's own `toolu_…` id (confirming the nonce round trip that was the plan's main
 open risk), and the packaged bundle. Not yet exercised by hand: steering, cancel, compaction,
 subagent delegation, and resume after restart.
 
-## Goal
+Follow-up clarification (2026-08-01): this document records the original Mini provider port. The
+blanket no-persistence decision was superseded by
+`plan/claude-code-native-session-continuation.md`. Mini main and named subagent sessions now start
+fresh persisted or fork an exact compatible binding, including generated names returned after an
+omitted `sessionName`; utility models remain `persistSession: false`. The shared bridge also always appends `ToolSearch`
+for deferred Lilac MCP discovery. Mini conditionally adds `WebSearch`; Core adds no profile-requested
+built-in but also has `ToolSearch`. The published Mini bundle still requires an external `claude`
+executable on `PATH`, while Core Docker can use the SDK-bundled executable with operator-provided
+authentication.
+
+## Historical Goal
 
 Let a Mini Lilac operator select a Claude model backed by their own local Claude Code / Claude Agent
 SDK authentication, with the same guarantees Core already ships:
 
 - Lilac never reads, stores, refreshes, or transmits a Claude credential; `claude auth login` owns it.
-- Claude built-in tools, ambient filesystem settings, and Claude transcript persistence stay disabled.
+- At initial release, Claude built-in tools, ambient filesystem settings, and Claude transcript
+  persistence were disabled. The later native-continuation work supersedes only the blanket
+  persistence part as described above.
 - Lilac Level-1 tools reach Claude only through the run-scoped in-process `lilac` MCP server.
 - Tool execution parity: approvals, execution events, `toModelOutput`, output normalization, and
   artifact overflow all behave exactly as on ordinary providers.
 
 Non-goal: any new auth flow, Claude built-ins/subagents/skills/plugins, or a Node sidecar.
 
-## What Core Already Gives Us
+## Historical Shared Baseline
 
 The branch already moved the reusable parts below the app boundary, so the Mini Lilac port is mostly
 wiring, not new mechanism:
@@ -51,22 +67,22 @@ Neither claude-code file imports anything Core-specific: only `@modelcontextprot
 `@stanley2058/lilac-agent`, `@stanley2058/lilac-utils`, `ai`, `ai-sdk-provider-claude-code`, and
 `node:path`. The move is mechanical.
 
-## Key Architectural Differences From Core
+## Historical Architectural Differences From Core
 
-| Concern | Core | Mini Lilac |
-| --- | --- | --- |
-| Provider registry | Always-on singletons in `packages/utils/model-provider.ts`, env-gated | Config-driven `providers.yaml` + `auth.json`, every provider must have an API key |
-| Model catalog | Capability metadata only | `ModelCatalog` fetches models.dev or `/v1/models` per configured provider |
-| Model construction | One place, `bus-agent-runner.ts` | `SessionActor.createAgent()`, used by both top-level and delegated (subagent) runs |
-| Controls | `applyToRunningAgent()` steer/interrupt/cancel | `SessionActor.steer()`, `interruptQueuedSteering()`, `cancel()`, each a protocol command with a persisted result |
-| Transcript | `transcriptStore` + recovery checkpoints | SQLite store, `finalizeRootRun({ modelMessages: agent.state.messages })` |
-| Display | Bus events | `StoredUIMessageChunk` projection consumed by the client/TUI |
+| Concern            | Core                                                                  | Mini Lilac                                                                                                       |
+| ------------------ | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Provider registry  | Always-on singletons in `packages/utils/model-provider.ts`, env-gated | Config-driven `providers.yaml` + `auth.json`, every provider must have an API key                                |
+| Model catalog      | Capability metadata only                                              | `ModelCatalog` fetches models.dev or `/v1/models` per configured provider                                        |
+| Model construction | One place, `bus-agent-runner.ts`                                      | `SessionActor.createAgent()`, used by both top-level and delegated (subagent) runs                               |
+| Controls           | `applyToRunningAgent()` steer/interrupt/cancel                        | `SessionActor.steer()`, `interruptQueuedSteering()`, `cancel()`, each a protocol command with a persisted result |
+| Transcript         | `transcriptStore` + recovery checkpoints                              | SQLite store, `finalizeRootRun({ modelMessages: agent.state.messages })`                                         |
+| Display            | Bus events                                                            | `StoredUIMessageChunk` projection consumed by the client/TUI                                                     |
 
 The credentialless-provider concept already has a precedent in Mini Lilac: Codex OAuth
 (`supersededProviderIds`) exempts a provider from `validateProviderAuth`. `claude-code` reuses that
 shape but is simpler — it is credentialless by type, not by ambient token discovery.
 
-## Agreed Decisions
+## Historical Agreed Decisions
 
 1. **Opt-in via `providers.yaml`, not implicit.** (Confirmed.) Mini Lilac builds its model catalog from configured
    providers; an always-on hidden provider would not appear in the model list. Operators add:
@@ -84,7 +100,7 @@ shape but is simpler — it is credentialless by type, not by ambient token disc
 2. **No `auth.json` entry.** A supplied key for a `claude-code` provider is a config error.
 3. **`catalog: models-dev` only**, resolved against the models.dev `anthropic` provider; `baseUrl` is
    rejected.
-4. **Built-in tools become a caller-supplied allowlist.** (Confirmed.) Mini Lilac's `websearch` is a
+4. **Built-in tools become a caller-supplied allowlist.** (Historical initial decision.) Mini Lilac's `websearch` is a
    provider-executed OpenAI/Anthropic tool needing an API key, so `claude-code` models resolve to no
    web search provider (existing behavior of `createWebSearchProviderResolver`, which returns
    `undefined` for unknown types). Claude's own built-in `WebSearch` is subscription-backed, and the
@@ -93,7 +109,9 @@ shape but is simpler — it is credentialless by type, not by ambient token disc
    derives it per run from the profile** — `profileRequestsTool(profile, "websearch")` yields
    `["WebSearch"]`, otherwise `[]`. A profile that does not ask for web search does not get Claude's
    either, and subagent profiles are governed by the same config as every other tool. The utility
-   model (title generation and inherit-compaction) always gets `[]`. See "Claude built-in web search".
+   model (title generation and inherit-compaction) always gets `[]`. Current clarification: the
+   shared bridge appends `ToolSearch` after this caller-supplied list, so `[]` is not the effective
+   agent built-in list. See "Claude built-in web search".
 5. **`batch` stays omitted**, matching Core; Claude issues parallel MCP calls natively.
 6. **Steering result stays `queued`** in the protocol. Native injection marks the entry consumed and
    decrements the queued count; no protocol version bump.
@@ -105,7 +123,7 @@ shape but is simpler — it is credentialless by type, not by ambient token disc
    confirmed, so the control disappears on its own precisely when it would be useless. Flushing also
    requests a native interrupt so the live query yields.
 
-## Implementation Plan
+## Historical Implementation Plan
 
 ### Stage 1 — Extract the shared bridge package
 
@@ -121,9 +139,10 @@ Create `packages/claude-code-bridge` (`@stanley2058/lilac-claude-code`), dependi
   `apps/core/package.json` if nothing else in Core uses them directly.
 - Add `COPY packages/claude-code-bridge/package.json ...` to the `deps` stage of the root
   `Dockerfile` (the per-package manifest list at lines ~151–161). The later `COPY packages ./packages`
-  in the build stage needs no change. Note that the container itself cannot use `claude-code` — there
-  is no Claude CLI and no local credential in the image — so this is purely about keeping the
-  workspace graph resolvable; document `claude-code` as a local-run provider.
+  in the build stage needs no change. Historical assumption: the container could not use
+  `claude-code`. This was superseded for Core; its image can use the SDK-bundled executable with
+  `CLAUDE_CODE_OAUTH_TOKEN` and/or mounted authenticated config. The published Mini single-file bundle
+  still resolves an external `claude` from `PATH`.
 - Move `buildSafeRecoveryCheckpoint` into `packages/agent` (it is transcript logic, not surface
   logic) and re-export from Core's existing module path to keep Core diffs small.
 - Harden the bridge while moving: skip (do not throw on) tool definitions without `execute`, since
@@ -149,7 +168,7 @@ authenticated, rather than a second copy shipped inside Lilac. When no `claude` 
 `{}`, so the SDK's own resolution and diagnostic survive — which is what Core-in-Docker relies on,
 where auth comes from `CLAUDE_CODE_OAUTH_TOKEN` instead.
 
-Note that `settingSources: []` isolates settings *files* only (`~/.claude/settings.json`, project and
+Note that `settingSources: []` isolates settings _files_ only (`~/.claude/settings.json`, project and
 local settings, CLAUDE.md). Credential resolution is unaffected: the subprocess inherits an allowlist
 of `process.env` including `HOME`, `ANTHROPIC_*`, and `CLAUDE_*`, so a stored `claude auth login`
 credential and env tokens both work. The one on-disk auth path this isolation does block is
@@ -171,11 +190,12 @@ credential and env tokens both work. The one on-disk auth path this isolation do
   ```ts
   createClaudeCode({
     defaultSettings: { tools: [], settingSources: [], persistSession: false },
-  })
+  });
   ```
 
   This instance is correct for title generation, compaction, and validation because it carries no MCP
   server and no tools.
+
 - Add `ai-sdk-provider-claude-code` to `packages/mini-lilac-runtime/package.json`.
 
 ### Stage 3 — Model catalog
@@ -306,28 +326,30 @@ produces an execution event, so its namespaced name would reach the projection.
   leave it exported and uncalled.
 
 Add a regression test pinning the dedup contract: `tool_execution_start/end` fire before `message_end`,
-and inline tool-*result* parts inside assistant messages are deliberately not handled by the
+and inline tool-_result_ parts inside assistant messages are deliberately not handled by the
 `role === "tool"` branch because `tool_execution_end` already emitted the output chunk.
 
-### Stage 9 — Config surface and docs
+### Stage 9 — Config Surface And Docs (Historical)
 
 - `apps/mini-lilac-server/providers.example.yaml`: add a commented `claude-code` block.
 - `mini-lilac server auth` help text: state that `claude-code` needs no Lilac auth command, only
   `claude auth login`.
-- README: replace "currently supported by Core, not Mini Lilac" with Mini Lilac configuration, the
-  omitted `batch` note, and the one built-in Mini Lilac admits (`WebSearch`, executed by Claude
-  outside Lilac's approval/normalization pipeline — Core admits none).
+- README: the initial port described `WebSearch` as Mini's one admitted built-in and Core as admitting
+  none. Current correction: the shared bridge always enables `ToolSearch`; Mini may additionally
+  enable profile-requested `WebSearch`, while Core enables no profile-requested built-in.
 - No `configVersion` bump: `providers.yaml` gains an enum member, which is backward compatible.
 
-## Claude Built-In Web Search
+## Claude Built-In Web Search (Historical Initial Design)
 
-Mini Lilac enables one Claude built-in, `WebSearch`, for profiles that request `websearch`, because
-its own `websearch` tool needs a provider API key that a `claude-code` session does not have. Core
-keeps the allowlist empty.
+The initial Mini port enabled `WebSearch` for profiles that request `websearch`, because its own
+`websearch` tool needs a provider API key that a `claude-code` session does not have. That conditional
+behavior remains, but the current shared bridge also always appends `ToolSearch` for deferred Lilac
+MCP discovery in both Mini and Core. Core keeps the caller-supplied/profile-requested allowlist empty,
+not the effective built-in list.
 
-- `materializeClaudeCodeRun` gains a `builtInTools: readonly string[]` option (default `[]`), applied
-  to the agent model only. The utility model always gets `[]` so a summarization prompt can never
-  reach the network.
+- `materializeClaudeCodeRun` gained a caller-supplied `builtInTools` option (initial default `[]`) for
+  the agent model. Current materialization appends `ToolSearch` to that validated list. The utility
+  model remains tool-free so a summarization prompt cannot reach the network.
 - `canUseTool` currently rejects everything outside `mcp__lilac__*`. Extend it to also allow exactly
   the names in the run's allowlist — a set membership check, not a prefix or pattern match — and keep
   rejecting everything else.
@@ -359,13 +381,14 @@ The projection change is correspondingly small — mini-lilac's `message_end` sw
 - Run the tool name through `displayClaudeCodeToolName` on this path; `WebSearch` is not namespaced
   and passes through unchanged.
 
-## Testing
+## Historical Testing
 
 **New shared package** — move the existing Core bridge tests; add the "tool without execute is
 skipped" case; `canUseTool` allows an allowlisted built-in and still rejects every other non-`lilac`
 tool; the utility model never receives a built-in allowlist.
 
 **`packages/mini-lilac-runtime`**
+
 - `providers.test.ts`: `claude-code` needs no key; supplying a key errors; `baseUrl` and
   `catalog: v1` rejected; registry builds a no-tools base model.
 - `model-catalog.test.ts`: models.dev `anthropic` entries surface under the `claude-code` provider id;
@@ -381,14 +404,15 @@ tool; the utility model never receives a built-in allowlist.
   a `WebSearch` call produces both an input and a terminal output chunk; an errored built-in result
   produces `tool-output-error`.
 - `websearch` (the Lilac tool) is never present in a `claude-code` run's toolset.
-- Built-in allowlist follows the profile: a profile without `websearch` materializes with `[]`, and a
-  delegated subagent's allowlist comes from its own profile, not the parent's.
+- Historical assertion: a profile without `websearch` materialized with `[]`. Current effective agent
+  built-ins always include `ToolSearch`; `WebSearch` still follows the active profile, including a
+  delegated subagent's own profile rather than its parent's.
 
 **Manual/authenticated** — one real `claude auth login` session through the TUI: prompt, parallel
 tool calls, a web search, steering mid-run, cancel, compaction, subagent delegation, resume after
 restart.
 
-## Risks And Open Questions
+## Historical Risks And Open Questions
 
 - **`updatedInput` nonce round trip** is still unverified against a live authenticated session (open
   from the Core work). Mini Lilac inherits the risk; it fails closed, so the failure mode is refused
@@ -403,7 +427,7 @@ restart.
   config overrides.
 - Bun hosting of the provider is already proven in Core; no new gate.
 
-## Implementation Order
+## Historical Implementation Order
 
 1. Extract `packages/claude-code-bridge` (+ `Dockerfile` manifest line); move
    `buildSafeRecoveryCheckpoint` into `packages/agent`; add the `builtInTools` option with Core
@@ -421,10 +445,11 @@ restart.
 10. Focused tests, changed-package typechecks, root `lint:fix` + `fmt`, then the full harness; one
     authenticated manual pass.
 
-## Deferred
+## Historical Deferred Work
 
 - Ambient Claude user/project/local settings.
-- Claude built-ins beyond `WebSearch`; native Claude subagents, plugins, skills.
+- Task-facing Claude built-ins beyond `WebSearch`; native Claude subagents, plugins, skills.
 - Any Lilac-owned Claude OAuth or token storage.
 - A concurrency cap on Claude-backed runs (measure first).
-- `claude-code` inside the Docker image (no CLI, no credential).
+- Historical Mini container packaging work. Core Docker is supported through the SDK-bundled
+  executable; a custom Mini container must provide the external CLI required by the published bundle.

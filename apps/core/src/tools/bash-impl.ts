@@ -501,6 +501,7 @@ function buildBashChildEnv(params: {
   context?: {
     requestId: string;
     sessionId: string;
+    originSessionId?: string;
     requestClient: string;
   };
   resolvedCwd: string;
@@ -515,6 +516,7 @@ function buildBashChildEnv(params: {
     ...params.vcsEnv,
     LILAC_REQUEST_ID: params.context?.requestId,
     LILAC_SESSION_ID: params.context?.sessionId,
+    LILAC_ORIGIN_SESSION_ID: params.context?.originSessionId,
     LILAC_REQUEST_CLIENT: params.context?.requestClient,
     LILAC_CWD: params.resolvedCwd,
     LILAC_TOOL_CALL_ID: params.toolCallId,
@@ -555,6 +557,7 @@ export async function executeBash(
     context?: {
       requestId: string;
       sessionId: string;
+      originSessionId?: string;
       requestClient: string;
     };
     abortSignal?: AbortSignal;

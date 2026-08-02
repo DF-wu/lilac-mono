@@ -193,6 +193,7 @@ export const workflowCompletionTargetSchema = z.discriminatedUnion("kind", [
     childSessionId: idSchema,
     profile: workflowAgentProfileSchema,
     sessionName: idSchema,
+    stableNamedContinuation: z.literal(true).optional(),
     depth: z.number().int().positive().max(64),
     reasoning: z
       .enum(["provider-default", "none", "minimal", "low", "medium", "high", "xhigh"])
@@ -288,7 +289,7 @@ export type WorkflowOperation = z.infer<typeof workflowOperationSchema>;
 export const workflowWaitMatchSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("reply"),
-    platform: z.literal("discord"),
+    platform: z.enum(["discord", "telegram"]),
     channelId: idSchema,
     messageId: idSchema.nullable(),
     fromUserId: idSchema.nullable(),

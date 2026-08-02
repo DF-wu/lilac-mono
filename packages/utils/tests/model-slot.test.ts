@@ -2,10 +2,16 @@ import { describe, expect, it } from "bun:test";
 
 import {
   CODEX_BASE_INSTRUCTIONS,
+  fromDurableResolvedModelPlan,
   parseCoreConfigV1ToUniversal,
   providers,
+  resolveModelChain,
+  resolveModelPlan,
   resolveModelRef,
   resolveModelSlot,
+  resolveModelSlotPlan,
+  toDurableResolvedModelPlan,
+  withModelPlanReasoning,
   type CoreConfig,
 } from "../index";
 
@@ -245,6 +251,61 @@ describe("resolveModelSlot", () => {
     expect(resolved.providerOptions?.response_commentary).toBeUndefined();
   });
 
+  it("uses openai_server_compaction as a top-level meta option after alias and slot merging", () => {
+    const cfg = baseConfig();
+    cfg.models.def = {
+      primary: {
+        model: "openai/gpt-4o",
+        options: {
+          openai_server_compaction: true,
+          openai: { temperature: 0.1 },
+        },
+      },
+    };
+    cfg.models.main = {
+      model: "primary",
+      options: {
+        openai: { textVerbosity: "low" },
+      },
+    };
+
+    const resolved = resolveModelSlot(cfg, "main");
+    expect(resolved.openaiServerCompaction).toBe(true);
+    expect(resolved.providerOptions?.openai?.temperature).toBe(0.1);
+    expect(resolved.providerOptions?.openai?.textVerbosity).toBe("low");
+    expect(resolved.providerOptions?.openai_server_compaction).toBeUndefined();
+  });
+
+  it("rejects invalid or unsupported openai_server_compaction options", () => {
+    const cfg = baseConfig();
+    cfg.models.main = {
+      model: "openai/gpt-4o",
+      options: { openai_server_compaction: false },
+    };
+    expect(() => resolveModelSlot(cfg, "main")).toThrow(
+      "Model option 'openai_server_compaction' must be literal boolean true",
+    );
+
+    cfg.models.main.options = { openai_server_compaction: "true" };
+    expect(() => resolveModelSlot(cfg, "main")).toThrow(
+      "Model option 'openai_server_compaction' must be literal boolean true",
+    );
+
+    cfg.models.main = {
+      model: "openrouter/openai/gpt-4o",
+      options: { openai_server_compaction: true },
+    };
+    expect(() => resolveModelSlot(cfg, "main")).toThrow(
+      "Model option 'openai_server_compaction' is supported only by openai and codex providers",
+    );
+
+    cfg.models.main = {
+      model: "codex/gpt-4o",
+      options: { openai_server_compaction: true },
+    };
+    expect(resolveModelSlot(cfg, "main").openaiServerCompaction).toBe(true);
+  });
+
   it("uses anthropic_prompt_cache as a top-level meta option", () => {
     const cfg = baseConfig();
     cfg.models.main = {
@@ -361,5 +422,157 @@ describe("resolveModelSlot", () => {
     expect(resolved.spec).toBe("openrouter/anthropic/claude-sonnet-4.5");
     expect(resolved.providerOptions?.anthropic?.thinking).toEqual({ type: "enabled" });
     expect(resolved.providerOptions?.gateway?.order).toEqual(["anthropic", "bedrock"]);
+  });
+});
+
+describe("resolved model plans", () => {
+  it("uses an alias chain when the slot has no nearer chain and preserves head repeats", () => {
+    const cfg = baseConfig();
+    cfg.models.def = {
+      primary: {
+        model: "openai/gpt-5.5",
+        reasoning: "high",
+        fallback: [
+          "primary",
+          {
+            model: "backup",
+            reasoning: "low",
+            options: { temperature: 0.1 },
+          },
+          "primary",
+        ],
+      },
+      backup: {
+        model: "openrouter/openai/gpt-4o",
+        options: { gateway: { order: ["openai"] } },
+      },
+    };
+    cfg.models.main = { model: "primary" };
+
+    const plan = resolveModelSlotPlan(cfg, "main");
+
+    expect(plan.head.spec).toBe("openai/gpt-5.5");
+    expect(plan.fallbacks.map((candidate) => candidate.spec)).toEqual([
+      "openai/gpt-5.5",
+      "openrouter/openai/gpt-4o",
+      "openai/gpt-5.5",
+    ]);
+    expect(plan.fallbacks.map((candidate) => candidate.reasoning)).toEqual(["high", "low", "high"]);
+    expect(plan.fallbacks[1]?.providerOptions?.openrouter?.temperature).toBe(0.1);
+    expect(plan.fallbacks[1]?.providerOptions?.openrouter?.gateway).toEqual({ order: ["openai"] });
+  });
+
+  it("lets an explicit empty or repeated slot chain override the alias chain", () => {
+    const cfg = baseConfig();
+    cfg.models.def.primary = {
+      model: "openai/gpt-5.5",
+      fallback: ["openai/gpt-4o-mini"],
+    };
+    cfg.models.main = { model: "primary", fallback: [] };
+
+    expect(resolveModelSlotPlan(cfg, "main").fallbacks).toEqual([]);
+
+    cfg.models.main.fallback = ["primary", "primary"];
+    expect(resolveModelSlotPlan(cfg, "main").fallbacks.map((candidate) => candidate.spec)).toEqual([
+      "openai/gpt-5.5",
+      "openai/gpt-5.5",
+    ]);
+  });
+
+  it("applies a common reasoning override while resolving every candidate", () => {
+    const cfg = baseConfig();
+    cfg.models.def.primary = {
+      model: "openai/gpt-5.5",
+      reasoning: "high",
+      fallback: [{ model: "openai/gpt-4o", reasoning: "low" }, "openrouter/openai/gpt-4o-mini"],
+    };
+
+    const plan = resolveModelPlan(cfg, {
+      head: { model: "primary" },
+      headSource: "agent.subagents.profiles.explore.model",
+      fallbackSource: "agent.subagents.profiles.explore.fallback",
+      reasoningOverride: "medium",
+    });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.reasoning)).toEqual([
+      "medium",
+      "medium",
+      "medium",
+    ]);
+
+    expect(
+      withModelPlanReasoning(plan, "none").fallbacks.map((candidate) => candidate.reasoning),
+    ).toEqual(["none", "none"]);
+  });
+
+  it("reports the indexed fallback source when resolution fails", () => {
+    const cfg = baseConfig();
+
+    expect(() =>
+      resolveModelChain(
+        cfg,
+        ["openai/gpt-4o", "missing"],
+        "agent.subagents.profiles.general.fallback",
+      ),
+    ).toThrow("Unknown model alias 'missing' (agent.subagents.profiles.general.fallback[1])");
+
+    cfg.models.def.primary = {
+      model: "openai/gpt-5.5",
+      fallback: ["missing"],
+    };
+    cfg.models.main = { model: "primary" };
+    expect(() => resolveModelSlotPlan(cfg, "main")).toThrow(
+      "Unknown model alias 'missing' (models.def.primary.fallback[0])",
+    );
+  });
+
+  it("round-trips durable plans and treats legacy requests as an empty chain", () => {
+    const cfg = baseConfig();
+    cfg.models.main = {
+      model: "openai/gpt-5.5",
+      options: { openai_server_compaction: true },
+      fallback: [
+        "openrouter/openai/gpt-4o",
+        {
+          model: "openai/gpt-4o-mini",
+          reasoning: "none",
+          options: { openai_server_compaction: true },
+        },
+      ],
+    };
+    const plan = resolveModelSlotPlan(cfg, "main");
+
+    const durable = toDurableResolvedModelPlan(plan, "detailed");
+    expect(durable.fallbacks?.map((candidate) => candidate.spec)).toEqual([
+      "openrouter/openai/gpt-4o",
+      "openai/gpt-4o-mini",
+    ]);
+    expect(durable.fallbacks?.every((candidate) => candidate.reasoningDisplay === "detailed")).toBe(
+      true,
+    );
+    expect(durable.openaiServerCompaction).toBe(true);
+    expect(durable.fallbacks?.[1]?.openaiServerCompaction).toBe(true);
+
+    const restored = fromDurableResolvedModelPlan(durable);
+    expect(restored.head.spec).toBe(plan.head.spec);
+    expect(restored.fallbacks.map((candidate) => candidate.spec)).toEqual(
+      plan.fallbacks.map((candidate) => candidate.spec),
+    );
+    expect(restored.fallbacks[1]?.reasoning).toBe("none");
+    expect(restored.fallbacks[1]?.reasoningDisplay).toBe("detailed");
+    expect(restored.head.openaiServerCompaction).toBe(true);
+    expect(restored.fallbacks[1]?.openaiServerCompaction).toBe(true);
+
+    const { fallbacks: _fallbacks, ...legacy } = durable;
+    expect(fromDurableResolvedModelPlan(legacy).fallbacks).toEqual([]);
+    expect(() =>
+      fromDurableResolvedModelPlan({
+        ...legacy,
+        spec: "anthropic/claude-test",
+        provider: "anthropic",
+        modelId: "claude-test",
+        openaiServerCompaction: true,
+      }),
+    ).toThrow("supported only by openai and codex providers");
   });
 });

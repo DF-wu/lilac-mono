@@ -26,6 +26,7 @@ export type NormalizeToolResultOutputFn = (
     toolCallId: string;
     toolName: string;
     bypassGenericOutputNormalizer?: boolean;
+    aggregateOutputBudgetExempt?: boolean;
   },
 ) => ToolResultOutput | Promise<ToolResultOutput>;
 
@@ -323,7 +324,9 @@ export function createOverflowReferenceNormalizer(
   ) => {
     const config = resolveConfig(params.getOutputConfig());
     const measured = entries.flatMap((entry, outputIndex) =>
-      measureOutput(entry.output, outputIndex),
+      entry.context.aggregateOutputBudgetExempt === true
+        ? []
+        : measureOutput(entry.output, outputIndex),
     );
     const selected = selectSpills(measured, config.maxInlineBytes);
 

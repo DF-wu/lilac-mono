@@ -35,6 +35,12 @@ const mcpApplicationErrorSchema = z.object({
   name: z.literal("MCPClientError"),
   code: z.number(),
 });
+const optionalHttpInboundSseErrorSchema = z.object({
+  name: z.literal("MCPClientError"),
+  message: z.string().startsWith("MCP HTTP Transport Error: GET SSE failed:"),
+  statusCode: z.number().int(),
+  url: z.string(),
+});
 
 type RegistryEntry = {
   readonly definition: McpServerDefinition;
@@ -198,6 +204,31 @@ function isCustomTransport(transport: MCPClientConfig["transport"]): transport i
     "close" in transport &&
     typeof transport.close === "function"
   );
+}
+
+function observeHttpSessionExpiration(
+  transport: MCPClientConfig["transport"],
+  onSessionExpired: () => void,
+): MCPClientConfig["transport"] {
+  if (isCustomTransport(transport) || transport.type !== "http") return transport;
+  const sdkOnSessionExpired = transport.onSessionExpired;
+  return {
+    ...transport,
+    onSessionExpired: (sessionId) => {
+      sdkOnSessionExpired?.(sessionId);
+      onSessionExpired();
+    },
+  };
+}
+
+function isOptionalHttpInboundSseError(
+  definition: McpServerDefinition,
+  sessionExpired: boolean,
+  error: unknown,
+): boolean {
+  if (definition.transportConfig.transport !== "http" || sessionExpired) return false;
+  const parsed = optionalHttpInboundSseErrorSchema.safeParse(error);
+  return parsed.success && parsed.data.url === new URL(definition.transportConfig.url).href;
 }
 
 export class McpRegistry implements McpRegistryApi {
@@ -509,12 +540,18 @@ export class McpRegistry implements McpRegistryApi {
     let phase: McpRegistryPhase = "configuration";
     let sensitiveValues: readonly string[] = [];
     let client: McpRegistryClient | undefined;
-    const holder: { client?: McpRegistryClient; terminalError?: unknown } = {};
+    const holder: {
+      client?: McpRegistryClient;
+      terminalError?: unknown;
+      sessionExpired?: boolean;
+    } = {};
 
     try {
       const resolved = prefetchedTransport ?? (await this.resolveTransport(definition));
       sensitiveValues = resolved.sensitiveValues;
-      const transport = this.createTransport(resolved.input);
+      const transport = observeHttpSessionExpiration(this.createTransport(resolved.input), () => {
+        holder.sessionExpired = true;
+      });
       phase = "connection";
 
       const candidate = await this.withDeadline(
@@ -525,6 +562,11 @@ export class McpRegistry implements McpRegistryApi {
             clientName: `lilac-mcp-${definition.id}`,
             maxRetries: 0,
             onUncaughtError: (error) => {
+              if (
+                isOptionalHttpInboundSseError(definition, holder.sessionExpired === true, error)
+              ) {
+                return;
+              }
               holder.terminalError = error;
               if (holder.client) this.handleTerminalFailure(definition.id, holder.client, error);
             },

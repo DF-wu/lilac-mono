@@ -35,8 +35,7 @@ describe("materializeClaudeCodeRun", () => {
       },
     });
 
-    expect(run.agentModel).not.toBe(run.utilityModel);
-    expect(settings).toHaveLength(2);
+    expect(settings).toHaveLength(1);
     expect(settings[0]).toMatchObject({
       cwd,
       env: { ENABLE_TOOL_SEARCH: "true" },
@@ -49,6 +48,8 @@ describe("materializeClaudeCodeRun", () => {
     expect(settings[0]?.canUseTool).toBeFunction();
     expect(settings[0]?.onStreamStart).toBeFunction();
     expect(settings[0]?.onQueryControllerCreated).toBeFunction();
+    const utilityModel = run.createUtilityModel();
+    expect(utilityModel).not.toBe(run.agentModel);
     expect(settings[1]).toEqual({
       ...claudeCodeExecutableSettings(),
       cwd,
@@ -56,6 +57,9 @@ describe("materializeClaudeCodeRun", () => {
       settingSources: [],
       persistSession: false,
     });
+    const nextUtilityModel = run.createUtilityModel();
+    expect(nextUtilityModel).not.toBe(utilityModel);
+    expect(settings[2]).toEqual(settings[1]);
     // Both models must target the same Claude installation.
     expect(settings[0]?.pathToClaudeCodeExecutable).toBe(
       settings[1]?.pathToClaudeCodeExecutable as string | undefined,
@@ -87,6 +91,38 @@ describe("materializeClaudeCodeRun", () => {
     await run.dispose();
   });
 
+  it("keeps persistent initial and continuation settings separate", async () => {
+    const settings: ClaudeCodeSettings[] = [];
+    const provider = createClaudeCode();
+    const sessionId = "22222222-2222-4222-8222-222222222222";
+    const run = await materializeClaudeCodeRun({
+      modelId: "sonnet",
+      cwd: process.cwd(),
+      tools: {},
+      nativeSession: { mode: "fresh", sessionId },
+      execute: () => {
+        throw new Error("not called");
+      },
+      createModel: (modelId, modelSettings) => {
+        settings.push(modelSettings);
+        return provider(modelId, modelSettings);
+      },
+    });
+
+    expect(run.continuationModel).toBeDefined();
+    expect(settings[0]).toMatchObject({ persistSession: true, sessionId });
+    expect(settings[0]?.resume).toBeUndefined();
+    expect(settings[1]).toMatchObject({ persistSession: true, resume: sessionId });
+    expect(settings[1]?.sessionId).toBeUndefined();
+    expect(settings[1]?.forkSession).toBeUndefined();
+
+    run.createUtilityModel();
+    expect(settings[2]).toMatchObject({ persistSession: false, tools: [], settingSources: [] });
+    expect(settings[2]?.resume).toBeUndefined();
+    expect(settings[2]?.sessionId).toBeUndefined();
+    await run.dispose();
+  });
+
   it("preserves caller built-ins, appends ToolSearch once, and keeps utility tools empty", async () => {
     const settings: ClaudeCodeSettings[] = [];
     const provider = createClaudeCode();
@@ -106,6 +142,7 @@ describe("materializeClaudeCodeRun", () => {
 
     expect(settings[0]?.tools).toEqual(["WebSearch", "ToolSearch"]);
     expect(settings[0]?.env).toEqual({ ENABLE_TOOL_SEARCH: "true" });
+    run.createUtilityModel();
     expect(settings[1]?.tools).toEqual([]);
     expect(settings[1]?.env).toBeUndefined();
 

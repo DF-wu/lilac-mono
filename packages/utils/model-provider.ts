@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { createXai } from "@ai-sdk/xai";
@@ -20,9 +22,11 @@ import {
   writeCodexTokens,
 } from "./codex-oauth";
 import { createLogger } from "./logging";
+import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
 import { isRecord } from "./runtime-utils";
+import { withServerCompactionRequestFetch } from "./server-compaction-request";
 
 let resolvedClaudeExecutable: string | null | undefined;
 
@@ -182,12 +186,30 @@ function completedSummaryDelta(streamed: string, completed: string): string {
   return completed.startsWith(streamed) ? completed.slice(streamed.length) : "";
 }
 
+function normalizeCodexCompactionItemId(event: Record<string, unknown>): Record<string, unknown> {
+  if (event.type !== "response.output_item.done" || !isRecord(event.item)) return event;
+  if (event.item.type !== "compaction" || typeof event.item.id === "string") return event;
+
+  const identity = JSON.stringify({
+    responseId: event.response_id ?? null,
+    outputIndex: event.output_index ?? null,
+    encryptedContent: event.item.encrypted_content ?? null,
+  });
+  const id = `cmp_lilac_${createHash("sha256").update(identity).digest("hex").slice(0, 32)}`;
+  return {
+    ...event,
+    output_index: typeof event.output_index === "number" ? event.output_index : 0,
+    item: { ...event.item, id },
+  };
+}
+
 export function createCodexResponsesEventNormalizer(): (
   event: Record<string, unknown>,
 ) => Record<string, unknown> {
   const summaries = new Map<string, string>();
 
   return (event) => {
+    event = normalizeCodexCompactionItemId(event);
     const type = event.type;
     if (
       type === "response.done" ||
@@ -264,7 +286,7 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
   return createOpenAI({
     baseURL: "https://chatgpt.com/backend-api/codex",
     apiKey: OAUTH_DUMMY_KEY,
-    fetch: (async (requestInput, init) => {
+    fetch: withServerCompactionRequestFetch((async (requestInput, init) => {
       const parsedUrl =
         requestInput instanceof URL
           ? requestInput
@@ -360,7 +382,7 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
       }
 
       return codexFetch(url, { ...init, headers, body });
-    }) as typeof globalThis.fetch,
+    }) as typeof globalThis.fetch),
   });
 }
 
@@ -385,18 +407,20 @@ export function getModelProviders() {
     },
   });
 
-  const openaiFetch = withLlmWireDebugFetch({
-    provider: "openai",
-    fetchFn: openaiResponsesFetch,
-    warn: (message, details) => logger.warn(message, details),
-  });
+  const openaiFetch = withServerCompactionRequestFetch(
+    withLlmWireDebugFetch({
+      provider: "openai",
+      fetchFn: openaiResponsesFetch,
+      warn: (message, details) => logger.warn(message, details),
+    }),
+  );
 
   const providers = {
     openai: env.providers.openai
       ? createOpenAI({
           baseURL: env.providers.openai.baseUrl,
           apiKey: env.providers.openai.apiKey,
-          fetch: openaiFetch,
+          fetch: withOpenAIImageEditFilenamesFetch(openaiFetch),
         })
       : null,
 

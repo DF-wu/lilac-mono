@@ -122,6 +122,7 @@ function recordingPluginManager(
         catalogMetadata: {},
         updateActiveBatchTools: () => {},
         genericOutputNormalizerBypassTools: new Set<string>(),
+        aggregateOutputBudgetExemptTools: new Set<string>(),
       };
     },
   };
@@ -143,6 +144,7 @@ function stubLiveParentBridge(): WorkflowLiveParentBridge {
         hasOutstandingRuns: false,
       }),
       listPending: () => [],
+      isPending: () => false,
       listPendingAsync: async () => [],
       listPendingIdentities: () => [],
       listPendingSettledAsync: async () => [],
@@ -160,6 +162,7 @@ function stubLiveParentBridge(): WorkflowLiveParentBridge {
 type IssuedCapabilityCall = {
   requestId: string;
   sessionId: string;
+  originSessionId?: string;
   requestClient: AdapterPlatform;
   canonicalCwd: string;
   principal?: { platform: SurfacePrincipalPlatform; userId: string };
@@ -219,6 +222,7 @@ async function runRequest(input: {
         kind: "primary",
         requestId: callInput.requestId,
         sessionId: callInput.sessionId,
+        originSessionId: callInput.originSessionId,
         platform: callInput.requestClient,
         principal,
         allowedCallables: null,
@@ -227,7 +231,7 @@ async function runRequest(input: {
         safetyMode: callInput.safetyMode,
         expiresAt: callInput.expiresAt,
       });
-      return { capability, principal };
+      return { capability, originSessionId: callInput.originSessionId, principal };
     },
   });
 
@@ -299,6 +303,7 @@ describe("level-2 control authority for a telegram primary request", () => {
       requestClient: "telegram",
       requestId: TELEGRAM_REQUEST_ID,
       sessionId: TELEGRAM_CHAT,
+      originSessionId: TELEGRAM_CHAT,
       canonicalCwd: "/workspace",
     });
   });
@@ -320,6 +325,7 @@ describe("level-2 control authority for a telegram primary request", () => {
     expect(builds[0]?.requestContext).toMatchObject({
       requestClient: "telegram",
       sessionId: TELEGRAM_CHAT,
+      originSessionId: TELEGRAM_CHAT,
       safetyMode: "trusted",
     });
   });

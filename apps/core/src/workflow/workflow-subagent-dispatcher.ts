@@ -17,12 +17,7 @@ import {
   WORKFLOW_RUNTIME_VERSION,
 } from "./workflow-definition";
 import { WorkflowDefinitionStore } from "./workflow-definition-store";
-import type {
-  WorkflowCompletionTarget,
-  WorkflowProgressTarget,
-  WorkflowRevision,
-  WorkflowRun,
-} from "./workflow-domain";
+import type { WorkflowCompletionTarget, WorkflowRevision, WorkflowRun } from "./workflow-domain";
 import { readWorkflowValueArtifact } from "./workflow-artifact-store";
 import { resolveWorkflowSubagentToolResult } from "./workflow-subagent-output";
 
@@ -220,11 +215,6 @@ export class WorkflowSubagentDispatcher {
       maxInputBytes: revision.limits.maxInputBytes,
     });
     const runId = `wfrun:subagent:${crypto.randomUUID()}`;
-    const fallbackProgressTarget: WorkflowProgressTarget | null = {
-      platform: registration.fallbackSurface.platform,
-      channelId: registration.fallbackSurface.sessionId,
-      replyToMessageId: null,
-    };
     const completionTarget: WorkflowCompletionTarget = {
       kind: "live_parent",
       parentRequestId: registration.parentRequestId,
@@ -235,10 +225,11 @@ export class WorkflowSubagentDispatcher {
       childSessionId: registration.childSessionId,
       profile: registration.profile,
       sessionName: registration.sessionName,
+      stableNamedContinuation: registration.stableNamedContinuation,
       depth: registration.depth,
       reasoning: registration.reasoningOverride ?? null,
-      fallbackToSurface: fallbackProgressTarget !== null,
-      fallbackProgressTarget,
+      fallbackToSurface: false,
+      fallbackProgressTarget: null,
       deferredDelivery: registration.mode === "deferred",
     };
     const requestedRun: WorkflowRun = {

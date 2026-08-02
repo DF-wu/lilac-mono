@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { buildCoreLineageManifestV1 } from "@stanley2058/lilac-event-bus";
 
 import {
   SqliteGracefulRestartStore,
@@ -28,6 +29,18 @@ async function makeStore() {
 function buildSnapshot(
   overrides?: Partial<Pick<GracefulRestartSnapshot, "createdAt" | "deadlineMs">>,
 ): GracefulRestartSnapshot {
+  const lineage = buildCoreLineageManifestV1([
+    {
+      atoms: [
+        {
+          kind: "synthetic",
+          source: "restart-test",
+          messageDigest: "11".repeat(32),
+        },
+      ],
+      canonicalMessages: [{ role: "user", content: "queued" }],
+    },
+  ]);
   return {
     version: 2,
     createdAt: overrides?.createdAt ?? Date.now(),
@@ -79,6 +92,7 @@ function buildSnapshot(
             ],
           },
         ],
+        corePrimaryLineage: lineage,
         raw: { triggerType: "mention" },
       },
     ],
@@ -130,6 +144,9 @@ describe("SqliteGracefulRestartStore", () => {
 
     const queued = loaded?.agent.find((a) => a.kind === "queued");
     expect(queued).toBeDefined();
+    expect(queued?.corePrimaryLineage).toEqual(
+      buildSnapshot().agent.find((entry) => entry.kind === "queued")?.corePrimaryLineage,
+    );
 
     const filePart = (queued?.messages[0] as { content?: unknown })?.content as
       | Array<{ type?: string; data?: unknown }>

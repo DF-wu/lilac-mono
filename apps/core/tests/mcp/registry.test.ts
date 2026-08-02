@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+  createMCPClient,
   UnauthorizedError,
   type MCPClientConfig,
   type MCPTransport,
@@ -8,6 +9,7 @@ import {
   type OAuthTokens,
 } from "@ai-sdk/mcp";
 import { Experimental_StdioMCPTransport } from "@ai-sdk/mcp/mcp-stdio";
+import { z } from "zod";
 
 import {
   McpConfigError,
@@ -26,6 +28,12 @@ import {
   mcpToolDefinition,
   stdioDefinition,
 } from "./fixtures/registry-fixture";
+
+const mcpHttpRequestSchema = z.object({
+  jsonrpc: z.literal("2.0"),
+  id: z.union([z.string(), z.number()]).optional(),
+  method: z.string(),
+});
 
 function fakeAuthProvider(tokens: OAuthTokens | undefined): OAuthClientProvider {
   return {
@@ -155,12 +163,174 @@ describe("McpRegistry startup and discovery", () => {
     const localConfig = factory.configs.find((value) => value.clientName === "lilac-mcp-local");
     const remoteConfig = factory.configs.find((value) => value.clientName === "lilac-mcp-remote");
     expect(localConfig?.transport).toBeInstanceOf(Experimental_StdioMCPTransport);
-    expect(remoteConfig?.transport).toEqual({
+    expect(remoteConfig?.transport).toMatchObject({
       type: "http",
       url: "https://example.invalid/mcp",
       headers: { Authorization: "Bearer http-secret" },
+      onSessionExpired: expect.any(Function),
     });
     await registry.shutdown();
+  });
+
+  it("keeps native HTTP available when the optional inbound SSE stream is unavailable", async () => {
+    const inboundError = deferred<unknown>();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        if (request.method === "GET") {
+          return new Response("Session not found", { status: 404 });
+        }
+
+        const message = mcpHttpRequestSchema.parse(await request.json());
+        if (message.method === "initialize" && message.id !== undefined) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: {} },
+              serverInfo: { name: "native-http-test", version: "1.0.0" },
+            },
+          });
+        }
+        if (message.method === "tools/list" && message.id !== undefined) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              tools: [{ name: "native-http-tool", inputSchema: { type: "object" } }],
+            },
+          });
+        }
+        return new Response(null, { status: 202 });
+      },
+    });
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(mcpConfig([httpDefinition("native-http", server.url.toString())])),
+        createClient: async (config) =>
+          createMCPClient({
+            ...config,
+            onUncaughtError: (error) => {
+              inboundError.resolve(error);
+              config.onUncaughtError?.(error);
+            },
+          }),
+      },
+    });
+
+    try {
+      const initializing = registry.init();
+      await expect(inboundError.promise).resolves.toMatchObject({
+        name: "MCPClientError",
+        message: "MCP HTTP Transport Error: GET SSE failed: 404 Not Found",
+        statusCode: 404,
+        url: server.url.toString(),
+      });
+      await initializing;
+
+      expect(registry.list()).toEqual([
+        {
+          serverId: "native-http",
+          transport: "http",
+          status: "available",
+          toolCount: 1,
+        },
+      ]);
+      expect(registry.getTools().map((tool) => tool.rawName)).toEqual(["native-http-tool"]);
+    } finally {
+      await registry.shutdown();
+      server.stop(true);
+    }
+  });
+
+  it("retires native HTTP when an established session expires on the inbound stream", async () => {
+    const sessionGetStarted = deferred<void>();
+    const releaseSessionGet = deferred<void>();
+    const sessionExpiredError = deferred<unknown>();
+    const sessionId = "native-http-session";
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        if (request.method === "GET") {
+          if (request.headers.get("mcp-session-id") !== sessionId) {
+            return new Response(null, { status: 405 });
+          }
+          sessionGetStarted.resolve();
+          await releaseSessionGet.promise;
+          return new Response("Session not found", { status: 404 });
+        }
+
+        const message = mcpHttpRequestSchema.parse(await request.json());
+        if (message.method === "initialize" && message.id !== undefined) {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: message.id,
+              result: {
+                protocolVersion: "2025-11-25",
+                capabilities: { tools: {} },
+                serverInfo: { name: "native-http-session-test", version: "1.0.0" },
+              },
+            },
+            { headers: { "mcp-session-id": sessionId } },
+          );
+        }
+        if (message.method === "tools/list" && message.id !== undefined) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              tools: [{ name: "stateful-http-tool", inputSchema: { type: "object" } }],
+            },
+          });
+        }
+        return new Response(null, { status: 202 });
+      },
+    });
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(mcpConfig([httpDefinition("stateful-http", server.url.toString())])),
+        createClient: async (config) =>
+          createMCPClient({
+            ...config,
+            onUncaughtError: (error) => {
+              sessionExpiredError.resolve(error);
+              config.onUncaughtError?.(error);
+            },
+          }),
+      },
+    });
+
+    try {
+      await registry.init();
+      await sessionGetStarted.promise;
+      expect(registry.list()[0]).toMatchObject({ status: "available", toolCount: 1 });
+
+      releaseSessionGet.resolve();
+      await expect(sessionExpiredError.promise).resolves.toMatchObject({
+        name: "MCPClientError",
+        message: "MCP HTTP Transport Error: GET SSE failed: 404 Not Found",
+        statusCode: 404,
+        url: server.url.toString(),
+      });
+      expect(registry.list()[0]).toMatchObject({
+        serverId: "stateful-http",
+        status: "unavailable",
+        phase: "runtime",
+      });
+      expect(registry.getTools()).toEqual([]);
+    } finally {
+      releaseSessionGet.resolve();
+      await registry.shutdown();
+      server.stop(true);
+    }
   });
 
   it("injects resolved transport and auth-provider dependencies", async () => {

@@ -3,6 +3,7 @@ import type { ModelMessage } from "ai";
 import {
   lilacEventTypes,
   type LilacBus,
+  type CorePrimaryLineageV1,
   type RequestQueueMode,
 } from "@stanley2058/lilac-event-bus";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
@@ -14,7 +15,7 @@ import type { TranscriptStore } from "../../../transcript/transcript-store";
 import {
   composeRecentChannelMessages,
   composeRequestMessages,
-  composeSingleMessage,
+  composeSingleMessageWithLineage,
 } from "../request-composition";
 import {
   buildDiscordUserAliasById,
@@ -35,6 +36,7 @@ export type PublishBusRequestInput = {
   sessionMode: SessionMode;
   modelOverride?: string;
   messages: ModelMessage[];
+  corePrimaryLineage: CorePrimaryLineageV1;
   raw: unknown;
 };
 
@@ -81,6 +83,7 @@ export async function publishBusRequest(params: {
     {
       queue: params.input.queue,
       messages: params.input.messages,
+      corePrimaryLineage: params.input.corePrimaryLineage,
       ...(params.input.modelOverride ? { modelOverride: params.input.modelOverride } : {}),
       raw: {
         ...(params.input.raw && typeof params.input.raw === "object"
@@ -120,6 +123,7 @@ export async function publishComposedRequest(params: {
     userId: string;
     sessionMode: SessionMode;
     modelOverride?: string;
+    currentMessageIds?: readonly string[];
     transformTriggerUserText?: (text: string) => string;
     transformUserTextForMessageId?: string;
   };
@@ -133,6 +137,7 @@ export async function publishComposedRequest(params: {
     botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     transcriptStore: params.transcriptStore,
     currentRequestId: params.input.requestId,
+    currentMessageIds: params.input.currentMessageIds ?? [params.input.msgRef.messageId],
     discordUserAliasById,
     transformUserText: params.input.transformTriggerUserText,
     transformUserTextForMessageId: params.input.transformUserTextForMessageId,
@@ -156,6 +161,7 @@ export async function publishComposedRequest(params: {
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
       messages: composed.messages,
+      corePrimaryLineage: composed.corePrimaryLineage,
       raw: {
         authenticatedOrigin: {
           platform: params.input.platform,
@@ -190,6 +196,7 @@ export async function publishActiveChannelPrompt(params: {
     triggerType: "mention" | "reply" | undefined;
     sessionMode: SessionMode;
     modelOverride?: string;
+    currentMessageIds?: readonly string[];
     botMentionNames?: readonly string[];
     transformTriggerUserText?: (text: string) => string;
     transformUserTextForMessageId?: string;
@@ -206,6 +213,9 @@ export async function publishActiveChannelPrompt(params: {
           botName: resolveSurfaceBotName(params.cfg, params.input.platform),
           transcriptStore: params.transcriptStore,
           currentRequestId: params.input.requestId,
+          currentMessageIds:
+            params.input.currentMessageIds ??
+            (params.input.triggerMsgRef ? [params.input.triggerMsgRef.messageId] : []),
           discordUserAliasById,
           transformUserText: params.input.transformTriggerUserText,
           transformUserTextForMessageId: params.input.transformUserTextForMessageId,
@@ -223,6 +233,9 @@ export async function publishActiveChannelPrompt(params: {
           limit: 8,
           transcriptStore: params.transcriptStore,
           currentRequestId: params.input.requestId,
+          currentMessageIds:
+            params.input.currentMessageIds ??
+            (params.input.triggerMsgRef ? [params.input.triggerMsgRef.messageId] : []),
           discordUserAliasById,
           transformUserText: params.input.transformTriggerUserText,
           transformUserTextForMessageId: params.input.transformUserTextForMessageId,
@@ -248,6 +261,7 @@ export async function publishActiveChannelPrompt(params: {
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
       messages: composed.messages,
+      corePrimaryLineage: composed.corePrimaryLineage,
       raw: {
         ...(originMessage && params.input.triggerMsgRef
           ? {
@@ -274,6 +288,7 @@ export async function publishSingleMessageToActiveRequest(params: {
   adapter: SurfaceAdapter;
   bus: LilacBus;
   cfg: CoreConfig;
+  transcriptStore?: TranscriptStore;
   logger: Logger;
   input: {
     platform: RoutedSurfacePlatform;
@@ -284,22 +299,24 @@ export async function publishSingleMessageToActiveRequest(params: {
     queue: "followUp" | "steer" | "interrupt";
     msgRef: MsgRef;
     sessionMode: SessionMode;
+    modelOverride?: string;
     transformUserText?: (text: string) => string;
   };
 }) {
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
-  const msg = await composeSingleMessage(params.adapter, {
+  const composed = await composeSingleMessageWithLineage(params.adapter, {
     platform: params.input.platform,
     botUserId: self.userId,
     botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     msgRef: params.input.msgRef,
     discordUserAliasById,
+    transcriptStore: params.transcriptStore,
     transformUserText: params.input.transformUserText,
   });
 
-  if (!msg) return;
+  if (!composed) return;
 
   const surfaceMessage = await params.adapter.readMsg(params.input.msgRef);
 
@@ -315,7 +332,9 @@ export async function publishSingleMessageToActiveRequest(params: {
       queue: params.input.queue,
       triggerType: "active",
       sessionMode: params.input.sessionMode,
-      messages: [msg],
+      modelOverride: params.input.modelOverride,
+      messages: composed.messages,
+      corePrimaryLineage: composed.corePrimaryLineage,
       raw: {
         ...(surfaceMessage
           ? {
@@ -339,6 +358,7 @@ export async function publishSingleMessagePrompt(params: {
   adapter: SurfaceAdapter;
   bus: LilacBus;
   cfg: CoreConfig;
+  transcriptStore?: TranscriptStore;
   logger: Logger;
   input: {
     platform: RoutedSurfacePlatform;
@@ -356,16 +376,17 @@ export async function publishSingleMessagePrompt(params: {
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
-  const msg = await composeSingleMessage(params.adapter, {
+  const composed = await composeSingleMessageWithLineage(params.adapter, {
     platform: params.input.platform,
     botUserId: self.userId,
     botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     msgRef: params.input.msgRef,
     discordUserAliasById,
+    transcriptStore: params.transcriptStore,
     transformUserText: params.input.transformUserText,
   });
 
-  if (!msg) return;
+  if (!composed) return;
 
   const surfaceMessage = await params.adapter.readMsg(params.input.msgRef);
 
@@ -382,7 +403,8 @@ export async function publishSingleMessagePrompt(params: {
       triggerType: "active",
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
-      messages: [msg],
+      messages: composed.messages,
+      corePrimaryLineage: composed.corePrimaryLineage,
       raw: {
         ...(surfaceMessage
           ? {

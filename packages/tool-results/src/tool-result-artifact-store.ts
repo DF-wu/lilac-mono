@@ -98,7 +98,13 @@ export type ToolResultArtifactStore = {
   readWindow(
     uri: string,
     scopeId: string,
-    options: { start: ToolResultArtifactStart; maxCharacters: number; maxLines: number },
+    options: {
+      start: ToolResultArtifactStart;
+      maxCharacters: number;
+      maxLines: number;
+      /** Maximum payload bytes. Must be at least 4 when set. */
+      maxOutputBytes?: number;
+    },
   ): Promise<
     | {
         ok: true;
@@ -398,6 +404,7 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     start: ToolResultArtifactStart,
     maxCharacters: number,
     maxLines: number,
+    maxOutputBytes: number,
   ): Promise<{
     content: string;
     startOffset: number;
@@ -433,6 +440,7 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     let selectedEndLine: number | undefined;
     let selectedEndColumn: number | undefined;
     let selectedLines = 1;
+    let selectedBytes = 0;
     const selected: string[] = [];
     const consume = (text: string) => {
       for (const character of text) {
@@ -445,11 +453,18 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
         }
         let selectionEnds = false;
         if (selectedStartOffset !== undefined && selectedEndOffset === undefined) {
-          if (character === "\n" && selectedLines >= maxLines) {
+          const characterBytes = Buffer.byteLength(character, "utf8");
+          if (selectedBytes + characterBytes > maxOutputBytes) {
+            selectedEndOffset = totalCharacters;
+            selectedEndLine = line;
+            selectedEndColumn = column;
+          } else if (character === "\n" && selectedLines >= maxLines) {
             if (start.type === "offset") selected.push(character);
+            if (start.type === "offset") selectedBytes += characterBytes;
             selectionEnds = true;
           } else {
             selected.push(character);
+            selectedBytes += characterBytes;
             if (selected.length >= maxCharacters) {
               selectionEnds = true;
             } else if (character === "\n") {
@@ -571,6 +586,15 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
       });
     },
     async readWindow(uri, scopeId, options) {
+      if (
+        options.maxOutputBytes !== undefined &&
+        Number.isFinite(options.maxOutputBytes) &&
+        Math.floor(options.maxOutputBytes) < 4
+      ) {
+        throw new RangeError(
+          "Tool result artifact maxOutputBytes must be at least 4 to fit one Unicode character",
+        );
+      }
       return exclusive(async () => {
         const now = Date.now();
         await cleanupExpired(now);
@@ -608,11 +632,16 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
           const maxLines = Number.isFinite(options.maxLines)
             ? Math.max(1, Math.floor(options.maxLines))
             : 1;
+          const maxOutputBytes =
+            options.maxOutputBytes !== undefined && Number.isFinite(options.maxOutputBytes)
+              ? Math.max(1, Math.floor(options.maxOutputBytes))
+              : Number.POSITIVE_INFINITY;
           const window = await readEncryptedWindow(
             metadata.storageKey,
             start,
             maxCharacters,
             maxLines,
+            maxOutputBytes,
           );
           const hasMore = window.endOffset < window.totalCharacters;
           const nextStart = hasMore

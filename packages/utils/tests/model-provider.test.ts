@@ -145,9 +145,45 @@ describe("normalizeCodexResponsesRequestRecord", () => {
       "requires streaming",
     );
   });
+
+  it("keeps compaction triggers while stripping replay item IDs from the wire", () => {
+    expect(
+      normalizeCodexResponsesRequestRecord({
+        stream: true,
+        input: [
+          { type: "compaction", id: "cmp_123", encrypted_content: "encrypted" },
+          { type: "compaction_trigger" },
+        ],
+      }).input,
+    ).toEqual([
+      { type: "compaction", encrypted_content: "encrypted" },
+      { type: "compaction_trigger" },
+    ]);
+  });
 });
 
 describe("createCodexResponsesEventNormalizer", () => {
+  it("assigns a stable synthetic ID to no-ID compaction items", () => {
+    const normalize = createCodexResponsesEventNormalizer();
+    const event = {
+      type: "response.output_item.done",
+      item: { type: "compaction", encrypted_content: "encrypted-state" },
+    };
+
+    const first = normalize(event);
+    const second = normalize(event);
+
+    expect(first).toEqual(second);
+    expect(first).toMatchObject({
+      output_index: 0,
+      item: {
+        type: "compaction",
+        encrypted_content: "encrypted-state",
+        id: expect.stringMatching(/^cmp_lilac_[a-f0-9]{32}$/),
+      },
+    });
+  });
+
   it("recovers atomic completed reasoning summaries", () => {
     const normalize = createCodexResponsesEventNormalizer();
 

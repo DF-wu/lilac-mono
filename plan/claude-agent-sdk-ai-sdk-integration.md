@@ -2,8 +2,20 @@
 
 ## Status
 
-This is the implementation plan agreed on 2026-07-25. The live execution tracker is
-`plan/claude-agent-sdk-ai-sdk-integration.todo.md`.
+> **Historical and superseded.** This is the initial Core integration plan agreed on 2026-07-25, not
+> the current persistence or deployment contract. Its blanket `persistSession: false` decision and
+> representative settings record the first implementation. Current eligible agent calls use the
+> typed `fresh`/`fork` lifecycle in `plan/claude-code-native-session-continuation.md`: first, missing,
+> invalid, compacted, or scope-mismatched state starts fresh persisted, while only an exact compatible
+> continuation forks. Utility and otherwise ineligible calls remain ephemeral with
+> `persistSession: false`.
+
+The original execution tracker is `plan/claude-agent-sdk-ai-sdk-integration.todo.md`; it is retained as
+historical progress. Current Core Docker deployment may use the Agent SDK's bundled executable with
+`CLAUDE_CODE_OAUTH_TOKEN` and/or mounted authenticated config. The shared bridge now always enables
+`ToolSearch` for deferred Lilac MCP discovery, so blanket built-in-disable statements below are also
+historical. See `README.md`, `docs/docker-deployment.md`, and the native continuation plan for current
+operator guidance.
 
 The first implementation target is Core. Mini Lilac follows after the shared tool execution and
 MCP boundary is proven.

@@ -406,9 +406,13 @@ code that assumes Discord semantics will be surprised.
 - **`removeReaction()` clears every reaction, not the named one.**
   `setMessageReaction` replaces the bot's whole reaction set, and a bot may hold
   only one reaction, so removal is all-or-nothing.
-- **`sendMsg()` ignores `content.actions` and `content.attachments`.** The
-  streaming output path delivers attachments normally; it is only this direct
-  send path that drops them. This is what blocks workflow buttons above.
+- **`sendMsg()` projects `content.actions`, but ignores `content.attachments`.**
+  Actions become inline-keyboard buttons. The streaming output path delivers
+  attachments normally; only the direct send path drops attachments.
 - **History comes from a local SQLite index, not the platform.** A freshly
   provisioned bot has no history of a chat it has just joined, however long that
-  chat has existed. See §6.
+  chat has existed. A successful `readMsg()` therefore means the message is in
+  the local cache, not that it still exists remotely. Direct edit/delete calls
+  tombstone cache entries when Telegram confirms they are gone; workflow startup
+  reconciliation probes unchanged cards with an edit and recreates a card
+  immediately when that probe proves it was deleted. See §6.

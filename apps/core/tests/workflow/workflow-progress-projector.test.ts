@@ -62,8 +62,10 @@ class CapturingRawBus implements RawBus {
 class ProjectionAdapter implements SurfaceAdapter {
   readonly contents: ContentOpts[] = [];
   readonly messages = new Map<string, SurfaceMessage>();
+  readonly remoteMessageIds = new Set<string>();
   sends = 0;
   edits = 0;
+  editAttempts = 0;
   reads = 0;
   failNextSend = false;
   failNextRead = false;
@@ -113,6 +115,7 @@ class ProjectionAdapter implements SurfaceAdapter {
       text: content.text ?? "",
       ts: Date.now(),
     });
+    this.remoteMessageIds.add(ref.messageId);
     return ref;
   }
   async readMsg(ref: MsgRef) {
@@ -127,8 +130,14 @@ class ProjectionAdapter implements SurfaceAdapter {
     return [...this.messages.values()];
   }
   async editMsg(ref: MsgRef, content: ContentOpts) {
+    this.editAttempts += 1;
     if (this.failNextEditNotFound) {
       this.failNextEditNotFound = false;
+      this.remoteMessageIds.delete(ref.messageId);
+      this.messages.delete(ref.messageId);
+      throw new SurfaceMessageNotFoundError(this.platform, 10_008, "missing");
+    }
+    if (!this.remoteMessageIds.has(ref.messageId)) {
       this.messages.delete(ref.messageId);
       throw new SurfaceMessageNotFoundError(this.platform, 10_008, "missing");
     }
@@ -139,7 +148,12 @@ class ProjectionAdapter implements SurfaceAdapter {
     this.messages.set(ref.messageId, { ...current, text: content.text ?? "" });
   }
   async deleteMsg(ref: MsgRef) {
+    this.remoteMessageIds.delete(ref.messageId);
     this.messages.delete(ref.messageId);
+  }
+
+  removeRemoteMessage(messageId: string): void {
+    this.remoteMessageIds.delete(messageId);
   }
   async getReplyContext() {
     return [];
@@ -312,6 +326,144 @@ describe("WorkflowProgressProjector", () => {
     }
   });
 
+  it("rechecks Telegram target authorization before every send or edit", async () => {
+    const dbPath = tempDbPath("workflow-telegram-revoked-target");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let authorized = true;
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["telegram", adapter]]),
+      subscriptionId: "telegram-revoked-target",
+      now: () => 20,
+      isTargetAuthorized: () => authorized,
+    });
+    try {
+      createInvocation(store, true, "telegram");
+      await projector.ensureInitialCard("run-1");
+      authorized = false;
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Workflow progress target is no longer authorized",
+      );
+      expect(adapter.sends).toBe(1);
+      expect(adapter.editAttempts).toBe(0);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks Telegram target authorization immediately before sending", async () => {
+    const dbPath = tempDbPath("workflow-telegram-send-race");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let checks = 0;
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["telegram", adapter]]),
+      subscriptionId: "telegram-send-race",
+      now: () => 20,
+      isTargetAuthorized: () => ++checks === 1,
+    });
+    try {
+      createInvocation(store, true, "telegram");
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Workflow progress target is no longer authorized",
+      );
+      expect(checks).toBe(2);
+      expect(adapter.sends).toBe(0);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks Telegram target authorization immediately before editing", async () => {
+    const dbPath = tempDbPath("workflow-telegram-edit-race");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let checks = 0;
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["telegram", adapter]]),
+      subscriptionId: "telegram-edit-race",
+      now: () => 20,
+      isTargetAuthorized: () => ++checks !== 4,
+    });
+    try {
+      createInvocation(store, true, "telegram");
+      const messageRef = await projector.ensureInitialCard("run-1");
+      store.applySurfaceAction({
+        tokenSha256: sha256(actionToken(adapter, "Pause")),
+        platform: "telegram",
+        userId: "user-1",
+        messageRef,
+        now: 21,
+      });
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Workflow progress target is no longer authorized",
+      );
+      expect(checks).toBe(4);
+      expect(adapter.editAttempts).toBe(0);
+      expect(adapter.sends).toBe(1);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks authorization before recreating a missing Telegram edit target", async () => {
+    const dbPath = tempDbPath("workflow-telegram-fallback-send-race");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let checks = 0;
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["telegram", adapter]]),
+      subscriptionId: "telegram-fallback-send-race",
+      now: () => 20,
+      isTargetAuthorized: () => ++checks !== 5,
+    });
+    try {
+      createInvocation(store, true, "telegram");
+      const messageRef = await projector.ensureInitialCard("run-1");
+      store.applySurfaceAction({
+        tokenSha256: sha256(actionToken(adapter, "Pause")),
+        platform: "telegram",
+        userId: "user-1",
+        messageRef,
+        now: 21,
+      });
+      adapter.failNextEditNotFound = true;
+
+      await projector.reconcile();
+      expect(checks).toBe(5);
+      expect(adapter.editAttempts).toBe(1);
+      expect(adapter.sends).toBe(1);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("ignores event projection for a null target and rejects explicit card creation", async () => {
     const dbPath = tempDbPath("workflow-null-target");
     const store = new DurableWorkflowStore(dbPath);
@@ -459,6 +611,48 @@ describe("WorkflowProgressProjector", () => {
       expect(adapter.reads).toBe(1);
       expect(adapter.sends).toBe(2);
       expect(store.getSurfaceBinding("run-1")?.messageRef?.messageId).toBe("card-2");
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("remotely probes an unchanged Telegram card and immediately recreates it when deleted", async () => {
+    const dbPath = tempDbPath("workflow-telegram-remote-reconcile");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["telegram", adapter]]),
+      subscriptionId: "telegram-remote-reconcile",
+      now: () => 20,
+    });
+    try {
+      createInvocation(store, true, "telegram");
+      const firstRef = await projector.ensureInitialCard("run-1");
+      adapter.removeRemoteMessage(firstRef.messageId);
+
+      expect(await adapter.readMsg(firstRef)).not.toBeNull();
+      await projector.reconcile();
+
+      expect(adapter.reads).toBe(2);
+      expect(adapter.editAttempts).toBe(1);
+      expect(adapter.edits).toBe(0);
+      expect(adapter.sends).toBe(2);
+      expect(store.getSurfaceBinding("run-1")).toMatchObject({
+        messageRef: {
+          platform: "telegram",
+          channelId: "channel-1",
+          messageId: "card-2",
+        },
+        lastError: null,
+        retryCount: 0,
+        nextAttemptAt: null,
+      });
     } finally {
       await projector.stop();
       await bus.close();

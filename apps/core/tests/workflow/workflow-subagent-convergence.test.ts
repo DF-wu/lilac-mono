@@ -15,22 +15,8 @@ import {
 } from "@stanley2058/lilac-event-bus";
 
 import type { TrustedSubagentDelegationRegistration } from "../../src/tools/subagent";
-import type {
-  AdapterEventHandler,
-  SurfaceAdapter,
-  SurfaceOutputStream,
-} from "../../src/surface/adapter";
-import type {
-  ContentOpts,
-  LimitOpts,
-  MsgRef,
-  SendOpts,
-  SessionRef,
-  SurfaceMessage,
-} from "../../src/surface/types";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { WorkflowLiveParentBridge } from "../../src/workflow/workflow-live-parent-bridge";
-import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
 import { WorkflowSubagentDispatcher } from "../../src/workflow/workflow-subagent-dispatcher";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { createToolResultArtifactStore } from "../../src/artifacts/tool-result-artifact-store";
@@ -39,8 +25,6 @@ const roots: string[] = [];
 const AUTHENTICATED_PARENT = { platform: "discord", userId: "user-1" } as const;
 
 function createInMemoryRawBus(control?: {
-  failProgressRequested?: boolean;
-  progressRequestedFailures?: number;
   beforePublish?: (input: { type: string; headers: PublishOptions["headers"] }) => Promise<void>;
 }): RawBus & { activeSubscriptions(): number } {
   const topics = new Map<string, Array<Message<unknown>>>();
@@ -51,13 +35,6 @@ function createInMemoryRawBus(control?: {
   return {
     publish: async <TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) => {
       await control?.beforePublish?.({ type: options.type, headers: options.headers });
-      if (
-        control?.failProgressRequested &&
-        options.type === lilacEventTypes.EvtWorkflowProgressRequested
-      ) {
-        control.progressRequestedFailures = (control.progressRequestedFailures ?? 0) + 1;
-        throw new Error("simulated progress publication failure");
-      }
       const id = crypto.randomUUID();
       const stored: Message<unknown> = {
         topic: options.topic,
@@ -116,101 +93,6 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-class FallbackTrackingWorkflowStore extends DurableWorkflowStore {
-  private nullTargetProjectionResolve: (() => void) | null = null;
-
-  waitForNullTargetProjection(): Promise<void> {
-    return new Promise((resolve) => {
-      this.nullTargetProjectionResolve = resolve;
-    });
-  }
-
-  override getRun(runId: string) {
-    const run = super.getRun(runId);
-    if (run?.progressTarget === null && this.nullTargetProjectionResolve) {
-      const resolve = this.nullTargetProjectionResolve;
-      this.nullTargetProjectionResolve = null;
-      // The no-target path has no awaits; its projection promise settles before this microtask runs.
-      queueMicrotask(resolve);
-    }
-    return run;
-  }
-}
-
-class FallbackCardAdapter implements SurfaceAdapter {
-  readonly messages = new Map<string, SurfaceMessage>();
-  sends = 0;
-
-  async connect() {}
-  async disconnect() {}
-  async getSelf() {
-    return { platform: "discord" as const, userId: "bot", userName: "bot" };
-  }
-  async getCapabilities() {
-    return {
-      platform: "discord" as const,
-      send: true,
-      edit: true,
-      delete: true,
-      reactions: false,
-      readHistory: true,
-      threads: false,
-      markRead: false,
-    };
-  }
-  async listSessions() {
-    return [];
-  }
-  async startOutput(): Promise<SurfaceOutputStream> {
-    throw new Error("not used");
-  }
-  async sendMsg(session: SessionRef, content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
-    this.sends += 1;
-    const ref = {
-      platform: "discord" as const,
-      channelId: session.channelId,
-      messageId: `fallback-card-${this.sends}`,
-    };
-    this.messages.set(ref.messageId, {
-      ref,
-      session: { platform: "discord", channelId: session.channelId },
-      userId: "bot",
-      text: content.text ?? "",
-      ts: Date.now(),
-    });
-    return ref;
-  }
-  async readMsg(ref: MsgRef) {
-    return this.messages.get(ref.messageId) ?? null;
-  }
-  async listMsg(_session: SessionRef, _opts?: LimitOpts) {
-    return [...this.messages.values()];
-  }
-  async editMsg(ref: MsgRef, content: ContentOpts) {
-    const current = this.messages.get(ref.messageId);
-    if (!current) throw new Error("fallback card is missing");
-    this.messages.set(ref.messageId, { ...current, text: content.text ?? "" });
-  }
-  async deleteMsg(ref: MsgRef) {
-    this.messages.delete(ref.messageId);
-  }
-  async getReplyContext() {
-    return [];
-  }
-  async addReaction() {}
-  async removeReaction() {}
-  async listReactions() {
-    return [];
-  }
-  async subscribe(_handler: AdapterEventHandler) {
-    return { stop: async () => {} };
-  }
-  async getUnRead() {
-    return [];
-  }
-  async markRead() {}
-}
-
 afterEach(async () => {
   await Promise.all(roots.splice(0, roots.length).map((root) => rm(root, { recursive: true })));
 });
@@ -227,7 +109,7 @@ async function setup(maxActiveRuns?: number) {
     mkdir(projectRoot, { recursive: true }),
     mkdir(dataDir, { recursive: true }),
   ]);
-  const store = new FallbackTrackingWorkflowStore(dbPath);
+  const store = new DurableWorkflowStore(dbPath);
   const dispatcher = await WorkflowSubagentDispatcher.create({
     store,
     dataDir,
@@ -245,6 +127,7 @@ function registration(
     mode: "deferred",
     profile: "explore",
     sessionName: "audit",
+    stableNamedContinuation: true,
     task: "Audit the authentication flow",
     idleTimeoutMs: 2_000,
     depth: 1,
@@ -341,6 +224,18 @@ describe("workflow subagent convergence", () => {
     store.close();
   });
 
+  it("persists stable named eligibility for every generated delegation", async () => {
+    const { projectRoot, store, dispatcher } = await setup();
+    const generated = await dispatcher.delegate(registration(projectRoot, "parent:generated"));
+
+    expect(store.getRun(generated.runId)?.completionTarget).toMatchObject({
+      kind: "live_parent",
+      childSessionId: "sub:channel:1:named:audit",
+      stableNamedContinuation: true,
+    });
+    store.close();
+  });
+
   it("persists completion materialization failures across store restarts", async () => {
     const { store, dbPath, run } = await createRun("parent:materialization-retry");
     expect(
@@ -389,7 +284,7 @@ describe("workflow subagent convergence", () => {
     store.close();
   });
 
-  it("targets the authoritative Discord surface for nested delegation fallback", async () => {
+  it("retains the authoritative Discord origin without a nested surface fallback", async () => {
     const { projectRoot, store, dispatcher } = await setup();
     const syntheticParentSessionId = "sub:channel:1:named:outer";
     const nested = registration(projectRoot, "wfr:nested-parent");
@@ -413,14 +308,8 @@ describe("workflow subagent convergence", () => {
     expect(run?.completionTarget).toMatchObject({
       kind: "live_parent",
       parentSessionId: syntheticParentSessionId,
-      fallbackProgressTarget: {
-        platform: "discord",
-        channelId: "channel:1",
-        replyToMessageId: null,
-      },
-    });
-    expect(run?.completionTarget).not.toMatchObject({
-      fallbackProgressTarget: { channelId: syntheticParentSessionId },
+      fallbackToSurface: false,
+      fallbackProgressTarget: null,
     });
     store.close();
   });
@@ -962,10 +851,9 @@ describe("workflow subagent convergence", () => {
     await expect(parent.listPendingAsync()).rejects.toThrow();
     expect(parent.snapshot().hasPendingCompletions).toBe(true);
     await parent.close();
-    await expect(bridge.enableFallbacks()).rejects.toThrow();
-    expect(store.listOrphanedLiveParentCompletions().map((item) => item.runId)).toEqual([
-      run.runId,
-    ]);
+    await bridge.enableOrphanHandling();
+    expect(store.getRun(run.runId)?.state).toBe("succeeded");
+    expect(store.getLiveParentDeliveryState(run.runId)).toBe("orphaned");
     await bridge.stop();
     await bus.close();
     store.close();
@@ -1118,6 +1006,51 @@ describe("workflow subagent convergence", () => {
     store.close();
   });
 
+  it("cancels an active orphan before the workflow engine can claim it", async () => {
+    const { store, run, dataDir } = await createRun("parent:lost");
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const bridge = new WorkflowLiveParentBridge({
+      bus,
+      store,
+      subscriptionId: "test-live-parent-active-orphan",
+    });
+
+    await bridge.enableOrphanHandling();
+
+    expect(store.getRun(run.runId)).toMatchObject({
+      state: "cancelled",
+      terminalDetail: "Orphaned subagent: parent request could not be restored",
+    });
+    expect(store.getLiveParentDeliveryState(run.runId)).toBe("orphaned");
+    expect(store.listActiveLiveParentRuns("parent:lost")).toEqual([]);
+    expect(store.listPendingLiveParentCompletions("parent:lost", 1_000, true)).toEqual([]);
+
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir,
+      subscriptionId: "test-live-parent-active-orphan-engine",
+    });
+    await engine.start();
+    const requests = await raw.fetch("cmd.request", {
+      offset: { type: "begin" },
+      limit: 100,
+    });
+    expect(
+      requests.messages.some(
+        ({ msg }) =>
+          msg.type === lilacEventTypes.CmdRequestMessage &&
+          z.object({ queue: z.string() }).parse(msg.data).queue === "prompt",
+      ),
+    ).toBe(false);
+
+    await engine.stop();
+    await bridge.stop();
+    await bus.close();
+    store.close();
+  });
+
   it("releases each child activity subscription across many sequential children", async () => {
     const setupResult = await setup();
     const raw = createInMemoryRawBus();
@@ -1235,9 +1168,9 @@ describe("workflow subagent convergence", () => {
     expect(raw.activeSubscriptions()).toBe(0);
     await bus.close();
     setupResult.store.close();
-  });
+  }, 20_000);
 
-  it("converges a coalesced null-target event to one card after surface fallback", async () => {
+  it("suppresses an orphaned terminal completion instead of falling back to the surface", async () => {
     const { store, run } = await createRun();
     store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
     store.transitionRun({
@@ -1245,26 +1178,17 @@ describe("workflow subagent convergence", () => {
       from: "running",
       to: "succeeded",
       now: 20,
-      result: "fallback result",
+      result: "orphaned result",
     });
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FallbackCardAdapter();
-    const projector = new WorkflowProgressProjector({
-      bus,
-      store,
-      adapters: new Map([["discord", adapter]]),
-      subscriptionId: "test-live-parent-fallback-projector",
-      coalesceMs: 25,
-      minEditIntervalMs: 0,
-    });
-    await projector.start();
-    const projected: string[] = [];
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const userVisibleEvents: string[] = [];
     await bus.subscribeTopic(
       "evt.workflow",
       { mode: "tail", offset: { type: "begin" } },
       async (message, context) => {
         if (message.type === lilacEventTypes.EvtWorkflowProgressRequested) {
-          projected.push(message.data.runId);
+          userVisibleEvents.push(message.data.runId);
         }
         await context.commit();
       },
@@ -1272,164 +1196,22 @@ describe("workflow subagent convergence", () => {
     const bridge = new WorkflowLiveParentBridge({
       bus,
       store,
-      subscriptionId: "test-live-parent-fallback",
+      subscriptionId: "test-live-parent-orphan",
     });
-    const nullTargetProjection = store.waitForNullTargetProjection();
-    await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-      runId: run.runId,
-      revisionId: run.revisionId,
-      state: "succeeded",
-      previousState: "running",
-      ts: 20,
-    });
-    await nullTargetProjection;
-    expect(store.getSurfaceBinding(run.runId)).toBeNull();
-    expect(adapter.sends).toBe(0);
-    await bridge.enableFallbacks();
-    await waitFor(() => Boolean(store.getSurfaceBinding(run.runId)?.messageRef));
+    await bridge.enableOrphanHandling();
 
-    expect(store.getRun(run.runId)?.progressTarget).toEqual({
-      platform: "discord",
-      channelId: "channel:1",
-      replyToMessageId: null,
-    });
-    expect(projected).toContain(run.runId);
-    expect(adapter.sends).toBe(1);
-    expect(adapter.messages.size).toBe(1);
-    expect(
-      store.listSurfaceBindings({ limit: 10 }).filter((item) => item.runId === run.runId),
-    ).toHaveLength(1);
-
-    await projector.stop();
-    await bridge.stop();
-    await bus.close();
-    store.close();
-  });
-
-  it("reconciles a committed fallback after progress publication recovers", async () => {
-    const { store, run } = await createRun("parent:publish-failure");
-    store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
-    store.transitionRun({
-      runId: run.runId,
-      from: "running",
-      to: "succeeded",
-      now: 20,
-      result: "fallback after recovery",
-    });
-    const publishControl = { failProgressRequested: true, progressRequestedFailures: 0 };
-    const bus = createLilacBus(createInMemoryRawBus(publishControl));
-    const adapter = new FallbackCardAdapter();
-    const projector = new WorkflowProgressProjector({
-      bus,
-      store,
-      adapters: new Map([["discord", adapter]]),
-      subscriptionId: "test-live-parent-publish-recovery-projector",
-      coalesceMs: 0,
-      minEditIntervalMs: 0,
-      retryIntervalMs: 10,
-    });
-    const bridge = new WorkflowLiveParentBridge({
-      bus,
-      store,
-      subscriptionId: "test-live-parent-publish-recovery",
-    });
-    await projector.start();
-
-    await bridge.enableFallbacks();
-    expect(publishControl.progressRequestedFailures).toBe(1);
-    expect(store.getRun(run.runId)?.progressTarget).not.toBeNull();
-    expect(store.getSurfaceBinding(run.runId)).toBeNull();
-
-    publishControl.failProgressRequested = false;
-    await projector.reconcile();
-    await waitFor(() => Boolean(store.getSurfaceBinding(run.runId)?.messageRef));
-    // test-wait-justification: crosses the projector retry interval to detect duplicate fallback card sends
-    await Bun.sleep(30);
-    expect(adapter.sends).toBe(1);
-    expect(adapter.messages.size).toBe(1);
-    expect(
-      store.listSurfaceBindings({ limit: 10 }).filter((item) => item.runId === run.runId),
-    ).toHaveLength(1);
-
-    await projector.stop();
-    await bridge.stop();
-    await bus.close();
-    store.close();
-  });
-
-  it("keeps a completion with a parent that reattaches before fallback activation", async () => {
-    const { root, store, run } = await createRun("parent:race");
-    store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
-    const artifactId = "00000000-0000-0000-0000-000000000000";
-    const result = [
-      "preview",
-      "",
-      "[tool result truncated: 1 characters omitted]",
-      `Complete output: tool-result://${artifactId}`,
-      'Use read_file with this URI and start: { "type": "offset", "offset": 0 }. Reuse the returned nextStart unchanged while more content remains.',
-      "",
-      "tail",
-    ].join("\n");
-    store.transitionRun({
-      runId: run.runId,
-      from: "running",
-      to: "succeeded",
-      now: 20,
-      result,
-    });
-
-    let releaseRead = () => {};
-    let markReadStarted = () => {};
-    const readGate = new Promise<void>((resolve) => {
-      releaseRead = resolve;
-    });
-    const readStarted = new Promise<void>((resolve) => {
-      markReadStarted = resolve;
-    });
-    const toolResultArtifacts = createToolResultArtifactStore(path.join(root, "race-artifacts"));
-    toolResultArtifacts.read = async () => {
-      markReadStarted();
-      await readGate;
-      return {
-        ok: true,
-        content: "complete child output",
-        id: artifactId,
-        bytes: 21,
-        createdAt: 1,
-        expiresAt: 1_000,
-      };
-    };
-    const bus = createLilacBus(createInMemoryRawBus());
-    const bridge = new WorkflowLiveParentBridge({
-      bus,
-      store,
-      subscriptionId: "test-live-parent-reattachment-race",
-      toolResultArtifacts,
-    });
-
-    const fallback = bridge.enableFallbacks();
-    await readStarted;
-    const parent = bridge.registerParent({ parentRequestId: "parent:race" });
-    releaseRead();
-    await fallback;
-
+    expect(store.getRun(run.runId)?.state).toBe("succeeded");
     expect(store.getRun(run.runId)?.progressTarget).toBeNull();
-    const pending = await parent.listPendingAsync();
-    expect(pending).toHaveLength(1);
-    expect(pending[0]).toMatchObject({
-      runId: run.runId,
-      finalText: "complete child output",
-    });
-    await parent.acknowledge([run.runId]);
-    expect(await parent.listPendingAsync()).toHaveLength(0);
+    expect(store.getLiveParentDeliveryState(run.runId)).toBe("orphaned");
+    expect(store.getSurfaceBinding(run.runId)).toBeNull();
+    expect(userVisibleEvents).toEqual([]);
 
-    await parent.close();
     await bridge.stop();
     await bus.close();
     store.close();
   });
 
-  it("does not fall back while a restored parent is reattaching", async () => {
+  it("does not orphan a completion while a restored parent is reattaching", async () => {
     const { store, run } = await createRun("parent:restored");
     store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
     store.transitionRun({
@@ -1445,7 +1227,7 @@ describe("workflow subagent convergence", () => {
       store,
       subscriptionId: "test-live-parent-protected",
     });
-    await bridge.enableFallbacks({
+    await bridge.enableOrphanHandling({
       protectedParentRequestIds: ["parent:restored"],
       protectionMs: 20,
     });
@@ -1455,6 +1237,7 @@ describe("workflow subagent convergence", () => {
     // test-wait-justification: crosses the restored-parent protection window to verify fallback remains suppressed
     await Bun.sleep(30);
     expect(store.getRun(run.runId)?.progressTarget).toBeNull();
+    expect(store.getLiveParentDeliveryState(run.runId)).toBe("pending");
     expect(parent.listPending()).toHaveLength(1);
 
     await parent.close();

@@ -64,21 +64,72 @@ superseded and always requires its configured key. Do not put real credentials i
 Each provider in `providers.yaml` uses `type` as its provider discriminator; API-key entries use the
 exact shape `{ "type": "api-key", "key": "..." }`.
 
+### Local Claude Subscription
+
+Add the commented `claude-code` provider from `providers.example.yaml`. The published single-file
+`mini-lilac` command requires an external official `claude` executable on `PATH`; it cannot resolve
+the Agent SDK's optional executable from a bundled dependency tree. Local runs may use an existing
+authenticated Claude config or `claude auth login`. A custom Mini container can use the provider when
+it installs/mounts that external CLI and supplies authentication explicitly; this differs from the
+Core image, which can resolve the SDK-bundled executable. A `claude-code` provider must not have an
+`auth.json` entry; supplying one is a configuration error. It also requires `catalog: models-dev` and
+rejects `baseUrl`.
+
+Claude authentication may come from authenticated config under `CLAUDE_CONFIG_DIR`,
+`CLAUDE_CODE_OAUTH_TOKEN`, or platform secure storage. `CLAUDE_CONFIG_DIR` controls Claude's
+filesystem config and native session storage, falling back to `~/.claude`. If set, it must be a
+non-empty absolute path. It must be writable and persistently mounted when a custom container should
+retain native continuation across replacement. A dedicated directory separates operator-selected
+storage; it is not an access-control or privacy boundary from Mini, its tools, or other same-user
+processes. Lilac does not read, store, or refresh the credential. Claude's `ToolSearch` is enabled over
+Mini's deferred MCP tool catalog; profiles that request `websearch` additionally receive Claude's
+built-in `WebSearch`.
+
+Claude continuation persists across Mini server restarts for:
+
+- Main sessions, when the selected history state has an exact clean binding.
+- Named subagents when `subagent_delegate` uses either a caller-supplied or generated `sessionName`;
+  the current child history state/hash must match. Reuse the returned generated name to continue the
+  same persisted child.
+
+The first eligible call, or one from a compacted/unbound state, missing or changed native state, or a
+history/scope mismatch, starts a fresh persisted Claude session from Mini's canonical history. Only
+an exact compatible continuation forks the last clean session, which is never advanced in place. Undo
+and redo select the binding attached to the exact retained main-history state, and a prompt after undo
+creates a new branch and, when that state is exactly bound, a new fork. Native Claude session IDs are
+not part of the user-facing protocol.
+
+Explicit quiescent model selection may cross into or out of `claude-code`. Historical context then
+uses lossy text replay: visible conversation text and bounded, labeled tool facts remain; hidden
+reasoning, provider metadata, binary history, and executable historical tool protocol do not.
+
+Native Claude transcripts contain conversation data outside Mini's SQLite database and workspace
+history store. Repeated exact continuations create retained forks, so storage under
+`CLAUDE_CONFIG_DIR` can grow roughly quadratically with conversation length. Mini bounds attempt
+metadata and keeps one current binding for each named child. Main-session historical
+bindings remain attached to retained history states and may grow with that history. Mini does not
+delete Claude's native files; Claude's retention policy applies.
+
 `workspaceWrites: false` also disables Bash because allowed commands have unrestricted process
 authority and can write outside filesystem-tool guardrails. Bash safety blocks known destructive
 operations, expansion-sensitive recursive deletion, and protected paths by default, but it is not
-a sandbox. Set `dangerouslyAllow: true` only to intentionally bypass every Bash guardrail for one
-call, including credential and state-path protections. Bash receives an environment with the HTTP
-auth-token variable removed.
+a sandbox. Filesystem and patch tools similarly deny credential and state paths by default. For a
+profile that exposes the relevant tool, `dangerouslyAllow: true` is an explicit per-call escape
+hatch that bypasses its guardrails, including protected-path checks. Hidden paths such as `.bun` do
+not require this flag unless a tool first reports an access denial. Bash receives an environment
+with the HTTP auth-token variable removed.
 
-Model-facing tool results are limited to 40 KiB. When a non-Bash tool completes with a larger
-materialized result, Mini Lilac stores the complete sanitized result under the transient,
-session-scoped `tool-result://` artifact referenced by the replacement tool error. Use `read_file`
-with that URI and its returned `nextStart` to page the result instead of rerunning the original
-tool. Bash keeps a bounded head-and-tail preview and includes the artifact URI in its structured
-truncation metadata. Encrypted artifact files live under `$XDG_STATE_HOME/mini-lilac/tool-results`,
-are invalidated when the server restarts, and never include results omitted by native query limits
-such as `maxResults` or `maxCharacters`.
+Model-facing tool results are limited to 40 KiB. For `read_file`, that limit applies only to the
+returned textual payload, measured as UTF-8 bytes; metadata, paths, JSON encoding, and loaded
+`AGENTS.md` instructions are outside the limit. Direct and batched reads return `nextStart` rather
+than creating duplicate overflow artifacts, and batched reads do not share an aggregate inline
+budget. When another non-Bash tool completes with a larger materialized result, Mini Lilac stores
+the complete sanitized result under the transient, session-scoped `tool-result://` artifact
+referenced by the replacement tool error. Use `read_file` with that URI and its returned `nextStart`
+to page the result instead of rerunning the original tool. Bash keeps a bounded head-and-tail
+preview and includes the artifact URI in its structured truncation metadata. Encrypted artifact
+files live under `$XDG_STATE_HOME/mini-lilac/tool-results`, are invalidated when the server restarts,
+and never include results omitted by native query limits such as `maxResults` or `maxCharacters`.
 
 ## Run
 
@@ -93,8 +144,9 @@ needed:
 mini-lilac server --config ./config.yaml --database ./data/mini-lilac.sqlite
 ```
 
-Mini Lilac transactionally migrates supported schema-v2, schema-v3, and schema-v4 databases to
-schema v5 at startup. Unsupported versions and unrelated experimental lineages are rejected.
+Mini Lilac transactionally migrates supported schema-v2 through schema-v7 databases to schema v8 at
+startup. Fresh databases are created at the current schema. Unsupported versions and unrelated
+experimental lineages are rejected.
 
 ## History Recovery
 
@@ -149,8 +201,10 @@ system prompt or an earlier `read_file` result.
 Provider model metadata can override discovered models.dev or `/v1/models` values under
 `providers.<provider>.models.<model>`. Configured fields win while omitted fields keep their
 catalog values. Supported patches include `name`, `family`, `attachment`, `reasoning`, `toolCall`,
-`modalities`, and partial `limit.context` / `limit.output` values. These resolved limits are shared
-by the model list, token-usage display, and automatic and manual compaction.
+`modalities`, partial `limit.context` / `limit.output` values, and `openaiServerCompaction`.
+`openaiServerCompaction: true` is accepted only for `type: openai`; omitting it or setting `false`
+disables it. These resolved limits are shared by the model list, token-usage display, and automatic
+and manual compaction.
 
 Profiles can expose the native `skill` tool explicitly or through `tools: ["*"]`. Mini Lilac only
 discovers compatible `SKILL.md` bundles from workspace `.agents/skills`, user `~/.agents/skills`, and
@@ -210,7 +264,9 @@ Subagents are ordinary sessions. `subagent_delegate` returns a stable `sessionNa
 the same parent session continues that child session with its canonical model transcript. Explicit
 model and effort selections become that named session's new defaults. Distinct child sessions have
 no sibling-count or concurrency cap; by default, depth permits `Primary -> Subagent` only. Child
-transcripts use the normal session message and active-stream endpoints.
+transcripts use the normal session message and active-stream endpoints. For `claude-code`, native
+continuation is enabled for both caller-supplied names and automatically generated names returned by
+the first delegation.
 
 This distinction also applies to AI SDK's generic `AbstractChat` state machine and framework hooks:
 `stop()` or another generic client abort detaches the current response stream but does not
@@ -275,6 +331,8 @@ tools, patches, or commands. A successful strict response is:
 `filesystem.status = "skipped"` means transcript history moved but the worktree was left unchanged:
 
 - `git-unavailable`: the Git executable needed by the private snapshot store was unavailable.
+- `non-git-workspace`: filesystem history is disabled because the session directory is outside a Git
+  worktree.
 - `snapshot-unavailable`: the target has no usable snapshot, including legacy, failed, missing, or
   corrupt captures.
 - `platform-unsupported`: native filesystem history is unavailable on the current platform.

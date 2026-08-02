@@ -1,5 +1,5 @@
 import type { SurfaceAdapter } from "../../adapter";
-import type { MsgRef, SurfaceMessage } from "../../types";
+import type { MsgRef, RoutedSurfacePlatform, SurfaceMessage } from "../../types";
 
 import { compareMessagePosition, normalizeGateText } from "./common";
 import type { BufferedMessage } from "./gate";
@@ -40,6 +40,7 @@ export async function resolvePreviousMessageText(params: {
 export async function resolveRepliedToMessageText(params: {
   adapter: SurfaceAdapter;
   input: {
+    platform: RoutedSurfacePlatform;
     sessionId: string;
     replyToMessageId?: string;
   };
@@ -48,7 +49,7 @@ export async function resolveRepliedToMessageText(params: {
 
   const repliedTo = await params.adapter
     .readMsg({
-      platform: "discord",
+      platform: params.input.platform,
       channelId: params.input.sessionId,
       messageId: params.input.replyToMessageId,
     })

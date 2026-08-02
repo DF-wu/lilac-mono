@@ -50,6 +50,17 @@ const reasoningDisplaySchema = z.enum(["none", "simple", "detailed"]).default("d
 
 const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS);
 
+const configuredModelChainEntrySchemaV2 = z.union([
+  z.string().min(1),
+  z.object({
+    model: z.string().min(1),
+    reasoning: modelReasoningEffortSchema.optional(),
+    options: jsonObjectSchema.optional(),
+  }),
+]);
+
+const modelFallbackSchemaV2 = z.array(configuredModelChainEntrySchemaV2).optional();
+
 const profileNamesSchema = z.array(z.string().trim().min(1)).default([]);
 
 const profileLevel1Schema = z.object({
@@ -119,6 +130,8 @@ function subagentProfileSchemaV2(defaults: SubagentProfileConfig) {
       reasoning: modelReasoningEffortSchema.optional(),
       /** Optional providerOptions override merged onto models.def.<alias>.options. */
       options: jsonObjectSchema.optional(),
+      /** Optional ordered model fallback chain. */
+      fallback: modelFallbackSchemaV2,
       promptOverlay: z.string().min(1).optional(),
       level1: profileLevel1Schema.default(defaults.level1),
       level2: profileLevel2Schema.default(defaults.level2),
@@ -326,6 +339,15 @@ const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
+    generate: z
+      .object({
+        image: z
+          .object({
+            provider: z.enum(["default", "openai-compatible"]).default("default"),
+          })
+          .default({ provider: "default" }),
+      })
+      .default({ image: { provider: "default" } }),
     web: webExtractConfigSchema,
     inspect: z
       .object({
@@ -380,6 +402,11 @@ const toolsSchema = z
   })
   .default({
     fsBackend: "fff",
+    generate: {
+      image: {
+        provider: "default",
+      },
+    },
     web: {
       extract: {
         providers: ["tavily"],
@@ -420,12 +447,14 @@ const conversationSchemaV2 = z
             enabled: z.boolean().default(false),
             model: z.string().trim().min(1).default("fast"),
             concurrency: z.number().int().min(1).max(128).default(1),
+            batchSize: z.number().int().min(1).max(10_000).default(32),
             includePromptContext: z.boolean().default(false),
           })
           .default({
             enabled: false,
             model: "fast",
             concurrency: 1,
+            batchSize: 32,
             includePromptContext: false,
           }),
         embedding: z
@@ -460,6 +489,7 @@ const conversationSchemaV2 = z
           enabled: false,
           model: "fast",
           concurrency: 1,
+          batchSize: 32,
           includePromptContext: false,
         },
         embedding: { enabled: false, model: "openai/text-embedding-3-small" },
@@ -480,6 +510,7 @@ const conversationSchemaV2 = z
         enabled: false,
         model: "fast",
         concurrency: 1,
+        batchSize: 32,
         includePromptContext: false,
       },
       embedding: { enabled: false, model: "openai/text-embedding-3-small" },
@@ -514,6 +545,8 @@ const modelsSchemaV2 = z
           reasoning: modelReasoningEffortSchema.optional(),
           /** AI SDK providerOptions-style object (nested JSON allowed). */
           options: jsonObjectSchema.optional(),
+          /** Optional ordered model fallback chain. */
+          fallback: modelFallbackSchemaV2,
           /** Optional parent-agent guidance shown alongside this model alias. */
           comment: z.string().trim().min(1).optional(),
           /** Whether subagent_delegate may dynamically select this alias. */
@@ -530,6 +563,8 @@ const modelsSchemaV2 = z
         reasoning: modelReasoningEffortSchema.optional(),
         /** Provider-specific model options. */
         options: jsonObjectSchema.optional(),
+        /** Optional ordered model fallback chain. */
+        fallback: modelFallbackSchemaV2,
       })
       .default({
         model: "openrouter/openai/gpt-4o",
@@ -541,6 +576,7 @@ const modelsSchemaV2 = z
         model: z.string().min(1).default("openrouter/openai/gpt-4o-mini"),
         reasoning: modelReasoningEffortSchema.optional(),
         options: jsonObjectSchema.optional(),
+        fallback: modelFallbackSchemaV2,
       })
       .default({
         model: "openrouter/openai/gpt-4o-mini",

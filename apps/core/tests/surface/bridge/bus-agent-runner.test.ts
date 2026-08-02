@@ -4,9 +4,14 @@ import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
+  buildCoreLineageManifestV1,
   createLilacBus,
   lilacEventTypes,
   outReqTopic,
+  parseCorePrimaryLineageV1,
+  type CmdRequestMessageData,
+  type CoreLineageManifestV1,
+  type CorePrimaryLineageV1,
   type HandleContext,
   type Message,
   type PublishOptions,
@@ -16,16 +21,31 @@ import {
 import {
   RESPONSE_COMMENTARY_INSTRUCTIONS,
   createLogger,
+  ModelCapability,
   parseCoreConfigV1ToUniversal,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import { jsonSchema, tool, type ModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import { AiSdkPiAgent, ToolExpansion, buildSyntheticToolCallId } from "@stanley2058/lilac-agent";
+import {
+  AiSdkPiAgent,
+  attachAutoCompaction,
+  ToolExpansion,
+  buildSyntheticToolCallId,
+  hashCanonicalMessagesV1,
+  type AiSdkPiAgentOptions,
+} from "@stanley2058/lilac-agent";
+import {
+  materializeClaudeCodeRun,
+  type ClaudeNativeAttemptObservation,
+  type ClaudeNativeSessionStart,
+  type MaterializedClaudeCodeRun,
+} from "@stanley2058/lilac-claude-code-bridge";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
   applyCompleteLevel1Tools,
+  appendAutoInjectedThreadSearchLineage,
   assertWorkflowDispatchPolicy,
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
@@ -38,6 +58,7 @@ import {
   createAssistantTextPartBoundaryState,
   createAgentRunIdleWatchdog,
   createTransientModelRetryController,
+  degradeCorePrimaryLineageForMutation,
   formatAutoCompactionToolDisplay,
   formatUnknownErrorForDisplay,
   buildHeartbeatOverlayForRequest,
@@ -49,31 +70,74 @@ import {
   buildPersistedHeartbeatMessages,
   buildSurfaceMetadataOverlay,
   isRetryableTransientModelError,
+  isActiveRuntimeModelCompatible,
+  isWorkflowAgentRecoveryEntry,
   markAssistantTextPartEnded,
   markAssistantTextPartStarted,
+  mapCorePrimaryCompactionCurrentCanonicalStart,
   measureMeaningfulTextUnits,
   mergeToSingleUserMessage,
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
   refreshSelectedLevel1Tools,
+  removeSilentAssistantTurnMessages,
   resolveAgentRunModel,
+  resolveAgentRunModelFallbacks,
+  selectNextNativeModelFallback,
   shouldRunAutoInjectedThreadSearch,
+  shouldQueueIncompatibleActiveRuntimeModel,
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
+  shouldUsePersistentCoreClaudeRuntime,
+  startBusAgentRunner,
   shouldEnableAnthropicPromptCache,
   selectPersistedTranscriptMessages,
   selectedLevel1ToolNames,
   resolveCompactionCheckpointMeta,
+  resolveCorePrimaryTranscriptProviderState,
+  resolveCoreStableNamedContinuation,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
   withReasoningSummaryDefaultForOpenAIModels,
   WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS,
+  validateCorePrimaryLineageAtRunnerIntake,
 } from "../../../src/surface/bridge/bus-agent-runner";
-import type { BuiltLevel1Toolset } from "../../../src/plugins";
+import { createCorePrimaryClaudeRuntime } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+import {
+  createCoreToolPluginManager,
+  type BuiltLevel1Toolset,
+  type CoreToolPluginManager,
+} from "../../../src/plugins";
+import {
+  CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  computeCorePrimaryClaudeTerminalHead,
+  SqliteTranscriptStore,
+} from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createIdleTimer } from "../../../src/shared/idle-timer";
+import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
+import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
+import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
+import type {
+  AdapterEventHandler,
+  StartOutputOpts,
+  SurfaceAdapter,
+  SurfaceOutputPart,
+  SurfaceOutputStream,
+} from "../../../src/surface/adapter";
+import type {
+  AdapterCapabilities,
+  ContentOpts,
+  LimitOpts,
+  MsgRef,
+  SendOpts,
+  SessionRef,
+  SurfaceMessage,
+  SurfaceSelf,
+  SurfaceSession,
+} from "../../../src/surface/types";
 import {
   parseSubagentMetaFromRaw,
   parseWorkflowRequestHintFromRaw,
@@ -135,6 +199,7 @@ function level1TestToolset(params?: {
     },
     updateActiveBatchTools: (activeToolNames) => params?.onBatchUpdate?.(activeToolNames),
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
+    aggregateOutputBudgetExemptTools: new Set(),
   };
 }
 
@@ -162,11 +227,63 @@ function level1TextStep(text: string) {
   };
 }
 
+function level1PhasedTextStep(finalText = "Final answer.") {
+  const commentaryMetadata = {
+    openai: { itemId: "msg_commentary", phase: "commentary" },
+  } as const;
+  const finalMetadata = { openai: { itemId: "msg_final", phase: "final_answer" } } as const;
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "commentary", providerMetadata: commentaryMetadata },
+        {
+          type: "text-delta" as const,
+          id: "commentary",
+          delta: "Commentary.",
+          providerMetadata: commentaryMetadata,
+        },
+        { type: "text-end" as const, id: "commentary", providerMetadata: commentaryMetadata },
+        { type: "text-start" as const, id: "final", providerMetadata: finalMetadata },
+        {
+          type: "text-delta" as const,
+          id: "final",
+          delta: finalText,
+          providerMetadata: finalMetadata,
+        },
+        { type: "text-end" as const, id: "final", providerMetadata: finalMetadata },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: level1ZeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 function level1ToolCallStep(calls: readonly { toolCallId: string; toolName: string }[]) {
   return {
     stream: simulateReadableStream({
       chunks: [
         ...calls.map((call) => ({ type: "tool-call" as const, ...call, input: "{}" })),
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: level1ZeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function level1TextAndToolCallStep(text: string, call: { toolCallId: string; toolName: string }) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "text" },
+        { type: "text-delta" as const, id: "text", delta: text },
+        { type: "text-end" as const, id: "text" },
+        { type: "tool-call" as const, ...call, input: "{}" },
         {
           type: "finish" as const,
           finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
@@ -311,6 +428,7 @@ describe("runner Level 1 catalog selection", () => {
       catalogMetadata: {},
       updateActiveBatchTools: () => {},
       genericOutputNormalizerBypassTools: new Set(),
+      aggregateOutputBudgetExemptTools: new Set(),
     };
     let calls = 0;
     const model = new MockLanguageModelV4({
@@ -626,6 +744,233 @@ describe("deferred subagent result", () => {
 });
 
 describe("subagent model selection", () => {
+  it("runtime-validates primary lineage, rejects stale proof, and omits it outside Discord", () => {
+    const messages = [{ role: "user", content: "hello" }] satisfies ModelMessage[];
+    const manifest = buildCoreLineageManifestV1([
+      {
+        atoms: [
+          {
+            kind: "surface",
+            requestClient: "discord",
+            surfaceId: "discord:channel",
+            sessionId: "channel",
+            messageId: "message",
+          },
+        ],
+        canonicalMessages: messages,
+      },
+    ]);
+    const staleStore = {
+      saveRequestTranscript() {},
+      linkSurfaceMessagesToRequest() {},
+      getCoreSurfaceProjection() {
+        return null;
+      },
+      getTranscriptBySurfaceMessage() {
+        return null;
+      },
+      validateCorePrimaryLineageReferences() {
+        return "stale-surface-lineage";
+      },
+      close() {},
+    };
+    const validStore = {
+      ...staleStore,
+      getCoreSurfaceProjection() {
+        return {
+          requestClient: "discord" as const,
+          surfaceId: "discord:channel",
+          sessionId: "channel",
+          messageId: "message",
+          projectionFormatVersion: 1 as const,
+          canonicalMessages: messages,
+          sourceFacts: {
+            segmentMessageIds: ["message"],
+            segmentDigest: hashCanonicalMessagesV1(messages).hash,
+          },
+          ownedBlobs: [],
+          createdAt: 1,
+        };
+      },
+      validateCorePrimaryLineageReferences(input: { manifest: CoreLineageManifestV1 }) {
+        return input.manifest.segments[0]?.canonicalMessages[0]?.content === "hello"
+          ? null
+          : "transformed-surface-lineage";
+      },
+    };
+
+    expect(
+      validateCorePrimaryLineageAtRunnerIntake({
+        requestClient: "discord",
+        sessionId: "channel",
+        runProfile: "primary",
+        messages,
+        corePrimaryLineage: manifest,
+        transcriptStore: validStore,
+      }),
+    ).toEqual(manifest);
+
+    expect(
+      validateCorePrimaryLineageAtRunnerIntake({
+        requestClient: "discord",
+        sessionId: "channel",
+        runProfile: "primary",
+        messages,
+        corePrimaryLineage: manifest,
+        transcriptStore: staleStore,
+      }),
+    ).toEqual({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "stale-surface-lineage",
+    });
+    const transformedMessages = [{ role: "user", content: "edited" }] satisfies ModelMessage[];
+    const transformedManifest = buildCoreLineageManifestV1([
+      {
+        atoms: manifest.segments[0]!.atoms,
+        canonicalMessages: transformedMessages,
+      },
+    ]);
+    expect(
+      validateCorePrimaryLineageAtRunnerIntake({
+        requestClient: "discord",
+        sessionId: "channel",
+        runProfile: "primary",
+        messages: transformedMessages,
+        corePrimaryLineage: transformedManifest,
+        transcriptStore: validStore,
+      }),
+    ).toEqual({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "transformed-surface-lineage",
+    });
+    expect(
+      validateCorePrimaryLineageAtRunnerIntake({
+        requestClient: "discord",
+        sessionId: "channel",
+        runProfile: "primary",
+        messages,
+        corePrimaryLineage: { ...manifest, segments: [] },
+        transcriptStore: staleStore,
+      }),
+    ).toEqual({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      reason: "malformed-or-unaligned-manifest",
+    });
+    expect(
+      validateCorePrimaryLineageAtRunnerIntake({
+        requestClient: "github",
+        sessionId: "channel",
+        runProfile: "primary",
+        messages,
+        corePrimaryLineage: manifest,
+        transcriptStore: staleStore,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("enables persistent Claude only for Discord primary or stable named ownership", () => {
+    const manifest = buildCoreLineageManifestV1([
+      {
+        atoms: [
+          {
+            kind: "synthetic",
+            source: "test",
+            messageDigest: "11".repeat(32),
+          },
+        ],
+        canonicalMessages: [{ role: "user", content: "hello" }],
+      },
+    ]);
+    expect(
+      shouldUsePersistentCoreClaudeRuntime({
+        runProfile: "primary",
+        requestClient: "discord",
+        stableNamedContinuation: null,
+        corePrimaryLineage: manifest,
+      }),
+    ).toBe(true);
+    expect(
+      shouldUsePersistentCoreClaudeRuntime({
+        runProfile: "primary",
+        requestClient: "github",
+        stableNamedContinuation: null,
+        corePrimaryLineage: manifest,
+      }),
+    ).toBe(false);
+  });
+
+  it("treats missing provider metadata and unidentified assistant history as mixed", () => {
+    const requestLineage = buildCoreLineageManifestV1([
+      {
+        atoms: [
+          {
+            kind: "request",
+            requestId: "request",
+            transcriptDigest: "11".repeat(32),
+            providerFamily: "claude-code",
+            containsCrossFamilyTurns: false,
+          },
+        ],
+        requestSource: {
+          aliases: [
+            {
+              requestClient: "discord",
+              surfaceId: "discord:channel",
+              sessionId: "channel",
+              messageId: "output",
+            },
+          ],
+        },
+        canonicalMessages: [{ role: "assistant", content: "request output" }],
+      },
+    ]);
+    expect(
+      resolveCorePrimaryTranscriptProviderState({
+        targetFamily: "claude-code",
+        lineage: requestLineage,
+      }).containsCrossFamilyTurns,
+    ).toBe(true);
+
+    const syntheticAssistantLineage = buildCoreLineageManifestV1([
+      {
+        atoms: [{ kind: "synthetic", source: "test", messageDigest: "22".repeat(32) }],
+        canonicalMessages: [{ role: "assistant", content: "unknown provider" }],
+      },
+    ]);
+    expect(
+      resolveCorePrimaryTranscriptProviderState({
+        targetFamily: "claude-code",
+        lineage: syntheticAssistantLineage,
+      }).containsCrossFamilyTurns,
+    ).toBe(true);
+  });
+
+  it("marks queue, follow-up, steering, recovery, and synthetic transforms fresh-only", () => {
+    for (const reason of [
+      "queued-request-coalesced",
+      "queued-buffer-absorbed-into-steering",
+      "follow-up-transform",
+      "steering-transform",
+      "restart-recovery-checkpoint",
+      "compaction-checkpoint-transform",
+      "synthetic-thread-search-insertion",
+      "deferred-result-insertion",
+    ]) {
+      expect(degradeCorePrimaryLineageForMutation(reason)).toEqual({
+        state: "fresh-only",
+        lineageVersion: 1,
+        currentCanonicalStart: 0,
+        reason,
+      });
+    }
+  });
+
   it("parses the minimal workflow dispatch hint and requires its epoch", () => {
     expect(
       parseWorkflowRequestHintFromRaw({
@@ -680,9 +1025,9 @@ describe("subagent model selection", () => {
       reasoningOverride: "high",
     });
 
-    expect(resolved.alias).toBe("scout");
-    expect(resolved.spec).toBe("openai/gpt-4o-mini");
-    expect(resolved.reasoning).toBe("high");
+    expect(resolved.head.alias).toBe("scout");
+    expect(resolved.head.spec).toBe("openai/gpt-4o-mini");
+    expect(resolved.head.reasoning).toBe("high");
   });
 
   it("rejects direct and opted-out subagent model overrides", () => {
@@ -729,7 +1074,7 @@ describe("subagent model selection", () => {
       runProfile: "general",
     });
 
-    expect(resolved.alias).toBe("manual");
+    expect(resolved.head.alias).toBe("manual");
   });
 
   it("applies reasoning overrides to the configured profile fallback", () => {
@@ -746,8 +1091,7 @@ describe("subagent model selection", () => {
       reasoningOverride: "medium",
     });
 
-    expect(resolved).toMatchObject({ slot: "fast" });
-    expect(resolved.reasoning).toBe("medium");
+    expect(resolved.head.reasoning).toBe("medium");
   });
 
   it("rehydrates a durable workflow model request without current preset resolution", () => {
@@ -774,7 +1118,7 @@ describe("subagent model selection", () => {
       },
     });
 
-    expect(resolved).toMatchObject({
+    expect(resolved.head).toMatchObject({
       alias: "removed-preset",
       spec: "codex/durable-model",
       provider: "codex",
@@ -784,6 +1128,305 @@ describe("subagent model selection", () => {
       responseCommentary: true,
       anthropicPromptCache: true,
     });
+  });
+
+  it("preserves request alias fallback order and applies the strongest reasoning chain-wide", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      requested: {
+        model: "openai/head",
+        reasoning: "low",
+        agentCanSelect: true,
+        fallback: [
+          "openai/backup",
+          { model: "openai/special", reasoning: "none" },
+          "openai/backup",
+        ],
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      reasoning: "medium",
+    };
+
+    const defaultReasoningPlan = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      requestModelOverride: "requested",
+    });
+    expect(
+      [defaultReasoningPlan.head, ...defaultReasoningPlan.fallbacks].map(
+        (candidate) => candidate.reasoning,
+      ),
+    ).toEqual(["medium", "medium", "none", "medium"]);
+
+    const plan = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      requestModelOverride: "requested",
+      reasoningOverride: "xhigh",
+    });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/head",
+      "openai/backup",
+      "openai/special",
+      "openai/backup",
+    ]);
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.reasoning)).toEqual([
+      "xhigh",
+      "xhigh",
+      "xhigh",
+      "xhigh",
+    ]);
+  });
+
+  it("resolves current override fallbacks without resolving or validating the alias head", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      requested: {
+        model: "invalid-changed-head",
+        agentCanSelect: false,
+        fallback: ["openai/current", { model: "openai/explicit", reasoning: "low" }],
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      reasoning: "medium",
+    };
+
+    const fallbacks = resolveAgentRunModelFallbacks({
+      cfg,
+      runProfile: "general",
+      requestModelOverride: "requested",
+    });
+
+    expect(fallbacks.map((candidate) => [candidate.spec, candidate.reasoning])).toEqual([
+      ["openai/current", "medium"],
+      ["openai/explicit", "low"],
+    ]);
+    delete cfg.models.def.requested;
+    expect(
+      resolveAgentRunModelFallbacks({
+        cfg,
+        runProfile: "general",
+        requestModelOverride: "requested",
+        reasoningOverride: "high",
+      }),
+    ).toEqual([]);
+  });
+
+  it("keeps explicit profile and slot fallbacks when their head aliases are missing", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.main = {
+      model: "missing-slot-head",
+      fallback: ["openai/slot-backup"],
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      model: "missing-profile-head",
+      fallback: ["openai/profile-backup"],
+    };
+
+    expect(
+      resolveAgentRunModelFallbacks({ cfg, runProfile: "general" }).map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/profile-backup"]);
+    expect(
+      resolveAgentRunModelFallbacks({ cfg, runProfile: "explore" }).map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/slot-backup"]);
+  });
+
+  it("uses explicit profile fallback and profile reasoning unless an entry overrides it", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      profile: {
+        model: "openai/profile",
+        fallback: ["openai/alias-backup"],
+      },
+    };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      model: "profile",
+      reasoning: "medium",
+      fallback: [
+        "openai/common-reasoning",
+        { model: "openai/own-reasoning", reasoning: "low" },
+        "openai/common-reasoning",
+      ],
+    };
+
+    const plan = resolveAgentRunModel({ cfg, runProfile: "general" });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/profile",
+      "openai/common-reasoning",
+      "openai/own-reasoning",
+      "openai/common-reasoning",
+    ]);
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.reasoning)).toEqual([
+      "medium",
+      "medium",
+      "low",
+      "medium",
+    ]);
+  });
+
+  it("lets profile fallback replace slot and alias fallback", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      slot: { model: "openai/slot", fallback: ["openai/alias-backup"] },
+    };
+    cfg.models.fast = { model: "slot", fallback: ["openai/slot-backup"] };
+    cfg.agent.subagents.profiles.explore = {
+      ...cfg.agent.subagents.profiles.explore,
+      modelSlot: "fast",
+      fallback: ["openai/profile-backup", "openai/profile-backup"],
+    };
+
+    const plan = resolveAgentRunModel({ cfg, runProfile: "explore" });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/slot",
+      "openai/profile-backup",
+      "openai/profile-backup",
+    ]);
+  });
+
+  it("inherits alias fallback for a direct profile and slot fallback for a slot profile", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.def = {
+      direct: { model: "openai/direct", fallback: ["openai/direct-alias-backup"] },
+      slot: { model: "openai/slot", fallback: ["openai/slot-alias-backup"] },
+    };
+    cfg.models.fast = { model: "slot", fallback: ["openai/slot-backup"] };
+    cfg.agent.subagents.profiles.general = {
+      ...cfg.agent.subagents.profiles.general,
+      model: "direct",
+    };
+    cfg.agent.subagents.profiles.explore = {
+      ...cfg.agent.subagents.profiles.explore,
+      modelSlot: "fast",
+    };
+
+    expect(
+      resolveAgentRunModel({ cfg, runProfile: "general" }).fallbacks.map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/direct-alias-backup"]);
+    expect(
+      resolveAgentRunModel({ cfg, runProfile: "explore" }).fallbacks.map(
+        (candidate) => candidate.spec,
+      ),
+    ).toEqual(["openai/slot-backup"]);
+  });
+
+  it("rehydrates the complete durable fallback plan", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    const plan = resolveAgentRunModel({
+      cfg,
+      runProfile: "general",
+      resolvedModelRequest: {
+        spec: "openai/durable-head",
+        provider: "openai",
+        modelId: "durable-head",
+        reasoning: "low",
+        reasoningDisplay: "simple",
+        fallbacks: [
+          {
+            spec: "openai/durable-backup",
+            provider: "openai",
+            modelId: "durable-backup",
+            reasoning: "high",
+            reasoningDisplay: "simple",
+          },
+        ],
+      },
+    });
+
+    expect([plan.head, ...plan.fallbacks].map((candidate) => candidate.spec)).toEqual([
+      "openai/durable-head",
+      "openai/durable-backup",
+    ]);
+    expect(plan.fallbacks[0]?.reasoning).toBe("high");
+    expect(plan.fallbacks[0]?.reasoningDisplay).toBe("simple");
+  });
+
+  it("skips claude-code candidates, preserves duplicates, and never advances a claude head", () => {
+    const cfg = parseCoreConfigV1ToUniversal({});
+    cfg.models.main = {
+      model: "openai/head",
+      fallback: ["claude-code/sonnet", "openai/backup", "openai/backup"],
+    };
+    const plan = resolveAgentRunModel({ cfg, runProfile: "primary" });
+    const skipped: string[] = [];
+
+    const first = selectNextNativeModelFallback({
+      plan,
+      activeIndex: 0,
+      onSkipClaudeCode: (candidate) => skipped.push(candidate.spec),
+    });
+    const second = selectNextNativeModelFallback({
+      plan,
+      activeIndex: first?.index ?? 0,
+    });
+
+    expect(skipped).toEqual(["claude-code/sonnet"]);
+    expect(first).toMatchObject({ index: 2, candidate: { spec: "openai/backup" } });
+    expect(second).toMatchObject({ index: 3, candidate: { spec: "openai/backup" } });
+
+    cfg.models.main = { model: "claude-code/sonnet", fallback: ["openai/backup"] };
+    expect(
+      selectNextNativeModelFallback({
+        plan: resolveAgentRunModel({ cfg, runProfile: "primary" }),
+        activeIndex: 0,
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps active model and effort immutable for steering compatibility", () => {
+    const requested = {
+      spec: "claude-code/sonnet",
+      provider: "claude-code",
+      modelId: "sonnet",
+      model: new MockLanguageModelV4({ modelId: "sonnet" }),
+      reasoning: "high" as const,
+    };
+    expect(
+      isActiveRuntimeModelCompatible({
+        activeSpec: requested.spec,
+        activeReasoning: "high",
+        activeFamily: "claude-code",
+        requested,
+      }),
+    ).toBe(true);
+    expect(
+      isActiveRuntimeModelCompatible({
+        activeSpec: requested.spec,
+        activeReasoning: "low",
+        activeFamily: "claude-code",
+        requested,
+      }),
+    ).toBe(false);
+    expect(
+      isActiveRuntimeModelCompatible({
+        activeSpec: "openai/gpt-5",
+        activeReasoning: "high",
+        activeFamily: "ai-sdk",
+        requested,
+      }),
+    ).toBe(false);
+    expect(
+      shouldQueueIncompatibleActiveRuntimeModel({
+        activeSpec: "openai/gpt-5",
+        activeReasoning: "high",
+        activeFamily: "ai-sdk",
+        requested,
+      }),
+    ).toBe(true);
   });
 
   it("validates workflow reasoning against the operation request, not resolved defaults", () => {
@@ -819,6 +1462,63 @@ describe("subagent model selection", () => {
         { profile: "general", depth: 1, reasoning: "low" },
       ),
     ).toThrow("reasoning does not match the approved operation policy");
+  });
+
+  it("accepts only the exact durable stable-named identity", () => {
+    const policy = {
+      runId: "run-1",
+      operationId: "operation-1",
+      dispatchEpoch: "dispatch-epoch-0001",
+      profile: "general" as const,
+      model: null,
+      reasoning: null,
+      resolvedModelRequest: {
+        spec: "claude-code/sonnet",
+        provider: "claude-code",
+        modelId: "sonnet",
+        reasoningDisplay: "simple" as const,
+      },
+      cwd: "/workspace",
+      originSession: {
+        requestId: "parent",
+        sessionId: "channel",
+        client: "discord" as const,
+        userId: "user",
+      },
+      stableNamedContinuation: {
+        sessionId: "sub:channel:named:audit",
+        requestClient: "discord" as const,
+      },
+    };
+
+    expect(
+      resolveCoreStableNamedContinuation({
+        runProfile: "general",
+        sessionId: "sub:channel:named:audit",
+        workflowPolicy: policy,
+      }),
+    ).toEqual(policy.stableNamedContinuation);
+    expect(
+      resolveCoreStableNamedContinuation({
+        runProfile: "general",
+        sessionId: "sub:channel:named:generated",
+        workflowPolicy: { ...policy, stableNamedContinuation: undefined },
+      }),
+    ).toBeNull();
+    expect(() =>
+      resolveCoreStableNamedContinuation({
+        runProfile: "general",
+        sessionId: "sub:channel:named:other",
+        workflowPolicy: policy,
+      }),
+    ).toThrow("does not match the child session");
+    expect(() =>
+      resolveCoreStableNamedContinuation({
+        runProfile: "primary",
+        sessionId: "sub:channel:named:audit",
+        workflowPolicy: policy,
+      }),
+    ).toThrow("cannot authorize a primary run");
   });
 });
 
@@ -972,6 +1672,35 @@ describe("agent run activity", () => {
 describe("workflow request claim pacing", () => {
   it("refreshes at one third of the engine's 30s stale-owner threshold", () => {
     expect(WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS).toBe(10_000);
+  });
+});
+
+describe("agent recovery ownership", () => {
+  it("does not treat workflow-owned recovery entries as root parent requests", () => {
+    const base = {
+      kind: "active" as const,
+      requestId: "request-1",
+      sessionId: "session-1",
+      requestClient: "discord" as const,
+      queue: "prompt" as const,
+      messages: [] as ModelMessage[],
+    };
+
+    expect(isWorkflowAgentRecoveryEntry(base)).toBe(false);
+    expect(
+      isWorkflowAgentRecoveryEntry({
+        ...base,
+        requestId: "wfr:run:operation:0",
+        requestClient: "unknown",
+        raw: {
+          workflow: {
+            runId: "run-1",
+            operationId: "operation-1",
+            dispatchEpoch: "1234567890abcdef",
+          },
+        },
+      }),
+    ).toBe(true);
   });
 });
 
@@ -1164,6 +1893,1946 @@ function createInMemoryRawBus(): RawBus {
   };
 }
 
+function deferred<T>() {
+  let resolvePromise: (value: T) => void = () => {
+    throw new Error("deferred promise was not initialized");
+  };
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
+type ProductionPathOutput = {
+  readonly messageId: string;
+  readonly parts: SurfaceOutputPart[];
+  readonly finished: Promise<void>;
+};
+
+class ProductionPathDiscordAdapter implements SurfaceAdapter {
+  readonly messages = new Map<string, SurfaceMessage>();
+  readonly outputs: ProductionPathOutput[] = [];
+  readonly updatedOutputMessageIds: string[] = [];
+  private readonly handlers = new Set<AdapterEventHandler>();
+  private outputSequence = 0;
+  private timestamp = 10_000;
+
+  async emitCreated(message: SurfaceMessage): Promise<void> {
+    this.messages.set(message.ref.messageId, message);
+    await Promise.all(
+      [...this.handlers].map((handler) =>
+        handler({
+          type: "adapter.message.created",
+          platform: "discord",
+          ts: message.ts,
+          message,
+        }),
+      ),
+    );
+  }
+
+  private async emitOutputUpdated(message: SurfaceMessage): Promise<void> {
+    this.updatedOutputMessageIds.push(message.ref.messageId);
+    await Promise.all(
+      [...this.handlers].map((handler) =>
+        handler({
+          type: "adapter.message.updated",
+          platform: "discord",
+          ts: message.ts,
+          message,
+        }),
+      ),
+    );
+  }
+
+  async connect(): Promise<void> {}
+  async disconnect(): Promise<void> {}
+
+  async getSelf(): Promise<SurfaceSelf> {
+    return { platform: "discord", userId: "bot", userName: "lilac" };
+  }
+
+  async getCapabilities(): Promise<AdapterCapabilities> {
+    throw new Error("not used");
+  }
+
+  async listSessions(): Promise<SurfaceSession[]> {
+    throw new Error("not used");
+  }
+
+  async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts): Promise<SurfaceOutputStream> {
+    this.outputSequence += 1;
+    const messageId = `output-${this.outputSequence}`;
+    const parts: SurfaceOutputPart[] = [];
+    const finished = deferred<void>();
+    let outputMessage: SurfaceMessage | null = null;
+    let visibleText = "";
+    const ensureOutputMessage = (): SurfaceMessage => {
+      if (outputMessage) return outputMessage;
+      outputMessage = {
+        ref: { platform: "discord", channelId: sessionRef.channelId, messageId },
+        session: { platform: "discord", channelId: sessionRef.channelId },
+        userId: "bot",
+        userName: "lilac",
+        text: "",
+        ts: this.timestamp++,
+        raw: {
+          reference: opts?.replyTo
+            ? { messageId: opts.replyTo.messageId, channelId: opts.replyTo.channelId }
+            : {},
+          discord: { isChat: true },
+        },
+      };
+      this.messages.set(messageId, outputMessage);
+      opts?.onMessageCreated?.(outputMessage.ref);
+      return outputMessage;
+    };
+    this.outputs.push({ messageId, parts, finished: finished.promise });
+
+    return {
+      push: async (part) => {
+        parts.push(part);
+        const message = ensureOutputMessage();
+        if (part.type === "text.delta") visibleText += part.delta;
+        if (part.type === "text.set") visibleText = part.text;
+        message.text = visibleText;
+        await this.emitOutputUpdated(message);
+      },
+      finish: async () => {
+        const message = ensureOutputMessage();
+        finished.resolve(undefined);
+        return { created: [message.ref], last: message.ref };
+      },
+      abort: async () => {
+        finished.resolve(undefined);
+      },
+      getFinalTextMode: () => "continuation",
+    };
+  }
+
+  async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts): Promise<MsgRef> {
+    throw new Error("not used");
+  }
+
+  async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+    return this.messages.get(msgRef.messageId) ?? null;
+  }
+
+  async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
+    const before = opts?.beforeMessageId ? this.messages.get(opts.beforeMessageId)?.ts : undefined;
+    return [...this.messages.values()]
+      .filter((message) => message.session.channelId === sessionRef.channelId)
+      .filter((message) => before === undefined || message.ts < before)
+      .toSorted((left, right) => left.ts - right.ts)
+      .slice(-(opts?.limit ?? 50));
+  }
+
+  async editMsg(): Promise<void> {}
+  async deleteMsg(): Promise<void> {}
+  async getReplyContext(): Promise<SurfaceMessage[]> {
+    return [];
+  }
+  async addReaction(): Promise<void> {}
+  async removeReaction(): Promise<void> {}
+  async listReactions(): Promise<string[]> {
+    return [];
+  }
+
+  async subscribe(handler: AdapterEventHandler): Promise<{ stop(): Promise<void> }> {
+    this.handlers.add(handler);
+    return {
+      stop: async () => {
+        this.handlers.delete(handler);
+      },
+    };
+  }
+
+  async getUnRead(): Promise<SurfaceMessage[]> {
+    return [];
+  }
+  async markRead(): Promise<void> {}
+}
+
+async function observeRequestLifecycle(bus: ReturnType<typeof createLilacBus>, requestId: string) {
+  const terminal = deferred<"resolved" | "cancelled" | "failed">();
+  const states: string[] = [];
+  const details: Array<string | undefined> = [];
+  const subscription = await bus.subscribeTopic(
+    "evt.request",
+    { mode: "tail", offset: { type: "begin" } },
+    async (message, context) => {
+      if (
+        message.type === lilacEventTypes.EvtRequestLifecycleChanged &&
+        message.headers?.request_id === requestId
+      ) {
+        states.push(message.data.state);
+        details.push(message.data.detail);
+        if (
+          message.data.state === "resolved" ||
+          message.data.state === "cancelled" ||
+          message.data.state === "failed"
+        ) {
+          terminal.resolve(message.data.state);
+        }
+      }
+      await context.commit();
+    },
+  );
+  return { states, details, terminal: terminal.promise, stop: subscription.stop };
+}
+
+async function observeResponseAfterOutputRelay(
+  bus: ReturnType<typeof createLilacBus>,
+  requestId: string,
+) {
+  const relayed = deferred<void>();
+  let outputSubscription: { stop(): Promise<void> } | null = null;
+  const lifecycleSubscription = await bus.subscribeTopic(
+    "evt.request",
+    { mode: "tail", offset: { type: "now" } },
+    async (message, context) => {
+      if (
+        message.type === lilacEventTypes.EvtRequestLifecycleChanged &&
+        message.headers?.request_id === requestId &&
+        message.data.state === "resolved" &&
+        outputSubscription === null
+      ) {
+        outputSubscription = await bus.subscribeTopic(
+          outReqTopic(requestId),
+          { mode: "tail", offset: { type: "now" } },
+          async (outputMessage, outputContext) => {
+            if (outputMessage.type === lilacEventTypes.EvtAgentOutputResponseText) {
+              relayed.resolve(undefined);
+            }
+            await outputContext.commit();
+          },
+        );
+      }
+      await context.commit();
+    },
+  );
+  return {
+    relayed: relayed.promise,
+    stop: async () => {
+      await lifecycleSubscription.stop();
+      await outputSubscription?.stop();
+    },
+  };
+}
+
+async function publishRunnerRequest(input: {
+  bus: ReturnType<typeof createLilacBus>;
+  requestId: string;
+  sessionId: string;
+  queue?: "prompt" | "followUp" | "steer" | "interrupt";
+  text: string;
+  messages?: ModelMessage[];
+  modelOverride?: string;
+  requestClient?: "discord" | "github";
+  corePrimaryLineage?: CorePrimaryLineageV1;
+  raw?: unknown;
+}) {
+  await input.bus.publish(
+    lilacEventTypes.CmdRequestMessage,
+    {
+      queue: input.queue ?? "prompt",
+      messages: input.messages ?? [{ role: "user", content: input.text }],
+      ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
+      ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
+      ...(input.raw === undefined ? {} : { raw: input.raw }),
+    },
+    {
+      headers: {
+        request_id: input.requestId,
+        session_id: input.sessionId,
+        request_client: input.requestClient ?? "github",
+      },
+    },
+  );
+}
+
+describe("startBusAgentRunner production path", () => {
+  it("latches the active model, applies an unqualified follow-up, and queues an explicit change", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/initial" };
+    config.models.def = {
+      active: { model: "openai/active", agentCanSelect: true },
+      other: { model: "openai/other", agentCanSelect: true },
+    };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-production-"));
+    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const bus = createLilacBus(createInMemoryRawBus());
+    const firstCallStarted = deferred<void>();
+    const releaseFirstCall = deferred<void>();
+    const createdSpecs: string[] = [];
+    let activeCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-model-latch",
+      config,
+      pluginManager,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options: AiSdkPiAgentOptions<ToolSet>) => {
+        const spec = options.modelSpecifier ?? "unknown";
+        createdSpecs.push(spec);
+        const model = new MockLanguageModelV4({
+          modelId: spec,
+          doStream: async () => {
+            if (spec === "openai/active") {
+              activeCalls += 1;
+              if (activeCalls === 1) {
+                firstCallStarted.resolve(undefined);
+                await releaseFirstCall.promise;
+              }
+            }
+            return level1TextStep(`${spec} response`);
+          },
+        });
+        return new AiSdkPiAgent({ ...options, model });
+      },
+    });
+    const requestId = "github:session:model-latch";
+    const changedRequestId = "github:session:changed-message";
+    const activeLifecycle = await observeRequestLifecycle(bus, requestId);
+    const changedLifecycle = await observeRequestLifecycle(bus, changedRequestId);
+
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "session",
+      text: "first",
+      modelOverride: "active",
+    });
+    expect(
+      await Promise.race([
+        firstCallStarted.promise.then(() => "model-started" as const),
+        activeLifecycle.terminal,
+      ]),
+    ).toBe("model-started");
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "session",
+      queue: "followUp",
+      text: "same model",
+    });
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "session",
+      queue: "followUp",
+      text: "change model",
+      modelOverride: "other",
+      raw: {
+        authenticatedOrigin: { messageRef: { messageId: "changed-message" } },
+      },
+    });
+    expect(changedLifecycle.states).toContain("queued");
+
+    releaseFirstCall.resolve(undefined);
+    await expect(activeLifecycle.terminal).resolves.toBe("resolved");
+    await expect(changedLifecycle.terminal).resolves.toBe("resolved");
+    expect(activeCalls).toBe(2);
+    expect(createdSpecs).toEqual(["openai/active", "openai/other"]);
+
+    await activeLifecycle.stop();
+    await changedLifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("cancels an active model call after the running lifecycle transition", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/cancellable" };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-cancel-"));
+    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const bus = createLilacBus(createInMemoryRawBus());
+    const modelCallStarted = deferred<void>();
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-cancel",
+      config,
+      pluginManager,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "cancellable",
+            doStream: async ({ abortSignal }) => {
+              modelCallStarted.resolve(undefined);
+              await new Promise<void>((resolve) => {
+                abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+              });
+              throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+            },
+          }),
+        }),
+    });
+    const requestId = "github:cancel-session:request";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+
+    await publishRunnerRequest({ bus, requestId, sessionId: "cancel-session", text: "start" });
+    expect(
+      await Promise.race([
+        modelCallStarted.promise.then(() => "model-started" as const),
+        lifecycle.terminal,
+      ]),
+    ).toBe("model-started");
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "cancel-session",
+      queue: "interrupt",
+      text: "cancel",
+      raw: { cancel: true },
+    });
+
+    await expect(lifecycle.terminal).resolves.toBe("cancelled");
+    expect(lifecycle.states[0]).toBe("running");
+    expect(lifecycle.states.at(-1)).toBe("cancelled");
+
+    await lifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("advances the live agent to the configured fallback transport", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/primary", fallback: ["openai/fallback"] };
+    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-fallback-"));
+    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const bus = createLilacBus(createInMemoryRawBus());
+    const switchedSpecs: Array<string | undefined> = [];
+    const successModel = new MockLanguageModelV4({
+      modelId: "fallback",
+      doStream: async () => level1TextStep("fallback response"),
+    });
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-fallback",
+      config,
+      pluginManager,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "primary",
+            doStream: async () => {
+              throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+            },
+          }),
+        });
+        const setModel = agent.setModel.bind(agent);
+        agent.setModel = (_model, providerOptions, modelSpecifier, reasoning) => {
+          switchedSpecs.push(modelSpecifier);
+          setModel(successModel, providerOptions, modelSpecifier, reasoning);
+        };
+        return agent;
+      },
+    });
+    const requestId = "github:fallback-session:request";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+
+    await publishRunnerRequest({ bus, requestId, sessionId: "fallback-session", text: "start" });
+
+    expect({ terminal: await lifecycle.terminal, details: lifecycle.details }).toEqual({
+      terminal: "resolved",
+      details: [undefined, undefined],
+    });
+    expect(switchedSpecs).toEqual(["openai/fallback"]);
+
+    await lifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("publishes OpenAI phases and honors a final-answer NO_REPLY", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/phased" };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-phased-output-"));
+    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const bus = createLilacBus(createInMemoryRawBus());
+    let createdAgents = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-phased-output",
+      config,
+      pluginManager,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options) => {
+        createdAgents += 1;
+        return new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "phased",
+            doStream: level1PhasedTextStep(createdAgents === 1 ? "Final answer." : "NO_REPLY"),
+          }),
+        });
+      },
+    });
+    const requestId = "github:phased-output:request";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    const responsePublished = deferred<void>();
+    const textDeltas: Array<{
+      delta: string;
+      phase?: "commentary" | "final_answer";
+      phaseBoundaryPrefixChars?: number;
+    }> = [];
+    const outputSubscription = await bus.subscribeTopic(
+      outReqTopic(requestId),
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
+          textDeltas.push(message.data);
+        }
+        if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
+          responsePublished.resolve(undefined);
+        }
+        await context.commit();
+      },
+    );
+
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "phased-output",
+      text: "show both phases",
+    });
+
+    await expect(lifecycle.terminal).resolves.toBe("resolved");
+    await responsePublished.promise;
+    expect(textDeltas).toEqual([
+      { delta: "Commentary.", phase: "commentary" },
+      {
+        delta: "\n\nFinal answer.",
+        phase: "final_answer",
+        phaseBoundaryPrefixChars: 2,
+      },
+    ]);
+
+    const skippedRequestId = "github:phased-output:skip";
+    const skippedLifecycle = await observeRequestLifecycle(bus, skippedRequestId);
+    const skippedDeltas: typeof textDeltas = [];
+    const skippedResets: string[] = [];
+    const skippedResponse = deferred<{
+      finalText: string;
+      delivery?: "reply" | "skip";
+    }>();
+    const skippedOutputSubscription = await bus.subscribeTopic(
+      outReqTopic(skippedRequestId),
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
+          skippedDeltas.push(message.data);
+        }
+        if (message.type === lilacEventTypes.EvtAgentOutputTextReset) {
+          skippedResets.push(message.data.text);
+        }
+        if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
+          skippedResponse.resolve(message.data);
+        }
+        await context.commit();
+      },
+    );
+    await publishRunnerRequest({
+      bus,
+      requestId: skippedRequestId,
+      sessionId: "phased-output-skip",
+      text: "skip the final response",
+    });
+
+    await expect(skippedLifecycle.terminal).resolves.toBe("resolved");
+    await expect(skippedResponse.promise).resolves.toMatchObject({
+      finalText: "",
+      delivery: "skip",
+    });
+    expect(skippedDeltas).toEqual([{ delta: "Commentary.", phase: "commentary" }]);
+    expect(skippedResets).toEqual([""]);
+
+    await skippedOutputSubscription.stop();
+    await skippedLifecycle.stop();
+    await outputSubscription.stop();
+    await lifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("silences an intermediate NO_REPLY turn while preserving its tool exchange", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/silent-turn" };
+    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-silent-turn-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const modelPrompts: ModelMessage[][] = [];
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-silent-turn",
+      config,
+      pluginManager,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "silent-turn",
+            doStream: async (call) => {
+              modelPrompts.push([...call.prompt]);
+              modelCalls += 1;
+              return modelCalls === 1
+                ? level1TextAndToolCallStep("NO_REPLY", {
+                    toolCallId: "call-silent",
+                    toolName: "builtin",
+                  })
+                : level1TextStep("final answer");
+            },
+          }),
+        }),
+    });
+    const requestId = "github:silent-turn-session:request";
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    const responsePublished = deferred<void>();
+    const outputEvents: Array<Message<unknown>> = [];
+    const outputSubscription = await bus.subscribeTopic(
+      outReqTopic(requestId),
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        outputEvents.push(message);
+        if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
+          responsePublished.resolve(undefined);
+        }
+        await context.commit();
+      },
+    );
+
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "silent-turn-session",
+      text: "wait for the work",
+    });
+
+    await expect(lifecycle.terminal).resolves.toBe("resolved");
+    await responsePublished.promise;
+    expect(modelCalls).toBe(2);
+    expect(JSON.stringify(outputEvents)).not.toContain("NO_REPLY");
+    expect(
+      outputEvents.find((message) => message.type === lilacEventTypes.EvtAgentOutputResponseText)
+        ?.data,
+    ).toMatchObject({ finalText: "final answer", delivery: "reply" });
+    const secondTurnAssistantMessages = modelPrompts[1]?.filter(
+      (message) => message.role === "assistant",
+    );
+    expect(JSON.stringify(secondTurnAssistantMessages)).not.toContain("NO_REPLY");
+    expect(JSON.stringify(secondTurnAssistantMessages)).toContain("call-silent");
+    const transcript = store.getRequestTranscript({ requestId });
+    expect(transcript?.finalText).toBe("final answer");
+    expect(JSON.stringify(transcript?.messages)).not.toContain("NO_REPLY");
+    expect(JSON.stringify(transcript?.messages)).toContain("call-silent");
+
+    await outputSubscription.stop();
+    await lifecycle.stop();
+    await runner.stop();
+    await pluginManager.destroy();
+    store.close();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+});
+
+function corePrimaryTestPluginManager(): CoreToolPluginManager {
+  const toolset = level1TestToolset();
+  return {
+    init: async () => {},
+    destroy: async () => {},
+    reload: async () => {},
+    ensureFresh: async () => {},
+    getStatuses: () => [],
+    getLevel2Tools: () => [],
+    getLevel2ContributionInfo: () => new Map(),
+    buildLevel1Toolset: async () => toolset,
+  };
+}
+
+function admitPrimarySurface(
+  store: SqliteTranscriptStore,
+  sessionId: string,
+  messageId: string,
+  canonicalMessages: readonly ModelMessage[],
+) {
+  store.admitCoreSurfaceProjection({
+    requestClient: "discord",
+    surfaceId: `discord:${sessionId}`,
+    sessionId,
+    messageId,
+    projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+    canonicalMessages,
+    sourceFacts: {
+      segmentMessageIds: [messageId],
+      segmentDigest: hashCanonicalMessagesV1(canonicalMessages).hash,
+    },
+    ownedBlobs: [],
+  });
+  return {
+    atoms: [
+      {
+        kind: "surface" as const,
+        requestClient: "discord",
+        surfaceId: `discord:${sessionId}`,
+        sessionId,
+        messageId,
+      },
+    ],
+    canonicalMessages,
+  };
+}
+
+function extendPrimaryManifest(input: {
+  store: SqliteTranscriptStore;
+  sessionId: string;
+  previous: CoreLineageManifestV1;
+  completedRequestId: string;
+  outputMessageId: string;
+  currentMessageId: string;
+  currentMessages: readonly ModelMessage[];
+}): CoreLineageManifestV1 {
+  const transcript = input.store.getRequestTranscript({ requestId: input.completedRequestId });
+  const metadata = input.store.getCoreRequestAtomMetadata({ requestId: input.completedRequestId });
+  if (!transcript || !metadata) throw new Error("completed primary request metadata is missing");
+  input.store.admitCoreSurfaceProjection({
+    requestClient: "discord",
+    surfaceId: `discord:${input.sessionId}`,
+    sessionId: input.sessionId,
+    messageId: input.outputMessageId,
+    projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+    canonicalMessages: transcript.messages,
+    sourceFacts: {},
+    ownedBlobs: [],
+  });
+  input.store.linkSurfaceMessagesToRequest({
+    requestId: input.completedRequestId,
+    created: [
+      { platform: "discord", channelId: input.sessionId, messageId: input.outputMessageId },
+    ],
+    last: { platform: "discord", channelId: input.sessionId, messageId: input.outputMessageId },
+  });
+  const currentSegment = admitPrimarySurface(
+    input.store,
+    input.sessionId,
+    input.currentMessageId,
+    input.currentMessages,
+  );
+  return buildCoreLineageManifestV1(
+    [
+      ...input.previous.segments.map((segment) => ({
+        atoms: segment.atoms,
+        canonicalMessages: segment.canonicalMessages,
+        ...(segment.requestSource ? { requestSource: segment.requestSource } : {}),
+      })),
+      {
+        atoms: [{ kind: "request" as const, ...metadata }],
+        canonicalMessages: transcript.messages,
+        requestSource: {
+          aliases: [
+            {
+              requestClient: "discord",
+              surfaceId: `discord:${input.sessionId}`,
+              sessionId: input.sessionId,
+              messageId: input.outputMessageId,
+            },
+          ],
+        },
+      },
+      currentSegment,
+    ],
+    { currentSegmentIndex: input.previous.segments.length + 1 },
+  );
+}
+
+describe("startBusAgentRunner Core-primary Claude production path", () => {
+  it("promotes an auto-injected first turn and forks the exact linked reply with suffix-only input", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "claude-code/sonnet" };
+    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    config.conversation.thread.autoInject = {
+      ...config.conversation.thread.autoInject,
+      enabled: true,
+      minTextUnits: 20,
+      followUpMinTextUnits: 20,
+      limit: 1,
+      minScore: 0.1,
+      mode: "hybrid",
+      filterCurrentParticipants: false,
+    };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-primary-auto-inject-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new ProductionPathDiscordAdapter();
+    const sessionId = "primary-auto-inject-session";
+    const starts: ClaudeNativeSessionStart[] = [];
+    const modelPrompts: ModelMessage[][] = [];
+    let plannedSearches = 0;
+    const routedRequests: Array<{
+      readonly headers?: Readonly<Record<string, string>>;
+      readonly data: CmdRequestMessageData;
+    }> = [];
+    const routedSub = await bus.subscribeTopic(
+      "cmd.request",
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage) {
+          routedRequests.push(message);
+        }
+        await context.commit();
+      },
+    );
+    const outputCreated = deferred<MsgRef>();
+    const outputCreatedSub = await bus.subscribeTopic(
+      "evt.surface",
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (
+          message.type === lilacEventTypes.EvtSurfaceOutputMessageCreated &&
+          message.headers?.request_id === `discord:${sessionId}:input-1`
+        ) {
+          const msgRef = message.data.msgRef;
+          if (msgRef.platform === "discord") {
+            outputCreated.resolve({
+              platform: "discord",
+              channelId: msgRef.channelId,
+              messageId: msgRef.messageId,
+            });
+          }
+        }
+        await context.commit();
+      },
+    );
+    const routedOutputUpdates: string[] = [];
+    const outputUpdatedSub = await bus.subscribeTopic(
+      "evt.adapter",
+      { mode: "tail", offset: { type: "now" } },
+      async (message, context) => {
+        if (
+          message.type === lilacEventTypes.EvtAdapterMessageUpdated &&
+          message.data.platform === "discord"
+        ) {
+          routedOutputUpdates.push(message.data.messageId);
+        }
+        await context.commit();
+      },
+    );
+    const adapterIngress = await bridgeAdapterToBus({
+      adapter,
+      bus,
+      subscriptionId: "production-primary-auto-inject-ingress",
+      transcriptStore: store,
+    });
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "production-primary-auto-inject-router",
+      config,
+      transcriptStore: store,
+      routerGate: async () => ({ forward: true, reason: "deterministic integration route" }),
+    });
+    const outputRelay = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "production-primary-auto-inject-relay",
+      transcriptStore: store,
+    });
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-primary-auto-inject",
+      config,
+      pluginManager: corePrimaryTestPluginManager(),
+      cwd: dataDir,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      conversationThreads: {
+        planAutoInjectSearch: async () => {
+          plannedSearches += 1;
+          return autoInjectPlanForQuery("native continuation", "Find continuation context.");
+        },
+        search: async () => ({
+          meta: {
+            query: "native continuation",
+            limit: 1,
+            mode: "hybrid",
+            minScore: 0.1,
+            count: 1,
+            vectorAvailable: false,
+          },
+          results: [
+            {
+              threadId: "related-thread",
+              title: "Relevant native continuation context",
+              brief: "A deterministic auto-injected result.",
+              score: 0.9,
+            },
+          ],
+        }),
+        metadata: async () => {
+          throw new Error("not used");
+        },
+        read: async () => {
+          throw new Error("not used");
+        },
+        runSummarization: async () => {
+          throw new Error("not used");
+        },
+      },
+      materializeClaudeCodeRun: async (options) => {
+        const start = options.nativeSession;
+        if (!start || start.mode === "ephemeral")
+          throw new Error("expected persistent Claude start");
+        const runIndex = starts.length;
+        starts.push(start);
+        const observation = (): ClaudeNativeAttemptObservation => ({
+          requestedSessionId: start.sessionId,
+          sourceSessionId: start.mode === "fork" ? start.baseSessionId : null,
+          initSessionId: start.sessionId,
+          resultSessionId: start.sessionId,
+          contextTokens: 100 + runIndex,
+          contextMaxTokens: 4_000,
+          requestedModel: options.modelId,
+          initializedModel: options.modelId,
+          requestedReasoning: options.reasoning ?? null,
+          providerWarnings: [],
+          invoked: true,
+          requiredObservabilityError: null,
+          callbackError: null,
+        });
+        const model = new MockLanguageModelV4({
+          modelId: options.modelId,
+          doStream: async (call) => {
+            modelPrompts.push([...call.prompt]);
+            return level1TextStep(`auto-inject response ${runIndex + 1}`);
+          },
+        });
+        return {
+          agentModel: model,
+          continuationModel: model,
+          createUtilityModel: () => model,
+          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          nativeSession: {
+            getObservation: observation,
+            waitForObservation: async () => observation(),
+            recordWarning: () => {},
+            finalize: async () => ({
+              status: "promotable" as const,
+              issues: [] as const,
+              observations: observation(),
+              candidate: {
+                sessionId: start.sessionId,
+                cwd: options.cwd,
+                lastModified: 1_000 + runIndex,
+              },
+              sourcePreflight:
+                start.mode === "fork"
+                  ? {
+                      sessionId: start.baseSessionId,
+                      cwd: options.cwd,
+                      lastModified: start.expectedSourceLastModified,
+                    }
+                  : null,
+              sourceFinal:
+                start.mode === "fork"
+                  ? {
+                      sessionId: start.baseSessionId,
+                      cwd: options.cwd,
+                      lastModified: start.expectedSourceLastModified,
+                    }
+                  : null,
+            }),
+          },
+          dispose: async () => {},
+        };
+      },
+    });
+
+    const firstRequestId = `discord:${sessionId}:input-1`;
+    const firstText = Array.from({ length: 40 }, (_, index) => `detail-${index}`).join(" ");
+    const firstLifecycle = await observeRequestLifecycle(bus, firstRequestId);
+    const firstRelayedResponse = await observeResponseAfterOutputRelay(bus, firstRequestId);
+    await adapter.emitCreated({
+      ref: { platform: "discord", channelId: sessionId, messageId: "input-1" },
+      session: { platform: "discord", channelId: sessionId },
+      userId: "user-1",
+      userName: "User One",
+      text: `<@bot> ${firstText}`,
+      ts: 1_000,
+      raw: {
+        reference: {},
+        discord: {
+          isChat: true,
+          isDMBased: false,
+          mentionsBot: true,
+          replyToBot: false,
+          botUserId: "bot",
+        },
+      },
+    });
+    await expect(firstLifecycle.terminal).resolves.toBe("resolved");
+    await firstRelayedResponse.relayed;
+    expect(await outputCreated.promise).toEqual({
+      platform: "discord",
+      channelId: sessionId,
+      messageId: "output-1",
+    });
+
+    const firstRouted = routedRequests.find(
+      (request) => request.headers?.request_id === firstRequestId,
+    );
+    if (!firstRouted || firstRouted.data.corePrimaryLineage?.state !== "complete") {
+      throw new Error("first request did not route with complete Stage 6 lineage");
+    }
+    const firstInputManifest = firstRouted.data.corePrimaryLineage;
+    const persistedFirstManifest = store.getCorePrimaryLineageManifest({
+      requestId: firstRequestId,
+    });
+    if (!persistedFirstManifest) throw new Error("auto-injected manifest was not persisted");
+    expect(persistedFirstManifest.currentCanonicalStart).toBe(
+      firstInputManifest.currentCanonicalStart,
+    );
+    expect(persistedFirstManifest.segments.slice(0, -1)).toEqual(firstInputManifest.segments);
+    expect(persistedFirstManifest.segments.at(-1)?.atoms).toEqual([
+      expect.objectContaining({ kind: "synthetic", source: "conversation-thread-auto-inject" }),
+    ]);
+    expect(
+      persistedFirstManifest.segments.at(-1)?.canonicalMessages.map((message) => message.role),
+    ).toEqual(["assistant", "tool"]);
+    const firstOutput = adapter.outputs[0];
+    if (!firstOutput) throw new Error("first output stream was not created");
+    expect(
+      firstOutput.parts
+        .filter((part) => part.type === "tool.status")
+        .map((part) => part.update.status),
+    ).toEqual(["start", "end"]);
+    expect(firstOutput.parts[0]).toMatchObject({
+      type: "tool.status",
+      update: { status: "start", display: "conversation_thread_search auto-injected metadata" },
+    });
+    expect(
+      adapter.updatedOutputMessageIds.filter((id) => id === firstOutput.messageId).length,
+    ).toBe(firstOutput.parts.length);
+    expect(routedOutputUpdates.filter((id) => id === firstOutput.messageId).length).toBe(
+      firstOutput.parts.length,
+    );
+    expect(adapter.messages.get(firstOutput.messageId)?.text).toBe("auto-inject response 1");
+    expect(
+      store.getTranscriptBySurfaceMessage({
+        platform: "discord",
+        channelId: sessionId,
+        messageId: firstOutput.messageId,
+      })?.requestId,
+    ).toBe(firstRequestId);
+    const firstBinding = store.getCorePrimaryClaudeSessionBinding({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+    });
+    const firstTranscript = store.getRequestTranscript({ requestId: firstRequestId });
+    if (!firstBinding || !firstTranscript?.transcriptDigest || !firstTranscript.providerState) {
+      throw new Error("auto-injected first turn did not promote");
+    }
+    expect(firstBinding).toMatchObject(
+      computeCorePrimaryClaudeTerminalHead({
+        manifest: persistedFirstManifest,
+        requestId: firstRequestId,
+        transcriptDigest: firstTranscript.transcriptDigest,
+        responseMessageCount: firstTranscript.messages.length,
+        providerState: firstTranscript.providerState,
+      }),
+    );
+
+    const secondRequestId = `discord:${sessionId}:input-2`;
+    const secondLifecycle = await observeRequestLifecycle(bus, secondRequestId);
+    const secondRelayedResponse = await observeResponseAfterOutputRelay(bus, secondRequestId);
+    await adapter.emitCreated({
+      ref: { platform: "discord", channelId: sessionId, messageId: "input-2" },
+      session: { platform: "discord", channelId: sessionId },
+      userId: "user-1",
+      userName: "User One",
+      text: "next",
+      ts: 20_000,
+      raw: {
+        reference: { messageId: firstOutput.messageId, channelId: sessionId },
+        discord: {
+          isChat: true,
+          isDMBased: false,
+          mentionsBot: false,
+          replyToBot: true,
+          botUserId: "bot",
+        },
+      },
+    });
+    await expect(secondLifecycle.terminal).resolves.toBe("resolved");
+    await secondRelayedResponse.relayed;
+
+    const secondRouted = routedRequests.find(
+      (request) => request.headers?.request_id === secondRequestId,
+    );
+    if (!secondRouted || secondRouted.data.corePrimaryLineage?.state !== "complete") {
+      throw new Error("second request did not route with complete Stage 6 lineage");
+    }
+    const secondManifest = secondRouted.data.corePrimaryLineage;
+    expect(secondManifest.segments.map((segment) => segment.atoms[0]?.kind)).toEqual([
+      "surface",
+      "synthetic",
+      "request",
+      "surface",
+    ]);
+    expect(secondManifest.segments[2]?.requestSource?.aliases).toEqual([
+      {
+        requestClient: "discord",
+        surfaceId: `discord:${sessionId}`,
+        sessionId,
+        messageId: firstOutput.messageId,
+      },
+    ]);
+    expect(secondManifest.segments[1]?.canonicalMessages).toEqual(
+      persistedFirstManifest.segments.at(-1)?.canonicalMessages,
+    );
+    const secondCurrentSegment = secondManifest.segments.at(-1);
+    if (!secondCurrentSegment) throw new Error("second current segment is missing");
+    expect(secondManifest.currentCanonicalStart).toBe(secondCurrentSegment.canonicalStart);
+
+    expect(plannedSearches).toBe(1);
+    expect(starts[0]).toMatchObject({ mode: "fresh", sessionId: firstBinding.claudeSessionId });
+    expect(starts[1]).toMatchObject({
+      mode: "fork",
+      baseSessionId: firstBinding.claudeSessionId,
+    });
+    expect(modelPrompts).toHaveLength(2);
+    expect(JSON.stringify(modelPrompts[0])).toContain("related-thread");
+    expect(JSON.stringify(modelPrompts[1])).toContain("next");
+    expect(JSON.stringify(modelPrompts[1])).not.toContain("detail-0");
+    expect(JSON.stringify(modelPrompts[1])).not.toContain("related-thread");
+    expect(
+      store.getCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+      })?.revision,
+    ).toBe(2);
+
+    await Promise.all([
+      firstLifecycle.stop(),
+      secondLifecycle.stop(),
+      firstRelayedResponse.stop(),
+      secondRelayedResponse.stop(),
+    ]);
+    await runner.stop();
+    await outputRelay.stop();
+    await router.stop();
+    await adapterIngress.stop();
+    await routedSub.stop();
+    await outputCreatedSub.stop();
+    await outputUpdatedSub.stop();
+    store.close();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("promotes fresh and exact-fork tool-loop turns, then fences cancellation and CAS loss", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = {
+      model: "claude-code/sonnet",
+      fallback: ["openai/must-not-run"],
+    };
+    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-primary-claude-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const sessionId = "primary-claude-session";
+    const starts: ClaudeNativeSessionStart[] = [];
+    const modelPrompts: ModelMessage[][][] = [];
+    const finalizationStarted = [deferred<void>(), deferred<void>()];
+    const releaseFinalization = [deferred<void>(), deferred<void>()];
+    const switchedModels: Array<string | undefined> = [];
+    const materialize = async (
+      options: Parameters<typeof materializeClaudeCodeRun>[0],
+    ): Promise<MaterializedClaudeCodeRun> => {
+      const start = options.nativeSession;
+      if (!start || start.mode === "ephemeral") throw new Error("expected persistent Claude start");
+      const runIndex = starts.length;
+      starts.push(start);
+      modelPrompts.push([]);
+      let modelCalls = 0;
+      let contextTokens = 100 + runIndex * 100;
+      const observation = (): ClaudeNativeAttemptObservation => ({
+        requestedSessionId: start.sessionId,
+        sourceSessionId: start.mode === "fork" ? start.baseSessionId : null,
+        initSessionId: start.sessionId,
+        resultSessionId: start.sessionId,
+        contextTokens,
+        contextMaxTokens: 4_000,
+        requestedModel: options.modelId,
+        initializedModel: options.modelId,
+        requestedReasoning: options.reasoning ?? null,
+        providerWarnings: [],
+        invoked: true,
+        requiredObservabilityError: null,
+        callbackError: null,
+      });
+      const model = new MockLanguageModelV4({
+        modelId: options.modelId,
+        doStream: async (call) => {
+          modelPrompts[runIndex]!.push([...call.prompt]);
+          modelCalls += 1;
+          if (runIndex === 1 && modelCalls === 1) {
+            return level1ToolCallStep([{ toolCallId: "native-tool", toolName: "builtin" }]);
+          }
+          return level1TextStep(`native response ${runIndex + 1}`);
+        },
+      });
+      return {
+        agentModel: model,
+        continuationModel: model,
+        createUtilityModel: () => model,
+        control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+        nativeSession: {
+          getObservation: observation,
+          waitForObservation: async () => {
+            contextTokens += 25;
+            return observation();
+          },
+          recordWarning: () => {},
+          finalize: async () => {
+            if (runIndex === 2 || runIndex === 3) {
+              const gateIndex = runIndex - 2;
+              finalizationStarted[gateIndex]!.resolve(undefined);
+              await releaseFinalization[gateIndex]!.promise;
+            }
+            return {
+              status: "promotable" as const,
+              issues: [] as const,
+              observations: observation(),
+              candidate: {
+                sessionId: start.sessionId,
+                cwd: options.cwd,
+                lastModified: 1_000 + runIndex,
+              },
+              sourcePreflight:
+                start.mode === "fork"
+                  ? {
+                      sessionId: start.baseSessionId,
+                      cwd: options.cwd,
+                      lastModified: start.expectedSourceLastModified,
+                    }
+                  : null,
+              sourceFinal:
+                start.mode === "fork"
+                  ? {
+                      sessionId: start.baseSessionId,
+                      cwd: options.cwd,
+                      lastModified: start.expectedSourceLastModified,
+                    }
+                  : null,
+            };
+          },
+        },
+        dispose: async () => {},
+      };
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-primary-claude",
+      config,
+      pluginManager: corePrimaryTestPluginManager(),
+      cwd: dataDir,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      materializeClaudeCodeRun: materialize,
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent(options);
+        const setModel = agent.setModel.bind(agent);
+        agent.setModel = (model, providerOptions, modelSpecifier, reasoning) => {
+          switchedModels.push(modelSpecifier);
+          setModel(model, providerOptions, modelSpecifier, reasoning);
+        };
+        return agent;
+      },
+    });
+
+    const firstRequestId = "discord:primary-claude-session:input-1";
+    const firstMessages = [{ role: "user", content: "first current" }] satisfies ModelMessage[];
+    const firstManifest = buildCoreLineageManifestV1([
+      admitPrimarySurface(store, sessionId, "input-1", firstMessages),
+    ]);
+    const firstLifecycle = await observeRequestLifecycle(bus, firstRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: firstRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "first current",
+      corePrimaryLineage: firstManifest,
+    });
+    await expect(firstLifecycle.terminal).resolves.toBe("resolved");
+    const firstBinding = store.getCorePrimaryClaudeSessionBinding({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+    });
+    if (!firstBinding) throw new Error("first binding was not promoted");
+    const firstTranscript = store.getRequestTranscript({ requestId: firstRequestId });
+    if (!firstTranscript?.transcriptDigest) throw new Error("first transcript digest is missing");
+    const firstHead = computeCorePrimaryClaudeTerminalHead({
+      manifest: firstManifest,
+      requestId: firstRequestId,
+      transcriptDigest: firstTranscript.transcriptDigest,
+      responseMessageCount: firstTranscript.messages.length,
+      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+    });
+    expect(starts[0]).toMatchObject({ mode: "fresh", sessionId: firstBinding.claudeSessionId });
+    expect(firstBinding).toMatchObject(firstHead);
+
+    const secondRequestId = "discord:primary-claude-session:input-2";
+    const secondMessages = [{ role: "user", content: "second current" }] satisfies ModelMessage[];
+    const secondManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: firstManifest,
+      completedRequestId: firstRequestId,
+      outputMessageId: "output-1",
+      currentMessageId: "input-2",
+      currentMessages: secondMessages,
+    });
+    const secondLifecycle = await observeRequestLifecycle(bus, secondRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: secondRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "second current",
+      messages: secondManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: secondManifest,
+    });
+    expect({ terminal: await secondLifecycle.terminal, details: secondLifecycle.details }).toEqual({
+      terminal: "resolved",
+      details: [undefined, undefined],
+    });
+    const secondBinding = store.getCorePrimaryClaudeSessionBinding({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+    });
+    if (!secondBinding) throw new Error("second binding was not promoted");
+    const secondTranscript = store.getRequestTranscript({ requestId: secondRequestId });
+    if (!secondTranscript?.transcriptDigest) throw new Error("second transcript digest is missing");
+    const secondHead = computeCorePrimaryClaudeTerminalHead({
+      manifest: secondManifest,
+      requestId: secondRequestId,
+      transcriptDigest: secondTranscript.transcriptDigest,
+      responseMessageCount: secondTranscript.messages.length,
+      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+    });
+    expect(starts[1]).toMatchObject({
+      mode: "fork",
+      baseSessionId: firstBinding.claudeSessionId,
+      sessionId: secondBinding.claudeSessionId,
+    });
+    expect(modelPrompts[1]).toHaveLength(2);
+    expect(JSON.stringify(modelPrompts[1]?.[0])).not.toContain("first current");
+    expect(JSON.stringify(modelPrompts[1]?.[0])).toContain("second current");
+    expect(JSON.stringify(modelPrompts[1]?.[1])).toContain(
+      "Continue after the completed tool call.",
+    );
+    expect(
+      JSON.stringify(store.getRequestTranscript({ requestId: secondRequestId })?.messages),
+    ).toContain("native-tool");
+    expect(secondBinding.canonicalMessageCount).toBe(
+      secondManifest.segments.at(-1)!.canonicalEnd +
+        store.getRequestTranscript({ requestId: secondRequestId })!.messages.length,
+    );
+    expect(secondBinding).toMatchObject(secondHead);
+    expect(secondBinding.nativeContextTokens).toBeGreaterThan(firstBinding.nativeContextTokens);
+
+    const cancellationRequestId = "discord:primary-claude-session:input-cancel";
+    const cancellationMessages = [
+      { role: "user", content: "cancel during finalize" },
+    ] satisfies ModelMessage[];
+    const cancellationManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: secondManifest,
+      completedRequestId: secondRequestId,
+      outputMessageId: "output-2",
+      currentMessageId: "input-cancel",
+      currentMessages: cancellationMessages,
+    });
+    const cancellationLifecycle = await observeRequestLifecycle(bus, cancellationRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: cancellationRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "cancel during finalize",
+      messages: cancellationManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: cancellationManifest,
+    });
+    await finalizationStarted[0]!.promise;
+    await publishRunnerRequest({
+      bus,
+      requestId: cancellationRequestId,
+      sessionId,
+      requestClient: "discord",
+      queue: "interrupt",
+      text: "cancel",
+      raw: { cancel: true },
+    });
+    releaseFinalization[0]!.resolve(undefined);
+    await expect(cancellationLifecycle.terminal).resolves.toBe("cancelled");
+    expect(starts[2]).toMatchObject({
+      mode: "fork",
+      baseSessionId: secondBinding.claudeSessionId,
+    });
+    expect(
+      store.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId: cancellationRequestId,
+        attemptIndex: 0,
+      }),
+    ).toMatchObject({
+      candidateSessionId:
+        starts[2]?.mode === "fresh" || starts[2]?.mode === "fork" ? starts[2].sessionId : null,
+      sourceSessionId: secondBinding.claudeSessionId,
+      state: "cancelled",
+    });
+    expect(
+      store.getCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+      }),
+    ).toEqual(secondBinding);
+
+    const raceRequestId = "discord:primary-claude-session:input-race";
+    const raceMessages = [{ role: "user", content: "race finalize" }] satisfies ModelMessage[];
+    const raceManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: secondManifest,
+      completedRequestId: secondRequestId,
+      outputMessageId: "output-2-race",
+      currentMessageId: "input-race",
+      currentMessages: raceMessages,
+    });
+    const raceLifecycle = await observeRequestLifecycle(bus, raceRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: raceRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "race finalize",
+      messages: raceManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: raceManifest,
+    });
+    await finalizationStarted[1]!.promise;
+    expect(starts[3]).toMatchObject({
+      mode: "fork",
+      baseSessionId: secondBinding.claudeSessionId,
+    });
+
+    const competitorRequestId = "primary-competitor";
+    const competitorSessionId = crypto.randomUUID();
+    store.reserveCorePrimaryClaudeSessionAttempt({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+      executionScopeHashVersion: 1,
+      executionScopeHash: secondBinding.executionScopeHash,
+      requestId: competitorRequestId,
+      attemptIndex: 0,
+      candidateSessionId: competitorSessionId,
+      sourceSessionId: secondBinding.claudeSessionId,
+      expectedBindingRevision: secondBinding.revision,
+    });
+    store.saveRequestTranscript({
+      requestId: competitorRequestId,
+      sessionId,
+      requestClient: "discord",
+      messages: [{ role: "assistant", content: "competitor response" }],
+      corePrimaryLineage: raceManifest,
+    });
+    const competitorTranscript = store.getRequestTranscript({ requestId: competitorRequestId });
+    if (!competitorTranscript?.transcriptDigest)
+      throw new Error("competitor transcript is missing");
+    const competitorHead = computeCorePrimaryClaudeTerminalHead({
+      manifest: raceManifest,
+      requestId: competitorRequestId,
+      transcriptDigest: competitorTranscript.transcriptDigest,
+      responseMessageCount: competitorTranscript.messages.length,
+      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+    });
+    store.publishCorePrimaryClaudeSuccess({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+      requestId: competitorRequestId,
+      attemptIndex: 0,
+      terminalRequestId: competitorRequestId,
+      terminalLineageVersion: 1,
+      terminalAtomCount: competitorHead.atomCount,
+      terminalPrefixDigest: competitorHead.prefixDigest,
+      terminalCanonicalMessageCount: competitorHead.canonicalMessageCount,
+      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+      nativeCwd: dataDir,
+      nativeLastModified: 9_999,
+      nativeContextTokens: 999,
+      nativeContextMaxTokens: 4_000,
+      lastModelSpecifier: "claude-code/sonnet",
+      lastReasoning: "provider-default",
+    });
+    expect(
+      store.promoteCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId: competitorRequestId,
+        attemptIndex: 0,
+      }),
+    ).toBe(true);
+    releaseFinalization[1]!.resolve(undefined);
+    await expect(raceLifecycle.terminal).resolves.toBe("resolved");
+    expect(
+      store.getCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+      }),
+    ).toMatchObject({
+      claudeSessionId: competitorSessionId,
+      atomCount: competitorHead.atomCount,
+      prefixDigest: competitorHead.prefixDigest,
+      canonicalMessageCount: competitorHead.canonicalMessageCount,
+    });
+    expect(
+      store.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId: raceRequestId,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("failed");
+    expect(
+      store.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId: raceRequestId,
+        attemptIndex: 0,
+      }),
+    ).toMatchObject({
+      candidateSessionId:
+        starts[3]?.mode === "fresh" || starts[3]?.mode === "fork" ? starts[3].sessionId : null,
+      sourceSessionId: secondBinding.claudeSessionId,
+    });
+    expect(switchedModels).toEqual([]);
+
+    await Promise.all([
+      firstLifecycle.stop(),
+      secondLifecycle.stop(),
+      cancellationLifecycle.stop(),
+      raceLifecycle.stop(),
+    ]);
+    await runner.stop();
+    store.close();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("does not invoke a configured cross-family fallback after a Claude failure", async () => {
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = {
+      model: "claude-code/sonnet",
+      fallback: ["openai/must-not-run"],
+    };
+    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-primary-fallback-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const sessionId = "primary-no-fallback";
+    let materializations = 0;
+    const switchedModels: Array<string | undefined> = [];
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "production-primary-no-fallback",
+      config,
+      pluginManager: corePrimaryTestPluginManager(),
+      cwd: dataDir,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      materializeClaudeCodeRun: async (options) => {
+        materializations += 1;
+        const start = options.nativeSession;
+        if (!start || start.mode === "ephemeral")
+          throw new Error("expected persistent Claude start");
+        const observation: ClaudeNativeAttemptObservation = {
+          requestedSessionId: start.sessionId,
+          sourceSessionId: null,
+          initSessionId: start.sessionId,
+          resultSessionId: start.sessionId,
+          contextTokens: 100,
+          contextMaxTokens: 4_000,
+          requestedModel: options.modelId,
+          initializedModel: options.modelId,
+          requestedReasoning: options.reasoning ?? null,
+          providerWarnings: [],
+          invoked: true,
+          requiredObservabilityError: null,
+          callbackError: null,
+        };
+        const failingModel = new MockLanguageModelV4({
+          modelId: options.modelId,
+          doStream: async () => {
+            throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+          },
+        });
+        return {
+          agentModel: failingModel,
+          continuationModel: failingModel,
+          createUtilityModel: () => failingModel,
+          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          nativeSession: {
+            getObservation: () => observation,
+            waitForObservation: async () => observation,
+            recordWarning: () => {},
+            finalize: async () => ({
+              status: "promotable" as const,
+              issues: [] as const,
+              observations: observation,
+              candidate: { sessionId: start.sessionId, cwd: options.cwd, lastModified: 1 },
+              sourcePreflight: null,
+              sourceFinal: null,
+            }),
+          },
+          dispose: async () => {},
+        };
+      },
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent(options);
+        const setModel = agent.setModel.bind(agent);
+        agent.setModel = (model, providerOptions, modelSpecifier, reasoning) => {
+          switchedModels.push(modelSpecifier);
+          setModel(model, providerOptions, modelSpecifier, reasoning);
+        };
+        return agent;
+      },
+    });
+    const requestId = "discord:primary-no-fallback:input";
+    const messages = [{ role: "user", content: "fail without fallback" }] satisfies ModelMessage[];
+    const manifest = buildCoreLineageManifestV1([
+      admitPrimarySurface(store, sessionId, "input", messages),
+    ]);
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fail without fallback",
+      corePrimaryLineage: manifest,
+    });
+
+    await expect(lifecycle.terminal).resolves.toBe("failed");
+    expect(materializations).toBe(1);
+    expect(switchedModels).toEqual([]);
+    expect(
+      store.getCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+      }),
+    ).toBeNull();
+
+    await lifecycle.stop();
+    await runner.stop();
+    store.close();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+});
+
+describe("Core-primary local compaction replacement", () => {
+  it("maps the current boundary and text-lowers retained mixed history in the fresh payload", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const oldPrefix = [
+      { role: "user", content: `old question ${"x".repeat(20_000)}` },
+      { role: "assistant", content: "old answer" },
+    ] satisfies ModelMessage[];
+    const retainedHistorical = [
+      { role: "user", content: "retained historical question" },
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "old-tool", toolName: "builtin", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "old-tool",
+            toolName: "builtin",
+            output: { type: "text", value: "historical tool output" },
+          },
+        ],
+      },
+      { role: "assistant", content: "retained historical answer" },
+    ] satisfies ModelMessage[];
+    const current = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "current question" },
+          { type: "file", data: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+        ],
+      },
+    ] satisfies ModelMessage[];
+    const originalMessages = [...oldPrefix, ...retainedHistorical, ...current];
+    let lineage: CorePrimaryLineageV1 = buildCoreLineageManifestV1(
+      [
+        {
+          atoms: [
+            {
+              kind: "synthetic",
+              source: "old-prefix",
+              messageDigest: hashCanonicalMessagesV1(oldPrefix).hash,
+            },
+          ],
+          canonicalMessages: oldPrefix,
+        },
+        {
+          atoms: [
+            {
+              kind: "synthetic",
+              source: "retained-history",
+              messageDigest: hashCanonicalMessagesV1(retainedHistorical).hash,
+            },
+          ],
+          canonicalMessages: retainedHistorical,
+        },
+        {
+          atoms: [
+            {
+              kind: "synthetic",
+              source: "current-media",
+              messageDigest: hashCanonicalMessagesV1(current).hash,
+            },
+          ],
+          canonicalMessages: current,
+        },
+      ],
+      { currentSegmentIndex: 2 },
+    );
+    const mainPayloads: ModelMessage[][] = [];
+    const mainModel = new MockLanguageModelV4({
+      modelId: "sonnet",
+      doStream: async (call) => {
+        mainPayloads.push([...call.prompt]);
+        return level1TextStep("fresh response");
+      },
+    });
+    const summaryModel = new MockLanguageModelV4({
+      modelId: "summary",
+      doStream: async () => level1TextStep("## Objective\n- Preserve current input."),
+    });
+    const materializedStarts: ClaudeNativeSessionStart[] = [];
+    const disposedSessionIds: string[] = [];
+    const observation: ClaudeNativeAttemptObservation = {
+      requestedSessionId: null,
+      sourceSessionId: null,
+      initSessionId: null,
+      resultSessionId: null,
+      contextTokens: null,
+      contextMaxTokens: null,
+      requestedModel: "sonnet",
+      initializedModel: null,
+      requestedReasoning: null,
+      providerWarnings: [],
+      invoked: false,
+      requiredObservabilityError: null,
+      callbackError: null,
+    };
+    const runtime = createCorePrimaryClaudeRuntime({
+      store,
+      sessionId: "compaction-session",
+      requestId: "compaction-request",
+      providerId: "claude-code",
+      modelSpecifier: "claude-code/sonnet",
+      reasoning: "provider-default",
+      executionScopeHash: "scope",
+      executionCwd: dataDir,
+      getLineage: () => lineage,
+      materialize: async (start) => {
+        materializedStarts.push(start);
+        return {
+          agentModel: mainModel,
+          continuationModel: mainModel,
+          createUtilityModel: () => summaryModel,
+          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          nativeSession: {
+            getObservation: () => ({
+              ...observation,
+              requestedSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+              initSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+              resultSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+              invoked: true,
+            }),
+            waitForObservation: async () => observation,
+            recordWarning: () => {},
+            finalize: async () => ({
+              status: "unpromotable" as const,
+              issues: [
+                { code: "candidate-missing" as const, message: "not finalized in this test" },
+              ],
+              observations: observation,
+              candidate: null,
+              sourcePreflight: null,
+              sourceFinal: null,
+            }),
+          },
+          dispose: async () => {
+            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
+          },
+        };
+      },
+    });
+    await runtime.prepareModelCall({
+      canonicalMessages: originalMessages,
+      fullBudgetView: originalMessages,
+      runtime: {
+        model: mainModel,
+        modelSpecifier: "claude-code/sonnet",
+        executionMode: "provider-tools",
+      },
+      payload: { mode: "full" },
+      transformContext: { system: "test", tools: level1TestToolset().tools },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "claude-code/sonnet",
+      messages: originalMessages,
+      tools: level1TestToolset().tools,
+      sendToolsToModel: false,
+      prepareModelCall: runtime.prepareModelCall,
+    });
+    let replacement:
+      | {
+          originalSuffixStart: number;
+          replacementSuffixStart: number;
+          replacementMessageCount: number;
+        }
+      | undefined;
+    const detach = await attachAutoCompaction(agent, {
+      model: "claude-code/sonnet",
+      modelCapability: new ModelCapability({ fetch: globalThis.fetch }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 2_000, output: 200 }),
+      resolveSummaryContextLimit: () => 2_000,
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTurns: 2,
+      keepRecentTokens: 1_000,
+      prepareFullModelView: (messages) => runtime.prepareHistoryView(messages),
+      prepareFullBudgetView: (messages, context) =>
+        runtime.prepareFullBudgetView(messages, context.canonicalStartIndex),
+      resolveCurrentInputCanonicalStart: () => lineage.currentCanonicalStart,
+      onCompactionEnd: (event) => {
+        if (event.status !== "completed" || !event.canonicalReplacement) return;
+        replacement = event.canonicalReplacement;
+        lineage = degradeCorePrimaryLineageForMutation(
+          "compaction-checkpoint-transform",
+          mapCorePrimaryCompactionCurrentCanonicalStart({
+            previousCurrentCanonicalStart: lineage.currentCanonicalStart,
+            replacement: event.canonicalReplacement,
+          }),
+        );
+      },
+    });
+
+    try {
+      await agent.continue();
+    } finally {
+      detach();
+      await runtime.retireAtRunEnd();
+    }
+
+    expect(replacement).toMatchObject({
+      originalSuffixStart: 3,
+      replacementSuffixStart: 1,
+      replacementMessageCount: 5,
+    });
+    expect(String(lineage.state)).toBe("fresh-only");
+    expect(lineage.currentCanonicalStart).toBe(4);
+    expect("reason" in lineage ? lineage.reason : null).toBe("compaction-checkpoint-transform");
+    expect(materializedStarts).toHaveLength(2);
+    expect(materializedStarts[0]).toMatchObject({ mode: "fresh" });
+    expect(materializedStarts[1]).toMatchObject({ mode: "fresh" });
+    const firstStart = materializedStarts[0];
+    const replacementStart = materializedStarts[1];
+    if (
+      !firstStart ||
+      !replacementStart ||
+      firstStart.mode === "ephemeral" ||
+      replacementStart.mode === "ephemeral"
+    ) {
+      throw new Error("expected persisted compaction candidates");
+    }
+    expect(replacementStart.sessionId).not.toBe(firstStart.sessionId);
+    expect(disposedSessionIds).toContain(firstStart.sessionId);
+    expect(agent.state.messages.slice(1, 5)).toEqual([...retainedHistorical.slice(1), ...current]);
+    expect(mainPayloads).toHaveLength(1);
+    const actualPayload = mainPayloads[0]!;
+    const serializedPayload = JSON.stringify(actualPayload);
+    expect(serializedPayload).not.toContain('"type":"tool-call"');
+    expect(serializedPayload).not.toContain('"type":"tool-result"');
+    expect(serializedPayload).toContain("historical tool output");
+    const payloadCurrent = actualPayload.find(
+      (message) =>
+        message.role === "user" &&
+        Array.isArray(message.content) &&
+        message.content.some((part) => part.type === "file"),
+    );
+    if (!payloadCurrent || !Array.isArray(payloadCurrent.content)) {
+      throw new Error("current media payload is missing");
+    }
+    expect(
+      payloadCurrent.content.some(
+        (part) => part.type === "text" && part.text === "current question",
+      ),
+    ).toBe(true);
+    expect(
+      payloadCurrent.content.some((part) => part.type === "file" && part.mediaType === "image/png"),
+    ).toBe(true);
+
+    store.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+});
+
 describe("formatAutoCompactionToolDisplay", () => {
   it("keeps start and successful end displays compact", () => {
     expect(
@@ -1240,6 +3909,128 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
         ],
       },
     });
+  });
+
+  it("appends one deterministic unsliceable synthetic segment after the current boundary", () => {
+    const sourceMessages = [
+      { role: "user", content: "historical" },
+      { role: "user", content: "current" },
+    ] satisfies ModelMessage[];
+    const source = buildCoreLineageManifestV1(
+      [
+        {
+          atoms: [
+            {
+              kind: "surface",
+              requestClient: "discord",
+              surfaceId: "discord:channel",
+              sessionId: "channel",
+              messageId: "historical",
+            },
+          ],
+          canonicalMessages: sourceMessages.slice(0, 1),
+        },
+        {
+          atoms: [
+            {
+              kind: "surface",
+              requestClient: "discord",
+              surfaceId: "discord:channel",
+              sessionId: "channel",
+              messageId: "current",
+            },
+          ],
+          canonicalMessages: sourceMessages.slice(1),
+        },
+      ],
+      { currentSegmentIndex: 1 },
+    );
+    const injected = buildAutoInjectedThreadSearchMessages({
+      toolCallId: "auto-thread-deterministic",
+      entries: [{ threadId: "thread-1", title: "Relevant thread" }],
+    });
+
+    const first = appendAutoInjectedThreadSearchLineage({
+      lineage: source,
+      canonicalMessages: sourceMessages,
+      injectedMessages: injected,
+    });
+    const second = appendAutoInjectedThreadSearchLineage({
+      lineage: source,
+      canonicalMessages: sourceMessages,
+      injectedMessages: injected,
+    });
+
+    expect(first).toEqual(second);
+    if (first.state !== "complete") throw new Error("expected complete appended lineage");
+    expect(first.currentCanonicalStart).toBe(source.currentCanonicalStart);
+    expect(first.segments.slice(0, -1)).toEqual(source.segments);
+    const synthetic = first.segments.at(-1)!;
+    expect(synthetic).toMatchObject({
+      atoms: [
+        {
+          kind: "synthetic",
+          source: "conversation-thread-auto-inject",
+          messageDigest: hashCanonicalMessagesV1(injected).hash,
+        },
+      ],
+      canonicalMessages: injected,
+      canonicalStart: sourceMessages.length,
+      canonicalEnd: sourceMessages.length + injected.length,
+      cumulativeAtomCount: source.segments.at(-1)!.cumulativeAtomCount + 1,
+    });
+    expect(synthetic.canonicalMessages).toHaveLength(2);
+    expect(synthetic.atoms).toHaveLength(1);
+    expect(synthetic.atoms[0]?.kind).toBe("synthetic");
+    expect(() => parseCorePrimaryLineageV1(first, [...sourceMessages, ...injected])).not.toThrow();
+  });
+
+  it("fails closed for missing, fresh-only, malformed, or unaligned source lineage", () => {
+    const canonicalMessages = [{ role: "user", content: "current" }] satisfies ModelMessage[];
+    const injectedMessages = buildAutoInjectedThreadSearchMessages({
+      toolCallId: "auto-thread-invalid",
+      entries: [{ threadId: "thread-1", title: "Relevant thread" }],
+    });
+    const complete = buildCoreLineageManifestV1([
+      {
+        atoms: [
+          {
+            kind: "surface",
+            requestClient: "discord",
+            surfaceId: "discord:channel",
+            sessionId: "channel",
+            messageId: "current",
+          },
+        ],
+        canonicalMessages,
+      },
+    ]);
+    const cases: unknown[] = [
+      undefined,
+      degradeCorePrimaryLineageForMutation("already-fresh", 0),
+      { ...complete, segments: [] },
+      complete,
+    ];
+
+    expect(
+      cases.map((lineage, index) =>
+        appendAutoInjectedThreadSearchLineage({
+          lineage,
+          canonicalMessages:
+            index === cases.length - 1
+              ? [{ role: "user", content: "transformed" }]
+              : canonicalMessages,
+          injectedMessages,
+        }),
+      ),
+    ).toEqual(
+      cases.map(() => ({
+        state: "fresh-only",
+        lineageVersion: 1,
+        currentCanonicalStart: 0,
+        reason: "synthetic-thread-search-insertion",
+      })),
+    );
   });
 });
 
@@ -3005,9 +5796,9 @@ describe("anthropic fallback URL downloads", () => {
         },
       ]);
 
-      expect(downloadCalls).toEqual([
-        "https://example.com/image.png?test=force-download",
+      expect(downloadCalls.toSorted()).toEqual([
         "data:image/png;base64,AA==",
+        "https://example.com/image.png?test=force-download",
       ]);
       expect(result).toEqual([
         {
@@ -3649,6 +6440,105 @@ describe("withBlankLineBetweenTextParts", () => {
     });
 
     expect(out).toBe("Fresh reply.");
+  });
+});
+
+describe("silent assistant turn removal", () => {
+  it("drops pure assistant output only inside the completed turn range", () => {
+    const messages = [
+      { role: "user", content: "request" },
+      { role: "assistant", content: "NO_REPLY" },
+      { role: "assistant", content: "later answer" },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 1, messageCount: 1 })).toEqual(
+      [messages[0]!, messages[2]!],
+    );
+  });
+
+  it("removes sentinel text but preserves structural assistant parts", () => {
+    const messages = [
+      { role: "user", content: "request" },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private" },
+          { type: "text", text: "NO_REPLY" },
+          { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "builtin",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 1, messageCount: 1 })).toEqual(
+      [
+        messages[0]!,
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "private" },
+            { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+          ],
+        },
+        messages[2]!,
+      ],
+    );
+  });
+
+  it("drops reasoning when no structural assistant parts remain", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private" },
+          { type: "text", text: "NO_REPLY" },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
+      [],
+    );
+  });
+
+  it("uses final-answer phase text when commentary precedes the sentinel", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "Commentary update.",
+            providerOptions: { openai: { phase: "commentary" } },
+          },
+          {
+            type: "text",
+            text: "NO_REPLY",
+            providerOptions: { openai: { phase: "final_answer" } },
+          },
+          { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
+      [
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} }],
+        },
+      ],
+    );
   });
 });
 

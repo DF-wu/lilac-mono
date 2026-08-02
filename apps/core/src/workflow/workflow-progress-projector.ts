@@ -7,7 +7,7 @@ import { GithubMessageCreatedError } from "../surface/github/github-adapter";
 import type { ContentOpts, MsgRef, SessionRef } from "../surface/types";
 import { DurableWorkflowStore } from "./durable-workflow-store";
 import { sha256 } from "./workflow-definition";
-import type { WorkflowSurfaceActionKind } from "./workflow-domain";
+import type { WorkflowProgressTarget, WorkflowSurfaceActionKind } from "./workflow-domain";
 import {
   buildWorkflowProgressView,
   renderWorkflowProgressView,
@@ -17,6 +17,7 @@ import {
 export interface WorkflowProgressCardService {
   ensureInitialCard(runId: string): Promise<MsgRef>;
   requestProjection(runId: string): void;
+  isTargetAuthorized?(target: WorkflowProgressTarget): Promise<boolean>;
 }
 
 type CachedActions = {
@@ -92,8 +93,20 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       coalesceMs?: number;
       minEditIntervalMs?: number;
       retryIntervalMs?: number;
+      isTargetAuthorized?: (target: WorkflowProgressTarget) => boolean | Promise<boolean>;
     },
   ) {}
+
+  async isTargetAuthorized(target: WorkflowProgressTarget): Promise<boolean> {
+    return (await this.input.isTargetAuthorized?.(target)) ?? true;
+  }
+
+  private async assertTargetAuthorized(target: WorkflowProgressTarget): Promise<void> {
+    if (await this.isTargetAuthorized(target)) return;
+    throw new Error(
+      `Workflow progress target is no longer authorized: ${target.platform}:${target.channelId}`,
+    );
+  }
 
   async start(): Promise<void> {
     this.stopping = false;
@@ -363,8 +376,10 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     ) {
       throw new Error(`Workflow run ${runId} has no supported durable progress target`);
     }
-    const adapter = this.input.adapters.get(target.platform);
-    if (!adapter) throw new Error(`Workflow progress adapter is unavailable: ${target.platform}`);
+    const platform = target.platform;
+    await this.assertTargetAuthorized(target);
+    const adapter = this.input.adapters.get(platform);
+    if (!adapter) throw new Error(`Workflow progress adapter is unavailable: ${platform}`);
 
     let existing = this.input.store.getSurfaceBinding(runId);
     if (!existing) {
@@ -410,7 +425,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     const content = limitContentText(
       renderWorkflowProgressView({
         view,
-        platform: target.platform,
+        platform,
         actions: toSurfaceActions({ view, actionIds: issued.ids }),
       }),
     );
@@ -421,25 +436,42 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         revision: view.revision.sourceSha256,
       }),
     );
-    if (messageRef && existing.lastRenderedSha256 === renderedSha256) return messageRef;
+    const probeTelegramRemotely = messageRef !== null && verifyExisting && platform === "telegram";
+    if (messageRef && existing.lastRenderedSha256 === renderedSha256 && !probeTelegramRemotely) {
+      return messageRef;
+    }
 
+    let editTargetMissing = false;
     try {
-      const projectedRef = messageRef
-        ? (await adapter.editMsg(messageRef, content), messageRef)
-        : await adapter.sendMsg(
-            asSessionRef(target.platform, target.channelId),
-            content,
-            target.replyToMessageId
-              ? {
-                  replyTo: asSupportedMsgRef(
-                    target.platform,
-                    target.channelId,
-                    target.replyToMessageId,
-                  ),
-                  silent: true,
-                }
-              : { silent: true },
-          );
+      const sendCard = async (): Promise<MsgRef> => {
+        await this.assertTargetAuthorized(target);
+        return await adapter.sendMsg(
+          asSessionRef(platform, target.channelId),
+          content,
+          target.replyToMessageId
+            ? {
+                replyTo: asSupportedMsgRef(platform, target.channelId, target.replyToMessageId),
+                silent: true,
+              }
+            : { silent: true },
+        );
+      };
+      let projectedRef: MsgRef;
+      if (!messageRef) {
+        projectedRef = await sendCard();
+      } else {
+        try {
+          await this.assertTargetAuthorized(target);
+          await adapter.editMsg(messageRef, content);
+          projectedRef = messageRef;
+        } catch (error) {
+          editTargetMissing =
+            error instanceof SurfaceMessageNotFoundError ||
+            (error instanceof GithubApiError && error.status === 404);
+          if (!editTargetMissing || !probeTelegramRemotely) throw error;
+          projectedRef = await sendCard();
+        }
+      }
       this.input.store.commitSurfaceProjection({
         binding: {
           ...existing,
@@ -458,10 +490,11 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       return projectedRef;
     } catch (error) {
       const createdRef = error instanceof GithubMessageCreatedError ? error.messageRef : null;
-      const editTargetMissing =
+      editTargetMissing ||= Boolean(
         messageRef !== null &&
         (error instanceof SurfaceMessageNotFoundError ||
-          (error instanceof GithubApiError && error.status === 404));
+          (error instanceof GithubApiError && error.status === 404)),
+      );
       this.writeFailure(existing, error, now, {
         messageRef: editTargetMissing ? null : (createdRef ?? messageRef),
         lastRenderedSha256: editTargetMissing ? null : existing.lastRenderedSha256,

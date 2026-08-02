@@ -75,10 +75,12 @@ async function git(cwd: string, args: readonly string[], input?: string): Promis
 async function createStore(
   root: string,
   options: Partial<ConstructorParameters<typeof WorkspaceHistoryStore>[0]> = {},
+  initializeSourceRepository = true,
 ): Promise<{ workspace: string; history: string; store: WorkspaceHistoryStore }> {
   const workspace = path.join(root, "workspace");
   const history = path.join(root, "history");
   await mkdir(workspace);
+  if (initializeSourceRepository) await git(workspace, ["init", "--quiet"]);
   const store = new WorkspaceHistoryStore({
     cwd: workspace,
     historyRoot: history,
@@ -91,6 +93,9 @@ async function createStore(
 }
 
 async function captured(store: WorkspaceHistoryStore) {
+  if (!(await lstat(path.join(store.cwd, ".git")).catch(() => undefined))) {
+    await git(store.cwd, ["init", "--quiet"]);
+  }
   const result = await store.capture();
   expect(result.status).toBe("captured");
   if (result.status !== "captured") throw new Error(`capture skipped: ${result.reason}`);
@@ -238,42 +243,41 @@ async function runDurablePlanCrash(params: {
 }
 
 describe("WorkspaceHistoryStore", () => {
-  it("captures and restores a non-Git workspace with hierarchical .gitignore rules", async () => {
+  it("skips non-Git workspaces before initializing the private store", async () => {
     const root = await temporaryDirectory();
-    const { workspace, store } = await createStore(root);
-    await mkdir(path.join(workspace, "build", "keep"), { recursive: true });
-    await mkdir(path.join(workspace, "src", "generated"), { recursive: true });
-    await writeFile(path.join(workspace, ".gitignore"), "build/\nsrc/generated/*.tmp\n");
-    await writeFile(path.join(workspace, "src", ".gitignore"), "*.log\n");
-    await writeFile(path.join(workspace, "source.txt"), "before\n");
-    await writeFile(path.join(workspace, "src", "managed.txt"), "managed-before\n");
-    await writeFile(path.join(workspace, "src", "ignored.log"), "ignored-before\n");
-    await writeFile(path.join(workspace, "src", "generated", "cache.tmp"), "cache-before\n");
-    await writeFile(path.join(workspace, "build", "keep", "artifact.bin"), "artifact-before\n");
+    const metrics: WorkspaceHistoryMetric[] = [];
+    const { workspace, history, store } = await createStore(
+      root,
+      {
+        onMetric: (metric) => {
+          metrics.push(metric);
+        },
+      },
+      false,
+    );
+    await mkdir(path.join(workspace, "large", "nested"), { recursive: true });
+    await writeFile(path.join(workspace, "large", "nested", "secret.txt"), "secret\n");
 
-    const first = await captured(store);
-    await writeFile(path.join(workspace, "source.txt"), "after\n");
-    await rm(path.join(workspace, "src", "managed.txt"));
-    await writeFile(path.join(workspace, "added.txt"), "added\n");
-    await writeFile(path.join(workspace, "src", "ignored.log"), "ignored-after\n");
-    await writeFile(path.join(workspace, "src", "generated", "cache.tmp"), "cache-after\n");
-    await writeFile(path.join(workspace, "build", "keep", "artifact.bin"), "artifact-after\n");
+    expect(await store.capture()).toEqual({ status: "skipped", reason: "non-git-workspace" });
+    expect(metrics.find((metric) => metric.type === "capture")).toMatchObject({
+      outcome: "skipped",
+      candidatePathCount: 0,
+      managedPathCount: 0,
+      payloadBytes: 0n,
+    });
+    expect(await lstat(history).catch(() => undefined)).toBeUndefined();
 
-    expect(await restoreFromCurrent(store, first.rootTreeOid)).toEqual({ status: "restored" });
-    expect(await readFile(path.join(workspace, "source.txt"), "utf8")).toBe("before\n");
-    expect(await readFile(path.join(workspace, "src", "managed.txt"), "utf8")).toBe(
-      "managed-before\n",
-    );
-    expect(await lstat(path.join(workspace, "added.txt")).catch(() => undefined)).toBeUndefined();
-    expect(await readFile(path.join(workspace, "src", "ignored.log"), "utf8")).toBe(
-      "ignored-after\n",
-    );
-    expect(await readFile(path.join(workspace, "src", "generated", "cache.tmp"), "utf8")).toBe(
-      "cache-after\n",
-    );
-    expect(await readFile(path.join(workspace, "build", "keep", "artifact.bin"), "utf8")).toBe(
-      "artifact-after\n",
-    );
+    await git(workspace, ["init", "--quiet"]);
+    expect((await captured(store)).managedPathCount).toBe(1);
+  });
+
+  it("treats a bare repository as outside a Git worktree", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, history, store } = await createStore(root, {}, false);
+    await git(workspace, ["init", "--bare", "--quiet"]);
+
+    expect(await store.capture()).toEqual({ status: "skipped", reason: "non-git-workspace" });
+    expect(await lstat(history).catch(() => undefined)).toBeUndefined();
   });
 
   it("does not mutate a dirty source repository and keeps tracked-but-ignored files managed", async () => {
@@ -368,6 +372,73 @@ describe("WorkspaceHistoryStore", () => {
       statusBefore,
     );
     expect((await readdir(path.join(workspace, ".git"))).sort()).toEqual(gitEntriesBefore);
+  });
+
+  it("does not recursively scan ignored directories when capturing a Git workspace", async () => {
+    const root = await temporaryDirectory();
+    const metrics: WorkspaceHistoryMetric[] = [];
+    const { workspace, store } = await createStore(root, {
+      onMetric: (metric) => {
+        metrics.push(metric);
+      },
+    });
+    await git(workspace, ["init", "--quiet"]);
+    await mkdir(path.join(workspace, "ignored"));
+    await writeFile(path.join(workspace, ".gitignore"), "ignored/\n");
+    await writeFile(path.join(workspace, "tracked.txt"), "tracked\n");
+    await git(workspace, ["add", ".gitignore", "tracked.txt"]);
+    for (let index = 0; index < 100; index += 1) {
+      await writeFile(path.join(workspace, "ignored", `artifact-${index}.txt`), "ignored\n");
+    }
+
+    await captured(store);
+
+    expect(metrics.find((metric) => metric.type === "capture")).toMatchObject({
+      candidatePathCount: 3,
+      managedPathCount: 2,
+      outcome: "captured",
+    });
+  });
+
+  it("captures Git directory-to-file transitions without traversing stale index paths", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    await git(workspace, ["init", "--quiet"]);
+    await mkdir(path.join(workspace, "entry"));
+    await writeFile(path.join(workspace, "entry", "child.txt"), "child\n");
+    await git(workspace, ["add", "entry/child.txt"]);
+    const directorySnapshot = await captured(store);
+
+    await rm(path.join(workspace, "entry"), { recursive: true });
+    await writeFile(path.join(workspace, "entry"), "file\n");
+
+    expect((await captured(store)).managedPathCount).toBe(1);
+    expect(await restoreFromCurrent(store, directorySnapshot.rootTreeOid)).toEqual({
+      status: "restored",
+    });
+    expect(await readFile(path.join(workspace, "entry", "child.txt"), "utf8")).toBe("child\n");
+  });
+
+  it("does not traverse a symlink that replaces a tracked directory", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    const external = path.join(root, "external");
+    await git(workspace, ["init", "--quiet"]);
+    await mkdir(path.join(workspace, "entry"));
+    await mkdir(external);
+    await writeFile(path.join(workspace, "entry", "child.txt"), "inside\n");
+    await writeFile(path.join(external, "child.txt"), "outside\n");
+    await git(workspace, ["add", "entry/child.txt"]);
+
+    await rm(path.join(workspace, "entry"), { recursive: true });
+    await symlink(external, path.join(workspace, "entry"));
+    const snapshot = await captured(store);
+
+    expect(snapshot.managedPathCount).toBe(1);
+    await rm(path.join(workspace, "entry"));
+    expect(await restoreFromCurrent(store, snapshot.rootTreeOid)).toEqual({ status: "restored" });
+    expect(await readlink(path.join(workspace, "entry"))).toBe(external);
+    expect(await readFile(path.join(external, "child.txt"), "utf8")).toBe("outside\n");
   });
 
   it("restores add, modify, delete, binary, executable, symlink, and type transitions", async () => {
@@ -562,7 +633,7 @@ describe("WorkspaceHistoryStore", () => {
 
     await writeFile(path.join(workspace, "later.txt"), "later\n");
     expect(await restoreFromCurrent(store, empty.rootTreeOid)).toEqual({ status: "restored" });
-    expect(await readdir(workspace)).toEqual([]);
+    expect(await readdir(workspace)).toEqual([".git"]);
     expect((await captured(store)).rootTreeOid).toBe(empty.rootTreeOid);
   });
 
@@ -952,7 +1023,7 @@ describe("WorkspaceHistoryStore", () => {
     }
   });
 
-  it("ignores ignored FIFOs but rejects a FIFO in the managed set", async () => {
+  it("does not scan ignored or untracked FIFOs", async () => {
     const root = await temporaryDirectory();
     const { workspace, store } = await createStore(root);
     await writeFile(path.join(workspace, ".gitignore"), "ignored.pipe\n");
@@ -965,10 +1036,7 @@ describe("WorkspaceHistoryStore", () => {
     expect(
       await Bun.spawn(["mkfifo", managedFifo], { stdout: "ignore", stderr: "ignore" }).exited,
     ).toBe(0);
-    await expect(store.capture()).rejects.toMatchObject({
-      code: "workspace-invalid",
-      operation: "capture workspace",
-    });
+    expect(await store.capture()).toMatchObject({ status: "captured", managedPathCount: 1 });
   });
 
   it("supports journaling between prepared restore and apply and rejects stale plans", async () => {
@@ -2565,6 +2633,7 @@ describe("WorkspaceHistoryStore", () => {
     const workspace = path.join(root, "workspace");
     const history = path.join(root, "history");
     await mkdir(workspace);
+    await git(workspace, ["init", "--quiet"]);
     await writeFile(path.join(workspace, "file.txt"), "content\n");
     const callbackFinished = deferred();
     let callbackStarted = false;
@@ -2960,6 +3029,7 @@ describe("WorkspaceHistoryStore", () => {
     const realHistory = path.join(root, "real-history");
     const linkedHistory = path.join(root, "linked-history");
     await mkdir(workspace);
+    await git(workspace, ["init", "--quiet"]);
     await mkdir(realHistory);
     await symlink(realHistory, linkedHistory);
     const store = new WorkspaceHistoryStore({

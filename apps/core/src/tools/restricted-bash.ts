@@ -36,6 +36,7 @@ const logger = createLogger({ module: "restricted-bash" });
 type RestrictedBashContext = {
   requestId?: string;
   sessionId?: string;
+  originSessionId?: string;
   requestClient?: string;
   controlCapability?: string;
   toolCallId?: string;
@@ -283,6 +284,9 @@ function buildToolServerHeaders(
   };
   if (context.requestId) headers["x-lilac-request-id"] = context.requestId;
   if (context.sessionId) headers["x-lilac-session-id"] = context.sessionId;
+  if (context.originSessionId) {
+    headers["x-lilac-origin-session-id"] = context.originSessionId;
+  }
   if (context.requestClient) headers["x-lilac-request-client"] = context.requestClient;
   if (context.controlCapability) {
     headers["x-lilac-control-capability"] = context.controlCapability;
@@ -552,6 +556,9 @@ async function createRestrictedBash(params: {
       LILAC_RESTRICTED_TMP: TMP_MOUNT,
       ...(params.context.requestId ? { LILAC_REQUEST_ID: params.context.requestId } : {}),
       ...(params.context.sessionId ? { LILAC_SESSION_ID: params.context.sessionId } : {}),
+      ...(params.context.originSessionId
+        ? { LILAC_ORIGIN_SESSION_ID: params.context.originSessionId }
+        : {}),
       ...(params.context.requestClient
         ? { LILAC_REQUEST_CLIENT: params.context.requestClient }
         : {}),

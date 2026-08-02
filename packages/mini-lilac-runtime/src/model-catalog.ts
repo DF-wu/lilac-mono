@@ -102,6 +102,7 @@ export type CatalogModel = {
   attachment?: boolean;
   reasoning?: boolean;
   toolCall?: boolean;
+  openaiServerCompaction?: boolean;
   modalities?: {
     input: z.infer<typeof modalitySchema>[];
     output?: z.infer<typeof modalitySchema>[];
@@ -221,6 +222,9 @@ function applyModelOverride(
     ...(override.attachment === undefined ? {} : { attachment: override.attachment }),
     ...(override.reasoning === undefined ? {} : { reasoning: override.reasoning }),
     ...(override.toolCall === undefined ? {} : { toolCall: override.toolCall }),
+    ...(override.openaiServerCompaction === undefined
+      ? {}
+      : { openaiServerCompaction: override.openaiServerCompaction }),
     ...(override.modalities === undefined ? {} : { modalities: override.modalities }),
     ...(override.limit === undefined
       ? {}

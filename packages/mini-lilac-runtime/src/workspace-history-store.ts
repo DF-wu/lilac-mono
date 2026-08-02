@@ -164,15 +164,24 @@ export type WorkspaceHistoryCaptureResult =
       formatVersion: number;
       managedPathCount: number;
     }
-  | { status: "skipped"; reason: "git-unavailable" | "platform-unsupported" };
+  | {
+      status: "skipped";
+      reason: "git-unavailable" | "non-git-workspace" | "platform-unsupported";
+    };
 
 export type WorkspaceHistoryRestoreResult =
   | { status: "restored" }
-  | { status: "skipped"; reason: "git-unavailable" | "platform-unsupported" };
+  | {
+      status: "skipped";
+      reason: "git-unavailable" | "non-git-workspace" | "platform-unsupported";
+    };
 
 export type WorkspaceHistoryVerifyResult =
   | { status: "verified" }
-  | { status: "skipped"; reason: "git-unavailable" | "platform-unsupported" };
+  | {
+      status: "skipped";
+      reason: "git-unavailable" | "non-git-workspace" | "platform-unsupported";
+    };
 
 interface WorkspaceHistoryOperationMetricBase {
   workspaceId: string;
@@ -313,7 +322,10 @@ export type WorkspaceHistoryPathComparison = "case-sensitive" | "case-insensitiv
 
 export type WorkspaceHistoryPrepareRestoreResult =
   | { status: "prepared"; plan: PreparedWorkspaceRestore }
-  | { status: "skipped"; reason: "git-unavailable" | "platform-unsupported" };
+  | {
+      status: "skipped";
+      reason: "git-unavailable" | "non-git-workspace" | "platform-unsupported";
+    };
 
 export interface PreparedWorkspaceRestore {
   readonly rootTreeOid: string;
@@ -329,6 +341,7 @@ export type WorkspaceHistoryExpectedCurrent =
       status: "unavailable";
       reason:
         | "git-unavailable"
+        | "non-git-workspace"
         | "platform-unsupported"
         | "capture-failed"
         | "snapshot-unavailable";
@@ -1028,8 +1041,13 @@ export class WorkspaceHistoryStore {
         this.emitCaptureMetric(startedAt, observation, "skipped");
         return { status: "skipped", reason: capability.reason };
       }
+      const sourceRepository = await this.discoverSourceRepository();
+      if (!sourceRepository) {
+        this.emitCaptureMetric(startedAt, observation, "skipped");
+        return { status: "skipped", reason: "non-git-workspace" };
+      }
       await this.ensureStore();
-      const classified = await this.classifyWorkspace();
+      const classified = await this.classifyWorkspaceForCapture(sourceRepository.root);
       observation.candidatePathCount = classified.entries.size + classified.directories.size;
       observation.managedPathCount = classified.managed.size;
       const result = await this.captureClassifiedWorkspace(classified, observation);
@@ -1329,6 +1347,10 @@ export class WorkspaceHistoryStore {
         this.emitVerifyMetric(startedAt, 0, 0n, "skipped");
         return { status: "skipped", reason: capability.reason };
       }
+      if (!(await this.discoverSourceRepository())) {
+        this.emitVerifyMetric(startedAt, 0, 0n, "skipped");
+        return { status: "skipped", reason: "non-git-workspace" };
+      }
       if (!OID_PATTERN.test(rootTreeOid)) {
         throw new WorkspaceHistoryStoreError({
           code: "snapshot-invalid",
@@ -1369,6 +1391,7 @@ export class WorkspaceHistoryStore {
     if (
       expectedCurrent?.status === "unavailable" &&
       (expectedCurrent.reason === "git-unavailable" ||
+        expectedCurrent.reason === "non-git-workspace" ||
         expectedCurrent.reason === "platform-unsupported")
     ) {
       this.emitRestoreMetric(metricStartedAt, 0, 0, 0n, false, "skipped");
@@ -1378,6 +1401,10 @@ export class WorkspaceHistoryStore {
     if (capability.status === "unavailable") {
       this.emitRestoreMetric(metricStartedAt, 0, 0, 0n, false, "skipped");
       return { status: "skipped", reason: capability.reason };
+    }
+    if (!(await this.discoverSourceRepository())) {
+      this.emitRestoreMetric(metricStartedAt, 0, 0, 0n, false, "skipped");
+      return { status: "skipped", reason: "non-git-workspace" };
     }
     if (!OID_PATTERN.test(rootTreeOid)) {
       throw new WorkspaceHistoryStoreError({
@@ -1571,6 +1598,10 @@ export class WorkspaceHistoryStore {
     if (capability.status === "unavailable") {
       this.emitRestoreMetric(metricStartedAt, 0, 0, 0n, false, "skipped");
       return { status: "skipped", reason: capability.reason };
+    }
+    if (!(await this.discoverSourceRepository())) {
+      this.emitRestoreMetric(metricStartedAt, 0, 0, 0n, false, "skipped");
+      return { status: "skipped", reason: "non-git-workspace" };
     }
     try {
       await this.ensureStore();
@@ -2558,11 +2589,18 @@ export class WorkspaceHistoryStore {
     }
   }
 
-  private async scanWorkspace(): Promise<ScanResult> {
+  private async scanWorkspace(managedPaths?: ReadonlySet<string>): Promise<ScanResult> {
     const entries = new Map<string, ScannedEntry>();
     const directories = new Set<string>();
     const boundaryRoots = new Set<string>();
     const ownedRestoreArtifacts = await this.validatedOwnedRestoreArtifactPaths();
+    const traversedDirectories = new Set<string>();
+    if (managedPaths) {
+      for (const relativePath of managedPaths) {
+        traversedDirectories.add(relativePath);
+        for (const ancestor of pathAncestors(relativePath)) traversedDirectories.add(ancestor);
+      }
+    }
 
     const scanDirectory = async (
       absoluteDirectory: string,
@@ -2591,6 +2629,7 @@ export class WorkspaceHistoryStore {
         const stats = await lstat(absolutePath, { bigint: true });
         if (stats.isDirectory()) {
           directories.add(relativePath);
+          if (managedPaths && !traversedDirectories.has(relativePath)) continue;
           await scanDirectory(absolutePath, relativePath);
           continue;
         }
@@ -2622,26 +2661,35 @@ export class WorkspaceHistoryStore {
   }
 
   private async classifyWorkspace(): Promise<ClassifiedWorkspace> {
-    const scan = await this.scanWorkspace();
     const sourceRepository = await this.discoverSourceRepository();
-    let managedPaths: Set<string>;
-    let ignored: Set<string>;
-    if (sourceRepository) {
-      this.sourceExcludesFile = await this.resolveEffectiveExcludesFile(sourceRepository.root);
-      managedPaths = await this.listSourceManagedPaths(sourceRepository.root);
-      ignored = await this.checkIgnoredPaths(scan, {
-        repositoryRoot: sourceRepository.root,
-        sourceProfile: true,
+    if (!sourceRepository) {
+      throw new WorkspaceHistoryStoreError({
+        code: "workspace-invalid",
+        operation: "classify workspace",
+        message: "Workspace is not inside a Git worktree",
       });
-    } else {
-      ignored = await this.checkIgnoredPaths(scan, {
-        repositoryRoot: this.cwd,
-        sourceProfile: false,
-      });
-      managedPaths = new Set(
-        [...scan.entries.keys()].filter((relativePath) => !ignored.has(relativePath)),
-      );
     }
+    const scan = await this.scanWorkspace();
+    this.sourceExcludesFile = await this.resolveEffectiveExcludesFile(sourceRepository.root);
+    const managedPaths = await this.listSourceManagedPaths(sourceRepository.root);
+    const ignored = await this.checkIgnoredPaths(scan, sourceRepository.root);
+    const managed = new Map<string, ScannedEntry>();
+    for (const relativePath of managedPaths) {
+      const entry = scan.entries.get(relativePath);
+      if (entry) managed.set(relativePath, entry);
+    }
+    for (const relativePath of managed.keys()) ignored.delete(relativePath);
+    const ignoredDirectories = new Set(
+      [...scan.directories].filter((relativePath) => ignored.has(relativePath)),
+    );
+    return { ...scan, managed, ignored, ignoredDirectories };
+  }
+
+  private async classifyWorkspaceForCapture(repositoryRoot: string): Promise<ClassifiedWorkspace> {
+    this.sourceExcludesFile = await this.resolveEffectiveExcludesFile(repositoryRoot);
+    const managedPaths = await this.listSourceManagedPaths(repositoryRoot);
+    const scan = await this.scanWorkspace(managedPaths);
+    const ignored = await this.checkIgnoredPaths(scan, repositoryRoot);
     const managed = new Map<string, ScannedEntry>();
     for (const relativePath of managedPaths) {
       const entry = scan.entries.get(relativePath);
@@ -2660,7 +2708,7 @@ export class WorkspaceHistoryStore {
       acceptedExitCodes: [0, 128],
     });
     if (result.exitCode !== 0) {
-      if (result.stderr.includes("not a git repository")) return undefined;
+      if (/not a git repository|must be run in a work tree/u.test(result.stderr)) return undefined;
       throw new WorkspaceHistoryStoreError({
         code: "git-command-failed",
         operation: "discover source repository",
@@ -2690,9 +2738,12 @@ export class WorkspaceHistoryStore {
     const workspacePrefix = scope === "." ? "" : `${scope}/`;
     const paths = new Set<string>();
     for (const repositoryPath of splitNul(result.stdout, "classify source repository paths")) {
-      const relativePath = workspacePrefix
-        ? repositoryPath.slice(workspacePrefix.length)
+      const normalizedRepositoryPath = repositoryPath.endsWith("/")
+        ? repositoryPath.slice(0, -1)
         : repositoryPath;
+      const relativePath = workspacePrefix
+        ? normalizedRepositoryPath.slice(workspacePrefix.length)
+        : normalizedRepositoryPath;
       if (workspacePrefix && !repositoryPath.startsWith(workspacePrefix)) {
         throw new WorkspaceHistoryStoreError({
           code: "malformed-git-output",
@@ -2742,27 +2793,19 @@ export class WorkspaceHistoryStore {
     return (await lstatIfExists(defaultGlobalExclude))?.isFile() ? defaultGlobalExclude : undefined;
   }
 
-  private async checkIgnoredPaths(
-    scan: ScanResult,
-    options: { repositoryRoot: string; sourceProfile: boolean },
-  ): Promise<Set<string>> {
+  private async checkIgnoredPaths(scan: ScanResult, repositoryRoot: string): Promise<Set<string>> {
     const candidates = [...scan.entries.keys(), ...scan.directories].sort();
     if (candidates.length === 0) return new Set();
-    const scope = toPosixPath(path.relative(options.repositoryRoot, this.cwd));
+    const scope = toPosixPath(path.relative(repositoryRoot, this.cwd));
     const requestPaths = candidates.map((relativePath) =>
       scope ? `${scope}/${relativePath}` : relativePath,
     );
     const input = new TextEncoder().encode(`${requestPaths.join("\0")}\0`);
-    const result = options.sourceProfile
-      ? await this.runSourceGit(
-          options.repositoryRoot,
-          ["check-ignore", "--no-index", "-z", "--stdin"],
-          { operation: "classify ignored source paths", acceptedExitCodes: [0, 1], input },
-        )
-      : await this.runPrivateGit(
-          ["--work-tree", this.cwd, "check-ignore", "--no-index", "-z", "--stdin"],
-          { operation: "classify ignored non-Git paths", acceptedExitCodes: [0, 1], input },
-        );
+    const result = await this.runSourceGit(
+      repositoryRoot,
+      ["check-ignore", "--no-index", "-z", "--stdin"],
+      { operation: "classify ignored source paths", acceptedExitCodes: [0, 1], input },
+    );
     if (result.exitCode === 1) return new Set();
     const ignored = new Set<string>();
     for (const outputPath of splitNul(result.stdout, "classify ignored paths")) {
@@ -3974,6 +4017,9 @@ export class WorkspaceHistoryStore {
     let mutated = false;
     let changed = false;
     try {
+      if (!(await this.discoverSourceRepository())) {
+        throw this.restoreConflict("Workspace is no longer inside a Git worktree");
+      }
       await this.cleanupStaleRestoreArtifactsLocked();
       await this.assertPreparedRestoreFresh(prepared);
       if (!prepared.recovery) {

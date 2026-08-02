@@ -301,6 +301,11 @@ function mapFffGrepMatch(item: {
 
 const fffBackend: SearchBackend = {
   async grep(options) {
+    // FFF indexes directories; explicit single-file searches must not broaden to siblings.
+    if (options.searchPath !== undefined) {
+      return await nodeRgBackend.grep(options);
+    }
+
     if (
       shouldFallbackForDenyPaths({
         cwd: options.cwd,

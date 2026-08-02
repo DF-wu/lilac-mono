@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   chmod,
   copyFile,
   mkdir,
-  mkdtemp,
+  mkdtemp as mkdtempFs,
   readdir,
   rm,
   stat,
@@ -14,6 +15,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createOpenAI } from "@ai-sdk/openai";
+import {
+  attachAutoCompaction,
+  type AutoCompactionOptions,
+  type HistoryProviderState,
+} from "@stanley2058/lilac-agent";
 import type {
   MiniLilacCancelCompactionResult,
   MiniLilacCompactionEvent,
@@ -59,6 +65,19 @@ import {
 } from "../src/workspace-history-store";
 
 const temporaryDirectories: string[] = [];
+
+async function mkdtemp(prefix: string): Promise<string> {
+  const directory = await mkdtempFs(prefix);
+  const child = Bun.spawn(["git", "-C", directory, "init", "--quiet"], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  if (exitCode !== 0) throw new Error(`git init failed: ${stderr}`);
+  return directory;
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -130,6 +149,45 @@ function textResultWithOpenAIItemId(id: string, text: string, itemId: string) {
   };
 }
 
+function phasedOpenAITextResult(
+  parts: readonly {
+    readonly id: string;
+    readonly itemId: string;
+    readonly phase: "commentary" | "final_answer";
+    readonly text: string;
+  }[],
+) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        ...parts.flatMap((part) => {
+          const providerMetadata = {
+            openai: { itemId: part.itemId, phase: part.phase },
+          };
+          return [
+            { type: "text-start" as const, id: part.id, providerMetadata },
+            {
+              type: "text-delta" as const,
+              id: part.id,
+              delta: part.text,
+              providerMetadata,
+            },
+            { type: "text-end" as const, id: part.id, providerMetadata },
+          ];
+        }),
+        {
+          type: "finish" as const,
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            inputTokens: { total: 9, noCache: 9, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+        },
+      ],
+    }),
+  };
+}
+
 function streamErrorResult(error: unknown, partialText?: string) {
   return {
     stream: simulateReadableStream({
@@ -153,6 +211,32 @@ function textAndReadToolResult(id: string, text: string, filePath: string) {
         { type: "text-start" as const, id },
         { type: "text-delta" as const, id, delta: text },
         { type: "text-end" as const, id },
+        {
+          type: "tool-call" as const,
+          toolCallId: `${id}-read`,
+          toolName: "read_file",
+          input: JSON.stringify({ path: filePath }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
+function commentaryAndReadToolResult(id: string, text: string, filePath: string) {
+  const providerMetadata = {
+    openai: { itemId: `msg_${id}`, phase: "commentary" as const },
+  };
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id, providerMetadata },
+        { type: "text-delta" as const, id, delta: text, providerMetadata },
+        { type: "text-end" as const, id, providerMetadata },
         {
           type: "tool-call" as const,
           toolCallId: `${id}-read`,
@@ -257,7 +341,7 @@ function grepToolResult(pattern: string) {
   };
 }
 
-function readToolResult(path: string) {
+function readToolResult(path: string, options?: { dangerouslyAllow?: boolean }) {
   return {
     stream: simulateReadableStream({
       chunks: [
@@ -265,7 +349,7 @@ function readToolResult(path: string) {
           type: "tool-call" as const,
           toolCallId: "direct-read",
           toolName: "read_file",
-          input: JSON.stringify({ path, maxCharacters: 20_000 }),
+          input: JSON.stringify({ path, maxCharacters: 20_000, ...options }),
         },
         {
           type: "finish" as const,
@@ -397,6 +481,7 @@ function seedCompletedHistory(
   uiMessages: readonly MiniLilacUIMessage[],
   todos?: readonly MiniLilacTodo[],
   runId = `seed-run:${crypto.randomUUID()}`,
+  providerState?: HistoryProviderState,
 ): string {
   const currentModelMessages = store.getModelMessages(sessionId);
   const currentUiMessages = store.getUiMessages(sessionId);
@@ -447,6 +532,7 @@ function seedCompletedHistory(
     workspaceSnapshotId: null,
     workspaceStatus: "unavailable",
     workspaceUnavailableReason: "git-unavailable",
+    ...(providerState === undefined ? {} : { providerState }),
   });
   return runId;
 }
@@ -764,7 +850,7 @@ describe("MiniLilacSqliteStore", () => {
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, "runtime.sqlite");
     const original = new MiniLilacSqliteStore(databasePath);
-    original.database.exec("PRAGMA user_version = 8;");
+    original.database.exec("PRAGMA user_version = 9;");
     original.close();
 
     expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(MiniLilacDatabaseVersionError);
@@ -1070,6 +1156,39 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("keeps transcript history without workspace snapshots outside Git", async () => {
+    const directory = await mkdtempFs(path.join(tmpdir(), "mini-lilac-non-git-history-"));
+    temporaryDirectories.push(directory);
+    const model = new MockLanguageModelV4({
+      doStream: async () => textResult("non-git-answer", "done"),
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("non-git prompt"), "non-git-prompt"))
+        .stream,
+    );
+    const workspace = service.store.getWorkspaceForSession(session.id);
+    expect(service.store.listWorkspaceSnapshots(workspace.id)).toEqual([]);
+    expect(service.store.getCurrentHistoryState(session.id)).toMatchObject({
+      workspaceStatus: "unavailable",
+      workspaceUnavailableReason: "non-git-workspace",
+    });
+    expect(
+      await service.undo({ sessionId: session.id, clientCommandId: "non-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      filesystem: { status: "skipped", reason: "non-git-workspace" },
+    });
+    expect(service.store.getUiMessages(session.id)).toEqual([]);
+    service.close();
+  });
+
   it("runs workspace maintenance after retained history recovery", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-maintenance-order-"));
     temporaryDirectories.push(directory);
@@ -2330,7 +2449,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("shares the inline result budget across settled batch children", async () => {
+  it("exempts bounded read_file children from the settled aggregate budget", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-batch-overflow-"));
     temporaryDirectories.push(directory);
     const largePayload = `large:${"x".repeat(900)}\n`;
@@ -2362,14 +2481,10 @@ describe("SessionService", () => {
     await collect((await service.startPrompt(session.id, userMessage("read both"))).stream);
 
     const transcript = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(transcript.match(/\[tool result overflow\]/gu)).toHaveLength(1);
-    expect(transcript).not.toContain("x".repeat(500));
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(transcript).toContain("x".repeat(500));
     expect(transcript).toContain("y".repeat(300));
-    const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(transcript)?.[0];
-    if (uri === undefined) throw new Error("batch overflow artifact URI was not persisted");
-    const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(artifact.content).toContain(largePayload.trim());
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
     service.close();
   });
 
@@ -2396,8 +2511,9 @@ describe("SessionService", () => {
     );
 
     const transcript = JSON.stringify(service.store.getModelMessages(session.id));
-    expect(transcript).toContain("[tool result overflow]");
-    expect(transcript).not.toContain("😀".repeat(1_000));
+    expect(transcript).not.toContain("[tool result overflow]");
+    expect(transcript).toContain("😀".repeat(1_000));
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
     expect(chunks).toContainEqual(
       expect.objectContaining({ type: "tool-output-available", toolCallId: "direct-read" }),
     );
@@ -2867,6 +2983,187 @@ describe("SessionService", () => {
       "assistant",
     ]);
     reopened.close();
+  });
+
+  it("persists OpenAI commentary and plain final text as adjacent UI messages", async () => {
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        return callCount === 1
+          ? phasedOpenAITextResult([
+              {
+                id: "commentary",
+                itemId: "msg_commentary",
+                phase: "commentary",
+                text: "I am checking the implementation.",
+              },
+              {
+                id: "final",
+                itemId: "msg_final",
+                phase: "final_answer",
+                text: "The implementation is correct.",
+              },
+            ])
+          : textResult("next-answer", "Continued successfully.");
+      },
+    });
+    const { directory, service, session } = await temporaryRuntime(model);
+    const first = await service.startPrompt(session.id, userMessage("check it"));
+    await collect(first.stream);
+
+    const firstUiMessages = service.getMessages(session.id);
+    expect(firstUiMessages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+    ]);
+    const commentary = firstUiMessages[1];
+    const finalAnswer = firstUiMessages[2];
+    expect(commentary?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual([
+      "I am checking the implementation.",
+    ]);
+    expect(finalAnswer?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(
+      ["The implementation is correct."],
+    );
+    expect(finalAnswer?.id).toBe(`${commentary?.id}:final-answer`);
+    expect(commentary?.metadata?.usage).toBeUndefined();
+    expect(finalAnswer?.metadata?.usage).toMatchObject({
+      inputTokens: 9,
+      outputTokens: 5,
+      totalTokens: 14,
+    });
+    expect(service.store.getRun(first.runId).terminalResult).toEqual({
+      text: "The implementation is correct.",
+    });
+
+    const firstModelMessages = service.store.getModelMessages(session.id);
+    expect(firstModelMessages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain("msg_commentary");
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain("msg_final");
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain('"phase":"commentary"');
+    expect(JSON.stringify(firstModelMessages.at(-1))).toContain('"phase":"final_answer"');
+
+    const second = await service.startPrompt(session.id, userMessage("continue"));
+    await collect(second.stream);
+    const replayedAssistantMessages = model.doStreamCalls[1]?.prompt.filter(
+      (message) => message.role === "assistant",
+    );
+    expect(replayedAssistantMessages).toHaveLength(1);
+    expect(JSON.stringify(replayedAssistantMessages)).toContain("msg_commentary");
+    expect(JSON.stringify(replayedAssistantMessages)).toContain("msg_final");
+
+    const canonicalUi = service.getMessages(session.id);
+    expect(canonicalUi.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    service.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.getMessages(session.id)).toEqual(canonicalUi);
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "undo-after-phase-split" }),
+    ).toMatchObject({ status: "undone" });
+    expect(reopened.getMessages(session.id)).toEqual(firstUiMessages);
+    expect(
+      await reopened.redo({ sessionId: session.id, clientCommandId: "redo-after-phase-split" }),
+    ).toMatchObject({ status: "redone" });
+    expect(reopened.getMessages(session.id)).toEqual(canonicalUi);
+    reopened.close();
+  });
+
+  it("keeps completed operations on the commentary parent of a plain final answer", async () => {
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        return callCount === 1
+          ? commentaryAndReadToolResult(
+              "operation-commentary",
+              "I am reading the requested file.",
+              "answer.txt",
+            )
+          : phasedOpenAITextResult([
+              {
+                id: "operation-final",
+                itemId: "msg_operation_final",
+                phase: "final_answer",
+                text: "The file contains the answer.",
+              },
+            ]);
+      },
+    });
+    const { directory, service, session } = await temporaryRuntime(model);
+    await Bun.write(path.join(directory, "answer.txt"), "the answer");
+    const started = await service.startPrompt(session.id, userMessage("read the answer"));
+    await collect(started.stream);
+
+    const messages = service.getMessages(session.id);
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "assistant"]);
+    expect(JSON.stringify(messages[1])).toContain("I am reading the requested file.");
+    expect(JSON.stringify(messages[1])).toContain("the answer");
+    expect(JSON.stringify(messages[2])).toContain("The file contains the answer.");
+    expect(
+      messages[2]?.parts.every(
+        (part) =>
+          part.type === "text" || part.type === "step-start" || part.type.startsWith("data-"),
+      ),
+    ).toBe(true);
+    expect(service.store.getModelMessages(session.id).map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+    ]);
+    service.close();
+  });
+
+  it("keeps malformed OpenAI phase ordering in one UI message", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: phasedOpenAITextResult([
+        {
+          id: "commentary-before",
+          itemId: "msg_commentary_before",
+          phase: "commentary",
+          text: "Before final.",
+        },
+        {
+          id: "premature-final",
+          itemId: "msg_premature_final",
+          phase: "final_answer",
+          text: "Premature final.",
+        },
+        {
+          id: "commentary-after",
+          itemId: "msg_commentary_after",
+          phase: "commentary",
+          text: "After final.",
+        },
+      ]),
+    });
+    const { service, session } = await temporaryRuntime(model);
+    const started = await service.startPrompt(session.id, userMessage("malformed phases"));
+    await collect(started.stream);
+
+    const messages = service.getMessages(session.id);
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(messages[1]?.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))).toEqual(
+      ["Before final.", "Premature final.", "After final."],
+    );
+    expect(service.store.getRun(started.runId).terminalResult).toEqual({
+      text: "Premature final.",
+    });
+    service.close();
   });
 
   it("replays and tails the process-local live log without a chunk table", async () => {
@@ -3975,17 +4272,123 @@ describe("SessionService", () => {
     reopened.close();
   });
 
+  it("manually compacts an ungated session whose stored profile no longer exists", async () => {
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => textResult("summary", "Portable context."),
+    });
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-removed-profile-compact-"));
+    temporaryDirectories.push(directory);
+    const databasePath = path.join(directory, "runtime.sqlite");
+    const initial = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const session = await initial.createSession({ cwd: directory, model: "test/mock" });
+    seedCompletedHistory(
+      initial.store,
+      session.id,
+      [
+        { role: "user", content: "retained native input" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "custom",
+              kind: "openai.compaction",
+              providerOptions: {
+                openai: {
+                  type: "compaction",
+                  itemId: "cmp_removed_profile",
+                  encryptedContent: "encrypted-removed-profile-state",
+                },
+                lilac: {
+                  serverCompaction: {
+                    formatVersion: 1,
+                    protocol: "openai-responses-v2",
+                    replayKey: "openai:openai/gpt-old",
+                    portableSummary: `Portable removed-profile context ${"p".repeat(6_000)}`,
+                    estimatedTokens: 1_600,
+                  },
+                },
+              },
+            },
+          ],
+        },
+        { role: "user", content: `latest request ${"b".repeat(6_000)}` },
+      ],
+      [userMessage("visible history")],
+    );
+    initial.close();
+
+    const database = new Database(databasePath, { strict: true });
+    database.query("UPDATE sessions SET profile = ? WHERE id = ?").run("removed", session.id);
+    database.close();
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => summaryModel,
+      modelLimitsResolver: async () => ({ context: 10_000, output: 1_000 }),
+    });
+    const { result } = await compact(reopened, {
+      sessionId: session.id,
+      clientCommandId: "compact-removed-profile",
+    });
+
+    expect(result).toMatchObject({ phase: "completed", outcome: "compacted" });
+    expect(result.messageCountBefore).toBe(3);
+    expect(JSON.stringify(summaryModel.doStreamCalls)).toContain(
+      "Portable removed-profile context",
+    );
+    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain(
+      "encrypted-removed-profile-state",
+    );
+    reopened.close();
+  });
+
   it("streams and persists automatic compaction events in visible history", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-auto-compact-event-"));
     temporaryDirectories.push(directory);
     let resolvedLimits: number | { readonly context: number; readonly output: number } | undefined;
+    let thresholdInputSource: string | undefined;
+    let mediaScrubbed = false;
     const service = new SessionService({
       config: config(),
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       modelLimitsResolver: async () => ({ context: 32_000, output: 12_000 }),
       attachCompaction: async (agent, options) => {
+        thresholdInputSource = options.thresholdInputSource;
+        const encoded = Buffer.alloc(4, 7).toString("base64");
+        const transformed = await options.prepareFullModelView?.(
+          [
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "media",
+                  toolName: "read_file",
+                  output: {
+                    type: "content",
+                    value: [
+                      {
+                        type: "file",
+                        mediaType: "image/png",
+                        data: { type: "data", data: encoded },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+          { system: "test", tools: {} },
+        );
+        mediaScrubbed = transformed !== undefined && !JSON.stringify(transformed).includes(encoded);
         resolvedLimits = await options.resolveContextLimit?.({
           defaultModel: options.model,
           currentModelSpecifier: agent.state.modelSpecifier,
@@ -3999,6 +4402,8 @@ describe("SessionService", () => {
               spec: "test/mock" as const,
               reason: "threshold" as const,
               messageCountBefore: 12,
+              observedInputTokens: 8_000,
+              inputTokenSource: "provider-usage" as const,
               estimatedInputTokens: 8_000,
               budget: {
                 inputBudget: 9_000,
@@ -4012,11 +4417,7 @@ describe("SessionService", () => {
               stepCount: 1,
               pass: 1,
             };
-            const splitTurn = { ...progress, stage: "split-turn" as const };
             options.onCompactionStart?.(base);
-            // The split turn summarizes concurrently with history; its deltas
-            // must reach the summary rather than being dropped.
-            options.onSummaryDelta?.("Mid-turn state.", splitTurn);
             options.onProgress?.(progress);
             options.onSummaryDelta?.("Condensed prior context.", progress);
             options.onCompactionEnd?.({
@@ -4025,7 +4426,7 @@ describe("SessionService", () => {
               messageCountAfter: 4,
               estimatedInputTokensAfter: 2_000,
               durationMs: 20,
-              summary: "Engine summary covering both stages.",
+              summary: "Engine anchored summary.",
             });
           });
         });
@@ -4036,6 +4437,8 @@ describe("SessionService", () => {
     const streamed = await collect(started.stream);
 
     expect(resolvedLimits).toEqual({ context: 32_000, output: 12_000 });
+    expect(thresholdInputSource).toBe("usage");
+    expect(mediaScrubbed).toBe(true);
     const compactionChunks = streamed.filter((chunk) => chunk.type === "data-compaction");
     // One chunk id spans the lifecycle so the renderer updates a single entry.
     expect(new Set(compactionChunks.map((chunk) => chunk.id)).size).toBe(1);
@@ -4049,19 +4452,17 @@ describe("SessionService", () => {
     // carry the state captured when it was raised, not whatever came later.
     expect(compactionChunks.at(0)?.data).toMatchObject({ modelCalls: 0, elapsedMs: 0 });
     expect(compactionChunks.at(0)?.data.summary).toBeUndefined();
-    // Split-turn text is part of the summary, assembled the way the engine does.
-    expect(compactionChunks.at(1)?.data.summary).toBe(
-      "**Turn Context (split turn):**\n\nMid-turn state.",
-    );
+    expect(compactionChunks.at(1)?.data.summary).toBeUndefined();
     expect(compactionChunks.at(2)?.data.progress).toEqual({
       stage: "history",
       step: 1,
       stepCount: 1,
       pass: 1,
     });
+    expect(compactionChunks.at(2)?.data.summary).toBe("Condensed prior context.");
     // The engine's own summary wins at the terminal phase: it is post-truncation
     // and complete, which a throttled delta buffer cannot guarantee.
-    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine summary covering both stages.");
+    expect(compactionChunks.at(-1)?.data.summary).toBe("Engine anchored summary.");
     expect(compactionChunks.at(-1)?.data).toMatchObject({
       source: "automatic",
       reason: "threshold",
@@ -4079,6 +4480,164 @@ describe("SessionService", () => {
         data: expect.objectContaining({ phase: "completed", outcome: "compacted" }),
       }),
     );
+    service.close();
+  });
+
+  it("enables OpenAI server compaction only for its exact configured model override", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-server-compaction-"));
+    temporaryDirectories.push(directory);
+    const providerConfig: ProviderConfig = {
+      configVersion: 1,
+      providers: {
+        openai: {
+          type: "openai",
+          catalog: "models-dev",
+          models: { "gpt-enabled": { openaiServerCompaction: true } },
+        },
+        other: { type: "openai", catalog: "models-dev" },
+      },
+    };
+    const auth: ProviderAuth = {
+      openai: { type: "api-key", key: "test-openai-key" },
+      other: { type: "api-key", key: "test-other-key" },
+    };
+    const providers: LoadedProviderRegistry = {
+      config: providerConfig,
+      auth,
+      registry: createAiProviderRegistry(providerConfig, auth),
+      supersededProviderIds: [],
+    };
+    const attached: Array<{ model: string; hasServerCompaction: boolean }> = [];
+    const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers,
+      modelResolver: () => model,
+      attachCompaction: async (_agent, options) => {
+        attached.push({
+          model: options.model,
+          hasServerCompaction: options.serverCompaction !== undefined,
+        });
+        return () => {};
+      },
+    });
+
+    for (const modelSpecifier of [
+      "openai/gpt-enabled",
+      "openai/gpt-unmatched",
+      "other/gpt-enabled",
+    ]) {
+      const session = await service.createSession({
+        cwd: directory,
+        model: modelSpecifier,
+        reasoning: "high",
+      });
+      await collect((await service.startPrompt(session.id, userMessage(modelSpecifier))).stream);
+    }
+
+    expect(attached).toEqual([
+      { model: "openai/gpt-enabled", hasServerCompaction: true },
+      { model: "openai/gpt-unmatched", hasServerCompaction: false },
+      { model: "other/gpt-enabled", hasServerCompaction: false },
+    ]);
+    service.close();
+  });
+
+  it("heals a rejected native replay and re-enables later server compaction", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-server-replay-fallback-"));
+    temporaryDirectories.push(directory);
+    const providerConfig: ProviderConfig = {
+      configVersion: 1,
+      providers: {
+        openai: {
+          type: "openai",
+          catalog: "models-dev",
+          models: { "gpt-enabled": { openaiServerCompaction: true } },
+        },
+      },
+    };
+    const auth: ProviderAuth = { openai: { type: "api-key", key: "test-openai-key" } };
+    const providers: LoadedProviderRegistry = {
+      config: providerConfig,
+      auth,
+      registry: createAiProviderRegistry(providerConfig, auth),
+      supersededProviderIds: [],
+    };
+    let calls = 0;
+    const prompts: string[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: async (options) => {
+        calls += 1;
+        prompts.push(JSON.stringify(options.prompt));
+        if (calls === 1) {
+          throw Object.assign(new Error("invalid compaction item"), { statusCode: 400 });
+        }
+        return textResult("answer", "portable retry succeeded");
+      },
+    });
+    let attachedOptions: AutoCompactionOptions | undefined;
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      providers,
+      modelResolver: () => model,
+      modelLimitsResolver: async () => ({ context: 100_000, output: 4_000 }),
+      attachCompaction: async (agent, options) => {
+        attachedOptions = options;
+        return await attachAutoCompaction(agent, options);
+      },
+    });
+    const session = await service.createSession({ cwd: directory, model: "openai/gpt-enabled" });
+    seedCompletedHistory(
+      service.store,
+      session.id,
+      [
+        { role: "user", content: "retained native input" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "custom",
+              kind: "openai.compaction",
+              providerOptions: {
+                openai: {
+                  type: "compaction",
+                  itemId: "cmp_rejected",
+                  encryptedContent: "encrypted-rejected-state",
+                },
+                lilac: {
+                  serverCompaction: {
+                    formatVersion: 1,
+                    protocol: "openai-responses-v2",
+                    replayKey: "openai:openai/gpt-enabled",
+                    portableSummary: "Portable replay context.",
+                    estimatedTokens: 64,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+      [userMessage("visible prior request")],
+      undefined,
+      undefined,
+      { lastFamily: "ai-sdk", containsCrossFamilyTurns: false },
+    );
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("continue after native replay"))).stream,
+    );
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("encrypted-rejected-state");
+    expect(prompts[1]).toContain("Portable replay context.");
+    expect(prompts[1]).not.toContain("encrypted-rejected-state");
+    expect(JSON.stringify(service.store.getModelMessages(session.id))).not.toContain(
+      "encrypted-rejected-state",
+    );
+    expect(attachedOptions?.serverCompactionEnabled?.()).toBe(true);
     service.close();
   });
 
@@ -4681,6 +5240,161 @@ describe("SessionService", () => {
       reopened.close();
     });
   }
+
+  it("downgrades an unmutated prepared restore when the worktree becomes non-Git", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-prepared-non-git-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("non-git-recovery", "response") }),
+      attachCompaction: async () => () => {},
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const prompt = userMessage("prepared non-git recovery");
+    await collect((await service.startPrompt(session.id, prompt, "prepared-prompt")).stream);
+    await writeFile(managed, "source-drift");
+    const updatePhase = service.store.updateHistoryOperationPhase.bind(service.store);
+    service.store.updateHistoryOperationPhase = (operationId, phase) => {
+      if (phase === "restoring") throw new Error("injected prepared crash");
+      return updatePhase(operationId, phase);
+    };
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "prepared-non-git-undo" }),
+    ).rejects.toThrow("injected prepared crash");
+    service.close();
+    await rm(path.join(directory, ".git"), { recursive: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(await Bun.file(managed).text()).toBe("source-drift");
+    expect(reopened.getMessages(session.id)).toEqual([]);
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "prepared-non-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      message: prompt,
+      filesystem: { status: "skipped", reason: "non-git-workspace" },
+    });
+    reopened.close();
+  });
+
+  it("commits a verified restore after the worktree becomes non-Git", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-verified-non-git-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("verified-non-git", "response") }),
+      attachCompaction: async () => () => {},
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    const prompt = userMessage("verified non-git recovery");
+    await collect((await service.startPrompt(session.id, prompt, "verified-prompt")).stream);
+    await writeFile(managed, "source-drift");
+    service.store.commitHistoryNavigation = () => {
+      throw new Error("injected verified crash");
+    };
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "verified-non-git-undo" }),
+    ).rejects.toThrow("injected verified crash");
+    expect(service.store.listHistoryOperations()).toMatchObject([{ phase: "verified" }]);
+    service.close();
+    await rm(path.join(directory, ".git"), { recursive: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await reopened.initialize();
+    expect(reopened.getHistoryRecoveryStatus().navigation).toEqual([]);
+    expect(await Bun.file(managed).text()).toBe("target");
+    expect(reopened.getMessages(session.id)).toEqual([]);
+    expect(
+      await reopened.undo({ sessionId: session.id, clientCommandId: "verified-non-git-undo" }),
+    ).toMatchObject({
+      status: "undone",
+      message: prompt,
+      filesystem: { status: "restored" },
+    });
+    reopened.close();
+  });
+
+  it("does not resume a restoring operation after the worktree becomes non-Git", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-restoring-non-git-"));
+    temporaryDirectories.push(directory);
+    const workspace = path.join(directory, "workspace");
+    const databasePath = path.join(directory, "runtime.sqlite");
+    await mkdir(workspace);
+    const managed = path.join(workspace, "managed.txt");
+    await writeFile(managed, "target");
+    const service = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () =>
+        new MockLanguageModelV4({ doStream: textResult("restoring-non-git", "response") }),
+      attachCompaction: async () => () => {},
+      workspaceHistoryStoreFactory: (options) =>
+        new WorkspaceHistoryStore({
+          ...options,
+          testHooks: {
+            beforeMutation: () => {
+              throw new Error("injected restoring failure");
+            },
+          },
+        }),
+    });
+    const session = await service.createSession({ cwd: workspace, model: "test/mock" });
+    await collect(
+      (
+        await service.startPrompt(
+          session.id,
+          userMessage("restoring non-git recovery"),
+          "restoring-prompt",
+        )
+      ).stream,
+    );
+    await writeFile(managed, "source-drift");
+    await expect(
+      service.undo({ sessionId: session.id, clientCommandId: "restoring-non-git-undo" }),
+    ).rejects.toThrow("injected restoring failure");
+    expect(service.store.listHistoryOperations()).toMatchObject([{ phase: "restoring" }]);
+    service.close();
+    await rm(path.join(directory, ".git"), { recursive: true });
+
+    const reopened = new SessionService({
+      config: config(),
+      databasePath,
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+    await expect(reopened.initialize()).rejects.toThrow(
+      "requires Git for recovery (non-git-workspace)",
+    );
+    expect(reopened.getHistoryRecoveryStatus().navigation).toMatchObject([{ phase: "restoring" }]);
+    expect(await Bun.file(managed).text()).toBe("source-drift");
+    reopened.close();
+  });
 
   for (const scenario of [
     {
@@ -6635,7 +7349,7 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("rolls back root setup when agent construction fails", async () => {
+  it("terminalizes an admitted root prompt when model preparation fails", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-setup-"));
     temporaryDirectories.push(directory);
@@ -6655,8 +7369,8 @@ describe("SessionService", () => {
       "model construction failed",
     );
     expect(service.store.getActiveRootRun(session.id)).toBeNull();
-    expect(service.getSnapshot(session.id).status).toBe("idle");
-    expect(service.getMessages(session.id)).toEqual([]);
+    expect(service.getSnapshot(session.id).status).toBe("error");
+    expect(JSON.stringify(service.getMessages(session.id))).toContain("should roll back");
     service.close();
   });
 
@@ -6735,7 +7449,13 @@ describe("SessionService", () => {
     await collect(started.stream);
 
     expect(service.store.getRun(started.runId).status).toBe("completed");
-    expect(delegatedRuns(service, session.id)).toEqual([]);
+    const childRun = delegatedRuns(service, session.id)[0];
+    expect(childRun).toMatchObject({
+      status: "error",
+      error: "Failed to prepare model runtime: child construction failed",
+    });
+    if (childRun === undefined) throw new Error("expected terminal child setup failure");
+    expect(service.store.getActiveRootRun(childRun.sessionId)).toBeNull();
     expect(service.getSnapshot(session.id).status).toBe("idle");
     service.close();
   });
@@ -6940,6 +7660,86 @@ describe("SessionService", () => {
     ]);
     expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain("result-b");
     expect(service.store.getRun(started.runId).status).toBe("completed");
+    service.close();
+  });
+
+  it("splits phased assistant output before a committed steering message", async () => {
+    const firstEntered = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<void>();
+    const releaseSecond = Promise.withResolvers<void>();
+    let callCount = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          firstEntered.resolve();
+          await releaseFirst.promise;
+          return phasedOpenAITextResult([
+            {
+              id: "pre-steer-commentary",
+              itemId: "msg_pre_steer_commentary",
+              phase: "commentary",
+              text: "Preparing for steering.",
+            },
+            {
+              id: "pre-steer-final",
+              itemId: "msg_pre_steer_final",
+              phase: "final_answer",
+              text: "Ready for steering.",
+            },
+          ]);
+        }
+        secondEntered.resolve();
+        await releaseSecond.promise;
+        return textResult("after-steer", "Steering applied.");
+      },
+    });
+    const { service, session } = await temporaryRuntime(model);
+    const rootUser = userMessage("start phased work");
+    const steer = steeringMessage("change direction");
+    const started = await service.startPrompt(session.id, rootUser);
+    const completion = collect(started.stream);
+    await firstEntered.promise;
+    await service.steer({
+      sessionId: session.id,
+      runId: started.runId,
+      clientCommandId: "phase-boundary-steer",
+      message: steer,
+    });
+    releaseFirst.resolve();
+    await secondEntered.promise;
+    const activeResume = await service.getSessionResume(session.id);
+    expect(activeResume.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+    ]);
+    expect(activeResume.messages[3]).toEqual(steer);
+    expect(activeResume.replayCursor).toMatchObject({ runId: started.runId });
+    releaseSecond.resolve();
+    await completion;
+
+    const messages = service.getMessages(session.id);
+    expect(messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    expect(messages[0]).toEqual(rootUser);
+    expect(messages[3]).toEqual(steer);
+    expect(JSON.stringify(messages[1])).toContain("Preparing for steering.");
+    expect(JSON.stringify(messages[2])).toContain("Ready for steering.");
+    expect(JSON.stringify(messages[4])).toContain("Steering applied.");
+    expect(service.store.getModelMessages(session.id).map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
     service.close();
   });
 
@@ -7353,7 +8153,7 @@ describe("SessionService", () => {
       databasePath,
       modelResolver: () => model,
       attachCompaction: async (agent) => {
-        agent.setTransformMessages((messages) => [
+        agent.setPrepareFullModelView((messages) => [
           ...messages,
           { role: "user", content: "compaction-transform-marker" },
         ]);
@@ -7550,7 +8350,7 @@ describe("SessionService", () => {
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
       attachCompaction: async (agent) => {
-        agent.setTransformMessages((messages) => [
+        agent.setPrepareFullModelView((messages) => [
           ...messages,
           { role: "assistant", content: "invalid assistant tail" },
         ]);
@@ -7564,7 +8364,7 @@ describe("SessionService", () => {
     expect(model.doStreamCalls).toHaveLength(0);
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
-      error: "Cannot append todo context after an assistant message",
+      error: "Cannot append an ephemeral overlay after an assistant message",
     });
     service.close();
   });
@@ -7886,12 +8686,6 @@ describe("SessionService", () => {
                 toolName: "read_file",
                 input: JSON.stringify({ path: protectedPath }),
               })),
-              ...protectedPaths.map((protectedPath, index) => ({
-                type: "tool-call" as const,
-                toolCallId: `read-protected-bypass-${index}`,
-                toolName: "read_file",
-                input: JSON.stringify({ path: protectedPath, dangerouslyAllow: true }),
-              })),
               {
                 type: "finish",
                 finishReason: { unified: "tool-calls", raw: "tool-calls" },
@@ -7920,7 +8714,31 @@ describe("SessionService", () => {
     expect(continuation).not.toContain("must-not-read");
     expect(continuation).not.toContain("provider-marker-must-not-read");
     expect(continuation).not.toContain("mini-lilac-token-must-not-read");
-    expect(continuation).toContain("dangerouslyAllow is disabled");
+    service.close();
+  });
+
+  it("permits an explicit filesystem dangerouslyAllow retry for an enabled profile tool", async () => {
+    const runtimeConfig = config();
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-filesystem-bypass-"));
+    temporaryDirectories.push(directory);
+    const protectedPath = path.join(directory, "protected.txt");
+    await Bun.write(protectedPath, "explicit-bypass-marker");
+    const model = new MockLanguageModelV4({
+      doStream: [
+        readToolResult(protectedPath, { dangerouslyAllow: true }),
+        textResult("answer", "inspected"),
+      ],
+    });
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      protectedToolPaths: [protectedPath],
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect((await service.startPrompt(session.id, userMessage("read protected"))).stream);
+
+    expect(JSON.stringify(model.doStreamCalls.at(-1)?.prompt)).toContain("explicit-bypass-marker");
     service.close();
   });
 

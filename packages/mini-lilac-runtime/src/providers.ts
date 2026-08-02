@@ -15,6 +15,7 @@ import {
   claudeCodeExecutableSettings,
   createCodexOAuthProvider,
   readCodexTokens,
+  withServerCompactionRequestFetch,
   type CodexOAuthTokens,
 } from "@stanley2058/lilac-utils";
 
@@ -45,6 +46,7 @@ const providerModelOverrideSchema = z
     attachment: z.boolean().optional(),
     reasoning: z.boolean().optional(),
     toolCall: z.boolean().optional(),
+    openaiServerCompaction: z.boolean().optional(),
     modalities: z
       .object({
         input: z.array(modelModalitySchema),
@@ -95,6 +97,16 @@ export const providerDefinitionSchema = z
           code: "custom",
           path: ["catalog"],
           message: "claude-code providers must set catalog: models-dev; there is no /v1/models",
+        });
+      }
+    }
+    if (provider.type !== "openai") {
+      for (const [modelId, override] of Object.entries(provider.models ?? {})) {
+        if (override.openaiServerCompaction !== true) continue;
+        context.addIssue({
+          code: "custom",
+          path: ["models", modelId, "openaiServerCompaction"],
+          message: "openaiServerCompaction is supported only by openai providers",
         });
       }
     }
@@ -286,7 +298,14 @@ export function createAiProviderRegistry(
 
       switch (definition.type) {
         case "openai":
-          return [providerId, createOpenAI({ apiKey, baseURL: definition.baseUrl })] as const;
+          return [
+            providerId,
+            createOpenAI({
+              apiKey,
+              baseURL: definition.baseUrl,
+              fetch: withServerCompactionRequestFetch(globalThis.fetch),
+            }),
+          ] as const;
         case "openai-compatible":
           return [
             providerId,
@@ -327,8 +346,18 @@ export function reasoningProviderOptions(params: {
   readonly usesCodexOAuth: boolean;
   readonly providerType: ProviderType | undefined;
   readonly reasoningEnabled: boolean;
+  readonly openaiServerCompactionEnabled?: boolean;
 }): { readonly openai: Record<string, JSONValue> } | undefined {
   if (params.usesCodexOAuth) {
+    return {
+      openai: {
+        store: false,
+        include: ["reasoning.encrypted_content"],
+        ...(params.reasoningEnabled ? { reasoningSummary: "detailed" } : {}),
+      },
+    };
+  }
+  if (params.providerType === "openai" && params.openaiServerCompactionEnabled) {
     return {
       openai: {
         store: false,

@@ -324,10 +324,9 @@ export function buildDiscordProgressLines(input: {
   tools: readonly DiscordProgressEntry[];
   subagents: readonly DiscordProgressEntry[];
 }): string[] {
-  const rankedSubagents = [...input.subagents].sort((a, b) => {
-    const activeDelta = Number(b.update.status !== "end") - Number(a.update.status !== "end");
-    return activeDelta || b.updatedSeq - a.updatedSeq;
-  });
+  const rankedSubagents = input.subagents
+    .filter((entry) => entry.update.status !== "end")
+    .sort((a, b) => b.updatedSeq - a.updatedSeq);
   const visibleSubagents = rankedSubagents.slice(0, 3);
   const overflow = Math.max(0, rankedSubagents.length - visibleSubagents.length);
   const agentLines: string[] = [];
@@ -363,10 +362,20 @@ export function buildDiscordProgressLines(input: {
 
   let remainingToolLines = Math.max(0, PROGRESS_MAX_LINES - agentLines.length);
   const toolChunks: string[][] = [];
-  const toolsByRecency = [...input.tools].sort((a, b) => b.updatedSeq - a.updatedSeq);
-  for (const entry of toolsByRecency) {
+  const historyByRecency = [
+    ...input.tools.map((entry) => ({
+      entry,
+      rows: buildToolLine(entry.update).split("\n"),
+    })),
+    ...input.subagents
+      .filter((entry) => entry.update.status === "end")
+      .map((entry) => ({
+        entry,
+        rows: [buildSubagentHeader(entry, parseSubagentDisplay(entry.update.display), false)],
+      })),
+  ].sort((a, b) => b.entry.updatedSeq - a.entry.updatedSeq);
+  for (const { rows } of historyByRecency) {
     if (remainingToolLines === 0) break;
-    const rows = buildToolLine(entry.update).split("\n");
     const selectedRows =
       rows.length <= remainingToolLines
         ? rows
@@ -516,6 +525,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
   private running: Promise<void> | null = null;
   private usedEmbedPusher = false;
+  private finalTextSegments: readonly string[] | null = null;
   private renderedTextCacheInput: string | null = null;
   private renderedTextCacheOutput = "";
 
@@ -583,8 +593,16 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       return this.renderedTextCacheOutput;
     }
 
+    const rendered = this.renderText(this.textAcc);
+
+    this.renderedTextCacheInput = this.textAcc;
+    this.renderedTextCacheOutput = rendered;
+    return rendered;
+  }
+
+  private renderText(text: string): string {
     const rewrite = this.deps.rewriteText;
-    let rendered = rewrite ? rewrite(this.textAcc) : this.textAcc;
+    let rendered = rewrite ? rewrite(text) : text;
     rendered = normalizeDiscordBlockquotes(rendered);
 
     const tableRender = this.deps.markdownTableRender;
@@ -592,8 +610,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       rendered = renderMarkdownTablesAsCodeBlocks(rendered, tableRender);
     }
 
-    this.renderedTextCacheInput = this.textAcc;
-    this.renderedTextCacheOutput = rendered;
     return rendered;
   }
 
@@ -921,11 +937,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     switch (part.type) {
       case "text.delta":
+        this.finalTextSegments = null;
         this.textAcc += part.delta;
         await this.ensureStarted();
         return;
       case "text.set":
         this.textAcc = part.text;
+        this.finalTextSegments = part.finalSegments?.slice() ?? null;
         await this.ensureStarted();
         return;
       case "meta.stats":
@@ -1150,18 +1168,21 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       send: (options: MessageCreateOptions) => Promise<Message>;
     };
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
-    const fullText = this.getRenderedText();
-    const content = fullText.length > 0 ? fullText : "*<empty_string>*";
-
     const maxChunkLength =
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
-    const chunks = chunkMarkdownForEmbeds(content, {
-      maxChunkLength,
-      maxLastChunkLength: maxChunkLength,
-      useSmartSplitting: this.deps.useSmartSplitting,
-      hardMaxChunkLength: DISCORD_CONTENT_MAX_CHARS,
-      completeLastChunk: true,
-    });
+    const finalTexts =
+      this.finalTextSegments && this.finalTextSegments.length > 0
+        ? this.finalTextSegments.map((segment) => this.renderText(segment))
+        : [this.getRenderedText()];
+    const chunks = finalTexts.flatMap((text) =>
+      chunkMarkdownForEmbeds(text.length > 0 ? text : "*<empty_string>*", {
+        maxChunkLength,
+        maxLastChunkLength: maxChunkLength,
+        useSmartSplitting: this.deps.useSmartSplitting,
+        hardMaxChunkLength: DISCORD_CONTENT_MAX_CHARS,
+        completeLastChunk: true,
+      }),
+    );
 
     const MAX_FILES = 10;
     const filesForLastMessage = this.pendingAttachments.slice(0, MAX_FILES);

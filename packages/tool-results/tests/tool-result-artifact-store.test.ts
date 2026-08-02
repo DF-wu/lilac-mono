@@ -241,6 +241,59 @@ describe("tool result artifact store", () => {
     });
   });
 
+  it("caps artifact payload bytes and returns the exact Unicode continuation", async () => {
+    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    await store.init();
+    const created = await store.create({
+      ...artifactParams("A😀BéC"),
+      maxBytesPerSession: 100,
+    });
+
+    const first = await store.readWindow(created.uri, "session-a", {
+      start: { type: "offset", offset: 0 },
+      maxCharacters: 100,
+      maxLines: 10,
+      maxOutputBytes: 5,
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      content: "A😀",
+      endOffset: 2,
+      nextStart: { type: "offset", offset: 2 },
+      hasMore: true,
+    });
+
+    if (!first.ok || !first.nextStart) throw new Error("expected artifact continuation");
+    const second = await store.readWindow(created.uri, "session-a", {
+      start: first.nextStart,
+      maxCharacters: 100,
+      maxLines: 10,
+      maxOutputBytes: 4,
+    });
+    expect(second).toMatchObject({ ok: true, content: "BéC", hasMore: false });
+  });
+
+  it("rejects an artifact page budget too small for one Unicode character", async () => {
+    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    await store.init();
+    const created = await store.create({
+      ...artifactParams("😀x"),
+      maxBytesPerSession: 100,
+    });
+
+    await expect(
+      store.readWindow(created.uri, "session-a", {
+        start: { type: "offset", offset: 0 },
+        maxCharacters: 100,
+        maxLines: 10,
+        maxOutputBytes: 3,
+      }),
+    ).rejects.toThrow(
+      "Tool result artifact maxOutputBytes must be at least 4 to fit one Unicode character",
+    );
+    expect((await store.read(created.uri, "session-a")).ok).toBe(true);
+  });
+
   it("reads multiline windows from one-based lines and Unicode columns", async () => {
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
