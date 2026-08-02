@@ -3031,6 +3031,17 @@ export class DurableWorkflowStore {
     return result.changes === 1 ? this.getTrigger(input.triggerId) : null;
   }
 
+  releaseTriggerClaim(input: { triggerId: string; claimerId: string; now: number }): boolean {
+    return (
+      this.db
+        .query(
+          `UPDATE workflow_triggers SET claimed_by = NULL, claimed_at = NULL, updated_at = ?
+           WHERE trigger_id = ? AND state = 'active' AND claimed_by = ?`,
+        )
+        .run(input.now, input.triggerId, input.claimerId).changes === 1
+    );
+  }
+
   fireClaimedTrigger(input: {
     triggerId: string;
     claimerId: string;

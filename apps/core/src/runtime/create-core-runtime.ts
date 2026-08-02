@@ -29,6 +29,8 @@ import {
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { GithubAdapter } from "../surface/github/github-adapter";
 import { TelegramAdapter } from "../surface/telegram/telegram-adapter";
+import { isTelegramChatAllowed } from "../surface/telegram/telegram-guards";
+import { tryParseTelegramSessionId } from "../surface/telegram/telegram-ids";
 import type { SurfaceAdapter } from "../surface/adapter";
 import type { SurfaceRefPlatform } from "../surface/types";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
@@ -841,6 +843,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           platform: "telegram",
           subscriptionId: subId(subscriptionPrefix, "telegram-router"),
           customCommands,
+          shouldSuppressAdapterEvent: async ({ evt }) =>
+            shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
           transcriptStore: transcriptStore ?? undefined,
         });
 
@@ -865,6 +869,12 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         store: durableWorkflowStore,
         adapters: workflowAdapters,
         subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
+        isTargetAuthorized: async (target) => {
+          if (target.platform !== "telegram") return true;
+          const parsed = tryParseTelegramSessionId(target.channelId);
+          if (!parsed) return false;
+          return isTelegramChatAllowed({ cfg: await getCoreConfig(), chatId: parsed.chatId });
+        },
       });
       await workflowProgressProjector.start();
 

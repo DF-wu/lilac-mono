@@ -899,6 +899,78 @@ describe("WorkflowWaitResolver", () => {
     }
   });
 
+  it("resolves and suppresses a Telegram reply without routing it as a prompt", async () => {
+    const dbPath = join(
+      tmpdir(),
+      `workflow-telegram-reply-suppression-${crypto.randomUUID()}.sqlite`,
+    );
+    const store = new DurableWorkflowStore(dbPath);
+    const bus = createLilacBus(new IdleRawBus());
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "test-telegram-reply-suppression",
+      now: () => 20,
+    });
+    try {
+      createRunAndWait(store, {
+        runId: "telegram-reply-wait",
+        operationId: "wait-1",
+        wait: {
+          state: "pending",
+          match: {
+            kind: "reply",
+            platform: "telegram",
+            channelId: "-100123:7",
+            messageId: "anchor-1",
+            fromUserId: "user-1",
+          },
+          matchKey: "telegram:-100123:7",
+          dueAt: null,
+          deadlineAt: 1_000,
+          resolverCursor: null,
+          result: null,
+          resolvedBy: null,
+          claimedBy: null,
+          claimedAt: null,
+          createdAt: 3,
+          updatedAt: 3,
+          resolvedAt: null,
+        },
+      });
+      const event = {
+        platform: "telegram" as const,
+        channelId: "-100123:7",
+        messageId: "reply-1",
+        userId: "user-1",
+        text: "continue",
+        ts: 20,
+        raw: { telegram: { replyToMessageId: "anchor-1" } },
+      };
+
+      expect(shouldSuppressRouterForWorkflowReply({ store, event, now: 20 })).toMatchObject({
+        suppress: true,
+        reason: "workflow:telegram-reply-wait:wait-1:pending",
+      });
+      await resolver.start();
+      await resolver.resolveAdapterEvent(event, "telegram-cursor");
+      expect(store.getWait("telegram-reply-wait", "wait-1")).toMatchObject({
+        state: "resolved",
+        resolverCursor: "telegram-cursor",
+        result: { platform: "telegram", messageId: "reply-1", text: "continue" },
+      });
+      expect(shouldSuppressRouterForWorkflowReply({ store, event, now: 21 })).toMatchObject({
+        suppress: true,
+        reason: "workflow:telegram-reply-wait:wait-1:consumed",
+      });
+    } finally {
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("expires an exact-deadline reply deterministically regardless of resolver order", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-deadline-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);

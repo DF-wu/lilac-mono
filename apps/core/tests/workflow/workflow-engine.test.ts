@@ -173,6 +173,10 @@ function createTrustedRun(
   mixedEditing = false,
   operationIdleTimeoutMs = 2_000,
   originUserId: string | null = "user-1",
+  origin: { client: "discord" | "telegram"; sessionId: string } = {
+    client: "discord",
+    sessionId: "channel-1",
+  },
 ) {
   const inputSchema = {
     type: "object",
@@ -223,8 +227,8 @@ function createTrustedRun(
       argsSha256: canonicalJsonSha256(args),
       origin: {
         requestId: "origin-1",
-        sessionId: "channel-1",
-        client: "discord",
+        sessionId: origin.sessionId,
+        client: origin.client,
         userId: originUserId,
         projectCwd: canonicalWorkspaceRoot,
       },
@@ -2245,8 +2249,58 @@ describe("WorkflowEngine", () => {
       await engine.start();
       await waitFor(() => store.getRun("run-unauthenticated-reply")?.state === "failed");
       expect(store.getRun("run-unauthenticated-reply")?.terminalDetail).toContain(
-        "authenticated originating Discord session and user",
+        "authenticated originating Discord or Telegram session and user",
       );
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("creates reply waits for the authenticated originating Telegram session", async () => {
+    const dbPath = join(tmpdir(), `workflow-engine-telegram-reply-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const bus = createLilacBus(new CapturingRawBus());
+    createApprovedRun(
+      store,
+      "run-telegram-reply",
+      {},
+      { operation: 10_000, result: 10_000 },
+      { kind: "detached" },
+      false,
+      process.cwd(),
+      false,
+      2_000,
+      "user-1",
+      { client: "telegram", sessionId: "-100123:7" },
+    );
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "test-telegram-reply",
+      pollMs: 5,
+      loadSnapshot: async () =>
+        workflowSource(
+          "waitForReply",
+          'return await waitForReply({ messageId: "anchor-1", timeoutMs: 1000 });',
+        ),
+      compileSource: compileTestWorkflow,
+    });
+    try {
+      await engine.start();
+      await waitFor(() => store.listOperations("run-telegram-reply")[0]?.state === "blocked");
+      const operation = store.listOperations("run-telegram-reply")[0];
+      if (!operation) throw new Error("Missing Telegram wait operation");
+      expect(store.getWait("run-telegram-reply", operation.operationId)?.match).toEqual({
+        kind: "reply",
+        platform: "telegram",
+        channelId: "-100123:7",
+        messageId: "anchor-1",
+        fromUserId: "user-1",
+      });
     } finally {
       await engine.stop();
       await bus.close();

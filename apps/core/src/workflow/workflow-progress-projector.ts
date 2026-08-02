@@ -7,7 +7,7 @@ import { GithubMessageCreatedError } from "../surface/github/github-adapter";
 import type { ContentOpts, MsgRef, SessionRef } from "../surface/types";
 import { DurableWorkflowStore } from "./durable-workflow-store";
 import { sha256 } from "./workflow-definition";
-import type { WorkflowSurfaceActionKind } from "./workflow-domain";
+import type { WorkflowProgressTarget, WorkflowSurfaceActionKind } from "./workflow-domain";
 import {
   buildWorkflowProgressView,
   renderWorkflowProgressView,
@@ -17,6 +17,7 @@ import {
 export interface WorkflowProgressCardService {
   ensureInitialCard(runId: string): Promise<MsgRef>;
   requestProjection(runId: string): void;
+  isTargetAuthorized?(target: WorkflowProgressTarget): Promise<boolean>;
 }
 
 type CachedActions = {
@@ -92,8 +93,20 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       coalesceMs?: number;
       minEditIntervalMs?: number;
       retryIntervalMs?: number;
+      isTargetAuthorized?: (target: WorkflowProgressTarget) => boolean | Promise<boolean>;
     },
   ) {}
+
+  async isTargetAuthorized(target: WorkflowProgressTarget): Promise<boolean> {
+    return (await this.input.isTargetAuthorized?.(target)) ?? true;
+  }
+
+  private async assertTargetAuthorized(target: WorkflowProgressTarget): Promise<void> {
+    if (await this.isTargetAuthorized(target)) return;
+    throw new Error(
+      `Workflow progress target is no longer authorized: ${target.platform}:${target.channelId}`,
+    );
+  }
 
   async start(): Promise<void> {
     this.stopping = false;
@@ -364,6 +377,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       throw new Error(`Workflow run ${runId} has no supported durable progress target`);
     }
     const platform = target.platform;
+    await this.assertTargetAuthorized(target);
     const adapter = this.input.adapters.get(platform);
     if (!adapter) throw new Error(`Workflow progress adapter is unavailable: ${platform}`);
 
@@ -429,8 +443,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
 
     let editTargetMissing = false;
     try {
-      const sendCard = async (): Promise<MsgRef> =>
-        await adapter.sendMsg(
+      const sendCard = async (): Promise<MsgRef> => {
+        await this.assertTargetAuthorized(target);
+        return await adapter.sendMsg(
           asSessionRef(platform, target.channelId),
           content,
           target.replyToMessageId
@@ -440,11 +455,13 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
               }
             : { silent: true },
         );
+      };
       let projectedRef: MsgRef;
       if (!messageRef) {
         projectedRef = await sendCard();
       } else {
         try {
+          await this.assertTargetAuthorized(target);
           await adapter.editMsg(messageRef, content);
           projectedRef = messageRef;
         } catch (error) {

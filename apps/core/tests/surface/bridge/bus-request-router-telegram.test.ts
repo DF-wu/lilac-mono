@@ -206,6 +206,9 @@ async function startRouter(
   opts: {
     config?: Record<string, unknown>;
     routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
+    shouldSuppressAdapterEvent?: Parameters<
+      typeof startBusRequestRouter
+    >[0]["shouldSuppressAdapterEvent"];
   } = {},
 ) {
   const bus = createLilacBus(createInMemoryRawBus());
@@ -227,6 +230,7 @@ async function startRouter(
     subscriptionId: "telegram-router-test",
     config: opts.config ?? routerConfig(),
     routerGate: opts.routerGate,
+    shouldSuppressAdapterEvent: opts.shouldSuppressAdapterEvent,
   });
 
   return { bus, published, router };
@@ -270,6 +274,28 @@ describe("the shared router serving the telegram surface", () => {
       expect(msg.headers?.request_client).toBe("telegram");
       expect(msg.headers?.session_id).toBe(CHAT);
       expect(String(msg.headers?.request_id ?? "")).toStartWith("telegram:");
+    } finally {
+      await router.stop();
+    }
+  });
+
+  it("suppresses a workflow reply without blocking later Telegram messages", async () => {
+    const adapter = new FakeTelegramAdapter();
+    const { bus, published, router } = await startRouter(adapter, {
+      shouldSuppressAdapterEvent: async ({ evt }) => ({
+        suppress: evt.messageId === "10",
+        ...(evt.messageId === "10" ? { reason: "workflow reply" } : {}),
+      }),
+    });
+
+    try {
+      await publishTelegramMessage(bus, { messageId: "10", text: "workflow answer" });
+      expect(published).toHaveLength(0);
+
+      await publishTelegramMessage(bus, { messageId: "11", text: "ordinary prompt" });
+      const msg = await waitForPublish(published);
+      expect(published).toHaveLength(1);
+      expect(msg.headers?.request_id).toBe(`telegram:${CHAT}:11`);
     } finally {
       await router.stop();
     }
