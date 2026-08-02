@@ -78,6 +78,10 @@ export type BashExecutionError =
       message: string;
     };
 
+type BashTermination =
+  | { type: "aborted" }
+  | { type: "timeout"; timeoutKind: "no_output" | "wall_clock"; timeoutMs: number };
+
 export type BashToolOutput = {
   stdout: string;
   stderr: string;
@@ -108,6 +112,25 @@ export type BashToolOutput = {
 function toErrorMessage(error: unknown) {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function toFailedExecutionError(
+  termination: BashTermination | undefined,
+  errorMessage: string,
+): BashExecutionError {
+  if (!termination) {
+    return {
+      type: "exception",
+      phase: "spawn",
+      message: errorMessage,
+    };
+  }
+  switch (termination.type) {
+    case "timeout":
+      return { ...termination, signal: DEFAULT_KILL_SIGNAL };
+    case "aborted":
+      return { type: "aborted", signal: DEFAULT_KILL_SIGNAL };
+  }
 }
 
 function stripAnsiEscapeSequences(input: string): string {
@@ -310,16 +333,16 @@ function allocateStreamPreviewBytes(params: {
   maxBytes: number;
 }): { stdout: number; stderr: number } {
   const both = params.stdoutBytes > 0 && params.stderrBytes > 0;
-  let stdout = both
-    ? Math.min(params.stdoutBytes, Math.ceil(params.maxBytes / 2))
-    : params.stdoutBytes > 0
-      ? params.maxBytes
-      : 0;
-  let stderr = both
-    ? Math.min(params.stderrBytes, Math.floor(params.maxBytes / 2))
-    : params.stderrBytes > 0
-      ? params.maxBytes
-      : 0;
+  let stdout = 0;
+  let stderr = 0;
+  if (both) {
+    stdout = Math.min(params.stdoutBytes, Math.ceil(params.maxBytes / 2));
+    stderr = Math.min(params.stderrBytes, Math.floor(params.maxBytes / 2));
+  } else if (params.stdoutBytes > 0) {
+    stdout = params.maxBytes;
+  } else if (params.stderrBytes > 0) {
+    stderr = params.maxBytes;
+  }
   let remaining = Math.max(0, params.maxBytes - stdout - stderr);
   const stdoutExtra = Math.min(Math.max(0, params.stdoutBytes - stdout), remaining);
   stdout += stdoutExtra;
@@ -355,16 +378,16 @@ function limitBashOutput(
 
   const available = Math.max(0, maxOutputBytes);
   const bothStreams = input.stdout.length > 0 && input.stderr.length > 0;
-  let stdoutBudget = bothStreams
-    ? Math.min(stdoutBytes, Math.ceil(available / 2))
-    : input.stdout.length > 0
-      ? available
-      : 0;
-  let stderrBudget = bothStreams
-    ? Math.min(stderrBytes, Math.floor(available / 2))
-    : input.stderr.length > 0
-      ? available
-      : 0;
+  let stdoutBudget = 0;
+  let stderrBudget = 0;
+  if (bothStreams) {
+    stdoutBudget = Math.min(stdoutBytes, Math.ceil(available / 2));
+    stderrBudget = Math.min(stderrBytes, Math.floor(available / 2));
+  } else if (input.stdout.length > 0) {
+    stdoutBudget = available;
+  } else if (input.stderr.length > 0) {
+    stderrBudget = available;
+  }
   let remaining = Math.max(0, available - stdoutBudget - stderrBudget);
   const stdoutNeed = Math.max(0, stdoutBytes - stdoutBudget);
   const stdoutExtra = Math.min(stdoutNeed, remaining);
@@ -568,12 +591,12 @@ export async function executeBash(
   } = {},
 ): Promise<BashToolOutput> {
   const cwdTarget = parseSshCwdTarget(cwd);
-  const resolvedCwd =
-    cwdTarget.kind === "local"
-      ? cwdTarget.cwd
-        ? expandTilde(cwdTarget.cwd)
-        : process.cwd()
-      : cwdTarget.cwd;
+  let resolvedCwd: string;
+  if (cwdTarget.kind === "local") {
+    resolvedCwd = cwdTarget.cwd ? expandTilde(cwdTarget.cwd) : process.cwd();
+  } else {
+    resolvedCwd = cwdTarget.cwd;
+  }
   const displayCwd =
     cwdTarget.kind === "ssh" ? formatRemoteDisplayPath(cwdTarget.host, cwdTarget.cwd) : resolvedCwd;
   const remoteLogMeta =
@@ -644,10 +667,7 @@ export async function executeBash(
   const vcsEnv = resolveVcsEnv({ dataDir: env.dataDir });
 
   const controller = new AbortController();
-  let termination:
-    | { type: "aborted" }
-    | { type: "timeout"; timeoutKind: "no_output" | "wall_clock"; timeoutMs: number }
-    | undefined;
+  let termination: BashTermination | undefined;
 
   let child: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -1336,16 +1356,7 @@ export async function executeBash(
       err,
     );
 
-    const executionError: BashExecutionError =
-      termination?.type === "timeout"
-        ? { ...termination, signal: DEFAULT_KILL_SIGNAL }
-        : termination?.type === "aborted"
-          ? { type: "aborted", signal: DEFAULT_KILL_SIGNAL }
-          : {
-              type: "exception",
-              phase: "spawn",
-              message: toErrorMessage(err),
-            };
+    const executionError = toFailedExecutionError(termination, toErrorMessage(err));
     return {
       stdout: "",
       stderr: "",

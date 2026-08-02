@@ -56,6 +56,24 @@ function isTerminalRun(run: WorkflowRun): boolean {
   return ["succeeded", "failed", "rejected", "cancelled"].includes(run.state);
 }
 
+function toCompletionStatus(
+  state: WorkflowRun["state"],
+  timedOut: boolean,
+): WorkflowLiveParentCompletion["status"] {
+  switch (state) {
+    case "succeeded":
+      return "resolved";
+    case "cancelled":
+      return "cancelled";
+    case "queued":
+    case "running":
+    case "blocked":
+    case "paused":
+    case "failed":
+      return timedOut ? "timeout" : "failed";
+  }
+}
+
 function toCompletionIdentity(
   run: WorkflowRun,
   store: DurableWorkflowStore,
@@ -66,14 +84,7 @@ function toCompletionIdentity(
   const timedOut = store
     .listOperations(run.runId, { limit: 1_000 })
     .some((operation) => operation.state === "timed_out");
-  const status =
-    run.state === "succeeded"
-      ? "resolved"
-      : run.state === "cancelled"
-        ? "cancelled"
-        : timedOut
-          ? "timeout"
-          : "failed";
+  const status = toCompletionStatus(run.state, timedOut);
   return {
     runId: run.runId,
     parentToolCallId: run.completionTarget.parentToolCallId,
@@ -105,8 +116,10 @@ async function toCompletion(
           maxBytes: revision.limits.maxResultBytes,
         })
       : run.result;
-  const rawFinalText =
-    run.state === "succeeded" ? (typeof result === "string" ? result : JSON.stringify(result)) : "";
+  let rawFinalText = "";
+  if (run.state === "succeeded") {
+    rawFinalText = typeof result === "string" ? result : JSON.stringify(result);
+  }
   const finalText = await resolveWorkflowSubagentToolResult({
     finalText: rawFinalText,
     childSessionId: run.completionTarget.childSessionId,
@@ -270,12 +283,11 @@ export class WorkflowLiveParentBridge {
             if (run.completionTarget.kind !== "live_parent") {
               throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
             }
-            const status =
-              run.state === "succeeded"
-                ? "resolved"
-                : run.state === "cancelled"
-                  ? "cancelled"
-                  : "failed";
+            const status = toCompletionStatus(run.state, false);
+            let finalText = "";
+            if (run.state === "succeeded") {
+              finalText = typeof run.result === "string" ? run.result : JSON.stringify(run.result);
+            }
             return {
               runId: run.runId,
               parentToolCallId: run.completionTarget.parentToolCallId,
@@ -284,12 +296,7 @@ export class WorkflowLiveParentBridge {
               sessionName: run.completionTarget.sessionName,
               status,
               ok: status === "resolved",
-              finalText:
-                run.state === "succeeded"
-                  ? typeof run.result === "string"
-                    ? run.result
-                    : JSON.stringify(run.result)
-                  : "",
+              finalText,
               ...(run.terminalDetail ? { detail: run.terminalDetail } : {}),
             };
           }),
@@ -594,15 +601,18 @@ export class WorkflowLiveParentBridge {
   ): void {
     const existing = forwarding.children.get(message.data.toolCallId);
     const preserveTerminal = existing?.status === "done" && message.data.status !== "end";
+    let ok: boolean | null;
+    if (message.data.status === "end") {
+      ok = message.data.ok === true;
+    } else if (preserveTerminal) {
+      ok = existing.ok ?? false;
+    } else {
+      ok = existing?.ok ?? null;
+    }
     const next: ChildToolState = {
       toolCallId: message.data.toolCallId,
       status: message.data.status === "end" || preserveTerminal ? "done" : "running",
-      ok:
-        message.data.status === "end"
-          ? message.data.ok === true
-          : preserveTerminal
-            ? (existing.ok ?? false)
-            : (existing?.ok ?? null),
+      ok,
       display: message.data.display,
       updatedSeq: ++forwarding.updateSeq,
     };
@@ -708,9 +718,11 @@ export class WorkflowLiveParentBridge {
     detail?: string,
   ): string {
     const selection = this.resolveChildModelSelection(runId);
-    const model = selection
-      ? `${selection.model}${selection.reasoning ? ` [${selection.reasoning}]` : ""}`
-      : null;
+    let model: string | null = null;
+    if (selection) {
+      model = selection.model;
+      if (selection.reasoning) model += ` [${selection.reasoning}]`;
+    }
     return `subagent (${[target.profile, model, state, detail?.slice(0, 160) ?? null]
       .filter((part): part is string => part !== null)
       .join("; ")})`;

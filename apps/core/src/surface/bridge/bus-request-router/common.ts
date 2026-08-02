@@ -1,6 +1,7 @@
 import type { EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
 import {
   getDiscordUserAliasValue,
+  isRecord,
   parseCoreConfig,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
@@ -394,13 +395,9 @@ export function getDiscordFlags(raw: unknown): {
 
 export type RouterConfigOverride = Record<string, unknown>;
 
-function isConfigRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export async function withDefaultToolsConfig(config: RouterConfigOverride): Promise<CoreConfig> {
   const parsed = await parseCoreConfig(config);
-  const agent = isConfigRecord(config.agent) ? config.agent : {};
+  const agent = isRecord(config.agent) ? config.agent : {};
   const systemPrompt = typeof agent.systemPrompt === "string" ? agent.systemPrompt : "";
 
   return {

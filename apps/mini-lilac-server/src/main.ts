@@ -309,10 +309,13 @@ export function parseCliArgs(args: readonly string[]): MiniLilacServerCliOptions
     if (parsed.values.status && parsed.values.logout) {
       throw new Error("Choose only one of --status or --logout");
     }
+    let action: "login" | "logout" | "status" = "login";
+    if (parsed.values.status) action = "status";
+    else if (parsed.values.logout) action = "logout";
     return authOptionsSchema.parse({
       command: "auth",
       provider,
-      action: parsed.values.status ? "status" : parsed.values.logout ? "logout" : "login",
+      action,
     });
   }
   if (args[0] === "init") {

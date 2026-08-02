@@ -31,12 +31,14 @@ function choosePermissionOutcome(
   const pick = (...kinds: readonly string[]) =>
     request.options.find((option) => kinds.includes(option.kind));
 
-  const preferred =
-    behavior === "reject"
-      ? pick("reject_once", "reject_always")
-      : behavior === "once"
-        ? pick("allow_once", "allow_always", "reject_once", "reject_always")
-        : pick("allow_always", "allow_once", "reject_once", "reject_always");
+  let preferred: RequestPermissionRequest["options"][number] | undefined;
+  if (behavior === "reject") {
+    preferred = pick("reject_once", "reject_always");
+  } else if (behavior === "once") {
+    preferred = pick("allow_once", "allow_always", "reject_once", "reject_always");
+  } else {
+    preferred = pick("allow_always", "allow_once", "reject_once", "reject_always");
+  }
 
   if (!preferred) {
     return { outcome: "cancelled" };

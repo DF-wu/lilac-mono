@@ -135,15 +135,19 @@ function toDiscordAttachmentMeta(x: unknown): DiscordAttachmentMeta | null {
   const url = typeof o.url === "string" ? o.url : null;
   if (!url) return null;
 
-  const filename =
-    typeof o.name === "string" ? o.name : typeof o.filename === "string" ? o.filename : undefined;
+  let filename: string | undefined;
+  if (typeof o.name === "string") {
+    filename = o.name;
+  } else if (typeof o.filename === "string") {
+    filename = o.filename;
+  }
 
-  const mimeType =
-    typeof o.contentType === "string"
-      ? o.contentType
-      : typeof o.mimeType === "string"
-        ? o.mimeType
-        : undefined;
+  let mimeType: string | undefined;
+  if (typeof o.contentType === "string") {
+    mimeType = o.contentType;
+  } else if (typeof o.mimeType === "string") {
+    mimeType = o.mimeType;
+  }
 
   const size = typeof o.size === "number" ? o.size : undefined;
 

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import type { UIMessageChunk } from "ai";
 
 import { MiniLilacCompactionCancelledError, MiniLilacTransport } from "./mini-lilac-transport";
 import {
+  MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   type MiniLilacStreamCursorChunk,
   miniLilacProfileSummarySchema,
   miniLilacUIMessageDataPartSchema,
@@ -217,7 +219,7 @@ describe("MiniLilacTransport", () => {
       { type: "text-delta", id: "answer", delta: "child answer" },
       { type: "text-end", id: "answer" },
       { type: "finish", finishReason: "stop" },
-    ];
+    ] satisfies readonly UIMessageChunk[];
     const transport = new MiniLilacTransport({
       baseUrl: "/mini",
       fetch: mockFetch(async (input, init) => {
@@ -230,6 +232,70 @@ describe("MiniLilacTransport", () => {
     if (stream === null) throw new Error("expected active session stream");
     expect(await readChunks(stream)).toEqual(chunks);
     expect(String(calls[0]?.input)).toBe("/mini/chat/session%20%2F%201/stream");
+  });
+
+  it("normalizes future non-data envelopes before installed SDK validation", async () => {
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () =>
+        sseResponse([
+          { type: "future-observation", payload: { opaque: true }, secret: "discard-me" },
+          { type: "text-delta", id: "answer", delta: "still connected" },
+        ]),
+      ),
+    });
+
+    const stream = await transport.streamSession("session-1");
+    if (stream === null) throw new Error("expected active session stream");
+
+    expect(await readChunks(stream)).toEqual([
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "future-observation" },
+        transient: true,
+      },
+      { type: "text-delta", id: "answer", delta: "still connected" },
+    ]);
+  });
+
+  it("keeps known chunks SDK-validated while preserving raw tool payloads", async () => {
+    const input = { command: "bun test", extension: ["raw", 1] };
+    const output = { stdout: "pass\n", nested: { untouched: true } };
+    const chunks = [
+      { type: "tool-input-available", toolCallId: "tool-1", toolName: "bash", input },
+      { type: "tool-output-available", toolCallId: "tool-1", output },
+      { type: "data-futureExtension", data: { open: true } },
+    ] satisfies readonly UIMessageChunk[];
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => sseResponse(chunks)),
+    });
+
+    const stream = await transport.streamSession("session-1");
+    if (stream === null) throw new Error("expected active session stream");
+
+    expect(await readChunks(stream)).toEqual(chunks);
+  });
+
+  it("fails the stream for malformed known and malformed future envelopes", async () => {
+    const malformedChunks: readonly unknown[] = [
+      { type: "text-delta", id: "answer" },
+      { type: "data-futureExtension" },
+      { payload: { noType: true } },
+      { type: "x".repeat(129), payload: true },
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "future-observation", leaked: true },
+        transient: true,
+      },
+    ];
+
+    for (const malformed of malformedChunks) {
+      const transport = new MiniLilacTransport({
+        fetch: mockFetch(async () => sseResponse([malformed])),
+      });
+      const stream = await transport.streamSession("session-1");
+      if (stream === null) throw new Error("expected active session stream");
+      await expect(stream.getReader().read()).rejects.toThrow();
+    }
   });
 
   it("lists profile-aware skills for an encoded cwd", async () => {
@@ -501,6 +567,72 @@ describe("MiniLilacTransport", () => {
     expect(String(calls[2]?.input)).toBe("https://streams.example.test/reconnect/session%201");
     expect(calls[2]?.init?.method).toBe("GET");
     expect(new Headers(calls[2]?.init?.headers).get("Authorization")).toBe("Bearer token-2");
+  });
+
+  it("applies send request headers after configured, bearer, and JSON headers", async () => {
+    const calls: FetchCall[] = [];
+    const transport = new MiniLilacTransport({
+      headers: {
+        Authorization: "Configured authorization",
+        "Content-Type": "application/configured",
+        "X-Configured": "retained",
+      },
+      bearerToken: () => "default-token",
+      fetch: mockFetch(async (input, init) => {
+        calls.push({ input, init });
+        return sseResponse([]);
+      }),
+    });
+
+    await readChunks(
+      await transport.sendMessages({
+        trigger: "submit-message",
+        chatId: "session-1",
+        messageId: undefined,
+        messages: [],
+        abortSignal: undefined,
+        headers: {
+          Authorization: "Caller authorization",
+          "Content-Type": "application/caller+json",
+        },
+      }),
+    );
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("Authorization")).toBe("Caller authorization");
+    expect(headers.get("Content-Type")).toBe("application/caller+json");
+    expect(headers.get("X-Configured")).toBe("retained");
+  });
+
+  it("applies reconnect request headers after configured and bearer headers", async () => {
+    const calls: FetchCall[] = [];
+    const transport = new MiniLilacTransport({
+      headers: {
+        Authorization: "Configured authorization",
+        "Content-Type": "application/configured",
+        "X-Configured": "retained",
+      },
+      bearerToken: () => "default-token",
+      fetch: mockFetch(async (input, init) => {
+        calls.push({ input, init });
+        return new Response(null, { status: 204 });
+      }),
+    });
+
+    expect(
+      await transport.reconnectToStream({
+        chatId: "session-1",
+        headers: {
+          Authorization: "Caller authorization",
+          "Content-Type": "application/caller-stream",
+        },
+      }),
+    ).toBeNull();
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("Authorization")).toBe("Caller authorization");
+    expect(headers.get("Content-Type")).toBe("application/caller-stream");
+    expect(headers.get("X-Configured")).toBe("retained");
   });
 
   it("sends control command IDs and parses typed control results", async () => {

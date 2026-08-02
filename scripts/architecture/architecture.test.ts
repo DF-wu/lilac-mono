@@ -6,11 +6,16 @@ import ts from "typescript-codegen";
 import { analyzeWorkspace, declarationPackageName } from "./analyzer.ts";
 import { applyBaselines, baselineFromFindings, formatBaselineModule } from "./baseline.ts";
 import { createFingerprint } from "./fingerprint.ts";
-import type { ArchitectureManifest, WorkspaceArchitecture } from "./manifest.ts";
-import { architectureManifest } from "./manifest.ts";
+import type {
+  ArchitectureManifest,
+  OpenProtocolAdapter,
+  WorkspaceArchitecture,
+} from "./manifest.ts";
+import { architectureManifest, assertArchitectureManifestIntegrity } from "./manifest.ts";
 import type { ArchitectureDiagnostic, ArchitectureRule } from "./model.ts";
 import { createWorkspaceProgram } from "./program.ts";
 import { analyzeArchitecture } from "./runner.ts";
+import { isProductionFileName } from "./source-policy.ts";
 import {
   assertWorkspaceInventoryMatches,
   compareWorkspaceInventory,
@@ -31,6 +36,7 @@ const BASE_WORKSPACE = {
   opaqueUnknown: [],
   capabilityPredicates: [],
   exceptionAdapters: [],
+  openProtocolAdapters: [],
   panicSites: [],
   compatibilityOutputs: [],
   structuredLoggers: [],
@@ -55,6 +61,20 @@ function findingsFor(
     ruleZones: { [rule]: [{ include: file }] },
   } satisfies WorkspaceArchitecture;
   return analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram);
+}
+
+function openProtocolAdapter(
+  exportName: string,
+  overrides: Partial<OpenProtocolAdapter> = {},
+): OpenProtocolAdapter {
+  return {
+    identity: { module: "unions.ts", exportName },
+    externalProtocol: { package: "open-protocol-sdk", exportName: "ProtocolEvent" },
+    protocolParameter: 0,
+    fallbackVariant: { discriminant: "kind", value: "unsupported" },
+    reason: "Fixture open protocol normalization boundary.",
+    ...overrides,
+  };
 }
 
 describe("boundary validation rules", () => {
@@ -214,6 +234,405 @@ describe("failure flow rules", () => {
     expect(findings).toHaveLength(4);
     expect(findings.some((finding) => finding.message.includes("worker"))).toBeTrue();
     expect(findings.some((finding) => finding.message.includes("http"))).toBeTrue();
+  });
+});
+
+describe("Stage 2 union rules", () => {
+  test("requires exhaustive project-owned switches across imports, aliases, discriminants, and generics", () => {
+    const findings = findingsFor("architecture/closed-union-exhaustiveness", "unions.ts");
+    expect(findings).toHaveLength(11);
+    expect(findings.some((finding) => finding.message.includes('missing "complete"'))).toBeTrue();
+    expect(findings.some((finding) => finding.message.includes('missing "deleted"'))).toBeTrue();
+    expect(
+      findings.some((finding) => finding.message.includes("uses a silent default")),
+    ).toBeTrue();
+    expect(findings.every((finding) => finding.suggestion.includes("never sink"))).toBeTrue();
+    expect(findings.some((finding) => finding.identity.includes("thirdPartySwitch"))).toBeFalse();
+    expect(
+      findings.some((finding) => finding.identity.includes("launderedThirdPartySwitch")),
+    ).toBeFalse();
+    expect(
+      findings.some((finding) => finding.identity.includes("wrappedThirdPartySwitch")),
+    ).toBeFalse();
+    expect(
+      findings.some((finding) => finding.identity.includes("exhaustiveWithNeverSink")),
+    ).toBeFalse();
+    expect(
+      findings.some((finding) => finding.identity.includes("exhaustivePropertyWithNeverSink")),
+    ).toBeFalse();
+    expect(findings.some((finding) => finding.identity.includes("unrelatedNeverSink"))).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("incompleteInferredSwitch")),
+    ).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("incompleteInferredFunctionSwitch")),
+    ).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("incompleteInferredObjectSwitch")),
+    ).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("incompleteShorthandObjectSwitch")),
+    ).toBeTrue();
+  });
+
+  test("follows imported maps and accepts checked imported and intermediate assignments", () => {
+    const findings = findingsFor("architecture/closed-union-map-exhaustiveness", "unions.ts");
+    expect(findings).toHaveLength(7);
+    expect(findings.every((finding) => finding.message.includes("compiler-checked"))).toBeTrue();
+    expect(findings.some((finding) => finding.location?.file === "union-types.ts")).toBeTrue();
+    expect(findings.filter((finding) => finding.location?.file === "union-types.ts")).toHaveLength(
+      2,
+    );
+  });
+
+  test("deduplicates exhaustive map findings by source file and position", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      ruleZones: {
+        "architecture/closed-union-map-exhaustiveness": [
+          { include: "map-a.ts" },
+          { include: "map-b.ts" },
+        ],
+      },
+    } satisfies WorkspaceArchitecture;
+    const findings = analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram);
+    expect(findings).toHaveLength(2);
+    expect(findings.map((finding) => finding.location?.file).sort()).toEqual([
+      "map-a.ts",
+      "map-b.ts",
+    ]);
+  });
+
+  test("checks unindexed nested map property assignments and preserves exhaustive contracts", () => {
+    const findings = findingsFor("architecture/closed-union-map-exhaustiveness", "nested-maps.ts");
+    expect(findings).toHaveLength(7);
+    expect(findings.every((finding) => finding.location?.file === "nested-maps.ts")).toBeTrue();
+    expect(findings.every((finding) => finding.message.includes("compiler-checked"))).toBeTrue();
+  });
+
+  test("validates exact external input, closed local output, and explicit open fallback", () => {
+    const valid = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+      openProtocolAdapters: [openProtocolAdapter("normalizeProtocolEvent")],
+    });
+    expect(valid).toEqual([]);
+
+    const missingFallback = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+      openProtocolAdapters: [
+        openProtocolAdapter("normalizeProtocolEvent"),
+        openProtocolAdapter("normalizeWithoutExplicitFallback"),
+      ],
+    });
+    expect(missingFallback).toHaveLength(1);
+    expect(missingFallback[0]?.message).toContain("never explicitly returns");
+
+    const wrongInput = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+      openProtocolAdapters: [
+        openProtocolAdapter("normalizeProtocolEvent"),
+        openProtocolAdapter("normalizeLocalValue"),
+      ],
+    });
+    expect(wrongInput).toHaveLength(1);
+    expect(wrongInput[0]?.message).toContain("not the named external protocol");
+
+    const aliasInput = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+      openProtocolAdapters: [
+        openProtocolAdapter("normalizeProtocolEvent"),
+        openProtocolAdapter("normalizeAliasedProtocolEvent"),
+      ],
+    });
+    expect(aliasInput).toEqual([]);
+
+    for (const exportName of ["normalizeWrappedProtocolEvent", "normalizeUnionProtocolEvent"]) {
+      const inexact = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+        openProtocolAdapters: [
+          openProtocolAdapter("normalizeProtocolEvent"),
+          openProtocolAdapter(exportName),
+        ],
+      });
+      expect(inexact).toHaveLength(1);
+      expect(inexact[0]?.message).toContain("not the named external protocol");
+    }
+  });
+
+  test("rejects direct external protocol switching outside the exact adapter", () => {
+    const findings = findingsFor("architecture/open-protocol-normalization", "open-consumer.ts", {
+      openProtocolAdapters: [openProtocolAdapter("normalizeProtocolEvent")],
+    });
+    expect(findings).toHaveLength(4);
+    expect(findings.every((finding) => finding.message.includes("switched directly"))).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("consumeProtocolDirectly")),
+    ).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("consumeAliasedProtocolDirectly")),
+    ).toBeTrue();
+    expect(
+      findings.some((finding) => finding.identity.includes("consumeDestructuredProtocolDirectly")),
+    ).toBeTrue();
+    expect(
+      findings.some((finding) =>
+        finding.identity.includes("consumePropertyAliasedProtocolDirectly"),
+      ),
+    ).toBeTrue();
+    expect(
+      findings.every((finding) =>
+        finding.suggestion.includes("exactly registered open-protocol adapter"),
+      ),
+    ).toBeTrue();
+  });
+
+  test("fails stale open-protocol registrations that do not resolve to a callable", () => {
+    expect(() =>
+      findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+        openProtocolAdapters: [openProtocolAdapter("misspelledProtocolAdapter")],
+      }),
+    ).toThrow("must resolve to exactly one callable implementation; found 0");
+  });
+
+  test("requires nonempty unique open-protocol registrations", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      ruleZones: {
+        "architecture/open-protocol-normalization": [{ include: "unions.ts" }],
+      },
+      openProtocolAdapters: [openProtocolAdapter("normalizeProtocolEvent")],
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [workspace] }),
+    ).not.toThrow();
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...workspace,
+            openProtocolAdapters: [
+              openProtocolAdapter("normalizeProtocolEvent"),
+              openProtocolAdapter("normalizeProtocolEvent"),
+            ],
+          },
+        ],
+      }),
+    ).toThrow("Duplicate open-protocol adapter registration");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...workspace,
+            openProtocolAdapters: [openProtocolAdapter("normalizeProtocolEvent", { reason: "" })],
+          },
+        ],
+      }),
+    ).toThrow("reason must be nonempty");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...workspace,
+            ruleZones: {
+              "architecture/open-protocol-normalization": [{ include: "consumer.ts" }],
+            },
+          },
+        ],
+      }),
+    ).toThrow("outside its workspace rule zones");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...workspace,
+            ruleZones: {
+              "architecture/open-protocol-normalization": [{ include: "**" }],
+            },
+          },
+        ],
+      }),
+    ).toThrow("must name an exact module");
+  });
+
+  test("activates closed unions globally and open protocols only in exact registered zones", () => {
+    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
+    for (const workspace of architectureManifest.workspaces) {
+      const zones: WorkspaceArchitecture["ruleZones"] = workspace.ruleZones;
+      expect(zones["architecture/closed-union-exhaustiveness"]).toEqual([{ include: "**" }]);
+      expect(zones["architecture/closed-union-map-exhaustiveness"]).toEqual([{ include: "**" }]);
+    }
+    const acp = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/acp-controller",
+    );
+    const tui = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/mini-lilac-tui",
+    );
+    expect(acp?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
+      { include: "session-history.ts" },
+    ]);
+    expect(acp?.openProtocolAdapters).toEqual([
+      {
+        identity: { module: "session-history.ts", exportName: "projectSessionUpdate" },
+        externalProtocol: { package: "@agentclientprotocol/sdk", exportName: "SessionUpdate" },
+        protocolParameter: 0,
+        fallbackVariant: { discriminant: "type", value: "unsupported" },
+        reason:
+          "Defense-in-depth projection for runtime ACP version skew; the SDK normally validates SessionUpdate before this adapter runs.",
+      },
+    ]);
+    expect(tui?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
+      { include: "src/ui-message-chunk-projection.ts" },
+      { include: "src/render.ts" },
+    ]);
+    expect(tui?.openProtocolAdapters).toEqual([
+      {
+        identity: {
+          module: "src/ui-message-chunk-projection.ts",
+          exportName: "projectUIMessageChunk",
+        },
+        externalProtocol: { package: "ai", exportName: "UIMessageChunk" },
+        protocolParameter: 0,
+        fallbackVariant: { discriminant: "kind", value: "unsupported" },
+        reason: "Projects the open AI SDK stream protocol into local TUI chunk variants.",
+      },
+    ]);
+    expect(
+      architectureManifest.workspaces
+        .filter(
+          (workspace) =>
+            workspace.root !== "apps/acp-controller" && workspace.root !== "apps/mini-lilac-tui",
+        )
+        .every(
+          (workspace) =>
+            workspace.ruleZones["architecture/open-protocol-normalization"]?.length === 0 &&
+            workspace.openProtocolAdapters.length === 0,
+        ),
+    ).toBeTrue();
+  });
+
+  test("registers exact wire, projection, CLI, and remote-runner boundary decoders", () => {
+    const acp = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/acp-controller",
+    );
+    const miniServer = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/mini-lilac-server",
+    );
+    const miniRuntime = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-runtime",
+    );
+    const remoteRunner = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/remote-fs-runner",
+    );
+    const tui = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/mini-lilac-tui",
+    );
+    const miniClient = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-client",
+    );
+    expect(acp?.boundaryDecoders).toEqual([]);
+    expect(tui?.boundaryDecoders).toEqual([
+      {
+        identity: {
+          module: "src/ui-message-chunk-projection.ts",
+          exportName: "projectMiniLilacStreamChunk",
+        },
+        category: "projection",
+      },
+    ]);
+    expect(miniClient?.boundaryDecoders).toEqual([
+      {
+        identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunk" },
+        category: "wire",
+      },
+    ]);
+    expect(miniServer?.boundaryDecoders).toEqual([
+      {
+        identity: { module: "src/main.ts", exportName: "parseCliArgs" },
+        category: "request",
+      },
+    ]);
+    expect(remoteRunner?.boundaryDecoders).toEqual([
+      {
+        identity: { module: "src/cli.ts", exportName: "ordinaryFileStartOrUndefined" },
+        category: "projection",
+      },
+      {
+        identity: { module: "src/cli.ts", exportName: "parseEnvelope" },
+        category: "wire",
+      },
+      {
+        identity: { module: "src/cli.ts", exportName: "decodeDaemonResponseEnvelope" },
+        category: "wire",
+      },
+    ]);
+    expect(
+      miniRuntime?.boundaryDecoders.some(
+        (decoder) => decoder.identity.exportName === "SessionActor.summarizeForCompaction",
+      ),
+    ).toBeFalse();
+  });
+
+  test("registers exact stream validation and ChatTransport host rejection adapters", () => {
+    const miniClient = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-client",
+    );
+    expect(miniClient?.exceptionAdapters).toEqual([
+      {
+        identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunk" },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/mini-lilac-client",
+          exportName: "miniLilacUnsupportedUIMessageChunkSchema",
+        },
+        direction: "signal-host",
+        reason:
+          "Rejects malformed reserved data-* sentinels and stream chunks through the existing stream host contract.",
+      },
+      {
+        identity: {
+          module: "mini-lilac-transport.ts",
+          exportName: "validateUnsupportedSentinel",
+        },
+        category: "result-to-framework",
+        externalApi: { package: "ai", exportName: "Schema.validate" },
+        direction: "signal-host",
+        reason: "Rejects an invalid unsupported-chunk sentinel through the stream host contract.",
+      },
+      {
+        identity: {
+          module: "mini-lilac-transport.ts",
+          exportName: "parseMiniLilacStream.transform",
+        },
+        category: "result-to-framework",
+        externalApi: { package: "global", exportName: "TransformStream.transform" },
+        direction: "signal-host",
+        reason: "Propagates malformed event-stream frames through the stream host contract.",
+      },
+      {
+        identity: {
+          module: "mini-lilac-transport.ts",
+          exportName: "MiniLilacTransport.responseStream",
+        },
+        category: "result-to-framework",
+        externalApi: { package: "ai", exportName: "ChatTransport" },
+        direction: "signal-host",
+        reason: "Reports an invalid chat response through the ChatTransport rejection contract.",
+      },
+    ]);
+  });
+
+  test("excludes the generated Core remote runner bundle but not its source", () => {
+    const root = path.join(REPOSITORY_ROOT, "apps/core");
+    expect(
+      isProductionFileName(path.join(root, "src/ssh/remote-js/remote-runner.cjs"), root),
+    ).toBeFalse();
+    expect(
+      isProductionFileName(path.join(root, "src/ssh/remote-js/remote-runner-entry.ts"), root),
+    ).toBeTrue();
+    expect(isProductionFileName(path.join(root, "test/support.ts"), root)).toBeFalse();
+    expect(isProductionFileName(path.join(root, "tests/support.ts"), root)).toBeFalse();
+    expect(isProductionFileName(path.join(root, "__tests__/support.ts"), root)).toBeFalse();
+    expect(isProductionFileName(path.join(root, "src/generated/output.ts"), root)).toBeFalse();
+    expect(isProductionFileName(path.join(root, "src/fixtures/production.ts"), root)).toBeFalse();
   });
 });
 

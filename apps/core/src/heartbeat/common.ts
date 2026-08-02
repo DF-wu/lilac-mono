@@ -59,12 +59,14 @@ export function getHeartbeatQuietState(params: {
   const end = parseHourMinute(quietHours.end);
   const current = local.hour * 60 + local.minute;
 
-  const inside =
-    start === end
-      ? true
-      : start < end
-        ? current >= start && current < end
-        : current >= start || current < end;
+  let inside: boolean;
+  if (start === end) {
+    inside = true;
+  } else if (start < end) {
+    inside = current >= start && current < end;
+  } else {
+    inside = current >= start || current < end;
+  }
 
   return {
     inside,

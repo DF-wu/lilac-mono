@@ -206,11 +206,13 @@ class StreamingPatternRedactor {
       const redacted = redactSecrets(this.carry);
       if (redacted !== this.carry) {
         const lowerCarry = this.carry.toLowerCase();
-        this.suppression = lowerCarry.includes("authorization")
-          ? "line"
-          : !/\s$/u.test(this.carry)
-            ? "whitespace"
-            : null;
+        if (lowerCarry.includes("authorization")) {
+          this.suppression = "line";
+        } else if (!/\s$/u.test(this.carry)) {
+          this.suppression = "whitespace";
+        } else {
+          this.suppression = null;
+        }
         this.carry = "";
         return redacted;
       }

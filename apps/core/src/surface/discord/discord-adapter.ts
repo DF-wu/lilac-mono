@@ -278,6 +278,28 @@ export function buildDiscordSlashOption(arg: CustomCommandArgDef) {
   };
 }
 
+function readDiscordSlashOption(
+  interaction: ChatInputCommandInteraction<CacheType>,
+  arg: CustomCommandArgDef,
+): string | number | boolean | null {
+  switch (arg.type) {
+    case "string":
+      return interaction.options.getString(arg.key);
+    case "number":
+      return interaction.options.getNumber(arg.key);
+    case "boolean":
+      return interaction.options.getBoolean(arg.key);
+  }
+}
+
+function resolveDiscordSessionKind(
+  isDm: boolean,
+  parentChannelId: string | null,
+): "channel" | "thread" | "dm" {
+  if (isDm) return "dm";
+  return parentChannelId ? "thread" : "channel";
+}
+
 export class DiscordAdapter implements SurfaceAdapter {
   private client: Client | null = null;
   private store: DiscordSurfaceStore | null = null;
@@ -1247,12 +1269,12 @@ export class DiscordAdapter implements SurfaceAdapter {
       for (const threadMember of members.values()) {
         if (out.length >= limit) break;
 
-        const userId =
-          "userId" in threadMember && typeof threadMember.userId === "string"
-            ? threadMember.userId
-            : typeof threadMember.id === "string"
-              ? threadMember.id
-              : null;
+        let userId: string | null = null;
+        if ("userId" in threadMember && typeof threadMember.userId === "string") {
+          userId = threadMember.userId;
+        } else if (typeof threadMember.id === "string") {
+          userId = threadMember.id;
+        }
         if (!userId) continue;
 
         const member =
@@ -1954,12 +1976,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     try {
       const rawArgs = Object.fromEntries(
         custom.def.args.flatMap((arg) => {
-          const value =
-            arg.type === "number"
-              ? interaction.options.getNumber(arg.key)
-              : arg.type === "boolean"
-                ? interaction.options.getBoolean(arg.key)
-                : interaction.options.getString(arg.key);
+          const value = readDiscordSlashOption(interaction, arg);
           return value === null ? [] : [[arg.key, value] as const];
         }),
       );
@@ -2262,14 +2279,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const parentChannelId =
       "isThread" in msg.channel && msg.channel.isThread() ? msg.channel.parentId : null;
 
-    const sessionKind: "channel" | "thread" | "dm" =
+    const sessionKind = resolveDiscordSessionKind(
       "isDMBased" in msg.channel &&
-      typeof msg.channel.isDMBased === "function" &&
-      msg.channel.isDMBased()
-        ? "dm"
-        : parentChannelId
-          ? "thread"
-          : "channel";
+        typeof msg.channel.isDMBased === "function" &&
+        msg.channel.isDMBased(),
+      parentChannelId,
+    );
 
     this.upsertMessageRelationFromDiscordMessage(msg);
 
@@ -2409,14 +2424,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const parentChannelId =
       "isThread" in msg.channel && msg.channel.isThread() ? msg.channel.parentId : null;
 
-    const sessionKind: "channel" | "thread" | "dm" =
+    const sessionKind = resolveDiscordSessionKind(
       "isDMBased" in msg.channel &&
-      typeof msg.channel.isDMBased === "function" &&
-      msg.channel.isDMBased()
-        ? "dm"
-        : parentChannelId
-          ? "thread"
-          : "channel";
+        typeof msg.channel.isDMBased === "function" &&
+        msg.channel.isDMBased(),
+      parentChannelId,
+    );
 
     store.upsertSession({
       channelId,
@@ -2611,14 +2624,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const parentChannelId =
       "isThread" in msg.channel && msg.channel.isThread() ? msg.channel.parentId : null;
 
-    const sessionKind: "channel" | "thread" | "dm" =
+    const sessionKind = resolveDiscordSessionKind(
       "isDMBased" in msg.channel &&
-      typeof msg.channel.isDMBased === "function" &&
-      msg.channel.isDMBased()
-        ? "dm"
-        : parentChannelId
-          ? "thread"
-          : "channel";
+        typeof msg.channel.isDMBased === "function" &&
+        msg.channel.isDMBased(),
+      parentChannelId,
+    );
 
     store.upsertSession({
       channelId,

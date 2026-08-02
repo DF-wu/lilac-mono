@@ -63,6 +63,9 @@ function architectureResolutionDiagnostics(
   for (const formatter of workspace.taggedErrorFormatters) {
     if (formatter.kind === "external") criticalPackages.add(formatter.package);
   }
+  for (const adapter of workspace.openProtocolAdapters) {
+    criticalPackages.add(adapter.externalProtocol.package);
+  }
   const localSinkModules = new Set(
     [
       ...workspace.compatibilityOutputs.map((output) => output.sink),

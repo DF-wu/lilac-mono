@@ -74,6 +74,7 @@ export type RuntimeDiagnosticSample = {
 };
 
 type PressureLine = NonNullable<PressureMetrics["some"]>;
+type PressureKind = keyof PressureMetrics;
 
 const CGROUP_ROOT = "/sys/fs/cgroup";
 
@@ -85,7 +86,7 @@ function nanosecondsToMilliseconds(value: number): number {
   return Number.isFinite(value) ? value / 1_000_000 : 0;
 }
 
-function parsePressureLine(line: string): { kind: "some" | "full"; metrics: PressureLine } | null {
+function parsePressureLine(line: string): { kind: PressureKind; metrics: PressureLine } | null {
   const match =
     /^(some|full)\s+avg10=([0-9.]+)\s+avg60=([0-9.]+)\s+avg300=([0-9.]+)\s+total=(\d+)$/u.exec(
       line.trim(),
@@ -118,7 +119,14 @@ export function parsePressureMetrics(input: string): PressureMetrics | undefined
   for (const line of input.split("\n")) {
     const parsed = parsePressureLine(line);
     if (!parsed) continue;
-    result[parsed.kind] = parsed.metrics;
+    switch (parsed.kind) {
+      case "some":
+        result.some = parsed.metrics;
+        break;
+      case "full":
+        result.full = parsed.metrics;
+        break;
+    }
   }
   return result.some || result.full ? result : undefined;
 }

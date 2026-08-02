@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "bun:test";
 
 import type { ArchitectureManifest, ExceptionAdapter } from "../architecture/manifest.ts";
@@ -5,7 +7,6 @@ import {
   findExceptionFlowViolations,
   findInlineAsyncResultCallbackViolations,
   findLocalRecordGuardViolations,
-  findNestedTernaryViolations,
 } from "./production-syntax.mts";
 import { type SyntacticPolicy, SYNTACTIC_POLICY } from "./syntax-policy.mts";
 
@@ -28,6 +29,7 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): Architectu
         opaqueUnknown: [],
         capabilityPredicates: [],
         exceptionAdapters: adapters,
+        openProtocolAdapters: [],
         panicSites: [],
         compatibilityOutputs: [],
         structuredLoggers: [],
@@ -125,7 +127,7 @@ describe("production exception syntax", () => {
     ]);
   });
 
-  it("does not hard-fail ambiguous catch/then methods or unused reject parameters", () => {
+  it("treats every catch method and non-nullish then rejection callback as exception flow", () => {
     const violations = findExceptionFlowViolations(
       `
         cache.catch(handleMiss);
@@ -141,10 +143,31 @@ describe("production exception syntax", () => {
       policyWith(),
     );
 
-    expect(violations).toEqual([]);
+    expect(violations.map((violation) => violation.kind)).toEqual([
+      "promise-catch",
+      "rejection-callback",
+    ]);
   });
 
-  it("does not infer promises from shadowed fetch or non-promise module and local calls", () => {
+  it("detects spread arguments that can occupy the then rejection callback slot", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        task.then(...callbacks);
+        task.then(useValue, ...rejectionCallbacks);
+        task.then(useValue);
+        task.then(useValue, null, ...laterCallbacks);
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map((violation) => violation.kind)).toEqual([
+      "rejection-callback",
+      "rejection-callback",
+    ]);
+  });
+
+  it("does not require Promise provenance for catch methods", () => {
     const violations = findExceptionFlowViolations(
       `
         import { readFile } from "node:fs";
@@ -162,7 +185,13 @@ describe("production exception syntax", () => {
       policyWith(),
     );
 
-    expect(violations).toEqual([]);
+    expect(violations.map((violation) => violation.kind)).toEqual([
+      "promise-catch",
+      "promise-catch",
+      "promise-catch",
+      "promise-catch",
+      "promise-catch",
+    ]);
   });
 
   it("detects throws, catches, and explicit host stream/error signals", () => {
@@ -271,9 +300,32 @@ describe("production exception syntax", () => {
     expect(
       findExceptionFlowViolations(code, "apps/example/tests/support.ts", policyWith()),
     ).toEqual([]);
+    expect(findExceptionFlowViolations(code, "apps/example/test/support.ts", policyWith())).toEqual(
+      [],
+    );
+    expect(
+      findExceptionFlowViolations(code, "apps/example/__tests__/support.ts", policyWith()),
+    ).toEqual([]);
     expect(findExceptionFlowViolations(code, "apps/example/dist/output.js", policyWith())).toEqual(
       [],
     );
+    expect(
+      findExceptionFlowViolations(code, "apps/example/generated/output.js", policyWith()),
+    ).toEqual([]);
+    expect(
+      findExceptionFlowViolations(
+        code,
+        "apps/core/src/ssh/remote-js/remote-runner.cjs",
+        policyWith(),
+      ),
+    ).toEqual([]);
+    expect(
+      findExceptionFlowViolations(
+        code,
+        "apps/core/src/ssh/remote-js/remote-runner-entry.ts",
+        policyWith(),
+      ),
+    ).toHaveLength(1);
   });
 });
 
@@ -326,42 +378,123 @@ describe("Result callback syntax", () => {
   });
 });
 
-describe("dormant Stage 2 syntax", () => {
-  it("detects configured local record guards except the canonical utility", () => {
-    const policy = policyWith({
-      recordGuardNames: ["isObjectRecord", "isPlainObject", "isRecord"],
-    });
+describe("local record guard syntax", () => {
+  it("detects canonical record guards regardless of name except the canonical utility", () => {
+    const policy = policyWith();
     const code = `
-      function isRecord(value: unknown) { return typeof value === "object"; }
-      const isPlainObject = (value: unknown) => value !== null;
-      function isObjectRecord(value: unknown) { return !!value; }
+      function asRecord(value: unknown) {
+        return typeof value === "object" && value !== null && !Array.isArray(value);
+      }
+      const objectLike = (candidate: unknown) =>
+        !Array.isArray(candidate) && candidate !== null && typeof candidate === "object";
     `;
     expect(findLocalRecordGuardViolations(code, "apps/example/src/guards.ts", policy)).toHaveLength(
-      3,
+      2,
     );
     expect(
       findLocalRecordGuardViolations(
-        `export function isRecord(value: unknown) { return value !== null; }`,
+        `export function isRecord(value: unknown) {
+          return typeof value === "object" && value !== null && !Array.isArray(value);
+        }`,
         "packages/utils/runtime-utils.ts",
         policy,
       ),
     ).toEqual([]);
   });
 
-  it("detects nested ternaries but permits a single binary ternary", () => {
+  it("detects multi-return guards in functions, class fields, and object properties", () => {
+    const code = `
+      function asRecord(value: unknown): Record<string, unknown> | undefined {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+        return value as Record<string, unknown>;
+      }
+      class GuardSet {
+        asRecord = function (candidate: unknown): Record<string, unknown> | undefined {
+          if (typeof candidate !== "object" || candidate === null) return undefined;
+          if (Array.isArray(candidate)) return undefined;
+          return candidate as Record<string, unknown>;
+        };
+      }
+      const guards = {
+        objectRecord: (input: unknown): Record<string, unknown> | undefined => {
+          if (Array.isArray(input) || input === null || typeof input !== "object") return undefined;
+          return input as Record<string, unknown>;
+        },
+      };
+    `;
     expect(
-      findNestedTernaryViolations(
-        `const value = first ? (second ? "a" : "b") : "c";`,
-        "apps/example/src/render.ts",
-        policyWith(),
-      ),
-    ).toHaveLength(1);
+      findLocalRecordGuardViolations(code, "apps/example/src/multi-return-guards.ts", policyWith()),
+    ).toHaveLength(3);
+  });
+
+  it("allows complete decoders, capability checks, and wrappers around canonical isRecord", () => {
+    const code = `
+      import { isRecord } from "@stanley2058/lilac-utils";
+      function decodeService(value: unknown): value is { id: string } {
+        return typeof value === "object" && value !== null && !Array.isArray(value)
+          && "id" in value && typeof value.id === "string";
+      }
+      function hasRunCapability(value: unknown): value is { run(): void } {
+        return isRecord(value) && typeof value.run === "function";
+      }
+      function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {
+        return isRecord(value) ? value : undefined;
+      }
+      function decodeNamed(value: unknown): { id: string } | undefined {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+        if (!("id" in value) || typeof value.id !== "string") return undefined;
+        return value as { id: string };
+      }
+      const capabilities = {
+        runnable: (value: unknown): { run(): void } | undefined => {
+          if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+          if (!("run" in value) || typeof value.run !== "function") return undefined;
+          return value as { run(): void };
+        },
+      };
+    `;
     expect(
-      findNestedTernaryViolations(
-        `const value = first ? "a" : "b";`,
-        "apps/example/src/render.ts",
-        policyWith(),
-      ),
+      findLocalRecordGuardViolations(code, "apps/example/src/decoders.ts", policyWith()),
     ).toEqual([]);
+  });
+});
+
+describe("Oxlint production syntax activation", () => {
+  it("enables production-only syntax rules and preserves generated exclusions", () => {
+    const config = JSON.parse(
+      readFileSync(new URL("../../.oxlintrc.json", import.meta.url), "utf8"),
+    );
+    expect(config).toMatchObject({
+      ignorePatterns: [
+        "ref/**",
+        "node_modules/**",
+        "data/**",
+        "**/dist/**",
+        "**/generated/**",
+        "apps/core/src/ssh/remote-js/remote-runner.cjs",
+      ],
+      overrides: [
+        {
+          files: ["apps/**/*.{js,jsx,cjs,mjs,ts,tsx}", "packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"],
+          rules: {
+            "no-nested-ternary": "error",
+            "lilac/no-local-is-record": "error",
+          },
+        },
+        {
+          files: [
+            "**/*.test.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+            "**/*.spec.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+            "**/test/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+            "**/tests/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+            "**/__tests__/**/*.{js,jsx,ts,tsx,cjs,cts,mjs,mts}",
+          ],
+          rules: {
+            "no-nested-ternary": "off",
+            "lilac/no-local-is-record": "off",
+          },
+        },
+      ],
+    });
   });
 });

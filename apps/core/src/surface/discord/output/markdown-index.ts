@@ -338,11 +338,17 @@ function scanBlockquotes(
       if (match?.[1]) {
         const isMultiline = match[1].trimStart().startsWith(">>>");
         const contentStart = pos + match[1].length;
+        let lineEnd = end;
+        if (isMultiline) {
+          lineEnd = raw.length;
+        } else if (line.endsWith("\n")) {
+          lineEnd = end - 1;
+        }
         addZone(zones, pos, contentStart, "marker");
         blockquotes.push({
           lineStart: pos,
           contentStart,
-          lineEnd: isMultiline ? raw.length : line.endsWith("\n") ? end - 1 : end,
+          lineEnd,
           prefix: match[1],
         });
         if (isMultiline) break;
@@ -490,14 +496,17 @@ function scanInlineState(
   const closedFormatting = new Set(formatting);
   const extraFormatting = openFormatting.filter((marker) => !closedFormatting.has(marker));
 
+  let inlineCodeState: MarkdownState["inlineCode"] = null;
+  if (inlineCode) {
+    inlineCodeState = { marker: inlineCode.marker };
+  } else if (openInlineMarker) {
+    inlineCodeState = { marker: openInlineMarker };
+  }
+
   return {
     fence: fence ? { markerLength: fence.markerLength, lang: fence.lang } : null,
     blockquote: blockquote ? { prefix: blockquote.prefix } : null,
-    inlineCode: inlineCode
-      ? { marker: inlineCode.marker }
-      : openInlineMarker
-        ? { marker: openInlineMarker }
-        : null,
+    inlineCode: inlineCodeState,
     formatting: formatting.concat(extraFormatting),
   };
 }

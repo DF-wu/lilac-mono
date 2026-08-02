@@ -11,6 +11,7 @@ import {
   type HashlineEdit,
   type ReadFileStart,
 } from "@stanley2058/lilac-fs";
+import { z } from "zod";
 
 declare const PACKAGE_VERSION: string;
 
@@ -30,9 +31,18 @@ type RequestEnvelope = {
 
 type ResponseEnvelope = { ok: true; value: unknown } | { ok: false; error: string };
 
-function isRecord(value: unknown): value is JsonObject {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
+const jsonObjectSchema = z.record(z.string(), z.unknown());
+const successResponseEnvelopeSchema = z
+  .looseObject({ ok: z.literal(true) })
+  .refine((envelope) => Object.hasOwn(envelope, "value"), {
+    message: "successful daemon response must include value",
+    path: ["value"],
+  })
+  .transform((envelope): ResponseEnvelope => ({ ...envelope, ok: true, value: envelope["value"] }));
+const responseEnvelopeSchema = z.union([
+  successResponseEnvelopeSchema,
+  z.looseObject({ ok: z.literal(false), error: z.string() }),
+]);
 
 function numberOrUndefined(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -48,18 +58,20 @@ function stringArray(value: unknown): string[] {
 }
 
 function ordinaryFileStartOrUndefined(value: unknown): ReadFileStart | undefined {
-  if (!isRecord(value)) return undefined;
+  const decoded = jsonObjectSchema.safeParse(value);
+  if (!decoded.success) return undefined;
+  const record = decoded.data;
 
-  if (value["type"] === "offset") {
-    const offset = value["offset"];
+  if (record["type"] === "offset") {
+    const offset = record["offset"];
     return typeof offset === "number" && Number.isFinite(offset)
       ? { type: "offset", offset }
       : undefined;
   }
-  if (value["type"] !== "line") return undefined;
+  if (record["type"] !== "line") return undefined;
 
-  const line = value["line"];
-  const column = value["column"];
+  const line = record["line"];
+  const column = record["column"];
   if (typeof line !== "number" || !Number.isFinite(line)) return undefined;
   if (column !== undefined && (typeof column !== "number" || !Number.isFinite(column))) {
     return undefined;
@@ -69,17 +81,24 @@ function ordinaryFileStartOrUndefined(value: unknown): ReadFileStart | undefined
 }
 
 function parseEnvelope(value: unknown): RequestEnvelope {
-  if (!isRecord(value)) {
+  const decoded = jsonObjectSchema.safeParse(value);
+  if (!decoded.success) {
     throw new Error("request must be a JSON object");
   }
 
-  const input = value["input"];
+  const record = decoded.data;
+  const input = jsonObjectSchema.safeParse(record["input"]);
   return {
-    op: String(value["op"] ?? ""),
-    input: isRecord(input) ? input : {},
-    denyPaths: stringArray(value["denyPaths"]),
-    cwd: typeof value["cwd"] === "string" ? value["cwd"] : process.cwd(),
+    op: String(record["op"] ?? ""),
+    input: input.success ? input.data : {},
+    denyPaths: stringArray(record["denyPaths"]),
+    cwd: typeof record["cwd"] === "string" ? record["cwd"] : process.cwd(),
   };
+}
+
+export function decodeDaemonResponseEnvelope(value: unknown): ResponseEnvelope | undefined {
+  const decoded = responseEnvelopeSchema.safeParse(value);
+  return decoded.success ? decoded.data : undefined;
 }
 
 function runtimeBaseDir(): string {
@@ -135,24 +154,27 @@ function responseError(error: unknown): ResponseEnvelope {
   return { ok: false, error: error instanceof Error ? error.message : String(error) };
 }
 
-function normalizeEditOutput(result: unknown): unknown {
-  if (!isRecord(result)) return result;
-  if (result["success"] === true) {
+type EditResult =
+  | Awaited<ReturnType<FileSystem["editFile"]>>
+  | Awaited<ReturnType<FileSystem["hashlineEditFile"]>>;
+
+function normalizeEditOutput(result: EditResult): unknown {
+  if (result.success) {
     return {
       success: true,
-      resolvedPath: result["resolvedPath"],
-      oldHash: result["oldHash"],
-      newHash: result["newHash"],
-      changesMade: result["changesMade"],
-      replacementsMade: result["replacementsMade"],
+      resolvedPath: result.resolvedPath,
+      oldHash: result.oldHash,
+      newHash: result.newHash,
+      changesMade: result.changesMade,
+      replacementsMade: result.replacementsMade,
     };
   }
 
   return {
     success: false,
-    resolvedPath: result["resolvedPath"],
-    currentHash: result["currentHash"],
-    error: result["error"],
+    resolvedPath: result.resolvedPath,
+    currentHash: result.currentHash,
+    error: result.error,
   };
 }
 
@@ -166,18 +188,17 @@ export async function handleRequest(envelope: RequestEnvelope): Promise<unknown>
 
   if (envelope.op === "fs.read_text") {
     const start = ordinaryFileStartOrUndefined(input["start"]);
+    let format: "raw" | "numbered" | "hashline" = "raw";
+    if (input["format"] === "numbered" || input["format"] === "hashline") {
+      format = input["format"];
+    }
     return await fsTool.readFile({
       path: String(input["path"] ?? ""),
       start,
       maxLines: numberOrUndefined(input["maxLines"]),
       maxCharacters: numberOrUndefined(input["maxCharacters"]),
       maxBytes: numberOrUndefined(input["maxBytes"]),
-      format:
-        input["format"] === "numbered"
-          ? "numbered"
-          : input["format"] === "hashline"
-            ? "hashline"
-            : "raw",
+      format,
     });
   }
 
@@ -213,6 +234,10 @@ export async function handleRequest(envelope: RequestEnvelope): Promise<unknown>
   }
 
   if (envelope.op === "fs.grep") {
+    let mode: "default" | "detailed" | "hashline" = "default";
+    if (input["mode"] === "detailed" || input["mode"] === "hashline") {
+      mode = input["mode"];
+    }
     return await fsTool.grep({
       pattern: String(input["pattern"] ?? ""),
       baseDir: typeof input["baseDir"] === "string" ? input["baseDir"] : undefined,
@@ -222,12 +247,7 @@ export async function handleRequest(envelope: RequestEnvelope): Promise<unknown>
       maxResults: numberOrUndefined(input["maxResults"]),
       fileExtensions: stringArray(input["fileExtensions"]).map((ext) => ext.replace(/^\./, "")),
       includeContextLines: numberOrUndefined(input["includeContextLines"]),
-      mode:
-        input["mode"] === "detailed"
-          ? "detailed"
-          : input["mode"] === "hashline"
-            ? "hashline"
-            : "default",
+      mode,
     });
   }
 
@@ -298,12 +318,12 @@ function connectOnce(payload: unknown): Promise<ResponseEnvelope> {
       if (settled) return;
       settled = true;
       try {
-        const parsed = JSON.parse(response) as unknown;
-        if (!isRecord(parsed) || typeof parsed["ok"] !== "boolean") {
+        const decoded = decodeDaemonResponseEnvelope(JSON.parse(response) as unknown);
+        if (!decoded) {
           resolve({ ok: false, error: "daemon returned invalid response" });
           return;
         }
-        resolve(parsed as ResponseEnvelope);
+        resolve(decoded);
       } catch (error) {
         reject(error);
       }

@@ -1,5 +1,6 @@
 import type { CoreConfigModelOptionWarning, JSONObject, JSONValue } from "./core-config/types";
 import { MODEL_PROVIDER_OPTION_SHAPES } from "./model-provider-option-shapes.generated";
+import { isRecord } from "./runtime-utils";
 
 export type ModelProviderOptionWarning = CoreConfigModelOptionWarning;
 
@@ -29,15 +30,9 @@ const OPTION_SHAPES_BY_NAMESPACE = MODEL_PROVIDER_OPTION_SHAPES as Readonly<
   Record<string, ProviderOptionShape>
 >;
 
-function isObject(value: JSONValue | undefined): value is JSONObject {
-  return (
-    value !== null && value !== undefined && typeof value === "object" && !Array.isArray(value)
-  );
-}
-
 function looksLikeProviderOptionsMap(options: JSONObject): boolean {
   const values = Object.values(options);
-  return values.length > 0 && values.every(isObject);
+  return values.length > 0 && values.every(isRecord);
 }
 
 function providerOptionsNamespace(provider: string): string {
@@ -62,7 +57,7 @@ export function normalizeConfiguredModelProviderOptions(
   if (looksLikeProviderOptionsMap(providerOptions)) {
     return Object.fromEntries(
       Object.entries(providerOptions).filter((entry): entry is [string, JSONObject] =>
-        isObject(entry[1]),
+        isRecord(entry[1]),
       ),
     );
   }
@@ -135,7 +130,7 @@ function validateShape(params: {
       (variant) =>
         variant !== null &&
         ((variant.kind === "array" && Array.isArray(value)) ||
-          (variant.kind === "object" && isObject(value))),
+          (variant.kind === "object" && isRecord(value))),
     );
     if (matchingShape) {
       validateShape({ namespace, path, value, shape: matchingShape, warnings });
@@ -143,7 +138,7 @@ function validateShape(params: {
     return;
   }
 
-  if (!isObject(value)) return;
+  if (!isRecord(value)) return;
   const knownKeys = Object.keys(shape.properties);
   for (const [option, nestedValue] of Object.entries(value)) {
     const optionPath = [...path, option];

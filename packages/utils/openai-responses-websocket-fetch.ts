@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { ResponsesTransportMode } from "./env";
+import { isRecord } from "./runtime-utils";
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
 const CONTINUATION_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -102,15 +103,13 @@ export function createOpenAIResponsesWebSocketFetch(
     error?: unknown;
   }): void {
     if (options.mode !== "auto") return;
+    let errorMessage: string | undefined;
+    if (details.error instanceof Error) errorMessage = details.error.message;
+    else if (details.error !== undefined) errorMessage = String(details.error);
     options.onAutoFallback?.({
       reason: details.reason,
       requestUrl: details.requestUrl.toString(),
-      errorMessage:
-        details.error instanceof Error
-          ? details.error.message
-          : details.error === undefined
-            ? undefined
-            : String(details.error),
+      errorMessage,
     });
   }
 
@@ -747,15 +746,13 @@ function buildIncrementalWebSocketPayload(input: {
   }
 
   if (!best) {
+    let optimizationReason: ResponsesOptimizationReason = "not_prefix_extension";
+    if (matchingPrefix?.entry.responseId) optimizationReason = "request_shape_changed";
+    else if (matchingPrefix) optimizationReason = "no_continuation_state";
     return {
       payload: cloneJsonObject(requestBody),
       optimizationEnabled: false,
-      optimizationReason:
-        matchingPrefix && matchingPrefix.entry.responseId
-          ? "request_shape_changed"
-          : matchingPrefix
-            ? "no_continuation_state"
-            : "not_prefix_extension",
+      optimizationReason,
       turnState: matchingPrefix?.entry.turnState ?? null,
     };
   }
@@ -1573,11 +1570,7 @@ function extractErrorDetails(
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-
-  return value as Record<string, unknown>;
+  return isRecord(value) ? value : null;
 }
 
 function readString(value: unknown): string | undefined {

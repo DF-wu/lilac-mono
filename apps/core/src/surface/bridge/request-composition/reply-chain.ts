@@ -61,12 +61,11 @@ export function toReplyChainMessage(
     authorNameFallback?: string;
   },
 ): ReplyChainMessage {
-  const text =
-    opts?.overrideText !== undefined
-      ? opts.overrideText
-      : msg.text.trim().length > 0
-        ? msg.text
-        : (getForwardSnapshotTextFromRaw(msg.raw) ?? msg.text);
+  let text = opts?.overrideText;
+  if (text === undefined) {
+    text =
+      msg.text.trim().length > 0 ? msg.text : (getForwardSnapshotTextFromRaw(msg.raw) ?? msg.text);
+  }
 
   return {
     messageId: msg.ref.messageId,

@@ -214,7 +214,9 @@ function domainHash(domain: string, serialized: string): string {
 }
 
 function utf16Compare(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 const strictJsonPrimitiveSchema = z.union([z.null(), z.boolean(), z.number().finite(), z.string()]);
@@ -371,14 +373,16 @@ function projectResultContentItem(item: unknown): StrictJsonValue | null {
     return { type: "text", text: item["text"] };
   }
   if (type.includes("file") || type.startsWith("image")) {
-    const data =
-      item["fileId"] !== undefined
-        ? { type: "reference", reference: item["fileId"] }
-        : item["providerReference"] !== undefined
-          ? { type: "reference", reference: item["providerReference"] }
-          : item["reference"] !== undefined
-            ? { type: "reference", reference: item["reference"] }
-            : (item["url"] ?? item["data"]);
+    let data: unknown;
+    if (item["fileId"] !== undefined) {
+      data = { type: "reference", reference: item["fileId"] };
+    } else if (item["providerReference"] !== undefined) {
+      data = { type: "reference", reference: item["providerReference"] };
+    } else if (item["reference"] !== undefined) {
+      data = { type: "reference", reference: item["reference"] };
+    } else {
+      data = item["url"] ?? item["data"];
+    }
     const projected: Record<string, StrictJsonValue> = {
       type: "file",
       mediaType:
@@ -643,7 +647,8 @@ function sanitizeReplayValue(
 ): StrictJsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
-    return Number.isFinite(value) ? (Object.is(value, -0) ? 0 : value) : `[${String(value)}]`;
+    if (!Number.isFinite(value)) return `[${String(value)}]`;
+    return Object.is(value, -0) ? 0 : value;
   }
   if (typeof value === "bigint") return `[BigInt ${value.toString()}]`;
   if (typeof value === "undefined") return "[Unavailable value]";
@@ -1045,18 +1050,18 @@ export function preparePlainTextReplayForTarget(
     const message = canonicalPrefix[index]!;
     if (message.role === "system") continue;
     if (message.role === "user") {
-      const content =
-        typeof message.content === "string"
-          ? message.content
-          : message.content
-              .flatMap((part) =>
-                part.type === "text"
-                  ? part.text.length === 0
-                    ? []
-                    : [part.text]
-                  : [fileDescription(part)],
-              )
-              .join("\n\n");
+      let content: string;
+      if (typeof message.content === "string") {
+        content = message.content;
+      } else {
+        content = message.content
+          .flatMap((part) => {
+            if (part.type !== "text") return [fileDescription(part)];
+            if (part.text.length === 0) return [];
+            return [part.text];
+          })
+          .join("\n\n");
+      }
       appendReplayMessage(output, "user", content);
       continue;
     }

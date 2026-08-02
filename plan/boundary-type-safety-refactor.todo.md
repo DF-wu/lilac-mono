@@ -11,7 +11,7 @@
 
 ## Current Stage
 
-Stages 0 and 1 complete. Next: Stage 2, Mechanical Union, Predicate, And Failure Guardrails.
+Stages 0 through 2 complete. Next: Stage 3, High-Risk Process And Extension Boundaries.
 
 ## Stage 0
 
@@ -39,10 +39,21 @@ Stages 0 and 1 complete. Next: Stage 2, Mechanical Union, Predicate, And Failure
 - [x] Run independent Core, enforcement, and exit-criteria reviews and resolve all blocking findings.
 - [x] Run focused tests, root typecheck, full tests, lint, architecture ratchets, and formatting.
 
+## Stage 2
+
+- [x] Remove every production nested ternary and enable Oxlint's production rule.
+- [x] Remove canonical record-guard duplicates and enable semantic duplicate detection.
+- [x] Add and globally activate closed-union switch and map exhaustiveness checks.
+- [x] Add exact open-protocol normalization checks and ACP/TUI fallback projections.
+- [x] Broaden exception-flow syntax coverage to all `.catch` and rejection callbacks.
+- [x] Preserve Mini Lilac `ChatTransport`, plugin identity, filesystem, remote-fs, wire, and persisted shapes.
+- [x] Run partitioned independent reviews and resolve all blocking behavioral and enforcement findings.
+- [x] Run focused tests, root typecheck, full tests, lint, architecture ratchets, and formatting.
+
 ## Later Stages
 
 - [x] Stage 1: `better-result` foundation and pilot migrations.
-- [ ] Stage 2: mechanical union, predicate, and failure guardrails.
+- [x] Stage 2: mechanical union, predicate, and failure guardrails.
 - [ ] Stage 3: high-risk process and extension boundaries.
 - [ ] Stage 4: typed event-bus codec and delivery registry.
 - [ ] Stage 5: TUI tool-observation projection.
@@ -77,3 +88,10 @@ Stages 0 and 1 complete. Next: Stage 2, Mechanical Union, Predicate, And Failure
 - 2026-08-02: Stage 1 validation passed: `bun run typecheck`, `bun run test:all`, `bun run lint:fix`,
   `bun run fmt`, `bun run lint`, `bun run fmt:check`, and `git diff --check`. The syntax ratchet matched
   all 2,593 reviewed findings with zero new errors.
+- 2026-08-02: Stage 2 removed production nested ternaries and duplicate record guards, activated
+  compiler-backed closed-union/map checks, and added reachable ACP and TUI open-protocol fallbacks.
+  Reviews drove fixes for Mini Lilac transport/header compatibility, plugin identity, remote response
+  completeness, sparse result shapes, map/never provenance, and rejection-callback blind spots.
+- 2026-08-02: Stage 2 validation passed: `bun run typecheck`, `bun run test:all`, `bun run lint:fix`,
+  `bun run fmt`, `bun run lint`, `bun run fmt:check`, and `git diff --check`. The strengthened syntax
+  ratchet matched all 2,799 reviewed findings with zero new errors.

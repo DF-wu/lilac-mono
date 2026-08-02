@@ -1811,6 +1811,7 @@ describe("conversation thread store", () => {
     expect(first.eligibleTotal).toBe(3);
     expect(first.eligibility.summary).toBe(3);
     expect(first.eligibility.embeddingOnly).toBe(0);
+    expect(first.eligibility.reasons).toEqual({ "never-summarized": 3 });
     expect(first.summarized).toBe(2);
 
     const second = await service.runSummarization({ now, limit: 2, trigger: "periodic" });

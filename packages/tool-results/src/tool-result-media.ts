@@ -6,7 +6,9 @@ type ContentOutput = Extract<ToolResultOutput, { type: "content" }>;
 type ContentItem = ContentOutput["value"][number];
 
 function decodedBase64Bytes(data: string): number {
-  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  let padding = 0;
+  if (data.endsWith("==")) padding = 2;
+  else if (data.endsWith("=")) padding = 1;
   return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
 }
 
@@ -35,12 +37,7 @@ function inlineMedia(
 ): { bytes: number; filename?: string; mediaType: string } | undefined {
   if (item.type === "file" && item.data.type === "data") {
     const data = item.data.data;
-    const bytes =
-      typeof data === "string"
-        ? decodedBase64Bytes(data)
-        : data instanceof ArrayBuffer
-          ? data.byteLength
-          : data.byteLength;
+    const bytes = typeof data === "string" ? decodedBase64Bytes(data) : data.byteLength;
     return {
       bytes,
       ...(item.filename === undefined ? {} : { filename: item.filename }),

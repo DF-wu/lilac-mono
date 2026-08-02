@@ -994,13 +994,12 @@ export class WorkspaceHistoryStore {
         },
         prepareRestore: async (rootTreeOid, expectedCurrent, operationId) => {
           assertActive();
-          const boundCurrent =
-            expectedCurrent ??
-            (lastCapture?.status === "captured"
-              ? { status: "captured" as const, rootTreeOid: lastCapture.rootTreeOid }
-              : lastCapture?.status === "skipped"
-                ? { status: "unavailable" as const, reason: lastCapture.reason }
-                : undefined);
+          let boundCurrent = expectedCurrent;
+          if (boundCurrent === undefined && lastCapture?.status === "captured") {
+            boundCurrent = { status: "captured", rootTreeOid: lastCapture.rootTreeOid };
+          } else if (boundCurrent === undefined && lastCapture?.status === "skipped") {
+            boundCurrent = { status: "unavailable", reason: lastCapture.reason };
+          }
           return await this.prepareRestoreLocked(
             rootTreeOid,
             boundCurrent,
@@ -1897,11 +1896,14 @@ export class WorkspaceHistoryStore {
         const allExpectedProtected = cleanup.expected.every(
           (expected) => expected.status === "present" || expected.status === "repaired",
         );
-        const pruneExpire = !allExpectedProtected
-          ? "never"
-          : pruneAgeSeconds === 0
-            ? "now"
-            : `${pruneAgeSeconds}.seconds.ago`;
+        let pruneExpire: string;
+        if (!allExpectedProtected) {
+          pruneExpire = "never";
+        } else if (pruneAgeSeconds === 0) {
+          pruneExpire = "now";
+        } else {
+          pruneExpire = `${pruneAgeSeconds}.seconds.ago`;
+        }
         await this.runPrivateGit(
           ["-c", `gc.pruneExpire=${pruneExpire}`, "gc", "--auto", "--no-detach"],
           { operation: "maintain private Git objects" },
@@ -2633,15 +2635,24 @@ export class WorkspaceHistoryStore {
           await scanDirectory(absolutePath, relativePath);
           continue;
         }
-        const kind = stats.isSymbolicLink() ? "symlink" : stats.isFile() ? "regular" : "special";
-        const mode =
-          kind === "symlink"
-            ? POSIX_SYMLINK_MODE
-            : kind === "special"
-              ? 0
-              : (stats.mode & 0o111n) !== 0n
-                ? POSIX_EXECUTABLE_MODE
-                : POSIX_FILE_MODE;
+        let kind: ScannedEntry["kind"];
+        if (stats.isSymbolicLink()) {
+          kind = "symlink";
+        } else if (stats.isFile()) {
+          kind = "regular";
+        } else {
+          kind = "special";
+        }
+        let mode: number;
+        if (kind === "symlink") {
+          mode = POSIX_SYMLINK_MODE;
+        } else if (kind === "special") {
+          mode = 0;
+        } else if ((stats.mode & 0o111n) !== 0n) {
+          mode = POSIX_EXECUTABLE_MODE;
+        } else {
+          mode = POSIX_FILE_MODE;
+        }
         entries.set(relativePath, {
           relativePath,
           absolutePath,
@@ -2784,11 +2795,12 @@ export class WorkspaceHistoryStore {
     }
 
     const home = process.env.HOME;
-    const defaultGlobalExclude = process.env.XDG_CONFIG_HOME
-      ? path.join(process.env.XDG_CONFIG_HOME, "git", "ignore")
-      : home
-        ? path.join(home, ".config", "git", "ignore")
-        : undefined;
+    let defaultGlobalExclude: string | undefined;
+    if (process.env.XDG_CONFIG_HOME) {
+      defaultGlobalExclude = path.join(process.env.XDG_CONFIG_HOME, "git", "ignore");
+    } else if (home) {
+      defaultGlobalExclude = path.join(home, ".config", "git", "ignore");
+    }
     if (!defaultGlobalExclude) return undefined;
     return (await lstatIfExists(defaultGlobalExclude))?.isFile() ? defaultGlobalExclude : undefined;
   }
@@ -3657,17 +3669,20 @@ export class WorkspaceHistoryStore {
         if (!staged) throw this.verificationError(`Target blob was not staged: ${relativePath}`);
         const replacementRoot = this.findReplacementRoot(relativePath, replacementRoots);
         const targetParent = path.posix.dirname(relativePath);
-        const destinationDirectory = replacementRoot
-          ? path.join(
-              replacementRoot.temporaryPath,
-              ...path.posix
-                .relative(replacementRoot.relativePath, targetParent)
-                .split("/")
-                .filter(Boolean),
-            )
-          : targetParent === "."
-            ? this.cwd
-            : fromPosixPath(this.cwd, targetParent);
+        let destinationDirectory: string;
+        if (replacementRoot) {
+          destinationDirectory = path.join(
+            replacementRoot.temporaryPath,
+            ...path.posix
+              .relative(replacementRoot.relativePath, targetParent)
+              .split("/")
+              .filter(Boolean),
+          );
+        } else if (targetParent === ".") {
+          destinationDirectory = this.cwd;
+        } else {
+          destinationDirectory = fromPosixPath(this.cwd, targetParent);
+        }
         await this.beforeDestinationStage?.(relativePath, destinationDirectory);
         const parentStats = await lstat(destinationDirectory);
         if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
@@ -4286,13 +4301,16 @@ export class WorkspaceHistoryStore {
       }
       await this.assertOwnedTemporary(temporary);
       const temporaryStats = await lstat(entry.temporaryPath);
-      const temporaryMode = temporaryStats.isSymbolicLink()
-        ? POSIX_SYMLINK_MODE
-        : temporaryStats.isFile() && (temporaryStats.mode & 0o111) !== 0
-          ? POSIX_EXECUTABLE_MODE
-          : temporaryStats.isFile()
-            ? POSIX_FILE_MODE
-            : 0;
+      let temporaryMode: number;
+      if (temporaryStats.isSymbolicLink()) {
+        temporaryMode = POSIX_SYMLINK_MODE;
+      } else if (temporaryStats.isFile() && (temporaryStats.mode & 0o111) !== 0) {
+        temporaryMode = POSIX_EXECUTABLE_MODE;
+      } else if (temporaryStats.isFile()) {
+        temporaryMode = POSIX_FILE_MODE;
+      } else {
+        temporaryMode = 0;
+      }
       if (temporaryMode !== entry.mode) {
         throw this.restoreConflict(`Destination sibling mode changed: ${relativePath}`);
       }
@@ -4857,15 +4875,24 @@ export class WorkspaceHistoryStore {
   ): Promise<ScannedEntry | undefined> {
     const stats = await lstatIfExists(absolutePath, true);
     if (!stats) return undefined;
-    const kind = stats.isSymbolicLink() ? "symlink" : stats.isFile() ? "regular" : "special";
-    const mode =
-      kind === "symlink"
-        ? POSIX_SYMLINK_MODE
-        : kind === "special"
-          ? 0
-          : (stats.mode & 0o111n) !== 0n
-            ? POSIX_EXECUTABLE_MODE
-            : POSIX_FILE_MODE;
+    let kind: ScannedEntry["kind"];
+    if (stats.isSymbolicLink()) {
+      kind = "symlink";
+    } else if (stats.isFile()) {
+      kind = "regular";
+    } else {
+      kind = "special";
+    }
+    let mode: number;
+    if (kind === "symlink") {
+      mode = POSIX_SYMLINK_MODE;
+    } else if (kind === "special") {
+      mode = 0;
+    } else if ((stats.mode & 0o111n) !== 0n) {
+      mode = POSIX_EXECUTABLE_MODE;
+    } else {
+      mode = POSIX_FILE_MODE;
+    }
     return {
       relativePath,
       absolutePath,
@@ -5257,14 +5284,16 @@ export class WorkspaceHistoryStore {
         });
       }
       const mode = Number.parseInt(match[1], 8);
-      const expectedType =
-        mode === 0o040000
-          ? "tree"
-          : mode === POSIX_FILE_MODE ||
-              mode === POSIX_EXECUTABLE_MODE ||
-              mode === POSIX_SYMLINK_MODE
-            ? "blob"
-            : undefined;
+      let expectedType: "blob" | "tree" | undefined;
+      if (mode === 0o040000) {
+        expectedType = "tree";
+      } else if (
+        mode === POSIX_FILE_MODE ||
+        mode === POSIX_EXECUTABLE_MODE ||
+        mode === POSIX_SYMLINK_MODE
+      ) {
+        expectedType = "blob";
+      }
       if (!expectedType) {
         corrupt = true;
         continue;
@@ -5639,14 +5668,16 @@ export class WorkspaceHistoryStore {
     startedAt: number,
     result: WorkspaceHistoryMaintenanceResult,
   ): void {
-    const outcome =
-      result.status === "unavailable"
-        ? "skipped"
-        : result.status === "missing"
-          ? "missing"
-          : result.storeDisposition === "removed"
-            ? "removed"
-            : "maintained";
+    let outcome: Extract<WorkspaceHistoryMetric, { type: "maintenance" }>["outcome"];
+    if (result.status === "unavailable") {
+      outcome = "skipped";
+    } else if (result.status === "missing") {
+      outcome = "missing";
+    } else if (result.storeDisposition === "removed") {
+      outcome = "removed";
+    } else {
+      outcome = "maintained";
+    }
     this.emitMetric({
       type: "maintenance",
       workspaceId: this.workspaceId,

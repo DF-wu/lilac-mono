@@ -622,15 +622,19 @@ function normalizeAttachmentMeta(input: unknown): SurfaceMessageAttachmentMeta |
   const url = typeof o.url === "string" ? o.url : null;
   if (!url) return null;
 
-  const filename =
-    typeof o.filename === "string" ? o.filename : typeof o.name === "string" ? o.name : undefined;
+  let filename: string | undefined;
+  if (typeof o.filename === "string") {
+    filename = o.filename;
+  } else if (typeof o.name === "string") {
+    filename = o.name;
+  }
 
-  const rawMimeType =
-    typeof o.mimeType === "string"
-      ? o.mimeType
-      : typeof o.contentType === "string"
-        ? o.contentType
-        : undefined;
+  let rawMimeType: string | undefined;
+  if (typeof o.mimeType === "string") {
+    rawMimeType = o.mimeType;
+  } else if (typeof o.contentType === "string") {
+    rawMimeType = o.contentType;
+  }
 
   const mimeType = inferAttachmentMimeType({
     mimeType: rawMimeType,
@@ -1533,6 +1537,63 @@ export class Surface implements ServerTool {
           })
         : undefined;
 
+    let sessionIdFormats;
+    switch (effectiveClient) {
+      case undefined:
+      case "discord":
+        sessionIdFormats = {
+          client: "discord" as const,
+          accepted: [
+            {
+              format: "123456789012345678",
+              meaning: "Raw Discord channel id",
+            },
+            {
+              format: "<#123456789012345678>",
+              meaning: "Discord channel mention",
+            },
+            {
+              format: "dev-chat",
+              meaning:
+                "Configured session alias (cfg.entity.sessions.discord maps alias -> channelId or { discord, comment })",
+            },
+            {
+              format: "#dev-chat",
+              meaning: "Configured session alias with optional leading # prefix",
+            },
+          ],
+          notes: [
+            "If the request has no session context, you must pass --session-id (or set LILAC_SESSION_ID). Some requests also allow inferring sessionId/messageId from requestId when it is 'discord:<sessionId>:<messageId>'.",
+          ],
+        };
+        break;
+      case "github":
+        sessionIdFormats = {
+          client: "github" as const,
+          accepted: [
+            {
+              format: "OWNER/REPO#123",
+              meaning: "GitHub issue/PR thread",
+            },
+          ],
+          notes: [
+            "surface.sessions.list is not implemented for GitHub; use gh to discover issues/PRs.",
+            "For GitHub triggers, surface tools can default sessionId/messageId from requestId when it is 'github:<OWNER/REPO#N>:<triggerId>'.",
+          ],
+        };
+        break;
+      case "whatsapp":
+      case "slack":
+      case "telegram":
+      case "web":
+        sessionIdFormats = {
+          client: effectiveClient,
+          accepted: [],
+          notes: ["Only Discord and GitHub are implemented today."],
+        };
+        break;
+    }
+
     return {
       tool: "surface" as const,
       supportedClients: ["discord", "github"] as const,
@@ -1557,52 +1618,7 @@ export class Surface implements ServerTool {
         attachments:
           "Outbound: local files attached to a send (paths resolved relative to request cwd). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
       },
-      sessionIdFormats:
-        effectiveClient === "discord" || effectiveClient === undefined
-          ? {
-              client: "discord" as const,
-              accepted: [
-                {
-                  format: "123456789012345678",
-                  meaning: "Raw Discord channel id",
-                },
-                {
-                  format: "<#123456789012345678>",
-                  meaning: "Discord channel mention",
-                },
-                {
-                  format: "dev-chat",
-                  meaning:
-                    "Configured session alias (cfg.entity.sessions.discord maps alias -> channelId or { discord, comment })",
-                },
-                {
-                  format: "#dev-chat",
-                  meaning: "Configured session alias with optional leading # prefix",
-                },
-              ],
-              notes: [
-                "If the request has no session context, you must pass --session-id (or set LILAC_SESSION_ID). Some requests also allow inferring sessionId/messageId from requestId when it is 'discord:<sessionId>:<messageId>'.",
-              ],
-            }
-          : effectiveClient === "github"
-            ? {
-                client: "github" as const,
-                accepted: [
-                  {
-                    format: "OWNER/REPO#123",
-                    meaning: "GitHub issue/PR thread",
-                  },
-                ],
-                notes: [
-                  "surface.sessions.list is not implemented for GitHub; use gh to discover issues/PRs.",
-                  "For GitHub triggers, surface tools can default sessionId/messageId from requestId when it is 'github:<OWNER/REPO#N>:<triggerId>'.",
-                ],
-              }
-            : {
-                client: effectiveClient,
-                accepted: [],
-                notes: ["Only Discord and GitHub are implemented today."],
-              },
+      sessionIdFormats,
       relatedConfigKeys: {
         requestClientEnv: "LILAC_REQUEST_CLIENT",
         sessionIdEnv: "LILAC_SESSION_ID",

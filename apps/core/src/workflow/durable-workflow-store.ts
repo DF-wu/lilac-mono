@@ -1215,6 +1215,14 @@ export class DurableWorkflowStore {
       return resume.immediate();
     }
     const terminal = ["succeeded", "failed", "rejected", "cancelled"].includes(input.to);
+    let resultJson: string | null;
+    if (input.result === undefined) {
+      resultJson = current.result === null ? null : JSON.stringify(current.result);
+    } else if (input.result === null) {
+      resultJson = null;
+    } else {
+      resultJson = JSON.stringify(jsonValueSchema.parse(input.result));
+    }
     const result = this.db
       .query(
         `UPDATE workflow_runs SET state = ?, terminal_detail = ?, result_json = ?,
@@ -1225,13 +1233,7 @@ export class DurableWorkflowStore {
       .run(
         input.to,
         input.detail ?? current.terminalDetail,
-        input.result === undefined
-          ? current.result === null
-            ? null
-            : JSON.stringify(current.result)
-          : input.result === null
-            ? null
-            : JSON.stringify(jsonValueSchema.parse(input.result)),
+        resultJson,
         input.resultArtifactId === undefined ? current.resultArtifactId : input.resultArtifactId,
         input.to,
         input.now,
@@ -2283,6 +2285,22 @@ export class DurableWorkflowStore {
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
     const terminal = ["succeeded", "failed", "cancelled", "timed_out"].includes(input.to);
+    let outputJson: string | null;
+    if (input.output === undefined) {
+      outputJson = current.output === null ? null : JSON.stringify(current.output);
+    } else if (input.output === null) {
+      outputJson = null;
+    } else {
+      outputJson = JSON.stringify(jsonValueSchema.parse(input.output));
+    }
+    let usageJson: string | null;
+    if (input.usage === undefined) {
+      usageJson = current.usage === null ? null : JSON.stringify(current.usage);
+    } else if (input.usage === null) {
+      usageJson = null;
+    } else {
+      usageJson = JSON.stringify(workflowUsageSchema.parse(input.usage));
+    }
     const result = this.db
       .query(
         `UPDATE workflow_operations SET state = ?, request_id = ?, output_json = ?,
@@ -2299,22 +2317,10 @@ export class DurableWorkflowStore {
       .run(
         input.to,
         input.requestId === undefined ? current.requestId : input.requestId,
-        input.output === undefined
-          ? current.output === null
-            ? null
-            : JSON.stringify(current.output)
-          : input.output === null
-            ? null
-            : JSON.stringify(jsonValueSchema.parse(input.output)),
+        outputJson,
         input.resultArtifactId === undefined ? current.resultArtifactId : input.resultArtifactId,
         input.error === undefined ? current.error : input.error,
-        input.usage === undefined
-          ? current.usage === null
-            ? null
-            : JSON.stringify(current.usage)
-          : input.usage === null
-            ? null
-            : JSON.stringify(workflowUsageSchema.parse(input.usage)),
+        usageJson,
         input.to,
         input.now,
         terminal,
@@ -2673,6 +2679,14 @@ export class DurableWorkflowStore {
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
     const resolved = input.to === "resolved" || input.to === "expired";
+    let resultJson: string | null;
+    if (input.result === undefined) {
+      resultJson = current.result === null ? null : JSON.stringify(current.result);
+    } else if (input.result === null) {
+      resultJson = null;
+    } else {
+      resultJson = JSON.stringify(jsonValueSchema.parse(input.result));
+    }
     const result = this.db
       .query(
         `UPDATE workflow_waits SET state = ?, resolver_cursor = ?, result_json = ?,
@@ -2687,13 +2701,7 @@ export class DurableWorkflowStore {
       .run(
         input.to,
         input.resolverCursor === undefined ? current.resolverCursor : input.resolverCursor,
-        input.result === undefined
-          ? current.result === null
-            ? null
-            : JSON.stringify(current.result)
-          : input.result === null
-            ? null
-            : JSON.stringify(jsonValueSchema.parse(input.result)),
+        resultJson,
         input.resolvedBy === undefined ? current.resolvedBy : input.resolvedBy,
         resolved,
         input.now,
@@ -3337,14 +3345,22 @@ export class DurableWorkflowStore {
       const run = this.getRun(action.runId);
       if (!run) return { status: "stale" };
       previousRunStates.set(run.runId, run.state);
-      const nextState =
-        action.kind === "cancel" ? "cancelled" : action.kind === "pause" ? "paused" : "queued";
-      const valid =
-        action.kind === "cancel"
-          ? !["succeeded", "failed", "cancelled"].includes(run.state)
-          : action.kind === "pause"
-            ? ["queued", "running", "blocked"].includes(run.state)
-            : run.state === "paused";
+      let nextState: WorkflowRunState;
+      let valid: boolean;
+      switch (action.kind) {
+        case "cancel":
+          nextState = "cancelled";
+          valid = !["succeeded", "failed", "cancelled"].includes(run.state);
+          break;
+        case "pause":
+          nextState = "paused";
+          valid = ["queued", "running", "blocked"].includes(run.state);
+          break;
+        case "resume":
+          nextState = "queued";
+          valid = run.state === "paused";
+          break;
+      }
       if (!valid) return { status: "stale" };
       const terminal = nextState === "cancelled";
       if (

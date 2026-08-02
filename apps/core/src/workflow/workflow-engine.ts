@@ -531,14 +531,23 @@ export class WorkflowEngine {
         ...(options.reasoning ? { reasoning: options.reasoning } : {}),
       });
     }
-    const parsedLabel =
-      call.kind === "agent"
-        ? (resolvedWorkflowAgentInputSchema.parse(input).options.label ?? null)
-        : call.kind === "waitForReply"
-          ? (workflowWaitForReplyOptionsSchema.parse(input).prompt ?? "Waiting for reply")
-          : call.kind === "sleep"
-            ? "Sleeping"
-            : null;
+    let parsedLabel: string | null;
+    switch (call.kind) {
+      case "agent":
+        parsedLabel = resolvedWorkflowAgentInputSchema.parse(input).options.label ?? null;
+        break;
+      case "waitForReply":
+        parsedLabel = workflowWaitForReplyOptionsSchema.parse(input).prompt ?? "Waiting for reply";
+        break;
+      case "sleep":
+        parsedLabel = "Sleeping";
+        break;
+      case "parallel":
+      case "pipeline":
+      case "phase":
+        parsedLabel = null;
+        break;
+    }
     const operation: WorkflowOperation = {
       runId,
       operationId: id,
@@ -657,12 +666,14 @@ export class WorkflowEngine {
         if (typeof value === "string" && !Number.isFinite(parsedTimestamp)) {
           throw new Error(`Invalid sleep timestamp: ${value}`);
         }
-        const dueAt =
-          typeof value === "string"
-            ? (parsedTimestamp ?? now)
-            : value >= 100_000_000_000
-              ? Math.trunc(value)
-              : operationCreatedAt + Math.trunc(value);
+        let dueAt: number;
+        if (typeof value === "string") {
+          dueAt = parsedTimestamp ?? now;
+        } else if (value >= 100_000_000_000) {
+          dueAt = Math.trunc(value);
+        } else {
+          dueAt = operationCreatedAt + Math.trunc(value);
+        }
         wait = {
           runId: run.runId,
           operationId: operation.operationId,
@@ -761,14 +772,25 @@ export class WorkflowEngine {
     operation: WorkflowOperation,
   ): Promise<JsonValue> {
     let current = operation;
-    const transitions: WorkflowOperationState[] =
-      current.state === "queued"
-        ? ["dispatched", "running", "succeeded"]
-        : current.state === "dispatched"
-          ? ["running", "succeeded"]
-          : current.state === "running"
-            ? ["succeeded"]
-            : [];
+    let transitions: WorkflowOperationState[];
+    switch (current.state) {
+      case "queued":
+        transitions = ["dispatched", "running", "succeeded"];
+        break;
+      case "dispatched":
+        transitions = ["running", "succeeded"];
+        break;
+      case "running":
+        transitions = ["succeeded"];
+        break;
+      case "blocked":
+      case "succeeded":
+      case "failed":
+      case "cancelled":
+      case "timed_out":
+        transitions = [];
+        break;
+    }
     for (const to of transitions) {
       const changed = this.input.store.transitionOperation({
         runOwnerId: this.workerId,
@@ -860,23 +882,29 @@ export class WorkflowEngine {
           reasoningDisplay: "simple",
         },
       };
-      const concreteSelection: ResolvedAgentSelection =
-        handoff.status === "live"
-          ? {
-              model: handoff.policy.resolvedModelRequest.spec,
-              reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
-              request: handoff.policy.resolvedModelRequest,
-            }
-          : handoff.status === "stale"
-            ? {
-                model: handoff.policy.resolvedModelRequest.spec,
-                reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
-                request: {
-                  ...handoff.policy.resolvedModelRequest,
-                  fallbacks: [...(currentFallbacks ?? [])],
-                },
-              }
-            : currentConcreteSelection;
+      let concreteSelection: ResolvedAgentSelection;
+      switch (handoff.status) {
+        case "live":
+          concreteSelection = {
+            model: handoff.policy.resolvedModelRequest.spec,
+            reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
+            request: handoff.policy.resolvedModelRequest,
+          };
+          break;
+        case "stale":
+          concreteSelection = {
+            model: handoff.policy.resolvedModelRequest.spec,
+            reasoning: handoff.policy.resolvedModelRequest.reasoning ?? null,
+            request: {
+              ...handoff.policy.resolvedModelRequest,
+              fallbacks: [...(currentFallbacks ?? [])],
+            },
+          };
+          break;
+        case "fresh":
+          concreteSelection = currentConcreteSelection;
+          break;
+      }
       const dispatchEpoch = liveOwner
         ? handoff.dispatchEpoch
         : (this.input.createDispatchEpoch?.() ?? crypto.randomUUID());
@@ -905,16 +933,22 @@ export class WorkflowEngine {
             }
           : {}),
       } satisfies WorkflowRequestPolicy;
-      const policy: WorkflowRequestPolicy =
-        handoff.status === "live"
-          ? { ...handoff.policy, dispatchEpoch }
-          : handoff.status === "stale"
-            ? {
-                ...handoff.policy,
-                dispatchEpoch,
-                resolvedModelRequest: concreteSelection.request,
-              }
-            : newlyResolvedPolicy;
+      let policy: WorkflowRequestPolicy;
+      switch (handoff.status) {
+        case "live":
+          policy = { ...handoff.policy, dispatchEpoch };
+          break;
+        case "stale":
+          policy = {
+            ...handoff.policy,
+            dispatchEpoch,
+            resolvedModelRequest: concreteSelection.request,
+          };
+          break;
+        case "fresh":
+          policy = newlyResolvedPolicy;
+          break;
+      }
       if (
         handoff.status === "live" &&
         canonicalJson(jsonValueSchema.parse(workflowRequestPolicyIdentityProjection(policy))) !==
@@ -1043,14 +1077,21 @@ export class WorkflowEngine {
       await this.publishOperation(revision, operation, "dispatched", "queued");
       latest = this.input.store.getOperation(run.runId, operation.operationId) ?? latest;
     }
-    const nextState =
-      result.state === "resolved"
-        ? "succeeded"
-        : result.state === "timed_out"
-          ? "timed_out"
-          : result.state === "cancelled"
-            ? "cancelled"
-            : "failed";
+    let nextState: "succeeded" | "failed" | "cancelled" | "timed_out";
+    switch (result.state) {
+      case "resolved":
+        nextState = "succeeded";
+        break;
+      case "failed":
+        nextState = "failed";
+        break;
+      case "cancelled":
+        nextState = "cancelled";
+        break;
+      case "timed_out":
+        nextState = "timed_out";
+        break;
+    }
     if (result.state === "resolved" && !result.output) {
       throw new Error("Agent request resolved without captured final output");
     }

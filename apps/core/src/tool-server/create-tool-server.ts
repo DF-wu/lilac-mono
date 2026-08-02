@@ -95,6 +95,16 @@ function safeToolInputPreview(callableId: string, input: unknown): string {
   return safeJsonPreview(input);
 }
 
+function toolCallErrorOutput(callableId: string, error: Error | string): string {
+  if (callableId === "mcp.add") {
+    return error instanceof ToolInputValidationError
+      ? "mcp.add input validation failed"
+      : "mcp.add failed without exposing sensitive configuration";
+  }
+  if (error instanceof Error) return error.message;
+  return error;
+}
+
 function headerStr(h: unknown): string | undefined {
   return typeof h === "string" && h.length > 0 ? h : undefined;
 }
@@ -776,18 +786,10 @@ export function createToolServer(options: ToolServerOptions) {
           );
         }
 
+        const outputError = e instanceof Error ? e : String(e);
         return {
           isError: true,
-          output:
-            body.callableId === "mcp.add"
-              ? e instanceof ToolInputValidationError
-                ? "mcp.add input validation failed"
-                : "mcp.add failed without exposing sensitive configuration"
-              : e instanceof ToolInputValidationError
-                ? e.message
-                : e instanceof Error
-                  ? e.message
-                  : String(e),
+          output: toolCallErrorOutput(body.callableId, outputError),
         };
       }
     },

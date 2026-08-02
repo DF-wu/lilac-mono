@@ -55,15 +55,15 @@ export function resolveWebSearchProvider(params: {
       .filter((value) => value.length > 0),
   );
 
-  const requestedIds =
-    normalizedRequested.length > 0
-      ? normalizedRequested
-      : byId.has(DEFAULT_WEB_SEARCH_PROVIDER)
-        ? [
-            DEFAULT_WEB_SEARCH_PROVIDER,
-            ...ids.filter((id) => id.toLowerCase() !== DEFAULT_WEB_SEARCH_PROVIDER),
-          ]
-        : ids;
+  let requestedIds: readonly string[] = normalizedRequested;
+  if (requestedIds.length === 0) {
+    requestedIds = byId.has(DEFAULT_WEB_SEARCH_PROVIDER)
+      ? [
+          DEFAULT_WEB_SEARCH_PROVIDER,
+          ...ids.filter((id) => id.toLowerCase() !== DEFAULT_WEB_SEARCH_PROVIDER),
+        ]
+      : ids;
+  }
 
   const unknownRequested = requestedIds.find((requestedId) => !byId.has(requestedId));
   if (unknownRequested) {

@@ -1306,12 +1306,12 @@ class SessionActor {
       this.snapshot = this.store.getSession(this.snapshot.id);
       this.reconcileTerminalReplay(this.snapshot);
     }
-    const projection =
-      this.active?.runId === runId
-        ? this.active
-        : this.terminalReplay?.runId === runId
-          ? this.terminalReplay
-          : undefined;
+    let projection: ActiveRootRun | TerminalReplayProjection | undefined;
+    if (this.active?.runId === runId) {
+      projection = this.active;
+    } else if (this.terminalReplay?.runId === runId) {
+      projection = this.terminalReplay;
+    }
     return projection?.liveLog.filter((entry) => entry.seq > afterSeq) ?? [];
   }
 
@@ -2015,18 +2015,32 @@ class SessionActor {
           const binding = bindingIsCompatible(sourceBinding, prepareContext.canonicalMessages)
             ? sourceBinding
             : null;
+          let mode: "fork" | "text-replay" | "fresh";
+          if (binding !== null) {
+            mode = "fork";
+          } else if (shouldReplayHistoricalPrefix) {
+            mode = "text-replay";
+          } else {
+            mode = "fresh";
+          }
+          let reason:
+            | "exact-binding"
+            | "provider-history-replay"
+            | "missing-binding"
+            | "binding-mismatch";
+          if (binding !== null) {
+            reason = "exact-binding";
+          } else if (sourceBinding !== null) {
+            reason = "binding-mismatch";
+          } else if (shouldReplayHistoricalPrefix) {
+            reason = "provider-history-replay";
+          } else {
+            reason = "missing-binding";
+          }
           logger.debug("mini_claude.selection", {
             ...lifecycleFields,
-            mode:
-              binding !== null ? "fork" : shouldReplayHistoricalPrefix ? "text-replay" : "fresh",
-            reason:
-              binding !== null
-                ? "exact-binding"
-                : sourceBinding === null
-                  ? shouldReplayHistoricalPrefix
-                    ? "provider-history-replay"
-                    : "missing-binding"
-                  : "binding-mismatch",
+            mode,
+            reason,
           });
           if (binding !== null) {
             try {
@@ -2507,17 +2521,19 @@ class SessionActor {
         live.lastPublishedAt = now;
         this.queueAutomaticCompaction({ ...base, phase: "progress", progress });
       },
-      onCompactionEnd: (event) =>
+      onCompactionEnd: (event) => {
+        let phase: MiniLilacCompactionPhase = "failed";
+        if (event.status === "completed") {
+          phase = "completed";
+        } else if (event.status === "cancelled") {
+          phase = "cancelled";
+        }
         this.queueAutomaticCompaction({
           ...event,
-          phase:
-            event.status === "completed"
-              ? "completed"
-              : event.status === "cancelled"
-                ? "cancelled"
-                : "failed",
+          phase,
           ...(event.summary === undefined ? {} : { finalSummary: event.summary }),
-        }),
+        });
+      },
     });
     agent.setBuildEphemeralOverlay(buildEphemeralOverlay);
     agent.setDecorateRequestPayload(usesCodexOAuth ? withoutOpenAIItemIds : undefined);
@@ -3199,7 +3215,14 @@ class SessionActor {
         await this.appendChunk(context.runId, { type: "error", errorText: error });
         await this.appendChunk(context.runId, { type: "finish", finishReason: "error" });
       }
-      const runStatus = cancelled ? "cancelled" : error ? "error" : "completed";
+      let runStatus: "completed" | "cancelled" | "error";
+      if (cancelled) {
+        runStatus = "cancelled";
+      } else if (error) {
+        runStatus = "error";
+      } else {
+        runStatus = "completed";
+      }
       const runChunks = active.liveLog;
       const { message: assistantMessage } = await assistantMessageFromChunks(
         runChunks,
@@ -4913,18 +4936,21 @@ class SessionActor {
       onProgress: params.onProgress,
       onSummaryDelta: params.onSummaryDelta,
     });
+    let status: MiniLilacCompactResult["status"];
+    if (compacted.status === "compacted") {
+      status = "compacted";
+    } else if (compacted.reason === "empty") {
+      status = "empty";
+    } else {
+      status = "noop";
+    }
     return {
       messages: compacted.messages,
       ...(compacted.status === "compacted" && compacted.summary !== undefined
         ? { summary: compacted.summary }
         : {}),
       result: miniLilacCompactResultSchema.parse({
-        status:
-          compacted.status === "compacted"
-            ? "compacted"
-            : compacted.reason === "empty"
-              ? "empty"
-              : "noop",
+        status,
         clientCommandId: id,
         messageCountBefore: params.messages.length,
         messageCountAfter: compacted.messageCountAfter,

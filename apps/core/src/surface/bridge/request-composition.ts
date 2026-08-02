@@ -564,19 +564,22 @@ async function composeSelectedDiscordChain(input: {
     const hasEmptyLineageSegment = segmentInputs.some(
       (segment) => segment.canonicalMessages.length === 0,
     );
-    const corePrimaryLineage =
-      lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment
-        ? buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex })
-        : createCorePrimaryLineageFreshOnlyV1(
-            hasEmptyLineageSegment
-              ? "empty-lineage-segment"
-              : currentSegmentIndex < 0
-                ? "current-input-boundary-unreachable"
-                : projectionStore
-                  ? "incomplete-request-metadata"
-                  : "projection-store-unavailable",
-            currentCanonicalStart,
-          );
+    let corePrimaryLineage: CorePrimaryLineageV1;
+    if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
+      corePrimaryLineage = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+    } else {
+      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
+      if (hasEmptyLineageSegment) {
+        reason = "empty-lineage-segment";
+      } else if (currentSegmentIndex < 0) {
+        reason = "current-input-boundary-unreachable";
+      } else if (projectionStore) {
+        reason = "incomplete-request-metadata";
+      } else {
+        reason = "projection-store-unavailable";
+      }
+      corePrimaryLineage = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+    }
     return {
       messages,
       mergedGroups: merged.map((chunk) => ({
@@ -1490,9 +1493,13 @@ export async function composeRecentChannelMessages(
     ? (contextList.find((m) => m.ref.messageId === opts.triggerMsgRef!.messageId) ?? null)
     : null;
 
-  const activeAnchor = shouldApplyActiveBurstRules
-    ? (triggerMsg ?? (contextList.length > 0 ? contextList[contextList.length - 1]! : null))
-    : null;
+  let activeAnchor: SurfaceMessage | null = null;
+  if (shouldApplyActiveBurstRules) {
+    activeAnchor = triggerMsg;
+    if (activeAnchor === null && contextList.length > 0) {
+      activeAnchor = contextList[contextList.length - 1]!;
+    }
+  }
 
   const dividerCutContextList =
     shouldApplyActiveBurstRules && activeAnchor
@@ -1554,19 +1561,23 @@ export async function composeRecentChannelMessages(
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
+  let currentMessageIds = opts.currentMessageIds;
+  if (currentMessageIds === undefined) {
+    if (opts.triggerMsgRef) {
+      currentMessageIds = [opts.triggerMsgRef.messageId];
+    } else if (selectedNoDivider.length > 0) {
+      currentMessageIds = [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId];
+    } else {
+      currentMessageIds = [];
+    }
+  }
   const composed = await composeSelectedDiscordChain({
     adapter,
     sessionId: opts.sessionId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
     checkpointSelection,
-    currentMessageIds:
-      opts.currentMessageIds ??
-      (opts.triggerMsgRef
-        ? [opts.triggerMsgRef.messageId]
-        : selectedNoDivider.length > 0
-          ? [selectedNoDivider[selectedNoDivider.length - 1]!.ref.messageId]
-          : []),
+    currentMessageIds,
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });

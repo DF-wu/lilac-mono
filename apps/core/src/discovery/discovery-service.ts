@@ -203,6 +203,18 @@ const DISCOVERY_TIME_WITH_YEAR_FORMATTER = new Intl.DateTimeFormat("en-US", {
   hour12: false,
 });
 
+const DISCOVERY_RECENCY_BASE = {
+  conversation: 0.35,
+  prompt: 0.04,
+  heartbeat: 0.1,
+} satisfies Record<DiscoverySource, number>;
+
+const DISCOVERY_RECENCY_DECAY_MS = {
+  conversation: 7 * 86_400_000,
+  prompt: 30 * 86_400_000,
+  heartbeat: 30 * 86_400_000,
+} satisfies Record<DiscoverySource, number>;
+
 function normalizeFtsQuery(input: string): string | null {
   const tokens = input
     .trim()
@@ -290,18 +302,13 @@ function parseRelativeDurationMs(rawInput: string, fieldName: string): number {
     matched += match[0].length;
     const amount = Number(match[1]);
     const unit = match[2];
-    const factor =
-      unit === "ms"
-        ? 1
-        : unit === "s"
-          ? 1000
-          : unit === "m"
-            ? 60_000
-            : unit === "h"
-              ? 3_600_000
-              : unit === "d"
-                ? 86_400_000
-                : 604_800_000;
+    let factor: number;
+    if (unit === "ms") factor = 1;
+    else if (unit === "s") factor = 1000;
+    else if (unit === "m") factor = 60_000;
+    else if (unit === "h") factor = 3_600_000;
+    else if (unit === "d") factor = 86_400_000;
+    else factor = 604_800_000;
     total += amount * factor;
   }
 
@@ -470,9 +477,8 @@ function buildCandidateScore(params: {
   const bm25 = params.row.bm25_score ?? 0;
   const lexicalScore = 1 / (20 + params.rank);
   const ageMs = Math.max(0, params.nowMs - params.row.ts);
-  const recencyBase =
-    params.row.source === "conversation" ? 0.35 : params.row.source === "heartbeat" ? 0.1 : 0.04;
-  const decayWindowMs = params.row.source === "conversation" ? 7 * 86_400_000 : 30 * 86_400_000;
+  const recencyBase = DISCOVERY_RECENCY_BASE[params.row.source];
+  const decayWindowMs = DISCOVERY_RECENCY_DECAY_MS[params.row.source];
   const recencyBoost = recencyBase * Math.exp(-ageMs / decayWindowMs);
   return {
     bm25,
@@ -1406,50 +1412,56 @@ export class DiscoveryService {
       })
       .sort((left, right) => compareCandidates(left, right, orderBy, direction));
 
-    const groups =
-      groupBy === "origin"
-        ? await this.buildOriginGroups({ candidates, surrounding, cfg })
-        : groupBy === "source"
-          ? this.buildSourceGroups({ candidates, cfg })
-          : candidates.slice(0, limit).map((candidate) => ({
-              key: `hit:${candidate.row.doc_key}`,
-              source: candidate.row.source,
-              score: candidate.score,
-              ts: candidate.row.ts,
-              time: formatDiscoveryTime(candidate.row.ts),
-              origin: buildOriginFromRow(candidate.row, cfg),
-              entries:
-                candidate.row.source === "conversation"
-                  ? [
-                      [
-                        buildConversationEntry({
-                          row: candidate.row,
-                          matched: true,
-                          candidate,
-                          origin: buildOriginFromRow(candidate.row, cfg),
-                          discordUserAliasById: buildDiscordUserAliasById(cfg),
-                        }),
-                      ],
-                    ]
-                  : [
-                      [
-                        buildFileRangeEntry({
-                          row: candidate.row,
+    let groups: DiscoveryResultGroup[];
+    switch (groupBy) {
+      case "origin":
+        groups = await this.buildOriginGroups({ candidates, surrounding, cfg });
+        break;
+      case "source":
+        groups = this.buildSourceGroups({ candidates, cfg });
+        break;
+      case "none":
+        groups = candidates.slice(0, limit).map((candidate) => ({
+          key: `hit:${candidate.row.doc_key}`,
+          source: candidate.row.source,
+          score: candidate.score,
+          ts: candidate.row.ts,
+          time: formatDiscoveryTime(candidate.row.ts),
+          origin: buildOriginFromRow(candidate.row, cfg),
+          entries:
+            candidate.row.source === "conversation"
+              ? [
+                  [
+                    buildConversationEntry({
+                      row: candidate.row,
+                      matched: true,
+                      candidate,
+                      origin: buildOriginFromRow(candidate.row, cfg),
+                      discordUserAliasById: buildDiscordUserAliasById(cfg),
+                    }),
+                  ],
+                ]
+              : [
+                  [
+                    buildFileRangeEntry({
+                      row: candidate.row,
+                      startLine: candidate.row.start_line ?? 1,
+                      endLine: candidate.row.end_line ?? 1,
+                      text: candidate.row.text,
+                      matchRanges: [
+                        {
                           startLine: candidate.row.start_line ?? 1,
                           endLine: candidate.row.end_line ?? 1,
-                          text: candidate.row.text,
-                          matchRanges: [
-                            {
-                              startLine: candidate.row.start_line ?? 1,
-                              endLine: candidate.row.end_line ?? 1,
-                            },
-                          ],
-                          candidate,
-                          origin: buildOriginFromRow(candidate.row, cfg),
-                        }),
+                        },
                       ],
-                    ],
-            }));
+                      candidate,
+                      origin: buildOriginFromRow(candidate.row, cfg),
+                    }),
+                  ],
+                ],
+        }));
+        break;
+    }
 
     const limitedGroups =
       groupBy === "none"

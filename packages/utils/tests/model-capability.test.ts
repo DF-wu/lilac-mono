@@ -465,6 +465,7 @@ describe("ModelCapability", () => {
                 output: 37.5,
                 cache_read: 1,
                 cache_write: 12.5,
+                provider_only: true,
               },
             },
             limit: { context: 200_000, output: 128_000 },
@@ -479,14 +480,20 @@ describe("ModelCapability", () => {
       overrides: {
         "custom/opus": {
           inherit: "anthropic/claude-opus-4-6",
+          cost: { input: 6 },
           limit: { context: 1_000_000 },
         },
       },
     });
 
     const info = await mc.resolve("custom/opus");
-    expect(info.cost?.context_over_200k?.input).toBe(10);
-    expect(info.cost?.context_over_200k?.output).toBe(37.5);
+    expect(info.cost?.input).toBe(6);
+    expect(info.cost?.context_over_200k).toEqual({
+      input: 10,
+      output: 37.5,
+      cache_read: 1,
+      cache_write: 12.5,
+    });
 
     const overTierCost = mc.estimateCostUsd(
       info,

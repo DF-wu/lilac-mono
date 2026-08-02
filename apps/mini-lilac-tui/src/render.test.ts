@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
+import type { UIMessageChunk } from "ai";
+
 import type { MiniLilacTodoState, MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 
 import {
@@ -139,6 +141,63 @@ describe("renderInitialMessages", () => {
     renderer.handle({ type: "finish", finishReason: "stop" });
 
     expect(entries()[0]?.streaming).toBe(false);
+  });
+
+  it("leaves open text state unchanged for every explicitly ignored chunk", () => {
+    const ignoredChunks = [
+      { type: "custom", kind: "provider.event" },
+      { type: "tool-approval-request", approvalId: "approval", toolCallId: "tool" },
+      { type: "tool-approval-response", approvalId: "approval", approved: false },
+      { type: "tool-input-delta", toolCallId: "tool", inputTextDelta: '{"command":' },
+      {
+        type: "reasoning-file",
+        url: "https://example.test/reasoning",
+        mediaType: "text/plain",
+      },
+      { type: "start-step" },
+      { type: "finish-step" },
+      { type: "start", messageId: "message" },
+      { type: "message-metadata", messageMetadata: { traceId: "trace" } },
+    ] satisfies readonly UIMessageChunk[];
+
+    for (const chunk of ignoredChunks) {
+      const { renderer, entries } = createRendererHarness();
+      renderer.handle({ type: "text-delta", id: "text", delta: "before" });
+      const before = entries();
+
+      renderer.handle(chunk);
+
+      expect(entries()).toEqual(before);
+      renderer.handle({ type: "text-delta", id: "text", delta: " after" });
+      expect(entries()).toEqual([
+        {
+          id: "entry-0",
+          kind: "assistant",
+          tone: "normal",
+          text: "before after",
+          streaming: true,
+        },
+      ]);
+    }
+  });
+
+  it("leaves renderer state unchanged for open data and future non-data chunks", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({ type: "reasoning-delta", id: "reasoning", delta: "before" });
+    const before = entries();
+
+    renderer.handle({ type: "data-futureExtension", data: { opaque: true } });
+    expect(entries()).toEqual(before);
+
+    const futureChunk = { type: "future-observation", payload: { opaque: true } };
+    // @ts-expect-error -- simulates one future SDK variant beyond the installed union.
+    renderer.handle(futureChunk);
+    expect(entries()).toEqual(before);
+
+    renderer.handle({ type: "reasoning-delta", id: "reasoning", delta: " after" });
+    expect(transcriptSemantics(entries())).toEqual([
+      { kind: "reasoning", tone: "muted", text: "Thinking\nbefore after" },
+    ]);
   });
 
   it("routes transient todo chunks without adding transcript output", () => {

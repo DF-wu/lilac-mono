@@ -277,6 +277,7 @@ type ImageGenerationPrompt =
     };
 
 type VideoModelObject = Exclude<Parameters<typeof generateVideo>[0]["model"], string>;
+type GenerationProvider = "openai" | "openrouter" | "xai" | "vercel";
 
 type ModelDescriptor<TId extends string, TModel, TInput> = {
   id: TId;
@@ -291,11 +292,24 @@ type VideoModelDescriptor = ModelDescriptor<
   VideoGenerateInput
 >;
 
-function isConfiguredProvider(provider: "openai" | "openrouter" | "xai" | "vercel"): boolean {
-  const config = env.providers[provider];
-  const apiKey = "apiKey" in config ? config.apiKey : undefined;
-  const baseUrl = "baseUrl" in config ? config.baseUrl : undefined;
-  return Boolean(apiKey?.trim() || baseUrl?.trim());
+function hasConfiguredProviderValue(config: {
+  readonly apiKey: string | undefined;
+  readonly baseUrl: string | undefined;
+}): boolean {
+  return Boolean(config.apiKey?.trim() || config.baseUrl?.trim());
+}
+
+function isConfiguredProvider(provider: GenerationProvider): boolean {
+  switch (provider) {
+    case "openai":
+      return hasConfiguredProviderValue(env.providers.openai);
+    case "openrouter":
+      return hasConfiguredProviderValue(env.providers.openrouter);
+    case "xai":
+      return hasConfiguredProviderValue(env.providers.xai);
+    case "vercel":
+      return hasConfiguredProviderValue(env.providers.vercel);
+  }
 }
 
 function isOneOf<const T extends readonly string[]>(allowed: T, value: string): value is T[number] {

@@ -384,17 +384,27 @@ export function createCorePrimaryClaudeRuntime(input: {
       const persistedAttemptIndex = attemptIndex * 2;
       const selection = selectionFor(prepareContext.canonicalMessages);
       const lineage = input.getLineage();
-      const mode =
-        selection.mode === "fork"
-          ? "fork"
-          : shouldReplayCorePrimaryHistory({
-                lineage,
-                historicalEnd: lineage?.currentCanonicalStart ?? 0,
-                store: input.store,
-                targetFamily: "claude-code",
-              })
+      let mode: "fork" | "text-replay" | "fresh";
+      switch (selection.mode) {
+        case "fork":
+          mode = "fork";
+          break;
+        case "fresh":
+          mode = shouldReplayCorePrimaryHistory({
+            lineage,
+            historicalEnd: lineage?.currentCanonicalStart ?? 0,
+            store: input.store,
+            targetFamily: "claude-code",
+          })
             ? "text-replay"
             : "fresh";
+          break;
+        default: {
+          const _exhaustive: never = selection;
+          mode = _exhaustive;
+          break;
+        }
+      }
       diagnostic("selection", {
         mode,
         ...(selection.mode === "fresh" ? { reason: selection.reason } : {}),
@@ -506,12 +516,12 @@ export function createCorePrimaryClaudeRuntime(input: {
         cursorMatches &&
         binding !== null &&
         cursor.canonicalMessageCount === binding.canonicalMessageCount;
+      let storedNativeContextTokens = binding?.nativeContextTokens;
+      if (cursorMatches && !cursorIsBindingHead) {
+        storedNativeContextTokens = undefined;
+      }
       return owner.getNativeInputEstimateFloor({
-        storedNativeContextTokens: cursorMatches
-          ? cursorIsBindingHead
-            ? binding.nativeContextTokens
-            : undefined
-          : binding?.nativeContextTokens,
+        storedNativeContextTokens,
         unsynchronizedSuffixAndOverlayEstimate: estimateMessagesTokens([
           ...canonicalMessages.slice(synchronizedMessageCount),
           ...overlay,

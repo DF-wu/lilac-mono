@@ -644,11 +644,12 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
             maxOutputBytes,
           );
           const hasMore = window.endOffset < window.totalCharacters;
-          const nextStart = hasMore
-            ? start.type === "offset"
-              ? ({ type: "offset", offset: window.endOffset } as const)
-              : ({ type: "line", line: window.endLine, column: window.endColumn } as const)
-            : undefined;
+          let nextStart: ToolResultArtifactStart | undefined;
+          if (hasMore && start.type === "offset") {
+            nextStart = { type: "offset", offset: window.endOffset };
+          } else if (hasMore) {
+            nextStart = { type: "line", line: window.endLine, column: window.endColumn };
+          }
           logger.info("tool.artifact.read", { bytes: metadata.bytes });
           return {
             ok: true,

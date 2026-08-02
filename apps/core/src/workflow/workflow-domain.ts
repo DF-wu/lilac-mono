@@ -46,7 +46,9 @@ export const workflowAgentProfileSchema = z.enum(WORKFLOW_AGENT_PROFILES);
 export const workflowReasoningSchema = z.enum(MODEL_REASONING_EFFORTS);
 
 export function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 export const workflowScopeSchema = z.enum(["project", "personal"]);

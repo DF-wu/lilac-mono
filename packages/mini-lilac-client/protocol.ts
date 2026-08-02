@@ -1,4 +1,4 @@
-import type { UIMessage } from "ai";
+import type { UIMessage, UIMessageChunk } from "ai";
 import { z } from "zod";
 
 export const MINI_LILAC_PROTOCOL_VERSION = 1 as const;
@@ -451,6 +451,19 @@ export const miniLilacStreamCursorChunkSchema = z
   })
   .strict();
 export type MiniLilacStreamCursorChunk = z.infer<typeof miniLilacStreamCursorChunkSchema>;
+
+export const MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE =
+  "data-miniLilacUnsupportedUIMessageChunk" as const;
+export const miniLilacUnsupportedUIMessageChunkSchema = z.strictObject({
+  type: z.literal(MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE),
+  data: z.strictObject({
+    chunkType: z.string().min(1).max(128),
+  }),
+  transient: z.literal(true),
+}) satisfies z.ZodType<UIMessageChunk>;
+export type MiniLilacUnsupportedUIMessageChunk = z.infer<
+  typeof miniLilacUnsupportedUIMessageChunkSchema
+>;
 
 export const miniLilacTodoSchema = z.strictObject({
   content: z.string().max(500),

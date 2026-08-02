@@ -39,12 +39,10 @@ export function buildProgressFieldValue(input: {
     : [];
   const reasoningRows = input.reasoningValue ? input.reasoningValue.split("\n") : [];
   // Detailed reasoning is a separate product lane and must not consume action-row capacity.
-  const rows =
-    reasoningRows.length > 0 && actionRows.length > 0
-      ? [...reasoningRows, "", ...actionRows]
-      : reasoningRows.length > 0
-        ? reasoningRows
-        : actionRows;
+  let rows = actionRows;
+  if (reasoningRows.length > 0) {
+    rows = actionRows.length > 0 ? [...reasoningRows, "", ...actionRows] : reasoningRows;
+  }
   return rows.length > 0 ? clampWithEllipsis(rows.join("\n"), PROGRESS_FIELD_MAX_CHARS) : "\u200b";
 }
 

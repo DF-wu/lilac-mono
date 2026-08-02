@@ -1478,11 +1478,10 @@ export class Onboarding implements ServerTool {
           throw new Error("Missing required input: installationId");
         }
 
-        const privateKeyPem = input.privateKeyPem
-          ? input.privateKeyPem
-          : input.privateKeyPath
-            ? await Bun.file(input.privateKeyPath).text()
-            : null;
+        let privateKeyPem = input.privateKeyPem ?? null;
+        if (!privateKeyPem && input.privateKeyPath) {
+          privateKeyPem = await Bun.file(input.privateKeyPath).text();
+        }
         if (!privateKeyPem) {
           throw new Error("Missing required input: privateKeyPem or privateKeyPath");
         }

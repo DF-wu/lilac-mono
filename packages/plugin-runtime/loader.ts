@@ -2,21 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import type { LilacToolPlugin, ToolPluginMeta } from "./types";
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isPluginMeta(value: unknown): value is ToolPluginMeta {
-  if (!isObject(value)) return false;
-  return typeof value.id === "string" && value.id.trim().length > 0;
-}
-
-function isLilacToolPlugin(value: unknown): value is LilacToolPlugin<unknown, unknown, unknown> {
-  if (!isObject(value)) return false;
-  return isPluginMeta(value.meta) && typeof value.create === "function";
-}
+import type { LilacToolPlugin } from "./types";
 
 async function copyDirectoryTree(sourceDir: string, targetDir: string): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
@@ -74,10 +60,32 @@ export async function loadToolPluginModule(params: {
   const url = pathToFileURL(snapshotPath);
 
   const mod = await import(url.toString());
-  const plugin = (mod as Record<string, unknown>).default;
-  if (!isLilacToolPlugin(plugin)) {
+  const importedDefault = mod.default;
+  const plugin: unknown = importedDefault;
+  if (
+    typeof plugin !== "object" ||
+    plugin === null ||
+    Array.isArray(plugin) ||
+    !("meta" in plugin) ||
+    !("create" in plugin)
+  ) {
     throw new Error("Plugin entrypoint must default export a LilacToolPlugin");
   }
 
-  return plugin;
+  const meta = plugin.meta;
+  if (
+    typeof meta !== "object" ||
+    meta === null ||
+    Array.isArray(meta) ||
+    !("id" in meta) ||
+    typeof meta.id !== "string" ||
+    meta.id.trim().length === 0 ||
+    ("name" in meta && meta.name !== undefined && typeof meta.name !== "string") ||
+    ("version" in meta && meta.version !== undefined && typeof meta.version !== "string") ||
+    typeof plugin.create !== "function"
+  ) {
+    throw new Error("Plugin entrypoint must default export a LilacToolPlugin");
+  }
+
+  return importedDefault;
 }

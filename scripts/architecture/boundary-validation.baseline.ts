@@ -77,18 +77,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Facp-controller|rule=architecture%2Fno-domain-unknown|identity=controller.ts%23isRecord%5BParameter%5D%401|sha256=72127beb8bd66e4f98ad674dad09240c4558f34c62a7594f73db1e2ba0fd726c",
-        identity: "controller.ts#isRecord[Parameter]@1",
-        location: {
-          file: "controller.ts",
-          line: 55,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Facp-controller|rule=architecture%2Fno-domain-unknown|identity=controller.ts%23getString%5BParameter%5D%401|sha256=a05daacdd21019e29e943be0db4b2a7896b1defd844b8b38039fc8baa288342e",
         identity: "controller.ts#getString[Parameter]@1",
         location: {
@@ -327,20 +315,6 @@ export const boundaryValidationBaseline = {
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-    ],
-    "architecture/no-rich-unknown-predicate": [
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Facp-controller|rule=architecture%2Fno-rich-unknown-predicate|identity=controller.ts%23isRecord%5BFunctionDeclaration%5D%401|sha256=b9005d26d630900b9a77face652bf329e19f86e322fb304345016ea364bc8257",
-        identity: "controller.ts#isRecord[FunctionDeclaration]@1",
-        location: {
-          file: "controller.ts",
-          line: 55,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
       },
     ],
   },
@@ -916,28 +890,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftools%2Ftool-args-display.ts%23safeValidateSync%5BAsExpression%5D%401|sha256=d4b5ab52e21813d4004cc9acf5cb569777164e991a645ade7e6a7f960fff3e8d",
-        identity: "src/tools/tool-args-display.ts#safeValidateSync[AsExpression]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 40,
-          column: 23,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftools%2Ftool-args-display.ts%23safeValidateSync%5BAsExpression%5D%401|sha256=e98d66992f511ef9b440437b4699d09467572a8fec3452760e7c02cb9392e940",
-        identity: "src/tools/tool-args-display.ts#safeValidateSync[AsExpression]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 46,
-          column: 20,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Fplugins%2Fbuiltin%2Flocal-tools.ts%23createLocalToolSpecs.editTargets%5BAsExpression%5D%401|sha256=b4ace8b75305cf665b270599347805096b0a6f865ed11915ab62c80a81aeec24",
         identity:
           "src/plugins/builtin/local-tools.ts#createLocalToolSpecs.editTargets[AsExpression]@1",
@@ -1174,18 +1126,6 @@ export const boundaryValidationBaseline = {
           file: "src/surface/bridge/bus-request-router/common.ts",
           line: 368,
           column: 33,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-request-router%2Fcommon.ts%23isConfigRecord%5BParameter%5D%401|sha256=b5c575944cc77964f3bd702d09a41719478dfd60c549e3c693b08ff6623ed031",
-        identity: "src/surface/bridge/bus-request-router/common.ts#isConfigRecord[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-request-router/common.ts",
-          line: 397,
-          column: 25,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -2154,19 +2094,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner%2Ftool-failure-logging.ts%23isRecord%5BParameter%5D%401|sha256=7a5519c9cd1005f4b51bd082c312aaf545e925c41e5d49e32c5082a7951ba9d2",
-        identity:
-          "src/surface/bridge/bus-agent-runner/tool-failure-logging.ts#isRecord[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner/tool-failure-logging.ts",
-          line: 27,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner%2Ftool-failure-logging.ts%23getStringField%5BParameter%5D%401|sha256=497ec748951a87604445cea97ea710be489a5d25c85dada07b7babe4616ae970",
         identity:
           "src/surface/bridge/bus-agent-runner/tool-failure-logging.ts#getStringField[Parameter]@1",
@@ -2373,54 +2300,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23isZodSchema%5BParameter%5D%401|sha256=62f36deb2c4446970aa0dd7e210eef572b37d8106480fef4c1b797a2b89b6bd5",
-        identity: "src/tools/tool-args-display.ts#isZodSchema[Parameter]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 12,
-          column: 22,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23isZodSchema%5BParameter%5D%401|sha256=0d0056655d09754c120dc951c9798993f5f134fc205c7ba00c0f01afbef82e97",
-        identity: "src/tools/tool-args-display.ts#isZodSchema[Parameter]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 13,
-          column: 15,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23isPromiseLike%5BParameter%5D%401|sha256=d51248df5ce62454f023da3802a7024a2f420bcf7696c81af778fb63d527ac56",
-        identity: "src/tools/tool-args-display.ts#isPromiseLike[Parameter]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 23,
-          column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23safeValidateSync%5BParameter%5D%401|sha256=f0fa52356159025f84da9c28225ca6375b95402a326b6367074123998822fb33",
-        identity: "src/tools/tool-args-display.ts#safeValidateSync[Parameter]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 32,
-          column: 30,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23safeValidateSync%5BParameter%5D%401|sha256=17963c500ab3f865c4edf8bea96692f52ae2c6302de4e32c518a3b36f55c07b4",
         identity: "src/tools/tool-args-display.ts#safeValidateSync[Parameter]@1",
         location: {
@@ -2433,36 +2312,12 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23safeValidateSync%5BParameter%5D%401|sha256=6b15f00f5e2cf04f15011198749c0bae4deb346c7cc5388cc47312511ac5b2a3",
-        identity: "src/tools/tool-args-display.ts#safeValidateSync[Parameter]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 43,
-          column: 31,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23%3Cmodule%3E%5BParameter%5D%401|sha256=a567b83b9d661ffe43ffc81a7cdda94d7dfcfd49dceed7e5846be652daf2e72d",
         identity: "src/tools/tool-args-display.ts#<module>[Parameter]@1",
         location: {
           file: "src/tools/tool-args-display.ts",
           line: 106,
           column: 34,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Ftools%2Ftool-args-display.ts%23getRecord%5BParameter%5D%401|sha256=4daa1a0b68c71a2a33f7af6983ca86a6fcab75c0f7404311ca6bd2c76605ed5c",
-        identity: "src/tools/tool-args-display.ts#getRecord[Parameter]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 138,
-          column: 20,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -4674,19 +4529,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Fsurface%2Fbridge%2Fbus-request-router%2Fcommon.ts%23isConfigRecord%5BFunctionDeclaration%5D%401|sha256=f5f3c42c5929cc55e0fe81708c6e203f4c3f67b3c15792278b87ee56575f7a1e",
-        identity:
-          "src/surface/bridge/bus-request-router/common.ts#isConfigRecord[FunctionDeclaration]@1",
-        location: {
-          file: "src/surface/bridge/bus-request-router/common.ts",
-          line: 397,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Fconversation%2Fthread-embedding.ts%23hasEmbeddingModel%5BFunctionDeclaration%5D%401|sha256=b692b9642d008bed6e2987f07f015fea66fd42b37712f34359657b7e10a94098",
         identity: "src/conversation/thread-embedding.ts#hasEmbeddingModel[FunctionDeclaration]@1",
         location: {
@@ -4716,43 +4558,6 @@ export const boundaryValidationBaseline = {
         location: {
           file: "src/tools/bash-output-sanitizer.ts",
           line: 314,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner%2Ftool-failure-logging.ts%23isRecord%5BFunctionDeclaration%5D%401|sha256=7265d61022f986a7d283f1bba23284f9d2397c6ca089d865e583ad8ba757d7fd",
-        identity:
-          "src/surface/bridge/bus-agent-runner/tool-failure-logging.ts#isRecord[FunctionDeclaration]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner/tool-failure-logging.ts",
-          line: 27,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Ftools%2Ftool-args-display.ts%23isZodSchema%5BFunctionDeclaration%5D%401|sha256=ffff6a97ff3efa41d575b07709c917473acf43a481b51f4b485c560aee91a2be",
-        identity: "src/tools/tool-args-display.ts#isZodSchema[FunctionDeclaration]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 12,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Ftools%2Ftool-args-display.ts%23isPromiseLike%5BFunctionDeclaration%5D%401|sha256=9bcff7cdb3c117136c454affaab7eecb0d6194acff5a90d50e522a01479361a8",
-        identity: "src/tools/tool-args-display.ts#isPromiseLike[FunctionDeclaration]@1",
-        location: {
-          file: "src/tools/tool-args-display.ts",
-          line: 23,
           column: 1,
         },
         reason:
@@ -9419,66 +9224,6 @@ export const boundaryValidationBaseline = {
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
       },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmain.ts%23parseCliArgs%5BCallExpression%5D%401|sha256=c63d47c74a692a52a102c14406160f164d3a96319130df9c150028721c6eb8f6",
-        identity: "src/main.ts#parseCliArgs[CallExpression]@1",
-        location: {
-          file: "src/main.ts",
-          line: 297,
-          column: 39,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmain.ts%23parseCliArgs%5BCallExpression%5D%401|sha256=05e0baa4070c7ca24114c4b752293491ea8b233dce81ada7577d4a7b025cbe67",
-        identity: "src/main.ts#parseCliArgs[CallExpression]@1",
-        location: {
-          file: "src/main.ts",
-          line: 312,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmain.ts%23parseCliArgs%5BCallExpression%5D%401|sha256=b6c19b5a5aa4b917df1e086f66aa2ff93cb615affe51b5c5a80bd1f2798197ee",
-        identity: "src/main.ts#parseCliArgs[CallExpression]@1",
-        location: {
-          file: "src/main.ts",
-          line: 325,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmain.ts%23parseCliArgs%5BCallExpression%5D%401|sha256=fb3f59931baac79ba1b98d9068a7539af16d4a9b8b6d035ae91f401f62f3db1b",
-        identity: "src/main.ts#parseCliArgs[CallExpression]@1",
-        location: {
-          file: "src/main.ts",
-          line: 345,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fmain.ts%23parseCliArgs%5BCallExpression%5D%401|sha256=8b6697be8fe27a6e8ece11a662304172692583545a9c50eef34b0f558f4e195f",
-        identity: "src/main.ts#parseCliArgs[CallExpression]@1",
-        location: {
-          file: "src/main.ts",
-          line: 363,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
     ],
   },
   "apps/mini-lilac-tui": {
@@ -9899,42 +9644,6 @@ export const boundaryValidationBaseline = {
           file: "src/render.ts",
           line: 1648,
           column: 33,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-tui|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fcontroller.ts%23Controller.consume%5BCallExpression%5D%401|sha256=40ec35429a436f5ebce9816b5cbee019177f35002fff20379a0a9eaf8050cecd",
-        identity: "src/controller.ts#Controller.consume[CallExpression]@1",
-        location: {
-          file: "src/controller.ts",
-          line: 708,
-          column: 26,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-tui|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fcontroller.ts%23Controller.consume%5BCallExpression%5D%401|sha256=fc37283db94f6056b614974d680f9cc58048a30187de71ca519e109abe0ee498",
-        identity: "src/controller.ts#Controller.consume[CallExpression]@1",
-        location: {
-          file: "src/controller.ts",
-          line: 711,
-          column: 28,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-tui|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fcontroller.ts%23Controller.consume%5BCallExpression%5D%401|sha256=569625cb8da110ecc1cb5ef75ceaf741fc5475333e734ce0d883426c3063ef29",
-        identity: "src/controller.ts#Controller.consume[CallExpression]@1",
-        location: {
-          file: "src/controller.ts",
-          line: 717,
-          column: 28,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -12042,13 +11751,12 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-client|rule=architecture%2Fno-unregistered-decoder|identity=mini-lilac-transport.ts%23MiniLilacTransport.constructor.prepareSendMessagesRequest%5BCallExpression%5D%401|sha256=b111641041b79dd67f3cf47e0e87f0303c7d10ae35752916eaf4e0a5d49b25ba",
-        identity:
-          "mini-lilac-transport.ts#MiniLilacTransport.constructor.prepareSendMessagesRequest[CallExpression]@1",
+          "arch-v2|workspace=packages%2Fmini-lilac-client|rule=architecture%2Fno-unregistered-decoder|identity=mini-lilac-transport.ts%23MiniLilacTransport.sendMessages%5BCallExpression%5D%401|sha256=531b65a4e97194c5cb6bb2d8e752cb6d9a0e1f430a1e094208e5aded64795794",
+        identity: "mini-lilac-transport.ts#MiniLilacTransport.sendMessages[CallExpression]@1",
         location: {
           file: "mini-lilac-transport.ts",
-          line: 165,
-          column: 31,
+          line: 239,
+          column: 27,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -12252,7 +11960,7 @@ export const boundaryValidationBaseline = {
         identity: "mini-lilac-transport.ts#MiniLilacTransport.compact[CallExpression]@1",
         location: {
           file: "mini-lilac-transport.ts",
-          line: 481,
+          line: 575,
           column: 22,
         },
         reason:
@@ -12264,7 +11972,7 @@ export const boundaryValidationBaseline = {
         identity: "mini-lilac-transport.ts#MiniLilacTransport.compact[CallExpression]@1",
         location: {
           file: "mini-lilac-transport.ts",
-          line: 483,
+          line: 577,
           column: 15,
         },
         reason:
@@ -12302,8 +12010,8 @@ export const boundaryValidationBaseline = {
           "mini-lilac-transport.ts#MiniLilacTransport.trackStream.transform[CallExpression]@1",
         location: {
           file: "mini-lilac-transport.ts",
-          line: 607,
-          column: 26,
+          line: 691,
+          column: 17,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -15211,11 +14919,11 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsession-service.ts%23SessionActor.summarizeForCompaction%5BCallExpression%5D%401|sha256=0eb68a8499edb409720d0c1bf521f89727371eb37b763c53e28bfde095ba47eb",
+          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsession-service.ts%23SessionActor.summarizeForCompaction%5BCallExpression%5D%401|sha256=b7bd12a814124e48d8a7e1583bf8a16930ec068478b3fc178ce1b7f91c8eda23",
         identity: "src/session-service.ts#SessionActor.summarizeForCompaction[CallExpression]@1",
         location: {
           file: "src/session-service.ts",
-          line: 4921,
+          line: 4952,
           column: 15,
         },
         reason:
@@ -16061,42 +15769,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-domain-unknown|identity=loader.ts%23isObject%5BParameter%5D%401|sha256=d276b01196919dc7e36527257121cde9a5c32393ad28cd9302c58250e2f26f97",
-        identity: "loader.ts#isObject[Parameter]@1",
-        location: {
-          file: "loader.ts",
-          line: 7,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-domain-unknown|identity=loader.ts%23isPluginMeta%5BParameter%5D%401|sha256=6afdc81a5587838cbc880adce681810cd3ab3960f6f34654f6b770ca6bbb8268",
-        identity: "loader.ts#isPluginMeta[Parameter]@1",
-        location: {
-          file: "loader.ts",
-          line: 11,
-          column: 23,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-domain-unknown|identity=loader.ts%23isLilacToolPlugin%5BParameter%5D%401|sha256=936baabe2adccc9dc22250a6f3021e5ccc37c02e4e3f85d2a7a7240f701f12f8",
-        identity: "loader.ts#isLilacToolPlugin[Parameter]@1",
-        location: {
-          file: "loader.ts",
-          line: 16,
-          column: 28,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-domain-unknown|identity=manager.ts%23toErrorMessage%5BParameter%5D%401|sha256=b82ccaaabffb832722dc8dd55916a9fbd6bed0b7ea70ddf05705b14b2fa85938",
         identity: "manager.ts#toErrorMessage[Parameter]@1",
         location: {
@@ -16123,42 +15795,6 @@ export const boundaryValidationBaseline = {
     "architecture/no-rich-unknown-predicate": [
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-rich-unknown-predicate|identity=loader.ts%23isObject%5BFunctionDeclaration%5D%401|sha256=a7b8dfb3efb98a0964ec1dfeae18f27d9e03ddf4b268a9bd717aeb0b03d7b2ff",
-        identity: "loader.ts#isObject[FunctionDeclaration]@1",
-        location: {
-          file: "loader.ts",
-          line: 7,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-rich-unknown-predicate|identity=loader.ts%23isPluginMeta%5BFunctionDeclaration%5D%401|sha256=dd4e5087cb23c45f7ce2232da850423aea77fb7aadc8ab889be0f73b58504a4e",
-        identity: "loader.ts#isPluginMeta[FunctionDeclaration]@1",
-        location: {
-          file: "loader.ts",
-          line: 11,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-rich-unknown-predicate|identity=loader.ts%23isLilacToolPlugin%5BFunctionDeclaration%5D%401|sha256=42588655507498bb54a201d9d398f0cf12236a44e8a57a272ac41c68d9838821",
-        identity: "loader.ts#isLilacToolPlugin[FunctionDeclaration]@1",
-        location: {
-          file: "loader.ts",
-          line: 16,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fplugin-runtime|rule=architecture%2Fno-rich-unknown-predicate|identity=manager.ts%23isLevel1ToolSpec%5BFunctionDeclaration%5D%401|sha256=c2de0d402ed10bcde6849926bfb860411f3f3781764f767710bf81f0654aab2c",
         identity: "manager.ts#isLevel1ToolSpec[FunctionDeclaration]@1",
         location: {
@@ -16172,33 +15808,7 @@ export const boundaryValidationBaseline = {
     ],
   },
   "packages/remote-fs-runner": {
-    "architecture/no-rich-unknown-predicate": [
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Fcli.ts%23isRecord%5BFunctionDeclaration%5D%401|sha256=c49492500c1ee9627a9f20463d19c4e6205b5eca6c989d32553db947263987f8",
-        identity: "src/cli.ts#isRecord[FunctionDeclaration]@1",
-        location: {
-          file: "src/cli.ts",
-          line: 33,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-    ],
     "architecture/no-domain-unknown": [
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-domain-unknown|identity=src%2Fcli.ts%23isRecord%5BParameter%5D%401|sha256=dfdd048dd0c2e16cb1d372a2be512e7dfbe1213dc1195423dc0dc948af6e4b1a",
-        identity: "src/cli.ts#isRecord[Parameter]@1",
-        location: {
-          file: "src/cli.ts",
-          line: 33,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
       {
         fingerprint:
           "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-domain-unknown|identity=src%2Fcli.ts%23numberOrUndefined%5BParameter%5D%401|sha256=6ce6d27d950ea2b5c1979ca5146a2cda26c2096836ae63457b93ab7a204229e6",
@@ -16225,30 +15835,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-domain-unknown|identity=src%2Fcli.ts%23ordinaryFileStartOrUndefined%5BParameter%5D%401|sha256=4adc3abd9dd3dbc47692a7d007f08f06e73a08daf816ce2212770bcac90ba63b",
-        identity: "src/cli.ts#ordinaryFileStartOrUndefined[Parameter]@1",
-        location: {
-          file: "src/cli.ts",
-          line: 50,
-          column: 39,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-domain-unknown|identity=src%2Fcli.ts%23parseEnvelope%5BParameter%5D%401|sha256=7aa6986d62678de8ad6d488848e8b63e8308bc62443a326c82ce7ba344108a15",
-        identity: "src/cli.ts#parseEnvelope[Parameter]@1",
-        location: {
-          file: "src/cli.ts",
-          line: 71,
-          column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-domain-unknown|identity=src%2Fcli.ts%23writeJson%5BParameter%5D%401|sha256=327fcd872d55abab41a27bf565e3b84bc6a424b18b20f9af14784bac9f76f298",
         identity: "src/cli.ts#writeJson[Parameter]@1",
         location: {
@@ -16267,18 +15853,6 @@ export const boundaryValidationBaseline = {
           file: "src/cli.ts",
           line: 134,
           column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fremote-fs-runner|rule=architecture%2Fno-domain-unknown|identity=src%2Fcli.ts%23normalizeEditOutput%5BParameter%5D%401|sha256=800c28c28603719182dda0fca1bee63abd538dcc8a2de27c541c1924856bfb72",
-        identity: "src/cli.ts#normalizeEditOutput[Parameter]@1",
-        location: {
-          file: "src/cli.ts",
-          line: 138,
-          column: 30,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -16579,18 +16153,6 @@ export const boundaryValidationBaseline = {
         location: {
           file: "model-message-provider-options.ts",
           line: 26,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Futils|rule=architecture%2Fno-rich-unknown-predicate|identity=tool-call-input-normalization.ts%23isPlainObject%5BFunctionDeclaration%5D%401|sha256=102a8b71c18c07ec19318fa883afe271c25e90ca53de45eaf65a22d0a0ed4bd2",
-        identity: "tool-call-input-normalization.ts#isPlainObject[FunctionDeclaration]@1",
-        location: {
-          file: "tool-call-input-normalization.ts",
-          line: 3,
           column: 1,
         },
         reason:
@@ -17244,18 +16806,6 @@ export const boundaryValidationBaseline = {
           file: "model-message-provider-options.ts",
           line: 26,
           column: 40,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Futils|rule=architecture%2Fno-domain-unknown|identity=tool-call-input-normalization.ts%23isPlainObject%5BParameter%5D%401|sha256=11415cd976220f4347e533691128e52504f77da662eb94f9542adbaea2d247fa",
-        identity: "tool-call-input-normalization.ts#isPlainObject[Parameter]@1",
-        location: {
-          file: "tool-call-input-normalization.ts",
-          line: 3,
-          column: 24,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",

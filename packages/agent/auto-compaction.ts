@@ -907,6 +907,15 @@ type PendingCompactionReason = CompactionScheduleReason;
 
 export type CompactionSummaryModel = "current" | LanguageModel | (() => LanguageModel);
 
+function resolveSummaryModel(
+  summaryModel: CompactionSummaryModel,
+  currentModel: LanguageModel,
+): LanguageModel {
+  if (summaryModel === "current") return currentModel;
+  if (typeof summaryModel === "function") return summaryModel();
+  return summaryModel;
+}
+
 type AutoCompactionObservedBudget = {
   inputBudget: number;
   safeInputBudget: number;
@@ -1674,12 +1683,7 @@ export async function compactMessages(
       summaryContextLimit: options.summaryContextLimit,
       fallbackContextLimit: options.contextLimit,
     }),
-    resolveModel: () =>
-      summaryModel === "current"
-        ? options.currentModel
-        : typeof summaryModel === "function"
-          ? summaryModel()
-          : summaryModel,
+    resolveModel: () => resolveSummaryModel(summaryModel, options.currentModel),
     providerOptions: buildSummaryProviderOptions(options.providerOptions),
     serverCompaction: options.serverCompaction,
     serverCompactionContext: options.serverCompactionContext,
@@ -2250,12 +2254,13 @@ export async function attachAutoCompaction(
     const modelInputEstimate = inputEstimate.effective;
     lastModelInputEstimate = modelInputEstimate;
     const providerInputTokens = thresholdInputSource === "usage" ? lastTurnInputTokens : null;
-    const observedInputTokens =
-      providerInputTokens === null
-        ? modelInputEstimate
-        : inputEstimate.floor === null
+    let observedInputTokens = modelInputEstimate;
+    if (providerInputTokens !== null) {
+      observedInputTokens =
+        inputEstimate.floor === null
           ? providerInputTokens
           : Math.max(providerInputTokens, inputEstimate.effective);
+    }
     const inputTokenSource =
       providerInputTokens === null ||
       (inputEstimate.floor !== null && inputEstimate.effective > providerInputTokens)
@@ -2381,12 +2386,7 @@ export async function attachAutoCompaction(
         context,
         budget: contentBudget,
         summaryContextLimit,
-        resolveModel: () =>
-          summaryModel === "current"
-            ? agent.state.model
-            : typeof summaryModel === "function"
-              ? summaryModel()
-              : summaryModel,
+        resolveModel: () => resolveSummaryModel(summaryModel, agent.state.model),
         providerOptions: buildSummaryProviderOptions(agent.state.providerOptions),
         serverCompaction: options.serverCompaction,
         serverCompactionEnabled: options.serverCompactionEnabled,

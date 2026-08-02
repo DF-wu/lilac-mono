@@ -16,7 +16,6 @@ export interface SyntacticPolicy {
     readonly pattern: string;
     readonly reason: string;
   }[];
-  readonly recordGuardNames: readonly string[];
 }
 
 export const SYNTACTIC_POLICY: SyntacticPolicy = {
@@ -45,5 +44,4 @@ export const SYNTACTIC_POLICY: SyntacticPolicy = {
       reason: "Generated remote runner bundle is enforced at its TypeScript source",
     },
   ],
-  recordGuardNames: ["isPlainObject", "isRecord"],
 };

@@ -106,6 +106,12 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing structured assertion from unknown awaiting complete runtime validation.";
     case "architecture/no-rich-unknown-predicate":
       return "Existing rich unknown predicate awaiting schema decoding or exact capability registration.";
+    case "architecture/closed-union-exhaustiveness":
+      return "Existing closed-union control flow awaiting exhaustive handling without a silent default.";
+    case "architecture/closed-union-map-exhaustiveness":
+      return "Existing closed-union map awaiting a compiler-checked exhaustive shape.";
+    case "architecture/open-protocol-normalization":
+      return "Existing open protocol adapter awaiting a closed local union and explicit fallback variant.";
     case "architecture/no-production-unwrap":
       return "Existing unsafe Result extraction awaiting explicit success/error policy handling.";
     case "architecture/no-unmapped-result-capture":

@@ -101,18 +101,24 @@ function normalizeEditOutput(result: EditFileResult): EditFileResult {
 
 async function opReadText(input: Record<string, unknown>, fsTool: FileSystem): Promise<unknown> {
   const start = ordinaryFileStartOrUndefined(input["start"]);
+  let format: "numbered" | "hashline" | "raw";
+  switch (input["format"]) {
+    case "numbered":
+      format = "numbered";
+      break;
+    case "hashline":
+      format = "hashline";
+      break;
+    default:
+      format = "raw";
+  }
   const readRes = await fsTool.readFile({
     path: String(input["path"] ?? ""),
     start,
     maxLines: numberOrUndefined(input["maxLines"]),
     maxCharacters: numberOrUndefined(input["maxCharacters"]),
     maxBytes: numberOrUndefined(input["maxBytes"]),
-    format:
-      input["format"] === "numbered"
-        ? "numbered"
-        : input["format"] === "hashline"
-          ? "hashline"
-          : "raw",
+    format,
   });
   return readRes;
 }
@@ -171,12 +177,17 @@ async function opGrep(input: Record<string, unknown>, fsTool: FileSystem): Promi
   const fileExtensions = Array.isArray(input["fileExtensions"])
     ? input["fileExtensions"].map((e) => String(e).replace(/^\./, ""))
     : [];
-  const mode =
-    input["mode"] === "detailed"
-      ? "detailed"
-      : input["mode"] === "hashline"
-        ? "hashline"
-        : "default";
+  let mode: "detailed" | "hashline" | "default";
+  switch (input["mode"]) {
+    case "detailed":
+      mode = "detailed";
+      break;
+    case "hashline":
+      mode = "hashline";
+      break;
+    default:
+      mode = "default";
+  }
 
   return await fsTool.grep({
     pattern: String(input["pattern"] ?? ""),

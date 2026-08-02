@@ -16,6 +16,7 @@ import {
   type MiniLilacUIMessageMetadata,
   type MiniLilacUndoRequest,
   type MiniLilacUpdateSessionBindingsRequest,
+  MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   miniLilacCompactionEventSchema,
   miniLilacCompactRequestSchema,
   miniLilacCompactResultSchema,
@@ -33,6 +34,7 @@ import {
   miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageMetadataSchema,
   miniLilacUIMessageSchema,
+  miniLilacUnsupportedUIMessageChunkSchema,
   miniLilacUndoRequestSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
@@ -41,6 +43,42 @@ import {
 function messageWith(part: unknown): unknown {
   return { id: "message-1", role: "assistant", parts: [part] };
 }
+
+describe("unsupported UI message chunk sentinel", () => {
+  it("keeps only a bounded future chunk type in a strict transient data envelope", () => {
+    expect(
+      miniLilacUnsupportedUIMessageChunkSchema.parse({
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "future-observation" },
+        transient: true,
+      }),
+    ).toEqual({
+      type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+      data: { chunkType: "future-observation" },
+      transient: true,
+    });
+
+    for (const malformed of [
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "" },
+        transient: true,
+      },
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "x".repeat(129) },
+        transient: true,
+      },
+      {
+        type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+        data: { chunkType: "future-observation", payload: true },
+        transient: true,
+      },
+    ]) {
+      expect(miniLilacUnsupportedUIMessageChunkSchema.safeParse(malformed).success).toBe(false);
+    }
+  });
+});
 
 const pendingTodo = {
   content: "Implement durable todos",

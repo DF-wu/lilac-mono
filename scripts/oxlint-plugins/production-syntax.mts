@@ -23,7 +23,6 @@ import {
 
 export type LocalRecordGuardKind = "local-record-guard";
 export type ResultCallbackKind = "inline-async-result-callback";
-export type NestedTernaryKind = "nested-ternary";
 
 function sourceFileOf(sourceText: string, filePath: string): ts.SourceFile {
   return ts.createSourceFile(
@@ -382,6 +381,19 @@ function isNullishCallback(expression: ts.Expression): boolean {
   );
 }
 
+function possibleThenRejectionArgument(call: ts.CallExpression): ts.Expression | undefined {
+  let fixedArguments = 0;
+  for (const argument of call.arguments) {
+    if (ts.isSpreadElement(argument)) {
+      if (fixedArguments <= 1) return argument;
+      continue;
+    }
+    if (fixedArguments === 1 && !isNullishCallback(argument)) return argument;
+    fixedArguments += 1;
+  }
+  return undefined;
+}
+
 function usedExecutorRejectCalls(
   node: ts.NewExpression,
   provenance: PromiseProvenance,
@@ -555,29 +567,21 @@ export function findExceptionFlowViolations(
         add(node, "promise-reject", "Return Result.err instead of Promise.reject");
       } else {
         const parts = propertyAccessParts(node.expression);
-        if (
-          parts &&
-          parts[1] === "catch" &&
-          isKnownPromiseExpression(parts[0], provenance, node.getStart(sourceFile))
-        ) {
+        if (parts && parts[1] === "catch") {
           add(
             node,
             "promise-catch",
             "Capture rejection in an exactly registered external-to-result adapter instead of .catch",
           );
-        } else if (
-          parts &&
-          parts[1] === "then" &&
-          node.arguments[1] &&
-          !ts.isSpreadElement(node.arguments[1]) &&
-          !isNullishCallback(node.arguments[1]) &&
-          isKnownPromiseExpression(parts[0], provenance, node.getStart(sourceFile))
-        ) {
-          add(
-            node.arguments[1],
-            "rejection-callback",
-            "Capture rejection in a named Result-returning adapter before composition",
-          );
+        } else if (parts && parts[1] === "then") {
+          const rejection = possibleThenRejectionArgument(node);
+          if (rejection) {
+            add(
+              rejection,
+              "rejection-callback",
+              "Capture rejection in a named Result-returning adapter before composition",
+            );
+          }
         } else if (isExplicitHostErrorSignal(node, streamControllers)) {
           add(
             node,
@@ -604,7 +608,248 @@ function declarationName(node: ts.Node): string | undefined {
     return node.name.text;
   }
   if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) return node.name.text;
+  if (
+    (ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) &&
+    (ts.isIdentifier(node.name) || ts.isStringLiteralLike(node.name)) &&
+    node.initializer &&
+    (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+  ) {
+    return node.name.text;
+  }
   return undefined;
+}
+
+function declarationFunctionLike(node: ts.Node): ts.FunctionLikeDeclaration | undefined {
+  if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) return node;
+  if (
+    (ts.isVariableDeclaration(node) ||
+      ts.isPropertyDeclaration(node) ||
+      ts.isPropertyAssignment(node)) &&
+    node.initializer &&
+    (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+  ) {
+    return node.initializer;
+  }
+  return undefined;
+}
+
+function returnedGuardExpression(node: ts.FunctionLikeDeclaration): ts.Expression | undefined {
+  const body = node.body;
+  if (!body) return undefined;
+  if (!ts.isBlock(body)) return body;
+  if (body.statements.length !== 1) return undefined;
+  const statement = body.statements[0];
+  return statement && ts.isReturnStatement(statement) ? statement.expression : undefined;
+}
+
+function flattenLogicalAnd(expression: ts.Expression): readonly ts.Expression[] {
+  const unwrapped = unwrappedExpression(expression);
+  if (
+    ts.isBinaryExpression(unwrapped) &&
+    unwrapped.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken
+  ) {
+    return [...flattenLogicalAnd(unwrapped.left), ...flattenLogicalAnd(unwrapped.right)];
+  }
+  return [unwrapped];
+}
+
+function flattenLogicalOr(expression: ts.Expression): readonly ts.Expression[] {
+  const unwrapped = unwrappedExpression(expression);
+  if (
+    ts.isBinaryExpression(unwrapped) &&
+    unwrapped.operatorToken.kind === ts.SyntaxKind.BarBarToken
+  ) {
+    return [...flattenLogicalOr(unwrapped.left), ...flattenLogicalOr(unwrapped.right)];
+  }
+  return [unwrapped];
+}
+
+function isParameterIdentifier(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  return ts.isIdentifier(unwrapped) && unwrapped.text === parameterName;
+}
+
+function isObjectTypeofCheck(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  if (!ts.isBinaryExpression(unwrapped)) return false;
+  if (
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken &&
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsToken
+  ) {
+    return false;
+  }
+  const matches = (left: ts.Expression, right: ts.Expression): boolean => {
+    const unwrappedLeft = unwrappedExpression(left);
+    const unwrappedRight = unwrappedExpression(right);
+    return (
+      ts.isTypeOfExpression(unwrappedLeft) &&
+      isParameterIdentifier(unwrappedLeft.expression, parameterName) &&
+      ts.isStringLiteral(unwrappedRight) &&
+      unwrappedRight.text === "object"
+    );
+  };
+  return matches(unwrapped.left, unwrapped.right) || matches(unwrapped.right, unwrapped.left);
+}
+
+function isNonNullCheck(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  if (!ts.isBinaryExpression(unwrapped)) return false;
+  if (
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsEqualsToken &&
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsToken
+  ) {
+    return false;
+  }
+  return (
+    (isParameterIdentifier(unwrapped.left, parameterName) &&
+      unwrapped.right.kind === ts.SyntaxKind.NullKeyword) ||
+    (isParameterIdentifier(unwrapped.right, parameterName) &&
+      unwrapped.left.kind === ts.SyntaxKind.NullKeyword)
+  );
+}
+
+function isNonArrayCheck(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  if (
+    !ts.isPrefixUnaryExpression(unwrapped) ||
+    unwrapped.operator !== ts.SyntaxKind.ExclamationToken
+  ) {
+    return false;
+  }
+  const operand = unwrappedExpression(unwrapped.operand);
+  if (!ts.isCallExpression(operand) || operand.arguments.length !== 1) return false;
+  const parts = propertyAccessParts(operand.expression);
+  const receiver = parts && unwrappedExpression(parts[0]);
+  const argument = operand.arguments[0];
+  return (
+    !!parts &&
+    !!receiver &&
+    ts.isIdentifier(receiver) &&
+    receiver.text === "Array" &&
+    parts[1] === "isArray" &&
+    !!argument &&
+    !ts.isSpreadElement(argument) &&
+    isParameterIdentifier(argument, parameterName)
+  );
+}
+
+function isObjectTypeofRejectCheck(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  if (!ts.isBinaryExpression(unwrapped)) return false;
+  if (
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsEqualsToken &&
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.ExclamationEqualsToken
+  ) {
+    return false;
+  }
+  const matches = (left: ts.Expression, right: ts.Expression): boolean => {
+    const unwrappedLeft = unwrappedExpression(left);
+    const unwrappedRight = unwrappedExpression(right);
+    return (
+      ts.isTypeOfExpression(unwrappedLeft) &&
+      isParameterIdentifier(unwrappedLeft.expression, parameterName) &&
+      ts.isStringLiteral(unwrappedRight) &&
+      unwrappedRight.text === "object"
+    );
+  };
+  return matches(unwrapped.left, unwrapped.right) || matches(unwrapped.right, unwrapped.left);
+}
+
+function isNullRejectCheck(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  if (!ts.isBinaryExpression(unwrapped)) return false;
+  if (
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken &&
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsToken
+  ) {
+    return false;
+  }
+  return (
+    (isParameterIdentifier(unwrapped.left, parameterName) &&
+      unwrapped.right.kind === ts.SyntaxKind.NullKeyword) ||
+    (isParameterIdentifier(unwrapped.right, parameterName) &&
+      unwrapped.left.kind === ts.SyntaxKind.NullKeyword)
+  );
+}
+
+function isArrayRejectCheck(expression: ts.Expression, parameterName: string): boolean {
+  const unwrapped = unwrappedExpression(expression);
+  if (!ts.isCallExpression(unwrapped) || unwrapped.arguments.length !== 1) return false;
+  const parts = propertyAccessParts(unwrapped.expression);
+  const receiver = parts && unwrappedExpression(parts[0]);
+  const argument = unwrapped.arguments[0];
+  return (
+    !!parts &&
+    !!receiver &&
+    ts.isIdentifier(receiver) &&
+    receiver.text === "Array" &&
+    parts[1] === "isArray" &&
+    !!argument &&
+    !ts.isSpreadElement(argument) &&
+    isParameterIdentifier(argument, parameterName)
+  );
+}
+
+function returnStatementFrom(node: ts.Statement): ts.ReturnStatement | undefined {
+  if (ts.isReturnStatement(node)) return node;
+  if (!ts.isBlock(node) || node.statements.length !== 1) return undefined;
+  const statement = node.statements[0];
+  return statement && ts.isReturnStatement(statement) ? statement : undefined;
+}
+
+function isRejectReturn(statement: ts.ReturnStatement): boolean {
+  if (!statement.expression) return true;
+  const expression = unwrappedExpression(statement.expression);
+  return (
+    expression.kind === ts.SyntaxKind.NullKeyword ||
+    expression.kind === ts.SyntaxKind.FalseKeyword ||
+    (ts.isIdentifier(expression) && expression.text === "undefined") ||
+    ts.isVoidExpression(expression)
+  );
+}
+
+function hasCanonicalRecordGuardControlFlow(
+  functionLike: ts.FunctionLikeDeclaration,
+  parameterName: string,
+): boolean {
+  const body = functionLike.body;
+  if (!body || !ts.isBlock(body) || body.statements.length < 2) return false;
+  const success = body.statements.at(-1);
+  if (!success || !ts.isReturnStatement(success) || !success.expression) return false;
+  if (!isParameterIdentifier(success.expression, parameterName)) return false;
+  const rejectChecks: ts.Expression[] = [];
+  for (const statement of body.statements.slice(0, -1)) {
+    if (!ts.isIfStatement(statement) || statement.elseStatement) return false;
+    const rejected = returnStatementFrom(statement.thenStatement);
+    if (!rejected || !isRejectReturn(rejected)) return false;
+    rejectChecks.push(...flattenLogicalOr(statement.expression));
+  }
+  if (rejectChecks.length !== 3) return false;
+  return (
+    rejectChecks.some((check) => isObjectTypeofRejectCheck(check, parameterName)) &&
+    rejectChecks.some((check) => isNullRejectCheck(check, parameterName)) &&
+    rejectChecks.some((check) => isArrayRejectCheck(check, parameterName))
+  );
+}
+
+function hasCanonicalRecordGuardSemantics(node: ts.Node): boolean {
+  const functionLike = declarationFunctionLike(node);
+  const parameter = functionLike?.parameters[0];
+  if (!functionLike || !parameter || !ts.isIdentifier(parameter.name)) return false;
+  const parameterName = parameter.name.text;
+  const returned = returnedGuardExpression(functionLike);
+  if (returned) {
+    const checks = flattenLogicalAnd(returned);
+    if (
+      checks.length === 3 &&
+      checks.some((check) => isObjectTypeofCheck(check, parameterName)) &&
+      checks.some((check) => isNonNullCheck(check, parameterName)) &&
+      checks.some((check) => isNonArrayCheck(check, parameterName))
+    ) {
+      return true;
+    }
+  }
+  return hasCanonicalRecordGuardControlFlow(functionLike, parameterName);
 }
 
 export function findLocalRecordGuardViolations(
@@ -616,10 +861,9 @@ export function findLocalRecordGuardViolations(
   const sourceFile = sourceFileOf(sourceText, filePath);
   const identity = sourceIdentity(filePath);
   const findings: SyntacticFinding<LocalRecordGuardKind>[] = [];
-  const names = new Set(policy.recordGuardNames);
   const visit = (node: ts.Node): void => {
     const name = declarationName(node);
-    if (name && names.has(name)) {
+    if (name && hasCanonicalRecordGuardSemantics(node)) {
       const canonical = policy.canonicalRecordGuards.some(
         (guard) =>
           guard.workspace === identity.workspace &&
@@ -633,7 +877,7 @@ export function findLocalRecordGuardViolations(
             filePath,
             node,
             "local-record-guard",
-            `Import the canonical ${name} utility instead of declaring a local duplicate`,
+            "Import the canonical isRecord utility instead of declaring a local duplicate",
           ),
         );
       }
@@ -892,39 +1136,6 @@ export function findInlineAsyncResultCallbackViolations(
           }
         }
       }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return findings;
-}
-
-function nearestExpressionParent(node: ts.Node): ts.Node | undefined {
-  let parent = node.parent;
-  while (parent && ts.isParenthesizedExpression(parent)) parent = parent.parent;
-  return parent;
-}
-
-export function findNestedTernaryViolations(
-  sourceText: string,
-  filePath = "apps/example/src/example.ts",
-  policy: SyntacticPolicy = SYNTACTIC_POLICY,
-): SyntacticFinding<NestedTernaryKind>[] {
-  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
-  const sourceFile = sourceFileOf(sourceText, filePath);
-  const findings: SyntacticFinding<NestedTernaryKind>[] = [];
-  const visit = (node: ts.Node): void => {
-    const parent = nearestExpressionParent(node);
-    if (ts.isConditionalExpression(node) && parent && ts.isConditionalExpression(parent)) {
-      findings.push(
-        createFinding(
-          sourceFile,
-          filePath,
-          node,
-          "nested-ternary",
-          "Replace the nested ternary with an if/else, switch, or named helper",
-        ),
-      );
     }
     ts.forEachChild(node, visit);
   };

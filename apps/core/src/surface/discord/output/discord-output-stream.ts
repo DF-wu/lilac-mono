@@ -376,12 +376,13 @@ export function buildDiscordProgressLines(input: {
   ].sort((a, b) => b.entry.updatedSeq - a.entry.updatedSeq);
   for (const { rows } of historyByRecency) {
     if (remainingToolLines === 0) break;
-    const selectedRows =
-      rows.length <= remainingToolLines
-        ? rows
-        : remainingToolLines === 1
+    let selectedRows = rows;
+    if (rows.length > remainingToolLines) {
+      selectedRows =
+        remainingToolLines === 1
           ? rows.slice(0, 1)
           : [rows[0]!, ...rows.slice(-(remainingToolLines - 1))];
+    }
     toolChunks.unshift(selectedRows);
     remainingToolLines -= selectedRows.length;
   }

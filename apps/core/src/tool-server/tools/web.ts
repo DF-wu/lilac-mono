@@ -954,20 +954,24 @@ export class Web implements ServerTool {
 
     checkSignal(requestSignal);
 
-    const content = isHtmlMediaType(mediaType)
-      ? body.bytesRead > MAX_FULL_DOM_PARSE_BYTES
-        ? buildSimpleHtmlContent(body.text, url)
-        : await this.parsePage(body.text, url, {
-            preprocessor,
-            signal: requestSignal,
-          })
-      : {
-          url,
-          title: url,
-          markdown: body.text,
-          text: body.text,
-          raw: body.text,
-        };
+    let content;
+    if (isHtmlMediaType(mediaType)) {
+      content =
+        body.bytesRead > MAX_FULL_DOM_PARSE_BYTES
+          ? buildSimpleHtmlContent(body.text, url)
+          : await this.parsePage(body.text, url, {
+              preprocessor,
+              signal: requestSignal,
+            });
+    } else {
+      content = {
+        url,
+        title: url,
+        markdown: body.text,
+        text: body.text,
+        raw: body.text,
+      };
+    }
     return {
       isError: false,
       content,

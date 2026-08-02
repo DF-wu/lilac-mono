@@ -61,3 +61,14 @@ declare module "better-result" {
 declare module "wire-api" {
   export function send(value: unknown): void;
 }
+
+declare module "third-party-closed" {
+  export type ExternalState = "external-idle" | "external-running" | "external-done";
+}
+
+declare module "open-protocol-sdk" {
+  export interface ProtocolEvent {
+    readonly kind: string;
+    readonly payload?: string;
+  }
+}

@@ -2,6 +2,44 @@ import type { SessionNotification, SessionUpdate } from "@agentclientprotocol/sd
 
 import type { HistoryMessage, SessionPlanEntry } from "./types.ts";
 
+type IgnoredSessionUpdateTag =
+  | "usage_update"
+  | "available_commands_update"
+  | "agent_thought_chunk"
+  | "tool_call"
+  | "tool_call_update"
+  | "config_option_update";
+
+type ProjectedSessionUpdate =
+  | {
+      type: "append-message";
+      role: HistoryMessage["role"];
+      text: string;
+    }
+  | {
+      type: "replace-plan";
+      entries: SessionPlanEntry[];
+    }
+  | {
+      type: "session-info";
+      title: string | null | undefined;
+      updatedAt: string | null | undefined;
+    }
+  | {
+      type: "mode";
+      currentModeId: string;
+    }
+  | {
+      type: "ignored";
+      sessionUpdate: IgnoredSessionUpdateTag;
+    }
+  | UnsupportedProjectedSessionUpdate;
+
+type UnsupportedProjectedSessionUpdate = {
+  type: "unsupported";
+  sessionUpdate: string;
+};
+
 type SnapshotRun = {
   user: {
     text: string;
@@ -17,6 +55,48 @@ function contentToText(update: Extract<SessionUpdate, { content: unknown }>): st
     return update.content.uri;
   }
   return `[${update.content.type}]`;
+}
+
+export function projectUnsupportedSessionUpdate(
+  sessionUpdate: string,
+): UnsupportedProjectedSessionUpdate {
+  return { type: "unsupported", sessionUpdate };
+}
+
+export function projectSessionUpdate(update: SessionUpdate): ProjectedSessionUpdate {
+  const sessionUpdate: string = update.sessionUpdate;
+  switch (update.sessionUpdate) {
+    case "user_message_chunk":
+      return { type: "append-message", role: "user", text: contentToText(update) };
+    case "agent_message_chunk":
+      return { type: "append-message", role: "assistant", text: contentToText(update) };
+    case "plan":
+      return {
+        type: "replace-plan",
+        entries: update.entries.map((entry) => ({
+          content: entry.content,
+          priority: entry.priority,
+          status: entry.status,
+        })),
+      };
+    case "session_info_update":
+      return {
+        type: "session-info",
+        title: update.title,
+        updatedAt: update.updatedAt,
+      };
+    case "current_mode_update":
+      return { type: "mode", currentModeId: update.currentModeId };
+    case "usage_update":
+    case "available_commands_update":
+    case "agent_thought_chunk":
+    case "tool_call":
+    case "tool_call_update":
+    case "config_option_update":
+      return { type: "ignored", sessionUpdate: update.sessionUpdate };
+  }
+
+  return projectUnsupportedSessionUpdate(sessionUpdate);
 }
 
 function appendMessage(messages: HistoryMessage[], role: HistoryMessage["role"], text: string) {
@@ -40,38 +120,28 @@ export class SessionHistoryCollector {
   currentModelId: string | undefined;
 
   add(notification: SessionNotification): void {
-    const { update } = notification;
-    switch (update.sessionUpdate) {
-      case "user_message_chunk":
-        appendMessage(this.history, "user", contentToText(update));
+    const update = projectSessionUpdate(notification.update);
+    switch (update.type) {
+      case "append-message":
+        appendMessage(this.history, update.role, update.text);
         return;
-      case "agent_message_chunk":
-        appendMessage(this.history, "assistant", contentToText(update));
+      case "replace-plan":
+        this.plan = update.entries;
         return;
-      case "plan":
-        this.plan = update.entries.map((entry) => ({
-          content: entry.content,
-          priority: entry.priority,
-          status: entry.status,
-        }));
-        return;
-      case "session_info_update":
+      case "session-info":
         if (typeof update.title === "string") this.title = update.title;
         if (typeof update.updatedAt === "string") this.updatedAt = update.updatedAt;
         return;
-      case "current_mode_update":
+      case "mode":
         this.currentModeId = update.currentModeId;
         return;
-      case "usage_update":
-      case "available_commands_update":
-      case "agent_thought_chunk":
-      case "tool_call":
-      case "tool_call_update":
-      case "config_option_update":
-        return;
-      default:
+      case "ignored":
+      case "unsupported":
         return;
     }
+
+    const exhaustive: never = update;
+    return exhaustive;
   }
 
   latestAssistantText(): string | undefined {

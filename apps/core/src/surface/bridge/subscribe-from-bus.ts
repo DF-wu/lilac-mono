@@ -1254,11 +1254,10 @@ export async function bridgeBusToAdapter(params: {
                 const isContinuationOnlyFinal = finalText.length < totalTextChars;
                 const hasPriorLanePrefix = clampedStreamPrefixChars > 0;
                 const shouldUseFullLaneFinal = finalTextMode === "full" && !hasPriorLanePrefix;
-                let streamFinalText = shouldUseFullLaneFinal
-                  ? finalText
-                  : isContinuationOnlyFinal
-                    ? finalText
-                    : finalText.slice(clampedStreamPrefixChars);
+                let streamFinalText = finalText;
+                if (!shouldUseFullLaneFinal && !isContinuationOnlyFinal) {
+                  streamFinalText = finalText.slice(clampedStreamPrefixChars);
+                }
 
                 const hasTrackedPhasedText =
                   commentaryText.trim().length > 0 && finalAnswerText.trim().length > 0;

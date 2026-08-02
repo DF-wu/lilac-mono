@@ -28,7 +28,6 @@ const productionFile = "apps/example/src/example.ts";
 
 ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
   valid: [
-    { code: "cache.catch(handleMiss);", filename: productionFile },
     { code: "new Promise((resolve, reject) => resolve(1));", filename: productionFile },
     { code: "try { operation(); } finally { cleanup(); }", filename: productionFile },
     { code: "throw new Error('test invariant');", filename: "apps/example/tests/example.test.ts" },
@@ -43,6 +42,21 @@ ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
       code: "Promise.resolve(1).catch(handleError);",
       filename: productionFile,
       errors: [{ message: /external-to-result adapter/u, line: 1, column: 0 }],
+    },
+    {
+      code: "cache.catch(handleMiss);",
+      filename: productionFile,
+      errors: [{ message: /external-to-result adapter/u, line: 1, column: 0 }],
+    },
+    {
+      code: "task.then(...callbacks);",
+      filename: productionFile,
+      errors: [{ message: /named Result-returning adapter/u, line: 1 }],
+    },
+    {
+      code: "task.then(onFulfilled, ...callbacks);",
+      filename: productionFile,
+      errors: [{ message: /named Result-returning adapter/u, line: 1 }],
     },
     {
       code: 'import { TaggedError } from "better-result"; class Failure extends TaggedError("Failure") {} function run() { throw new Failure(); }',
@@ -65,15 +79,20 @@ ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
 ruleTester.run("lilac/no-local-is-record", noLocalIsRecordRule, {
   valid: [
     {
-      code: "export function isRecord(value: unknown) { return value !== null; }",
+      code: 'export function isRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value); }',
       filename: "packages/utils/runtime-utils.ts",
     },
   ],
   invalid: [
     {
-      code: "function isRecord(value: unknown) { return value !== null; }",
+      code: 'function asRecord(value: unknown) { return typeof value === "object" && value !== null && !Array.isArray(value); }',
       filename: productionFile,
       errors: [{ message: /Import the canonical isRecord utility/u, line: 1, column: 0 }],
+    },
+    {
+      code: 'const guards = { asRecord: (value: unknown) => { if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined; return value as Record<string, unknown>; } };',
+      filename: productionFile,
+      errors: [{ message: /Import the canonical isRecord utility/u, line: 1 }],
     },
   ],
 });

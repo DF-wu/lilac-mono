@@ -10,7 +10,7 @@ import {
 import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
 import { failureFlowBaseline } from "./failure-flow.baseline.ts";
 import type { ArchitectureManifest } from "./manifest.ts";
-import { architectureManifest } from "./manifest.ts";
+import { architectureManifest, assertArchitectureManifestIntegrity } from "./manifest.ts";
 import type { ArchitectureDiagnostic } from "./model.ts";
 import { ARCHITECTURE_RULES } from "./model.ts";
 import { createWorkspaceProgram, type WorkspaceProgram } from "./program.ts";
@@ -26,6 +26,7 @@ export function analyzeArchitecture(
   manifest: ArchitectureManifest = architectureManifest,
   programFactory: ProgramFactory = createWorkspaceProgram,
 ): readonly ArchitectureDiagnostic[] {
+  assertArchitectureManifestIntegrity(manifest);
   const diagnostics: ArchitectureDiagnostic[] = [];
   const packageRoots = manifest.workspaces.map((workspace) => ({
     packageName: workspace.packageName,
@@ -45,7 +46,14 @@ export function inventoryManifest(manifest: ArchitectureManifest): ArchitectureM
     ...manifest,
     workspaces: manifest.workspaces.map((workspace) => ({
       ...workspace,
-      ruleZones: Object.fromEntries(ARCHITECTURE_RULES.map((rule) => [rule, [{ include: "**" }]])),
+      ruleZones: Object.fromEntries(
+        ARCHITECTURE_RULES.map((rule) => [
+          rule,
+          rule === "architecture/open-protocol-normalization"
+            ? (workspace.ruleZones[rule] ?? [])
+            : [{ include: "**" }],
+        ]),
+      ),
     })),
   };
 }

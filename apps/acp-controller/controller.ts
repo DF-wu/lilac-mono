@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 import type { PromptResponse } from "@agentclientprotocol/sdk";
+import { isRecord } from "@stanley2058/lilac-utils";
 
 import { getBoolFlag, getIntFlag, getStringFlag, parseFlags, readStdinText } from "./cli-flags.ts";
 import {
@@ -50,10 +51,6 @@ function printJson(value: unknown): void {
 
 function printText(text: string): void {
   process.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function getString(value: unknown): string | undefined {
@@ -1078,27 +1075,29 @@ async function persistRunFromCollector(
   run: PromptRunRecord,
   collector: SessionHistoryCollector,
 ): Promise<void> {
+  let sessionUpdate: Pick<PromptRunRecord, "session"> | Record<string, never> = {};
+  if (run.session) {
+    sessionUpdate = {
+      session: {
+        ...run.session,
+        title: collector.title ?? run.session.title,
+        updatedAt: collector.updatedAt ?? run.session.updatedAt,
+      },
+    };
+  } else if (run.sessionRef) {
+    sessionUpdate = {
+      session: {
+        title: collector.title ?? run.requestedTitle,
+        cwd: run.directory,
+        updatedAt: collector.updatedAt,
+        capabilities: capabilitiesFromSummary(run.session),
+      },
+    };
+  }
   const next: PromptRunRecord = {
     ...run,
     updatedAt: Date.now(),
-    ...(run.session
-      ? {
-          session: {
-            ...run.session,
-            title: collector.title ?? run.session.title,
-            updatedAt: collector.updatedAt ?? run.session.updatedAt,
-          },
-        }
-      : run.sessionRef
-        ? {
-            session: {
-              title: collector.title ?? run.requestedTitle,
-              cwd: run.directory,
-              updatedAt: collector.updatedAt,
-              capabilities: capabilitiesFromSummary(run.session),
-            },
-          }
-        : {}),
+    ...sessionUpdate,
     ...(collector.plan ? { plan: collector.plan } : {}),
     ...(collector.history.length > 0 ? { history: collector.history } : {}),
     ...(collector.latestAssistantText() ? { resultText: collector.latestAssistantText() } : {}),
@@ -1252,16 +1251,18 @@ async function runWorkerProcess(runId: string, version: string): Promise<number>
     return run.status === "completed" ? 0 : 1;
   } catch (error) {
     const authHint = client.authHint();
+    const cancelled = run.status === "cancelled" || cancellationRequested;
+    let runError = errorMessage(error);
+    if (cancelled) {
+      runError = run.error ?? "Prompt cancelled.";
+    } else if (authHint && isAuthRequiredError(error)) {
+      runError = authHint;
+    }
     const next: PromptRunRecord = {
       ...run,
-      status: run.status === "cancelled" || cancellationRequested ? "cancelled" : "failed",
+      status: cancelled ? "cancelled" : "failed",
       updatedAt: Date.now(),
-      error:
-        run.status === "cancelled" || cancellationRequested
-          ? (run.error ?? "Prompt cancelled.")
-          : authHint && isAuthRequiredError(error)
-            ? authHint
-            : errorMessage(error),
+      error: runError,
     };
     await saveRunRecord(next);
     return 1;

@@ -812,6 +812,25 @@ function hiddenToolRejection(toolName: string): string {
   return `Tool '${toolName}' was not offered on the step that produced this call, so it was not executed.`;
 }
 
+function toolExecutionRejection(options: {
+  readonly toolName: string;
+  readonly snapshotTools: ToolSet;
+  readonly currentTools: ToolSet;
+  readonly hasExclusiveTool: boolean;
+  readonly exclusiveToolNames: ReadonlySet<string>;
+}): string | undefined {
+  if (
+    options.snapshotTools[options.toolName] === undefined &&
+    options.currentTools[options.toolName]
+  ) {
+    return hiddenToolRejection(options.toolName);
+  }
+  if (options.hasExclusiveTool && !options.exclusiveToolNames.has(options.toolName)) {
+    return `Tool '${options.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`;
+  }
+  return undefined;
+}
+
 export function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): ToolSet {
   // We keep the schema/description/title so the model can call tools,
   // but remove execution so we can run tools ourselves (enables steering).
@@ -1244,8 +1263,9 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const signals = [input.abortSignal, this.abortController?.signal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
-    const abortSignal =
-      signals.length > 1 ? AbortSignal.any(signals) : signals.length === 1 ? signals[0] : undefined;
+    let abortSignal: AbortSignal | undefined;
+    if (signals.length > 1) abortSignal = AbortSignal.any(signals);
+    else if (signals.length === 1) abortSignal = signals[0];
 
     const snapshot: StepToolSnapshot<TOOLS> = this.lastStepToolSnapshot ?? {
       step: 0,
@@ -1704,11 +1724,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       throw new Error("Agent is already processing. Use steer() or followUp(), or waitForIdle().");
     }
 
-    const newMessages = Array.isArray(input)
-      ? input
-      : typeof input === "string"
-        ? [makeUserMessage(input)]
-        : [input];
+    let newMessages: ModelMessage[];
+    if (Array.isArray(input)) newMessages = input;
+    else if (typeof input === "string") newMessages = [makeUserMessage(input)];
+    else newMessages = [input];
 
     await this.runLoop({ newMessages });
   }
@@ -2415,13 +2434,19 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
             if (this.turnErrorHandler) {
               const lastMessage = this.state.messages.at(-1);
-              const retrySafety: TurnRetrySafety = modelTurnCompleted
-                ? { canRetry: false, reason: "post-model-phase" }
-                : this.providerExecutedToolAttemptLatched
-                  ? { canRetry: false, reason: "provider-executed-tool" }
-                  : lastMessage?.role === "assistant" || this.state.pendingToolCalls.size > 0
-                    ? { canRetry: false, reason: "invalid-transcript-boundary" }
-                    : { canRetry: true };
+              let retrySafety: TurnRetrySafety;
+              if (modelTurnCompleted) {
+                retrySafety = { canRetry: false, reason: "post-model-phase" };
+              } else if (this.providerExecutedToolAttemptLatched) {
+                retrySafety = { canRetry: false, reason: "provider-executed-tool" };
+              } else if (
+                lastMessage?.role === "assistant" ||
+                this.state.pendingToolCalls.size > 0
+              ) {
+                retrySafety = { canRetry: false, reason: "invalid-transcript-boundary" };
+              } else {
+                retrySafety = { canRetry: true };
+              }
               let decision: TurnErrorHandlerDecision | undefined;
               try {
                 decision = await this.turnErrorHandler(err, {
@@ -2589,14 +2614,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
     await this.canonicalModelCallPreflight?.(canonicalMessages, preparationContext);
     canonicalMessages = normalizeReplayMessages(this.state.messages.map(cloneMessage));
-    preparedCanonical = this.prepareFullBudgetView
-      ? await this.prepareFullBudgetView(canonicalMessages, {
-          ...preparationContext,
-          canonicalStartIndex: 0,
-        })
-      : this.prepareFullModelView
-        ? await this.prepareFullModelView(canonicalMessages, preparationContext)
-        : canonicalMessages;
+    if (this.prepareFullBudgetView) {
+      preparedCanonical = await this.prepareFullBudgetView(canonicalMessages, {
+        ...preparationContext,
+        canonicalStartIndex: 0,
+      });
+    } else if (this.prepareFullModelView) {
+      preparedCanonical = await this.prepareFullModelView(canonicalMessages, preparationContext);
+    } else {
+      preparedCanonical = canonicalMessages;
+    }
     preparedCanonical = normalizeReplayMessages(preparedCanonical);
     throwIfPreparationAborted();
 
@@ -3175,12 +3202,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         },
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
         aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
-        executionRejection:
-          snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
-            ? hiddenToolRejection(call.toolName)
-            : hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
-              ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
-              : undefined,
+        executionRejection: toolExecutionRejection({
+          toolName: call.toolName,
+          snapshotTools: snapshot.tools,
+          currentTools: this.state.tools,
+          hasExclusiveTool,
+          exclusiveToolNames: this.exclusiveToolNames,
+        }),
         assertNotAborted,
         onEvent: (event) => this.emit(event),
       }),
@@ -3390,12 +3418,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
         aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
-        executionRejection:
-          snapshot.tools[call.toolName] === undefined && this.state.tools[call.toolName]
-            ? hiddenToolRejection(call.toolName)
-            : hasExclusiveTool && !this.exclusiveToolNames.has(call.toolName)
-              ? `Tool '${call.toolName}' was not executed because an exclusive tool was selected in the same turn. Retry it after processing the exclusive tool result.`
-              : undefined,
+        executionRejection: toolExecutionRejection({
+          toolName: call.toolName,
+          snapshotTools: snapshot.tools,
+          currentTools: this.state.tools,
+          hasExclusiveTool,
+          exclusiveToolNames: this.exclusiveToolNames,
+        }),
         assertNotAborted,
         onEvent: (event) => this.emit(event),
       });

@@ -1285,6 +1285,1423 @@ function analyzePredicate(
   );
 }
 
+interface LiteralDomain {
+  readonly keys: ReadonlyMap<string, string>;
+}
+
+function isProjectDeclaration(
+  declaration: ts.Node,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const sourceFile = declaration.getSourceFile();
+  if (sourceFile.isDeclarationFile) return false;
+  const file = canonicalPath(sourceFile.fileName);
+  return packageRoots.some((candidate) => {
+    const root = canonicalPath(candidate.root);
+    return file === root || file.startsWith(`${root}/`);
+  });
+}
+
+function typeNodeIsProjectOwned(
+  node: ts.TypeNode,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol>,
+): boolean {
+  if (ts.isLiteralTypeNode(node) || ts.isTypeLiteralNode(node)) return true;
+  if (ts.isParenthesizedTypeNode(node)) {
+    return typeNodeIsProjectOwned(node.type, checker, packageRoots, seenSymbols);
+  }
+  if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) {
+    return node.types.every((member) =>
+      typeNodeIsProjectOwned(member, checker, packageRoots, seenSymbols),
+    );
+  }
+  if (ts.isTypeReferenceNode(node)) {
+    const referenced = checker.getSymbolAtLocation(node.typeName);
+    if (!referenced) return false;
+    const symbol = canonicalSymbol(referenced, checker);
+    if (seenSymbols.has(symbol)) return true;
+    seenSymbols.add(symbol);
+    const declarations = symbol.declarations ?? [];
+    if (
+      declarations.length === 0 ||
+      declarations.some((declaration) => !isProjectDeclaration(declaration, packageRoots))
+    ) {
+      return false;
+    }
+    return declarations.every((declaration) => {
+      if (ts.isTypeAliasDeclaration(declaration)) {
+        return typeNodeIsProjectOwned(declaration.type, checker, packageRoots, seenSymbols);
+      }
+      if (ts.isTypeParameterDeclaration(declaration)) {
+        return Boolean(
+          declaration.constraint &&
+          typeNodeIsProjectOwned(declaration.constraint, checker, packageRoots, seenSymbols),
+        );
+      }
+      return true;
+    });
+  }
+  return false;
+}
+
+function typeIsProjectOwned(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenTypes: Set<ts.Type> = new Set(),
+): boolean {
+  if (seenTypes.has(type)) return true;
+  seenTypes.add(type);
+  if ((type.flags & ts.TypeFlags.TypeParameter) !== 0) {
+    const declarations = type.getSymbol()?.declarations ?? [];
+    if (
+      declarations.some((declaration) => {
+        if (!ts.isTypeParameterDeclaration(declaration) || !declaration.constraint) return false;
+        return (
+          isProjectDeclaration(declaration, packageRoots) &&
+          typeNodeIsProjectOwned(declaration.constraint, checker, packageRoots, new Set())
+        );
+      })
+    ) {
+      return true;
+    }
+    const constraint = checker.getBaseConstraintOfType(type);
+    return Boolean(constraint && typeIsProjectOwned(constraint, checker, packageRoots, seenTypes));
+  }
+  const alias = type.aliasSymbol;
+  if (alias) {
+    const declarations = alias.declarations ?? [];
+    return (
+      declarations.length > 0 &&
+      declarations.every(
+        (declaration) =>
+          isProjectDeclaration(declaration, packageRoots) &&
+          (!ts.isTypeAliasDeclaration(declaration) ||
+            typeNodeIsProjectOwned(declaration.type, checker, packageRoots, new Set([alias]))),
+      )
+    );
+  }
+  if (type.isUnionOrIntersection()) {
+    return type.types.every((member) =>
+      typeIsProjectOwned(member, checker, packageRoots, seenTypes),
+    );
+  }
+  const symbol = type.getSymbol();
+  const declarations = symbol?.declarations ?? [];
+  return (
+    declarations.length > 0 &&
+    declarations.every((declaration) => isProjectDeclaration(declaration, packageRoots))
+  );
+}
+
+function literalKey(type: ts.Type, checker: ts.TypeChecker): readonly [string, string] | undefined {
+  if ((type.flags & ts.TypeFlags.StringLiteral) !== 0) {
+    const value = (type as ts.StringLiteralType).value;
+    return [`string:${value}`, JSON.stringify(value)];
+  }
+  if ((type.flags & ts.TypeFlags.NumberLiteral) !== 0) {
+    const value = (type as ts.NumberLiteralType).value;
+    return [`number:${value}`, String(value)];
+  }
+  if ((type.flags & ts.TypeFlags.EnumLiteral) !== 0) {
+    const value = checker.typeToString(type);
+    return [`enum:${value}`, value];
+  }
+  return undefined;
+}
+
+function literalDomain(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  ownershipType: ts.Type = type,
+  ownershipConfirmed = false,
+): LiteralDomain | undefined {
+  let resolved = type;
+  if ((resolved.flags & ts.TypeFlags.TypeParameter) !== 0) {
+    const constraint = checker.getBaseConstraintOfType(resolved);
+    if (!constraint) return undefined;
+    resolved = constraint;
+  }
+  const members = resolved.isUnion() ? resolved.types : [resolved];
+  if (
+    members.length < 2 ||
+    (!ownershipConfirmed && !typeIsProjectOwned(ownershipType, checker, packageRoots))
+  ) {
+    return undefined;
+  }
+  const keys = new Map<string, string>();
+  for (const member of members) {
+    const key = literalKey(member, checker);
+    if (!key) return undefined;
+    keys.set(key[0], key[1]);
+  }
+  return keys.size < 2 ? undefined : { keys };
+}
+
+function declaredTypeNode(node: ts.Declaration): ts.TypeNode | undefined {
+  if (
+    ts.isParameter(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isPropertyDeclaration(node) ||
+    ts.isPropertySignature(node)
+  ) {
+    return node.type;
+  }
+  return undefined;
+}
+
+function expressionTypeIsProjectOwned(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const type = checker.getTypeAtLocation(expression);
+  if (typeIsProjectOwned(type, checker, packageRoots)) return true;
+  if (ts.isCallExpression(expression)) {
+    return expressionInfersLiteralUnion(expression, checker, packageRoots, new Set());
+  }
+  if (ts.isPropertyAccessExpression(expression)) {
+    const property = checker.getSymbolAtLocation(expression.name);
+    const declarations = property?.declarations ?? [];
+    const declaredOwned =
+      declarations.length > 0 &&
+      declarations.every((declaration) => {
+        const typeNode = declaredTypeNode(declaration);
+        return Boolean(
+          typeNode &&
+          isProjectDeclaration(declaration, packageRoots) &&
+          typeNodeIsProjectOwned(typeNode, checker, packageRoots, new Set()),
+        );
+      });
+    return (
+      declaredOwned ||
+      expressionInfersObjectDiscriminant(
+        expression.expression,
+        expression.name.text,
+        checker,
+        packageRoots,
+        new Set(),
+      )
+    );
+  }
+  if (ts.isElementAccessExpression(expression)) {
+    const argument = expression.argumentExpression;
+    if (!argument || !ts.isStringLiteralLike(argument)) return false;
+    const property = checker.getTypeAtLocation(expression.expression).getProperty(argument.text);
+    const declarations = property?.declarations ?? [];
+    const declaredOwned =
+      declarations.length > 0 &&
+      declarations.every((declaration) => {
+        const typeNode = declaredTypeNode(declaration);
+        return Boolean(
+          typeNode &&
+          isProjectDeclaration(declaration, packageRoots) &&
+          typeNodeIsProjectOwned(typeNode, checker, packageRoots, new Set()),
+        );
+      });
+    return (
+      declaredOwned ||
+      expressionInfersObjectDiscriminant(
+        expression.expression,
+        argument.text,
+        checker,
+        packageRoots,
+        new Set(),
+      )
+    );
+  }
+  if (!ts.isIdentifier(expression)) return false;
+  const symbol = checker.getSymbolAtLocation(expression);
+  return (
+    symbol?.declarations?.some((declaration) => {
+      const typeNode = declaredTypeNode(declaration);
+      if (
+        typeNode &&
+        isProjectDeclaration(declaration, packageRoots) &&
+        typeNodeIsProjectOwned(typeNode, checker, packageRoots, new Set())
+      ) {
+        return true;
+      }
+      return (
+        ts.isVariableDeclaration(declaration) &&
+        Boolean(declaration.initializer) &&
+        isProjectDeclaration(declaration, packageRoots) &&
+        expressionInfersLiteralUnion(
+          declaration.initializer as ts.Expression,
+          checker,
+          packageRoots,
+          new Set(),
+        )
+      );
+    }) ?? false
+  );
+}
+
+function expressionInfersLiteralUnion(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol>,
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isStringLiteralLike(unwrapped) || ts.isNumericLiteral(unwrapped)) return true;
+  if (ts.isConditionalExpression(unwrapped)) {
+    return (
+      expressionInfersLiteralUnion(
+        unwrapped.whenTrue,
+        checker,
+        packageRoots,
+        new Set(seenSymbols),
+      ) &&
+      expressionInfersLiteralUnion(unwrapped.whenFalse, checker, packageRoots, new Set(seenSymbols))
+    );
+  }
+  if (ts.isCallExpression(unwrapped)) {
+    const declaration = checker.getResolvedSignature(unwrapped)?.declaration;
+    return Boolean(
+      declaration &&
+      isProjectDeclaration(declaration, packageRoots) &&
+      functionReturnExpressions(declaration).every((returned) =>
+        expressionInfersLiteralUnion(returned, checker, packageRoots, new Set(seenSymbols)),
+      ) &&
+      functionReturnExpressions(declaration).length > 0,
+    );
+  }
+  if (!ts.isIdentifier(unwrapped)) return false;
+  const symbol = ts.isShorthandPropertyAssignment(unwrapped.parent)
+    ? checker.getShorthandAssignmentValueSymbol(unwrapped.parent)
+    : checker.getSymbolAtLocation(unwrapped);
+  if (!symbol || seenSymbols.has(symbol)) return false;
+  seenSymbols.add(symbol);
+  return (
+    symbol.declarations?.some(
+      (declaration) =>
+        ts.isVariableDeclaration(declaration) &&
+        Boolean(declaration.initializer) &&
+        expressionInfersLiteralUnion(
+          declaration.initializer as ts.Expression,
+          checker,
+          packageRoots,
+          new Set(seenSymbols),
+        ),
+    ) ?? false
+  );
+}
+
+function functionReturnExpressions(
+  node: ts.SignatureDeclaration | ts.JSDocSignature,
+): readonly ts.Expression[] {
+  const body =
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isConstructorDeclaration(node)
+      ? node.body
+      : undefined;
+  if (!body) return [];
+  if (!ts.isBlock(body)) return [body];
+  const returned: ts.Expression[] = [];
+  const visit = (child: ts.Node): void => {
+    if (child !== body && ts.isFunctionLike(child)) return;
+    if (ts.isReturnStatement(child) && child.expression) {
+      returned.push(child.expression);
+      return;
+    }
+    ts.forEachChild(child, visit);
+  };
+  visit(body);
+  return returned;
+}
+
+function expressionInfersObjectDiscriminant(
+  expression: ts.Expression,
+  propertyName: string,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol>,
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isObjectLiteralExpression(unwrapped)) {
+    const property = unwrapped.properties.find(
+      (candidate) =>
+        (ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) &&
+        (ts.isIdentifier(candidate.name) || ts.isStringLiteralLike(candidate.name)) &&
+        candidate.name.text === propertyName,
+    );
+    let initializer: ts.Expression | undefined;
+    if (property && ts.isPropertyAssignment(property)) initializer = property.initializer;
+    if (property && ts.isShorthandPropertyAssignment(property)) initializer = property.name;
+    return Boolean(
+      initializer &&
+      expressionInfersLiteralUnion(initializer, checker, packageRoots, new Set(seenSymbols)),
+    );
+  }
+  if (ts.isConditionalExpression(unwrapped)) {
+    return (
+      expressionInfersObjectDiscriminant(
+        unwrapped.whenTrue,
+        propertyName,
+        checker,
+        packageRoots,
+        new Set(seenSymbols),
+      ) &&
+      expressionInfersObjectDiscriminant(
+        unwrapped.whenFalse,
+        propertyName,
+        checker,
+        packageRoots,
+        new Set(seenSymbols),
+      )
+    );
+  }
+  if (ts.isCallExpression(unwrapped)) {
+    const declaration = checker.getResolvedSignature(unwrapped)?.declaration;
+    if (!declaration || !isProjectDeclaration(declaration, packageRoots)) return false;
+    const returned = functionReturnExpressions(declaration);
+    return (
+      returned.length > 0 &&
+      returned.every((value) =>
+        expressionInfersObjectDiscriminant(
+          value,
+          propertyName,
+          checker,
+          packageRoots,
+          new Set(seenSymbols),
+        ),
+      )
+    );
+  }
+  if (!ts.isIdentifier(unwrapped)) return false;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (!symbol || seenSymbols.has(symbol)) return false;
+  seenSymbols.add(symbol);
+  return (
+    symbol.declarations?.some(
+      (declaration) =>
+        ts.isVariableDeclaration(declaration) &&
+        Boolean(declaration.initializer) &&
+        expressionInfersObjectDiscriminant(
+          declaration.initializer as ts.Expression,
+          propertyName,
+          checker,
+          packageRoots,
+          new Set(seenSymbols),
+        ),
+    ) ?? false
+  );
+}
+
+function switchDomain(
+  node: ts.SwitchStatement,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): LiteralDomain | undefined {
+  const direct = literalDomain(
+    checker.getTypeAtLocation(node.expression),
+    checker,
+    packageRoots,
+    checker.getTypeAtLocation(node.expression),
+    expressionTypeIsProjectOwned(node.expression, checker, packageRoots),
+  );
+  if (direct) return direct;
+  return undefined;
+}
+
+function unwrapExpression(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isSatisfiesExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function expressionSymbol(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): ts.Symbol | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (!ts.isIdentifier(unwrapped)) return undefined;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  return symbol && canonicalSymbol(symbol, checker);
+}
+
+function switchSourceExpressions(expression: ts.Expression): readonly ts.Expression[] {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+    return [unwrapped, unwrapExpression(unwrapped.expression)];
+  }
+  return [unwrapped];
+}
+
+function selectedProperty(
+  expression: ts.Expression,
+): { readonly receiver: ts.Expression; readonly name: string } | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isPropertyAccessExpression(unwrapped)) {
+    return { receiver: unwrapped.expression, name: unwrapped.name.text };
+  }
+  if (
+    ts.isElementAccessExpression(unwrapped) &&
+    unwrapped.argumentExpression &&
+    ts.isStringLiteralLike(unwrapped.argumentExpression)
+  ) {
+    return { receiver: unwrapped.expression, name: unwrapped.argumentExpression.text };
+  }
+  return undefined;
+}
+
+function expressionDerivesFromSwitch(
+  expression: ts.Expression,
+  switched: ts.Expression,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  for (const source of switchSourceExpressions(switched)) {
+    if (unwrapped === source) return true;
+    const expressionOwner = expressionSymbol(unwrapped, checker);
+    const sourceOwner = expressionSymbol(source, checker);
+    if (expressionOwner && sourceOwner && expressionOwner === sourceOwner) return true;
+    const expressionProperty = selectedProperty(unwrapped);
+    const sourceProperty = selectedProperty(source);
+    if (expressionProperty && sourceProperty && expressionProperty.name === sourceProperty.name) {
+      const expressionReceiver = expressionSymbol(expressionProperty.receiver, checker);
+      const sourceReceiver = expressionSymbol(sourceProperty.receiver, checker);
+      if (expressionReceiver && sourceReceiver && expressionReceiver === sourceReceiver)
+        return true;
+    }
+  }
+  if (!ts.isIdentifier(unwrapped)) return false;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (!symbol || seenSymbols.has(symbol)) return false;
+  seenSymbols.add(symbol);
+  return (
+    symbol.declarations?.some((declaration) => {
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        return expressionDerivesFromSwitch(declaration.initializer, switched, checker, seenSymbols);
+      }
+      if (ts.isBindingElement(declaration)) {
+        const source = bindingElementSource(declaration, checker);
+        return Boolean(
+          source && expressionDerivesFromSwitch(source, switched, checker, seenSymbols),
+        );
+      }
+      return false;
+    }) ?? false
+  );
+}
+
+function defaultContainsNeverSink(
+  clause: ts.DefaultClause,
+  switched: ts.Expression,
+  checker: ts.TypeChecker,
+): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isCallExpression(node)) {
+      const signature = checker.getResolvedSignature(node);
+      for (const [index, argument] of node.arguments.entries()) {
+        const parameter = signature?.parameters[Math.min(index, signature.parameters.length - 1)];
+        if (!parameter) continue;
+        const parameterType = checker.getTypeOfSymbolAtLocation(parameter, argument);
+        const argumentType = checker.getTypeAtLocation(argument);
+        if (
+          (parameterType.flags & ts.TypeFlags.Never) !== 0 &&
+          (argumentType.flags & ts.TypeFlags.Never) !== 0 &&
+          expressionDerivesFromSwitch(argument, switched, checker)
+        ) {
+          found = true;
+          return;
+        }
+      }
+    }
+    if (
+      ts.isVariableDeclaration(node) &&
+      node.type &&
+      node.initializer &&
+      (checker.getTypeFromTypeNode(node.type).flags & ts.TypeFlags.Never) !== 0 &&
+      (checker.getTypeAtLocation(node.initializer).flags & ts.TypeFlags.Never) !== 0 &&
+      expressionDerivesFromSwitch(node.initializer, switched, checker)
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(clause);
+  return found;
+}
+
+function analyzeClosedUnionSwitch(
+  node: ts.SwitchStatement,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const domain = switchDomain(node, checker, packageRoots);
+  if (!domain) return;
+  const handled = new Set<string>();
+  let defaultClause: ts.DefaultClause | undefined;
+  for (const clause of node.caseBlock.clauses) {
+    if (ts.isDefaultClause(clause)) {
+      defaultClause = clause;
+      continue;
+    }
+    const caseDomain = literalDomain(
+      checker.getTypeAtLocation(clause.expression),
+      checker,
+      packageRoots,
+    );
+    if (caseDomain) {
+      for (const key of caseDomain.keys.keys()) handled.add(key);
+      continue;
+    }
+    const key = literalKey(checker.getTypeAtLocation(clause.expression), checker);
+    if (key) handled.add(key[0]);
+  }
+  const missing = [...domain.keys]
+    .filter(([key]) => !handled.has(key))
+    .map(([, display]) => display);
+  const silentDefault =
+    defaultClause && !defaultContainsNeverSink(defaultClause, node.expression, checker);
+  if (missing.length === 0 && !silentDefault) return;
+  const detail = missing.length
+    ? `missing ${missing.join(", ")}`
+    : "uses a silent default after handling every known member";
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/closed-union-exhaustiveness",
+      defaultClause ?? node,
+      `Switch over a project-owned closed union is not exhaustive: ${detail}.`,
+      "Handle every union member directly; omit default, or use a default that passes the narrowed value to a never sink.",
+    ),
+  );
+}
+
+interface MapResolution {
+  readonly object: ts.ObjectLiteralExpression;
+  readonly checkedTypeNodes: readonly ts.TypeNode[];
+  readonly assertedTypeNodes: readonly ts.TypeNode[];
+}
+
+function mapResolutionFromExpression(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): MapResolution | undefined {
+  if (ts.isParenthesizedExpression(expression)) {
+    return mapResolutionFromExpression(expression.expression, checker, seenSymbols);
+  }
+  if (ts.isSatisfiesExpression(expression)) {
+    const resolution = mapResolutionFromExpression(expression.expression, checker, seenSymbols);
+    return resolution
+      ? {
+          ...resolution,
+          checkedTypeNodes: [...resolution.checkedTypeNodes, expression.type],
+        }
+      : undefined;
+  }
+  if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression)) {
+    const resolution = mapResolutionFromExpression(expression.expression, checker, seenSymbols);
+    return resolution
+      ? {
+          ...resolution,
+          assertedTypeNodes: [...resolution.assertedTypeNodes, expression.type],
+        }
+      : undefined;
+  }
+  if (ts.isObjectLiteralExpression(expression)) {
+    return { object: expression, checkedTypeNodes: [], assertedTypeNodes: [] };
+  }
+  const located = ts.isIdentifier(expression)
+    ? checker.getSymbolAtLocation(expression)
+    : ts.isPropertyAccessExpression(expression)
+      ? checker.getSymbolAtLocation(expression.name)
+      : ts.isElementAccessExpression(expression) &&
+          expression.argumentExpression &&
+          ts.isStringLiteralLike(expression.argumentExpression)
+        ? checker.getSymbolAtLocation(expression.argumentExpression)
+        : undefined;
+  if (!located) return undefined;
+  const symbol = canonicalSymbol(located, checker);
+  if (!symbol || seenSymbols.has(symbol)) return undefined;
+  seenSymbols.add(symbol);
+  const declaration = symbol.declarations?.find(
+    (
+      candidate,
+    ): candidate is ts.VariableDeclaration | ts.PropertyDeclaration | ts.PropertyAssignment =>
+      (ts.isVariableDeclaration(candidate) ||
+        ts.isPropertyDeclaration(candidate) ||
+        ts.isPropertyAssignment(candidate)) &&
+      candidate.initializer !== undefined,
+  );
+  if (!declaration?.initializer) return undefined;
+  const resolution = mapResolutionFromExpression(declaration.initializer, checker, seenSymbols);
+  if (!resolution || ts.isPropertyAssignment(declaration) || !declaration.type) return resolution;
+  return {
+    ...resolution,
+    checkedTypeNodes: [...resolution.checkedTypeNodes, declaration.type],
+  };
+}
+
+function domainsInTypeNode(
+  node: ts.TypeNode,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): readonly LiteralDomain[] {
+  const domains: LiteralDomain[] = [];
+  const seenAliases = new Set<ts.Symbol>();
+  const visit = (child: ts.Node): void => {
+    if (ts.isTypeNode(child)) {
+      const domain = literalDomain(checker.getTypeFromTypeNode(child), checker, packageRoots);
+      const ownedDomain =
+        domain ??
+        literalDomain(
+          checker.getTypeFromTypeNode(child),
+          checker,
+          packageRoots,
+          checker.getTypeFromTypeNode(child),
+          isProjectDeclaration(child, packageRoots) &&
+            typeNodeIsProjectOwned(child, checker, packageRoots, new Set()),
+        );
+      if (ownedDomain) domains.push(ownedDomain);
+      if (ts.isTypeReferenceNode(child)) {
+        const located = checker.getSymbolAtLocation(child.typeName);
+        const symbol = located && canonicalSymbol(located, checker);
+        if (symbol && !seenAliases.has(symbol)) {
+          seenAliases.add(symbol);
+          for (const declaration of symbol.declarations ?? []) {
+            if (ts.isTypeAliasDeclaration(declaration)) visit(declaration.type);
+          }
+        }
+      }
+    }
+    ts.forEachChild(child, visit);
+  };
+  visit(node);
+  return domains;
+}
+
+function typeNodeHasDomainProperties(
+  typeNode: ts.TypeNode,
+  domain: LiteralDomain,
+  checker: ts.TypeChecker,
+): boolean {
+  const contract = checker.getTypeFromTypeNode(typeNode);
+  return [...domain.keys.keys()].every((key) => {
+    const name = propertyNameForLiteralKey(key);
+    return name !== undefined && checker.getPropertyOfType(contract, name) !== undefined;
+  });
+}
+
+function typeNodeIsMapContract(
+  node: ts.TypeNode,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenAliases: Set<ts.Symbol> = new Set(),
+): boolean {
+  if (ts.isMappedTypeNode(node)) return true;
+  if (ts.isParenthesizedTypeNode(node) || ts.isTypeOperatorNode(node)) {
+    return typeNodeIsMapContract(node.type, checker, packageRoots, seenAliases);
+  }
+  if (ts.isIntersectionTypeNode(node) || ts.isUnionTypeNode(node)) {
+    return node.types.some((type) =>
+      typeNodeIsMapContract(type, checker, packageRoots, seenAliases),
+    );
+  }
+  if (!ts.isTypeReferenceNode(node)) return false;
+  const referenceName = ts.isIdentifier(node.typeName) ? node.typeName.text : undefined;
+  if (referenceName === "Record") return true;
+  if (
+    node.typeArguments?.some((type) =>
+      typeNodeIsMapContract(type, checker, packageRoots, seenAliases),
+    )
+  ) {
+    return true;
+  }
+  const located = checker.getSymbolAtLocation(node.typeName);
+  const symbol = located && canonicalSymbol(located, checker);
+  if (!symbol || seenAliases.has(symbol)) return false;
+  seenAliases.add(symbol);
+  return (
+    symbol.declarations?.some(
+      (declaration) =>
+        ts.isTypeAliasDeclaration(declaration) &&
+        isProjectDeclaration(declaration, packageRoots) &&
+        typeNodeIsMapContract(declaration.type, checker, packageRoots, seenAliases),
+    ) ?? false
+  );
+}
+
+function propertyNameForLiteralKey(key: string): string | undefined {
+  const separator = key.indexOf(":");
+  if (separator < 0) return undefined;
+  return key.slice(separator + 1);
+}
+
+function typeNodeRequiresDomain(
+  typeNode: ts.TypeNode,
+  domain: LiteralDomain,
+  checker: ts.TypeChecker,
+): boolean {
+  const contract = checker.getTypeFromTypeNode(typeNode);
+  return [...domain.keys.keys()].every((key) => {
+    const name = propertyNameForLiteralKey(key);
+    if (name === undefined) return false;
+    const property = checker.getPropertyOfType(contract, name);
+    return Boolean(property && (property.flags & ts.SymbolFlags.Optional) === 0);
+  });
+}
+
+function typeNodeMatchesDomain(
+  typeNode: ts.TypeNode,
+  domain: LiteralDomain,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  return domainsInTypeNode(typeNode, checker, packageRoots).some(
+    (candidate) =>
+      candidate.keys.size === domain.keys.size &&
+      [...candidate.keys.keys()].every((key) => domain.keys.has(key)),
+  );
+}
+
+function mapIsCompilerChecked(
+  resolution: MapResolution,
+  domain: LiteralDomain,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (
+    resolution.assertedTypeNodes.some((typeNode) =>
+      typeNodeMatchesDomain(typeNode, domain, checker, packageRoots),
+    )
+  ) {
+    return false;
+  }
+  return resolution.checkedTypeNodes.some(
+    (typeNode) =>
+      typeNodeMatchesDomain(typeNode, domain, checker, packageRoots) &&
+      typeNodeRequiresDomain(typeNode, domain, checker),
+  );
+}
+
+function analyzeClosedUnionMap(
+  resolution: MapResolution,
+  domain: LiteralDomain,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+  reported: Set<string>,
+): void {
+  const object = resolution.object;
+  const reportKey = `${canonicalPath(object.getSourceFile().fileName)}:${object.getStart()}`;
+  if (reported.has(reportKey) || mapIsCompilerChecked(resolution, domain, checker, packageRoots)) {
+    return;
+  }
+  reported.add(reportKey);
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/closed-union-map-exhaustiveness",
+      object,
+      "Map keyed by a project-owned closed union is not compiler-checked as exhaustive.",
+      "Declare or satisfy a required mapped type such as Record<Union, Value>; do not use Partial, a broad index signature, or a type assertion.",
+    ),
+  );
+}
+
+function propertyNameText(name: ts.PropertyName): string | undefined {
+  return ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)
+    ? name.text
+    : undefined;
+}
+
+function propertyTypeNodeInContract(
+  contract: ts.TypeNode,
+  propertyName: string,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): ts.TypeNode | undefined {
+  if (ts.isParenthesizedTypeNode(contract) || ts.isTypeOperatorNode(contract)) {
+    return propertyTypeNodeInContract(contract.type, propertyName, checker, seenSymbols);
+  }
+  if (ts.isIntersectionTypeNode(contract) || ts.isUnionTypeNode(contract)) {
+    for (const member of contract.types) {
+      const selected = propertyTypeNodeInContract(member, propertyName, checker, seenSymbols);
+      if (selected) return selected;
+    }
+    return undefined;
+  }
+  if (ts.isTypeLiteralNode(contract)) {
+    for (const member of contract.members) {
+      if (!ts.isPropertySignature(member) || !member.type) continue;
+      if (propertyNameText(member.name) === propertyName) return member.type;
+    }
+    return undefined;
+  }
+  if (!ts.isTypeReferenceNode(contract)) return undefined;
+  const located = checker.getSymbolAtLocation(contract.typeName);
+  const symbol = located && canonicalSymbol(located, checker);
+  if (!symbol || seenSymbols.has(symbol)) return undefined;
+  seenSymbols.add(symbol);
+  for (const declaration of symbol.declarations ?? []) {
+    if (ts.isTypeAliasDeclaration(declaration)) {
+      const selected = propertyTypeNodeInContract(
+        declaration.type,
+        propertyName,
+        checker,
+        seenSymbols,
+      );
+      if (selected) return selected;
+    }
+    if (ts.isInterfaceDeclaration(declaration)) {
+      for (const member of declaration.members) {
+        if (!ts.isPropertySignature(member) || !member.type) continue;
+        if (propertyNameText(member.name) === propertyName) return member.type;
+      }
+    }
+  }
+  return undefined;
+}
+
+interface NestedPropertyContracts {
+  readonly asserted: readonly ts.TypeNode[];
+  readonly checked: readonly ts.TypeNode[];
+}
+
+function selectPropertyContractPath(
+  root: ts.TypeNode,
+  path: readonly string[],
+  checker: ts.TypeChecker,
+): ts.TypeNode | undefined {
+  let selected: ts.TypeNode | undefined = root;
+  for (const segment of path) {
+    selected = propertyTypeNodeInContract(selected, segment, checker);
+    if (!selected) return undefined;
+  }
+  return selected;
+}
+
+function nestedPropertyContracts(
+  node: ts.PropertyAssignment,
+  checker: ts.TypeChecker,
+): NestedPropertyContracts {
+  const path: string[] = [];
+  const asserted: ts.TypeNode[] = [];
+  const checked: ts.TypeNode[] = [];
+  let property: ts.PropertyAssignment = node;
+  while (true) {
+    const name = propertyNameText(property.name);
+    if (!name) return { asserted, checked };
+    path.unshift(name);
+    const object = property.parent;
+    let expression: ts.Expression = object;
+    while (true) {
+      const wrapper = expression.parent;
+      if (ts.isParenthesizedExpression(wrapper) && wrapper.expression === expression) {
+        expression = wrapper;
+        continue;
+      }
+      if (
+        (ts.isAsExpression(wrapper) ||
+          ts.isSatisfiesExpression(wrapper) ||
+          ts.isTypeAssertionExpression(wrapper)) &&
+        wrapper.expression === expression
+      ) {
+        const selected = selectPropertyContractPath(wrapper.type, path, checker);
+        if (selected) {
+          if (ts.isSatisfiesExpression(wrapper)) checked.push(selected);
+          else asserted.push(selected);
+        }
+        expression = wrapper;
+        continue;
+      }
+      break;
+    }
+    const owner = expression.parent;
+    if (ts.isPropertyAssignment(owner) && owner.initializer === expression) {
+      property = owner;
+      continue;
+    }
+    const rootType =
+      (ts.isVariableDeclaration(owner) || ts.isPropertyDeclaration(owner)) &&
+      owner.initializer === expression
+        ? owner.type
+        : undefined;
+    if (rootType) {
+      const selected = selectPropertyContractPath(rootType, path, checker);
+      if (selected) checked.push(selected);
+    }
+    return { asserted, checked };
+  }
+}
+
+function analyzeDeclaredClosedUnionMap(
+  node: ts.VariableDeclaration | ts.PropertyDeclaration | ts.PropertyAssignment,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+  reported: Set<string>,
+): void {
+  if (!node.initializer) return;
+  const initial = mapResolutionFromExpression(node.initializer, checker);
+  if (!initial) return;
+  const nestedContracts = ts.isPropertyAssignment(node)
+    ? nestedPropertyContracts(node, checker)
+    : { asserted: [], checked: node.type ? [node.type] : [] };
+  const resolution: MapResolution = {
+    ...initial,
+    assertedTypeNodes: [...initial.assertedTypeNodes, ...nestedContracts.asserted],
+    checkedTypeNodes: [...initial.checkedTypeNodes, ...nestedContracts.checked],
+  };
+  const contracts = [...resolution.checkedTypeNodes, ...resolution.assertedTypeNodes];
+  for (const contract of contracts) {
+    if (!typeNodeIsMapContract(contract, checker, packageRoots)) continue;
+    for (const domain of domainsInTypeNode(contract, checker, packageRoots)) {
+      if (!typeNodeHasDomainProperties(contract, domain, checker)) continue;
+      analyzeClosedUnionMap(
+        resolution,
+        domain,
+        checker,
+        workspace,
+        workspaceRoot,
+        packageRoots,
+        diagnostics,
+        reported,
+      );
+    }
+  }
+}
+
+function symbolIsExternalProtocol(
+  symbol: ts.Symbol,
+  packageName: string,
+  exportName: string,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const canonical = canonicalSymbol(symbol, checker);
+  return (
+    canonical.getName() === exportName &&
+    symbolComesFromPackage(canonical, packageName, packageRoots)
+  );
+}
+
+function typeNodeIsExactExternalProtocol(
+  node: ts.TypeNode,
+  packageName: string,
+  exportName: string,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  if (ts.isParenthesizedTypeNode(node)) {
+    return typeNodeIsExactExternalProtocol(
+      node.type,
+      packageName,
+      exportName,
+      checker,
+      packageRoots,
+      seenSymbols,
+    );
+  }
+  if (!ts.isTypeReferenceNode(node) || node.typeArguments?.length) return false;
+  const located = checker.getSymbolAtLocation(node.typeName);
+  if (!located) return false;
+  const symbol = canonicalSymbol(located, checker);
+  if (symbolIsExternalProtocol(symbol, packageName, exportName, checker, packageRoots)) return true;
+  if (seenSymbols.has(symbol)) return false;
+  seenSymbols.add(symbol);
+  const aliases = symbol.declarations?.filter(ts.isTypeAliasDeclaration) ?? [];
+  return (
+    aliases.length > 0 &&
+    aliases.every(
+      (declaration) =>
+        isProjectDeclaration(declaration, packageRoots) &&
+        typeNodeIsExactExternalProtocol(
+          declaration.type,
+          packageName,
+          exportName,
+          checker,
+          packageRoots,
+          seenSymbols,
+        ),
+    )
+  );
+}
+
+function expressionIsExactExternalProtocol(
+  expression: ts.Expression,
+  packageName: string,
+  exportName: string,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  const type = checker.getTypeAtLocation(unwrapped);
+  if (typeIsPackageType(type, packageName, new Set([exportName]), packageRoots)) return true;
+  if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+    return expressionIsExactExternalProtocol(
+      unwrapped.expression,
+      packageName,
+      exportName,
+      checker,
+      packageRoots,
+      seenSymbols,
+    );
+  }
+  if (!ts.isIdentifier(unwrapped)) return false;
+  const located = checker.getSymbolAtLocation(unwrapped);
+  if (!located) return false;
+  const symbol = canonicalSymbol(located, checker);
+  if (seenSymbols.has(symbol)) return false;
+  seenSymbols.add(symbol);
+  return (
+    symbol.declarations?.some((declaration) => {
+      const typeNode = declaredTypeNode(declaration);
+      if (
+        typeNode &&
+        typeNodeIsExactExternalProtocol(typeNode, packageName, exportName, checker, packageRoots)
+      ) {
+        return true;
+      }
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        return expressionIsExactExternalProtocol(
+          declaration.initializer,
+          packageName,
+          exportName,
+          checker,
+          packageRoots,
+          seenSymbols,
+        );
+      }
+      if (ts.isBindingElement(declaration)) {
+        const source = bindingElementSource(declaration, checker);
+        return Boolean(
+          source &&
+          expressionIsExactExternalProtocol(
+            source,
+            packageName,
+            exportName,
+            checker,
+            packageRoots,
+            seenSymbols,
+          ),
+        );
+      }
+      return false;
+    }) ?? false
+  );
+}
+
+function discriminantValue(
+  type: ts.Type,
+  discriminant: string,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+): string | undefined {
+  const property = checker.getPropertyOfType(type, discriminant);
+  if (!property) return undefined;
+  const propertyType = checker.getTypeOfSymbolAtLocation(property, location);
+  if ((propertyType.flags & ts.TypeFlags.StringLiteral) === 0) return undefined;
+  return (propertyType as ts.StringLiteralType).value;
+}
+
+function isClosedLocalDiscriminatedUnion(
+  type: ts.Type,
+  discriminant: string,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  location: ts.Node,
+): boolean {
+  if (
+    !type.isUnion() ||
+    type.types.length < 2 ||
+    !typeIsProjectOwned(type, checker, packageRoots)
+  ) {
+    return false;
+  }
+  const values = type.types.map((member) =>
+    discriminantValue(member, discriminant, checker, location),
+  );
+  return values.every((value) => value !== undefined) && new Set(values).size === values.length;
+}
+
+function expressionHasFallback(
+  expression: ts.Expression,
+  discriminant: string,
+  fallback: string,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
+): boolean {
+  const unwrapped = ts.isParenthesizedExpression(expression)
+    ? expression.expression
+    : ts.isAsExpression(expression) ||
+        ts.isSatisfiesExpression(expression) ||
+        ts.isTypeAssertionExpression(expression)
+      ? expression.expression
+      : expression;
+  if (ts.isObjectLiteralExpression(unwrapped)) {
+    const property = unwrapped.properties.find(
+      (candidate): candidate is ts.PropertyAssignment =>
+        ts.isPropertyAssignment(candidate) &&
+        (ts.isIdentifier(candidate.name) || ts.isStringLiteral(candidate.name)) &&
+        candidate.name.text === discriminant,
+    );
+    if (
+      property &&
+      (ts.isStringLiteral(property.initializer) ||
+        ts.isNoSubstitutionTemplateLiteral(property.initializer))
+    ) {
+      return property.initializer.text === fallback;
+    }
+  }
+  const value = discriminantValue(
+    checker.getTypeAtLocation(unwrapped),
+    discriminant,
+    checker,
+    unwrapped,
+  );
+  if (value === fallback) return true;
+  if (!ts.isIdentifier(unwrapped)) return false;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (!symbol || seenSymbols.has(symbol)) return false;
+  seenSymbols.add(symbol);
+  const declaration = symbol.declarations?.find(
+    (candidate): candidate is ts.VariableDeclaration =>
+      ts.isVariableDeclaration(candidate) && candidate.initializer !== undefined,
+  );
+  return Boolean(
+    declaration?.initializer &&
+    expressionHasFallback(declaration.initializer, discriminant, fallback, checker, seenSymbols),
+  );
+}
+
+function functionReturnsFallback(
+  node: ts.SignatureDeclaration,
+  discriminant: string,
+  fallback: string,
+  checker: ts.TypeChecker,
+): boolean {
+  const body =
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isConstructorDeclaration(node)
+      ? node.body
+      : undefined;
+  if (!body) return false;
+  if (!ts.isBlock(body)) return expressionHasFallback(body, discriminant, fallback, checker);
+  let found = false;
+  const visit = (child: ts.Node): void => {
+    if (found) return;
+    if (child !== body && ts.isFunctionLike(child)) return;
+    if (
+      ts.isReturnStatement(child) &&
+      child.expression &&
+      expressionHasFallback(child.expression, discriminant, fallback, checker)
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(child, visit);
+  };
+  visit(body);
+  return found;
+}
+
+function functionHasImplementation(node: ts.SignatureDeclaration): boolean {
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return true;
+  if (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isConstructorDeclaration(node)
+  ) {
+    return node.body !== undefined;
+  }
+  return false;
+}
+
+function assertOpenProtocolAdaptersResolve(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+): void {
+  for (const adapter of workspace.openProtocolAdapters) {
+    const matches: ts.SignatureDeclaration[] = [];
+    const sourceFile = program
+      .getSourceFiles()
+      .find(
+        (candidate) =>
+          !candidate.isDeclarationFile &&
+          relativeModulePath(workspaceRoot, candidate) === adapter.identity.module,
+      );
+    if (sourceFile) {
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isFunctionLike(node) &&
+          functionHasImplementation(node) &&
+          identityMatches(adapter.identity, nodeIdentity(node, workspaceRoot))
+        ) {
+          matches.push(node);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+    }
+    if (matches.length !== 1) {
+      throw new Error(
+        `Open-protocol adapter ${workspace.name}/${adapter.identity.module}#${adapter.identity.exportName} must resolve to exactly one callable implementation; found ${matches.length}.`,
+      );
+    }
+  }
+}
+
+function analyzeOpenProtocolAdapter(
+  node: ts.SignatureDeclaration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const identity = nodeIdentity(node, workspaceRoot);
+  const adapter = workspace.openProtocolAdapters.find((candidate) =>
+    identityMatches(candidate.identity, identity),
+  );
+  if (!adapter) return;
+  const signature = checker.getSignatureFromDeclaration(node);
+  if (!signature) return;
+  const parameter = node.parameters[adapter.protocolParameter];
+  const inputValid = Boolean(
+    parameter &&
+    parameter.type &&
+    typeNodeIsExactExternalProtocol(
+      parameter.type,
+      adapter.externalProtocol.package,
+      adapter.externalProtocol.exportName,
+      checker,
+      packageRoots,
+    ),
+  );
+  const returnType = checker.getReturnTypeOfSignature(signature);
+  const fallback = adapter.fallbackVariant;
+  const outputClosed = isClosedLocalDiscriminatedUnion(
+    returnType,
+    fallback.discriminant,
+    checker,
+    packageRoots,
+    node,
+  );
+  const outputHasFallback =
+    outputClosed &&
+    returnType.isUnion() &&
+    returnType.types.some(
+      (member) =>
+        discriminantValue(member, fallback.discriminant, checker, node) === fallback.value,
+    );
+  const implementationHasFallback = functionReturnsFallback(
+    node,
+    fallback.discriminant,
+    fallback.value,
+    checker,
+  );
+  if (inputValid && outputHasFallback && implementationHasFallback) return;
+  const failures = [
+    inputValid ? undefined : "the registered parameter is not the named external protocol",
+    outputClosed ? undefined : "the return type is not a project-owned closed discriminated union",
+    outputHasFallback ? undefined : "the return union lacks the registered fallback variant",
+    implementationHasFallback
+      ? undefined
+      : "the implementation never explicitly returns the fallback variant",
+  ].filter((failure): failure is string => failure !== undefined);
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/open-protocol-normalization",
+      node,
+      `Open-protocol adapter ${identity.symbolPath} is invalid: ${failures.join("; ")}.`,
+      "Normalize the exact external protocol to a project-owned closed union and explicitly return the registered fallback variant.",
+    ),
+  );
+}
+
+function openProtocolSwitchInputExpression(node: ts.SwitchStatement): ts.Expression {
+  if (
+    ts.isPropertyAccessExpression(node.expression) ||
+    ts.isElementAccessExpression(node.expression)
+  ) {
+    return node.expression.expression;
+  }
+  return node.expression;
+}
+
+function analyzeOpenProtocolSwitch(
+  node: ts.SwitchStatement,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const input = openProtocolSwitchInputExpression(node);
+  const adapters = workspace.openProtocolAdapters.filter((adapter) =>
+    expressionIsExactExternalProtocol(
+      input,
+      adapter.externalProtocol.package,
+      adapter.externalProtocol.exportName,
+      checker,
+      packageRoots,
+    ),
+  );
+  if (adapters.length === 0) return;
+  const identity = nodeIdentity(node, workspaceRoot);
+  if (adapters.some((adapter) => identityOwns(adapter.identity, identity))) return;
+  const protocols = adapters
+    .map((adapter) => `${adapter.externalProtocol.package}#${adapter.externalProtocol.exportName}`)
+    .join(", ");
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/open-protocol-normalization",
+      node,
+      `Open external protocol ${protocols} is switched directly in ${identity.symbolPath}.`,
+      "Call the exactly registered open-protocol adapter and switch only on its closed local projection.",
+    ),
+  );
+}
+
 export function analyzeWorkspace(
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
@@ -1293,10 +2710,12 @@ export function analyzeWorkspace(
     { packageName: workspace.packageName, root: workspaceRoot },
   ],
 ): readonly ArchitectureDiagnostic[] {
+  assertOpenProtocolAdaptersResolve(workspace, workspaceRoot, program);
   const checker = program.getTypeChecker();
   const diagnostics: ArchitectureDiagnostic[] = [];
   const reportedPredicates = new Set<string>();
   const reportedContracts = new Set<string>();
+  const reportedMaps = new Set<string>();
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!isProductionSource(sourceFile, workspaceRoot)) continue;
@@ -1332,6 +2751,82 @@ export function analyzeWorkspace(
       }
       if (activeRules.has("architecture/no-rich-unknown-predicate") && ts.isFunctionLike(node)) {
         analyzePredicate(node, checker, workspace, workspaceRoot, diagnostics, reportedPredicates);
+      }
+      if (
+        activeRules.has("architecture/closed-union-exhaustiveness") &&
+        ts.isSwitchStatement(node)
+      ) {
+        analyzeClosedUnionSwitch(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+          diagnostics,
+        );
+      }
+      if (activeRules.has("architecture/closed-union-map-exhaustiveness")) {
+        if (
+          (ts.isVariableDeclaration(node) ||
+            ts.isPropertyDeclaration(node) ||
+            ts.isPropertyAssignment(node)) &&
+          node.initializer
+        ) {
+          analyzeDeclaredClosedUnionMap(
+            node,
+            checker,
+            workspace,
+            workspaceRoot,
+            packageRoots,
+            diagnostics,
+            reportedMaps,
+          );
+        }
+        if (ts.isElementAccessExpression(node) && node.argumentExpression) {
+          const domain = literalDomain(
+            checker.getTypeAtLocation(node.argumentExpression),
+            checker,
+            packageRoots,
+            checker.getTypeAtLocation(node.argumentExpression),
+            expressionTypeIsProjectOwned(node.argumentExpression, checker, packageRoots),
+          );
+          const resolution = mapResolutionFromExpression(node.expression, checker);
+          if (domain && resolution) {
+            analyzeClosedUnionMap(
+              resolution,
+              domain,
+              checker,
+              workspace,
+              workspaceRoot,
+              packageRoots,
+              diagnostics,
+              reportedMaps,
+            );
+          }
+        }
+      }
+      if (activeRules.has("architecture/open-protocol-normalization") && ts.isFunctionLike(node)) {
+        analyzeOpenProtocolAdapter(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+          diagnostics,
+        );
+      }
+      if (
+        activeRules.has("architecture/open-protocol-normalization") &&
+        ts.isSwitchStatement(node)
+      ) {
+        analyzeOpenProtocolSwitch(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+          diagnostics,
+        );
       }
       if (
         ts.isFunctionLike(node) &&

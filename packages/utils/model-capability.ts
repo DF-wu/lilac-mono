@@ -384,6 +384,23 @@ export class ModelCapability {
       );
     }
 
+    let contextOver200k: ModelCost["context_over_200k"];
+    if (params.patch.context_over_200k !== undefined) {
+      contextOver200k = {
+        input: params.patch.context_over_200k.input,
+        output: params.patch.context_over_200k.output,
+        cache_read: params.patch.context_over_200k.cache_read,
+        cache_write: params.patch.context_over_200k.cache_write,
+      };
+    } else if (params.baseCost?.context_over_200k) {
+      contextOver200k = {
+        input: params.baseCost.context_over_200k.input,
+        output: params.baseCost.context_over_200k.output,
+        cache_read: params.baseCost.context_over_200k.cache_read,
+        cache_write: params.baseCost.context_over_200k.cache_write,
+      };
+    }
+
     return {
       input: mergedInput,
       output: mergedOutput,
@@ -391,22 +408,7 @@ export class ModelCapability {
       cache_write: params.patch.cache_write ?? params.baseCost?.cache_write,
       input_audio: params.patch.input_audio ?? params.baseCost?.input_audio,
       output_audio: params.patch.output_audio ?? params.baseCost?.output_audio,
-      context_over_200k:
-        params.patch.context_over_200k !== undefined
-          ? {
-              input: params.patch.context_over_200k.input,
-              output: params.patch.context_over_200k.output,
-              cache_read: params.patch.context_over_200k.cache_read,
-              cache_write: params.patch.context_over_200k.cache_write,
-            }
-          : params.baseCost?.context_over_200k
-            ? {
-                input: params.baseCost.context_over_200k.input,
-                output: params.baseCost.context_over_200k.output,
-                cache_read: params.baseCost.context_over_200k.cache_read,
-                cache_write: params.baseCost.context_over_200k.cache_write,
-              }
-            : undefined,
+      context_over_200k: contextOver200k,
     };
   }
 

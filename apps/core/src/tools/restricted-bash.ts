@@ -23,7 +23,12 @@ import {
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { resolveRestrictedSessionTmpDir } from "../shared/attachment-utils";
 import { parseSshCwdTarget } from "../ssh/ssh-cwd";
-import { withLimitedBashOutput, type BashToolInput, type BashToolOutput } from "./bash-impl";
+import {
+  withLimitedBashOutput,
+  type BashExecutionError,
+  type BashToolInput,
+  type BashToolOutput,
+} from "./bash-impl";
 import { sanitizeBashOutputText } from "./bash-output-sanitizer";
 
 const WORKSPACE_MOUNT = "/workspace";
@@ -32,6 +37,30 @@ export const RESTRICTED_BASH_WALL_TIMEOUT_MS = 3 * 60 * 1000;
 const MAX_RESTRICTED_FILE_READ_BYTES = 10 * 1024 * 1024;
 const TOOL_SERVER_BACKEND_URL = process.env.TOOL_SERVER_BACKEND_URL || "http://localhost:8080";
 const logger = createLogger({ module: "restricted-bash" });
+
+type RestrictedBashTermination = "wall_clock" | "aborted";
+
+function toRestrictedTerminationError(
+  termination: RestrictedBashTermination | undefined,
+  timeoutMs: number,
+): BashExecutionError | undefined {
+  switch (termination) {
+    case "wall_clock":
+      return {
+        type: "timeout",
+        timeoutMs,
+        timeoutKind: "wall_clock",
+        signal: "ABORT",
+      };
+    case "aborted":
+      return {
+        type: "aborted",
+        signal: "ABORT",
+      };
+    case undefined:
+      return undefined;
+  }
+}
 
 type RestrictedBashContext = {
   requestId?: string;
@@ -644,8 +673,8 @@ export async function executeRestrictedBash(
     RESTRICTED_BASH_WALL_TIMEOUT_MS,
   );
   const controller = new AbortController();
-  let termination: "wall_clock" | "aborted" | undefined;
-  const terminate = (reason: "wall_clock" | "aborted") => {
+  let termination: RestrictedBashTermination | undefined;
+  const terminate = (reason: RestrictedBashTermination) => {
     if (termination) return;
     termination = reason;
     controller.abort();
@@ -675,27 +704,12 @@ export async function executeRestrictedBash(
     });
     clearTimeout(timeout);
     options.abortSignal?.removeEventListener("abort", abortListener);
+    const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs);
     const output: BashToolOutput = {
       stdout: sanitizeBashOutputText(result.stdout),
       stderr: sanitizeBashOutputText(result.stderr),
       exitCode: result.exitCode,
-      ...(termination === "wall_clock"
-        ? {
-            executionError: {
-              type: "timeout",
-              timeoutMs: wallClockTimeoutMs,
-              timeoutKind: "wall_clock",
-              signal: "ABORT",
-            },
-          }
-        : termination === "aborted"
-          ? {
-              executionError: {
-                type: "aborted",
-                signal: "ABORT",
-              },
-            }
-          : {}),
+      ...(executionError ? { executionError } : {}),
     };
     const outputConfig = options.outputConfig ?? {
       maxPreviewBytes: 40 * 1024,
@@ -747,28 +761,16 @@ export async function executeRestrictedBash(
       originalStderrBytes: Buffer.byteLength(output.stderr, "utf8"),
     });
   } catch (error) {
+    const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {
+      type: "exception" as const,
+      phase: "unknown" as const,
+      message: error instanceof Error ? error.message : String(error),
+    };
     return {
       stdout: "",
       stderr: error instanceof Error ? error.message : String(error),
       exitCode: -1,
-      executionError:
-        termination === "wall_clock"
-          ? {
-              type: "timeout",
-              timeoutMs: wallClockTimeoutMs,
-              timeoutKind: "wall_clock",
-              signal: "ABORT",
-            }
-          : termination === "aborted"
-            ? {
-                type: "aborted",
-                signal: "ABORT",
-              }
-            : {
-                type: "exception",
-                phase: "unknown",
-                message: error instanceof Error ? error.message : String(error),
-              },
+      executionError,
     };
   } finally {
     clearTimeout(timeout);

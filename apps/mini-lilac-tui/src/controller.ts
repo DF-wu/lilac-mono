@@ -1,9 +1,6 @@
 import type { UIMessageChunk } from "ai";
 
 import {
-  miniLilacSteeringCommittedChunkSchema,
-  miniLilacSteeringChunkSchema,
-  miniLilacStreamCursorChunkSchema,
   type MiniLilacCompactResult,
   type MiniLilacControlResult,
   type MiniLilacHistoryFilesystemResult,
@@ -35,6 +32,7 @@ import {
   type TranscriptEntry,
 } from "./render";
 import { sessionPresentation, type SessionPresentation } from "./presentation";
+import { projectMiniLilacStreamChunk } from "./ui-message-chunk-projection";
 
 export interface ControllerUISink {
   onState(state: InputState): void;
@@ -703,24 +701,27 @@ export class Controller {
           return "superseded";
         }
         if (done) return terminalFinish ? "completed" : "disconnected";
-        if (value.type === "finish") terminalFinish = true;
-        if (value.type === "data-streamCursor") {
-          const cursor = miniLilacStreamCursorChunkSchema.safeParse(value);
-          if (cursor.success) this.admitRun(cursor.data.data.runId);
-        } else if (value.type === "data-steering") {
-          const steering = miniLilacSteeringChunkSchema.safeParse(value);
-          if (steering.success) {
-            this.appendReplayedSteering(steering.data.data);
+        const projected = projectMiniLilacStreamChunk(value);
+        switch (projected.kind) {
+          case "finish":
+            terminalFinish = true;
+            this.renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });
             continue;
-          }
-        } else if (value.type === "data-steeringCommitted") {
-          const steering = miniLilacSteeringCommittedChunkSchema.safeParse(value);
-          if (steering.success) {
-            this.commitSteering(steering.data.data);
+          case "cursor":
+            this.admitRun(projected.cursor.runId);
             continue;
-          }
+          case "steering":
+            this.appendReplayedSteering(projected.message);
+            continue;
+          case "steering-committed":
+            this.commitSteering(projected.message);
+            continue;
+          case "renderer":
+            this.renderer.handleProjected(projected.chunk);
+            continue;
         }
-        this.renderer.handle(value);
+        const exhaustive: never = projected;
+        return exhaustive;
       }
     } catch {
       // A read failure is a transport disconnect, not a cancellation.
@@ -1613,7 +1614,8 @@ export class Controller {
         }),
       )
       .map((file) => {
-        const separator = restoredEditor.length > 0 ? (restoredText.length > 0 ? "\n" : " ") : "";
+        let separator = "";
+        if (restoredEditor.length > 0) separator = restoredText.length > 0 ? "\n" : " ";
         restoredEditor += separator;
         const start = editorOffsetWidth(restoredEditor);
         restoredEditor += file.placeholder;

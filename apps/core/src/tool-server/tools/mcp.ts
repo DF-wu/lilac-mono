@@ -198,16 +198,16 @@ export class McpManagement implements ServerTool {
         const reload = safeReloadOutcomes(
           resultToMcpToolValue(await this.params.registry.reload(serverId)),
         );
+        let mutationResult: "replaced" | "added" | "unchanged" = "unchanged";
+        if (mutation.changed) {
+          mutationResult = mutation.previousConfig.servers[serverId] ? "replaced" : "added";
+        }
         return {
           mutation: {
             type: "upsert" as const,
             serverId,
             changed: mutation.changed,
-            result: mutation.changed
-              ? mutation.previousConfig.servers[serverId]
-                ? ("replaced" as const)
-                : ("added" as const)
-              : ("unchanged" as const),
+            result: mutationResult,
           },
           reload,
         };

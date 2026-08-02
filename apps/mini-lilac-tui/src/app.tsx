@@ -102,6 +102,7 @@ import {
 } from "./presentation";
 import { COLORS, createMarkdownSyntaxStyle, type ThemeColors } from "./theme";
 import { createBufferedChunkOutput } from "./transcript-buffer";
+import { projectMiniLilacStreamChunk } from "./ui-message-chunk-projection";
 
 registerCodeBlockParsers();
 
@@ -180,12 +181,27 @@ function truncateStart(value: string, width: number): string {
 }
 
 function entryPrefix(entry: TranscriptEntry): string {
-  if (entry.kind === "compaction") return "COMPACTION / ";
-  if (entry.kind === "reasoning") return "* ";
-  if (entry.kind === "error") return "! ";
-  if (entry.kind === "status") return "- ";
-  if (entry.kind === "file") return "+ ";
-  return "";
+  switch (entry.kind) {
+    case "compaction":
+      return "COMPACTION / ";
+    case "reasoning":
+      return "* ";
+    case "error":
+      return "! ";
+    case "status":
+      return "- ";
+    case "file":
+      return "+ ";
+    case "user":
+    case "assistant":
+    case "tool":
+    case "shell":
+    case "exploration":
+    case "edit":
+    case "source":
+    case "subagent":
+      return "";
+  }
 }
 
 function shellPreviewRows(narrow: boolean): number {
@@ -202,6 +218,87 @@ function isToolTranscriptEntry(entry: TranscriptEntry): boolean {
   );
 }
 
+function toolDisclosureLabel(narrow: boolean, expanded: boolean): string {
+  if (!narrow) return expanded ? "hide" : "details";
+  return expanded ? "−" : "+";
+}
+
+function toolDisclosureWidth(narrow: boolean): number {
+  return narrow ? 2 : 5;
+}
+
+function transcriptEntryBackground(
+  entry: TranscriptEntry,
+  colors: ThemeColors,
+): string | undefined {
+  switch (entry.kind) {
+    case "shell":
+      return colors.raised;
+    case "user":
+      return colors.panel;
+    case "assistant":
+    case "reasoning":
+    case "tool":
+    case "exploration":
+    case "edit":
+    case "file":
+    case "source":
+    case "status":
+    case "subagent":
+    case "compaction":
+    case "error":
+      return undefined;
+  }
+}
+
+function transcriptEntryBorder(entry: TranscriptEntry): ("top" | "left")[] | undefined {
+  switch (entry.kind) {
+    case "compaction":
+      return ["top"];
+    case "user":
+    case "tool":
+    case "shell":
+    case "exploration":
+    case "edit":
+    case "subagent":
+      return ["left"];
+    case "assistant":
+    case "reasoning":
+    case "file":
+    case "source":
+    case "status":
+    case "error":
+      return undefined;
+  }
+}
+
+function paletteName(kind: PaletteKind | undefined): string {
+  switch (kind) {
+    case "models":
+      return "model";
+    case "sessions":
+      return "session";
+    case "skills":
+      return "skills";
+    case "todos":
+      return "todos";
+    case "commands":
+    case "reasoning":
+    case undefined:
+      return kind ?? "commands";
+  }
+}
+
+function subagentViewBorderColor(view: SubagentView, colors: ThemeColors): string {
+  if (view.error !== undefined) return colors.danger;
+  return view.loading ? colors.accent : colors.success;
+}
+
+function subagentViewStatus(view: SubagentView): string {
+  if (view.error !== undefined) return "transcript unavailable";
+  return view.loading ? "streaming / read-only" : "read-only";
+}
+
 function ToolDisclosure(props: {
   readonly expanded: boolean;
   readonly narrow: boolean;
@@ -209,7 +306,7 @@ function ToolDisclosure(props: {
 }) {
   return (
     <text flexShrink={0} paddingLeft={1} fg={props.colors.muted} selectable={false}>
-      {props.narrow ? (props.expanded ? "−" : "+") : props.expanded ? "hide" : "details"}
+      {toolDisclosureLabel(props.narrow, props.expanded)}
     </text>
   );
 }
@@ -287,11 +384,18 @@ function ExplorationView(props: {
   );
 
   const operationStatusColor = (operation: ExplorationOperation) => {
-    if (operation.status === "error") return props.colors.danger;
-    if (operation.status === "denied") return props.colors.warning;
-    if (operation.status === "cancelled") return props.colors.muted;
-    if (operation.status === "pending") return props.colors.accent;
-    return props.colors.success;
+    switch (operation.status) {
+      case "error":
+        return props.colors.danger;
+      case "denied":
+        return props.colors.warning;
+      case "cancelled":
+        return props.colors.muted;
+      case "pending":
+        return props.colors.accent;
+      case "success":
+        return props.colors.success;
+    }
   };
 
   return (
@@ -417,7 +521,7 @@ function EditView(props: {
                     operation={operation}
                     width={Math.max(
                       1,
-                      props.width - (showsDisclosure ? (props.narrow ? 2 : 5) : 0),
+                      props.width - (showsDisclosure ? toolDisclosureWidth(props.narrow) : 0),
                     )}
                     toneColors={props.toneColors}
                     colors={props.colors}
@@ -440,10 +544,16 @@ function EditView(props: {
 }
 
 function todoColor(status: MiniLilacTodo["status"], colors: ThemeColors): string {
-  if (status === "completed") return colors.success;
-  if (status === "in_progress") return colors.warning;
-  if (status === "cancelled") return colors.muted;
-  return colors.text;
+  switch (status) {
+    case "completed":
+      return colors.success;
+    case "in_progress":
+      return colors.warning;
+    case "cancelled":
+      return colors.muted;
+    case "pending":
+      return colors.text;
+  }
 }
 
 function TodoOverlay(props: {
@@ -820,35 +930,32 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     ),
   );
 
+  function itemsForPaletteKind(kind: PaletteKind): readonly PaletteItem[] {
+    switch (kind) {
+      case "models":
+        return modelPaletteItems(props.models);
+      case "reasoning":
+        return reasoningPaletteItems(currentModel());
+      case "sessions":
+        return sessionPaletteItems(availableSessions());
+      case "skills":
+        return skillPaletteItems(availableSkills());
+      case "todos":
+        return todoPaletteItems(todos());
+      case "commands":
+        return COMMAND_PALETTE_ITEMS;
+    }
+  }
+
   const paletteItems = createMemo<readonly PaletteItem[]>(() => {
     const current = palette();
-    const items =
-      current?.kind === "models"
-        ? modelPaletteItems(props.models)
-        : current?.kind === "reasoning"
-          ? reasoningPaletteItems(currentModel())
-          : current?.kind === "sessions"
-            ? sessionPaletteItems(availableSessions())
-            : current?.kind === "skills"
-              ? skillPaletteItems(availableSkills())
-              : current?.kind === "todos"
-                ? todoPaletteItems(todos())
-                : COMMAND_PALETTE_ITEMS;
+    const items = current === undefined ? COMMAND_PALETTE_ITEMS : itemsForPaletteKind(current.kind);
     return filterPaletteItems(items, current?.query ?? "");
   });
 
   const paletteTitle = createMemo(() => {
     const current = palette();
-    const name =
-      current?.kind === "models"
-        ? "model"
-        : current?.kind === "sessions"
-          ? "session"
-          : current?.kind === "skills"
-            ? "skills"
-            : current?.kind === "todos"
-              ? "todos"
-              : (current?.kind ?? "commands");
+    const name = paletteName(current?.kind);
     return current?.query ? `${name} ${current.query}` : name;
   });
 
@@ -864,12 +971,20 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   });
 
   function paletteItemColor(kind: PaletteKind, item: PaletteItem): string {
-    if (kind === "models") return colors.model;
-    if (kind === "reasoning") return colors.warning;
-    if (kind === "skills") return colors.success;
-    if (kind === "sessions") return colors.accent;
-    if (kind === "todos" && item.todoStatus !== undefined) {
-      return todoColor(item.todoStatus, colors);
+    switch (kind) {
+      case "models":
+        return colors.model;
+      case "reasoning":
+        return colors.warning;
+      case "skills":
+        return colors.success;
+      case "sessions":
+        return colors.accent;
+      case "todos":
+        if (item.todoStatus !== undefined) return todoColor(item.todoStatus, colors);
+        break;
+      case "commands":
+        break;
     }
     if (item.id === "model") return colors.model;
     if (item.id === "reasoning" || item.id === "compact") return colors.warning;
@@ -893,25 +1008,44 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     return colors.success;
   }
 
+  function transcriptEntryBorderColor(entry: TranscriptEntry): string | undefined {
+    switch (entry.kind) {
+      case "compaction":
+        return colors.warning;
+      case "tool":
+      case "shell":
+      case "exploration":
+      case "edit":
+      case "subagent":
+        return toolStateColor(entry);
+      case "user":
+        return colors.accent;
+      case "assistant":
+      case "reasoning":
+      case "file":
+      case "source":
+      case "status":
+      case "error":
+        return undefined;
+    }
+  }
+
   function openPalette(kind: PaletteKind): void {
-    const items =
-      kind === "models"
-        ? modelPaletteItems(props.models)
-        : kind === "reasoning"
-          ? reasoningPaletteItems(currentModel())
-          : kind === "sessions"
-            ? sessionPaletteItems(availableSessions())
-            : kind === "skills"
-              ? skillPaletteItems(availableSkills())
-              : kind === "todos"
-                ? todoPaletteItems(todos())
-                : COMMAND_PALETTE_ITEMS;
-    const currentId =
-      kind === "models"
-        ? bindings().model
-        : kind === "reasoning"
-          ? bindings().reasoning
-          : undefined;
+    const items = itemsForPaletteKind(kind);
+    let currentId: string | undefined;
+    switch (kind) {
+      case "models":
+        currentId = bindings().model;
+        break;
+      case "reasoning":
+        currentId = bindings().reasoning;
+        break;
+      case "commands":
+      case "sessions":
+      case "skills":
+      case "todos":
+        currentId = undefined;
+    }
     const selected = Math.max(
       0,
       items.findIndex((item) => item.id === currentId),
@@ -1059,7 +1193,21 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
         while (generation === subagentOpenGeneration) {
           const result = await reader.read();
           if (result.done) break;
-          renderer.handle(result.value);
+          const projected = projectMiniLilacStreamChunk(result.value);
+          switch (projected.kind) {
+            case "finish":
+              renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });
+              continue;
+            case "renderer":
+              renderer.handleProjected(projected.chunk);
+              continue;
+            case "cursor":
+            case "steering":
+            case "steering-committed":
+              continue;
+          }
+          const exhaustive: never = projected;
+          return exhaustive;
         }
       }
     } catch (error) {
@@ -1626,29 +1774,9 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
                   <box
                     width="100%"
                     flexShrink={0}
-                    backgroundColor={
-                      entry().kind === "shell"
-                        ? colors.raised
-                        : entry().kind === "user"
-                          ? colors.panel
-                          : undefined
-                    }
-                    border={
-                      entry().kind === "compaction"
-                        ? ["top"]
-                        : entry().kind === "user" || isToolTranscriptEntry(entry())
-                          ? ["left"]
-                          : undefined
-                    }
-                    borderColor={
-                      entry().kind === "compaction"
-                        ? colors.warning
-                        : isToolTranscriptEntry(entry())
-                          ? toolStateColor(entry())
-                          : entry().kind === "user"
-                            ? colors.accent
-                            : undefined
-                    }
+                    backgroundColor={transcriptEntryBackground(entry(), colors)}
+                    border={transcriptEntryBorder(entry())}
+                    borderColor={transcriptEntryBorderColor(entry())}
                     paddingLeft={
                       entry().kind === "user" ||
                       entry().kind === "compaction" ||
@@ -2015,26 +2143,14 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
               justifyContent="space-between"
               backgroundColor={colors.panel}
               border={["left"]}
-              borderColor={
-                view().error !== undefined
-                  ? colors.danger
-                  : view().loading
-                    ? colors.accent
-                    : colors.success
-              }
+              borderColor={subagentViewBorderColor(view(), colors)}
               paddingLeft={1}
               paddingRight={1}
               paddingTop={1}
               paddingBottom={1}
             >
               <text fg={colors.accent}>{`${view().subagent.profile} subagent`}</text>
-              <text fg={colors.muted}>
-                {view().error !== undefined
-                  ? "transcript unavailable"
-                  : view().loading
-                    ? "streaming / read-only"
-                    : "read-only"}
-              </text>
+              <text fg={colors.muted}>{subagentViewStatus(view())}</text>
             </box>
           )}
         </Show>

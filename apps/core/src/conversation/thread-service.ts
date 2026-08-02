@@ -150,10 +150,21 @@ export type ConversationThreadRunSummarizationInput = {
   now?: number;
 };
 
+export type ConversationThreadEligibilityReasonCounts = {
+  forced?: number;
+  "never-summarized"?: number;
+  "content-changed"?: number;
+  "summary-version"?: number;
+  "embedding-missing"?: number;
+  "embedding-outdated"?: number;
+  "embedding-version"?: number;
+  "embedding-model"?: number;
+};
+
 export type ConversationThreadEligibilityCounts = {
   summary: number;
   embeddingOnly: number;
-  reasons: Partial<Record<ConversationThreadSummarizationEligibilityReason, number>>;
+  reasons: ConversationThreadEligibilityReasonCounts;
 };
 
 export type ConversationThreadRunSummarizationResult = {
@@ -772,29 +783,40 @@ function computeAboutnessCoverage(
   const hasSpecificAboutness = hasSpecificQueryAboutness(queryAboutness);
   const hasDomainMismatch =
     queryAboutness.domains.length > 0 && domainCoverage === 0 && targetCoverage < 0.6;
-  const matchReason = !hasSpecificAboutness
-    ? "no-specific-aboutness"
-    : hasDomainMismatch
-      ? "domain-mismatch"
-      : highPrecisionCoverage < 0.25
-        ? "weak-coverage"
-        : highPrecisionCoverage < 0.45
-          ? "partial-coverage"
-          : highPrecisionCoverage < 0.65
-            ? "sufficient-coverage"
-            : "strong-coverage";
-  const multiplier =
-    matchReason === "no-specific-aboutness"
-      ? 1
-      : matchReason === "domain-mismatch"
-        ? DOMAIN_MISMATCH_COVERAGE_MULTIPLIER
-        : matchReason === "weak-coverage"
-          ? WEAK_COVERAGE_MULTIPLIER
-          : matchReason === "partial-coverage"
-            ? PARTIAL_COVERAGE_MULTIPLIER
-            : matchReason === "sufficient-coverage"
-              ? 1
-              : 1.05 + Math.min(0.1, ((highPrecisionCoverage - 0.65) / 0.35) * 0.1);
+  let matchReason: ConversationThreadAboutnessCoverage["matchReason"];
+  if (!hasSpecificAboutness) {
+    matchReason = "no-specific-aboutness";
+  } else if (hasDomainMismatch) {
+    matchReason = "domain-mismatch";
+  } else if (highPrecisionCoverage < 0.25) {
+    matchReason = "weak-coverage";
+  } else if (highPrecisionCoverage < 0.45) {
+    matchReason = "partial-coverage";
+  } else if (highPrecisionCoverage < 0.65) {
+    matchReason = "sufficient-coverage";
+  } else {
+    matchReason = "strong-coverage";
+  }
+
+  let multiplier: number;
+  switch (matchReason) {
+    case "no-specific-aboutness":
+    case "sufficient-coverage":
+      multiplier = 1;
+      break;
+    case "domain-mismatch":
+      multiplier = DOMAIN_MISMATCH_COVERAGE_MULTIPLIER;
+      break;
+    case "weak-coverage":
+      multiplier = WEAK_COVERAGE_MULTIPLIER;
+      break;
+    case "partial-coverage":
+      multiplier = PARTIAL_COVERAGE_MULTIPLIER;
+      break;
+    case "strong-coverage":
+      multiplier = 1.05 + Math.min(0.1, ((highPrecisionCoverage - 0.65) / 0.35) * 0.1);
+      break;
+  }
 
   return {
     preCoverageScore: hit.score,
@@ -938,6 +960,38 @@ function clampSummarizationConcurrency(input: number): number {
   return Math.min(128, Math.max(1, Math.floor(input)));
 }
 
+function incrementEligibilityReason(
+  counts: ConversationThreadEligibilityReasonCounts,
+  reason: ConversationThreadSummarizationEligibilityReason,
+): void {
+  switch (reason) {
+    case "forced":
+      counts.forced = (counts.forced ?? 0) + 1;
+      break;
+    case "never-summarized":
+      counts["never-summarized"] = (counts["never-summarized"] ?? 0) + 1;
+      break;
+    case "content-changed":
+      counts["content-changed"] = (counts["content-changed"] ?? 0) + 1;
+      break;
+    case "summary-version":
+      counts["summary-version"] = (counts["summary-version"] ?? 0) + 1;
+      break;
+    case "embedding-missing":
+      counts["embedding-missing"] = (counts["embedding-missing"] ?? 0) + 1;
+      break;
+    case "embedding-outdated":
+      counts["embedding-outdated"] = (counts["embedding-outdated"] ?? 0) + 1;
+      break;
+    case "embedding-version":
+      counts["embedding-version"] = (counts["embedding-version"] ?? 0) + 1;
+      break;
+    case "embedding-model":
+      counts["embedding-model"] = (counts["embedding-model"] ?? 0) + 1;
+      break;
+  }
+}
+
 function countSummarizationEligibility(
   items: readonly ConversationThreadSummarizationEligibility[],
 ): ConversationThreadEligibilityCounts {
@@ -950,7 +1004,7 @@ function countSummarizationEligibility(
     if (item.summaryIsStale) counts.summary += 1;
     else if (item.embeddingIsStale) counts.embeddingOnly += 1;
     for (const reason of item.reasons) {
-      counts.reasons[reason] = (counts.reasons[reason] ?? 0) + 1;
+      incrementEligibilityReason(counts.reasons, reason);
     }
   }
   return counts;

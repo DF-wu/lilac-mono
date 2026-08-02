@@ -21,3 +21,18 @@ the migration zones activated in the manifest.
 This initial semantic checker owns only rules that use resolved symbols or types. Pure throw, catch,
 rejection, nested-ternary, and duplicate-record-guard syntax remains owned by Oxlint and is deliberately
 not duplicated here.
+
+Stage 2 adds semantic checks for project-owned closed-union switches, exhaustive union-keyed maps, and
+registered open-protocol normalization. Closed-union switch and map rules apply to all production
+workspaces. Open-protocol rules apply only to exact registered adapter and consumer modules. A
+registration names the exact adapter, external protocol type and parameter, and local fallback
+discriminant/value; manifest integrity rejects blank fields and duplicate callable registrations, and
+direct switching on the registered external type is allowed only inside that adapter.
+
+The mini-client owns the raw stream trust boundary: `normalizeStreamChunk` converts `unknown` wire
+values into a validated installed `UIMessageChunk`, representing a future non-data chunk with the
+reserved `data-*` sentinel validated by `miniLilacUnsupportedUIMessageChunkSchema`. The TUI detects that sentinel and
+performs its registered Zod subtype classification in `projectMiniLilacStreamChunk`, while
+`projectUIMessageChunk` remains the exact open AI SDK adapter with its local unsupported fallback.
+Malformed stream frames signal through the exact registered stream-host adapters, including the
+`ChatTransport` rejection contract in `MiniLilacTransport.responseStream`.

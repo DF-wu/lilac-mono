@@ -20,6 +20,13 @@ import {
   type MiniLilacUIMessage,
 } from "@stanley2058/mini-lilac-client";
 
+import {
+  projectUIMessageChunk,
+  type DataUIMessageChunk,
+  type ProjectedUIMessageChunk,
+  type RenderedUIMessageChunk,
+} from "./ui-message-chunk-projection";
+
 export type TranscriptKind =
   | "user"
   | "assistant"
@@ -161,6 +168,23 @@ function controlSummary(result: MiniLilacControlResult): string {
   }
 }
 
+function subagentTone(state: SubagentTranscript["state"]): TranscriptTone {
+  switch (state) {
+    case "pending":
+    case "running":
+      return "accent";
+    case "completed":
+      return "success";
+    case "cancelled":
+      return "muted";
+    case "denied":
+      return "warning";
+    case "error":
+    case "rejected":
+      return "danger";
+  }
+}
+
 function subagentEntry(subagent: SubagentTranscript): Omit<TranscriptEntry, "id"> {
   const running = subagent.state === "pending" || subagent.state === "running";
   const profile = humanizeToolName(subagent.profile);
@@ -180,15 +204,7 @@ function subagentEntry(subagent: SubagentTranscript): Omit<TranscriptEntry, "id"
     lines.push("  ↳ Click to view transcript");
   return {
     kind: "subagent",
-    tone: running
-      ? "accent"
-      : subagent.state === "completed"
-        ? "success"
-        : subagent.state === "cancelled"
-          ? "muted"
-          : subagent.state === "denied"
-            ? "warning"
-            : "danger",
+    tone: subagentTone(subagent.state),
     text: lines.join("\n"),
     ...(running ? { running: true } : {}),
     subagent,
@@ -338,6 +354,25 @@ const bashOutputDeltaSchema = z.object({
   type: z.literal("output-delta"),
   delta: z.string(),
 });
+
+function bashExecutionErrorText(
+  executionError: z.output<typeof bashExecutionErrorSchema> | undefined,
+): string | undefined {
+  if (executionError === undefined) return undefined;
+  switch (executionError.type) {
+    case "blocked":
+      return executionError.reason;
+    case "aborted":
+      return "Command aborted";
+    case "timeout":
+      return executionError.timeoutKind === "no_output"
+        ? `Command terminated after ${executionError.timeoutMs}ms without output`
+        : `Command timed out after ${executionError.timeoutMs}ms`;
+    case "exception":
+      return executionError.message;
+  }
+}
+
 const subagentInputSchema = z.object({
   profile: z.string().optional(),
   prompt: z.string().optional(),
@@ -431,6 +466,68 @@ type ExplorationState = {
   pending: Set<string>;
 };
 
+function shellToolOutput(state: ToolRenderState): string | undefined {
+  switch (state.status) {
+    case "active":
+      return state.output === undefined ? undefined : shellOutput(state.output);
+    case "success":
+      return shellOutput(state.output);
+    case "error":
+      return /^[[{]/u.test(state.errorText.trimStart()) ? "Command failed" : state.errorText;
+    case "denied":
+      return "Denied";
+    case "cancelled": {
+      const cancellation = `Cancelled${state.reason === undefined ? "" : `: ${previewText(state.reason, 180)}`}`;
+      return [shellOutput(state.output), cancellation]
+        .filter((value) => value !== undefined)
+        .join("\n");
+    }
+  }
+}
+
+function shellToolTone(state: ToolRenderState): TranscriptTone {
+  switch (state.status) {
+    case "active":
+      return "normal";
+    case "success":
+      return shellOutputTone(state.output);
+    case "error":
+      return "danger";
+    case "denied":
+      return "warning";
+    case "cancelled":
+      return "muted";
+  }
+}
+
+function editToolDetail(state: ToolRenderState): string | undefined {
+  switch (state.status) {
+    case "active":
+    case "success":
+      return undefined;
+    case "error":
+      return `: ${previewText(state.errorText, 180)}`;
+    case "denied":
+      return ": denied";
+    case "cancelled":
+      return `: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`;
+  }
+}
+
+function editToolTone(state: ToolRenderState): TranscriptTone {
+  switch (state.status) {
+    case "active":
+    case "success":
+      return "normal";
+    case "error":
+      return "danger";
+    case "denied":
+      return "warning";
+    case "cancelled":
+      return "muted";
+  }
+}
+
 function explorationCategory(name: string): "read" | "search" | undefined {
   if (name === "read_file") return "read";
   if (name === "glob" || name === "grep" || name === "fuzzy_search") return "search";
@@ -439,6 +536,14 @@ function explorationCategory(name: string): "read" | "search" | undefined {
 
 function plural(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? "" : "s"}`;
+}
+
+function explorationTone(state: ExplorationState): TranscriptTone {
+  if (state.errors > 0) return "danger";
+  if (state.failures > 0) return "warning";
+  if (state.cancellations > 0) return "muted";
+  if (state.pending.size > 0) return "accent";
+  return "normal";
 }
 
 export function explorationTranscriptText(
@@ -472,16 +577,7 @@ function explorationEntry(state: ExplorationState): Omit<TranscriptEntry, "id"> 
   } satisfies ExplorationTranscript;
   return {
     kind: "exploration",
-    tone:
-      state.errors > 0
-        ? "danger"
-        : state.failures > 0
-          ? "warning"
-          : state.cancellations > 0
-            ? "muted"
-            : running
-              ? "accent"
-              : "normal",
+    tone: explorationTone(state),
     text: explorationTranscriptText(exploration, running),
     ...(running ? { running: true } : {}),
     exploration,
@@ -652,20 +748,37 @@ export function groupNearbyEdits(entries: readonly TranscriptEntry[]): Transcrip
     } satisfies EditTranscript;
     grouped[grouped.length - 1] = {
       ...previous,
-      tone:
-        previous.tone === "danger" || entry.tone === "danger"
-          ? "danger"
-          : previous.tone === "warning" || entry.tone === "warning"
-            ? "warning"
-            : previous.tone === "muted" || entry.tone === "muted"
-              ? "muted"
-              : "normal",
+      tone: combinedEditTone(previous.tone, entry.tone),
       running: previous.running === true || entry.running === true ? true : undefined,
       text: editTranscriptText(edit),
       edit,
     };
   }
   return grouped;
+}
+
+function combinedEditTone(left: TranscriptTone, right: TranscriptTone): TranscriptTone {
+  const leftGroup = groupedEditTone(left);
+  const rightGroup = groupedEditTone(right);
+  if (leftGroup === "danger" || rightGroup === "danger") return "danger";
+  if (leftGroup === "warning" || rightGroup === "warning") return "warning";
+  if (leftGroup === "muted" || rightGroup === "muted") return "muted";
+  return "normal";
+}
+
+function groupedEditTone(tone: TranscriptTone): "normal" | "muted" | "warning" | "danger" {
+  switch (tone) {
+    case "danger":
+      return "danger";
+    case "warning":
+      return "warning";
+    case "muted":
+      return "muted";
+    case "normal":
+    case "accent":
+    case "success":
+      return "normal";
+  }
 }
 
 function patchEdits(input: unknown, cwd: string | undefined): EditOperation[] | undefined {
@@ -753,19 +866,7 @@ function shellOutput(output: unknown): string | undefined {
   if (typeof output === "string") return output.trimEnd() || undefined;
   const parsed = bashOutputSchema.safeParse(output);
   if (!parsed.success) return undefined;
-  const executionError = parsed.data.executionError;
-  const executionErrorText =
-    executionError?.type === "blocked"
-      ? executionError.reason
-      : executionError?.type === "timeout"
-        ? executionError.timeoutKind === "no_output"
-          ? `Command terminated after ${executionError.timeoutMs}ms without output`
-          : `Command timed out after ${executionError.timeoutMs}ms`
-        : executionError?.type === "aborted"
-          ? "Command aborted"
-          : executionError?.type === "exception"
-            ? executionError.message
-            : undefined;
+  const executionErrorText = bashExecutionErrorText(parsed.data.executionError);
   const chunks = [
     parsed.data.stdout?.trimEnd(),
     parsed.data.stderr?.trimEnd(),
@@ -797,6 +898,8 @@ export function shellTranscriptText(
 ): string {
   const collapsible = isShellTranscriptCollapsible(shell, lineLimit, characterLimit);
   const preview = shellTranscriptPreview(shell, expanded, lineLimit, characterLimit);
+  let disclosure: string | undefined;
+  if (collapsible) disclosure = expanded ? "Click to collapse" : "Click to expand";
   const lines = [
     shell.cwd === undefined ? undefined : `# Running in ${shell.cwd}`,
     shell.cwd === undefined ? undefined : "",
@@ -804,7 +907,7 @@ export function shellTranscriptText(
     preview.output === undefined ? undefined : "",
     preview.output,
     collapsible ? "" : undefined,
-    collapsible ? (expanded ? "Click to collapse" : "Click to expand") : undefined,
+    disclosure,
   ].filter((value) => value !== undefined);
   return lines.join("\n");
 }
@@ -865,26 +968,7 @@ function toolEntry(
   if (name === "bash") {
     const parsed = bashInputSchema.safeParse(input);
     if (parsed.success) {
-      const cancellation =
-        state.status === "cancelled"
-          ? `Cancelled${state.reason === undefined ? "" : `: ${previewText(state.reason, 180)}`}`
-          : undefined;
-      const cancelledOutput =
-        state.status === "cancelled"
-          ? [shellOutput(state.output), cancellation]
-              .filter((value) => value !== undefined)
-              .join("\n")
-          : undefined;
-      const output =
-        state.status === "success" || (state.status === "active" && state.output !== undefined)
-          ? shellOutput(state.output)
-          : state.status === "error"
-            ? /^[[{]/u.test(state.errorText.trimStart())
-              ? "Command failed"
-              : state.errorText
-            : state.status === "denied"
-              ? "Denied"
-              : cancelledOutput;
+      const output = shellToolOutput(state);
       const shell = {
         command: parsed.data.command,
         ...(parsed.data.cwd === undefined || sameCwd(parsed.data.cwd, options.cwd)
@@ -894,16 +978,7 @@ function toolEntry(
       } satisfies ShellTranscript;
       return {
         kind: "shell",
-        tone:
-          state.status === "error"
-            ? "danger"
-            : state.status === "denied"
-              ? "warning"
-              : state.status === "cancelled"
-                ? "muted"
-                : state.status === "success"
-                  ? shellOutputTone(state.output)
-                  : "normal",
+        tone: shellToolTone(state),
         text: shellTranscriptText(shell),
         ...(state.status === "active" ? { running: true } : {}),
         shell,
@@ -921,29 +996,15 @@ function toolEntry(
       };
     }
   }
-  const edits =
-    name === "apply_patch"
-      ? patchEdits(input, options.cwd)
-      : name === "edit_file"
-        ? fileEdits(input, state.status === "success" ? state.output : undefined, options.cwd)
-        : undefined;
+  let edits: EditOperation[] | undefined;
+  if (name === "apply_patch") {
+    edits = patchEdits(input, options.cwd);
+  } else if (name === "edit_file") {
+    edits = fileEdits(input, state.status === "success" ? state.output : undefined, options.cwd);
+  }
   if (edits !== undefined && edits.length > 0) {
-    const detail =
-      state.status === "error"
-        ? `: ${previewText(state.errorText, 180)}`
-        : state.status === "denied"
-          ? ": denied"
-          : state.status === "cancelled"
-            ? `: cancelled${state.reason === undefined ? "" : ` (${previewText(state.reason, 160)})`}`
-            : undefined;
-    const tone =
-      state.status === "error"
-        ? "danger"
-        : state.status === "denied"
-          ? "warning"
-          : state.status === "cancelled"
-            ? "muted"
-            : "normal";
+    const detail = editToolDetail(state);
+    const tone = editToolTone(state);
     const edit = {
       operations: edits.map((operation, index) => ({
         ...operation,
@@ -1149,6 +1210,17 @@ function reasoningEntry(text: string, finalized: boolean): Omit<TranscriptEntry,
   };
 }
 
+function transcriptKindForRole(role: MiniLilacUIMessage["role"]): TranscriptKind {
+  switch (role) {
+    case "user":
+      return "user";
+    case "assistant":
+      return "assistant";
+    default:
+      return "status";
+  }
+}
+
 /** Convert a canonical startup transcript into the same model used by live output. */
 export function renderInitialMessages(
   messages: readonly MiniLilacUIMessage[],
@@ -1165,8 +1237,7 @@ export function renderInitialMessages(
     message.parts.forEach((part, index) => {
       const id = `message:${message.id}:${index}`;
       if (part.type === "text") {
-        const kind =
-          message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "status";
+        const kind = transcriptKindForRole(message.role);
         append({ id, kind, tone: kind === "user" ? "accent" : "normal", text: part.text });
         return;
       }
@@ -1211,14 +1282,20 @@ export function renderInitialMessages(
           }
           if (category === "read") exploration.reads += 1;
           else exploration.searches += 1;
-          const operationStatus =
-            part.state === "output-available"
-              ? "success"
-              : part.state === "output-error"
-                ? "error"
-                : part.state === "output-denied"
-                  ? "denied"
-                  : "pending";
+          let operationStatus: ExplorationOperation["status"];
+          switch (part.state) {
+            case "output-available":
+              operationStatus = "success";
+              break;
+            case "output-error":
+              operationStatus = "error";
+              break;
+            case "output-denied":
+              operationStatus = "denied";
+              break;
+            default:
+              operationStatus = "pending";
+          }
           exploration.operations.push(
             explorationOperation(
               name,
@@ -1240,14 +1317,20 @@ export function renderInitialMessages(
             entries[entryIndex] = { id: exploration.id, ...explorationEntry(exploration) };
           return;
         }
-        const state: ToolRenderState =
-          part.state === "output-available"
-            ? { status: "success", output: part.output }
-            : part.state === "output-error"
-              ? { status: "error", errorText: part.errorText }
-              : part.state === "output-denied"
-                ? { status: "denied" }
-                : { status: "active" };
+        let state: ToolRenderState;
+        switch (part.state) {
+          case "output-available":
+            state = { status: "success", output: part.output };
+            break;
+          case "output-error":
+            state = { status: "error", errorText: part.errorText };
+            break;
+          case "output-denied":
+            state = { status: "denied" };
+            break;
+          default:
+            state = { status: "active" };
+        }
         const entry = toolEntry(name, input, state, options);
         if (entry !== undefined) append({ id, ...entry });
         return;
@@ -1313,11 +1396,26 @@ export class ChunkRenderer {
   }
 
   handle(chunk: UIMessageChunk): void {
-    if (chunk.type.startsWith("data-")) {
-      this.handleData(chunk);
-      return;
-    }
+    this.handleProjected(projectUIMessageChunk(chunk));
+  }
 
+  handleProjected(projected: ProjectedUIMessageChunk): void {
+    switch (projected.kind) {
+      case "rendered":
+        this.handleRendered(projected.chunk);
+        return;
+      case "data":
+        this.handleData(projected.chunk);
+        return;
+      case "ignored":
+      case "unsupported":
+        return;
+    }
+    const exhaustive: never = projected;
+    return exhaustive;
+  }
+
+  private handleRendered(chunk: RenderedUIMessageChunk): void {
     switch (chunk.type) {
       case "text-start":
         this.finalizeReasoning();
@@ -1350,8 +1448,6 @@ export class ChunkRenderer {
         return;
       case "tool-input-start":
         this.renderToolStart(chunk.toolCallId, chunk.toolName);
-        return;
-      case "tool-input-delta":
         return;
       case "tool-input-available":
         this.renderToolStart(chunk.toolCallId, chunk.toolName, chunk.input, true);
@@ -1393,12 +1489,12 @@ export class ChunkRenderer {
           text: `aborted${chunk.reason !== undefined ? `: ${chunk.reason}` : ""}`,
         });
         return;
-      default:
-        return;
     }
+    const exhaustive: never = chunk;
+    return exhaustive;
   }
 
-  private handleData(chunk: UIMessageChunk): void {
+  private handleData(chunk: DataUIMessageChunk): void {
     const todos = miniLilacTodoChunkSchema.safeParse(chunk);
     if (todos.success) {
       this.hooks.onTodos?.(todos.data.data);

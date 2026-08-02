@@ -15,6 +15,7 @@ import type {
   FetchOptions,
   HandleContext,
   Message,
+  Offset,
   PublishOptions,
   SubscriptionOptions,
   Topic,
@@ -144,6 +145,22 @@ return redis.call("XGROUP", "DESTROY", KEYS[1], ARGV[1])
 function randomConsumerId(): string {
   // Bun + modern Node both support this.
   return crypto.randomUUID();
+}
+
+function redisIdForOffset(offset: Offset): string {
+  switch (offset.type) {
+    case "begin":
+      return "0-0";
+    case "now":
+      return "$";
+    case "cursor":
+      return offset.cursor;
+  }
+}
+
+function redisIdForOptionalOffset(offset: Offset | undefined): string {
+  if (offset === undefined) return "$";
+  return redisIdForOffset(offset);
 }
 
 function toRecord(fields: unknown): Record<string, string> {
@@ -493,8 +510,7 @@ export class RedisStreamsBus implements RawBus {
     const streamKey = this.streamKey(topic);
     const limit = opts.limit ?? DEFAULT_MAX_MESSAGES;
 
-    const startId =
-      opts.offset.type === "begin" ? "0-0" : opts.offset.type === "now" ? "$" : opts.offset.cursor;
+    const startId = redisIdForOffset(opts.offset);
 
     const res = (await this.redis.xread(
       "COUNT",
@@ -618,14 +634,7 @@ export class RedisStreamsBus implements RawBus {
     const running = (async () => {
       try {
         if (opts.mode === "tail") {
-          let cursor: string =
-            opts.offset?.type === "begin"
-              ? "0-0"
-              : opts.offset?.type === "now"
-                ? "$"
-                : opts.offset?.type === "cursor"
-                  ? opts.offset.cursor
-                  : "$";
+          let cursor = redisIdForOptionalOffset(opts.offset);
 
           while (!abortController.signal.aborted) {
             const res = (await subRedis.xread(

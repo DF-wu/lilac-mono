@@ -1,5 +1,5 @@
 import {
-  DefaultChatTransport,
+  asSchema,
   parseJsonEventStream,
   uiMessageChunkSchema,
   type ChatTransport,
@@ -30,9 +30,11 @@ import {
   type MiniLilacStreamCursor,
   type MiniLilacTodoState,
   type MiniLilacUIMessage,
+  type MiniLilacUnsupportedUIMessageChunk,
   type MiniLilacUndoInput,
   type MiniLilacUndoResult,
   type MiniLilacUpdateSessionBindingsInput,
+  MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   miniLilacCancelCompactionRequestSchema,
   miniLilacCancelCompactionResultSchema,
   miniLilacCancelRequestSchema,
@@ -56,6 +58,7 @@ import {
   miniLilacSteerResultSchema,
   miniLilacTodoStateSchema,
   miniLilacUIMessageDataPartSchema,
+  miniLilacUnsupportedUIMessageChunkSchema,
   miniLilacUndoRequestSchema,
   miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
@@ -85,6 +88,13 @@ export type MiniLilacRequestOptions = {
   signal?: AbortSignal;
 };
 
+export type MiniLilacSendMessagesOptions = Parameters<
+  ChatTransport<MiniLilacUIMessage>["sendMessages"]
+>[0];
+export type MiniLilacReconnectOptions = Parameters<
+  ChatTransport<MiniLilacUIMessage>["reconnectToStream"]
+>[0];
+
 /** Thrown by `compact()` when the compaction was deliberately stopped. */
 export class MiniLilacCompactionCancelledError extends Error {
   constructor() {
@@ -101,6 +111,100 @@ export type MiniLilacCompactOptions = MiniLilacRequestOptions & {
 };
 
 const sessionIdSchema = z.string().trim().min(1);
+const futureChunkEnvelopeSchema = z.object({
+  type: z.string().min(1).max(128),
+});
+const installedUIMessageChunkSchema = asSchema(uiMessageChunkSchema);
+const unsupportedChunkDiscriminantSchema = z.object({
+  type: z.literal(MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE),
+});
+const dataChunkDiscriminantSchema = z.object({
+  type: z.string().startsWith("data-"),
+});
+const rawDataChunkEnvelopeSchema = z.looseObject({
+  type: z.string().startsWith("data-"),
+  data: z.json(),
+});
+const INSTALLED_NON_DATA_CHUNK_TYPES = new Set<string>([
+  "text-start",
+  "text-delta",
+  "text-end",
+  "error",
+  "tool-input-start",
+  "tool-input-delta",
+  "tool-input-available",
+  "tool-input-error",
+  "tool-approval-request",
+  "tool-approval-response",
+  "tool-output-available",
+  "tool-output-error",
+  "tool-output-denied",
+  "reasoning-start",
+  "reasoning-delta",
+  "reasoning-end",
+  "custom",
+  "source-url",
+  "source-document",
+  "file",
+  "reasoning-file",
+  "start-step",
+  "finish-step",
+  "start",
+  "finish",
+  "abort",
+  "message-metadata",
+]);
+
+async function validateUnsupportedSentinel(
+  sentinel: MiniLilacUnsupportedUIMessageChunk,
+): Promise<UIMessageChunk> {
+  const validated = await installedUIMessageChunkSchema.validate?.(sentinel);
+  if (validated?.success === true) return validated.value;
+  throw validated?.error ?? new Error("UI message chunk validation is unavailable");
+}
+
+async function normalizeStreamChunk(value: unknown): Promise<UIMessageChunk> {
+  if (unsupportedChunkDiscriminantSchema.safeParse(value).success) {
+    return validateUnsupportedSentinel(miniLilacUnsupportedUIMessageChunkSchema.parse(value));
+  }
+
+  if (dataChunkDiscriminantSchema.safeParse(value).success) {
+    const dataEnvelope = rawDataChunkEnvelopeSchema.safeParse(value);
+    if (!dataEnvelope.success) throw dataEnvelope.error;
+  }
+
+  const validated = await installedUIMessageChunkSchema.validate?.(value);
+  if (validated?.success === true) return validated.value;
+
+  const envelope = futureChunkEnvelopeSchema.safeParse(value);
+  if (
+    envelope.success &&
+    !envelope.data.type.startsWith("data-") &&
+    !INSTALLED_NON_DATA_CHUNK_TYPES.has(envelope.data.type)
+  ) {
+    const sentinel = miniLilacUnsupportedUIMessageChunkSchema.parse({
+      type: MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
+      data: { chunkType: envelope.data.type },
+      transient: true,
+    });
+    return validateUnsupportedSentinel(sentinel);
+  }
+
+  throw validated?.error ?? new Error("UI message chunk validation is unavailable");
+}
+
+function parseMiniLilacStream(
+  stream: ReadableStream<Uint8Array<ArrayBufferLike>>,
+): ReadableStream<UIMessageChunk> {
+  return parseJsonEventStream({ stream, schema: z.unknown() }).pipeThrough(
+    new TransformStream({
+      async transform(result, controller) {
+        if (!result.success) throw result.error;
+        controller.enqueue(await normalizeStreamChunk(result.value));
+      },
+    }),
+  );
+}
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
@@ -135,7 +239,7 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
   private readonly fetch: typeof globalThis.fetch;
   private readonly headers: Record<string, string> | Headers | undefined;
   private readonly createClientCommandId: () => string;
-  private readonly delegate: DefaultChatTransport<MiniLilacUIMessage>;
+  private readonly reconnectEndpoint: MiniLilacReconnectEndpoint | undefined;
   private chatExtras: Omit<MiniLilacChatRequestExtras, "clientCommandId">;
   private bindingUpdateChain: Promise<void> = Promise.resolve();
   private readonly lastStreamCursor = new Map<string, MiniLilacStreamCursor>();
@@ -147,6 +251,7 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     this.credentials = options.credentials;
     this.fetch = options.fetch ?? globalThis.fetch;
     this.headers = options.headers;
+    this.reconnectEndpoint = options.reconnectEndpoint;
     this.createClientCommandId = options.createClientCommandId ?? defaultClientCommandId;
 
     this.chatExtras = miniLilacChatRequestExtrasSchema.parse({
@@ -155,55 +260,54 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
       profile: options.profile,
       reasoning: options.reasoning,
     });
-
-    this.delegate = new DefaultChatTransport<MiniLilacUIMessage>({
-      api: joinUrl(this.baseUrl, "chat"),
-      credentials: this.credentials,
-      fetch: this.fetch,
-      headers: () => this.createHeaders(false),
-      prepareSendMessagesRequest: ({ id, messages, body, trigger, messageId }) => {
-        const requestExtras = miniLilacChatRequestExtrasSchema.parse({
-          ...this.chatExtras,
-          ...body,
-        });
-        return {
-          body: {
-            ...requestExtras,
-            id,
-            messages,
-            trigger,
-            messageId,
-            clientCommandId: requestExtras.clientCommandId ?? this.createClientCommandId(),
-          },
-        };
-      },
-      prepareReconnectToStreamRequest: ({ id }) => {
-        const cursor = this.getLastStreamCursor(id);
-        let api = this.resolveReconnectEndpoint(options.reconnectEndpoint, id);
-        if (cursor !== undefined) {
-          api = setQueryParameter(api, "runId", cursor.runId);
-          api = setQueryParameter(api, "after", String(cursor.seq));
-        }
-        return { api };
-      },
-    });
   }
 
   async sendMessages(
-    options: Parameters<ChatTransport<MiniLilacUIMessage>["sendMessages"]>[0],
+    options: MiniLilacSendMessagesOptions,
   ): Promise<ReadableStream<UIMessageChunk>> {
     const generation = (this.streamGenerations.get(options.chatId) ?? 0) + 1;
     this.streamGenerations.set(options.chatId, generation);
-    const stream = await this.delegate.sendMessages(options);
+    const requestExtras = miniLilacChatRequestExtrasSchema.parse({
+      ...this.chatExtras,
+      ...options.body,
+    });
+    const headers = await this.createHeaders(true, options.headers);
+    const response = await this.fetch(joinUrl(this.baseUrl, "chat"), {
+      method: "POST",
+      body: JSON.stringify({
+        ...requestExtras,
+        id: options.chatId,
+        messages: options.messages,
+        trigger: options.trigger,
+        messageId: options.messageId,
+        clientCommandId: requestExtras.clientCommandId ?? this.createClientCommandId(),
+      }),
+      credentials: this.credentials,
+      headers,
+      signal: options.abortSignal,
+    });
+    const stream = await this.responseStream(response);
     this.lastStreamCursor.delete(options.chatId);
     return this.trackStream(options.chatId, generation, stream);
   }
 
   async reconnectToStream(
-    options: Parameters<ChatTransport<MiniLilacUIMessage>["reconnectToStream"]>[0],
+    options: MiniLilacReconnectOptions,
   ): Promise<ReadableStream<UIMessageChunk> | null> {
-    const stream = await this.delegate.reconnectToStream(options);
-    if (stream === null) return null;
+    const cursor = this.getLastStreamCursor(options.chatId);
+    let endpoint = this.resolveReconnectEndpoint(this.reconnectEndpoint, options.chatId);
+    if (cursor !== undefined) {
+      endpoint = setQueryParameter(endpoint, "runId", cursor.runId);
+      endpoint = setQueryParameter(endpoint, "after", String(cursor.seq));
+    }
+    const headers = await this.createHeaders(false, options.headers);
+    const response = await this.fetch(endpoint, {
+      method: "GET",
+      credentials: this.credentials,
+      headers,
+    });
+    if (response.status === 204) return null;
+    const stream = await this.responseStream(response);
     return this.trackStream(
       options.chatId,
       this.streamGenerations.get(options.chatId) ?? 0,
@@ -293,17 +397,7 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
           : `MiniLilac request failed (${response.status})`,
       );
     }
-    return parseJsonEventStream({
-      stream: response.body,
-      schema: uiMessageChunkSchema,
-    }).pipeThrough(
-      new TransformStream({
-        transform(chunk, controller) {
-          if (!chunk.success) throw chunk.error;
-          controller.enqueue(chunk.value);
-        },
-      }),
-    );
+    return parseMiniLilacStream(response.body);
   }
 
   getTodos(sessionId: string, options: MiniLilacRequestOptions = {}): Promise<MiniLilacTodoState> {
@@ -546,17 +640,7 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
           : `MiniLilac request failed (${response.status})`,
       );
     }
-    return parseJsonEventStream({
-      stream: response.body,
-      schema: uiMessageChunkSchema,
-    }).pipeThrough(
-      new TransformStream({
-        transform(chunk, controller) {
-          if (!chunk.success) throw chunk.error;
-          controller.enqueue(chunk.value);
-        },
-      }),
-    );
+    return parseMiniLilacStream(response.body);
   }
 
   private async performSessionBindingUpdate(
@@ -624,12 +708,27 @@ export class MiniLilacTransport implements ChatTransport<MiniLilacUIMessage> {
     );
   }
 
-  private async createHeaders(json: boolean): Promise<Headers> {
+  private async createHeaders(
+    json: boolean,
+    requestHeaders?: Record<string, string> | Headers,
+  ): Promise<Headers> {
     const headers = new Headers(this.headers);
     const token = await this.bearerToken?.();
     if (token !== null && token !== undefined) headers.set("Authorization", `Bearer ${token}`);
     if (json) headers.set("Content-Type", "application/json");
+    new Headers(requestHeaders).forEach((value, name) => headers.set(name, value));
     return headers;
+  }
+
+  private async responseStream(response: Response): Promise<ReadableStream<UIMessageChunk>> {
+    if (!response.ok || response.body === null) {
+      const detail =
+        response.body === null && response.ok
+          ? "The response body is empty."
+          : await response.text();
+      throw new Error(detail || "Failed to fetch the chat response.");
+    }
+    return parseMiniLilacStream(response.body);
   }
 
   private postControl<T>(

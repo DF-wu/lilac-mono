@@ -751,13 +751,18 @@ export function fsTool(
   const instructionClaims = createReadFileInstructionClaims();
 
   function buildReadFileDescription(): string {
-    const parts = [
-      readFileDirectAttachmentSupported
-        ? "Reads files from the filesystem. For supported images and PDFs, calling read_file attaches the original file to your context for native visual or document analysis. Call read_file first for an image or PDF path, either directly or as an independent batch child; use shell media processing only if read_file reports that the input is unsupported or oversized."
-        : hashlineEnabled
-          ? "Reads a file from the filesystem. Default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead."
-          : "Reads a file from the filesystem. Default format is raw (no line numbers) to preserve indentation.",
-    ];
+    let introduction: string;
+    if (readFileDirectAttachmentSupported) {
+      introduction =
+        "Reads files from the filesystem. For supported images and PDFs, calling read_file attaches the original file to your context for native visual or document analysis. Call read_file first for an image or PDF path, either directly or as an independent batch child; use shell media processing only if read_file reports that the input is unsupported or oversized.";
+    } else if (hashlineEnabled) {
+      introduction =
+        "Reads a file from the filesystem. Default format is raw to preserve indentation. Use format='hashline' before edit_file when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.";
+    } else {
+      introduction =
+        "Reads a file from the filesystem. Default format is raw (no line numbers) to preserve indentation.";
+    }
+    const parts = [introduction];
 
     if (readFileDirectAttachmentSupported && hashlineEnabled) {
       parts.push(
@@ -927,117 +932,54 @@ export function fsTool(
         const ext = path.extname(input.path).toLowerCase();
         const wantsAttachment = readFileDirectAttachmentSupported && attachmentExts.has(ext);
 
-        const res = wantsAttachment
-          ? await (async () => {
-              if (cwdTarget.kind === "ssh") {
-                const bytesRes = await remoteReadFileBytes({
-                  host: cwdTarget.host,
-                  cwd: cwdTarget.cwd,
-                  filePath: input.path,
-                  denyPaths: remoteDenyPaths,
-                  maxBytes: maxInlineMediaBytesPerPart,
-                });
+        const res = await (async () => {
+          if (wantsAttachment) {
+            if (cwdTarget.kind === "ssh") {
+              const bytesRes = await remoteReadFileBytes({
+                host: cwdTarget.host,
+                cwd: cwdTarget.cwd,
+                filePath: input.path,
+                denyPaths: remoteDenyPaths,
+                maxBytes: maxInlineMediaBytesPerPart,
+              });
 
-                if (!bytesRes.ok) {
-                  const filename = path.basename(input.path);
-                  const mimeType = inferMimeTypeFromFilename(filename);
-                  const message = /too large|media limit|maximum \d+ bytes/i.test(bytesRes.error)
-                    ? buildInlineMediaLimitMessage({
-                        filename,
-                        mimeType,
-                        maxBytes: maxInlineMediaBytesPerPart,
-                        detail: bytesRes.error,
-                      })
-                    : bytesRes.error;
-                  return {
-                    success: false as const,
-                    resolvedPath: toRemoteDebugPath(cwdTarget.host, input.path),
-                    error: {
-                      code: "UNKNOWN" as const,
-                      message,
-                    },
-                  };
-                }
-
-                const bytes = Buffer.from(bytesRes.base64, "base64");
-                const remoteResolvedPath = toRemoteDebugPath(cwdTarget.host, bytesRes.resolvedPath);
-                recordRemoteFileAccess({
-                  host: cwdTarget.host,
-                  remoteCwd: cwdTarget.cwd,
-                  inputPath: input.path,
-                  resolvedPath: bytesRes.resolvedPath,
-                  fileHash: bytesRes.fileHash,
-                });
-                const filename = path.basename(bytesRes.resolvedPath);
-
-                const detected = await fileTypeFromBuffer(bytes);
-                if (!detected || !attachmentMimeTypes.has(detected.mime)) {
-                  return {
-                    success: false as const,
-                    resolvedPath: remoteResolvedPath,
-                    error: {
-                      code: "UNKNOWN" as const,
-                      message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
-                    },
-                  };
-                }
-                const mimeType = detected.mime;
-
-                binaryCacheByToolCallId.set(options.toolCallId, {
-                  resolvedPath: remoteResolvedPath,
-                  filename,
-                  mimeType,
-                  bytes,
-                  fileHash: bytesRes.fileHash,
-                });
-
+              if (!bytesRes.ok) {
+                const filename = path.basename(input.path);
+                const mimeType = inferMimeTypeFromFilename(filename);
+                const message = /too large|media limit|maximum \d+ bytes/i.test(bytesRes.error)
+                  ? buildInlineMediaLimitMessage({
+                      filename,
+                      mimeType,
+                      maxBytes: maxInlineMediaBytesPerPart,
+                      detail: bytesRes.error,
+                    })
+                  : bytesRes.error;
                 return {
-                  success: true as const,
-                  kind: "attachment" as const,
-                  resolvedPath: remoteResolvedPath,
-                  fileHash: bytesRes.fileHash,
-                  filename,
-                  mimeType,
-                  bytes: bytesRes.bytesLength,
+                  success: false as const,
+                  resolvedPath: toRemoteDebugPath(cwdTarget.host, input.path),
+                  error: {
+                    code: "UNKNOWN" as const,
+                    message,
+                  },
                 };
               }
 
-              const bytesRes = await fileSystem.readFileBytes(
-                {
-                  path: input.path,
-                  dangerouslyAllow,
-                  maxBytes: maxInlineMediaBytesPerPart,
-                },
-                opCwd,
-              );
-              if (!bytesRes.success) {
-                if (/too large|media limit|maximum \d+ bytes/i.test(bytesRes.error.message)) {
-                  const filename = path.basename(bytesRes.resolvedPath);
-                  const mimeType = inferMimeTypeFromFilename(filename);
-                  return {
-                    ...bytesRes,
-                    error: {
-                      ...bytesRes.error,
-                      message: buildInlineMediaLimitMessage({
-                        filename,
-                        mimeType,
-                        maxBytes: maxInlineMediaBytesPerPart,
-                        detail: bytesRes.error.message,
-                      }),
-                    },
-                  };
-                }
-                return bytesRes;
-              }
+              const bytes = Buffer.from(bytesRes.base64, "base64");
+              const remoteResolvedPath = toRemoteDebugPath(cwdTarget.host, bytesRes.resolvedPath);
+              recordRemoteFileAccess({
+                host: cwdTarget.host,
+                remoteCwd: cwdTarget.cwd,
+                inputPath: input.path,
+                resolvedPath: bytesRes.resolvedPath,
+                fileHash: bytesRes.fileHash,
+              });
+              const filename = path.basename(bytesRes.resolvedPath);
 
-              const resolvedPath = bytesRes.resolvedPath;
-              const filename = path.basename(resolvedPath);
-
-              const detected = await fileTypeFromBuffer(bytesRes.bytes);
+              const detected = await fileTypeFromBuffer(bytes);
               if (!detected || !attachmentMimeTypes.has(detected.mime)) {
                 return {
                   success: false as const,
-                  resolvedPath,
+                  resolvedPath: remoteResolvedPath,
                   error: {
                     code: "UNKNOWN" as const,
                     message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
@@ -1047,70 +989,133 @@ export function fsTool(
               const mimeType = detected.mime;
 
               binaryCacheByToolCallId.set(options.toolCallId, {
-                resolvedPath,
+                resolvedPath: remoteResolvedPath,
                 filename,
                 mimeType,
-                bytes: bytesRes.bytes,
+                bytes,
                 fileHash: bytesRes.fileHash,
-              });
-
-              const instructions = await loadReadFileInstructions({
-                resolvedPath,
-                requestedPath: input.path,
-                cwd: opCwd ?? toolRootAbs,
-                messages: options.messages,
-                denyPaths,
-                claimedInstructionPaths: instructionClaims.forMessages(options.messages),
               });
 
               return {
                 success: true as const,
                 kind: "attachment" as const,
-                resolvedPath,
+                resolvedPath: remoteResolvedPath,
                 fileHash: bytesRes.fileHash,
                 filename,
                 mimeType,
                 bytes: bytesRes.bytesLength,
-                ...(instructions
-                  ? {
-                      loadedInstructions: instructions.loaded,
-                      instructionsText: instructions.text,
-                    }
-                  : {}),
               };
-            })()
-          : cwdTarget.kind === "ssh"
-            ? await (async () => {
-                const remoteRes = await remoteReadTextFile({
-                  host: cwdTarget.host,
-                  cwd: cwdTarget.cwd,
-                  input: {
-                    ...input,
-                    start: input.start,
-                    maxBytes: maxOutputBytes,
+            }
+
+            const bytesRes = await fileSystem.readFileBytes(
+              {
+                path: input.path,
+                dangerouslyAllow,
+                maxBytes: maxInlineMediaBytesPerPart,
+              },
+              opCwd,
+            );
+            if (!bytesRes.success) {
+              if (/too large|media limit|maximum \d+ bytes/i.test(bytesRes.error.message)) {
+                const filename = path.basename(bytesRes.resolvedPath);
+                const mimeType = inferMimeTypeFromFilename(filename);
+                return {
+                  ...bytesRes,
+                  error: {
+                    ...bytesRes.error,
+                    message: buildInlineMediaLimitMessage({
+                      filename,
+                      mimeType,
+                      maxBytes: maxInlineMediaBytesPerPart,
+                      detail: bytesRes.error.message,
+                    }),
                   },
-                  denyPaths: remoteDenyPaths,
-                });
-                if (remoteRes.success) {
-                  recordRemoteFileAccess({
-                    host: cwdTarget.host,
-                    remoteCwd: cwdTarget.cwd,
-                    inputPath: input.path,
-                    resolvedPath: remoteRes.resolvedPath,
-                    fileHash: remoteRes.fileHash,
-                  });
-                }
-                return remoteRes;
-              })()
-            : await fileSystem.readFile(
-                {
-                  ...input,
-                  start: input.start,
-                  maxBytes: maxOutputBytes,
-                  dangerouslyAllow,
+                };
+              }
+              return bytesRes;
+            }
+
+            const resolvedPath = bytesRes.resolvedPath;
+            const filename = path.basename(resolvedPath);
+
+            const detected = await fileTypeFromBuffer(bytesRes.bytes);
+            if (!detected || !attachmentMimeTypes.has(detected.mime)) {
+              return {
+                success: false as const,
+                resolvedPath,
+                error: {
+                  code: "UNKNOWN" as const,
+                  message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
                 },
-                opCwd,
-              );
+              };
+            }
+            const mimeType = detected.mime;
+
+            binaryCacheByToolCallId.set(options.toolCallId, {
+              resolvedPath,
+              filename,
+              mimeType,
+              bytes: bytesRes.bytes,
+              fileHash: bytesRes.fileHash,
+            });
+
+            const instructions = await loadReadFileInstructions({
+              resolvedPath,
+              requestedPath: input.path,
+              cwd: opCwd ?? toolRootAbs,
+              messages: options.messages,
+              denyPaths,
+              claimedInstructionPaths: instructionClaims.forMessages(options.messages),
+            });
+
+            return {
+              success: true as const,
+              kind: "attachment" as const,
+              resolvedPath,
+              fileHash: bytesRes.fileHash,
+              filename,
+              mimeType,
+              bytes: bytesRes.bytesLength,
+              ...(instructions
+                ? {
+                    loadedInstructions: instructions.loaded,
+                    instructionsText: instructions.text,
+                  }
+                : {}),
+            };
+          }
+          if (cwdTarget.kind === "ssh") {
+            const remoteRes = await remoteReadTextFile({
+              host: cwdTarget.host,
+              cwd: cwdTarget.cwd,
+              input: {
+                ...input,
+                start: input.start,
+                maxBytes: maxOutputBytes,
+              },
+              denyPaths: remoteDenyPaths,
+            });
+            if (remoteRes.success) {
+              recordRemoteFileAccess({
+                host: cwdTarget.host,
+                remoteCwd: cwdTarget.cwd,
+                inputPath: input.path,
+                resolvedPath: remoteRes.resolvedPath,
+                fileHash: remoteRes.fileHash,
+              });
+            }
+            return remoteRes;
+          }
+          return await fileSystem.readFile(
+            {
+              ...input,
+              start: input.start,
+              maxBytes: maxOutputBytes,
+              dangerouslyAllow,
+            },
+            opCwd,
+          );
+        })();
 
         const resQualified = (() => {
           if (cwdTarget.kind !== "ssh") return res;
@@ -1152,23 +1157,31 @@ export function fsTool(
             ? withInstructions.loadedInstructions.length
             : 0;
 
-        const textReadSummary = isReadTextOutput(withInstructions)
-          ? {
-              outputFormat: withInstructions.format,
-              startLine: withInstructions.startLine,
-              endLine: withInstructions.endLine,
-              totalLines: withInstructions.totalLines,
-              hasMoreLines: withInstructions.hasMoreLines,
-              truncatedByChars: withInstructions.truncatedByChars,
-              returnedLines: Math.max(0, withInstructions.endLine - withInstructions.startLine + 1),
-              returnedChars:
-                withInstructions.format === "raw"
-                  ? withInstructions.content.length
-                  : withInstructions.format === "numbered"
-                    ? withInstructions.numberedContent.length
-                    : withInstructions.hashlineContent.length,
-            }
-          : undefined;
+        let textReadSummary;
+        if (isReadTextOutput(withInstructions)) {
+          let returnedChars: number;
+          switch (withInstructions.format) {
+            case "raw":
+              returnedChars = withInstructions.content.length;
+              break;
+            case "numbered":
+              returnedChars = withInstructions.numberedContent.length;
+              break;
+            case "hashline":
+              returnedChars = withInstructions.hashlineContent.length;
+              break;
+          }
+          textReadSummary = {
+            outputFormat: withInstructions.format,
+            startLine: withInstructions.startLine,
+            endLine: withInstructions.endLine,
+            totalLines: withInstructions.totalLines,
+            hasMoreLines: withInstructions.hasMoreLines,
+            truncatedByChars: withInstructions.truncatedByChars,
+            returnedLines: Math.max(0, withInstructions.endLine - withInstructions.startLine + 1),
+            returnedChars,
+          };
+        }
 
         const attachmentSummary = isAttachmentOutput(withInstructions)
           ? {

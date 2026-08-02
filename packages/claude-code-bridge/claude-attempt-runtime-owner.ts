@@ -105,16 +105,13 @@ export class ClaudeAttemptRuntimeOwner<FactoryInputs> {
 
   get state(): ClaudeAttemptRuntimeOwnerState {
     const liveObservation = this.candidate?.nativeSession.getObservation() ?? null;
+    let phase: ClaudeAttemptRuntimeOwnerState["phase"] = "idle";
+    if (this.ended) phase = "retired";
+    else if (this.unusableReason) phase = "unusable";
+    else if (this.candidate) phase = "active";
+    else if (this.materialization) phase = "materializing";
     return {
-      phase: this.ended
-        ? "retired"
-        : this.unusableReason
-          ? "unusable"
-          : this.candidate
-            ? "active"
-            : this.materialization
-              ? "materializing"
-              : "idle",
+      phase,
       attemptIndex: this.attemptIndex,
       cursor: this.cursor ? { ...this.cursor } : null,
       nativeObservation: liveObservation ?? this.lastObservation,

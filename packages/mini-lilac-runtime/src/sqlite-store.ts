@@ -1336,11 +1336,21 @@ function canonicalJsonValue(value: unknown): unknown {
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
-        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .sort(([left], [right]) => {
+          if (left < right) return -1;
+          if (left > right) return 1;
+          return 0;
+        })
         .map(([key, nested]) => [key, canonicalJsonValue(nested)]),
     );
   }
   return value;
+}
+
+function storedProviderStateFlag(providerState: HistoryProviderState | null): number | null {
+  if (providerState === null) return null;
+  if (providerState.containsCrossFamilyTurns) return 1;
+  return 0;
 }
 
 function canonicalCommandPayload(payload: unknown): { json: string; fingerprint: string } {
@@ -3052,6 +3062,10 @@ export class MiniLilacSqliteStore {
       }
 
       const now = new Date().toISOString();
+      let inputTokensEstimated = 0;
+      if (bindings.model === undefined && snapshot.inputTokensEstimated) {
+        inputTokensEstimated = 1;
+      }
       this.database
         .query(
           `UPDATE sessions
@@ -3069,7 +3083,7 @@ export class MiniLilacSqliteStore {
           bindings.model === undefined ? (snapshot.inputTokens ?? null) : null,
           // Clearing the count must clear the flag with it: an estimate marker
           // left on a null count renders as an estimate of nothing.
-          bindings.model === undefined ? (snapshot.inputTokensEstimated ? 1 : 0) : 0,
+          inputTokensEstimated,
           now,
           sessionId,
         );
@@ -5133,7 +5147,7 @@ export class MiniLilacSqliteStore {
           input.terminalResult === undefined ? null : serialize(input.terminalResult),
           input.inputTokens,
           providerState?.lastFamily ?? null,
-          providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
+          storedProviderStateFlag(providerState),
           promotion === null ? null : serialize(promotion),
           namedPromotion === null ? null : serialize(namedPromotion),
           now,
@@ -5440,26 +5454,25 @@ export class MiniLilacSqliteStore {
       if (updated.changes !== 1) {
         throw new Error(`Run '${pending.runId}' is not active for session '${pending.sessionId}'`);
       }
-      const bindingPromotion =
-        promotion !== null
-          ? this.promoteMiniMainClaudeBinding(
-              pending,
-              this.getRootPromptSourceStateId(pending),
-              destination.id,
-              promotion,
-            )
-            ? "promoted"
-            : "cas-failed"
-          : namedPromotion !== null
-            ? this.promoteMiniNamedClaudeBinding(
-                pending,
-                this.getRootPromptSourceStateId(pending),
-                destination.id,
-                namedPromotion,
-              )
-              ? "promoted"
-              : "cas-failed"
-            : "not-requested";
+      let bindingPromotion: CommittedPendingStoredRunFinalization["bindingPromotion"] =
+        "not-requested";
+      if (promotion !== null) {
+        const promoted = this.promoteMiniMainClaudeBinding(
+          pending,
+          this.getRootPromptSourceStateId(pending),
+          destination.id,
+          promotion,
+        );
+        bindingPromotion = promoted ? "promoted" : "cas-failed";
+      } else if (namedPromotion !== null) {
+        const promoted = this.promoteMiniNamedClaudeBinding(
+          pending,
+          this.getRootPromptSourceStateId(pending),
+          destination.id,
+          namedPromotion,
+        );
+        bindingPromotion = promoted ? "promoted" : "cas-failed";
+      }
       this.deletePendingRunFinalizationRow(pending.runId);
       return {
         pending,
@@ -6053,7 +6066,7 @@ export class MiniLilacSqliteStore {
         input.workspaceUnavailableReason,
         input.origin,
         providerState?.lastFamily ?? null,
-        providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
+        storedProviderStateFlag(providerState),
         input.createdAt ?? new Date().toISOString(),
       );
   }

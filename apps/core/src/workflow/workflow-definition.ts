@@ -960,17 +960,19 @@ function bindingNames(name: ts.BindingName): string[] {
 function assertNoShadowedWorkflowBindings(body: ts.Node): void {
   const reserved = WORKFLOW_RUN_CONTEXT_NAMES;
   const visit = (node: ts.Node): void => {
-    const names =
-      ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)
-        ? bindingNames(node.name)
-        : ts.isFunctionDeclaration(node) ||
-            ts.isClassDeclaration(node) ||
-            ts.isFunctionExpression(node) ||
-            ts.isClassExpression(node)
-          ? node.name
-            ? [node.name.text]
-            : []
-          : [];
+    let names: string[];
+    if (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) {
+      names = bindingNames(node.name);
+    } else if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isClassDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isClassExpression(node)
+    ) {
+      names = node.name ? [node.name.text] : [];
+    } else {
+      names = [];
+    }
     for (const name of names) {
       if (reserved.has(name)) {
         throw new Error(`Workflow code cannot shadow reserved host API binding: ${name}`);
@@ -979,6 +981,25 @@ function assertNoShadowedWorkflowBindings(body: ts.Node): void {
     ts.forEachChild(node, visit);
   };
   visit(body);
+}
+
+function matchesWorkflowSchemaType(type: WorkflowJsonSchema["type"], value: JsonValue): boolean {
+  switch (type) {
+    case "null":
+      return value === null;
+    case "array":
+      return Array.isArray(value);
+    case "object":
+      return value !== null && typeof value === "object" && !Array.isArray(value);
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number";
+    case "boolean":
+      return typeof value === "boolean";
+  }
 }
 
 function assertSchemaBounds(schema: WorkflowJsonSchema, depth = 0): void {
@@ -1022,11 +1043,7 @@ function assertSchemaBounds(schema: WorkflowJsonSchema, depth = 0): void {
   }
   if (schema.type !== "object" && schema.type !== "array") {
     const matchesType = (value: JsonValue): boolean =>
-      schema.type === "null"
-        ? value === null
-        : schema.type === "integer"
-          ? typeof value === "number" && Number.isInteger(value)
-          : typeof value === schema.type;
+      matchesWorkflowSchemaType(schema.type, value);
     if (schema.const !== undefined && !matchesType(schema.const)) {
       throw new Error(`Input schema const must match type ${schema.type}`);
     }
@@ -1112,16 +1129,7 @@ function validateSchemaValue(
   path: PropertyKey[],
 ): void {
   const expected = schema.type;
-  const matches =
-    expected === "null"
-      ? value === null
-      : expected === "array"
-        ? Array.isArray(value)
-        : expected === "object"
-          ? value !== null && typeof value === "object" && !Array.isArray(value)
-          : expected === "integer"
-            ? typeof value === "number" && Number.isInteger(value)
-            : typeof value === expected;
+  const matches = matchesWorkflowSchemaType(expected, value);
   if (!matches) {
     addInputIssue(ctx, path, `expected ${expected}`);
     return;

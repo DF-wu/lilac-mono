@@ -3150,13 +3150,29 @@ export async function startBusAgentRunner(params: {
         return;
       }
 
+      let lifecycleDetail: string | undefined;
+      if (next.recovery) {
+        lifecycleDetail = "resumed after server restart";
+      } else {
+        switch (next.queue) {
+          case "prompt":
+            lifecycleDetail = undefined;
+            break;
+          case "steer":
+          case "followUp":
+          case "interrupt":
+            lifecycleDetail = `coerced queue=${next.queue} to prompt (no active run)`;
+            break;
+          default: {
+            const _exhaustive: never = next.queue;
+            lifecycleDetail = _exhaustive;
+            break;
+          }
+        }
+      }
       await publishCurrentLifecycle({
         state: "running",
-        detail: next.recovery
-          ? "resumed after server restart"
-          : next.queue !== "prompt"
-            ? `coerced queue=${next.queue} to prompt (no active run)`
-            : undefined,
+        detail: lifecycleDetail,
       });
       await bus.publish(lilacEventTypes.EvtRequestReply, {}, { headers });
 
@@ -4048,11 +4064,13 @@ export async function startBusAgentRunner(params: {
           !disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey)
             ? configuredServerCompactionReplayKey
             : undefined;
-        activeNativeServerCompactionReplayKey = configuredServerCompactionReplayKey
-          ? hasMatchingOpenAIServerCompaction(messages, serverCompactionReplayKey)
-            ? (serverCompactionReplayKey ?? null)
-            : null
-          : null;
+        activeNativeServerCompactionReplayKey = null;
+        if (
+          configuredServerCompactionReplayKey &&
+          hasMatchingOpenAIServerCompaction(messages, serverCompactionReplayKey)
+        ) {
+          activeNativeServerCompactionReplayKey = serverCompactionReplayKey ?? null;
+        }
         const materialized =
           configuredServerCompactionReplayKey || hasOpenAIServerCompaction(messages)
             ? materializeOpenAIServerCompaction(messages, serverCompactionReplayKey)
@@ -4060,34 +4078,40 @@ export async function startBusAgentRunner(params: {
         const targetFamily = classifyHistoryProviderFamily({
           type: activeBinding.resolved.provider,
         });
-        const historyPrepared = coreNamedClaudeRuntime
-          ? coreNamedClaudeRuntime.prepareHistoryView(materialized)
-          : corePrimaryClaudeRuntime
-            ? fullBudget
-              ? corePrimaryClaudeRuntime.prepareFullBudgetView(
-                  materialized,
-                  transformContext.canonicalStartIndex,
-                )
-              : corePrimaryClaudeRuntime.prepareHistoryView(materialized)
-            : runProfile === "primary"
-              ? (() => {
-                  const lineage = state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
-                  const historicalEnd = lineage?.currentCanonicalStart ?? 0;
-                  return prepareCorePrimaryHistoryView({
-                    canonicalMessages: materialized,
-                    lineage,
-                    replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
-                      lineage,
-                      historicalEnd,
-                      store: params.transcriptStore ?? {},
-                      targetFamily,
-                    }),
-                    targetFamily,
-                    modelSpecifier: activeBinding.resolved.spec,
-                    canonicalStartIndex: transformContext.canonicalStartIndex,
-                  });
-                })()
-              : stableNamedContinuation
+        let historyPrepared: readonly ModelMessage[];
+        if (coreNamedClaudeRuntime) {
+          historyPrepared = coreNamedClaudeRuntime.prepareHistoryView(materialized);
+        } else if (corePrimaryClaudeRuntime) {
+          historyPrepared = fullBudget
+            ? corePrimaryClaudeRuntime.prepareFullBudgetView(
+                materialized,
+                transformContext.canonicalStartIndex,
+              )
+            : corePrimaryClaudeRuntime.prepareHistoryView(materialized);
+        } else {
+          switch (runProfile) {
+            case "primary": {
+              const lineage = state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+              const historicalEnd = lineage?.currentCanonicalStart ?? 0;
+              historyPrepared = prepareCorePrimaryHistoryView({
+                canonicalMessages: materialized,
+                lineage,
+                replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
+                  lineage,
+                  historicalEnd,
+                  store: params.transcriptStore ?? {},
+                  targetFamily,
+                }),
+                targetFamily,
+                modelSpecifier: activeBinding.resolved.spec,
+                canonicalStartIndex: transformContext.canonicalStartIndex,
+              });
+              break;
+            }
+            case "explore":
+            case "general":
+            case "self":
+              historyPrepared = stableNamedContinuation
                 ? prepareCoreNamedHistoryView({
                     canonicalMessages: materialized,
                     sourceMessages: seededSessionMessages,
@@ -4100,6 +4124,14 @@ export async function startBusAgentRunner(params: {
                     modelSpecifier: activeBinding.resolved.spec,
                   })
                 : materialized;
+              break;
+            default: {
+              const _exhaustive: never = runProfile;
+              historyPrepared = _exhaustive;
+              break;
+            }
+          }
+        }
         if (
           configuredServerCompactionReplayKey &&
           disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey) &&
@@ -5095,12 +5127,18 @@ export async function startBusAgentRunner(params: {
             event.toolName === "subagent_delegate" &&
             isDeferredSubagentAcceptedResult(event.result);
 
-          const ok =
-            event.toolName === "batch"
-              ? (getBatchOkFromResult(event.result) ?? toolFailure.ok)
-              : event.toolName === "subagent_delegate"
-                ? (getSubagentOkFromResult(event.result) ?? toolFailure.ok)
-                : toolFailure.ok;
+          let ok: boolean;
+          switch (event.toolName) {
+            case "batch":
+              ok = getBatchOkFromResult(event.result) ?? toolFailure.ok;
+              break;
+            case "subagent_delegate":
+              ok = getSubagentOkFromResult(event.result) ?? toolFailure.ok;
+              break;
+            default:
+              ok = toolFailure.ok;
+              break;
+          }
           const interruptedForRestart = restartAbortRequestIds.has(headers.request_id);
           const toolFailureError = toolFailure.error ?? "tool failed";
 
@@ -5139,13 +5177,17 @@ export async function startBusAgentRunner(params: {
             return;
           }
 
+          let publishedToolError: string | undefined;
+          if (!ok) {
+            publishedToolError = interruptedForRestart ? "server restarted" : toolFailureError;
+          }
           outputPublisher
             .publishToolCall({
               toolCallId: event.toolCallId,
               status: "end",
               display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
               ok,
-              error: ok ? undefined : interruptedForRestart ? "server restarted" : toolFailureError,
+              error: publishedToolError,
             })
             .catch((e: unknown) => {
               logger.error(
@@ -5385,21 +5427,36 @@ export async function startBusAgentRunner(params: {
           const targetProviderFamily = classifyHistoryProviderFamily({
             type: activeBinding.resolved.provider,
           });
-          const providerState =
-            runProfile === "primary"
-              ? resolveCorePrimaryTranscriptProviderState({
-                  targetFamily: targetProviderFamily,
-                  lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
-                  transcriptStore: params.transcriptStore,
-                })
-              : stableNamedContinuation && !isCancelled
-                ? advanceHistoryProviderState(
-                    seededSessionTranscript === null
-                      ? "empty-history"
-                      : (seededSessionTranscript.providerState ?? "unknown-populated-history"),
-                    targetProviderFamily,
-                  )
-                : undefined;
+          let providerState: HistoryProviderState | undefined;
+          switch (runProfile) {
+            case "primary":
+              providerState = resolveCorePrimaryTranscriptProviderState({
+                targetFamily: targetProviderFamily,
+                lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                transcriptStore: params.transcriptStore,
+              });
+              break;
+            case "explore":
+            case "general":
+            case "self":
+              providerState = undefined;
+              if (stableNamedContinuation && !isCancelled) {
+                const sourceProviderState =
+                  seededSessionTranscript === null
+                    ? "empty-history"
+                    : (seededSessionTranscript.providerState ?? "unknown-populated-history");
+                providerState = advanceHistoryProviderState(
+                  sourceProviderState,
+                  targetProviderFamily,
+                );
+              }
+              break;
+            default: {
+              const _exhaustive: never = runProfile;
+              providerState = _exhaustive;
+              break;
+            }
+          }
           const terminalPrimaryLineage =
             state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
           const canPublishCorePrimaryClaude =
@@ -5651,18 +5708,21 @@ export async function startBusAgentRunner(params: {
       if (activeCustomCommandTool) {
         const { toolCallId, display } = activeCustomCommandTool;
         activeCustomCommandTool = null;
+        let customCommandError: string;
+        if (e instanceof PreAgentRunCancelledError) {
+          customCommandError = "cancelled by interrupt";
+        } else if (e instanceof Error) {
+          customCommandError = e.message;
+        } else {
+          customCommandError = String(e);
+        }
         await outputPublisher
           .publishToolCall({
             toolCallId,
             status: "end",
             display,
             ok: false,
-            error:
-              e instanceof PreAgentRunCancelledError
-                ? "cancelled by interrupt"
-                : e instanceof Error
-                  ? e.message
-                  : String(e),
+            error: customCommandError,
           })
           .catch(() => undefined);
       }
@@ -5891,11 +5951,17 @@ export async function startBusAgentRunner(params: {
         toolName: tool.toolName,
         ageMs: Math.max(0, now - tool.startedAt),
       }));
+      let phase: AgentRunnerActiveWork["phase"] = "preparing";
+      if (tools.length > 0) {
+        phase = "tool";
+      } else if (run.started) {
+        phase = "model";
+      }
       active.push({
         requestId: run.requestId,
         requestClient: run.requestClient,
         runProfile: run.runProfile,
-        phase: tools.length > 0 ? "tool" : run.started ? "model" : "preparing",
+        phase,
         runAgeMs: Math.max(0, now - run.startedAt),
         tools,
       });

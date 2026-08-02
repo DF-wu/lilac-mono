@@ -126,6 +126,23 @@ export const EDIT_ERROR_CODES = [
 ] as const;
 export type EditErrorCode = (typeof EDIT_ERROR_CODES)[number];
 
+function isEditErrorCode(code: string): code is EditErrorCode {
+  return EDIT_ERROR_CODES.some((candidate) => candidate === code);
+}
+
+function toBasicFsErrorCode(code: string | undefined): ReadErrorCode {
+  if (code === "ENOENT") return "NOT_FOUND";
+  if (code === "EACCES" || code === "EPERM") return "PERMISSION";
+  return "UNKNOWN";
+}
+
+function toHashlineEditErrorCode(code: string | undefined): EditErrorCode {
+  const basicCode = toBasicFsErrorCode(code);
+  if (basicCode !== "UNKNOWN") return basicCode;
+  if (code === "INVALID_EDIT" || code === "STALE_ANCHOR") return code;
+  return "UNKNOWN";
+}
+
 export type ReadFileSuccessBase = {
   success: true;
   resolvedPath: string;
@@ -311,6 +328,114 @@ export type FileEdit =
        */
       expectedMatches?: number | "any";
     };
+
+type FileEditDecodeResult =
+  | { readonly success: true; readonly edit: FileEdit }
+  | { readonly success: false; readonly message: string };
+
+function invalidFileEdit(message: string): FileEditDecodeResult {
+  return { success: false, message };
+}
+
+function decodeFileEdit(value: FileEdit): FileEditDecodeResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return invalidFileEdit("Unknown edit type: unknown");
+  }
+
+  const rawType: string = value.type;
+  if (typeof rawType !== "string") {
+    return invalidFileEdit(
+      `Unknown edit type: ${rawType === undefined ? "unknown" : String(rawType)}`,
+    );
+  }
+
+  switch (rawType) {
+    case "replace_range": {
+      const range = "range" in value ? value.range : undefined;
+      const newText = "newText" in value ? value.newText : undefined;
+      const expectedOldText = "expectedOldText" in value ? value.expectedOldText : undefined;
+      if (
+        typeof range !== "object" ||
+        range === null ||
+        Array.isArray(range) ||
+        !("startLine" in range) ||
+        typeof range.startLine !== "number" ||
+        !("endLine" in range) ||
+        typeof range.endLine !== "number" ||
+        typeof newText !== "string" ||
+        (expectedOldText !== undefined && typeof expectedOldText !== "string")
+      ) {
+        return invalidFileEdit(`Invalid edit payload for type: ${rawType}`);
+      }
+      const edit: Extract<FileEdit, { type: "replace_range" }> = {
+        type: rawType,
+        range,
+        newText,
+      };
+      if (expectedOldText !== undefined) edit.expectedOldText = expectedOldText;
+      return { success: true, edit };
+    }
+    case "insert_at": {
+      const line = "line" in value ? value.line : undefined;
+      const newText = "newText" in value ? value.newText : undefined;
+      if (typeof line !== "number" || typeof newText !== "string") {
+        return invalidFileEdit(`Invalid edit payload for type: ${rawType}`);
+      }
+      return { success: true, edit: { type: rawType, line, newText } };
+    }
+    case "delete_range": {
+      const range = "range" in value ? value.range : undefined;
+      const expectedOldText = "expectedOldText" in value ? value.expectedOldText : undefined;
+      if (
+        typeof range !== "object" ||
+        range === null ||
+        Array.isArray(range) ||
+        !("startLine" in range) ||
+        typeof range.startLine !== "number" ||
+        !("endLine" in range) ||
+        typeof range.endLine !== "number" ||
+        (expectedOldText !== undefined && typeof expectedOldText !== "string")
+      ) {
+        return invalidFileEdit(`Invalid edit payload for type: ${rawType}`);
+      }
+      const edit: Extract<FileEdit, { type: "delete_range" }> = { type: rawType, range };
+      if (expectedOldText !== undefined) edit.expectedOldText = expectedOldText;
+      return { success: true, edit };
+    }
+    case "replace_snippet": {
+      const target = "target" in value ? value.target : undefined;
+      const matching = "matching" in value ? value.matching : undefined;
+      const newText = "newText" in value ? value.newText : undefined;
+      const occurrence = "occurrence" in value ? value.occurrence : undefined;
+      const expectedMatches = "expectedMatches" in value ? value.expectedMatches : undefined;
+      if (
+        typeof target !== "string" ||
+        (matching !== undefined && matching !== "exact" && matching !== "regex") ||
+        typeof newText !== "string" ||
+        (occurrence !== undefined &&
+          typeof occurrence !== "number" &&
+          occurrence !== "first" &&
+          occurrence !== "all") ||
+        (expectedMatches !== undefined &&
+          typeof expectedMatches !== "number" &&
+          expectedMatches !== "any")
+      ) {
+        return invalidFileEdit(`Invalid edit payload for type: ${rawType}`);
+      }
+      const edit: Extract<FileEdit, { type: "replace_snippet" }> = {
+        type: rawType,
+        target,
+        newText,
+      };
+      if (matching !== undefined) edit.matching = matching;
+      if (occurrence !== undefined) edit.occurrence = occurrence;
+      if (expectedMatches !== undefined) edit.expectedMatches = expectedMatches;
+      return { success: true, edit };
+    }
+    default:
+      return invalidFileEdit(`Unknown edit type: ${rawType}`);
+  }
+}
 
 export const SEARCH_MODES = ["default", "detailed"] as const;
 export type SearchMode = (typeof SEARCH_MODES)[number];
@@ -835,12 +960,7 @@ export class FileSystem {
       const msg = e instanceof Error ? e.message : String(e);
       const code = getErrorCode(e);
 
-      const errorCode: ReadErrorCode =
-        code === "ENOENT"
-          ? "NOT_FOUND"
-          : code === "EACCES" || code === "EPERM"
-            ? "PERMISSION"
-            : "UNKNOWN";
+      const errorCode = toBasicFsErrorCode(code);
 
       return {
         success: false as const,
@@ -909,12 +1029,7 @@ export class FileSystem {
       const msg = e instanceof Error ? e.message : String(e);
       const code = getErrorCode(e);
 
-      const errorCode: ReadErrorCode =
-        code === "ENOENT"
-          ? "NOT_FOUND"
-          : code === "EACCES" || code === "EPERM"
-            ? "PERMISSION"
-            : "UNKNOWN";
+      const errorCode = toBasicFsErrorCode(code);
 
       return {
         success: false as const,
@@ -1028,12 +1143,7 @@ export class FileSystem {
       const msg = e instanceof Error ? e.message : String(e);
       const code = getErrorCode(e);
 
-      const errorCode: WriteErrorCode =
-        code === "ENOENT"
-          ? "NOT_FOUND"
-          : code === "EACCES" || code === "EPERM"
-            ? "PERMISSION"
-            : "UNKNOWN";
+      const errorCode = toBasicFsErrorCode(code);
 
       return {
         success: false as const,
@@ -1264,9 +1374,14 @@ export class FileSystem {
       let replacementsMade = 0;
 
       for (let editIndex = 0; editIndex < edits.length; editIndex++) {
-        const edit = edits[editIndex]!;
+        const suppliedEdit = edits[editIndex]!;
 
         try {
+          const decodedEdit = decodeFileEdit(suppliedEdit);
+          if (!decodedEdit.success) {
+            throw Object.assign(new Error(decodedEdit.message), { code: "INVALID_EDIT" });
+          }
+          const edit = decodedEdit.edit;
           switch (edit.type) {
             case "replace_range": {
               const {
@@ -1351,12 +1466,19 @@ export class FileSystem {
                 );
               }
 
-              const maxReplace =
-                typeof occurrence === "number"
-                  ? occurrence
-                  : occurrence === "first"
-                    ? 1
-                    : Number.MAX_SAFE_INTEGER;
+              let maxReplace: number;
+              if (typeof occurrence === "number") {
+                maxReplace = occurrence;
+              } else {
+                switch (occurrence) {
+                  case "first":
+                    maxReplace = 1;
+                    break;
+                  case "all":
+                    maxReplace = Number.MAX_SAFE_INTEGER;
+                    break;
+                }
+              }
 
               if (typeof occurrence === "number" && occurrence <= 0) {
                 throw Object.assign(new Error("occurrence must be a positive number"), {
@@ -1396,15 +1518,6 @@ export class FileSystem {
 
               break;
             }
-            default:
-              const rawEdit: unknown = edit;
-              const type =
-                rawEdit && typeof rawEdit === "object" && "type" in rawEdit
-                  ? String(rawEdit.type)
-                  : "unknown";
-              throw Object.assign(new Error(`Unknown edit type: ${type}`), {
-                code: "INVALID_EDIT",
-              });
           }
 
           succeededOperations.push(edit.type);
@@ -1412,10 +1525,7 @@ export class FileSystem {
           const msg = e instanceof Error ? e.message : String(e);
           const rawCode = getErrorCode(e);
 
-          const code: EditErrorCode =
-            typeof rawCode === "string" && EDIT_ERROR_CODES.includes(rawCode as EditErrorCode)
-              ? (rawCode as EditErrorCode)
-              : "UNKNOWN";
+          const code = rawCode !== undefined && isEditErrorCode(rawCode) ? rawCode : "UNKNOWN";
 
           return {
             success: false as const,
@@ -1427,7 +1537,7 @@ export class FileSystem {
                 code,
                 message: msg,
                 editIndex,
-                edit,
+                edit: suppliedEdit,
               },
             ],
           };
@@ -1466,12 +1576,7 @@ export class FileSystem {
       const msg = e instanceof Error ? e.message : String(e);
       const code = getErrorCode(e);
 
-      const errorCode: EditErrorCode =
-        code === "ENOENT"
-          ? "NOT_FOUND"
-          : code === "EACCES" || code === "EPERM"
-            ? "PERMISSION"
-            : "UNKNOWN";
+      const errorCode = toBasicFsErrorCode(code);
 
       return {
         success: false as const,
@@ -1576,14 +1681,7 @@ export class FileSystem {
       const msg = e instanceof Error ? e.message : String(e);
       const code = getErrorCode(e);
 
-      const errorCode: EditErrorCode =
-        code === "ENOENT"
-          ? "NOT_FOUND"
-          : code === "EACCES" || code === "EPERM"
-            ? "PERMISSION"
-            : code === "INVALID_EDIT" || code === "STALE_ANCHOR"
-              ? (code as EditErrorCode)
-              : "UNKNOWN";
+      const errorCode = toHashlineEditErrorCode(code);
 
       return {
         success: false,
@@ -1836,11 +1934,12 @@ export class FileSystem {
         !isFileTarget ||
         fileExtensions.length === 0 ||
         fileExtensions.some((ext) => canonicalBaseDir.endsWith(`.${ext.replace(/^\./, "")}`));
-      const matches = !fileMatchesExtensions
-        ? []
-        : isFileTarget
-          ? ripgrepResult.matches.map((match) => ({ ...match, file: reportedFilePath }))
-          : ripgrepResult.matches;
+      let matches = ripgrepResult.matches;
+      if (!fileMatchesExtensions) {
+        matches = [];
+      } else if (isFileTarget) {
+        matches = ripgrepResult.matches.map((match) => ({ ...match, file: reportedFilePath }));
+      }
       const truncated = fileMatchesExtensions ? ripgrepResult.truncated : false;
 
       if (mode === "hashline") {

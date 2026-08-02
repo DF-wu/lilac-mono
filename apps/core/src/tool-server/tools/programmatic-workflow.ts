@@ -147,6 +147,49 @@ function requestProgressTarget(context: RequestContext) {
   } as const;
 }
 
+function resolveWorkflowProgressTarget(
+  progress: z.output<typeof progressInputSchema> | undefined,
+  requestTarget: ReturnType<typeof requestProgressTarget>,
+): WorkflowRun["progressTarget"] {
+  if (progress?.client) {
+    return {
+      platform: progress.client,
+      channelId: progress.sessionId!,
+      replyToMessageId: null,
+    };
+  }
+  if (!requestTarget) return null;
+  return {
+    platform: requestTarget.platform,
+    channelId: requestTarget.sessionRef.channelId,
+    replyToMessageId: null,
+  };
+}
+
+function resolveScheduleTiming(
+  schedule: z.output<typeof scheduledTriggerDefinitionSchema>,
+  now: number,
+): { timestampAt: number | null; nextFireAt: number } {
+  switch (schedule.kind) {
+    case "timestamp": {
+      const timestampAt = typeof schedule.at === "number" ? schedule.at : Date.parse(schedule.at);
+      return { timestampAt, nextFireAt: timestampAt };
+    }
+    case "cron":
+      return {
+        timestampAt: null,
+        nextFireAt: computeNextCronAtMs(
+          {
+            expr: schedule.expression,
+            tz: schedule.timezone,
+            startAtMs: schedule.startAt,
+          },
+          now,
+        ),
+      };
+  }
+}
+
 function assertProjectScope(input: {
   canonicalProjectId: string;
   revision: WorkflowRevision;
@@ -539,39 +582,11 @@ export class ProgrammaticWorkflow implements ServerTool {
         jsonObjectSchema.parse({ idempotencyKey, triggerFingerprint }),
       )}`;
       const schedule = input.schedule;
-      const timestampAt =
-        schedule.kind === "timestamp"
-          ? typeof schedule.at === "number"
-            ? schedule.at
-            : Date.parse(schedule.at)
-          : null;
+      const { timestampAt, nextFireAt } = resolveScheduleTiming(schedule, now);
       if (schedule.kind === "timestamp" && !Number.isFinite(timestampAt)) {
         throw new Error(`Invalid workflow trigger timestamp: ${schedule.at}`);
       }
-      const nextFireAt =
-        schedule.kind === "timestamp"
-          ? (timestampAt ?? now)
-          : computeNextCronAtMs(
-              {
-                expr: schedule.expression,
-                tz: schedule.timezone,
-                startAtMs: schedule.startAt,
-              },
-              now,
-            );
-      const progressTarget = input.progress?.client
-        ? {
-            platform: input.progress.client,
-            channelId: input.progress.sessionId!,
-            replyToMessageId: null,
-          }
-        : requestTarget
-          ? {
-              platform: requestTarget.platform,
-              channelId: requestTarget.sessionRef.channelId,
-              replyToMessageId: null,
-            }
-          : null;
+      const progressTarget = resolveWorkflowProgressTarget(input.progress, requestTarget);
       const trigger: WorkflowTrigger = {
         triggerId,
         revisionId,
@@ -757,19 +772,7 @@ export class ProgrammaticWorkflow implements ServerTool {
       const runId = `wfrun:${canonicalJsonSha256(
         jsonObjectSchema.parse({ idempotencyKey, invocationFingerprint }),
       )}`;
-      const progressTarget = input.progress?.client
-        ? {
-            platform: input.progress.client,
-            channelId: input.progress.sessionId!,
-            replyToMessageId: null,
-          }
-        : requestTarget
-          ? {
-              platform: requestTarget.platform,
-              channelId: requestTarget.sessionRef.channelId,
-              replyToMessageId: null,
-            }
-          : null;
+      const progressTarget = resolveWorkflowProgressTarget(input.progress, requestTarget);
       const run: WorkflowRun = {
         runId,
         revisionId,

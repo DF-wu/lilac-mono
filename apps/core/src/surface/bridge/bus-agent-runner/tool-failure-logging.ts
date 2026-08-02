@@ -1,5 +1,7 @@
-import { redactSecrets } from "../../../tools/bash-safety/format";
 import type { Level1ToolFailureSummary, Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
+import { isRecord } from "@stanley2058/lilac-utils";
+
+import { redactSecrets } from "../../../tools/bash-safety/format";
 
 const SENSITIVE_KEYS = new Set([
   "authorization",
@@ -23,10 +25,6 @@ const SENSITIVE_KEYS = new Set([
 const DEFAULT_PREVIEW_MAX_CHARS = 4_000;
 
 export type ToolFailureSummary = Level1ToolFailureSummary;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function getStringField(value: unknown, key: string): string | undefined {
   if (!isRecord(value)) return undefined;

@@ -335,18 +335,27 @@ export function createCoreNamedClaudeRuntime(input: {
       const binding = bindingIsCompatible(sourceBinding, prepareContext.canonicalMessages)
         ? sourceBinding
         : null;
-      const selectionMode =
-        binding !== null ? "fork" : shouldReplayHistoricalPrefix ? "text-replay" : "fresh";
+      let selectionMode: "fork" | "text-replay" | "fresh";
+      if (binding !== null) {
+        selectionMode = "fork";
+      } else if (shouldReplayHistoricalPrefix) {
+        selectionMode = "text-replay";
+      } else {
+        selectionMode = "fresh";
+      }
+      let selectionReason: string;
+      if (binding !== null) {
+        selectionReason = "exact-binding";
+      } else if (sourceBinding !== null) {
+        selectionReason = "binding-mismatch";
+      } else if (shouldReplayHistoricalPrefix) {
+        selectionReason = "provider-history-replay";
+      } else {
+        selectionReason = "missing-binding";
+      }
       diagnostic("selection", {
         mode: selectionMode,
-        reason:
-          binding !== null
-            ? "exact-binding"
-            : sourceBinding === null
-              ? shouldReplayHistoricalPrefix
-                ? "provider-history-replay"
-                : "missing-binding"
-              : "binding-mismatch",
+        reason: selectionReason,
       });
       if (binding) {
         try {
@@ -415,12 +424,12 @@ export function createCoreNamedClaudeRuntime(input: {
         binding !== null &&
         cursor.canonicalMessageCount === binding.canonicalMessageCount &&
         cursor.canonicalPrefixHash === binding.canonicalHeadHash;
+      let storedNativeContextTokens = binding?.nativeContextTokens;
+      if (cursorMatches && !cursorIsBindingHead) {
+        storedNativeContextTokens = undefined;
+      }
       return owner.getNativeInputEstimateFloor({
-        storedNativeContextTokens: cursorMatches
-          ? cursorIsBindingHead
-            ? binding.nativeContextTokens
-            : undefined
-          : binding?.nativeContextTokens,
+        storedNativeContextTokens,
         unsynchronizedSuffixAndOverlayEstimate: estimateMessagesTokens([
           ...canonicalMessages.slice(synchronizedMessageCount),
           ...overlay,

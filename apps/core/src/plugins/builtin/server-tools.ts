@@ -153,6 +153,12 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
       }
       const getConfig = runtime.getConfig;
       const config = runtime.config;
+      let getMaxActiveRuns: (() => Promise<number>) | (() => number) | undefined;
+      if (getConfig) {
+        getMaxActiveRuns = async () => (await getConfig()).workflows.maxActiveRuns;
+      } else if (config) {
+        getMaxActiveRuns = () => config.workflows.maxActiveRuns;
+      }
       return {
         level2: [
           new ProgrammaticWorkflow({
@@ -160,11 +166,7 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
             store: runtime.durableWorkflowStore,
             bus: runtime.bus,
             progressCards: runtime.workflowProgressCards,
-            getMaxActiveRuns: getConfig
-              ? async () => (await getConfig()).workflows.maxActiveRuns
-              : config
-                ? () => config.workflows.maxActiveRuns
-                : undefined,
+            getMaxActiveRuns,
           }),
         ],
       };

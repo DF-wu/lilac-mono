@@ -52,12 +52,18 @@ export class McpOAuthProviderError extends Error {
     readonly serverId: string,
     operation: "start" | "complete" | "credentials",
   ) {
-    const action =
-      operation === "start"
-        ? "start MCP OAuth authorization"
-        : operation === "complete"
-          ? "complete MCP OAuth authorization"
-          : "load MCP OAuth client credentials";
+    let action: string;
+    switch (operation) {
+      case "start":
+        action = "start MCP OAuth authorization";
+        break;
+      case "complete":
+        action = "complete MCP OAuth authorization";
+        break;
+      case "credentials":
+        action = "load MCP OAuth client credentials";
+        break;
+    }
     super(`Could not ${action} for server ${JSON.stringify(serverId)}`);
     this.name = "McpOAuthProviderError";
   }

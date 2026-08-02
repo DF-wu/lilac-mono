@@ -204,11 +204,14 @@ class FakeTransport extends MiniLilacTransport {
     });
   }
 
-  override reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {
+  override async reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {
     this.reconnectCount += 1;
     this.calls.push("reconnect");
-    if (this.behavior.reconnectPromise !== undefined) return this.behavior.reconnectPromise;
-    return Promise.resolve(this.behavior.reconnectStream?.() ?? null);
+    const stream =
+      this.behavior.reconnectPromise !== undefined
+        ? await this.behavior.reconnectPromise
+        : (this.behavior.reconnectStream?.() ?? null);
+    return stream;
   }
 
   override steer(
@@ -4201,6 +4204,75 @@ describe("Controller effect wiring", () => {
     await flush();
 
     expect(seen).toEqual([{ revision: 0, todos: [] }, latest]);
+    controller.dispose();
+  });
+});
+
+describe("Controller stream normalization", () => {
+  it("keeps state unchanged and continues rendering after an unsupported transport chunk", async () => {
+    const encoder = new TextEncoder();
+    const connected = deferred<void>();
+    const firstText = deferred<void>();
+    const continuedText = deferred<void>();
+    let source: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const fetch = Object.assign(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              source = controller;
+              connected.resolve();
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      { preconnect() {} },
+    );
+    const transport = new MiniLilacTransport({ baseUrl: "/mini", fetch });
+    const controller = new Controller({
+      transport,
+      ui: {
+        onState: () => {},
+        onOutput: (entries) => {
+          const text = entries.map((entry) => entry.text).join("\n");
+          if (text === "before") firstText.resolve();
+          if (text === "before after") continuedText.resolve();
+        },
+      },
+      sessionId: "session-1",
+      initialSnapshot: {
+        ...idleSnapshot("history-1"),
+        activeRunId: "run-1",
+        status: "streaming",
+      },
+      onExit: () => {},
+    });
+
+    controller.start();
+    await connected.promise;
+    if (source === undefined) throw new Error("expected stream source");
+    source.enqueue(
+      encoder.encode(
+        `data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "before" })}\n\n`,
+      ),
+    );
+    await firstText.promise;
+    const stateBeforeUnsupported = controller.inputState;
+
+    source.enqueue(
+      encoder.encode(
+        [
+          `data: ${JSON.stringify({ type: "future-observation", payload: { opaque: true } })}`,
+          `data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: " after" })}`,
+          "",
+        ].join("\n\n"),
+      ),
+    );
+    await continuedText.promise;
+
+    expect(controller.inputState).toBe(stateBeforeUnsupported);
+    expect(controller.inputState.phase).toBe("active");
+    expect(controller.transcript.map((entry) => entry.text)).toEqual(["before after"]);
     controller.dispose();
   });
 });

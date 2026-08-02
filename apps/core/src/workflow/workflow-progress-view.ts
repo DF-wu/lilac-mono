@@ -140,6 +140,22 @@ function addOperationSummary(
   else if (summary.state === "cancelled") counts.cancelled += summary.count;
 }
 
+function agentUsageCount(summary: WorkflowOperationProgressSummary): number {
+  switch (summary.state) {
+    case "queued":
+      return 0;
+    case "cancelled":
+      return summary.startedCount;
+    case "dispatched":
+    case "running":
+    case "blocked":
+    case "succeeded":
+    case "failed":
+    case "timed_out":
+      return summary.count;
+  }
+}
+
 function summarizePhases(
   summaries: readonly WorkflowOperationProgressSummary[],
   sensitive: boolean,
@@ -178,13 +194,18 @@ export async function buildWorkflowProgressView(input: {
     .sort((left, right) => left.createdAt - right.createdAt)
     .map((wait): WorkflowProgressWait => {
       const operation = input.store.getOperation(run.runId, wait.operationId);
+      let prompt: string;
+      switch (wait.match.kind) {
+        case "reply":
+          prompt = sensitive ? "Waiting for your reply" : (operation?.label ?? "Waiting for reply");
+          break;
+        case "sleep":
+          prompt = sensitive ? "Waiting" : (operation?.label ?? "Waiting");
+          break;
+      }
       return {
         kind: wait.match.kind,
-        prompt: sensitive
-          ? wait.match.kind === "reply"
-            ? "Waiting for your reply"
-            : "Waiting"
-          : (operation?.label ?? (wait.match.kind === "reply" ? "Waiting for reply" : "Waiting")),
+        prompt,
         dueAt: wait.dueAt,
         deadlineAt: wait.deadlineAt,
         requiresReplyToMessage: wait.match.kind === "reply" && wait.match.messageId !== null,
@@ -213,16 +234,7 @@ export async function buildWorkflowProgressView(input: {
     recentOperations: visibleOperations,
     waits,
     agents: {
-      used: agentSummaries.reduce(
-        (total, summary) =>
-          total +
-          (summary.state === "queued"
-            ? 0
-            : summary.state === "cancelled"
-              ? summary.startedCount
-              : summary.count),
-        0,
-      ),
+      used: agentSummaries.reduce((total, summary) => total + agentUsageCount(summary), 0),
       active: agentSummaries
         .filter((summary) => ["dispatched", "running"].includes(summary.state))
         .reduce((total, summary) => total + summary.count, 0),

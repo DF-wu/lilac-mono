@@ -80,6 +80,15 @@ type ActiveSessionState = {
   activeOutputMessageIds: Set<string>;
 };
 
+function resolveTriggerType(input: {
+  replyToBot: boolean | undefined;
+  mentionsBot: boolean | undefined;
+}): "reply" | "mention" | undefined {
+  if (input.replyToBot) return "reply";
+  if (input.mentionsBot) return "mention";
+  return undefined;
+}
+
 function uniqueParticipantUserIds(input: {
   values: readonly (string | undefined)[];
   exclude: string;
@@ -971,7 +980,7 @@ export async function startBusRequestRouter(params: {
         }),
         sessionId,
         triggerMsgRef: msgRef,
-        triggerType: replyToBot ? "reply" : mentionsBot ? "mention" : undefined,
+        triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
         modelOverride: requestModelOverride,
@@ -1109,11 +1118,7 @@ export async function startBusRequestRouter(params: {
       messageId: msgRef.messageId,
     });
 
-    const triggerType: "mention" | "reply" | undefined = replyToBot
-      ? "reply"
-      : mentionsBot
-        ? "mention"
-        : undefined;
+    const triggerType = resolveTriggerType({ replyToBot, mentionsBot });
 
     // DMs are ungated: start a new request immediately.
     await publishActiveChannelPrompt({
@@ -1209,7 +1214,7 @@ export async function startBusRequestRouter(params: {
         }),
         sessionId,
         triggerMsgRef: msgRef,
-        triggerType: replyToBot ? "reply" : mentionsBot ? "mention" : undefined,
+        triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
         parentChannelId,
@@ -1640,7 +1645,7 @@ export async function startBusRequestRouter(params: {
       continueCount,
     });
 
-    const triggerType = replyToBot ? "reply" : mentionsBot ? "mention" : null;
+    const triggerType = resolveTriggerType({ replyToBot, mentionsBot }) ?? null;
 
     if (!triggerType) {
       // Mention-only channels: ignore non-triggers (even if a request is active).

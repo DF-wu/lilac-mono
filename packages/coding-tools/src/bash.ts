@@ -630,12 +630,12 @@ export async function executeLocalBash(
     const stderrTruncated = options.mergeOutput
       ? false
       : stderrStreamResult.totalBytes > budgets.stderr;
-    const executionError: BashExecutionError | undefined =
-      termination?.type === "timeout"
-        ? { ...termination, signal: "SIGTERM" }
-        : termination?.type === "aborted"
-          ? { type: "aborted", signal: "SIGTERM" }
-          : undefined;
+    let executionError: BashExecutionError | undefined;
+    if (termination?.type === "timeout") {
+      executionError = { ...termination, signal: "SIGTERM" };
+    } else if (termination?.type === "aborted") {
+      executionError = { type: "aborted", signal: "SIGTERM" };
+    }
     let truncation: BashTruncation | undefined;
     if (options.artifactIntegration && (stdoutTruncated || stderrTruncated)) {
       let retentionStatus: BashTruncationRetentionStatus;
