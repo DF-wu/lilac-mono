@@ -193,6 +193,7 @@ export const workflowCompletionTargetSchema = z.discriminatedUnion("kind", [
     childSessionId: idSchema,
     profile: workflowAgentProfileSchema,
     sessionName: idSchema,
+    stableNamedContinuation: z.literal(true).optional(),
     depth: z.number().int().positive().max(64),
     reasoning: z
       .enum(["provider-default", "none", "minimal", "low", "medium", "high", "xhigh"])

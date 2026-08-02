@@ -144,6 +144,7 @@ plugins:
 
 - Text and JSON returned to the model are bounded by `tools.output.maxPreviewBytes` after `toModelOutput` conversion.
 - Oversized text and JSON are preserved as transient, session-owned `tool-result://` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read_file`.
+- Core's trusted built-in `read_file` is the exception: it bounds only its textual payload by actual UTF-8 bytes, returns an exact continuation, and is excluded from settled batch aggregate budgeting. External tools named `read_file` do not receive this trust.
 - Media and provider-reference content parts are not converted into text artifacts.
 - Truncation does not change whether the tool execution succeeded or failed.
 - Level 1 tools are batch-callable by default. Set `supportsBatch: false` when a tool must not be expanded into a batch child.

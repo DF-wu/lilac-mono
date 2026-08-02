@@ -363,8 +363,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     ) {
       throw new Error(`Workflow run ${runId} has no supported durable progress target`);
     }
-    const adapter = this.input.adapters.get(target.platform);
-    if (!adapter) throw new Error(`Workflow progress adapter is unavailable: ${target.platform}`);
+    const platform = target.platform;
+    const adapter = this.input.adapters.get(platform);
+    if (!adapter) throw new Error(`Workflow progress adapter is unavailable: ${platform}`);
 
     let existing = this.input.store.getSurfaceBinding(runId);
     if (!existing) {
@@ -410,7 +411,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     const content = limitContentText(
       renderWorkflowProgressView({
         view,
-        platform: target.platform,
+        platform,
         actions: toSurfaceActions({ view, actionIds: issued.ids }),
       }),
     );
@@ -421,25 +422,39 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         revision: view.revision.sourceSha256,
       }),
     );
-    if (messageRef && existing.lastRenderedSha256 === renderedSha256) return messageRef;
+    const probeTelegramRemotely = messageRef !== null && verifyExisting && platform === "telegram";
+    if (messageRef && existing.lastRenderedSha256 === renderedSha256 && !probeTelegramRemotely) {
+      return messageRef;
+    }
 
+    let editTargetMissing = false;
     try {
-      const projectedRef = messageRef
-        ? (await adapter.editMsg(messageRef, content), messageRef)
-        : await adapter.sendMsg(
-            asSessionRef(target.platform, target.channelId),
-            content,
-            target.replyToMessageId
-              ? {
-                  replyTo: asSupportedMsgRef(
-                    target.platform,
-                    target.channelId,
-                    target.replyToMessageId,
-                  ),
-                  silent: true,
-                }
-              : { silent: true },
-          );
+      const sendCard = async (): Promise<MsgRef> =>
+        await adapter.sendMsg(
+          asSessionRef(platform, target.channelId),
+          content,
+          target.replyToMessageId
+            ? {
+                replyTo: asSupportedMsgRef(platform, target.channelId, target.replyToMessageId),
+                silent: true,
+              }
+            : { silent: true },
+        );
+      let projectedRef: MsgRef;
+      if (!messageRef) {
+        projectedRef = await sendCard();
+      } else {
+        try {
+          await adapter.editMsg(messageRef, content);
+          projectedRef = messageRef;
+        } catch (error) {
+          editTargetMissing =
+            error instanceof SurfaceMessageNotFoundError ||
+            (error instanceof GithubApiError && error.status === 404);
+          if (!editTargetMissing || !probeTelegramRemotely) throw error;
+          projectedRef = await sendCard();
+        }
+      }
       this.input.store.commitSurfaceProjection({
         binding: {
           ...existing,
@@ -458,10 +473,11 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       return projectedRef;
     } catch (error) {
       const createdRef = error instanceof GithubMessageCreatedError ? error.messageRef : null;
-      const editTargetMissing =
+      editTargetMissing ||= Boolean(
         messageRef !== null &&
         (error instanceof SurfaceMessageNotFoundError ||
-          (error instanceof GithubApiError && error.status === 404));
+          (error instanceof GithubApiError && error.status === 404)),
+      );
       this.writeFailure(existing, error, now, {
         messageRef: editTargetMissing ? null : (createdRef ?? messageRef),
         lastRenderedSha256: editTargetMissing ? null : existing.lastRenderedSha256,

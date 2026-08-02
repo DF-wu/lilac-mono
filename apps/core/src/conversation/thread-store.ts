@@ -55,6 +55,25 @@ export type ConversationThreadRow = {
   embedding_input_hash: string | null;
   summary_version: number;
   embedding_version: number;
+  maintenance_attempted_at: number | null;
+  maintenance_retry_after: number | null;
+};
+
+export type ConversationThreadSummarizationEligibilityReason =
+  | "forced"
+  | "never-summarized"
+  | "content-changed"
+  | "summary-version"
+  | "embedding-missing"
+  | "embedding-outdated"
+  | "embedding-version"
+  | "embedding-model";
+
+export type ConversationThreadSummarizationEligibility = {
+  thread: ConversationThreadRow;
+  reasons: ConversationThreadSummarizationEligibilityReason[];
+  summaryIsStale: boolean;
+  embeddingIsStale: boolean;
 };
 
 export type ConversationThreadSummaryRow = {
@@ -737,7 +756,9 @@ export class ConversationThreadStore {
         summary_prompt_context_hash TEXT,
         embedding_input_hash TEXT,
         summary_version INTEGER NOT NULL DEFAULT ${CONVERSATION_THREAD_SUMMARY_VERSION},
-        embedding_version INTEGER NOT NULL DEFAULT ${CONVERSATION_THREAD_EMBEDDING_VERSION}
+        embedding_version INTEGER NOT NULL DEFAULT ${CONVERSATION_THREAD_EMBEDDING_VERSION},
+        maintenance_attempted_at INTEGER,
+        maintenance_retry_after INTEGER
       );
     `);
 
@@ -755,6 +776,20 @@ export class ConversationThreadStore {
       this.db.run(`
         ALTER TABLE conversation_threads
         ADD COLUMN summary_prompt_context_hash TEXT;
+      `);
+    }
+
+    if (!this.tableHasColumn("conversation_threads", "maintenance_attempted_at")) {
+      this.db.run(`
+        ALTER TABLE conversation_threads
+        ADD COLUMN maintenance_attempted_at INTEGER;
+      `);
+    }
+
+    if (!this.tableHasColumn("conversation_threads", "maintenance_retry_after")) {
+      this.db.run(`
+        ALTER TABLE conversation_threads
+        ADD COLUMN maintenance_retry_after INTEGER;
       `);
     }
 
@@ -1048,19 +1083,17 @@ export class ConversationThreadStore {
         const result = this.db.run(
           `
           UPDATE conversation_threads
-          SET updated_at = CASE WHEN updated_at < ? THEN ? ELSE updated_at END,
-              last_summarized_at = NULL,
-              last_embedded_at = NULL,
+          SET updated_at = MAX(updated_at, ?, COALESCE(last_summarized_at + 1, 0)),
               summary_input_hash = ?,
-              summary_prompt_context_hash = NULL,
-              embedding_input_hash = NULL
+              maintenance_attempted_at = NULL,
+              maintenance_retry_after = NULL
           WHERE thread_id IN (
             SELECT thread_id
             FROM conversation_thread_messages
             WHERE channel_id = ? AND message_id = ?
           )
           `,
-          [updatedAt, updatedAt, contentRevision, input.channelId, messageId],
+          [updatedAt, contentRevision, input.channelId, messageId],
         );
         changed += result.changes;
       }
@@ -1121,8 +1154,10 @@ export class ConversationThreadStore {
         summary_prompt_context_hash,
         embedding_input_hash,
         summary_version,
-        embedding_version
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        embedding_version,
+        maintenance_attempted_at,
+        maintenance_retry_after
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(thread_id) DO UPDATE SET
         channel_id=excluded.channel_id,
         guild_id=excluded.guild_id,
@@ -1134,25 +1169,21 @@ export class ConversationThreadStore {
         end_ts=excluded.end_ts,
         message_count=excluded.message_count,
         updated_at=excluded.updated_at,
-        last_summarized_at=CASE
-          WHEN excluded.summary_input_hash = conversation_threads.summary_input_hash THEN conversation_threads.last_summarized_at
-          ELSE NULL
-        END,
-        last_embedded_at=CASE
-          WHEN excluded.summary_input_hash = conversation_threads.summary_input_hash THEN conversation_threads.last_embedded_at
-          ELSE NULL
-        END,
+        last_summarized_at=conversation_threads.last_summarized_at,
+        last_embedded_at=conversation_threads.last_embedded_at,
         summary_input_hash=excluded.summary_input_hash,
-        summary_prompt_context_hash=CASE
-          WHEN excluded.summary_input_hash = conversation_threads.summary_input_hash THEN conversation_threads.summary_prompt_context_hash
+        summary_prompt_context_hash=conversation_threads.summary_prompt_context_hash,
+        embedding_input_hash=conversation_threads.embedding_input_hash,
+        summary_version=conversation_threads.summary_version,
+        embedding_version=conversation_threads.embedding_version,
+        maintenance_attempted_at=CASE
+          WHEN excluded.summary_input_hash = conversation_threads.summary_input_hash THEN conversation_threads.maintenance_attempted_at
           ELSE NULL
         END,
-        embedding_input_hash=CASE
-          WHEN excluded.summary_input_hash = conversation_threads.summary_input_hash THEN conversation_threads.embedding_input_hash
+        maintenance_retry_after=CASE
+          WHEN excluded.summary_input_hash = conversation_threads.summary_input_hash THEN conversation_threads.maintenance_retry_after
           ELSE NULL
-        END,
-        summary_version=excluded.summary_version,
-        embedding_version=excluded.embedding_version;
+        END;
       `,
       [
         input.threadId,
@@ -1166,7 +1197,12 @@ export class ConversationThreadStore {
         last.ts,
         input.messages.length,
         hashChanged
-          ? Math.max(updatedAt, existing?.updated_at ?? 0, now)
+          ? Math.max(
+              updatedAt,
+              existing?.updated_at ?? 0,
+              now,
+              (existing?.last_summarized_at ?? -1) + 1,
+            )
           : (existing?.updated_at ?? updatedAt),
         existing?.last_summarized_at ?? null,
         existing?.last_embedded_at ?? null,
@@ -1175,6 +1211,8 @@ export class ConversationThreadStore {
         existing?.embedding_input_hash ?? null,
         CONVERSATION_THREAD_SUMMARY_VERSION,
         CONVERSATION_THREAD_EMBEDDING_VERSION,
+        null,
+        null,
       ],
     );
 
@@ -1363,7 +1401,9 @@ export class ConversationThreadStore {
             summary_prompt_context_hash = NULL,
             embedding_input_hash = NULL,
             summary_version = ?,
-            embedding_version = ?
+            embedding_version = ?,
+            maintenance_attempted_at = NULL,
+            maintenance_retry_after = NULL
         WHERE ${filter.sql}
         `,
         [
@@ -1386,57 +1426,63 @@ export class ConversationThreadStore {
     afterTs?: number;
     includeEmbeddingStale?: boolean;
     embeddingModelId?: string;
-    summaryPromptContextHash?: string;
     force?: boolean;
-  }): ConversationThreadRow[] {
+  }): ConversationThreadSummarizationEligibility[] {
     const now = input?.now ?? Date.now();
     const quietMs = input?.quietMs ?? 60 * 60 * 1000;
-    const values: Array<string | number> = [now - quietMs];
-    const shouldCheckPromptContext = input?.force !== true && !!input?.summaryPromptContextHash;
-    const promptContextClause = shouldCheckPromptContext
-      ? "OR t.summary_prompt_context_hash IS NULL OR t.summary_prompt_context_hash != ?"
-      : "";
-    if (shouldCheckPromptContext) values.push(input.summaryPromptContextHash!);
-    const shouldCheckEmbeddingModel =
-      input?.force !== true && input?.includeEmbeddingStale && !!input.embeddingModelId;
-    const embeddingModelClause = shouldCheckEmbeddingModel
-      ? `OR NOT EXISTS (
+    const embeddingModelId =
+      input?.force !== true && input?.includeEmbeddingStale === true
+        ? input.embeddingModelId
+        : undefined;
+    const embeddingModelSelect = embeddingModelId
+      ? `, EXISTS (
           SELECT 1
-          FROM conversation_thread_embeddings e
-          WHERE e.thread_id = t.thread_id
-            AND e.model_id = ?
-        )`
-      : "";
-    if (shouldCheckEmbeddingModel) values.push(input.embeddingModelId!);
-    const staleClause = input?.force
-      ? "1 = 1"
-      : input?.includeEmbeddingStale
-        ? `(
-          t.last_summarized_at IS NULL
-          OR t.last_summarized_at < t.updated_at
-          OR t.summary_version != ${CONVERSATION_THREAD_SUMMARY_VERSION}
-          ${promptContextClause}
-          OR (
-            t.last_summarized_at IS NOT NULL
-            AND (
-              t.last_embedded_at IS NULL
-              OR t.last_embedded_at < t.last_summarized_at
-              OR t.embedding_version != ${CONVERSATION_THREAD_EMBEDDING_VERSION}
-              ${embeddingModelClause}
-            )
-          )
-        )`
-        : `(
-          t.last_summarized_at IS NULL
-          OR t.last_summarized_at < t.updated_at
-          OR t.summary_version != ${CONVERSATION_THREAD_SUMMARY_VERSION}
-          ${promptContextClause}
-        )`;
+          FROM conversation_thread_embeddings selected_embedding
+          WHERE selected_embedding.thread_id = t.thread_id
+            AND selected_embedding.model_id = ?
+        ) AS has_embedding_model`
+      : ", 0 AS has_embedding_model";
+    const values: Array<string | number> = [];
+    if (embeddingModelId) values.push(embeddingModelId);
+    values.push(now - quietMs);
     const clauses = [
       "(CASE WHEN t.last_summarized_at IS NULL THEN t.end_ts ELSE t.updated_at END) <= ?",
       "t.message_count > 1",
-      staleClause,
     ];
+    if (input?.force !== true) {
+      clauses.push("(t.maintenance_retry_after IS NULL OR t.maintenance_retry_after <= ?)");
+      values.push(now);
+      const embeddingModelClause = embeddingModelId
+        ? `OR NOT EXISTS (
+            SELECT 1
+            FROM conversation_thread_embeddings e
+            WHERE e.thread_id = t.thread_id AND e.model_id = ?
+          )`
+        : "";
+      clauses.push(
+        input?.includeEmbeddingStale === true
+          ? `(
+              t.last_summarized_at IS NULL
+              OR t.last_summarized_at < t.updated_at
+              OR t.summary_version != ${CONVERSATION_THREAD_SUMMARY_VERSION}
+              OR (
+                t.last_summarized_at IS NOT NULL
+                AND (
+                  t.last_embedded_at IS NULL
+                  OR t.last_embedded_at < t.last_summarized_at
+                  OR t.embedding_version != ${CONVERSATION_THREAD_EMBEDDING_VERSION}
+                  ${embeddingModelClause}
+                )
+              )
+            )`
+          : `(
+              t.last_summarized_at IS NULL
+              OR t.last_summarized_at < t.updated_at
+              OR t.summary_version != ${CONVERSATION_THREAD_SUMMARY_VERSION}
+            )`,
+      );
+      if (embeddingModelId) values.push(embeddingModelId);
+    }
 
     if (input?.threadId) {
       clauses.push("t.thread_id = ?");
@@ -1451,16 +1497,122 @@ export class ConversationThreadStore {
       values.push(input.afterTs);
     }
 
-    return this.db
+    const candidates = this.db
       .query(
         `
-        SELECT t.*
+        SELECT t.* ${embeddingModelSelect}
         FROM conversation_threads t
         WHERE ${clauses.join(" AND ")}
-        ORDER BY t.updated_at ASC, t.thread_id ASC
+        ORDER BY
+          CASE WHEN t.maintenance_retry_after IS NOT NULL THEN 0 ELSE 1 END ASC,
+          t.maintenance_retry_after ASC,
+          COALESCE(t.maintenance_attempted_at, 0) ASC,
+          t.updated_at ASC,
+          t.thread_id ASC
         `,
       )
-      .all(...values) as ConversationThreadRow[];
+      .all(...values) as Array<ConversationThreadRow & { has_embedding_model: number }>;
+
+    return candidates.flatMap((candidate): ConversationThreadSummarizationEligibility[] => {
+      const { has_embedding_model: hasEmbeddingModel, ...thread } = candidate;
+      const reasons: ConversationThreadSummarizationEligibilityReason[] = [];
+      if (input?.force === true) {
+        reasons.push("forced");
+      } else {
+        if (thread.last_summarized_at === null) reasons.push("never-summarized");
+        if (thread.last_summarized_at !== null && thread.last_summarized_at < thread.updated_at) {
+          reasons.push("content-changed");
+        }
+        if (thread.summary_version !== CONVERSATION_THREAD_SUMMARY_VERSION) {
+          reasons.push("summary-version");
+        }
+      }
+
+      const summaryIsStale = reasons.length > 0;
+      const embeddingReasons: ConversationThreadSummarizationEligibilityReason[] = [];
+      if (
+        input?.force !== true &&
+        input?.includeEmbeddingStale === true &&
+        thread.last_summarized_at !== null
+      ) {
+        if (thread.last_embedded_at === null) embeddingReasons.push("embedding-missing");
+        if (
+          thread.last_embedded_at !== null &&
+          thread.last_embedded_at < thread.last_summarized_at
+        ) {
+          embeddingReasons.push("embedding-outdated");
+        }
+        if (thread.embedding_version !== CONVERSATION_THREAD_EMBEDDING_VERSION) {
+          embeddingReasons.push("embedding-version");
+        }
+        if (input.embeddingModelId && hasEmbeddingModel !== 1) {
+          embeddingReasons.push("embedding-model");
+        }
+      }
+
+      reasons.push(...embeddingReasons);
+      if (reasons.length === 0) return [];
+      return [
+        {
+          thread,
+          reasons,
+          summaryIsStale,
+          embeddingIsStale: embeddingReasons.length > 0,
+        },
+      ];
+    });
+  }
+
+  markMaintenanceAttempt(input: {
+    threadId: string;
+    summaryInputHash: string | null;
+    attemptedAt?: number;
+  }): boolean {
+    const result = this.db.run(
+      `
+      UPDATE conversation_threads
+      SET maintenance_attempted_at = ?, maintenance_retry_after = NULL
+      WHERE thread_id = ? AND summary_input_hash IS ?
+      `,
+      [input.attemptedAt ?? Date.now(), input.threadId, input.summaryInputHash],
+    );
+    return result.changes === 1;
+  }
+
+  markMaintenanceFailure(input: {
+    threadId: string;
+    summaryInputHash: string | null;
+    attemptedAt: number;
+    retryAfter: number;
+  }): boolean {
+    const result = this.db.run(
+      `
+      UPDATE conversation_threads
+      SET maintenance_retry_after = ?
+      WHERE thread_id = ?
+        AND summary_input_hash IS ?
+        AND maintenance_attempted_at = ?
+      `,
+      [input.retryAfter, input.threadId, input.summaryInputHash, input.attemptedAt],
+    );
+    return result.changes === 1;
+  }
+
+  clearMaintenanceFailure(input: {
+    threadId: string;
+    summaryInputHash: string | null;
+    attemptedAt: number;
+  }): void {
+    this.db.run(
+      `
+      UPDATE conversation_threads
+      SET maintenance_retry_after = NULL
+      WHERE thread_id = ?
+        AND summary_input_hash IS ?
+        AND maintenance_attempted_at = ?
+      `,
+      [input.threadId, input.summaryInputHash, input.attemptedAt],
+    );
   }
 
   upsertSummary(

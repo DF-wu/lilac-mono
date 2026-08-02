@@ -16,6 +16,7 @@ import {
   type WorkflowRun,
   type WorkflowTrigger,
 } from "../../src/workflow/workflow-domain";
+import { workflowResolvedModelRequestSchema } from "../../src/workflow/workflow-request-authority";
 
 function dbPath(label: string): string {
   return join(tmpdir(), `lilac-workflow-${label}-${crypto.randomUUID()}.sqlite`);
@@ -80,6 +81,32 @@ function run(id = "run-1", revisionId = "revision-1"): WorkflowRun {
     startedAt: null,
     updatedAt: 10,
     terminalAt: null,
+  };
+}
+
+function liveParentRun(id: string, parentRequestId: string): WorkflowRun {
+  return {
+    ...run(id),
+    completionTarget: {
+      kind: "live_parent",
+      parentRequestId,
+      parentSessionId: "session-1",
+      parentRequestClient: "discord",
+      parentToolCallId: `tool-${id}`,
+      childRequestId: `child-${id}`,
+      childSessionId: `child-session-${id}`,
+      profile: "general",
+      sessionName: `session-${id}`,
+      depth: 1,
+      reasoning: null,
+      fallbackToSurface: true,
+      fallbackProgressTarget: {
+        platform: "discord",
+        channelId: "session-1",
+        replyToMessageId: null,
+      },
+      deferredDelivery: true,
+    },
   };
 }
 
@@ -270,8 +297,8 @@ describe("durable workflow store minimal dispatch schema", () => {
         "running",
       );
       expect(store.listMigrations().at(-1)).toMatchObject({
-        version: 23,
-        name: "unbounded workflow v4 contract",
+        version: 24,
+        name: "durable orphaned live-parent delivery",
       });
     } finally {
       store.close();
@@ -338,6 +365,112 @@ describe("durable workflow store minimal dispatch schema", () => {
       ]);
     } finally {
       db.close();
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("atomically orphans unreachable live-parent runs while retaining reachable chains", () => {
+    const file = dbPath("live-parent-orphans");
+    const store = new DurableWorkflowStore(file);
+    try {
+      store.createRevision(revision());
+      expect(store.createRun(liveParentRun("reachable", "root-parent"))).toBe(true);
+      expect(store.createRun(liveParentRun("nested", "workflow-request"))).toBe(true);
+      expect(store.createRun(liveParentRun("active-orphan", "missing-parent"))).toBe(true);
+      expect(store.createRun(liveParentRun("terminal-orphan", "missing-parent"))).toBe(true);
+
+      expect(
+        store.tryClaimRun({ runId: "reachable", claimerId: "worker", now: 20 }),
+      ).not.toBeNull();
+      expect(
+        store.createOperation(
+          {
+            ...operation("reachable", "agent-op"),
+            state: "running",
+            requestId: "workflow-request",
+          },
+          "worker",
+        ),
+      ).toBe(true);
+      expect(
+        store.transitionRun({
+          runId: "terminal-orphan",
+          from: "queued",
+          to: "running",
+          now: 21,
+        }),
+      ).toBe(true);
+      expect(
+        store.transitionRun({
+          runId: "terminal-orphan",
+          from: "running",
+          to: "succeeded",
+          now: 22,
+          result: "completed without a parent",
+        }),
+      ).toBe(true);
+
+      const orphaned = store.reconcileOrphanedLiveParentRuns({
+        resolvableParentRequestIds: ["root-parent"],
+        now: 30,
+        detail: "parent request unavailable",
+      });
+
+      expect(orphaned.map((entry) => entry.run.runId)).toEqual([
+        "active-orphan",
+        "terminal-orphan",
+      ]);
+      expect(store.getRun("reachable")?.state).toBe("running");
+      expect(store.getRun("nested")?.state).toBe("queued");
+      expect(store.getRun("active-orphan")).toMatchObject({
+        state: "cancelled",
+        terminalDetail: "parent request unavailable",
+      });
+      expect(store.getRun("terminal-orphan")).toMatchObject({
+        state: "succeeded",
+        result: "completed without a parent",
+      });
+      expect(store.getLiveParentDeliveryState("reachable")).toBe("pending");
+      expect(store.getLiveParentDeliveryState("nested")).toBe("pending");
+      expect(store.getLiveParentDeliveryState("active-orphan")).toBe("orphaned");
+      expect(store.getLiveParentDeliveryState("terminal-orphan")).toBe("orphaned");
+      expect(
+        store.reconcileOrphanedLiveParentRuns({
+          resolvableParentRequestIds: ["root-parent"],
+          now: 31,
+          detail: "parent request unavailable",
+        }),
+      ).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("retires previously committed live-parent surface fallbacks during migration", () => {
+    const file = dbPath("retire-live-parent-fallback");
+    const initial = new DurableWorkflowStore(file);
+    initial.createRevision(revision());
+    expect(initial.createRun(liveParentRun("legacy-fallback", "missing-parent"))).toBe(true);
+    initial.close();
+
+    const db = new Database(file);
+    db.run(
+      `UPDATE workflow_completion_deliveries SET state = 'fallback', delivered_at = 20
+       WHERE run_id = 'legacy-fallback'`,
+    );
+    db.run(`UPDATE workflow_runs SET progress_target_json = ? WHERE run_id = 'legacy-fallback'`, [
+      JSON.stringify({ platform: "discord", channelId: "session-1", replyToMessageId: null }),
+    ]);
+    downgradeSchemaToV21(db);
+    db.close();
+
+    const migrated = new DurableWorkflowStore(file);
+    try {
+      expect(migrated.getLiveParentDeliveryState("legacy-fallback")).toBe("orphaned");
+      expect(migrated.getRun("legacy-fallback")?.progressTarget).toBeNull();
+    } finally {
+      migrated.close();
       rmSync(file, { force: true });
     }
   });
@@ -636,7 +769,7 @@ describe("durable workflow store minimal dispatch schema", () => {
     }
   });
 
-  it("pins the exact resolved model request across dispatch epochs", () => {
+  it("ignores fallbacks but pins every head field across dispatch epochs", () => {
     const file = dbPath("resolved-model-pinning");
     const store = new DurableWorkflowStore(file);
     try {
@@ -655,6 +788,14 @@ describe("durable workflow store minimal dispatch schema", () => {
           provider: "provider",
           modelId: "model-a",
           reasoningDisplay: "simple" as const,
+          fallbacks: [
+            {
+              spec: "provider/fallback-a",
+              provider: "provider",
+              modelId: "fallback-a",
+              reasoningDisplay: "simple" as const,
+            },
+          ],
         },
         cwd: "/workspace",
         originSession: {
@@ -678,6 +819,38 @@ describe("durable workflow store minimal dispatch schema", () => {
         }),
       ).toMatchObject({ state: "dispatched" });
       expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(policy);
+      const refreshedFallbackPolicy = {
+        ...policy,
+        dispatchEpoch: "b".repeat(32),
+        resolvedModelRequest: {
+          ...policy.resolvedModelRequest,
+          fallbacks: [
+            {
+              spec: "provider/fallback-b",
+              provider: "provider",
+              modelId: "fallback-b",
+              reasoning: "high" as const,
+              reasoningDisplay: "detailed" as const,
+            },
+          ],
+        },
+      };
+      expect(
+        store.authorizeAgentDispatch({
+          requestId: "agent-request",
+          runId: "run-1",
+          operationId: "operation-1",
+          runOwnerId: "worker-1",
+          sessionId: "workflow:run-1:operation-1",
+          platform: "unknown",
+          policy: refreshedFallbackPolicy,
+          now: 22,
+          staleOwnerBefore: 22,
+        }),
+      ).toMatchObject({ state: "dispatched" });
+      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(
+        refreshedFallbackPolicy,
+      );
       expect(
         store.authorizeAgentDispatch({
           requestId: "agent-request",
@@ -687,22 +860,154 @@ describe("durable workflow store minimal dispatch schema", () => {
           sessionId: "workflow:run-1:operation-1",
           platform: "unknown",
           policy: {
-            ...policy,
-            dispatchEpoch: "b".repeat(32),
+            ...refreshedFallbackPolicy,
+            dispatchEpoch: "c".repeat(32),
             resolvedModelRequest: {
-              ...policy.resolvedModelRequest,
+              ...refreshedFallbackPolicy.resolvedModelRequest,
               spec: "provider/model-b",
               modelId: "model-b",
             },
           },
-          now: 22,
-          staleOwnerBefore: 22,
+          now: 23,
+          staleOwnerBefore: 23,
         }),
       ).toBeNull();
-      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(policy);
+      expect(store.getWorkflowRequestDispatchPolicy("agent-request")).toEqual(
+        refreshedFallbackPolicy,
+      );
     } finally {
       store.close();
       rmSync(file, { force: true });
     }
+  });
+
+  it("binds stable named continuation authority to the durable completion target", () => {
+    const file = dbPath("stable-named-policy");
+    const store = new DurableWorkflowStore(file);
+    try {
+      const childSessionId = "sub:parent-session:named:generated";
+      const namedRun: WorkflowRun = {
+        ...run(),
+        completionTarget: {
+          kind: "live_parent",
+          parentRequestId: "parent-request",
+          parentSessionId: "parent-session",
+          parentRequestClient: "discord",
+          parentToolCallId: "parent-tool",
+          childRequestId: "child-request",
+          childSessionId,
+          profile: "general",
+          sessionName: "generated",
+          stableNamedContinuation: true,
+          depth: 1,
+          reasoning: null,
+          fallbackToSurface: false,
+          fallbackProgressTarget: null,
+          deferredDelivery: true,
+        },
+      };
+      store.createInvocation({ revision: revision(), run: namedRun });
+      store.tryClaimRun({ runId: "run-1", claimerId: "worker-1", now: 20 });
+      store.createOperation(operation("run-1", "operation-1"), "worker-1");
+      const policy = {
+        runId: "run-1",
+        operationId: "operation-1",
+        dispatchEpoch: "a".repeat(32),
+        profile: "general" as const,
+        model: null,
+        reasoning: null,
+        resolvedModelRequest: {
+          spec: "provider/model-a",
+          provider: "provider",
+          modelId: "model-a",
+          reasoningDisplay: "simple" as const,
+        },
+        cwd: "/workspace",
+        originSession: {
+          requestId: namedRun.origin.requestId,
+          sessionId: namedRun.origin.sessionId,
+          client: namedRun.origin.client,
+          userId: namedRun.origin.userId,
+        },
+      };
+      const authorize = (stableNamedContinuation?: {
+        sessionId: string;
+        requestClient: "discord" | "github";
+      }) =>
+        store.authorizeAgentDispatch({
+          requestId: "agent-request",
+          runId: "run-1",
+          operationId: "operation-1",
+          runOwnerId: "worker-1",
+          sessionId: childSessionId,
+          platform: "unknown",
+          policy: { ...policy, stableNamedContinuation },
+          now: 21,
+          staleOwnerBefore: 21,
+        });
+
+      expect(authorize()).toBeNull();
+      expect(
+        authorize({
+          sessionId: childSessionId,
+          requestClient: "github",
+        }),
+      ).toBeNull();
+      expect(
+        authorize({
+          sessionId: childSessionId,
+          requestClient: "discord",
+        }),
+      ).toMatchObject({ state: "dispatched" });
+    } finally {
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("decodes legacy and flat fallback model requests but rejects recursive fallbacks", () => {
+    const legacy = {
+      spec: "provider/model-a",
+      provider: "provider",
+      modelId: "model-a",
+      reasoningDisplay: "simple" as const,
+    };
+    expect(workflowResolvedModelRequestSchema.parse(legacy)).toEqual(legacy);
+    expect(
+      workflowResolvedModelRequestSchema.parse({
+        ...legacy,
+        fallbacks: [
+          {
+            ...legacy,
+            reasoning: "high",
+            reasoningDisplay: "detailed",
+          },
+        ],
+      }),
+    ).toEqual({
+      ...legacy,
+      fallbacks: [{ ...legacy, reasoning: "high", reasoningDisplay: "detailed" }],
+    });
+    expect(
+      workflowResolvedModelRequestSchema.safeParse({
+        ...legacy,
+        fallbacks: [{ ...legacy, fallbacks: [] }],
+      }).success,
+    ).toBe(false);
+    expect(
+      workflowResolvedModelRequestSchema.safeParse({
+        ...legacy,
+        openaiServerCompaction: false,
+      }).success,
+    ).toBe(false);
+    expect(
+      workflowResolvedModelRequestSchema.safeParse({
+        ...legacy,
+        provider: "anthropic",
+        spec: "anthropic/claude-test",
+        modelId: "claude-test",
+        openaiServerCompaction: true,
+      }).success,
+    ).toBe(false);
   });
 });

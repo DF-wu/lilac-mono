@@ -14,6 +14,7 @@ import {
   resolveDiscordSearchDbPath,
   resolveTranscriptDbPath,
   toDurableResolvedModelRequest,
+  toDurableResolvedModelPlan,
 } from "@stanley2058/lilac-utils";
 import path from "node:path";
 import { watch, type FSWatcher } from "node:fs";
@@ -33,7 +34,12 @@ import type { SurfaceRefPlatform } from "../surface/types";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
 import { startBusRequestRouter } from "../surface/bridge/bus-request-router";
-import { resolveAgentRunModel, startBusAgentRunner } from "../surface/bridge/bus-agent-runner";
+import {
+  resolveAgentRunModel,
+  resolveAgentRunModelFallbacks,
+  isWorkflowAgentRecoveryEntry,
+  startBusAgentRunner,
+} from "../surface/bridge/bus-agent-runner";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
 import { DiscordSearchService, DiscordSearchStore } from "../surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
@@ -702,13 +708,43 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           if (conversationThreadSummarizationStopping) {
             throw new Error("conversation thread summarization is stopping");
           }
+          const trigger = input?.trigger ?? "manual";
           const runner =
             input?.dryRun === true || !stopConversationThreadSummarizationWorker
               ? threadService
               : stopConversationThreadSummarizationWorker;
+          const flushStartedAt = Date.now();
+          if (trigger === "periodic") {
+            logger.info("conversation thread periodic summarization dispatch started", {
+              limit: input?.limit,
+            });
+          }
           await conversationThreadMaterializer?.flush();
+          if (trigger === "periodic") {
+            logger.info("conversation thread periodic summarization materialization flushed", {
+              durationMs: Date.now() - flushStartedAt,
+            });
+          }
           if (conversationThreadSummarizationStopping) {
             throw new Error("conversation thread summarization is stopping");
+          }
+          if (
+            trigger === "periodic" &&
+            (await getCoreConfig()).conversation.thread.summarization.enabled !== true
+          ) {
+            logger.info("conversation thread periodic summarization cancelled after flush");
+            return {
+              dryRun: false,
+              refreshed: { channels: 0, threads: 0, messages: 0 },
+              eligible: 0,
+              eligibleTotal: 0,
+              eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+              cleared: 0,
+              summarized: 0,
+              failed: 0,
+              failures: [],
+              threadIds: [],
+            };
           }
           return await runner.runSummarization(input);
         },
@@ -1030,6 +1066,48 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         logger.info("GitHub App secret missing; skipping GitHub surface");
       }
 
+      const restartLoad = gracefulRestartStore?.loadAndConsumeCompletedSnapshotDetailed() ?? {
+        snapshot: null,
+        reason: "empty" as const,
+      };
+
+      const initialHeartbeatExternalState = restartLoad.snapshot
+        ? {
+            activeRequestIds: restartLoad.snapshot.agent
+              .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
+              .map((entry) => entry.requestId),
+          }
+        : undefined;
+
+      if (!restartLoad.snapshot && restartLoad.reason === "stale") {
+        logger.warn("Graceful restart snapshot discarded (stale)", {
+          createdAt: restartLoad.createdAt,
+          ageMs: restartLoad.ageMs,
+          deadlineMs: restartLoad.deadlineMs,
+        });
+      } else if (restartLoad.reason !== "empty" && restartLoad.reason !== "loaded") {
+        logger.warn("Graceful restart snapshot discarded", {
+          reason: restartLoad.reason,
+        });
+      }
+
+      const recoverableRootParentRequestIds =
+        restartLoad.snapshot?.agent
+          .filter(
+            (entry) =>
+              entry.kind === "active" &&
+              !isHeartbeatSessionId(entry.sessionId) &&
+              !isWorkflowAgentRecoveryEntry(entry),
+          )
+          .map((entry) => entry.requestId) ?? [];
+      const remainingSnapshotProtectionMs = restartLoad.snapshot
+        ? Math.max(1, restartLoad.snapshot.createdAt + restartLoad.snapshot.deadlineMs - Date.now())
+        : GRACEFUL_SNAPSHOT_TTL_MS;
+      await workflowLiveParentBridge.enableOrphanHandling({
+        protectedParentRequestIds: recoverableRootParentRequestIds,
+        protectionMs: remainingSnapshotProtectionMs,
+      });
+
       // Start agent runner last so it can't publish replies before relay is online.
       stopAgentRunner = await startBusAgentRunner({
         bus,
@@ -1049,16 +1127,18 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
             await Bun.sleep(5);
             origin = requestMessageCache?.getOrigin(input.requestId);
           }
-          const originPrincipal =
-            origin?.actorUserId &&
-            origin.sessionId === input.sessionId &&
-            origin.platform === input.requestClient
-              ? { platform: origin.platform, userId: origin.actorUserId }
-              : null;
+          const matchingOrigin =
+            origin?.sessionId === input.sessionId && origin.platform === input.requestClient
+              ? origin
+              : undefined;
+          const originPrincipal = matchingOrigin?.actorUserId
+            ? { platform: matchingOrigin.platform, userId: matchingOrigin.actorUserId }
+            : null;
           const policy = {
             kind: "primary",
             requestId: input.requestId,
             sessionId: input.sessionId,
+            originSessionId: matchingOrigin?.sessionId ?? input.originSessionId,
             platform: input.requestClient,
             principal: input.principal ?? originPrincipal,
             allowedCallables: null,
@@ -1069,6 +1149,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
           } as const;
           return {
             capability: requestControlAuthority.issue(policy),
+            originSessionId: policy.originSessionId,
             principal: policy.principal,
           };
         },
@@ -1077,6 +1158,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
             kind: "heartbeat",
             requestId: input.requestId,
             sessionId: input.sessionId,
+            originSessionId: input.sessionId,
             platform: input.requestClient,
             principal: null,
             allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
@@ -1097,32 +1179,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         cwd: canonicalWorkspaceRoot,
       });
 
-      const restartLoad = gracefulRestartStore?.loadAndConsumeCompletedSnapshotDetailed() ?? {
-        snapshot: null,
-        reason: "empty" as const,
-      };
-
-      const initialHeartbeatExternalState = restartLoad.snapshot
-        ? {
-            activeRequestIds: restartLoad.snapshot.agent
-              .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
-              .map((entry) => entry.requestId),
-          }
-        : undefined;
-
       if (restartLoad.snapshot) {
         await restoreGracefulSnapshot(restartLoad.snapshot).catch((e: unknown) => {
           logger.error("Failed to restore graceful restart snapshot", e);
-        });
-      } else if (restartLoad.reason === "stale") {
-        logger.warn("Graceful restart snapshot discarded (stale)", {
-          createdAt: restartLoad.createdAt,
-          ageMs: restartLoad.ageMs,
-          deadlineMs: restartLoad.deadlineMs,
-        });
-      } else if (restartLoad.reason !== "empty") {
-        logger.warn("Graceful restart snapshot discarded", {
-          reason: restartLoad.reason,
         });
       }
 
@@ -1140,20 +1199,22 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
             ...(reasoning ? { reasoningOverride: reasoning } : {}),
           });
           return {
-            model: resolved.spec,
-            reasoning: resolved.reasoning ?? null,
-            request: toDurableResolvedModelRequest(resolved, cfg.agent.reasoningDisplay),
+            model: resolved.head.spec,
+            reasoning: resolved.head.reasoning ?? null,
+            request: toDurableResolvedModelPlan(resolved, cfg.agent.reasoningDisplay),
           };
+        },
+        resolveAgentFallbacks: async ({ profile, model, reasoning }) => {
+          const cfg = await getCoreConfig();
+          return resolveAgentRunModelFallbacks({
+            cfg,
+            runProfile: profile,
+            ...(model ? { requestModelOverride: model } : {}),
+            ...(reasoning ? { reasoningOverride: reasoning } : {}),
+          }).map((fallback) => toDurableResolvedModelRequest(fallback, cfg.agent.reasoningDisplay));
         },
       });
       await workflowEngine.start();
-      await workflowLiveParentBridge.enableFallbacks({
-        protectedParentRequestIds:
-          restartLoad.snapshot?.agent
-            .filter((entry) => entry.kind === "active")
-            .map((entry) => entry.requestId) ?? [],
-        protectionMs: GRACEFUL_SNAPSHOT_TTL_MS,
-      });
 
       logger.info("Unified workflow engine started", {
         subscriptionId: subId(subscriptionPrefix, "workflow-engine"),

@@ -2,10 +2,21 @@ import { describe, expect, it } from "bun:test";
 
 import type { ModelMessage } from "ai";
 
-import { withoutOpenAIItemIds } from "../model-message-provider-options";
+import { openAIMessagePhase, withoutOpenAIItemIds } from "../model-message-provider-options";
+
+describe("openAIMessagePhase", () => {
+  it("reads only supported OpenAI response phases", () => {
+    expect(openAIMessagePhase({ openai: { itemId: "msg_1", phase: "commentary" } })).toBe(
+      "commentary",
+    );
+    expect(openAIMessagePhase({ openai: { phase: "final_answer" } })).toBe("final_answer");
+    expect(openAIMessagePhase({ openai: { phase: "unknown" } })).toBeUndefined();
+    expect(openAIMessagePhase({ anthropic: { phase: "commentary" } })).toBeUndefined();
+  });
+});
 
 describe("withoutOpenAIItemIds", () => {
-  it("strips item IDs from stored assistant parts while preserving all other metadata", () => {
+  it("strips item IDs from other parts while preserving compaction item IDs", () => {
     const messages: ModelMessage[] = [
       { role: "user", content: "Continue" },
       {
@@ -97,7 +108,9 @@ describe("withoutOpenAIItemIds", () => {
           {
             type: "custom",
             kind: "openai.compaction",
-            providerOptions: { openai: { encryptedContent: "encrypted-compaction" } },
+            providerOptions: {
+              openai: { itemId: "cmp_123", encryptedContent: "encrypted-compaction" },
+            },
           },
         ],
       },

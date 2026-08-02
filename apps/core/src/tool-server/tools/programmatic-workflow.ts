@@ -1,10 +1,9 @@
 import { z } from "zod";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { env } from "@stanley2058/lilac-utils";
+import { env, type CoreConfig } from "@stanley2058/lilac-utils";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 
-import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
   DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
   DurableWorkflowStore,
@@ -31,6 +30,8 @@ import { parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
 import { readWorkflowValueArtifact } from "../../workflow/workflow-artifact-store";
 import { redactWorkflowValue } from "../../workflow/workflow-progress-view";
+import { isTelegramChatAllowed } from "../../surface/telegram/telegram-guards";
+import { parseTelegramSessionId } from "../../surface/telegram/telegram-ids";
 
 const definitionScopeSchema = z.enum(["project", "personal", "auto"]);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -133,36 +134,57 @@ const runCancelInputSchema = z.strictObject({
 const runPauseInputSchema = z.strictObject({ runId: z.string().min(1).max(200) });
 const runResumeInputSchema = z.strictObject({ runId: z.string().min(1).max(200) });
 function requestProgressTarget(context: RequestContext) {
-  if (
-    !context.sessionId ||
-    (context.requestClient !== "discord" &&
-      context.requestClient !== "github" &&
-      context.requestClient !== "telegram")
-  ) {
-    return null;
+  const requestClient =
+    context.requestClient === "discord" ||
+    context.requestClient === "github" ||
+    context.requestClient === "telegram"
+      ? context.requestClient
+      : null;
+  const principalClient = context.authenticatedPrincipal?.platform ?? null;
+  if (requestClient && principalClient && requestClient !== principalClient) {
+    throw new Error(
+      `Workflow request client '${requestClient}' does not match authenticated principal '${principalClient}'`,
+    );
   }
+  const platform = requestClient ?? principalClient;
+  const sessionId = context.originSessionId ?? context.sessionId;
+  if (!platform || !sessionId) return null;
   return {
-    platform: context.requestClient,
+    platform,
     userId: context.authenticatedPrincipal?.userId ?? null,
-    sessionRef: { platform: context.requestClient, channelId: context.sessionId },
+    sessionRef: { platform, channelId: sessionId },
     originMessageRef: null,
   } as const;
 }
 
-function assertProgressTargetAllowed(
-  context: RequestContext,
-  progress: { client?: "discord" | "github" | "telegram"; sessionId?: string } | undefined,
-): void {
-  if (!progress?.client) return;
-  const telegramPrincipal =
-    context.requestClient === "telegram" || context.authenticatedPrincipal?.platform === "telegram";
-  if (!telegramPrincipal) return;
+async function assertProgressTargetAllowed(input: {
+  requestTarget: ReturnType<typeof requestProgressTarget>;
+  progressTarget: { platform: "discord" | "github" | "telegram"; channelId: string } | null;
+  getConfig?: () => CoreConfig | Promise<CoreConfig>;
+}): Promise<void> {
+  const requestTarget = input.requestTarget;
+  const progressTarget = input.progressTarget;
+  const requestIsTelegram = requestTarget?.platform === "telegram";
+  const targetIsTelegram = progressTarget?.platform === "telegram";
+  if (!requestIsTelegram && !targetIsTelegram) return;
   if (
-    context.requestClient !== "telegram" ||
-    progress.client !== "telegram" ||
-    progress.sessionId !== context.sessionId
+    !requestTarget ||
+    requestTarget.platform !== "telegram" ||
+    !progressTarget ||
+    progressTarget.platform !== "telegram" ||
+    progressTarget.channelId !== requestTarget.sessionRef.channelId
   ) {
     throw new Error("Telegram workflow progress targets must use the current Telegram session");
+  }
+  if (!input.getConfig) {
+    throw new Error("Telegram workflow progress targets require current config access");
+  }
+  const cfg = await input.getConfig();
+  const { chatId } = parseTelegramSessionId(progressTarget.channelId);
+  if (!isTelegramChatAllowed({ cfg, chatId })) {
+    throw new Error(
+      `Not allowed: Telegram workflow progress session '${progressTarget.channelId}' is not in allowedChatIds`,
+    );
   }
 }
 
@@ -246,6 +268,7 @@ export class ProgrammaticWorkflow implements ServerTool {
       bus?: LilacBus;
       progressCards?: WorkflowProgressCardService;
       getMaxActiveRuns?: () => number | Promise<number>;
+      getConfig?: () => CoreConfig | Promise<CoreConfig>;
     } = {},
   ) {}
 
@@ -502,7 +525,24 @@ export class ProgrammaticWorkflow implements ServerTool {
         input: rawInput,
         schema: scheduledTriggerCreateInputSchema,
       });
-      assertProgressTargetAllowed(context, input.progress);
+      const progressTarget = input.progress?.client
+        ? {
+            platform: input.progress.client,
+            channelId: input.progress.sessionId!,
+            replyToMessageId: null,
+          }
+        : requestTarget
+          ? {
+              platform: requestTarget.platform,
+              channelId: requestTarget.sessionRef.channelId,
+              replyToMessageId: null,
+            }
+          : null;
+      await assertProgressTargetAllowed({
+        requestTarget,
+        progressTarget,
+        getConfig: this.params.getConfig,
+      });
       const definition = await definitions.get({
         scope: input.scope,
         name: input.name,
@@ -579,19 +619,6 @@ export class ProgrammaticWorkflow implements ServerTool {
               },
               now,
             );
-      const progressTarget = input.progress?.client
-        ? {
-            platform: input.progress.client,
-            channelId: input.progress.sessionId!,
-            replyToMessageId: null,
-          }
-        : requestTarget
-          ? {
-              platform: requestTarget.platform,
-              channelId: requestTarget.sessionRef.channelId,
-              replyToMessageId: null,
-            }
-          : null;
       const trigger: WorkflowTrigger = {
         triggerId,
         revisionId,
@@ -612,11 +639,8 @@ export class ProgrammaticWorkflow implements ServerTool {
         },
         origin: {
           requestId: context.requestId ?? null,
-          sessionId: context.sessionId ?? null,
-          client:
-            context.requestClient && isAdapterPlatform(context.requestClient)
-              ? context.requestClient
-              : null,
+          sessionId: requestTarget?.sessionRef.channelId ?? null,
+          client: requestTarget?.platform ?? null,
           userId: requestTarget?.userId ?? null,
           projectCwd: definitions.canonicalWorkspaceRoot,
         },
@@ -728,7 +752,24 @@ export class ProgrammaticWorkflow implements ServerTool {
       const context = requireTriggerContext(opts?.context);
       const requestTarget = requestProgressTarget(context);
       const input = parseToolInput({ callableId, input: rawInput, schema: runTriggerInputSchema });
-      assertProgressTargetAllowed(context, input.progress);
+      const progressTarget = input.progress?.client
+        ? {
+            platform: input.progress.client,
+            channelId: input.progress.sessionId!,
+            replyToMessageId: null,
+          }
+        : requestTarget
+          ? {
+              platform: requestTarget.platform,
+              channelId: requestTarget.sessionRef.channelId,
+              replyToMessageId: null,
+            }
+          : null;
+      await assertProgressTargetAllowed({
+        requestTarget,
+        progressTarget,
+        getConfig: this.params.getConfig,
+      });
       const definition = await definitions.get({
         scope: input.scope,
         name: input.name,
@@ -778,19 +819,6 @@ export class ProgrammaticWorkflow implements ServerTool {
       const runId = `wfrun:${canonicalJsonSha256(
         jsonObjectSchema.parse({ idempotencyKey, invocationFingerprint }),
       )}`;
-      const progressTarget = input.progress?.client
-        ? {
-            platform: input.progress.client,
-            channelId: input.progress.sessionId!,
-            replyToMessageId: null,
-          }
-        : requestTarget
-          ? {
-              platform: requestTarget.platform,
-              channelId: requestTarget.sessionRef.channelId,
-              replyToMessageId: null,
-            }
-          : null;
       const run: WorkflowRun = {
         runId,
         revisionId,
@@ -800,11 +828,8 @@ export class ProgrammaticWorkflow implements ServerTool {
         argsSha256: canonicalJsonSha256(args),
         origin: {
           requestId: context.requestId ?? null,
-          sessionId: context.sessionId ?? null,
-          client:
-            context.requestClient && isAdapterPlatform(context.requestClient)
-              ? context.requestClient
-              : null,
+          sessionId: requestTarget?.sessionRef.channelId ?? null,
+          client: requestTarget?.platform ?? null,
           userId: requestTarget?.userId ?? null,
           projectCwd: definitions.canonicalWorkspaceRoot,
         },

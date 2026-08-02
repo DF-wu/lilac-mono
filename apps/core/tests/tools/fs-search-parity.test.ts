@@ -315,6 +315,32 @@ describe("fs search parity (local vs remote runner)", () => {
     );
   });
 
+  it("grep supports a file target when the remote runner launches from its parent", async () => {
+    await writeFile(path.join(baseDir, "src", "sibling.ts"), "alpha sibling\n");
+    const local = await fsTool.grep({
+      pattern: "alpha",
+      baseDir: "src/a.ts",
+      mode: "hashline",
+    });
+    const remote = await runRemoteOp<GrepResult>({
+      cwd: path.join(baseDir, "src"),
+      op: "fs.grep",
+      input: {
+        pattern: "alpha",
+        baseDir: "a.ts",
+        reportedFilePath: "src/a.ts",
+        mode: "hashline",
+      },
+    });
+
+    expect(remote).toEqual(local);
+    expect(local.mode).toBe("hashline");
+    if (local.mode !== "hashline") throw new Error("expected hashline grep output");
+    expect(local.results).toHaveLength(1);
+    expect(local.results[0]?.file).toBe("src/a.ts");
+    expect(local.results[0]?.resolvedPath).toBe(path.join(baseDir, "src", "a.ts"));
+  });
+
   it("grep truncation behavior matches (exact and overflow)", async () => {
     const exactLocal = await fsTool.grep({
       pattern: "alpha",

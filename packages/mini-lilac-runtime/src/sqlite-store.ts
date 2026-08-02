@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 
+import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
+import { createLogger } from "@stanley2058/lilac-utils";
 import type {
   MiniLilacTodo,
   MiniLilacTodoState,
@@ -26,6 +28,7 @@ import {
   miniLilacOutputRollbackSchema,
   miniLilacProviderMetadataSchema,
   miniLilacRedoResultSchema,
+  miniLilacReasoningSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSessionStatusSchema,
   miniLilacSteeringCommittedChunkSchema,
@@ -45,7 +48,10 @@ import { z } from "zod";
 
 const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
-export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 5;
+export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 8;
+export const MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
+export const MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
+const logger = createLogger({ module: "mini-lilac-runtime:sqlite-store" });
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -134,6 +140,7 @@ const historyWorkspaceUnavailableReasonSchema = z.enum([
   "git-unavailable",
   "capture-failed",
   "legacy-migration",
+  "non-git-workspace",
   "platform-unsupported",
 ]);
 const historyStateOriginSchema = z.enum([
@@ -148,8 +155,21 @@ const historyDeliverySchema = z.enum(["prompt", "steer"]);
 const historyOperationActionSchema = z.enum(["undo", "redo"]);
 const historyOperationPhaseSchema = z.enum(["prepared", "restoring", "verified"]);
 const historyFilesystemModeSchema = z.enum(["restore", "skip"]);
+export const historyProviderFamilySchema = z.enum(["claude-code", "ai-sdk"]);
+export const historyProviderStateSchema = z.strictObject({
+  lastFamily: historyProviderFamilySchema,
+  containsCrossFamilyTurns: z.boolean(),
+});
+const miniMainClaudeAttemptStateSchema = z.enum([
+  "active",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "uncertain",
+]);
 const historySkipReasonSchema = z.enum([
   "git-unavailable",
+  "non-git-workspace",
   "snapshot-unavailable",
   "platform-unsupported",
 ]);
@@ -169,6 +189,7 @@ const historyWorkspaceOutcomeSchema = z.discriminatedUnion("workspaceStatus", [
     workspaceUnavailableReason: z.enum([
       "git-unavailable",
       "capture-failed",
+      "non-git-workspace",
       "platform-unsupported",
     ]),
   }),
@@ -217,8 +238,130 @@ const historyStateRowSchema = z.object({
   workspace_status: historyWorkspaceStatusSchema,
   workspace_unavailable_reason: historyWorkspaceUnavailableReasonSchema.nullable(),
   origin: historyStateOriginSchema,
+  last_provider_family: historyProviderFamilySchema.nullable(),
+  contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
   created_at: z.string(),
 });
+const miniMainClaudeBindingRowSchema = z.object({
+  session_id: z.string().min(1),
+  history_state_id: z.string().min(1),
+  provider_id: z.string().min(1),
+  binding_protocol_version: z.literal(1),
+  provider_family: z.literal("claude-code"),
+  request_client: z.string().min(1),
+  canonical_message_count: z.number().int().nonnegative(),
+  execution_scope_hash_version: z.literal(1),
+  execution_scope_hash: z.string().min(1),
+  claude_session_id: z.string().uuid(),
+  native_cwd: z.string().min(1),
+  native_last_modified: z.number().nonnegative(),
+  native_context_tokens: z.number().int().nonnegative(),
+  native_context_max_tokens: z.number().int().positive(),
+  last_model_specifier: z.string().min(1),
+  last_reasoning: z.string().min(1),
+  revision: z.number().int().positive(),
+  updated_at: z.string(),
+});
+const miniMainClaudeAttemptRowSchema = z.object({
+  id: z.number().int().positive(),
+  product: z.literal("mini"),
+  session_id: z.string().min(1),
+  source_history_state_id: z.string().min(1),
+  source_canonical_message_count: z.number().int().nonnegative(),
+  provider_id: z.string().min(1),
+  request_client: z.string().min(1),
+  execution_scope_hash_version: z.literal(1),
+  execution_scope_hash: z.string().min(1),
+  request_id: z.string().min(1),
+  attempt_index: z.number().int().nonnegative(),
+  candidate_session_id: z.string().uuid(),
+  source_session_id: z.string().uuid().nullable(),
+  expected_binding_revision: z.number().int().positive().nullable(),
+  state: miniMainClaudeAttemptStateSchema,
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+const miniNamedClaudeBindingRowSchema = miniMainClaudeBindingRowSchema;
+const miniNamedClaudeAttemptRowSchema = miniMainClaudeAttemptRowSchema;
+const miniMainClaudeStateLookupSchema = z.strictObject({
+  sessionId: z.string().min(1),
+  historyStateId: z.string().min(1),
+  providerId: z.string().min(1),
+});
+const miniNamedSessionIdSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => value.startsWith("sub:") && value.lastIndexOf(":named:") > "sub:".length,
+    "Expected a named delegated Mini session ID",
+  );
+const reserveMiniMainClaudeSessionAttemptSchema = z.strictObject({
+  providerId: z.string().min(1),
+  requestClient: z.string().min(1),
+  lilacSessionId: z.string().min(1),
+  sourceHistoryStateId: z.string().min(1),
+  executionScopeHashVersion: z.literal(1),
+  executionScopeHash: z.string().min(1),
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+  candidateSessionId: z.string().uuid(),
+  sourceSessionId: z.string().uuid().nullable(),
+  expectedBindingRevision: z.number().int().positive().nullable(),
+});
+const miniMainClaudeSessionAttemptKeySchema = z.strictObject({
+  providerId: z.string().min(1),
+  lilacSessionId: z.string().min(1),
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+});
+const recordMiniMainClaudeSessionAttemptOutcomeSchema =
+  miniMainClaudeSessionAttemptKeySchema.extend({
+    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
+  });
+const promoteMiniMainClaudeSessionBindingSchema = z.strictObject({
+  providerId: z.string().min(1),
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+  nativeCwd: z.string().min(1),
+  nativeLastModified: z.number().finite().nonnegative(),
+  nativeContextTokens: z.number().int().nonnegative(),
+  nativeContextMaxTokens: z.number().int().positive(),
+  lastModelSpecifier: z.string().min(1),
+  lastReasoning: z.string().min(1),
+});
+const miniNamedClaudeStateLookupSchema = z.strictObject({
+  sessionId: miniNamedSessionIdSchema,
+  providerId: z.string().min(1),
+});
+const reserveMiniNamedClaudeSessionAttemptSchema = z.strictObject({
+  providerId: z.string().min(1),
+  requestClient: z.string().min(1),
+  lilacSessionId: miniNamedSessionIdSchema,
+  sourceHistoryStateId: z.string().min(1),
+  executionScopeHashVersion: z.literal(1),
+  executionScopeHash: z.string().min(1),
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+  candidateSessionId: z.string().uuid(),
+  sourceSessionId: z.string().uuid().nullable(),
+  expectedBindingRevision: z.number().int().positive().nullable(),
+});
+const miniNamedClaudeSessionAttemptKeySchema = z.strictObject({
+  providerId: z.string().min(1),
+  lilacSessionId: miniNamedSessionIdSchema,
+  requestId: z.string().min(1),
+  attemptIndex: z.number().int().nonnegative(),
+});
+const recordMiniNamedClaudeSessionAttemptOutcomeSchema =
+  miniNamedClaudeSessionAttemptKeySchema.extend({
+    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
+  });
+const promoteMiniNamedClaudeSessionBindingSchema = promoteMiniMainClaudeSessionBindingSchema.extend(
+  {
+    canonicalMessageCount: z.number().int().nonnegative(),
+    canonicalHeadHash: z.string().min(1),
+  },
+);
 const historyTransitionRowSchema = z.object({
   id: z.string(),
   session_id: z.string(),
@@ -276,6 +419,10 @@ const pendingRunFinalizationRowSchema = z.object({
   error: z.string().nullable(),
   terminal_result_json: z.string().nullable(),
   input_tokens: z.number().int().nonnegative().nullable(),
+  last_provider_family: historyProviderFamilySchema.nullable(),
+  contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
+  claude_binding_promotion_json: z.string().nullable(),
+  named_claude_binding_promotion_json: z.string().nullable(),
   prepared_at: z.string(),
 });
 const historyAccountingRowSchema = z.object({
@@ -323,6 +470,127 @@ const migrationRunRowSchema = z.object({
   status: runStatusSchema,
   parent_run_id: z.string().nullable(),
 });
+const migrationIdentifierSchema = z.string().trim().min(1);
+const migrationSessionSnapshotV4Schema = z.strictObject({
+  id: migrationIdentifierSchema,
+  activeRunId: migrationIdentifierSchema.nullable(),
+  activeCompactionCommandId: migrationIdentifierSchema.nullable().optional(),
+  status: z.enum(["idle", "streaming", "compacting", "cancelling", "error"]),
+  cwd: z.string().min(1),
+  model: migrationIdentifierSchema.nullable(),
+  profile: migrationIdentifierSchema.nullable(),
+  reasoning: miniLilacReasoningSchema.nullable(),
+  title: z.string().max(100).optional(),
+  inputTokens: z.number().int().nonnegative().nullable().optional(),
+  inputTokensEstimated: z.boolean().optional(),
+  contextWindow: z.number().int().positive().nullable().optional(),
+  compactionThreshold: z.number().positive().max(1).optional(),
+  queuedSteeringCount: z.number().int().nonnegative(),
+  createdAt: z.string().datetime({ offset: true }).optional(),
+  updatedAt: z.string().datetime({ offset: true }).optional(),
+});
+const migrationSessionDataPartV4Schema = z.strictObject({
+  type: z.literal("data-session"),
+  id: migrationIdentifierSchema.optional(),
+  data: migrationSessionSnapshotV4Schema,
+});
+const migrationCompactionMetricsV4Schema = {
+  status: z.enum(["completed", "failed"]),
+  messageCountBefore: z.number().int().nonnegative(),
+  messageCountAfter: z.number().int().nonnegative().optional(),
+  estimatedInputTokensBefore: z.number().int().nonnegative().optional(),
+  estimatedInputTokensAfter: z.number().int().nonnegative().optional(),
+  error: z.string().optional(),
+} as const;
+const migrationCompactionEventV4Schema = z.discriminatedUnion("source", [
+  z.strictObject({
+    source: z.literal("automatic"),
+    reason: z.enum(["threshold", "overflow"]),
+    ...migrationCompactionMetricsV4Schema,
+  }),
+  z.strictObject({
+    source: z.literal("manual"),
+    reason: z.literal("manual"),
+    ...migrationCompactionMetricsV4Schema,
+  }),
+]);
+const migrationCompactionDataPartV4Schema = z.strictObject({
+  type: z.literal("data-compaction"),
+  id: migrationIdentifierSchema.optional(),
+  data: migrationCompactionEventV4Schema,
+});
+const migrationUiMessageEnvelopeSchema = z.looseObject({
+  role: z.enum(["system", "user", "assistant"]),
+  parts: z.array(z.unknown()),
+});
+
+type MigratedUiMessages = {
+  readonly messages: MiniLilacUIMessage[];
+  readonly changed: boolean;
+};
+
+function parseMigratedUiMessage(value: unknown): {
+  readonly message: MiniLilacUIMessage | null;
+  readonly changed: boolean;
+} {
+  const envelope = migrationUiMessageEnvelopeSchema.parse(value);
+  const parts: unknown[] = [];
+  let changed = false;
+  for (const part of envelope.parts) {
+    if (migrationSessionDataPartV4Schema.safeParse(part).success) {
+      changed = true;
+      continue;
+    }
+    const legacyCompaction = migrationCompactionDataPartV4Schema.safeParse(part);
+    if (legacyCompaction.success) {
+      const { status, ...data } = legacyCompaction.data.data;
+      parts.push({
+        type: legacyCompaction.data.type,
+        ...(legacyCompaction.data.id === undefined ? {} : { id: legacyCompaction.data.id }),
+        data: {
+          ...data,
+          phase: status,
+          ...(status === "completed" ? { outcome: "compacted" as const } : {}),
+        },
+      });
+      changed = true;
+      continue;
+    }
+    parts.push(part);
+  }
+  if (!changed) {
+    return { message: miniLilacMessagesSchema.element.parse(value), changed: false };
+  }
+  if (parts.length === 0) {
+    if (envelope.role === "user") {
+      throw new Error("Legacy user UI message contains only session snapshot parts");
+    }
+    return { message: null, changed: true };
+  }
+  return {
+    message: miniLilacMessagesSchema.element.parse({ ...envelope, parts }),
+    changed: true,
+  };
+}
+
+function parseMigratedUiMessages(values: readonly unknown[]): MigratedUiMessages {
+  const messages: MiniLilacUIMessage[] = [];
+  let changed = false;
+  for (const value of values) {
+    const migrated = parseMigratedUiMessage(value);
+    changed ||= migrated.changed;
+    if (migrated.message !== null) messages.push(migrated.message);
+  }
+  return { messages, changed };
+}
+
+function parseMigratedUserUiMessage(value: unknown): MiniLilacUserUIMessage {
+  const migrated = parseMigratedUiMessage(value);
+  if (migrated.message === null) {
+    throw new Error("Legacy user UI message cannot be empty after migration");
+  }
+  return miniLilacUserUIMessageSchema.parse(migrated.message);
+}
 export const storedHistoryCommandErrorSchema = z.strictObject({
   type: z.literal("history-command-error"),
   code: z.literal("history-recovery-abandoned"),
@@ -620,6 +888,9 @@ export type DeleteUnreferencedStoredWorkspaceSnapshots = {
   readonly snapshotIds?: readonly string[];
 };
 
+export type HistoryProviderFamily = z.infer<typeof historyProviderFamilySchema>;
+export type HistoryProviderState = z.infer<typeof historyProviderStateSchema>;
+
 export type StoredHistoryState = {
   readonly id: string;
   readonly sessionId: string;
@@ -632,11 +903,13 @@ export type StoredHistoryState = {
     typeof historyWorkspaceUnavailableReasonSchema
   > | null;
   readonly origin: z.infer<typeof historyStateOriginSchema>;
+  readonly providerState: HistoryProviderState | null;
   readonly createdAt: string;
 };
 
-type CreateStoredHistoryState = Omit<StoredHistoryState, "createdAt"> & {
+type CreateStoredHistoryState = Omit<StoredHistoryState, "createdAt" | "providerState"> & {
   readonly createdAt?: string;
+  readonly providerState?: HistoryProviderState | null;
 };
 
 export type StoredHistoryTransition = {
@@ -687,6 +960,7 @@ export type StoredHistoryWorkspaceOutcome =
       readonly workspaceUnavailableReason:
         | "git-unavailable"
         | "capture-failed"
+        | "non-git-workspace"
         | "platform-unsupported";
     };
 
@@ -736,6 +1010,7 @@ export type CommitStoredSteeringBoundary = {
   readonly mergedModelMessages: readonly ModelMessage[];
   readonly uiMessages: readonly MiniLilacUIMessage[];
   readonly entries: readonly StoredSteeringBoundaryEntry[];
+  readonly providerState?: HistoryProviderState;
 };
 
 export type CommittedStoredSteeringBoundary = {
@@ -872,6 +1147,9 @@ export type PendingStoredRunFinalization = {
   readonly error: string | null;
   readonly terminalResult: unknown;
   readonly inputTokens: number | null;
+  readonly providerState: HistoryProviderState | null;
+  readonly claudeBindingPromotion: PromoteMiniMainClaudeSessionBinding | null;
+  readonly namedClaudeBindingPromotion: PromoteMiniNamedClaudeSessionBinding | null;
   readonly preparedAt: string;
 };
 
@@ -894,17 +1172,136 @@ export type ReservePendingStoredRunFinalization = {
   readonly error: string | null;
   readonly terminalResult: unknown;
   readonly inputTokens: number | null;
+  readonly providerState?: HistoryProviderState;
+  readonly claudeBindingPromotion?: PromoteMiniMainClaudeSessionBinding;
+  readonly namedClaudeBindingPromotion?: PromoteMiniNamedClaudeSessionBinding;
 };
 
 export type CommitPendingStoredRunFinalization = StoredHistoryWorkspaceOutcome & {
   readonly runId: string;
   readonly destinationStateId: string;
+  readonly providerState?: HistoryProviderState;
+  readonly claudeBindingPromotion?: PromoteMiniMainClaudeSessionBinding;
+  readonly namedClaudeBindingPromotion?: PromoteMiniNamedClaudeSessionBinding;
 };
 
 export type CommittedPendingStoredRunFinalization = {
   readonly pending: PendingStoredRunFinalization;
   readonly state: StoredHistoryState;
   readonly snapshot: MiniLilacSessionSnapshot;
+  readonly bindingPromotion: "not-requested" | "promoted" | "cas-failed";
+};
+
+export type MiniMainClaudeSessionBinding = {
+  readonly bindingProtocolVersion: 1;
+  readonly providerId: string;
+  readonly providerFamily: "claude-code";
+  readonly requestClient: string;
+  readonly lilacSessionId: string;
+  readonly historyStateId: string;
+  readonly canonicalMessageCount: number;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly claudeSessionId: string;
+  readonly nativeCwd: string;
+  readonly nativeLastModified: number;
+  readonly nativeContextTokens: number;
+  readonly nativeContextMaxTokens: number;
+  readonly lastModelSpecifier: string;
+  readonly lastReasoning: string;
+  readonly revision: number;
+  readonly updatedAt: string;
+};
+
+export type MiniMainClaudeSessionAttempt = {
+  readonly product: "mini";
+  readonly providerId: string;
+  readonly requestClient: string;
+  readonly lilacSessionId: string;
+  readonly sourceHistoryStateId: string;
+  readonly sourceCanonicalMessageCount: number;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly requestId: string;
+  readonly attemptIndex: number;
+  readonly candidateSessionId: string;
+  readonly sourceSessionId: string | null;
+  readonly expectedBindingRevision: number | null;
+  readonly state: z.infer<typeof miniMainClaudeAttemptStateSchema>;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+};
+
+export type MiniMainClaudeState = {
+  readonly historyState: StoredHistoryState;
+  readonly providerState: HistoryProviderState | null;
+  readonly binding: MiniMainClaudeSessionBinding | null;
+};
+
+export type ReserveMiniMainClaudeSessionAttempt = {
+  readonly providerId: string;
+  readonly requestClient: string;
+  readonly lilacSessionId: string;
+  readonly sourceHistoryStateId: string;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly requestId: string;
+  readonly attemptIndex: number;
+  readonly candidateSessionId: string;
+  readonly sourceSessionId: string | null;
+  readonly expectedBindingRevision: number | null;
+};
+
+export type RecordMiniMainClaudeSessionAttemptOutcome = {
+  readonly providerId: string;
+  readonly lilacSessionId: string;
+  readonly requestId: string;
+  readonly attemptIndex: number;
+  readonly state: Exclude<z.infer<typeof miniMainClaudeAttemptStateSchema>, "active">;
+};
+
+export type PromoteMiniMainClaudeSessionBinding = {
+  readonly providerId: string;
+  readonly requestId: string;
+  readonly attemptIndex: number;
+  readonly nativeCwd: string;
+  readonly nativeLastModified: number;
+  readonly nativeContextTokens: number;
+  readonly nativeContextMaxTokens: number;
+  readonly lastModelSpecifier: string;
+  readonly lastReasoning: string;
+};
+
+export type MiniNamedClaudeSessionBinding = MiniMainClaudeSessionBinding;
+
+export type MiniNamedClaudeSessionAttempt = MiniMainClaudeSessionAttempt;
+
+export type MiniClaudeRetentionDiagnostics = {
+  readonly mainBindingCount: number;
+  readonly namedBindingCount: number;
+  readonly activeAttemptCount: number;
+  readonly terminalAttemptCount: number;
+  readonly orphanBindingCount: number;
+  readonly orphanAttemptCount: number;
+};
+
+export type MiniNamedClaudeState = {
+  readonly binding: MiniNamedClaudeSessionBinding | null;
+};
+
+export type ReserveMiniNamedClaudeSessionAttempt = Omit<
+  ReserveMiniMainClaudeSessionAttempt,
+  "sourceSessionId" | "expectedBindingRevision"
+> & {
+  readonly sourceSessionId: string | null;
+  readonly expectedBindingRevision: number | null;
+};
+
+export type RecordMiniNamedClaudeSessionAttemptOutcome = RecordMiniMainClaudeSessionAttemptOutcome;
+
+export type PromoteMiniNamedClaudeSessionBinding = PromoteMiniMainClaudeSessionBinding & {
+  readonly canonicalMessageCount: number;
+  readonly canonicalHeadHash: string;
 };
 
 export type CommitStoredHistoryCompaction = StoredHistoryWorkspaceOutcome & {
@@ -917,6 +1314,7 @@ export type CommitStoredHistoryCompaction = StoredHistoryWorkspaceOutcome & {
   readonly modelMessages: readonly ModelMessage[];
   readonly compactionEvent: MiniLilacCompactionEvent;
   readonly result: MiniLilacCompactResult;
+  readonly providerState?: HistoryProviderState;
   readonly observation?: StoredHistoryObservationInput;
 };
 
@@ -1056,6 +1454,9 @@ function toWorkspaceSnapshot(rowValue: unknown): StoredWorkspaceSnapshot {
 
 function toHistoryState(rowValue: unknown): StoredHistoryState {
   const row = historyStateRowSchema.parse(rowValue);
+  if ((row.last_provider_family === null) !== (row.contains_cross_family_turns === null)) {
+    throw new Error(`History state '${row.id}' has incomplete provider metadata`);
+  }
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -1066,8 +1467,69 @@ function toHistoryState(rowValue: unknown): StoredHistoryState {
     workspaceStatus: row.workspace_status,
     workspaceUnavailableReason: row.workspace_unavailable_reason,
     origin: row.origin,
+    providerState:
+      row.last_provider_family === null || row.contains_cross_family_turns === null
+        ? null
+        : historyProviderStateSchema.parse({
+            lastFamily: row.last_provider_family,
+            containsCrossFamilyTurns: row.contains_cross_family_turns === 1,
+          }),
     createdAt: row.created_at,
   };
+}
+
+function toMiniMainClaudeBinding(rowValue: unknown): MiniMainClaudeSessionBinding {
+  const row = miniMainClaudeBindingRowSchema.parse(rowValue);
+  return {
+    bindingProtocolVersion: row.binding_protocol_version,
+    providerId: row.provider_id,
+    providerFamily: row.provider_family,
+    requestClient: row.request_client,
+    lilacSessionId: row.session_id,
+    historyStateId: row.history_state_id,
+    canonicalMessageCount: row.canonical_message_count,
+    executionScopeHashVersion: row.execution_scope_hash_version,
+    executionScopeHash: row.execution_scope_hash,
+    claudeSessionId: row.claude_session_id,
+    nativeCwd: row.native_cwd,
+    nativeLastModified: row.native_last_modified,
+    nativeContextTokens: row.native_context_tokens,
+    nativeContextMaxTokens: row.native_context_max_tokens,
+    lastModelSpecifier: row.last_model_specifier,
+    lastReasoning: row.last_reasoning,
+    revision: row.revision,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toMiniMainClaudeAttempt(rowValue: unknown): MiniMainClaudeSessionAttempt {
+  const row = miniMainClaudeAttemptRowSchema.parse(rowValue);
+  return {
+    product: row.product,
+    providerId: row.provider_id,
+    requestClient: row.request_client,
+    lilacSessionId: row.session_id,
+    sourceHistoryStateId: row.source_history_state_id,
+    sourceCanonicalMessageCount: row.source_canonical_message_count,
+    executionScopeHashVersion: row.execution_scope_hash_version,
+    executionScopeHash: row.execution_scope_hash,
+    requestId: row.request_id,
+    attemptIndex: row.attempt_index,
+    candidateSessionId: row.candidate_session_id,
+    sourceSessionId: row.source_session_id,
+    expectedBindingRevision: row.expected_binding_revision,
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toMiniNamedClaudeBinding(rowValue: unknown): MiniNamedClaudeSessionBinding {
+  return toMiniMainClaudeBinding(miniNamedClaudeBindingRowSchema.parse(rowValue));
+}
+
+function toMiniNamedClaudeAttempt(rowValue: unknown): MiniNamedClaudeSessionAttempt {
+  return toMiniMainClaudeAttempt(miniNamedClaudeAttemptRowSchema.parse(rowValue));
 }
 
 function toHistoryTransition(rowValue: unknown): StoredHistoryTransition {
@@ -1149,6 +1611,25 @@ function toPendingRunFinalization(rowValue: unknown): PendingStoredRunFinalizati
     terminalResult:
       row.terminal_result_json === null ? undefined : deserialize(row.terminal_result_json),
     inputTokens: row.input_tokens,
+    providerState:
+      row.last_provider_family === null || row.contains_cross_family_turns === null
+        ? null
+        : historyProviderStateSchema.parse({
+            lastFamily: row.last_provider_family,
+            containsCrossFamilyTurns: row.contains_cross_family_turns === 1,
+          }),
+    claudeBindingPromotion:
+      row.claude_binding_promotion_json === null
+        ? null
+        : promoteMiniMainClaudeSessionBindingSchema.parse(
+            deserialize(row.claude_binding_promotion_json),
+          ),
+    namedClaudeBindingPromotion:
+      row.named_claude_binding_promotion_json === null
+        ? null
+        : promoteMiniNamedClaudeSessionBindingSchema.parse(
+            deserialize(row.named_claude_binding_promotion_json),
+          ),
     preparedAt: row.prepared_at,
   };
 }
@@ -1270,7 +1751,15 @@ export class MiniLilacSqliteStore {
       .object({ user_version: z.number().int() })
       .parse(this.database.query("PRAGMA user_version").get()).user_version;
     if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return;
-    if (version !== 0 && version !== 2 && version !== 3 && version !== 4) {
+    if (
+      version !== 0 &&
+      version !== 2 &&
+      version !== 3 &&
+      version !== 4 &&
+      version !== 5 &&
+      version !== 6 &&
+      version !== 7
+    ) {
       throw new MiniLilacDatabaseVersionError(version);
     }
 
@@ -1280,12 +1769,15 @@ export class MiniLilacSqliteStore {
     try {
       this.database.transaction(() => {
         if (version === 0) {
-          this.createSchemaV5();
+          this.createSchemaV6();
         } else {
           if (version === 2) this.migrateSchemaV2ToV3();
           if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
-          this.migrateSchemaV4ToV5();
+          if (version === 2 || version === 3 || version === 4) this.migrateSchemaV4ToV5();
+          if (version === 5) this.migrateSchemaV5ToV6();
         }
+        if (version <= 6) this.migrateSchemaV6ToV7();
+        this.migrateSchemaV7ToV8();
         const violations = this.database.query("PRAGMA foreign_key_check").all();
         if (violations.length > 0) {
           throw new Error(
@@ -1305,7 +1797,7 @@ export class MiniLilacSqliteStore {
     }
   }
 
-  private createSchemaV5(): void {
+  private createSchemaV6(): void {
     this.database.exec(`
         CREATE TABLE history_store_metadata (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1437,7 +1929,8 @@ export class MiniLilacSqliteStore {
         ),
         workspace_unavailable_reason TEXT CHECK(
           workspace_unavailable_reason IN (
-            'git-unavailable', 'capture-failed', 'legacy-migration', 'platform-unsupported'
+            'git-unavailable', 'capture-failed', 'legacy-migration', 'non-git-workspace',
+            'platform-unsupported'
           )
         ),
         origin TEXT NOT NULL CHECK(
@@ -1529,7 +2022,9 @@ export class MiniLilacSqliteStore {
         user_transition_id TEXT NOT NULL,
         filesystem_mode TEXT NOT NULL CHECK(filesystem_mode IN ('restore', 'skip')),
         skip_reason TEXT CHECK(
-          skip_reason IN ('git-unavailable', 'snapshot-unavailable', 'platform-unsupported')
+          skip_reason IN (
+            'git-unavailable', 'non-git-workspace', 'snapshot-unavailable', 'platform-unsupported'
+          )
         ),
         phase TEXT NOT NULL CHECK(phase IN ('prepared', 'restoring', 'verified')),
         prepared_at TEXT NOT NULL,
@@ -1578,6 +2073,252 @@ export class MiniLilacSqliteStore {
         ON history_transitions(session_id, from_state_id);
       CREATE INDEX history_transitions_root_run
         ON history_transitions(session_id, root_run_id);
+    `);
+  }
+
+  private migrateSchemaV5ToV6(): void {
+    this.database.exec(`
+      CREATE TABLE history_states_v6 (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        model_head_id INTEGER,
+        model_lane TEXT NOT NULL DEFAULT 'model' CHECK(model_lane = 'model'),
+        ui_head_id INTEGER,
+        ui_lane TEXT NOT NULL DEFAULT 'ui' CHECK(ui_lane = 'ui'),
+        workspace_snapshot_id TEXT,
+        workspace_status TEXT NOT NULL CHECK(
+          workspace_status IN ('captured', 'unavailable', 'capture-deferred')
+        ),
+        workspace_unavailable_reason TEXT CHECK(
+          workspace_unavailable_reason IN (
+            'git-unavailable', 'capture-failed', 'legacy-migration', 'non-git-workspace',
+            'platform-unsupported'
+          )
+        ),
+        origin TEXT NOT NULL CHECK(
+          origin IN ('root', 'turn-boundary', 'workspace-observation', 'compaction', 'migration')
+        ),
+        created_at TEXT NOT NULL,
+        UNIQUE(id, session_id),
+        UNIQUE(id, workspace_id),
+        FOREIGN KEY(session_id, workspace_id)
+          REFERENCES sessions(id, workspace_id) ON DELETE CASCADE,
+        FOREIGN KEY(workspace_snapshot_id, workspace_id)
+          REFERENCES workspace_snapshots(id, workspace_id),
+        FOREIGN KEY(model_head_id, session_id, model_lane)
+          REFERENCES transcript_nodes(id, session_id, lane),
+        FOREIGN KEY(ui_head_id, session_id, ui_lane)
+          REFERENCES transcript_nodes(id, session_id, lane),
+        CHECK(
+          (workspace_status = 'captured' AND workspace_snapshot_id IS NOT NULL
+            AND workspace_unavailable_reason IS NULL) OR
+          (workspace_status = 'unavailable' AND workspace_snapshot_id IS NULL
+            AND workspace_unavailable_reason IS NOT NULL) OR
+          (workspace_status = 'capture-deferred' AND workspace_snapshot_id IS NULL
+            AND workspace_unavailable_reason IS NULL)
+        )
+      );
+      INSERT INTO history_states_v6 (
+        rowid, id, session_id, workspace_id, model_head_id, model_lane, ui_head_id, ui_lane,
+        workspace_snapshot_id, workspace_status, workspace_unavailable_reason, origin, created_at
+      )
+      SELECT
+        rowid, id, session_id, workspace_id, model_head_id, model_lane, ui_head_id, ui_lane,
+        workspace_snapshot_id, workspace_status, workspace_unavailable_reason, origin, created_at
+      FROM history_states;
+      DROP TABLE history_states;
+      ALTER TABLE history_states_v6 RENAME TO history_states;
+      CREATE INDEX history_states_session ON history_states(session_id);
+      CREATE INDEX history_states_workspace_snapshot ON history_states(workspace_snapshot_id);
+
+      CREATE TABLE history_operations_v6 (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind = 'navigate'),
+        requested_action TEXT NOT NULL CHECK(requested_action IN ('undo', 'redo')),
+        source_state_id TEXT NOT NULL,
+        observed_source_state_id TEXT,
+        target_state_id TEXT NOT NULL,
+        user_transition_id TEXT NOT NULL,
+        filesystem_mode TEXT NOT NULL CHECK(filesystem_mode IN ('restore', 'skip')),
+        skip_reason TEXT CHECK(
+          skip_reason IN (
+            'git-unavailable', 'non-git-workspace', 'snapshot-unavailable', 'platform-unsupported'
+          )
+        ),
+        phase TEXT NOT NULL CHECK(phase IN ('prepared', 'restoring', 'verified')),
+        prepared_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(workspace_id),
+        FOREIGN KEY(session_id, workspace_id) REFERENCES sessions(id, workspace_id),
+        FOREIGN KEY(session_id, command_id) REFERENCES commands(session_id, command_id),
+        FOREIGN KEY(source_state_id, session_id) REFERENCES history_states(id, session_id),
+        FOREIGN KEY(observed_source_state_id, session_id) REFERENCES history_states(id, session_id),
+        FOREIGN KEY(target_state_id, session_id) REFERENCES history_states(id, session_id),
+        FOREIGN KEY(user_transition_id, session_id)
+          REFERENCES history_transitions(id, session_id),
+        CHECK(
+          (filesystem_mode = 'restore' AND skip_reason IS NULL) OR
+          (filesystem_mode = 'skip' AND skip_reason IS NOT NULL)
+        )
+      );
+      INSERT INTO history_operations_v6 (
+        rowid, id, session_id, workspace_id, command_id, kind, requested_action, source_state_id,
+        observed_source_state_id, target_state_id, user_transition_id, filesystem_mode, skip_reason,
+        phase, prepared_at, updated_at
+      )
+      SELECT
+        rowid, id, session_id, workspace_id, command_id, kind, requested_action, source_state_id,
+        observed_source_state_id, target_state_id, user_transition_id, filesystem_mode, skip_reason,
+        phase, prepared_at, updated_at
+      FROM history_operations;
+      DROP TABLE history_operations;
+      ALTER TABLE history_operations_v6 RENAME TO history_operations;
+    `);
+  }
+
+  private migrateSchemaV6ToV7(): void {
+    this.database.exec(`
+      ALTER TABLE history_states ADD COLUMN last_provider_family TEXT
+        CHECK(last_provider_family IN ('claude-code', 'ai-sdk'));
+      ALTER TABLE history_states ADD COLUMN contains_cross_family_turns INTEGER
+        CHECK(
+          (last_provider_family IS NULL AND contains_cross_family_turns IS NULL) OR
+          (last_provider_family IS NOT NULL AND contains_cross_family_turns IN (0, 1))
+        );
+
+      ALTER TABLE pending_run_finalizations ADD COLUMN last_provider_family TEXT
+        CHECK(last_provider_family IN ('claude-code', 'ai-sdk'));
+      ALTER TABLE pending_run_finalizations ADD COLUMN contains_cross_family_turns INTEGER
+        CHECK(
+          (last_provider_family IS NULL AND contains_cross_family_turns IS NULL) OR
+          (last_provider_family IS NOT NULL AND contains_cross_family_turns IN (0, 1))
+        );
+      ALTER TABLE pending_run_finalizations ADD COLUMN claude_binding_promotion_json TEXT;
+
+      CREATE TABLE mini_main_claude_bindings (
+        session_id TEXT NOT NULL,
+        history_state_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        binding_protocol_version INTEGER NOT NULL CHECK(binding_protocol_version = 1),
+        provider_family TEXT NOT NULL CHECK(provider_family = 'claude-code'),
+        request_client TEXT NOT NULL,
+        canonical_message_count INTEGER NOT NULL CHECK(canonical_message_count >= 0),
+        execution_scope_hash_version INTEGER NOT NULL CHECK(execution_scope_hash_version = 1),
+        execution_scope_hash TEXT NOT NULL,
+        claude_session_id TEXT NOT NULL,
+        native_cwd TEXT NOT NULL,
+        native_last_modified REAL NOT NULL CHECK(native_last_modified >= 0),
+        native_context_tokens INTEGER NOT NULL CHECK(native_context_tokens >= 0),
+        native_context_max_tokens INTEGER NOT NULL CHECK(native_context_max_tokens > 0),
+        last_model_specifier TEXT NOT NULL,
+        last_reasoning TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0 AND revision <= 9007199254740991),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, history_state_id, provider_id),
+        UNIQUE(claude_session_id),
+        FOREIGN KEY(history_state_id, session_id)
+          REFERENCES history_states(id, session_id) ON DELETE CASCADE
+      );
+      CREATE INDEX mini_main_claude_bindings_state
+        ON mini_main_claude_bindings(history_state_id, session_id);
+
+      CREATE TABLE mini_main_claude_attempts (
+        id INTEGER PRIMARY KEY,
+        product TEXT NOT NULL DEFAULT 'mini' CHECK(product = 'mini'),
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_history_state_id TEXT NOT NULL,
+        source_canonical_message_count INTEGER NOT NULL
+          CHECK(source_canonical_message_count >= 0),
+        provider_id TEXT NOT NULL,
+        request_client TEXT NOT NULL,
+        execution_scope_hash_version INTEGER NOT NULL CHECK(execution_scope_hash_version = 1),
+        execution_scope_hash TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL CHECK(attempt_index >= 0),
+        candidate_session_id TEXT NOT NULL UNIQUE,
+        source_session_id TEXT,
+        expected_binding_revision INTEGER
+          CHECK(expected_binding_revision IS NULL OR expected_binding_revision > 0),
+        state TEXT NOT NULL
+          CHECK(state IN ('active', 'succeeded', 'failed', 'cancelled', 'uncertain')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(session_id, provider_id, request_id, attempt_index),
+        FOREIGN KEY(source_history_state_id, session_id)
+          REFERENCES history_states(id, session_id) ON DELETE CASCADE,
+        CHECK(
+          (source_session_id IS NULL AND expected_binding_revision IS NULL) OR
+          (source_session_id IS NOT NULL AND expected_binding_revision IS NOT NULL)
+        )
+      );
+      CREATE INDEX mini_main_claude_attempts_owner
+        ON mini_main_claude_attempts(session_id, provider_id, updated_at);
+    `);
+  }
+
+  private migrateSchemaV7ToV8(): void {
+    this.database.exec(`
+      ALTER TABLE pending_run_finalizations
+        ADD COLUMN named_claude_binding_promotion_json TEXT;
+
+      CREATE TABLE mini_named_claude_bindings (
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        history_state_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        binding_protocol_version INTEGER NOT NULL CHECK(binding_protocol_version = 1),
+        provider_family TEXT NOT NULL CHECK(provider_family = 'claude-code'),
+        request_client TEXT NOT NULL,
+        canonical_message_count INTEGER NOT NULL CHECK(canonical_message_count >= 0),
+        execution_scope_hash_version INTEGER NOT NULL CHECK(execution_scope_hash_version = 1),
+        execution_scope_hash TEXT NOT NULL,
+        claude_session_id TEXT NOT NULL UNIQUE,
+        native_cwd TEXT NOT NULL,
+        native_last_modified REAL NOT NULL CHECK(native_last_modified >= 0),
+        native_context_tokens INTEGER NOT NULL CHECK(native_context_tokens >= 0),
+        native_context_max_tokens INTEGER NOT NULL CHECK(native_context_max_tokens > 0),
+        last_model_specifier TEXT NOT NULL,
+        last_reasoning TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0 AND revision <= 9007199254740991),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, provider_id),
+        FOREIGN KEY(history_state_id, session_id)
+          REFERENCES history_states(id, session_id) ON DELETE CASCADE
+      );
+      CREATE INDEX mini_named_claude_bindings_state
+        ON mini_named_claude_bindings(history_state_id, session_id);
+
+      CREATE TABLE mini_named_claude_attempts (
+        id INTEGER PRIMARY KEY,
+        product TEXT NOT NULL DEFAULT 'mini' CHECK(product = 'mini'),
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_history_state_id TEXT NOT NULL,
+        source_canonical_message_count INTEGER NOT NULL
+          CHECK(source_canonical_message_count >= 0),
+        provider_id TEXT NOT NULL,
+        request_client TEXT NOT NULL,
+        execution_scope_hash_version INTEGER NOT NULL CHECK(execution_scope_hash_version = 1),
+        execution_scope_hash TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        attempt_index INTEGER NOT NULL CHECK(attempt_index >= 0),
+        candidate_session_id TEXT NOT NULL UNIQUE,
+        source_session_id TEXT,
+        expected_binding_revision INTEGER
+          CHECK(expected_binding_revision IS NULL OR expected_binding_revision > 0),
+        state TEXT NOT NULL
+          CHECK(state IN ('active', 'succeeded', 'failed', 'cancelled', 'uncertain')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(session_id, provider_id, request_id, attempt_index),
+        FOREIGN KEY(source_history_state_id, session_id)
+          REFERENCES history_states(id, session_id) ON DELETE CASCADE,
+        CHECK(source_session_id IS NULL OR expected_binding_revision IS NOT NULL)
+      );
+      CREATE INDEX mini_named_claude_attempts_owner
+        ON mini_named_claude_attempts(session_id, provider_id, updated_at);
     `);
   }
 
@@ -1742,13 +2483,19 @@ export class MiniLilacSqliteStore {
           )
           .get(sessionId),
       );
-    const currentHeads = this.getTranscriptHeads(sessionId);
+    let currentHeads = this.getTranscriptHeads(sessionId);
     modelMessagesSchema.parse(
       this.readSerializedChain(sessionId, "model", currentHeads.model_head_id).map(deserialize),
     );
-    const currentUi = miniLilacMessagesSchema.parse(
+    const migratedCurrentUi = parseMigratedUiMessages(
       this.readSerializedChain(sessionId, "ui", currentHeads.ui_head_id).map(deserialize),
     );
+    const currentUi = migratedCurrentUi.messages;
+    if (migratedCurrentUi.changed) {
+      const uiHeadId = this.internChain(sessionId, "ui", currentUi);
+      this.setTranscriptHeads(sessionId, currentHeads.model_head_id, uiHeadId);
+      currentHeads = { ...currentHeads, ui_head_id: uiHeadId };
+    }
     const checkpoints = z.array(migrationCheckpointRowSchema).parse(
       this.database
         .query(
@@ -1792,13 +2539,17 @@ export class MiniLilacSqliteStore {
       modelMessagesSchema.parse(
         this.readSerializedChain(sessionId, "model", checkpoint.model_head_id).map(deserialize),
       );
+      const migratedUiPrefix = parseMigratedUiMessages(
+        this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id).map(deserialize),
+      );
+      const uiHeadId = migratedUiPrefix.changed
+        ? this.internChain(sessionId, "ui", migratedUiPrefix.messages)
+        : checkpoint.ui_head_id;
       return {
-        row: checkpoint,
+        row: { ...checkpoint, ui_head_id: uiHeadId },
         run,
-        message: miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json)),
-        uiPrefix: miniLilacMessagesSchema.parse(
-          this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id).map(deserialize),
-        ),
+        message: parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json)),
+        uiPrefix: migratedUiPrefix.messages,
       };
     });
     if (hasActiveLifecycle) {
@@ -2071,9 +2822,11 @@ export class MiniLilacSqliteStore {
         .all(sessionId)
         .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
       modelMessagesSchema.parse(modelValues.map(deserialize));
-      miniLilacMessagesSchema.parse(uiValues.map(deserialize));
+      const migratedUi = parseMigratedUiMessages(uiValues.map(deserialize));
       const modelHeadId = this.internSerializedChain(sessionId, "model", modelValues);
-      const uiHeadId = this.internSerializedChain(sessionId, "ui", uiValues);
+      const uiHeadId = migratedUi.changed
+        ? this.internChain(sessionId, "ui", migratedUi.messages)
+        : this.internSerializedChain(sessionId, "ui", uiValues);
       this.setTranscriptHeads(sessionId, modelHeadId, uiHeadId);
     }
 
@@ -2091,9 +2844,11 @@ export class MiniLilacSqliteStore {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const checkpoint of checkpoints) {
-      const message = miniLilacUserUIMessageSchema.parse(deserialize(checkpoint.user_message_json));
+      const message = parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json));
       const modelPrefix = modelMessagesSchema.parse(deserialize(checkpoint.model_prefix_json));
-      const uiPrefix = miniLilacMessagesSchema.parse(deserialize(checkpoint.ui_prefix_json));
+      const uiPrefix = parseMigratedUiMessages(
+        z.array(z.unknown()).parse(deserialize(checkpoint.ui_prefix_json)),
+      ).messages;
       const modelHeadId = this.internChain(checkpoint.session_id, "model", modelPrefix);
       const uiHeadId = this.internChain(checkpoint.session_id, "ui", uiPrefix);
       insertCheckpoint.run(
@@ -2700,6 +3455,367 @@ export class MiniLilacSqliteStore {
     return toHistoryState(row);
   }
 
+  getMiniMainClaudeState(inputValue: {
+    readonly sessionId: string;
+    readonly historyStateId: string;
+    readonly providerId: string;
+  }): MiniMainClaudeState {
+    const input = miniMainClaudeStateLookupSchema.parse(inputValue);
+    return this.database.transaction(() => {
+      const row = this.database
+        .query("SELECT * FROM history_states WHERE id = ? AND session_id = ?")
+        .get(input.historyStateId, input.sessionId);
+      if (!row) {
+        throw new Error(
+          `History state '${input.historyStateId}' does not belong to session '${input.sessionId}'`,
+        );
+      }
+      const historyState = toHistoryState(row);
+      const bindingRow = this.database
+        .query(
+          `SELECT * FROM mini_main_claude_bindings
+           WHERE session_id = ? AND history_state_id = ? AND provider_id = ?`,
+        )
+        .get(input.sessionId, input.historyStateId, input.providerId);
+      return {
+        historyState,
+        providerState: historyState.providerState,
+        binding: bindingRow ? toMiniMainClaudeBinding(bindingRow) : null,
+      };
+    })();
+  }
+
+  getMiniMainClaudeSessionAttempt(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): MiniMainClaudeSessionAttempt | null {
+    const input = miniMainClaudeSessionAttemptKeySchema.parse(inputValue);
+    const row = this.database
+      .query(
+        `SELECT * FROM mini_main_claude_attempts
+         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+      )
+      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+    return row ? toMiniMainClaudeAttempt(row) : null;
+  }
+
+  reserveMiniMainClaudeSessionAttempt(
+    inputValue: ReserveMiniMainClaudeSessionAttempt,
+  ): MiniMainClaudeSessionAttempt {
+    const input = reserveMiniMainClaudeSessionAttemptSchema.parse(inputValue);
+    if ((input.sourceSessionId === null) !== (input.expectedBindingRevision === null)) {
+      throw new Error("A Claude fork attempt requires both source session and binding revision");
+    }
+    return this.runImmediateTransaction(() => {
+      const source = this.getMiniMainClaudeState({
+        sessionId: input.lilacSessionId,
+        historyStateId: input.sourceHistoryStateId,
+        providerId: input.providerId,
+      });
+      if (input.expectedBindingRevision !== null) {
+        const binding = source.binding;
+        if (
+          binding === null ||
+          binding.revision !== input.expectedBindingRevision ||
+          binding.claudeSessionId !== input.sourceSessionId ||
+          binding.requestClient !== input.requestClient ||
+          binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
+          binding.executionScopeHash !== input.executionScopeHash
+        ) {
+          throw new Error("Claude attempt source binding changed before reservation");
+        }
+      }
+      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
+        this.database
+          .query(
+            `SELECT COUNT(*) AS count FROM mini_main_claude_attempts
+             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+          )
+          .get(input.lilacSessionId, input.providerId),
+      ).count;
+      if (activeCount >= MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        throw new Error("Too many active Mini main Claude attempts are retained");
+      }
+      const now = new Date().toISOString();
+      this.database
+        .query(
+          `INSERT INTO mini_main_claude_attempts
+            (product, session_id, source_history_state_id, source_canonical_message_count,
+             provider_id, request_client, execution_scope_hash_version, execution_scope_hash,
+             request_id, attempt_index, candidate_session_id, source_session_id,
+             expected_binding_revision, state, created_at, updated_at)
+           VALUES ('mini', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        )
+        .run(
+          input.lilacSessionId,
+          input.sourceHistoryStateId,
+          this.getHistoryStateCanonicalMessageCount(input.sourceHistoryStateId),
+          input.providerId,
+          input.requestClient,
+          input.executionScopeHashVersion,
+          input.executionScopeHash,
+          input.requestId,
+          input.attemptIndex,
+          input.candidateSessionId,
+          input.sourceSessionId,
+          input.expectedBindingRevision,
+          now,
+          now,
+        );
+      this.pruneMiniMainClaudeAttempts(input.lilacSessionId, input.providerId);
+      const attempt = this.getMiniMainClaudeSessionAttempt({
+        providerId: input.providerId,
+        lilacSessionId: input.lilacSessionId,
+        requestId: input.requestId,
+        attemptIndex: input.attemptIndex,
+      });
+      if (attempt === null) throw new Error("Reserved Claude attempt was not retained");
+      return attempt;
+    });
+  }
+
+  recordMiniMainClaudeSessionAttemptOutcome(
+    inputValue: RecordMiniMainClaudeSessionAttemptOutcome,
+  ): MiniMainClaudeSessionAttempt {
+    const input = recordMiniMainClaudeSessionAttemptOutcomeSchema.parse(inputValue);
+    return this.runImmediateTransaction(() => {
+      const attemptKey = {
+        providerId: input.providerId,
+        lilacSessionId: input.lilacSessionId,
+        requestId: input.requestId,
+        attemptIndex: input.attemptIndex,
+      };
+      const current = this.getMiniMainClaudeSessionAttempt(attemptKey);
+      if (current === null) throw new Error(`Claude attempt '${input.requestId}' was not found`);
+      if (current.state !== "active") {
+        if (current.state === input.state) return current;
+        throw new Error(
+          `Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+        );
+      }
+      const updated = this.database
+        .query(
+          `UPDATE mini_main_claude_attempts SET state = ?, updated_at = ?
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?
+             AND state = 'active'`,
+        )
+        .run(
+          input.state,
+          new Date().toISOString(),
+          input.lilacSessionId,
+          input.providerId,
+          input.requestId,
+          input.attemptIndex,
+        );
+      if (updated.changes !== 1) throw new Error("Claude attempt outcome lost its active fence");
+      this.pruneMiniMainClaudeAttempts(input.lilacSessionId, input.providerId);
+      const attempt = this.getMiniMainClaudeSessionAttempt(attemptKey);
+      if (attempt === null)
+        throw new Error("Updated Claude attempt exceeded retention immediately");
+      return attempt;
+    });
+  }
+
+  getMiniNamedClaudeState(inputValue: {
+    readonly sessionId: string;
+    readonly providerId: string;
+  }): MiniNamedClaudeState {
+    const input = miniNamedClaudeStateLookupSchema.parse(inputValue);
+    const session = this.database.query("SELECT 1 FROM sessions WHERE id = ?").get(input.sessionId);
+    if (!session) throw new Error(`Session '${input.sessionId}' was not found`);
+    const row = this.database
+      .query(
+        `SELECT * FROM mini_named_claude_bindings
+         WHERE session_id = ? AND provider_id = ?`,
+      )
+      .get(input.sessionId, input.providerId);
+    return { binding: row ? toMiniNamedClaudeBinding(row) : null };
+  }
+
+  getMiniNamedClaudeSessionAttempt(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): MiniNamedClaudeSessionAttempt | null {
+    const input = miniNamedClaudeSessionAttemptKeySchema.parse(inputValue);
+    const row = this.database
+      .query(
+        `SELECT * FROM mini_named_claude_attempts
+         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+      )
+      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+    return row ? toMiniNamedClaudeAttempt(row) : null;
+  }
+
+  getMiniClaudeRetentionDiagnostics(): MiniClaudeRetentionDiagnostics {
+    const count = (sql: string) =>
+      z.object({ count: z.number().int().nonnegative() }).parse(this.database.query(sql).get())
+        .count;
+    return {
+      mainBindingCount: count("SELECT COUNT(*) AS count FROM mini_main_claude_bindings"),
+      namedBindingCount: count("SELECT COUNT(*) AS count FROM mini_named_claude_bindings"),
+      activeAttemptCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state = 'active') +
+           (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state = 'active') AS count`,
+      ),
+      terminalAttemptCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state <> 'active') +
+           (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state <> 'active') AS count`,
+      ),
+      orphanBindingCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_bindings AS binding
+            LEFT JOIN history_states AS state
+              ON state.id = binding.history_state_id AND state.session_id = binding.session_id
+            WHERE state.id IS NULL) +
+           (SELECT COUNT(*) FROM mini_named_claude_bindings AS binding
+            LEFT JOIN history_states AS state
+              ON state.id = binding.history_state_id AND state.session_id = binding.session_id
+            WHERE state.id IS NULL) AS count`,
+      ),
+      orphanAttemptCount: count(
+        `SELECT
+           (SELECT COUNT(*) FROM mini_main_claude_attempts AS attempt
+            LEFT JOIN history_states AS state
+              ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
+            WHERE state.id IS NULL) +
+           (SELECT COUNT(*) FROM mini_named_claude_attempts AS attempt
+            LEFT JOIN history_states AS state
+              ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
+            WHERE state.id IS NULL) AS count`,
+      ),
+    };
+  }
+
+  reserveMiniNamedClaudeSessionAttempt(
+    inputValue: ReserveMiniNamedClaudeSessionAttempt,
+  ): MiniNamedClaudeSessionAttempt {
+    const input = reserveMiniNamedClaudeSessionAttemptSchema.parse(inputValue);
+    return this.runImmediateTransaction(() => {
+      const source = this.getHistoryState(input.sourceHistoryStateId);
+      if (source.sessionId !== input.lilacSessionId) {
+        throw new Error(
+          `History state '${input.sourceHistoryStateId}' does not belong to session '${input.lilacSessionId}'`,
+        );
+      }
+      const binding = this.getMiniNamedClaudeState({
+        sessionId: input.lilacSessionId,
+        providerId: input.providerId,
+      }).binding;
+      if (input.expectedBindingRevision === null) {
+        if (binding !== null) {
+          throw new Error("Named Claude attempt source binding changed before reservation");
+        }
+      } else if (
+        binding === null ||
+        binding.revision !== input.expectedBindingRevision ||
+        binding.requestClient !== input.requestClient ||
+        (input.sourceSessionId !== null &&
+          (binding.claudeSessionId !== input.sourceSessionId ||
+            binding.historyStateId !== input.sourceHistoryStateId ||
+            binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
+            binding.executionScopeHash !== input.executionScopeHash))
+      ) {
+        throw new Error("Named Claude attempt source binding changed before reservation");
+      }
+      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
+        this.database
+          .query(
+            `SELECT COUNT(*) AS count FROM mini_named_claude_attempts
+             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+          )
+          .get(input.lilacSessionId, input.providerId),
+      ).count;
+      if (activeCount >= MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        throw new Error("Too many active Mini named Claude attempts are retained");
+      }
+      const now = new Date().toISOString();
+      this.database
+        .query(
+          `INSERT INTO mini_named_claude_attempts
+            (product, session_id, source_history_state_id, source_canonical_message_count,
+             provider_id, request_client, execution_scope_hash_version, execution_scope_hash,
+             request_id, attempt_index, candidate_session_id, source_session_id,
+             expected_binding_revision, state, created_at, updated_at)
+           VALUES ('mini', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        )
+        .run(
+          input.lilacSessionId,
+          input.sourceHistoryStateId,
+          this.getHistoryStateCanonicalMessageCount(input.sourceHistoryStateId),
+          input.providerId,
+          input.requestClient,
+          input.executionScopeHashVersion,
+          input.executionScopeHash,
+          input.requestId,
+          input.attemptIndex,
+          input.candidateSessionId,
+          input.sourceSessionId,
+          input.expectedBindingRevision,
+          now,
+          now,
+        );
+      this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
+      const attempt = this.getMiniNamedClaudeSessionAttempt({
+        providerId: input.providerId,
+        lilacSessionId: input.lilacSessionId,
+        requestId: input.requestId,
+        attemptIndex: input.attemptIndex,
+      });
+      if (attempt === null) throw new Error("Reserved named Claude attempt was not retained");
+      return attempt;
+    });
+  }
+
+  recordMiniNamedClaudeSessionAttemptOutcome(
+    inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
+  ): MiniNamedClaudeSessionAttempt {
+    const input = recordMiniNamedClaudeSessionAttemptOutcomeSchema.parse(inputValue);
+    return this.runImmediateTransaction(() => {
+      const attemptKey = {
+        providerId: input.providerId,
+        lilacSessionId: input.lilacSessionId,
+        requestId: input.requestId,
+        attemptIndex: input.attemptIndex,
+      };
+      const current = this.getMiniNamedClaudeSessionAttempt(attemptKey);
+      if (current === null)
+        throw new Error(`Named Claude attempt '${input.requestId}' was not found`);
+      if (current.state !== "active") {
+        if (current.state === input.state) return current;
+        throw new Error(
+          `Named Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+        );
+      }
+      const updated = this.database
+        .query(
+          `UPDATE mini_named_claude_attempts SET state = ?, updated_at = ?
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?
+             AND state = 'active'`,
+        )
+        .run(
+          input.state,
+          new Date().toISOString(),
+          input.lilacSessionId,
+          input.providerId,
+          input.requestId,
+          input.attemptIndex,
+        );
+      if (updated.changes !== 1)
+        throw new Error("Named Claude attempt outcome lost its active fence");
+      this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
+      const attempt = this.getMiniNamedClaudeSessionAttempt(attemptKey);
+      if (attempt === null)
+        throw new Error("Updated named Claude attempt exceeded retention immediately");
+      return attempt;
+    });
+  }
+
   getSessionHistory(sessionId: string): StoredSessionHistory {
     const row = this.database
       .query("SELECT * FROM session_history WHERE session_id = ?")
@@ -3038,6 +4154,16 @@ export class MiniLilacSqliteStore {
         throw new Error("Steering UI boundary does not extend the canonical live transcript");
       }
       const fromState = this.getHistoryState(previous.fromStateId);
+      const providerState =
+        input.providerState === undefined
+          ? fromState.providerState
+          : historyProviderStateSchema.parse(input.providerState);
+      if (input.providerState !== undefined) {
+        this.assertConservativeProviderTransition(
+          fromState.id,
+          historyProviderStateSchema.parse(input.providerState),
+        );
+      }
       const fromUiMessages = miniLilacMessagesSchema.parse(
         this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId).map(deserialize),
       );
@@ -3056,6 +4182,7 @@ export class MiniLilacSqliteStore {
         uiHeadId: baseHeads.uiHeadId,
         ...input.workspace,
         origin: "turn-boundary",
+        providerState,
       };
       this.closeHistoryTransition(input.previousOpenTransitionId, boundaryState, { select: true });
       let currentState = this.getHistoryState(input.boundaryStateId);
@@ -3118,6 +4245,7 @@ export class MiniLilacSqliteStore {
               uiHeadId: nextUiHeadId,
               ...input.workspace,
               origin: "turn-boundary",
+              providerState,
             },
             { select: true },
           );
@@ -3230,6 +4358,12 @@ export class MiniLilacSqliteStore {
         );
         this.moveHistoryCursor(input.sessionId, fromState);
       }
+      if (input.providerState !== undefined) {
+        this.assertConservativeProviderTransition(
+          fromState.id,
+          historyProviderStateSchema.parse(input.providerState),
+        );
+      }
       const heads = {
         modelHeadId: this.internChain(input.sessionId, "model", input.modelMessages),
         uiHeadId: this.internChain(input.sessionId, "ui", [
@@ -3258,6 +4392,7 @@ export class MiniLilacSqliteStore {
           workspaceStatus: input.workspaceStatus,
           workspaceUnavailableReason: input.workspaceUnavailableReason,
           origin: "compaction",
+          providerState: input.providerState,
         },
         transition: {
           id: input.transitionId,
@@ -3685,6 +4820,33 @@ export class MiniLilacSqliteStore {
       .map(toHistoryOperation);
   }
 
+  skipPreparedHistoryRestore(
+    operationId: string,
+    reasonValue: z.infer<typeof historySkipReasonSchema>,
+  ): StoredHistoryOperation {
+    const reason = historySkipReasonSchema.parse(reasonValue);
+    return this.runImmediateTransaction(() => {
+      const operation = this.getHistoryOperation(operationId);
+      if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
+      if (operation.filesystemMode !== "restore" || operation.phase !== "prepared") {
+        throw new Error(`History operation '${operationId}' cannot skip its prepared restore`);
+      }
+      const updated = this.database
+        .query(
+          `UPDATE history_operations
+           SET filesystem_mode = 'skip', skip_reason = ?, updated_at = ?
+           WHERE id = ? AND filesystem_mode = 'restore' AND phase = 'prepared'`,
+        )
+        .run(reason, new Date().toISOString(), operationId);
+      if (updated.changes !== 1) {
+        throw new Error(`History operation '${operationId}' could not skip its prepared restore`);
+      }
+      const skipped = this.getHistoryOperation(operationId);
+      if (skipped === null) throw new Error(`History operation '${operationId}' disappeared`);
+      return skipped;
+    });
+  }
+
   updateHistoryOperationPhase(
     operationId: string,
     phaseValue: z.infer<typeof historyOperationPhaseSchema>,
@@ -3873,6 +5035,27 @@ export class MiniLilacSqliteStore {
     miniLilacMessagesSchema.parse(input.uiMessages);
     const runStatus = z.enum(["completed", "cancelled", "error"]).parse(input.runStatus);
     const sessionStatus = z.enum(["idle", "error"]).parse(input.sessionStatus);
+    const providerState =
+      input.providerState === undefined
+        ? null
+        : historyProviderStateSchema.parse(input.providerState);
+    const promotion =
+      input.claudeBindingPromotion === undefined
+        ? null
+        : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
+    const namedPromotion =
+      input.namedClaudeBindingPromotion === undefined
+        ? null
+        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
+    if (promotion !== null && namedPromotion !== null) {
+      throw new Error("A run cannot promote both main and named Claude bindings");
+    }
+    if (
+      (promotion !== null || namedPromotion !== null) &&
+      providerState?.lastFamily !== "claude-code"
+    ) {
+      throw new Error("A Claude binding promotion requires Claude provider-state metadata");
+    }
     if (input.inputTokens !== null) z.number().int().nonnegative().parse(input.inputTokens);
     return this.runImmediateTransaction(() => {
       const workspace = this.getWorkspaceForSession(input.sessionId);
@@ -3932,8 +5115,10 @@ export class MiniLilacSqliteStore {
         .query(
           `INSERT INTO pending_run_finalizations
             (run_id, session_id, workspace_id, open_transition_id, model_head_id, ui_head_id,
-             run_status, session_status, error, terminal_result_json, input_tokens, prepared_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             run_status, session_status, error, terminal_result_json, input_tokens,
+             last_provider_family, contains_cross_family_turns, claude_binding_promotion_json,
+             named_claude_binding_promotion_json, prepared_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.runId,
@@ -3947,6 +5132,10 @@ export class MiniLilacSqliteStore {
           input.error,
           input.terminalResult === undefined ? null : serialize(input.terminalResult),
           input.inputTokens,
+          providerState?.lastFamily ?? null,
+          providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
+          promotion === null ? null : serialize(promotion),
+          namedPromotion === null ? null : serialize(namedPromotion),
           now,
         );
       const pending = this.getPendingRunFinalization(input.runId);
@@ -4013,6 +5202,53 @@ export class MiniLilacSqliteStore {
   recoverInterruptedRuntimeState(): void {
     const now = new Date().toISOString();
     this.runImmediateTransaction(() => {
+      const interruptedAttempts = z
+        .array(
+          z.object({
+            product: z.enum(["main", "named"]),
+            request_id: z.string(),
+            session_id: z.string(),
+            provider_id: z.string(),
+            request_client: z.string(),
+            source_history_state_id: z.string(),
+            expected_binding_revision: z.number().int().positive().nullable(),
+            model: z.string(),
+            reasoning: z.string(),
+          }),
+        )
+        .parse(
+          this.database
+            .query(
+              `SELECT 'main' AS product, attempt.request_id, attempt.session_id,
+                      attempt.provider_id, attempt.request_client,
+                      attempt.source_history_state_id, attempt.expected_binding_revision,
+                      session.model, session.reasoning
+               FROM mini_main_claude_attempts AS attempt
+               JOIN sessions AS session ON session.id = attempt.session_id
+               WHERE attempt.state = 'active'
+               UNION ALL
+               SELECT 'named' AS product, attempt.request_id, attempt.session_id,
+                      attempt.provider_id, attempt.request_client,
+                      attempt.source_history_state_id, attempt.expected_binding_revision,
+                      session.model, session.reasoning
+               FROM mini_named_claude_attempts AS attempt
+               JOIN sessions AS session ON session.id = attempt.session_id
+               WHERE attempt.state = 'active'`,
+            )
+            .all(),
+        );
+      this.database
+        .query(
+          `UPDATE mini_main_claude_attempts SET state = 'uncertain', updated_at = ?
+           WHERE state = 'active'`,
+        )
+        .run(now);
+      this.database
+        .query(
+          `UPDATE mini_named_claude_attempts SET state = 'uncertain', updated_at = ?
+           WHERE state = 'active'`,
+        )
+        .run(now);
       this.database
         .query(
           `UPDATE runs SET status = 'error', error = ?, finished_at = ?
@@ -4042,6 +5278,52 @@ export class MiniLilacSqliteStore {
       this.database
         .query("DELETE FROM commands WHERE result_json IS NULL AND side_effect_started = 0")
         .run();
+      const owners = z.array(z.object({ session_id: z.string(), provider_id: z.string() })).parse(
+        this.database
+          .query(
+            `SELECT DISTINCT session_id, provider_id FROM mini_main_claude_attempts
+               ORDER BY session_id, provider_id`,
+          )
+          .all(),
+      );
+      for (const owner of owners) {
+        this.pruneMiniMainClaudeAttempts(owner.session_id, owner.provider_id);
+      }
+      const namedOwners = z
+        .array(z.object({ session_id: z.string(), provider_id: z.string() }))
+        .parse(
+          this.database
+            .query(
+              `SELECT DISTINCT session_id, provider_id FROM mini_named_claude_attempts
+               ORDER BY session_id, provider_id`,
+            )
+            .all(),
+        );
+      for (const owner of namedOwners) {
+        this.pruneMiniNamedClaudeAttempts(owner.session_id, owner.provider_id);
+      }
+      for (const attempt of interruptedAttempts) {
+        logger.debug("mini_claude.attempt_recovered", {
+          requestId: attempt.request_id,
+          sessionId: attempt.session_id,
+          providerId: attempt.provider_id,
+          requestClient: attempt.request_client,
+          owner: attempt.product,
+          mode: "recovery",
+          outcome: "uncertain",
+          reason: "runtime-restart",
+          bindingHead: attempt.source_history_state_id,
+          bindingRevision: attempt.expected_binding_revision,
+          model: attempt.model,
+          reasoning: attempt.reasoning,
+        });
+      }
+      const diagnostics = this.getMiniClaudeRetentionDiagnostics();
+      if (diagnostics.orphanBindingCount > 0 || diagnostics.orphanAttemptCount > 0) {
+        logger.warn("mini_claude.retention_orphans_detected", diagnostics);
+      } else {
+        logger.debug("mini_claude.retention_diagnostics", diagnostics);
+      }
     });
   }
 
@@ -4049,10 +5331,57 @@ export class MiniLilacSqliteStore {
     input: CommitPendingStoredRunFinalization,
   ): CommittedPendingStoredRunFinalization {
     parseHistoryWorkspaceOutcome(input);
+    const requestedProviderState =
+      input.providerState === undefined
+        ? null
+        : historyProviderStateSchema.parse(input.providerState);
+    const requestedPromotion =
+      input.claudeBindingPromotion === undefined
+        ? null
+        : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
+    const requestedNamedPromotion =
+      input.namedClaudeBindingPromotion === undefined
+        ? null
+        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
     return this.runImmediateTransaction(() => {
       const pending = this.getPendingRunFinalization(input.runId);
       if (pending === null)
         throw new Error(`Pending finalization for run '${input.runId}' was not found`);
+      if (
+        requestedProviderState !== null &&
+        pending.providerState !== null &&
+        !canonicalValuesEqual(requestedProviderState, pending.providerState)
+      ) {
+        throw new Error("Pending finalization provider-state metadata changed before commit");
+      }
+      if (
+        requestedPromotion !== null &&
+        pending.claudeBindingPromotion !== null &&
+        !canonicalValuesEqual(requestedPromotion, pending.claudeBindingPromotion)
+      ) {
+        throw new Error("Pending finalization Claude promotion metadata changed before commit");
+      }
+      if (
+        requestedNamedPromotion !== null &&
+        pending.namedClaudeBindingPromotion !== null &&
+        !canonicalValuesEqual(requestedNamedPromotion, pending.namedClaudeBindingPromotion)
+      ) {
+        throw new Error(
+          "Pending finalization named Claude promotion metadata changed before commit",
+        );
+      }
+      const providerState = requestedProviderState ?? pending.providerState;
+      const promotion = requestedPromotion ?? pending.claudeBindingPromotion;
+      const namedPromotion = requestedNamedPromotion ?? pending.namedClaudeBindingPromotion;
+      if (promotion !== null && namedPromotion !== null) {
+        throw new Error("A run cannot promote both main and named Claude bindings");
+      }
+      if (
+        (promotion !== null || namedPromotion !== null) &&
+        providerState?.lastFamily !== "claude-code"
+      ) {
+        throw new Error("A Claude binding promotion requires Claude provider-state metadata");
+      }
       this.assertWorkspaceHistoryAvailableForOwner(pending.workspaceId, pending.sessionId, {
         kind: "pending-run-finalization",
         runId: pending.runId,
@@ -4070,6 +5399,9 @@ export class MiniLilacSqliteStore {
       ) {
         throw new Error(`Pending finalization for run '${pending.runId}' is no longer coherent`);
       }
+      if (providerState !== null) {
+        this.assertConservativeProviderTransition(transition.fromStateId, providerState);
+      }
       const destination: CreateStoredHistoryState = {
         id: input.destinationStateId,
         sessionId: pending.sessionId,
@@ -4080,6 +5412,7 @@ export class MiniLilacSqliteStore {
         workspaceStatus: input.workspaceStatus,
         workspaceUnavailableReason: input.workspaceUnavailableReason,
         origin: "turn-boundary",
+        providerState,
       };
       this.closeHistoryTransition(pending.openTransitionId, destination, { select: true });
       const now = new Date().toISOString();
@@ -4107,13 +5440,324 @@ export class MiniLilacSqliteStore {
       if (updated.changes !== 1) {
         throw new Error(`Run '${pending.runId}' is not active for session '${pending.sessionId}'`);
       }
+      const bindingPromotion =
+        promotion !== null
+          ? this.promoteMiniMainClaudeBinding(
+              pending,
+              this.getRootPromptSourceStateId(pending),
+              destination.id,
+              promotion,
+            )
+            ? "promoted"
+            : "cas-failed"
+          : namedPromotion !== null
+            ? this.promoteMiniNamedClaudeBinding(
+                pending,
+                this.getRootPromptSourceStateId(pending),
+                destination.id,
+                namedPromotion,
+              )
+              ? "promoted"
+              : "cas-failed"
+            : "not-requested";
       this.deletePendingRunFinalizationRow(pending.runId);
       return {
         pending,
         state: this.getHistoryState(destination.id),
         snapshot: this.getSession(pending.sessionId),
+        bindingPromotion,
       };
     });
+  }
+
+  private getHistoryStateCanonicalMessageCount(stateId: string): number {
+    const state = this.getHistoryState(stateId);
+    if (state.modelHeadId === null) return 0;
+    return z.object({ depth: z.number().int().positive() }).parse(
+      this.database
+        .query(
+          `SELECT depth FROM transcript_nodes
+           WHERE id = ? AND session_id = ? AND lane = 'model'`,
+        )
+        .get(state.modelHeadId, state.sessionId),
+    ).depth;
+  }
+
+  private assertConservativeProviderTransition(
+    sourceStateId: string,
+    destination: HistoryProviderState,
+  ): void {
+    const source = this.getHistoryState(sourceStateId);
+    const sourceMessageCount = this.getHistoryStateCanonicalMessageCount(sourceStateId);
+    const requiresMixedHistory =
+      source.providerState?.containsCrossFamilyTurns === true ||
+      (source.providerState === null && sourceMessageCount > 0) ||
+      (source.providerState !== null && source.providerState.lastFamily !== destination.lastFamily);
+    if (requiresMixedHistory && !destination.containsCrossFamilyTurns) {
+      throw new Error(
+        `History state '${sourceStateId}' requires conservative cross-family metadata`,
+      );
+    }
+  }
+
+  private promoteMiniMainClaudeBinding(
+    pending: PendingStoredRunFinalization,
+    sourceHistoryStateId: string,
+    destinationHistoryStateId: string,
+    promotion: PromoteMiniMainClaudeSessionBinding,
+  ): boolean {
+    if (pending.runStatus !== "completed") return false;
+    const attempt = this.getMiniMainClaudeSessionAttempt({
+      providerId: promotion.providerId,
+      lilacSessionId: pending.sessionId,
+      requestId: promotion.requestId,
+      attemptIndex: promotion.attemptIndex,
+    });
+    if (
+      attempt === null ||
+      attempt.state !== "succeeded" ||
+      attempt.requestId !== pending.runId ||
+      attempt.sourceHistoryStateId !== sourceHistoryStateId ||
+      attempt.sourceCanonicalMessageCount !==
+        this.getHistoryStateCanonicalMessageCount(sourceHistoryStateId)
+    ) {
+      return false;
+    }
+    if (attempt.expectedBindingRevision !== null) {
+      const sourceBinding = this.getMiniMainClaudeState({
+        sessionId: pending.sessionId,
+        historyStateId: sourceHistoryStateId,
+        providerId: promotion.providerId,
+      }).binding;
+      if (
+        sourceBinding === null ||
+        sourceBinding.revision !== attempt.expectedBindingRevision ||
+        sourceBinding.claudeSessionId !== attempt.sourceSessionId ||
+        sourceBinding.requestClient !== attempt.requestClient ||
+        sourceBinding.executionScopeHashVersion !== attempt.executionScopeHashVersion ||
+        sourceBinding.executionScopeHash !== attempt.executionScopeHash
+      ) {
+        return false;
+      }
+    }
+    const revision = (attempt.expectedBindingRevision ?? 0) + 1;
+    if (!Number.isSafeInteger(revision)) return false;
+    const inserted = this.database
+      .query(
+        `INSERT INTO mini_main_claude_bindings
+          (session_id, history_state_id, provider_id, binding_protocol_version, provider_family,
+           request_client, canonical_message_count, execution_scope_hash_version,
+           execution_scope_hash, claude_session_id, native_cwd, native_last_modified,
+           native_context_tokens, native_context_max_tokens, last_model_specifier, last_reasoning,
+           revision, updated_at)
+         VALUES (?, ?, ?, 1, 'claude-code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, history_state_id, provider_id) DO NOTHING`,
+      )
+      .run(
+        pending.sessionId,
+        destinationHistoryStateId,
+        promotion.providerId,
+        attempt.requestClient,
+        this.getHistoryStateCanonicalMessageCount(destinationHistoryStateId),
+        attempt.executionScopeHashVersion,
+        attempt.executionScopeHash,
+        attempt.candidateSessionId,
+        promotion.nativeCwd,
+        promotion.nativeLastModified,
+        promotion.nativeContextTokens,
+        promotion.nativeContextMaxTokens,
+        promotion.lastModelSpecifier,
+        promotion.lastReasoning,
+        revision,
+        new Date().toISOString(),
+      );
+    return inserted.changes === 1;
+  }
+
+  private promoteMiniNamedClaudeBinding(
+    pending: PendingStoredRunFinalization,
+    sourceHistoryStateId: string,
+    destinationHistoryStateId: string,
+    promotion: PromoteMiniNamedClaudeSessionBinding,
+  ): boolean {
+    if (
+      pending.runStatus !== "completed" ||
+      !miniNamedSessionIdSchema.safeParse(pending.sessionId).success ||
+      this.getRun(pending.runId).depth === 0
+    ) {
+      return false;
+    }
+    const attempt = this.getMiniNamedClaudeSessionAttempt({
+      providerId: promotion.providerId,
+      lilacSessionId: pending.sessionId,
+      requestId: promotion.requestId,
+      attemptIndex: promotion.attemptIndex,
+    });
+    if (
+      attempt === null ||
+      attempt.state !== "succeeded" ||
+      attempt.requestId !== pending.runId ||
+      attempt.sourceHistoryStateId !== sourceHistoryStateId ||
+      attempt.sourceCanonicalMessageCount !==
+        this.getHistoryStateCanonicalMessageCount(sourceHistoryStateId)
+    ) {
+      return false;
+    }
+    const destinationMessages = this.getHistoryStateModelMessages(destinationHistoryStateId);
+    if (
+      destinationMessages.length !== promotion.canonicalMessageCount ||
+      hashCanonicalMessagesV1(destinationMessages).hash !== promotion.canonicalHeadHash
+    ) {
+      return false;
+    }
+    const current = this.getMiniNamedClaudeState({
+      sessionId: pending.sessionId,
+      providerId: promotion.providerId,
+    }).binding;
+    if (
+      (attempt.expectedBindingRevision === null && current !== null) ||
+      (attempt.expectedBindingRevision !== null &&
+        (current === null || current.revision !== attempt.expectedBindingRevision))
+    ) {
+      return false;
+    }
+    if (
+      attempt.sourceSessionId !== null &&
+      (current === null ||
+        current.historyStateId !== sourceHistoryStateId ||
+        current.claudeSessionId !== attempt.sourceSessionId ||
+        current.requestClient !== attempt.requestClient ||
+        current.executionScopeHashVersion !== attempt.executionScopeHashVersion ||
+        current.executionScopeHash !== attempt.executionScopeHash)
+    ) {
+      return false;
+    }
+    const revision = (attempt.expectedBindingRevision ?? 0) + 1;
+    if (!Number.isSafeInteger(revision)) return false;
+    const values = [
+      destinationHistoryStateId,
+      attempt.requestClient,
+      promotion.canonicalMessageCount,
+      attempt.executionScopeHashVersion,
+      attempt.executionScopeHash,
+      attempt.candidateSessionId,
+      promotion.nativeCwd,
+      promotion.nativeLastModified,
+      promotion.nativeContextTokens,
+      promotion.nativeContextMaxTokens,
+      promotion.lastModelSpecifier,
+      promotion.lastReasoning,
+      revision,
+      new Date().toISOString(),
+    ] as const;
+    if (current === null) {
+      return (
+        this.database
+          .query(
+            `INSERT INTO mini_named_claude_bindings
+              (session_id, history_state_id, provider_id, binding_protocol_version, provider_family,
+               request_client, canonical_message_count, execution_scope_hash_version,
+               execution_scope_hash, claude_session_id, native_cwd, native_last_modified,
+               native_context_tokens, native_context_max_tokens, last_model_specifier,
+               last_reasoning, revision, updated_at)
+             VALUES (?, ?, ?, 1, 'claude-code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id, provider_id) DO NOTHING`,
+          )
+          .run(
+            pending.sessionId,
+            destinationHistoryStateId,
+            promotion.providerId,
+            ...values.slice(1),
+          ).changes === 1
+      );
+    }
+    return (
+      this.database
+        .query(
+          `UPDATE mini_named_claude_bindings
+           SET history_state_id = ?, request_client = ?, canonical_message_count = ?,
+               execution_scope_hash_version = ?, execution_scope_hash = ?, claude_session_id = ?,
+               native_cwd = ?, native_last_modified = ?, native_context_tokens = ?,
+               native_context_max_tokens = ?, last_model_specifier = ?, last_reasoning = ?,
+               revision = ?, updated_at = ?
+           WHERE session_id = ? AND provider_id = ? AND revision = ?`,
+        )
+        .run(...values, pending.sessionId, promotion.providerId, attempt.expectedBindingRevision)
+        .changes === 1
+    );
+  }
+
+  private getRootPromptSourceStateId(pending: PendingStoredRunFinalization): string {
+    const row = z.object({ from_state_id: z.string().min(1) }).parse(
+      this.database
+        .query(
+          `SELECT from_state_id FROM history_transitions
+           WHERE session_id = ? AND root_run_id = ? AND kind = 'user-message'
+             AND delivery = 'prompt'
+           ORDER BY created_at, rowid
+           LIMIT 1`,
+        )
+        .get(pending.sessionId, pending.runId),
+    );
+    return row.from_state_id;
+  }
+
+  private pruneMiniMainClaudeAttempts(sessionId: string, providerId: string): void {
+    const pruned = this.database
+      .query(
+        `DELETE FROM mini_main_claude_attempts
+         WHERE session_id = ? AND provider_id = ? AND state <> 'active' AND id NOT IN (
+           SELECT id FROM mini_main_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND state <> 'active'
+           ORDER BY updated_at DESC, id DESC
+           LIMIT ?
+         )`,
+      )
+      .run(
+        sessionId,
+        providerId,
+        sessionId,
+        providerId,
+        MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT,
+      ).changes;
+    if (pruned > 0) {
+      logger.info("mini_claude.orphan_metadata_pruned", {
+        sessionId,
+        providerId,
+        owner: "main",
+        attemptCount: pruned,
+        reason: "terminal-count-bound",
+      });
+    }
+  }
+
+  private pruneMiniNamedClaudeAttempts(sessionId: string, providerId: string): void {
+    const pruned = this.database
+      .query(
+        `DELETE FROM mini_named_claude_attempts
+         WHERE session_id = ? AND provider_id = ? AND state <> 'active' AND id NOT IN (
+           SELECT id FROM mini_named_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND state <> 'active'
+           ORDER BY updated_at DESC, id DESC
+           LIMIT ?
+         )`,
+      )
+      .run(
+        sessionId,
+        providerId,
+        sessionId,
+        providerId,
+        MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT,
+      ).changes;
+    if (pruned > 0) {
+      logger.info("mini_claude.orphan_metadata_pruned", {
+        sessionId,
+        providerId,
+        owner: "named",
+        attemptCount: pruned,
+        reason: "terminal-count-bound",
+      });
+    }
   }
 
   private requireQuiescentHistorySession(
@@ -4241,6 +5885,7 @@ export class MiniLilacSqliteStore {
         workspaceStatus: observation.workspaceStatus,
         workspaceUnavailableReason: observation.workspaceUnavailableReason,
         origin: "workspace-observation",
+        providerState: source.providerState,
       },
       transition: {
         id: observation.transitionId,
@@ -4358,12 +6003,44 @@ export class MiniLilacSqliteStore {
     }
     if (input.modelHeadId !== null) z.number().int().positive().parse(input.modelHeadId);
     if (input.uiHeadId !== null) z.number().int().positive().parse(input.uiHeadId);
+    const providerState =
+      input.providerState === undefined || input.providerState === null
+        ? null
+        : historyProviderStateSchema.parse(input.providerState);
+    const hasProviderMetadataColumns = this.database
+      .query(
+        "SELECT 1 FROM pragma_table_info('history_states') WHERE name = 'last_provider_family'",
+      )
+      .get();
+    if (!hasProviderMetadataColumns) {
+      this.database
+        .query(
+          `INSERT INTO history_states
+            (id, session_id, workspace_id, model_head_id, ui_head_id, workspace_snapshot_id,
+             workspace_status, workspace_unavailable_reason, origin, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.sessionId,
+          input.workspaceId,
+          input.modelHeadId,
+          input.uiHeadId,
+          input.workspaceSnapshotId,
+          input.workspaceStatus,
+          input.workspaceUnavailableReason,
+          input.origin,
+          input.createdAt ?? new Date().toISOString(),
+        );
+      return;
+    }
     this.database
       .query(
         `INSERT INTO history_states
           (id, session_id, workspace_id, model_head_id, ui_head_id, workspace_snapshot_id,
-           workspace_status, workspace_unavailable_reason, origin, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           workspace_status, workspace_unavailable_reason, origin, last_provider_family,
+           contains_cross_family_turns, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -4375,6 +6052,8 @@ export class MiniLilacSqliteStore {
         input.workspaceStatus,
         input.workspaceUnavailableReason,
         input.origin,
+        providerState?.lastFamily ?? null,
+        providerState === null ? null : providerState.containsCrossFamilyTurns ? 1 : 0,
         input.createdAt ?? new Date().toISOString(),
       );
   }

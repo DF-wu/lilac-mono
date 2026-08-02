@@ -2,6 +2,7 @@ import {
   computeTransientRetryDelayMs,
   createTransientModelRetryController as createSharedTransientModelRetryController,
   isRetryableTransientModelError,
+  type AdvanceModel,
 } from "@stanley2058/lilac-agent";
 import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
 
@@ -17,6 +18,7 @@ export function createTransientModelRetryController(params: {
   requestId: string;
   sessionId: string;
   modelSpec: string;
+  advanceModel?: AdvanceModel;
 }) {
   return createSharedTransientModelRetryController({
     ...params,

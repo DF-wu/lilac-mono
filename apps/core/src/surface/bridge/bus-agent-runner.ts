@@ -12,10 +12,14 @@ import {
 } from "ai";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type {
+  ConfiguredModelChainEntry,
   CoreConfig,
   CustomCommandResult,
+  DurableResolvedModelRequest,
   ModelCapabilityInfo,
   ModelReasoningEffort,
+  ResolvedModelPlan,
+  ResolvedModelRef,
 } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_TOOL_NAME,
@@ -27,17 +31,26 @@ import {
   getCoreConfig,
   isRecord,
   ModelCapability,
+  openAIMessagePhase,
   resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
-  fromDurableResolvedModelRequest,
-  resolveModelRef,
-  resolveModelSlot,
+  fromDurableResolvedModelPlan,
+  claudeCodeExecutableSettings,
+  resolveModelChain,
+  resolveModelPlan,
   resolveNativeSubagentProfile,
+  withModelPlanReasoning,
 } from "@stanley2058/lilac-utils";
 import {
+  corePrimaryLineageV1Schema,
+  createCorePrimaryLineageFreshOnlyV1,
+  extendCoreLineagePrefixDigestV1,
   lilacEventTypes,
+  parseCorePrimaryLineageV1,
   type AdapterPlatform,
+  type CoreLineageManifestV1,
+  type CorePrimaryLineageV1,
   type LilacBus,
   type RequestLifecycleState,
   type RequestOrigin,
@@ -45,17 +58,28 @@ import {
   type RequestRunPolicy,
 } from "@stanley2058/lilac-event-bus";
 import {
+  advanceHistoryProviderState,
   AgentIdleTimeoutError,
   AiSdkPiAgent,
   attachAutoCompaction,
   buildSafeRecoveryCheckpoint,
   buildSyntheticToolCallId,
+  classifyHistoryProviderFamily,
+  compactWithOpenAIResponses,
   createAgentRunIdleWatchdog,
+  hasMatchingOpenAIServerCompaction,
+  hasOpenAIServerCompaction,
+  hashCanonicalMessagesV1,
+  materializeOpenAIServerCompaction,
+  type AiSdkPiAgentOptions,
   type AiSdkPiAgentEvent,
-  type TransformMessagesFn,
+  type HistoryProviderState,
+  type TransformMessagesContext,
+  type PrepareFullModelView,
 } from "@stanley2058/lilac-agent";
 
 import fs from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 
 import type { BuiltLevel1Toolset, CoreToolPluginManager } from "../../plugins";
@@ -93,7 +117,7 @@ import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
-import { resolveReplyDeliveryFromFinalText } from "./reply-directive";
+import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
@@ -162,6 +186,21 @@ import {
 } from "./bus-agent-runner/prompt-overlays";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "./bus-request-router/common";
 import type { CustomCommandManager } from "../../custom-commands/manager";
+import {
+  createCoreNamedClaudeRuntime,
+  hashCoreNamedExecutionScope,
+  prepareCoreNamedHistoryView,
+  shouldReplayCoreNamedHistory,
+  supportsCoreNamedContinuationStore,
+  type CoreNamedClaudeRuntime,
+} from "./bus-agent-runner/core-named-continuation";
+import {
+  createCorePrimaryClaudeRuntime,
+  prepareCorePrimaryHistoryView,
+  shouldReplayCorePrimaryHistory,
+  supportsCorePrimaryContinuationStore,
+  type CorePrimaryClaudeRuntime,
+} from "./bus-agent-runner/core-primary-continuation";
 
 export { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
 export { AgentIdleTimeoutError, createAgentRunIdleWatchdog };
@@ -190,6 +229,32 @@ export {
   maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
+
+export function resolveCoreStableNamedContinuation(input: {
+  readonly runProfile: AgentRunProfile;
+  readonly sessionId: string;
+  readonly workflowPolicy: WorkflowRequestPolicy | null;
+}): NonNullable<WorkflowRequestPolicy["stableNamedContinuation"]> | null {
+  const identity = input.workflowPolicy?.stableNamedContinuation;
+  if (!identity) return null;
+  if (input.runProfile === "primary") {
+    throw new Error("Stable named continuation cannot authorize a primary run");
+  }
+  if (identity.sessionId !== input.sessionId) {
+    throw new Error("Stable named continuation identity does not match the child session");
+  }
+  return identity;
+}
+
+export function shouldUsePersistentCoreClaudeRuntime(input: {
+  runProfile: AgentRunProfile;
+  requestClient: AdapterPlatform;
+  stableNamedContinuation: NonNullable<WorkflowRequestPolicy["stableNamedContinuation"]> | null;
+  corePrimaryLineage?: CorePrimaryLineageV1;
+}): boolean {
+  if (input.runProfile === "primary") return input.requestClient === "discord";
+  return input.stableNamedContinuation !== null;
+}
 
 function supportsReadFileDirectAttachments(info: ModelCapabilityInfo | null): boolean {
   if (info?.attachment !== true) return false;
@@ -296,6 +361,45 @@ export function consumeAssistantTextDelta(params: {
   }
   params.state.lastTextPartId = params.partId;
   return nextDelta;
+}
+
+export function removeSilentAssistantTurnMessages(input: {
+  messages: readonly ModelMessage[];
+  startIndex: number;
+  messageCount: number;
+}): ModelMessage[] {
+  const endIndex = input.startIndex + input.messageCount;
+  const messages: ModelMessage[] = [];
+
+  for (let index = 0; index < input.messages.length; index += 1) {
+    const message = input.messages[index]!;
+    if (index < input.startIndex || index >= endIndex || message.role !== "assistant") {
+      messages.push(message);
+      continue;
+    }
+
+    const text = (() => {
+      if (typeof message.content === "string") return message.content;
+      const textParts = message.content.filter((part) => part.type === "text");
+      const finalAnswerParts = textParts.filter(
+        (part) => openAIMessagePhase(part.providerOptions) === "final_answer",
+      );
+      return (finalAnswerParts.length > 0 ? finalAnswerParts : textParts)
+        .map((part) => part.text)
+        .join("\n\n");
+    })();
+    if (resolveReplyDeliveryFromFinalText(text) !== "skip") {
+      messages.push(message);
+      continue;
+    }
+    if (typeof message.content === "string") continue;
+
+    const content = message.content.filter((part) => part.type !== "text");
+    if (content.every((part) => part.type === "reasoning")) continue;
+    messages.push({ ...message, content });
+  }
+
+  return messages;
 }
 
 export type ReasoningChunkState = {
@@ -1133,6 +1237,7 @@ type Enqueued = {
   runPolicy: RequestRunPolicy;
   origin?: RequestOrigin;
   messages: ModelMessage[];
+  corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
   raw?: unknown;
   recovery?: {
@@ -1150,6 +1255,7 @@ export type AgentRunnerRecoveryEntry = {
   runPolicy?: RequestRunPolicy;
   origin?: RequestOrigin;
   messages: ModelMessage[];
+  corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
   raw?: unknown;
   recovery?: {
@@ -1157,6 +1263,204 @@ export type AgentRunnerRecoveryEntry = {
     partialText: string;
   };
 };
+
+export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): boolean {
+  return (
+    parseWorkflowRequestHintFromRaw(entry.raw) !== null ||
+    entry.requestId.startsWith("wfr:") ||
+    entry.sessionId.startsWith("workflow:")
+  );
+}
+
+export function validateCorePrimaryLineageAtRunnerIntake(input: {
+  requestClient: AdapterPlatform;
+  sessionId?: string;
+  runProfile: AgentRunProfile;
+  messages: readonly ModelMessage[];
+  corePrimaryLineage: unknown;
+  transcriptStore?: TranscriptStore;
+}): CorePrimaryLineageV1 | undefined {
+  if (input.requestClient !== "discord" || input.runProfile !== "primary") return undefined;
+  const fallbackCurrentCanonicalStart = Math.max(
+    0,
+    input.messages.findLastIndex((message) => message.role === "user"),
+  );
+  if (input.corePrimaryLineage === undefined) {
+    return createCorePrimaryLineageFreshOnlyV1("missing-manifest", fallbackCurrentCanonicalStart);
+  }
+  try {
+    const lineage = parseCorePrimaryLineageV1(input.corePrimaryLineage, input.messages);
+    if (lineage.state !== "complete") return lineage;
+    if (!input.sessionId)
+      return createCorePrimaryLineageFreshOnlyV1(
+        "missing-lineage-scope",
+        lineage.currentCanonicalStart,
+      );
+    if (!input.transcriptStore?.validateCorePrimaryLineageReferences)
+      return createCorePrimaryLineageFreshOnlyV1(
+        "lineage-store-unavailable",
+        lineage.currentCanonicalStart,
+      );
+    const invalidReason = input.transcriptStore.validateCorePrimaryLineageReferences({
+      manifest: lineage,
+      requestClient: input.requestClient,
+      sessionId: input.sessionId,
+      surfaceId: `discord:${input.sessionId}`,
+    });
+    if (invalidReason) {
+      return createCorePrimaryLineageFreshOnlyV1(invalidReason, lineage.currentCanonicalStart);
+    }
+    return lineage;
+  } catch {
+    return createCorePrimaryLineageFreshOnlyV1(
+      "malformed-or-unaligned-manifest",
+      fallbackCurrentCanonicalStart,
+    );
+  }
+}
+
+export function degradeCorePrimaryLineageForMutation(
+  reason: string,
+  currentCanonicalStart = 0,
+): CorePrimaryLineageV1 {
+  return createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+}
+
+const AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE = "conversation-thread-auto-inject";
+
+export function appendAutoInjectedThreadSearchLineage(input: {
+  lineage: unknown;
+  canonicalMessages: readonly ModelMessage[];
+  injectedMessages: readonly ModelMessage[];
+}): CorePrimaryLineageV1 {
+  const parsedShape = corePrimaryLineageV1Schema.safeParse(input.lineage);
+  const fallbackCurrentCanonicalStart = parsedShape.success
+    ? parsedShape.data.currentCanonicalStart
+    : Math.max(
+        0,
+        input.canonicalMessages.findLastIndex((message) => message.role === "user"),
+      );
+  const failClosed = () =>
+    degradeCorePrimaryLineageForMutation(
+      "synthetic-thread-search-insertion",
+      fallbackCurrentCanonicalStart,
+    );
+
+  try {
+    const lineage = parseCorePrimaryLineageV1(input.lineage, input.canonicalMessages);
+    if (lineage.state !== "complete" || input.injectedMessages.length === 0) return failClosed();
+    const previous = lineage.segments.at(-1);
+    if (!previous || previous.canonicalEnd !== input.canonicalMessages.length) return failClosed();
+
+    const atom = {
+      kind: "synthetic" as const,
+      source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
+      messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
+    };
+    const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
+    const candidate = {
+      ...lineage,
+      segments: [
+        ...lineage.segments,
+        {
+          atoms: [atom],
+          canonicalMessages: [...input.injectedMessages],
+          canonicalStart: previous.canonicalEnd,
+          canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
+          cumulativeAtomCount,
+          cumulativePrefixDigest: extendCoreLineagePrefixDigestV1(
+            previous.cumulativePrefixDigest,
+            cumulativeAtomCount,
+            atom,
+          ),
+        },
+      ],
+    };
+    const parsed = parseCorePrimaryLineageV1(candidate, [
+      ...input.canonicalMessages,
+      ...input.injectedMessages,
+    ]);
+    return parsed.state === "complete" ? parsed : failClosed();
+  } catch {
+    return failClosed();
+  }
+}
+
+export function mapCorePrimaryCompactionCurrentCanonicalStart(input: {
+  previousCurrentCanonicalStart: number;
+  replacement: {
+    originalSuffixStart: number;
+    replacementSuffixStart: number;
+    replacementMessageCount: number;
+  };
+}): number {
+  const retainedOffset =
+    input.previousCurrentCanonicalStart - input.replacement.originalSuffixStart;
+  if (retainedOffset < 0) return 0;
+  return Math.min(
+    input.replacement.replacementMessageCount,
+    input.replacement.replacementSuffixStart + retainedOffset,
+  );
+}
+
+function persistedCompleteLineage(lineage: CorePrimaryLineageV1 | undefined): {
+  corePrimaryLineage?: CoreLineageManifestV1;
+} {
+  return lineage?.state === "complete" ? { corePrimaryLineage: lineage } : {};
+}
+
+export function resolveCorePrimaryTranscriptProviderState(input: {
+  targetFamily: HistoryProviderState["lastFamily"];
+  lineage?: CorePrimaryLineageV1;
+  transcriptStore?: TranscriptStore;
+}): HistoryProviderState {
+  const lineage = input.lineage;
+  let containsCrossFamilyTurns = lineage?.state !== "complete";
+  if (lineage?.state === "complete") {
+    for (const segment of lineage.segments) {
+      const atom = segment.atoms[0];
+      if (!atom) {
+        containsCrossFamilyTurns = true;
+        continue;
+      }
+      if (atom.kind === "request") {
+        const state = input.transcriptStore?.getRequestTranscript?.({
+          requestId: atom.requestId,
+        })?.providerState;
+        if (
+          !state ||
+          state.lastFamily !== atom.providerFamily ||
+          state.containsCrossFamilyTurns !== atom.containsCrossFamilyTurns ||
+          state.lastFamily !== input.targetFamily ||
+          state.containsCrossFamilyTurns
+        ) {
+          containsCrossFamilyTurns = true;
+        }
+        continue;
+      }
+      if (atom.kind === "checkpoint") {
+        const state = input.transcriptStore?.getRequestTranscript?.({
+          requestId: atom.requestId,
+        })?.providerState;
+        if (!state || state.lastFamily !== input.targetFamily || state.containsCrossFamilyTurns) {
+          containsCrossFamilyTurns = true;
+        }
+        continue;
+      }
+      if (
+        segment.canonicalMessages.some(
+          (message) => message.role === "assistant" || message.role === "tool",
+        )
+      ) {
+        containsCrossFamilyTurns = true;
+      }
+    }
+  }
+  return {
+    lastFamily: input.targetFamily,
+    containsCrossFamilyTurns,
+  };
+}
 
 class RestartDrainingAbort extends Error {
   constructor() {
@@ -1302,15 +1606,16 @@ export function resolveAgentRunModel(params: {
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
-  resolvedModelRequest?: WorkflowRequestPolicy["resolvedModelRequest"];
-}) {
+  resolvedModelRequest?: DurableResolvedModelRequest;
+}): ResolvedModelPlan {
   const subagentProfileConfig =
     params.runProfile === "primary"
       ? null
       : resolveNativeSubagentProfile(params.cfg, params.runProfile);
 
   if (params.resolvedModelRequest) {
-    return fromDurableResolvedModelRequest(params.resolvedModelRequest);
+    const plan = fromDurableResolvedModelPlan(params.resolvedModelRequest);
+    return params.reasoningOverride ? withModelPlanReasoning(plan, params.reasoningOverride) : plan;
   }
 
   if (params.runProfile !== "primary" && params.requestModelOverride) {
@@ -1327,32 +1632,165 @@ export function resolveAgentRunModel(params: {
     }
   }
 
+  const applyHeadReasoning = (head: ResolvedModelRef): ResolvedModelRef => {
+    const profileHead = subagentProfileConfig?.reasoning
+      ? { ...head, reasoning: subagentProfileConfig.reasoning }
+      : head;
+    return params.reasoningOverride
+      ? { ...profileHead, reasoning: params.reasoningOverride }
+      : profileHead;
+  };
+
   if (params.requestModelOverride) {
-    return resolveModelRef(
-      params.cfg,
-      {
-        model: params.requestModelOverride,
-        reasoning: params.runProfile === "primary" ? undefined : params.reasoningOverride,
-      },
-      "cmd.request.message.modelOverride",
-    );
+    const head = resolveModelPlan(params.cfg, {
+      head: { model: params.requestModelOverride },
+      fallback: [],
+      headSource: "cmd.request.message.modelOverride",
+      fallbackSource: "cmd.request.message.modelOverride.fallback",
+    }).head;
+    return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
   }
 
   if (subagentProfileConfig?.model) {
-    return resolveModelRef(
-      params.cfg,
-      {
+    const head = resolveModelPlan(params.cfg, {
+      head: {
         model: subagentProfileConfig.model,
-        reasoning: params.reasoningOverride ?? subagentProfileConfig.reasoning,
+        reasoning: subagentProfileConfig.reasoning,
         options: subagentProfileConfig.options,
       },
-      `agent.subagents.profiles.${params.runProfile}.model`,
-    );
+      fallback: [],
+      headSource: `agent.subagents.profiles.${params.runProfile}.model`,
+      fallbackSource: `agent.subagents.profiles.${params.runProfile}.fallback`,
+    }).head;
+    return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
   }
 
-  const slotResolved = resolveModelSlot(params.cfg, subagentProfileConfig?.modelSlot ?? "main");
-  const reasoning = params.reasoningOverride ?? subagentProfileConfig?.reasoning;
-  return reasoning ? { ...slotResolved, reasoning } : slotResolved;
+  const slot = subagentProfileConfig?.modelSlot ?? "main";
+  const head = resolveModelPlan(params.cfg, {
+    head: params.cfg.models[slot],
+    fallback: [],
+    headSource: `models.${slot}.model`,
+    fallbackSource: `models.${slot}.fallback`,
+  }).head;
+  return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
+}
+
+type AgentRunFallbackSource = {
+  entries: readonly ConfiguredModelChainEntry[];
+  source: string;
+  profileReasoning?: ModelReasoningEffort;
+};
+
+function resolveAgentRunFallbackSource(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+}): AgentRunFallbackSource | null {
+  const profile =
+    params.runProfile === "primary"
+      ? null
+      : resolveNativeSubagentProfile(params.cfg, params.runProfile);
+
+  if (params.requestModelOverride) {
+    if (params.requestModelOverride.includes("/")) {
+      return { entries: [], source: "cmd.request.message.modelOverride.fallback" };
+    }
+    const preset = params.cfg.models.def[params.requestModelOverride];
+    if (!preset) return null;
+    return {
+      entries: preset.fallback ?? [],
+      source: `models.def.${params.requestModelOverride}.fallback`,
+      ...(profile?.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+
+  if (profile?.model) {
+    if (profile.fallback !== undefined) {
+      return {
+        entries: profile.fallback,
+        source: `agent.subagents.profiles.${params.runProfile}.fallback`,
+        ...(profile.reasoning ? { profileReasoning: profile.reasoning } : {}),
+      };
+    }
+    const preset = profile.model.includes("/") ? undefined : params.cfg.models.def[profile.model];
+    if (!profile.model.includes("/") && !preset) return null;
+    return {
+      entries: preset?.fallback ?? [],
+      source: `models.def.${profile.model}.fallback`,
+      ...(profile.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+
+  const slot = profile?.modelSlot ?? "main";
+  const slotConfig = params.cfg.models[slot];
+  if (profile?.fallback !== undefined) {
+    return {
+      entries: profile.fallback,
+      source: `agent.subagents.profiles.${params.runProfile}.fallback`,
+      ...(profile.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+  if (slotConfig.fallback !== undefined) {
+    return {
+      entries: slotConfig.fallback,
+      source: `models.${slot}.fallback`,
+      ...(profile?.reasoning ? { profileReasoning: profile.reasoning } : {}),
+    };
+  }
+  const preset = slotConfig.model.includes("/")
+    ? undefined
+    : params.cfg.models.def[slotConfig.model];
+  if (!slotConfig.model.includes("/") && !preset) return null;
+  return {
+    entries: preset?.fallback ?? [],
+    source: `models.def.${slotConfig.model}.fallback`,
+    ...(profile?.reasoning ? { profileReasoning: profile.reasoning } : {}),
+  };
+}
+
+export function resolveAgentRunModelFallbacks(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+  reasoningOverride?: ModelReasoningEffort;
+}): readonly ResolvedModelRef[] {
+  const fallbackSource = resolveAgentRunFallbackSource(params);
+  if (!fallbackSource) return [];
+  let fallbacks = resolveModelChain(params.cfg, fallbackSource.entries, fallbackSource.source);
+  if (fallbackSource.profileReasoning) {
+    fallbacks = fallbacks.map((candidate, index) => {
+      const configured = fallbackSource.entries[index];
+      return typeof configured === "object" && configured.reasoning !== undefined
+        ? candidate
+        : { ...candidate, reasoning: fallbackSource.profileReasoning };
+    });
+  }
+  return params.reasoningOverride
+    ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
+    : fallbacks;
+}
+
+export function selectNextNativeModelFallback(params: {
+  plan: ResolvedModelPlan;
+  activeIndex: number;
+  onSkipClaudeCode?: (candidate: ResolvedModelRef, index: number) => void;
+}): { candidate: ResolvedModelRef; index: number } | null {
+  const candidates = [params.plan.head, ...params.plan.fallbacks];
+  const current = candidates[params.activeIndex];
+  if (!current) return null;
+  const latchedFamily = classifyHistoryProviderFamily({ type: params.plan.head.provider });
+  if (latchedFamily === "claude-code") return null;
+
+  for (let index = params.activeIndex + 1; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (!candidate) continue;
+    if (classifyHistoryProviderFamily({ type: candidate.provider }) !== latchedFamily) {
+      params.onSkipClaudeCode?.(candidate, index);
+      continue;
+    }
+    return { candidate, index };
+  }
+  return null;
 }
 
 export function assertWorkflowDispatchPolicy(
@@ -1427,8 +1865,12 @@ type SessionQueue = {
     runPolicy: RequestRunPolicy;
     origin?: RequestOrigin;
     messages: ModelMessage[];
+    corePrimaryLineage?: CorePrimaryLineageV1;
     modelOverride?: string;
     raw?: unknown;
+    resolvedModelSpec: string | null;
+    resolvedReasoning: ModelReasoningEffort | undefined;
+    resolvedProviderFamily: HistoryProviderState["lastFamily"] | null;
     partialText: string;
     liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
     claudeCodeControl: ClaudeCodeRunControl | null;
@@ -1442,6 +1884,41 @@ type SessionQueue = {
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
 };
+
+export function isActiveRuntimeModelCompatible(input: {
+  readonly activeSpec: string;
+  readonly activeReasoning: ModelReasoningEffort | undefined;
+  readonly activeFamily: HistoryProviderState["lastFamily"];
+  readonly requested: ResolvedModelRef;
+}): boolean {
+  return (
+    input.activeSpec === input.requested.spec &&
+    input.activeReasoning === input.requested.reasoning &&
+    input.activeFamily === classifyHistoryProviderFamily({ type: input.requested.provider })
+  );
+}
+
+export function shouldQueueIncompatibleActiveRuntimeModel(input: {
+  readonly activeSpec: string;
+  readonly activeReasoning: ModelReasoningEffort | undefined;
+  readonly activeFamily: HistoryProviderState["lastFamily"];
+  readonly requested: ResolvedModelRef;
+}): boolean {
+  return !isActiveRuntimeModelCompatible(input);
+}
+
+function modelChangingRequestId(entry: Enqueued): string {
+  if (isRecord(entry.raw)) {
+    const origin = entry.raw["authenticatedOrigin"];
+    if (isRecord(origin)) {
+      const messageRef = origin["messageRef"];
+      if (isRecord(messageRef) && typeof messageRef["messageId"] === "string") {
+        return `${entry.requestClient}:${entry.sessionId}:${messageRef["messageId"]}`;
+      }
+    }
+  }
+  return `${entry.requestId}:model-turn:${crypto.randomUUID()}`;
+}
 
 export type AgentRunnerActiveWork = {
   requestId: string;
@@ -1474,6 +1951,7 @@ export async function startBusAgentRunner(params: {
   issueControlCapability?: (input: {
     requestId: string;
     sessionId: string;
+    originSessionId?: string;
     requestClient: AdapterPlatform;
     profile: AgentRunProfile;
     canonicalCwd: string;
@@ -1483,10 +1961,12 @@ export async function startBusAgentRunner(params: {
   }) =>
     | {
         capability: string;
+        originSessionId?: string;
         principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
       }
     | Promise<{
         capability: string;
+        originSessionId?: string;
         principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
       }>;
   issueHeartbeatCapability?: (input: {
@@ -1497,6 +1977,10 @@ export async function startBusAgentRunner(params: {
     expiresAt: number;
   }) => string | Promise<string>;
   expireControlCapability?: (requestId: string) => void;
+  /** Injection seam for exercising the complete bus runner with deterministic model transports. */
+  createAgent?: (options: AiSdkPiAgentOptions<ToolSet>) => AiSdkPiAgent<ToolSet>;
+  /** Injection seam for deterministic Claude native lifecycle/observation coverage. */
+  materializeClaudeCodeRun?: typeof materializeClaudeCodeRun;
 }) {
   const { bus, subscriptionId } = params;
 
@@ -1608,6 +2092,7 @@ export async function startBusAgentRunner(params: {
       // If reload fails, keep using the last known good config.
       await reloadCoreConfigIfNeeded();
 
+      const intakeRunProfile = parseSubagentMetaFromRaw(msg.data.raw).profile;
       const entry: Enqueued = {
         requestId,
         sessionId,
@@ -1616,6 +2101,14 @@ export async function startBusAgentRunner(params: {
         runPolicy: msg.data.runPolicy ?? "normal",
         origin: msg.data.origin,
         messages: msg.data.messages,
+        corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
+          requestClient,
+          sessionId,
+          runProfile: intakeRunProfile,
+          messages: msg.data.messages,
+          corePrimaryLineage: msg.data.corePrimaryLineage,
+          transcriptStore: params.transcriptStore,
+        }),
         modelOverride: msg.data.modelOverride,
         raw: msg.data.raw,
       };
@@ -1875,6 +2368,68 @@ export async function startBusAgentRunner(params: {
           return;
         }
 
+        if (
+          state.activeRequestId === requestId &&
+          !requestControl.cancel &&
+          state.activeRun?.runProfile === "primary"
+        ) {
+          const activeRun = state.activeRun;
+          const incomingOverride =
+            entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
+          let incompatible =
+            activeRun.resolvedModelSpec === null &&
+            incomingOverride !== undefined &&
+            incomingOverride !== activeRun.modelOverride;
+          if (
+            incomingOverride !== undefined &&
+            activeRun.resolvedModelSpec !== null &&
+            activeRun.resolvedProviderFamily !== null
+          ) {
+            try {
+              const requested = resolveAgentRunModel({
+                cfg,
+                runProfile: "primary",
+                requestModelOverride: incomingOverride,
+              }).head;
+              incompatible = shouldQueueIncompatibleActiveRuntimeModel({
+                activeSpec: activeRun.resolvedModelSpec,
+                activeReasoning: activeRun.resolvedReasoning,
+                activeFamily: activeRun.resolvedProviderFamily,
+                requested,
+              });
+            } catch {
+              incompatible = true;
+            }
+          }
+          if (incompatible) {
+            const queuedEntry: Enqueued = {
+              ...entry,
+              requestId: modelChangingRequestId(entry),
+              queue: "prompt",
+            };
+            const queueDepthBefore = state.queue.length;
+            state.queue.push(queuedEntry);
+            await publishLifecycle({
+              bus,
+              headers: {
+                request_id: queuedEntry.requestId,
+                session_id: sessionId,
+                request_client: requestClient,
+              },
+              state: "queued",
+              detail: "queued for incompatible model or reasoning selection",
+            });
+            logQueueTransition({
+              action: "enqueue",
+              queueDepthBefore,
+              queueDepthAfter: state.queue.length,
+              reason: "incompatible_active_model",
+            });
+            await ctx.commit();
+            return;
+          }
+        }
+
         // If the message is intended for the currently active request, apply immediately.
         if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
           const queueDepthBefore = state.queue.length;
@@ -1897,6 +2452,10 @@ export async function startBusAgentRunner(params: {
                     ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
                     ...entry.messages,
                   ],
+                  corePrimaryLineage: degradeCorePrimaryLineageForMutation(
+                    "queued-buffer-absorbed-into-steering",
+                    state.agent.state.messages.length,
+                  ),
                 } satisfies Enqueued)
               : entry;
 
@@ -2002,6 +2561,7 @@ export async function startBusAgentRunner(params: {
         runPolicy: state.activeRun.runPolicy,
         origin: state.activeRun.origin,
         messages: state.activeRun.messages,
+        corePrimaryLineage: state.activeRun.corePrimaryLineage,
         ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
         raw: state.activeRun.raw,
       };
@@ -2021,6 +2581,7 @@ export async function startBusAgentRunner(params: {
       runPolicy: state.activeRun.runPolicy,
       origin: state.activeRun.origin,
       messages: [],
+      corePrimaryLineage: degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint"),
       ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
       raw: state.activeRun.raw,
       recovery: {
@@ -2086,6 +2647,7 @@ export async function startBusAgentRunner(params: {
           runPolicy: queued.runPolicy,
           origin: queued.origin,
           messages: queued.messages,
+          corePrimaryLineage: queued.corePrimaryLineage,
           ...(queued.modelOverride ? { modelOverride: queued.modelOverride } : {}),
           raw: queued.raw,
         });
@@ -2099,6 +2661,30 @@ export async function startBusAgentRunner(params: {
     if (entries.length === 0) return;
 
     for (const entry of entries) {
+      if (isWorkflowAgentRecoveryEntry(entry)) {
+        const hint = parseWorkflowRequestHintFromRaw(entry.raw);
+        const authorized =
+          hint && params.durableWorkflowStore
+            ? params.durableWorkflowStore.authorizeWorkflowRequest({
+                requestId: entry.requestId,
+                sessionId: entry.sessionId,
+                platform: entry.requestClient,
+              })
+            : null;
+        if (
+          !hint ||
+          !authorized ||
+          authorized.policy.runId !== hint.runId ||
+          authorized.policy.operationId !== hint.operationId ||
+          authorized.policy.dispatchEpoch !== hint.dispatchEpoch
+        ) {
+          logger.warn("discarded stale workflow-owned agent recovery entry", {
+            requestId: entry.requestId,
+            sessionId: entry.sessionId,
+          });
+          continue;
+        }
+      }
       const state =
         bySession.get(entry.sessionId) ??
         ({
@@ -2119,6 +2705,9 @@ export async function startBusAgentRunner(params: {
         runPolicy: entry.runPolicy ?? "normal",
         origin: entry.origin,
         messages: entry.messages,
+        corePrimaryLineage: entry.recovery
+          ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
+          : entry.corePrimaryLineage,
         modelOverride: entry.modelOverride,
         raw: entry.raw,
         recovery: entry.recovery,
@@ -2160,6 +2749,9 @@ export async function startBusAgentRunner(params: {
 
     const subagentMeta = parseSubagentMetaFromRaw(next.raw);
     const runProfile = subagentMeta.profile;
+    if (next.recovery && runProfile === "primary" && next.requestClient === "discord") {
+      next.corePrimaryLineage = degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint");
+    }
     const workflowHint = parseWorkflowRequestHintFromRaw(next.raw);
     let workflowDispatchEpoch = workflowHint?.dispatchEpoch;
     let workflowPolicy: WorkflowRequestPolicy | null = null;
@@ -2167,6 +2759,7 @@ export async function startBusAgentRunner(params: {
     let workflowClaimTimer: ReturnType<typeof setInterval> | null = null;
     let preserveWorkflowClaim = false;
     let controlCapability: string | null = null;
+    let controlOriginSessionId: string | undefined;
     let trustedFallbackSurface: TrustedSubagentDelegationRegistration["fallbackSurface"] | null =
       null;
     const subagents = cfg.agent.subagents;
@@ -2175,6 +2768,8 @@ export async function startBusAgentRunner(params: {
 
     let activeAgent: AiSdkPiAgent<ToolSet> | null = null;
     let claudeCodeRun: MaterializedClaudeCodeRun | null = null;
+    let coreNamedClaudeRuntime: CoreNamedClaudeRuntime | null = null;
+    let corePrimaryClaudeRuntime: CorePrimaryClaudeRuntime | null = null;
     let activeRunOperation: Promise<unknown> | null = null;
     let customCommandAbortController: AbortController | null = null;
     let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
@@ -2357,8 +2952,12 @@ export async function startBusAgentRunner(params: {
       runPolicy: next.runPolicy,
       origin: next.origin,
       messages: next.messages,
+      corePrimaryLineage: next.corePrimaryLineage,
       modelOverride: next.modelOverride,
       raw: next.raw,
+      resolvedModelSpec: null,
+      resolvedReasoning: undefined,
+      resolvedProviderFamily: null,
       partialText: next.recovery?.partialText ?? "",
       liveParent: liveParentSession,
       claudeCodeControl: null,
@@ -2401,6 +3000,7 @@ export async function startBusAgentRunner(params: {
     let roundEstimatedCostCount = 0;
 
     let resolvedModelLabel = "unknown";
+    let resolvedProviderFamily: HistoryProviderState["lastFamily"] = "ai-sdk";
     try {
       const looksLikeWorkflowRequest =
         next.requestId.startsWith("wfr:") || next.sessionId.startsWith("workflow:");
@@ -2459,6 +3059,11 @@ export async function startBusAgentRunner(params: {
         workflowClaimTimer.unref?.();
       }
       if (workflowPolicy) assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
+      const stableNamedContinuation = resolveCoreStableNamedContinuation({
+        runProfile,
+        sessionId: next.sessionId,
+        workflowPolicy,
+      });
       const maxSubagentDepth = subagents.maxDepth;
       if (subagentMeta.depth > maxSubagentDepth) {
         const detail = `subagent depth ${subagentMeta.depth} exceeds maxDepth=${maxSubagentDepth}`;
@@ -2482,6 +3087,13 @@ export async function startBusAgentRunner(params: {
       await bus.publish(lilacEventTypes.EvtRequestReply, {}, { headers });
 
       if (parsedCustomCommand) {
+        if (runProfile === "primary" && next.requestClient === "discord") {
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "custom-command-tool-insertion",
+            next.corePrimaryLineage?.currentCanonicalStart,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
         const toolCallId = buildCustomCommandToolCallId(next.requestId, parsedCustomCommand.name);
         const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
         activeCustomCommandTool = { toolCallId, display };
@@ -2653,111 +3265,28 @@ export async function startBusAgentRunner(params: {
       ) {
         throw new Error("Workflow request model does not match the approved operation policy");
       }
-      const resolved = resolveAgentRunModel({
+      const modelPlan = resolveAgentRunModel({
         cfg,
         runProfile,
         requestModelOverride,
         reasoningOverride: subagentMeta.reasoning,
         resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
       });
-      resolvedModelLabel = resolved.modelId;
-      try {
-        modelCapabilityInfo = await waitForPreAgent(modelCapability.resolve(resolved.spec));
-        if (modelCapabilityInfo.cost) {
-          costEstimateStatus = "estimated";
-        } else {
-          costEstimateReason = "model_cost_missing";
-        }
-      } catch (error) {
-        if (error instanceof PreAgentRunCancelledError) throw error;
-        costEstimateReason =
-          error instanceof Error
-            ? `capability_resolve_failed:${error.message}`
-            : `capability_resolve_failed:${String(error)}`;
+      const initialResolvedModel = modelPlan.head;
+      resolvedModelLabel = initialResolvedModel.modelId;
+      resolvedProviderFamily = classifyHistoryProviderFamily({
+        type: initialResolvedModel.provider,
+      });
+      if (state.activeRun) {
+        state.activeRun.resolvedModelSpec = initialResolvedModel.spec;
+        state.activeRun.resolvedReasoning = initialResolvedModel.reasoning;
+        state.activeRun.resolvedProviderFamily = resolvedProviderFamily;
       }
 
-      const editingToolMode = resolveEditingToolMode({
-        provider: resolved.provider,
-        modelId: resolved.modelId,
-      });
-      const activeEditingToolMode = editingToolMode;
-
-      const anthropicModel = isAnthropicModelSpec(resolved.spec);
-      const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
-        spec: resolved.spec,
-        anthropicPromptCache: resolved.anthropicPromptCache,
-      });
-
-      // Improve prompt caching stability by providing a session-scoped cache key.
-      // This helps when many requests share a large common prefix (e.g. a long system prompt).
-      // Also, when reasoning display is enabled, request detailed reasoning summaries
-      // for OpenAI-backed models (including gateway/openrouter openai/* model IDs).
-      const providerOptionsWithOpenAIReasoningSummary = withReasoningSummaryDefaultForOpenAIModels({
-        reasoningDisplay:
-          workflowPolicy?.resolvedModelRequest.reasoningDisplay ?? cfg.agent.reasoningDisplay,
-        provider: resolved.provider,
-        modelId: resolved.modelId,
-        providerOptions: resolved.providerOptions,
-      });
-
-      // Newer Anthropic models can default to omitting thinking text unless
-      // anthropic.thinking.display="summarized" is set. When the user wants a
-      // reasoning lane and has thinking enabled, request summarized thinking text.
-      const providerOptionsWithReasoningDisplay = withReasoningDisplayDefaultForAnthropicModels({
-        reasoningDisplay:
-          workflowPolicy?.resolvedModelRequest.reasoningDisplay ?? cfg.agent.reasoningDisplay,
-        provider: resolved.provider,
-        modelId: resolved.modelId,
-        providerOptions: providerOptionsWithOpenAIReasoningSummary,
-      });
-
-      // Prompt cache key only applies for direct OpenAI/Codex providers.
-      const providerOptionsWithPromptCacheKey = (() => {
-        const provider = resolved.provider;
-        const supports = provider === "openai" || provider === "codex";
-        if (!supports) return providerOptionsWithReasoningDisplay;
-
-        const base = providerOptionsWithReasoningDisplay ?? {};
-        const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
-
-        return {
-          ...base,
-          openai: {
-            ...existingOpenAI,
-            promptCacheKey: toOpenAIPromptCacheKey(sessionId),
-          },
-        };
-      })();
-
-      const providerOptionsForAgent = anthropicModel
-        ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithPromptCacheKey)
-        : providerOptionsWithPromptCacheKey;
-      const experimentalDownloadForAgent = buildExperimentalDownloadForAnthropicFallback({
-        spec: resolved.spec,
-        provider: resolved.provider,
-        providerOptions: providerOptionsForAgent,
-      });
-
-      const baseSystemPrompt = buildSystemPromptForProfile({
-        baseSystemPrompt: cfg.agent.systemPrompt,
-        profile: runProfile,
-        profileConfig:
-          runProfile === "primary" ? undefined : resolveNativeSubagentProfile(cfg, runProfile),
-        activeEditingTool: runProfile === "explore" ? null : activeEditingToolMode,
-        exploreOverlay: subagents.profiles.explore.promptOverlay,
-        generalOverlay: subagents.profiles.general.promptOverlay,
-        selfOverlay: subagents.profiles.self.promptOverlay,
-        skillsSection:
-          runProfile === "explore"
-            ? null
-            : await waitForPreAgent(maybeBuildSkillsSectionForPrimary()),
-      });
-
-      const baseSystemPromptWithAliases = appendConfiguredAliasPromptBlock({
-        baseSystemPrompt,
-        cfg,
-        coreConfigPath: resolveCoreConfigPath(),
-      });
+      const skillsSection =
+        runProfile === "explore"
+          ? null
+          : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
 
       const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
       const parentChannelResolution =
@@ -2786,9 +3315,13 @@ export async function startBusAgentRunner(params: {
               userId: trustedFallbackSurface.userId,
             }
           : undefined;
+        const requestedOriginSessionId = workflowPolicy
+          ? (workflowPolicy.originSession.sessionId ?? undefined)
+          : (trustedFallbackSurface?.sessionId ?? next.sessionId);
         const issuedControl = await params.issueControlCapability?.({
           requestId: next.requestId,
           sessionId: next.sessionId,
+          ...(requestedOriginSessionId ? { originSessionId: requestedOriginSessionId } : {}),
           requestClient: next.requestClient,
           profile: runProfile,
           canonicalCwd: workflowPolicy?.cwd ?? cwd,
@@ -2802,10 +3335,15 @@ export async function startBusAgentRunner(params: {
           );
         }
         controlCapability = issuedControl.capability;
-        if (issuedControl.principal) {
+        controlOriginSessionId = issuedControl.originSessionId;
+        if (
+          issuedControl.principal &&
+          !trustedFallbackSurface &&
+          isSurfacePrincipalPlatform(next.requestClient)
+        ) {
           trustedFallbackSurface = {
             platform: issuedControl.principal.platform,
-            sessionId: next.sessionId,
+            sessionId: controlOriginSessionId ?? next.sessionId,
             userId: issuedControl.principal.userId,
           };
         }
@@ -2828,11 +3366,6 @@ export async function startBusAgentRunner(params: {
         }),
       );
 
-      const systemPromptWithSessionMemo = appendAdditionalSessionMemoBlock(
-        baseSystemPromptWithAliases,
-        additionalSessionPrompts,
-      );
-
       const heartbeatOverlay = buildHeartbeatOverlayForRequest({
         cfg,
         requestId: next.requestId,
@@ -2841,51 +3374,69 @@ export async function startBusAgentRunner(params: {
         nowMs: Date.now(),
       });
 
-      const systemPromptWithHeartbeatOverlay =
-        heartbeatOverlay && heartbeatOverlay.trim().length > 0
-          ? `${systemPromptWithSessionMemo}\n\n${heartbeatOverlay}`
-          : systemPromptWithSessionMemo;
-
       const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
         cfg,
         runProfile,
       });
 
-      const systemPromptWithAutoInjectedThreadSearchOverlay =
-        autoInjectedThreadSearchOverlay && autoInjectedThreadSearchOverlay.trim().length > 0
-          ? `${systemPromptWithHeartbeatOverlay}\n\n${autoInjectedThreadSearchOverlay}`
-          : systemPromptWithHeartbeatOverlay;
-
       const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
-
-      const systemPromptWithSurfaceMetadataOverlay =
-        surfaceMetadataOverlay && surfaceMetadataOverlay.trim().length > 0
-          ? `${systemPromptWithAutoInjectedThreadSearchOverlay}\n\n${surfaceMetadataOverlay}`
-          : systemPromptWithAutoInjectedThreadSearchOverlay;
 
       const restrictedSessionOverlay =
         safetyMode === "restricted"
           ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
           : null;
 
-      const systemPromptWithSafetyOverlay = restrictedSessionOverlay
-        ? `${systemPromptWithSurfaceMetadataOverlay}\n\n${restrictedSessionOverlay}`
-        : systemPromptWithSurfaceMetadataOverlay;
-
-      const systemPrompt = maybeAppendResponseCommentaryPrompt({
-        baseSystemPrompt: systemPromptWithSafetyOverlay,
-        provider: resolved.provider,
-        responseCommentary: resolved.responseCommentary,
-      });
+      const buildSystemPrompt = (
+        resolved: ResolvedModelRef,
+        editingToolMode: ReturnType<typeof resolveEditingToolMode>,
+      ): string => {
+        const baseSystemPrompt = buildSystemPromptForProfile({
+          baseSystemPrompt: cfg.agent.systemPrompt,
+          profile: runProfile,
+          profileConfig:
+            runProfile === "primary" ? undefined : resolveNativeSubagentProfile(cfg, runProfile),
+          activeEditingTool: runProfile === "explore" ? null : editingToolMode,
+          exploreOverlay: subagents.profiles.explore.promptOverlay,
+          generalOverlay: subagents.profiles.general.promptOverlay,
+          selfOverlay: subagents.profiles.self.promptOverlay,
+          skillsSection,
+        });
+        let prompt = appendConfiguredAliasPromptBlock({
+          baseSystemPrompt,
+          cfg,
+          coreConfigPath: resolveCoreConfigPath(),
+        });
+        prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
+        for (const overlay of [
+          heartbeatOverlay,
+          autoInjectedThreadSearchOverlay,
+          surfaceMetadataOverlay,
+          restrictedSessionOverlay,
+        ]) {
+          if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
+        }
+        return maybeAppendResponseCommentaryPrompt({
+          baseSystemPrompt: prompt,
+          provider: resolved.provider,
+          responseCommentary: resolved.responseCommentary,
+        });
+      };
 
       let seededSessionMessages: ModelMessage[] = [];
+      let seededSessionTranscript: ReturnType<
+        NonNullable<TranscriptStore["getLatestCompleteNamedTranscript"]>
+      > = null;
       if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
         try {
-          const latest = params.transcriptStore.getLatestTranscriptBySession?.({
-            sessionId: next.sessionId,
-          });
+          const latest = stableNamedContinuation
+            ? params.transcriptStore.getLatestCompleteNamedTranscript?.({
+                requestClient: stableNamedContinuation.requestClient,
+                sessionId: next.sessionId,
+              })
+            : params.transcriptStore.getLatestTranscriptBySession?.({ sessionId: next.sessionId });
           if (latest && latest.messages.length > 0) {
             seededSessionMessages = latest.messages;
+            seededSessionTranscript = latest;
             logger.info("subagent continuation seeded from transcript", {
               requestId: next.requestId,
               sessionId: next.sessionId,
@@ -2905,6 +3456,174 @@ export async function startBusAgentRunner(params: {
         }
       }
 
+      const fallbackSurfaceForDelegation = trustedFallbackSurface;
+      const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
+      const listSelectedCatalogIds = () =>
+        params.transcriptStore?.listSessionToolIds?.({
+          requestClient: next.requestClient,
+          sessionId: next.sessionId,
+        }) ?? [];
+      const buildModelBinding = async (resolved: ResolvedModelRef) => {
+        let capabilityInfo: ModelCapabilityInfo | null = null;
+        let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
+        let bindingCostEstimateReason: string | undefined;
+        try {
+          capabilityInfo = await waitForPreAgent(modelCapability.resolve(resolved.spec));
+          if (capabilityInfo.cost) {
+            bindingCostEstimateStatus = "estimated";
+          } else {
+            bindingCostEstimateReason = "model_cost_missing";
+          }
+        } catch (error) {
+          if (error instanceof PreAgentRunCancelledError) throw error;
+          bindingCostEstimateReason =
+            error instanceof Error
+              ? `capability_resolve_failed:${error.message}`
+              : `capability_resolve_failed:${String(error)}`;
+        }
+
+        const editingToolMode = resolveEditingToolMode({
+          provider: resolved.provider,
+          modelId: resolved.modelId,
+        });
+        const anthropicModel = isAnthropicModelSpec(resolved.spec);
+        const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
+          spec: resolved.spec,
+          anthropicPromptCache: resolved.anthropicPromptCache,
+        });
+        const reasoningDisplay =
+          resolved.reasoningDisplay ??
+          workflowPolicy?.resolvedModelRequest.reasoningDisplay ??
+          cfg.agent.reasoningDisplay;
+        const providerOptionsWithOpenAIReasoningSummary =
+          withReasoningSummaryDefaultForOpenAIModels({
+            reasoningDisplay,
+            provider: resolved.provider,
+            modelId: resolved.modelId,
+            providerOptions: resolved.providerOptions,
+          });
+        const providerOptionsWithReasoningDisplay = withReasoningDisplayDefaultForAnthropicModels({
+          reasoningDisplay,
+          provider: resolved.provider,
+          modelId: resolved.modelId,
+          providerOptions: providerOptionsWithOpenAIReasoningSummary,
+        });
+        const providerOptionsWithPromptCacheKey = (() => {
+          if (resolved.provider !== "openai" && resolved.provider !== "codex") {
+            return providerOptionsWithReasoningDisplay;
+          }
+          const base = providerOptionsWithReasoningDisplay ?? {};
+          const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
+          return {
+            ...base,
+            openai: {
+              ...existingOpenAI,
+              promptCacheKey: toOpenAIPromptCacheKey(sessionId),
+            },
+          };
+        })();
+        const providerOptionsWithServerCompaction = (() => {
+          if (!resolved.openaiServerCompaction) return providerOptionsWithPromptCacheKey;
+          const base = providerOptionsWithPromptCacheKey ?? {};
+          const existingOpenAI = base.openai ?? {};
+          const include = Array.isArray(existingOpenAI.include)
+            ? existingOpenAI.include.filter((value): value is string => typeof value === "string")
+            : [];
+          return {
+            ...base,
+            openai: {
+              ...existingOpenAI,
+              store: false,
+              include: [...new Set([...include, "reasoning.encrypted_content"])],
+            },
+          };
+        })();
+        const providerOptionsForAgent = anthropicModel
+          ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithServerCompaction)
+          : providerOptionsWithServerCompaction;
+        const systemPrompt = buildSystemPrompt(resolved, editingToolMode);
+        const agentSystem = anthropicPromptCachingEnabled
+          ? {
+              role: "system" as const,
+              content: systemPrompt,
+              providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+            }
+          : systemPrompt;
+        const experimentalDownload = buildExperimentalDownloadForAnthropicFallback({
+          spec: resolved.spec,
+          provider: resolved.provider,
+          providerOptions: providerOptionsForAgent,
+        });
+        const toolset = await waitForPreAgent(
+          params.pluginManager.buildLevel1Toolset({
+            cwd: executionCwd,
+            runProfile,
+            editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
+            subagentDepth: subagentMeta.depth,
+            subagentConfig: {
+              enabled: subagents.enabled,
+              idleTimeoutMs: subagents.idleTimeoutMs,
+              maxDepth: subagents.maxDepth,
+            },
+            requestContext: {
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              ...(controlOriginSessionId ? { originSessionId: controlOriginSessionId } : {}),
+              requestClient: next.requestClient,
+              subagentDepth: subagentMeta.depth,
+              subagentProfile: runProfile,
+              safetyMode,
+              metadata: {
+                controlCapability: controlCapability ?? undefined,
+                readFileDirectAttachmentSupported:
+                  supportsReadFileDirectAttachments(capabilityInfo),
+                onActivity: (source: "tool" | "subagent") => markRunActivity(source),
+                onSubagentDelegate:
+                  workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
+                    ? async (registration: SubagentDelegationRegistration) =>
+                        await workflowSubagentDispatcher.delegate({
+                          ...registration,
+                          projectRoot: executionCwd,
+                          fallbackSurface: fallbackSurfaceForDelegation,
+                        })
+                    : undefined,
+              },
+            },
+            reportToolStatus: (update) => {
+              outputPublisher.publishToolCall(update).catch((e: unknown) => {
+                logger.error(
+                  "failed to publish batch tool status",
+                  {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    toolCallId: update.toolCallId,
+                  },
+                  e,
+                );
+              });
+            },
+          }),
+        );
+        return {
+          resolved,
+          capabilityInfo,
+          costEstimateStatus: bindingCostEstimateStatus,
+          costEstimateReason: bindingCostEstimateReason,
+          editingToolMode,
+          anthropicPromptCachingEnabled,
+          providerOptionsForAgent,
+          agentSystem,
+          experimentalDownload,
+          toolset,
+          activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
+        };
+      };
+
+      let activeBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
+      modelCapabilityInfo = activeBinding.capabilityInfo;
+      costEstimateStatus = activeBinding.costEstimateStatus;
+      costEstimateReason = activeBinding.costEstimateReason;
+
       logger.info("agent run starting", {
         requestId: next.requestId,
         sessionId: next.sessionId,
@@ -2914,141 +3633,325 @@ export async function startBusAgentRunner(params: {
         sessionConfigId,
         safetyMode,
         requestModelOverride,
-        model: resolved.spec,
-        responseCommentary: resolved.responseCommentary === true,
-        editingToolMode: runProfile === "explore" ? "none" : activeEditingToolMode,
+        model: activeBinding.resolved.spec,
+        responseCommentary: activeBinding.resolved.responseCommentary === true,
+        editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
+        fallbackCount: modelPlan.fallbacks.length,
         isRecoveryResume: Boolean(next.recovery),
         messageCount: next.messages.length,
         recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
         queuedForSession: state.queue.length,
       });
 
-      const fallbackSurfaceForDelegation = trustedFallbackSurface;
-      const executionCwd = workflowPolicy?.cwd ?? cwd;
-      const initialLevel1Toolset = await waitForPreAgent(
-        params.pluginManager.buildLevel1Toolset({
-          cwd: executionCwd,
-          runProfile,
-          editingToolMode: runProfile === "explore" ? "none" : activeEditingToolMode,
-          subagentDepth: subagentMeta.depth,
-          subagentConfig: {
-            enabled: subagents.enabled,
-            idleTimeoutMs: subagents.idleTimeoutMs,
-            maxDepth: subagents.maxDepth,
-          },
-          requestContext: {
-            requestId: next.requestId,
-            sessionId: next.sessionId,
-            requestClient: next.requestClient,
-            subagentDepth: subagentMeta.depth,
-            subagentProfile: runProfile,
-            safetyMode,
-            metadata: {
-              controlCapability: controlCapability ?? undefined,
-              readFileDirectAttachmentSupported:
-                supportsReadFileDirectAttachments(modelCapabilityInfo),
-              onActivity: (source: "tool" | "subagent") => markRunActivity(source),
-              onSubagentDelegate:
-                workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
-                  ? async (registration: SubagentDelegationRegistration) =>
-                      await workflowSubagentDispatcher.delegate({
-                        ...registration,
-                        projectRoot: executionCwd,
-                        fallbackSurface: fallbackSurfaceForDelegation,
-                      })
-                  : undefined,
-            },
-          },
-          reportToolStatus: (update) => {
-            outputPublisher.publishToolCall(update).catch((e: unknown) => {
-              logger.error(
-                "failed to publish batch tool status",
-                {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: update.toolCallId,
-                },
-                e,
-              );
+      let agent: AiSdkPiAgent<ToolSet> | null = null;
+      let activeModelIndex = 0;
+      let didSwitchModel = false;
+      const advanceModel = async () => {
+        if (!agent) throw new Error("Model fallback started before the agent was ready");
+        const nextFallback = selectNextNativeModelFallback({
+          plan: modelPlan,
+          activeIndex: activeModelIndex,
+          onSkipClaudeCode: (candidate, index) => {
+            logger.warn("skipping claude-code model fallback for native agent run", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              modelSpec: candidate.spec,
+              fallbackIndex: index,
             });
           },
-        }),
-      );
-      const {
-        tools,
-        specs: level1ToolSpecs,
-        genericOutputNormalizerBypassTools,
-      } = initialLevel1Toolset;
-      const agentSystem = anthropicPromptCachingEnabled
-        ? {
-            role: "system" as const,
-            content: systemPrompt,
-            providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-          }
-        : systemPrompt;
+        });
+        if (!nextFallback) return { ok: false as const, reason: "model fallback exhausted" };
+
+        const nextBinding = await buildModelBinding(nextFallback.candidate);
+        nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
+        agent.setModel(
+          nextBinding.resolved.model,
+          nextBinding.providerOptionsForAgent,
+          nextBinding.resolved.spec,
+          nextBinding.resolved.reasoning,
+        );
+        agent.setSystem(nextBinding.agentSystem);
+        agent.setTools(nextBinding.toolset.tools);
+        agent.setActiveTools(nextBinding.activeToolNames);
+        agent.setExperimentalDownload(nextBinding.experimentalDownload);
+        agent.setGenericOutputNormalizerBypassTools(
+          nextBinding.toolset.genericOutputNormalizerBypassTools,
+        );
+        agent.setAggregateOutputBudgetExemptTools(
+          nextBinding.toolset.aggregateOutputBudgetExemptTools,
+        );
+
+        activeBinding = nextBinding;
+        activeModelIndex = nextFallback.index;
+        didSwitchModel = true;
+        modelCapabilityInfo = nextBinding.capabilityInfo;
+        costEstimateStatus = nextBinding.costEstimateStatus;
+        costEstimateReason = nextBinding.costEstimateReason;
+        resolvedModelLabel = nextBinding.resolved.modelId;
+        resolvedProviderFamily = classifyHistoryProviderFamily({
+          type: nextBinding.resolved.provider,
+        });
+        if (state.activeRun) {
+          state.activeRun.resolvedModelSpec = nextBinding.resolved.spec;
+          state.activeRun.resolvedReasoning = nextBinding.resolved.reasoning;
+          state.activeRun.resolvedProviderFamily = resolvedProviderFamily;
+        }
+        return { ok: true as const, modelSpec: nextBinding.resolved.spec };
+      };
+      const hasNativeModelFallback =
+        activeBinding.resolved.provider !== "claude-code" && modelPlan.fallbacks.length > 0;
       const transientRetryController = createTransientModelRetryController({
         retry: cfg.agent.retry,
         logger,
         requestId: headers.request_id,
         sessionId: headers.session_id,
-        modelSpec: resolved.spec,
+        modelSpec: activeBinding.resolved.spec,
+        ...(hasNativeModelFallback ? { advanceModel } : {}),
       });
-      if (resolved.provider === "claude-code") {
-        const claudeCodeToolMapping = completeLevel1ToolMapping(initialLevel1Toolset);
-        claudeCodeRun = await waitForPreAgent(
-          materializeClaudeCodeRun({
-            modelId: resolved.modelId,
+      const disabledServerCompactionReplayKeys = new Set<string>();
+      let activeNativeServerCompactionReplayKey: string | null = null;
+      const turnErrorHandler = async (
+        error: unknown,
+        errorContext: Parameters<
+          NonNullable<Parameters<typeof attachAutoCompaction>[1]["baseTurnErrorHandler"]>
+        >[1],
+      ) => {
+        const transientDecision = await transientRetryController.handler(error, errorContext);
+        if (transientDecision === "retry") {
+          await coreNamedClaudeRuntime?.retireForRetry();
+          await corePrimaryClaudeRuntime?.retireForRetry();
+          return "retry" as const;
+        }
+        if (
+          activeNativeServerCompactionReplayKey &&
+          errorContext.phase === "model-call" &&
+          errorContext.retrySafety.canRetry &&
+          errorContext.abortSignal?.aborted !== true
+        ) {
+          disabledServerCompactionReplayKeys.add(activeNativeServerCompactionReplayKey);
+          logger.warn(
+            "OpenAI server compaction replay failed; retrying portable summary",
+            {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              modelSpec: activeBinding.resolved.spec,
+              ...extractAiErrorLogDetails(error),
+            },
+            error,
+          );
+          activeNativeServerCompactionReplayKey = null;
+          return "retry" as const;
+        }
+        return "fail" as const;
+      };
+      if (activeBinding.resolved.provider === "claude-code") {
+        const claudeCodeToolMapping = completeLevel1ToolMapping(activeBinding.toolset);
+        const continuationStore = params.transcriptStore;
+        const materializeClaude = async (
+          nativeSession?: Parameters<typeof materializeClaudeCodeRun>[0]["nativeSession"],
+        ) => {
+          const run = await (params.materializeClaudeCodeRun ?? materializeClaudeCodeRun)({
+            modelId: activeBinding.resolved.modelId,
             cwd: executionCwd,
             tools: claudeCodeToolMapping.tools,
             catalogMetadata: claudeCodeToolMapping.catalogMetadata,
             // Core admits no Claude built-ins; Lilac remains the only tool source.
             builtInTools: [],
+            reasoning: activeBinding.resolved.reasoning,
+            ...(nativeSession ? { nativeSession } : {}),
             execute: async (request) => {
               if (!activeAgent) {
                 throw new Error("Claude Code tool execution started before the agent was ready");
               }
               return await activeAgent.executeExternalToolCall(request);
             },
-          }),
-        );
-        if (state.activeRun) state.activeRun.claudeCodeControl = claudeCodeRun.control;
+          });
+          if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
+          return run;
+        };
+        const shouldPersistClaude = shouldUsePersistentCoreClaudeRuntime({
+          runProfile,
+          requestClient: next.requestClient,
+          stableNamedContinuation,
+          corePrimaryLineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+        });
+        if (shouldPersistClaude && continuationStore !== undefined) {
+          const canonicalExecutionCwd = await fs
+            .realpath(executionCwd)
+            .catch(() => path.resolve(executionCwd));
+          const nativeStorageNamespace = path.resolve(
+            process.env["CLAUDE_CONFIG_DIR"] ?? path.join(homedir(), ".claude"),
+          );
+          const profileConfig =
+            runProfile === "primary" ? null : resolveNativeSubagentProfile(cfg, runProfile);
+          const executionScope = hashCoreNamedExecutionScope({
+            canonicalCwd: canonicalExecutionCwd,
+            providerIdentity: "core:claude-code",
+            nativeStorageNamespaceIdentity: nativeStorageNamespace,
+            nativeExecutableConfig: claudeCodeExecutableSettings(),
+            profile: runProfile,
+            safetyMode,
+            profileAuthority: {
+              level1: profileConfig?.level1 ?? null,
+              level2: profileConfig?.level2 ?? null,
+              network: profileConfig?.network ?? null,
+              workspaceWrites: profileConfig?.workspaceWrites ?? null,
+              execution: profileConfig?.execution ?? null,
+              delegation: profileConfig?.delegation ?? null,
+            },
+            pluginAuthority: cfg.plugins ?? null,
+            workflowAuthority: workflowPolicy
+              ? {
+                  profile: workflowPolicy.profile,
+                  cwd: workflowPolicy.cwd,
+                  originClient: workflowPolicy.originSession.client,
+                }
+              : null,
+            systemPolicy: {
+              base: cfg.agent.systemPrompt,
+              profileOverlay: profileConfig?.promptOverlay ?? null,
+              additionalSessionPrompts,
+              skillsSection,
+            },
+            directToolNames: [...activeBinding.toolset.directToolNames],
+            externalToolAuthority: activeBinding.toolset.catalog
+              .map((entry) => ({
+                source: entry.source,
+                sourceId: entry.sourceId,
+                stableId: entry.stableId,
+                modelName: entry.modelName,
+              }))
+              .sort((left, right) => left.stableId.localeCompare(right.stableId)),
+            subagentAuthority: {
+              enabled: subagents.enabled,
+              maxDepth: subagents.maxDepth,
+              currentDepth: subagentMeta.depth,
+            },
+          });
+          if (
+            runProfile === "primary" &&
+            next.requestClient === "discord" &&
+            supportsCorePrimaryContinuationStore(continuationStore)
+          ) {
+            corePrimaryClaudeRuntime = createCorePrimaryClaudeRuntime({
+              store: continuationStore,
+              sessionId: next.sessionId,
+              requestId: next.requestId,
+              providerId: activeBinding.resolved.provider,
+              modelSpecifier: activeBinding.resolved.spec,
+              reasoning: activeBinding.resolved.reasoning ?? "provider-default",
+              executionScopeHash: executionScope.hash,
+              executionCwd,
+              getLineage: () => state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+              materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
+              onDiagnostic: (event, detail) => {
+                const fields = { lifecycle: event, ...detail };
+                if (
+                  event === "native-source-invalid" ||
+                  event === "candidate-observability-lost" ||
+                  event === "candidate-unpromotable" ||
+                  event === "candidate-finalization-failed" ||
+                  event === "canonical-publication-failed" ||
+                  event === "promotion-failed" ||
+                  event === "promotion-rejected"
+                ) {
+                  logger.warn("core_primary_claude.lifecycle", fields);
+                } else if (event === "canonical-published" || event === "promotion") {
+                  logger.info("core_primary_claude.lifecycle", fields);
+                } else {
+                  logger.debug("core_primary_claude.lifecycle", fields);
+                }
+              },
+            });
+          } else if (
+            stableNamedContinuation !== null &&
+            supportsCoreNamedContinuationStore(continuationStore)
+          ) {
+            coreNamedClaudeRuntime = createCoreNamedClaudeRuntime({
+              store: continuationStore,
+              requestClient: stableNamedContinuation.requestClient,
+              sessionId: next.sessionId,
+              requestId: next.requestId,
+              providerId: activeBinding.resolved.provider,
+              modelSpecifier: activeBinding.resolved.spec,
+              reasoning: activeBinding.resolved.reasoning ?? "provider-default",
+              executionScopeHash: executionScope.hash,
+              executionCwd,
+              sourceTranscript: seededSessionTranscript,
+              getCurrentTurnMessages: () => initialMessages,
+              materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
+              onDiagnostic: (event, detail) => {
+                const fields = { lifecycle: event, ...detail };
+                if (
+                  event === "native-source-invalid" ||
+                  event === "candidate-observability-lost" ||
+                  event === "candidate-unpromotable" ||
+                  event === "candidate-finalization-failed" ||
+                  event === "canonical-publication-failed" ||
+                  event === "promotion-failed" ||
+                  event === "promotion-rejected"
+                ) {
+                  logger.warn("core_named_claude.lifecycle", fields);
+                } else if (event === "canonical-published" || event === "promotion") {
+                  logger.info("core_named_claude.lifecycle", fields);
+                } else {
+                  logger.debug("core_named_claude.lifecycle", fields);
+                }
+              },
+            });
+          } else {
+            claudeCodeRun = await waitForPreAgent(materializeClaude());
+          }
+        } else {
+          claudeCodeRun = await waitForPreAgent(materializeClaude());
+        }
       }
 
-      let agent: AiSdkPiAgent<ToolSet> | null = null;
-      agent = new AiSdkPiAgent<ToolSet>({
-        system: agentSystem,
-        model: claudeCodeRun?.agentModel ?? resolved.model,
-        modelSpecifier: resolved.spec,
+      const agentOptions: AiSdkPiAgentOptions<ToolSet> = {
+        system: activeBinding.agentSystem,
+        model: claudeCodeRun?.agentModel ?? activeBinding.resolved.model,
+        modelSpecifier: activeBinding.resolved.spec,
         messages: next.recovery?.checkpointMessages ?? seededSessionMessages,
-        tools,
-        providerOptions: providerOptionsForAgent,
-        reasoning: resolved.reasoning,
-        turnErrorHandler: transientRetryController.handler,
+        tools: activeBinding.toolset.tools,
+        providerOptions: activeBinding.providerOptionsForAgent,
+        reasoning: activeBinding.resolved.reasoning,
+        ...(hasNativeModelFallback ||
+        coreNamedClaudeRuntime !== null ||
+        corePrimaryClaudeRuntime !== null
+          ? { streamTextMaxRetries: 0 }
+          : {}),
+        turnErrorHandler,
         beforeStep:
-          claudeCodeRun === null
+          activeBinding.resolved.provider !== "claude-code"
             ? async () => {
                 if (!agent) throw new Error("Tool refresh started before the agent was ready");
                 await refreshSelectedLevel1Tools({
                   target: agent,
-                  toolset: initialLevel1Toolset,
-                  listSelectedCatalogIds: () =>
-                    params.transcriptStore?.listSessionToolIds?.({
-                      requestClient: next.requestClient,
-                      sessionId: next.sessionId,
-                    }) ?? [],
+                  toolset: activeBinding.toolset,
+                  listSelectedCatalogIds,
                 });
               }
             : undefined,
         normalizeToolResultOutput,
         normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
-        genericOutputNormalizerBypassTools,
-        experimentalDownload: experimentalDownloadForAgent,
-        sendToolsToModel: claudeCodeRun === null,
+        genericOutputNormalizerBypassTools:
+          activeBinding.toolset.genericOutputNormalizerBypassTools,
+        aggregateOutputBudgetExemptTools: activeBinding.toolset.aggregateOutputBudgetExemptTools,
+        experimentalDownload: activeBinding.experimentalDownload,
+        sendToolsToModel: activeBinding.resolved.provider !== "claude-code",
         debug: {
           captureModelViewMessages: env.debug.contextDump.enabled,
         },
-      });
-      if (claudeCodeRun !== null) applyCompleteLevel1Tools(agent, initialLevel1Toolset);
+      };
+      agent = params.createAgent
+        ? params.createAgent(agentOptions)
+        : new AiSdkPiAgent<ToolSet>(agentOptions);
+      if (activeBinding.resolved.provider === "claude-code") {
+        applyCompleteLevel1Tools(agent, activeBinding.toolset);
+      }
+      agent.setPrepareModelCall(
+        coreNamedClaudeRuntime?.prepareModelCall ?? corePrimaryClaudeRuntime?.prepareModelCall,
+      );
       activeAgent = agent;
 
       agent.setContext({
@@ -3064,9 +3967,84 @@ export async function startBusAgentRunner(params: {
       agent.setFollowUpMode("all");
       agent.setSteeringMode("all");
 
-      const toolPruneTransform: TransformMessagesFn = async (messages) => {
+      const prepareModelView = async (
+        messages: readonly ModelMessage[],
+        transformContext: TransformMessagesContext,
+        fullBudget: boolean,
+      ): Promise<ModelMessage[]> => {
+        const configuredServerCompactionReplayKey = activeBinding.resolved.openaiServerCompaction
+          ? `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`
+          : undefined;
+        const serverCompactionReplayKey =
+          configuredServerCompactionReplayKey &&
+          !disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey)
+            ? configuredServerCompactionReplayKey
+            : undefined;
+        activeNativeServerCompactionReplayKey = configuredServerCompactionReplayKey
+          ? hasMatchingOpenAIServerCompaction(messages, serverCompactionReplayKey)
+            ? (serverCompactionReplayKey ?? null)
+            : null
+          : null;
+        const materialized =
+          configuredServerCompactionReplayKey || hasOpenAIServerCompaction(messages)
+            ? materializeOpenAIServerCompaction(messages, serverCompactionReplayKey)
+            : messages;
+        const targetFamily = classifyHistoryProviderFamily({
+          type: activeBinding.resolved.provider,
+        });
+        const historyPrepared = coreNamedClaudeRuntime
+          ? coreNamedClaudeRuntime.prepareHistoryView(materialized)
+          : corePrimaryClaudeRuntime
+            ? fullBudget
+              ? corePrimaryClaudeRuntime.prepareFullBudgetView(
+                  materialized,
+                  transformContext.canonicalStartIndex,
+                )
+              : corePrimaryClaudeRuntime.prepareHistoryView(materialized)
+            : runProfile === "primary"
+              ? (() => {
+                  const lineage = state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+                  const historicalEnd = lineage?.currentCanonicalStart ?? 0;
+                  return prepareCorePrimaryHistoryView({
+                    canonicalMessages: materialized,
+                    lineage,
+                    replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
+                      lineage,
+                      historicalEnd,
+                      store: params.transcriptStore ?? {},
+                      targetFamily,
+                    }),
+                    targetFamily,
+                    modelSpecifier: activeBinding.resolved.spec,
+                    canonicalStartIndex: transformContext.canonicalStartIndex,
+                  });
+                })()
+              : stableNamedContinuation
+                ? prepareCoreNamedHistoryView({
+                    canonicalMessages: materialized,
+                    sourceMessages: seededSessionMessages,
+                    currentTurnMessages: initialMessages,
+                    replayHistoricalPrefix: shouldReplayCoreNamedHistory({
+                      sourceTranscript: seededSessionTranscript,
+                      targetFamily,
+                    }),
+                    targetFamily,
+                    modelSpecifier: activeBinding.resolved.spec,
+                  })
+                : materialized;
+        if (
+          configuredServerCompactionReplayKey &&
+          disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey) &&
+          hasMatchingOpenAIServerCompaction(messages, configuredServerCompactionReplayKey)
+        ) {
+          agent.replaceMessages(materializeOpenAIServerCompaction(messages, undefined), {
+            reason: "compaction",
+            preserveRecoveryCheckpoint: true,
+          });
+          disabledServerCompactionReplayKeys.delete(configuredServerCompactionReplayKey);
+        }
         // First, remove pathological binary blobs from the *model-facing* view.
-        const scrubbed = scrubLargeBinaryForModelView(messages, {
+        const scrubbed = scrubLargeBinaryForModelView(historyPrepared, {
           maxBytesPerPart: cfg.tools.media.maxInlineBytesPerPart,
           maxBytesTotal: cfg.tools.media.maxInlineBytesTotal,
         });
@@ -3096,12 +4074,15 @@ export async function startBusAgentRunner(params: {
             })
           : scrubbed;
 
-        if (!anthropicPromptCachingEnabled) return compacted;
-        return withProviderOptionsOnLastUserMessage(
-          compacted,
-          ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-        );
+        return compacted;
       };
+      const toolPruneTransform: PrepareFullModelView = (messages, transformContext) =>
+        prepareModelView(messages, transformContext, false);
+      const fullBudgetTransform: PrepareFullModelView = (messages, transformContext) =>
+        prepareModelView(messages, transformContext, true);
+      // History protocol safety is required even when automatic compaction is disabled.
+      agent.setPrepareFullModelView(toolPruneTransform);
+      agent.setPrepareFullBudgetView(fullBudgetTransform);
 
       let autoCompactionSeq = 0;
       let activeAutoCompactionToolCallId: string | null = null;
@@ -3134,12 +4115,89 @@ export async function startBusAgentRunner(params: {
 
       unsubscribeCompaction = await waitForPreAgent(
         attachAutoCompaction(agent, {
-          model: resolved.spec,
-          summaryModel: claudeCodeRun?.utilityModel ?? "current",
+          model: activeBinding.resolved.spec,
+          summaryModel:
+            claudeCodeRun?.createUtilityModel ??
+            coreNamedClaudeRuntime?.currentRun()?.createUtilityModel ??
+            corePrimaryClaudeRuntime?.currentRun()?.createUtilityModel ??
+            (activeBinding.resolved.provider === "claude-code"
+              ? () => activeBinding.resolved.model
+              : "current"),
           modelCapability,
-          resolveCurrentModelSpecifier: () => agent.state.modelSpecifier ?? resolved.spec,
-          baseTransformMessages: toolPruneTransform,
-          baseTurnErrorHandler: transientRetryController.handler,
+          thresholdInputSource:
+            activeBinding.resolved.provider === "claude-code" ? "transcript-estimate" : "usage",
+          resolveCurrentModelSpecifier: () =>
+            agent.state.modelSpecifier ?? activeBinding.resolved.spec,
+          prepareFullModelView: toolPruneTransform,
+          prepareFullBudgetView: fullBudgetTransform,
+          inputEstimateFloor:
+            coreNamedClaudeRuntime === null && corePrimaryClaudeRuntime === null
+              ? undefined
+              : ({ canonicalMessages, overlay, estimateMessagesTokens }) =>
+                  (coreNamedClaudeRuntime ?? corePrimaryClaudeRuntime)?.inputEstimateFloor({
+                    canonicalMessages,
+                    overlay,
+                    estimateMessagesTokens,
+                  }) ?? null,
+          resolveCurrentInputCanonicalStart: () =>
+            (state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage)
+              ?.currentCanonicalStart ?? null,
+          decorateRequestPayload: (payload) => {
+            const requestPayload =
+              payload.length === 0 && (coreNamedClaudeRuntime || corePrimaryClaudeRuntime)
+                ? ([
+                    {
+                      role: "user",
+                      content: "Continue after the completed tool call.",
+                    },
+                  ] satisfies ModelMessage[])
+                : [...payload];
+            return activeBinding.anthropicPromptCachingEnabled
+              ? withProviderOptionsOnLastUserMessage(
+                  requestPayload,
+                  ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+                )
+              : requestPayload;
+          },
+          baseTurnErrorHandler: turnErrorHandler,
+          serverCompaction: async ({
+            messages: prefix,
+            portableSummary,
+            context: modelContext,
+            abortSignal,
+          }) => {
+            if (!activeBinding.resolved.openaiServerCompaction) {
+              throw new Error("OpenAI server compaction is disabled for the active model");
+            }
+            return await compactWithOpenAIResponses({
+              model: agent.state.model,
+              replayKey: `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`,
+              portableSummary,
+              messages: prefix,
+              system: modelContext?.system ?? agent.state.system,
+              tools: modelContext?.tools,
+              providerOptions: agent.state.providerOptions,
+              reasoning: agent.state.reasoning,
+              abortSignal,
+            });
+          },
+          serverCompactionEnabled: () => {
+            if (!activeBinding.resolved.openaiServerCompaction) return false;
+            const replayKey = `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`;
+            return !disabledServerCompactionReplayKeys.has(replayKey);
+          },
+          onServerCompactionError: (error) => {
+            logger.warn(
+              "OpenAI server compaction failed; using portable summary",
+              {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                modelSpec: activeBinding.resolved.spec,
+                ...extractAiErrorLogDetails(error),
+              },
+              error,
+            );
+          },
           onUnknownCapability: ({ spec, reason, error }) => {
             logger.warn(
               "auto-compaction capability unknown; disabling threshold compaction",
@@ -3174,6 +4232,8 @@ export async function startBusAgentRunner(params: {
             spec,
             reason,
             messageCountBefore,
+            observedInputTokens,
+            inputTokenSource,
             estimatedInputTokens,
             budget,
           }) => {
@@ -3199,6 +4259,8 @@ export async function startBusAgentRunner(params: {
               modelSpec: spec,
               reason,
               messageCountBefore,
+              observedInputTokens,
+              inputTokenSource,
               estimatedInputTokens,
               inputBudget: budget.inputBudget,
               safeInputBudget: budget.safeInputBudget,
@@ -3215,6 +4277,7 @@ export async function startBusAgentRunner(params: {
             durationMs,
             status,
             error,
+            canonicalReplacement,
           }) => {
             const toolCallId =
               activeAutoCompactionToolCallId ??
@@ -3252,6 +4315,22 @@ export async function startBusAgentRunner(params: {
             };
             if (status === "completed") {
               completedCompactionCount += 1;
+              if (runProfile === "primary" && next.requestClient === "discord") {
+                const previousLineage =
+                  state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+                const mappedCurrentStart = (() => {
+                  if (!canonicalReplacement || !previousLineage) return 0;
+                  return mapCorePrimaryCompactionCurrentCanonicalStart({
+                    previousCurrentCanonicalStart: previousLineage.currentCanonicalStart,
+                    replacement: canonicalReplacement,
+                  });
+                })();
+                next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+                  "compaction-checkpoint-transform",
+                  mappedCurrentStart,
+                );
+                if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+              }
               logger.info("auto-compaction end", payload);
               return;
             }
@@ -3321,6 +4400,7 @@ export async function startBusAgentRunner(params: {
           }
 
           if (completion) {
+            if (!liveParentSession.isPending(completion.runId)) continue;
             liveParentSession.clearMaterializationFailure(completion.runId);
             completions.push(completion);
             continue;
@@ -3347,6 +4427,7 @@ export async function startBusAgentRunner(params: {
             materializationError,
           );
           if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS) continue;
+          if (!liveParentSession.isPending(identity.runId)) continue;
 
           completions.push({
             ...identity,
@@ -3357,13 +4438,18 @@ export async function startBusAgentRunner(params: {
           });
         }
 
-        const plan = planDeferredSubagentBoundary({
+        const deliverableCompletions = completions.filter((completion) =>
+          liveParentSession.isPending(completion.runId),
+        );
+
+        const provisionalPlan = planDeferredSubagentBoundary({
           canonicalMessages: agent.state.messages,
           modelInputMessages: input.modelInputMessages,
-          completions,
+          completions: deliverableCompletions,
         });
 
-        for (const completion of completions) {
+        for (const completion of deliverableCompletions) {
+          if (!liveParentSession.isPending(completion.runId)) continue;
           if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
           try {
             await outputPublisher.publishToolCall({
@@ -3385,13 +4471,65 @@ export async function startBusAgentRunner(params: {
           }
         }
 
-        if (plan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
-          await liveParentSession.acknowledge(plan.consumedRunIds);
+        if (provisionalPlan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
+          await liveParentSession.acknowledge(provisionalPlan.consumedRunIds);
         }
 
-        return { append: plan.append, forceNextTurn: plan.forceNextTurn };
+        const finalPlan = planDeferredSubagentBoundary({
+          canonicalMessages: agent.state.messages,
+          modelInputMessages: input.modelInputMessages,
+          completions: deliverableCompletions.filter((completion) =>
+            liveParentSession.isPending(completion.runId),
+          ),
+        });
+        if (
+          finalPlan.append.length > 0 &&
+          runProfile === "primary" &&
+          next.requestClient === "discord"
+        ) {
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "deferred-result-insertion",
+            agent.state.messages.length,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
+
+        return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
       };
+      let pendingSilentTurnStartIndex: number | null = null;
+      const removePendingSilentTurn = () => {
+        if (pendingSilentTurnStartIndex === null) return;
+        const startIndex = pendingSilentTurnStartIndex;
+        pendingSilentTurnStartIndex = null;
+        const hasAssistantMessage = agent.state.messages
+          .slice(startIndex)
+          .some((message) => message.role === "assistant");
+        if (!hasAssistantMessage) return;
+
+        const messages = removeSilentAssistantTurnMessages({
+          messages: agent.state.messages,
+          startIndex,
+          messageCount: agent.state.messages.length - startIndex,
+        });
+        if (runProfile === "primary" && next.requestClient === "discord") {
+          const currentCanonicalStart =
+            state.activeRun?.corePrimaryLineage?.currentCanonicalStart ??
+            next.corePrimaryLineage?.currentCanonicalStart ??
+            startIndex;
+          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+            "silent-turn-removal",
+            currentCanonicalStart,
+          );
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
+        agent.replaceMessages(messages);
+      };
+
       agent.setTurnBoundaryHandler(async (context) => {
+        await coreNamedClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
+        await corePrimaryClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
+        removePendingSilentTurn();
+
         lastBoundaryModelInputMessages = context.modelInputMessages;
         return await drainDeferredCompletions({
           modelInputMessages: context.modelInputMessages,
@@ -3403,9 +4541,47 @@ export async function startBusAgentRunner(params: {
 
       let finalText = "";
       let stableFinalText = "";
+      let stablePartialText = state.activeRun?.partialText ?? "";
+      let turnTextStartIndex = 0;
+      let turnPartialTextStartIndex = stablePartialText.length;
+      let pendingNoReplyTurnText = "";
+      let pendingNoReplyTurnOutputs: Array<{
+        delta: string;
+        phase?: ReturnType<typeof openAIMessagePhase>;
+        phaseBoundaryPrefixChars: number;
+      }> = [];
+      let bufferNoReplyTurnText = true;
+      let lastCompletedTurnWasSilent = false;
+      let turnFinalAnswerText = "";
+      let turnHasFinalAnswerPhase = false;
+      let lastCompletedTurnFinalAnswerText: string | undefined;
+      let currentTextPhase: ReturnType<typeof openAIMessagePhase>;
+      let retainedTextPhase: ReturnType<typeof openAIMessagePhase>;
+      const assistantTextPhaseByPartId = new Map<
+        string,
+        NonNullable<ReturnType<typeof openAIMessagePhase>>
+      >();
       const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
         next.recovery?.partialText,
       );
+      const appendPendingNoReplyOutput = (
+        delta: string,
+        phase: ReturnType<typeof openAIMessagePhase>,
+        phaseBoundaryPrefixChars: number,
+      ): void => {
+        const previous = pendingNoReplyTurnOutputs.at(-1);
+        if (previous !== undefined && previous.phase === phase && phaseBoundaryPrefixChars === 0) {
+          previous.delta += delta;
+          return;
+        }
+        pendingNoReplyTurnOutputs.push({ delta, phase, phaseBoundaryPrefixChars });
+      };
+      const publishPendingNoReplyOutputs = (): void => {
+        for (const output of pendingNoReplyTurnOutputs) {
+          outputPublisher.publishText(output.delta, output.phase, output.phaseBoundaryPrefixChars);
+        }
+        pendingNoReplyTurnOutputs = [];
+      };
       const reasoningChunkState: ReasoningChunkState = {
         chunks: new Map<string, string>(),
         seq: 0,
@@ -3441,8 +4617,8 @@ export async function startBusAgentRunner(params: {
             requestClient: headers.request_client,
             runProfile,
             subagentDepth: subagentMeta.depth,
-            modelSpec: resolved.spec,
-            modelId: resolved.modelId,
+            modelSpec: activeBinding.resolved.spec,
+            modelId: activeBinding.resolved.modelId,
             turnEndIndex: turnEndCount,
             modelViewTurn,
           },
@@ -3502,10 +4678,55 @@ export async function startBusAgentRunner(params: {
           runStats.finalMessages = event.messages;
         }
 
+        if (event.type === "messages_reset") {
+          removePendingSilentTurn();
+        }
+
         if (event.type === "turn_end") {
           transientRetryController.reset();
           retryAttemptHadReasoning = false;
+          const turnText = finalText.slice(turnTextStartIndex);
+          const turnDeliveryText = turnHasFinalAnswerPhase ? turnFinalAnswerText : turnText;
+          const silentTurn = resolveReplyDeliveryFromFinalText(turnDeliveryText) === "skip";
+          lastCompletedTurnWasSilent = silentTurn;
+          lastCompletedTurnFinalAnswerText = turnHasFinalAnswerPhase
+            ? turnFinalAnswerText
+            : undefined;
+          if (silentTurn) {
+            finalText = finalText.slice(0, turnTextStartIndex);
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText = state.activeRun.partialText.slice(
+                0,
+                turnPartialTextStartIndex,
+              );
+            }
+            void outputPublisher.publishTextReset({
+              text:
+                state.activeRun?.requestId === next.requestId
+                  ? state.activeRun.partialText
+                  : `${next.recovery?.partialText ?? ""}${finalText}`,
+              ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
+            });
+            pendingSilentTurnStartIndex = agent.state.messages.length - event.newMessages.length;
+          } else if (bufferNoReplyTurnText && pendingNoReplyTurnText.length > 0) {
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText += pendingNoReplyTurnText;
+            }
+            publishPendingNoReplyOutputs();
+          }
+          if (!silentTurn) retainedTextPhase = currentTextPhase ?? retainedTextPhase;
+
+          pendingNoReplyTurnText = "";
+          pendingNoReplyTurnOutputs = [];
+          bufferNoReplyTurnText = true;
+          turnFinalAnswerText = "";
+          turnHasFinalAnswerPhase = false;
+          currentTextPhase = undefined;
+          assistantTextPhaseByPartId.clear();
+          turnTextStartIndex = finalText.length;
+          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
           stableFinalText = finalText;
+          stablePartialText = state.activeRun?.partialText ?? stablePartialText;
 
           turnEndCount++;
           runStats.lastTurnFinishReason = event.finishReason;
@@ -3529,6 +4750,7 @@ export async function startBusAgentRunner(params: {
             cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
             estimatedCostUsd: roundEstimatedCostUsd,
             estimatedCostUsdTotal: roundEstimatedCostUsdTotal,
+            modelSpec: activeBinding.resolved.spec,
             costEstimateStatus:
               roundEstimatedCostUsd !== undefined ? "estimated" : costEstimateStatus,
             costEstimateReason:
@@ -3543,12 +4765,39 @@ export async function startBusAgentRunner(params: {
           transientRetryController.reset();
         }
 
+        if (event.type === "turn_abort") {
+          if (bufferNoReplyTurnText) {
+            finalText = finalText.slice(0, turnTextStartIndex);
+          }
+          pendingNoReplyTurnText = "";
+          pendingNoReplyTurnOutputs = [];
+          bufferNoReplyTurnText = true;
+          turnFinalAnswerText = "";
+          turnHasFinalAnswerPhase = false;
+          currentTextPhase = undefined;
+          assistantTextPhaseByPartId.clear();
+          turnTextStartIndex = finalText.length;
+          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
+        }
+
         if (event.type === "turn_retry") {
           outputPublisher.flush();
           assistantTextPartBoundaryState.lastTextPartId = null;
           assistantTextPartBoundaryState.pendingTextPartStartIds.clear();
           assistantTextPartBoundaryState.pendingRecoveryTextBoundary = event.hadPartialOutput;
           finalText = stableFinalText;
+          if (state.activeRun?.requestId === next.requestId) {
+            state.activeRun.partialText = stablePartialText;
+          }
+          pendingNoReplyTurnText = "";
+          pendingNoReplyTurnOutputs = [];
+          bufferNoReplyTurnText = true;
+          turnFinalAnswerText = "";
+          turnHasFinalAnswerPhase = false;
+          currentTextPhase = undefined;
+          assistantTextPhaseByPartId.clear();
+          turnTextStartIndex = stableFinalText.length;
+          turnPartialTextStartIndex = stablePartialText.length;
 
           if (retryAttemptHadReasoning) {
             reasoningChunkState.chunks.clear();
@@ -3578,6 +4827,10 @@ export async function startBusAgentRunner(params: {
         }
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_start") {
+          const phase = openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata);
+          if (phase !== undefined) {
+            assistantTextPhaseByPartId.set(event.assistantMessageEvent.id, phase);
+          }
           markAssistantTextPartStarted(
             assistantTextPartBoundaryState,
             event.assistantMessageEvent.id,
@@ -3586,6 +4839,20 @@ export async function startBusAgentRunner(params: {
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
           runStats.firstTextDeltaAt ??= Date.now();
+          const phase =
+            openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata) ??
+            assistantTextPhaseByPartId.get(event.assistantMessageEvent.id);
+          if (phase === "final_answer" && currentTextPhase === "commentary") {
+            if (pendingNoReplyTurnText.length > 0) {
+              if (state.activeRun?.requestId === next.requestId) {
+                state.activeRun.partialText += pendingNoReplyTurnText;
+              }
+              publishPendingNoReplyOutputs();
+              pendingNoReplyTurnText = "";
+            }
+            bufferNoReplyTurnText = true;
+          }
+          currentTextPhase = phase ?? currentTextPhase;
 
           const delta = consumeAssistantTextDelta({
             state: assistantTextPartBoundaryState,
@@ -3594,13 +4861,34 @@ export async function startBusAgentRunner(params: {
             partId: event.assistantMessageEvent.id,
             delta: event.assistantMessageEvent.delta,
           });
+          const phaseBoundaryPrefixChars = Math.max(
+            0,
+            delta.length - event.assistantMessageEvent.delta.length,
+          );
 
           finalText += delta;
-          if (state.activeRun && state.activeRun.requestId === next.requestId) {
-            state.activeRun.partialText += delta;
+          if (phase === "final_answer") {
+            turnHasFinalAnswerPhase = true;
+            turnFinalAnswerText += event.assistantMessageEvent.delta;
           }
 
-          outputPublisher.publishText(delta);
+          if (bufferNoReplyTurnText) {
+            pendingNoReplyTurnText += delta;
+            appendPendingNoReplyOutput(delta, phase, phaseBoundaryPrefixChars);
+            if (!isPossibleNoReplyPrefix(pendingNoReplyTurnText)) {
+              bufferNoReplyTurnText = false;
+              if (state.activeRun?.requestId === next.requestId) {
+                state.activeRun.partialText += pendingNoReplyTurnText;
+              }
+              publishPendingNoReplyOutputs();
+              pendingNoReplyTurnText = "";
+            }
+          } else {
+            if (state.activeRun?.requestId === next.requestId) {
+              state.activeRun.partialText += delta;
+            }
+            outputPublisher.publishText(delta, phase, phaseBoundaryPrefixChars);
+          }
         }
 
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_end") {
@@ -3608,6 +4896,7 @@ export async function startBusAgentRunner(params: {
             assistantTextPartBoundaryState,
             event.assistantMessageEvent.id,
           );
+          assistantTextPhaseByPartId.delete(event.assistantMessageEvent.id);
         }
 
         if (
@@ -3676,7 +4965,7 @@ export async function startBusAgentRunner(params: {
               .publishToolCall({
                 toolCallId: event.toolCallId,
                 status: "start",
-                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
+                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
               })
               .catch((e: unknown) => {
                 logger.error(
@@ -3701,7 +4990,7 @@ export async function startBusAgentRunner(params: {
             toolName: event.toolName,
             isError: event.isError,
             result: event.result,
-            toolSpecs: level1ToolSpecs,
+            toolSpecs: activeBinding.toolset.specs,
           });
           const deferredAccepted =
             event.toolName === "subagent_delegate" &&
@@ -3755,7 +5044,7 @@ export async function startBusAgentRunner(params: {
             .publishToolCall({
               toolCallId: event.toolCallId,
               status: "end",
-              display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, level1ToolSpecs)}`,
+              display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
               ok,
               error: ok ? undefined : interruptedForRestart ? "server restarted" : toolFailureError,
             })
@@ -3806,6 +5095,7 @@ export async function startBusAgentRunner(params: {
         // If additional messages for the same request id were queued before the run started,
         // merge them into the initial prompt so they don't become separate runs.
         const mergedInitial = mergeQueuedForSameRequest(next, state.queue);
+        if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
         const control = parseRequestControlFromRaw(next.raw);
         const autoInjectedThreadSearchMessages =
           runProfile === "primary" &&
@@ -3853,6 +5143,18 @@ export async function startBusAgentRunner(params: {
               )
             : [];
         initialMessages = [...mergedInitial, ...autoInjectedThreadSearchMessages];
+        if (
+          autoInjectedThreadSearchMessages.length > 0 &&
+          runProfile === "primary" &&
+          next.requestClient === "discord"
+        ) {
+          next.corePrimaryLineage = appendAutoInjectedThreadSearchLineage({
+            lineage: next.corePrimaryLineage,
+            canonicalMessages: mergedInitial,
+            injectedMessages: autoInjectedThreadSearchMessages,
+          });
+          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+        }
         initialMessagesEndWithInjectedTool = autoInjectedThreadSearchMessages.length > 0;
         responseStartIndex = agent.state.messages.length + initialMessages.length;
       }
@@ -3920,19 +5222,27 @@ export async function startBusAgentRunner(params: {
       }
       runIdleWatchdog?.stop();
 
-      const isCancelled = cancelledByRequestId.has(headers.request_id);
+      let isCancelled = cancelledByRequestId.has(headers.request_id);
+      if (isCancelled) coreNamedClaudeRuntime?.markTerminalFailure(true);
+      if (isCancelled) corePrimaryClaudeRuntime?.markTerminalFailure(true);
       if (isCancelled && !finalText) {
         finalText = "Cancelled.";
       }
 
+      const terminalDeliveryText = isCancelled
+        ? finalText
+        : (lastCompletedTurnFinalAnswerText ?? finalText);
       const isHeartbeatAckOnly =
-        isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(finalText);
-      const delivery = resolveReplyDeliveryFromFinalText(finalText);
+        isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(terminalDeliveryText);
+      const delivery =
+        finalText.length === 0 && lastCompletedTurnWasSilent
+          ? "skip"
+          : resolveReplyDeliveryFromFinalText(terminalDeliveryText);
       if (!isCancelled && delivery !== "skip" && !isHeartbeatAckOnly && finalText.length === 0) {
         throw new Error(
           buildNoAssistantTextError({
-            provider: resolved.provider,
-            modelId: resolved.modelId,
+            provider: activeBinding.resolved.provider,
+            modelId: activeBinding.resolved.modelId,
             finishReason: runStats.lastTurnFinishReason,
             warningSummary: summarizeCallWarnings(streamWarnings) ?? undefined,
           }),
@@ -3973,6 +5283,30 @@ export async function startBusAgentRunner(params: {
               didCompact: isCompactionCheckpoint,
             });
           })();
+          const targetProviderFamily = classifyHistoryProviderFamily({
+            type: activeBinding.resolved.provider,
+          });
+          const providerState =
+            runProfile === "primary"
+              ? resolveCorePrimaryTranscriptProviderState({
+                  targetFamily: targetProviderFamily,
+                  lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                  transcriptStore: params.transcriptStore,
+                })
+              : stableNamedContinuation && !isCancelled
+                ? advanceHistoryProviderState(
+                    seededSessionTranscript === null
+                      ? "empty-history"
+                      : (seededSessionTranscript.providerState ?? "unknown-populated-history"),
+                    targetProviderFamily,
+                  )
+                : undefined;
+          const terminalPrimaryLineage =
+            state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+          const canPublishCorePrimaryClaude =
+            corePrimaryClaudeRuntime !== null &&
+            terminalPrimaryLineage?.state === "complete" &&
+            !isCompactionCheckpoint;
 
           params.transcriptStore.saveRequestTranscript({
             requestId: headers.request_id,
@@ -3984,7 +5318,80 @@ export async function startBusAgentRunner(params: {
             finalText,
             modelLabel: resolvedModelLabel,
             contextMeta: checkpointMeta,
+            ...(providerState && !coreNamedClaudeRuntime && !canPublishCorePrimaryClaude
+              ? { providerState }
+              : {}),
+            ...(runProfile === "primary" ? persistedCompleteLineage(terminalPrimaryLineage) : {}),
+            ...(stableNamedContinuation && !isCancelled && !coreNamedClaudeRuntime
+              ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
+              : {}),
           });
+          if (coreNamedClaudeRuntime && !isCancelled) {
+            if (!providerState) {
+              throw new Error("Core named Claude finalization requires provider history state");
+            }
+            const verified = params.transcriptStore.getRequestTranscript?.({
+              requestId: headers.request_id,
+            });
+            const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+            if (
+              !verified ||
+              verified.messages.length !== persistedMessages.length ||
+              hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
+            ) {
+              throw new Error("persisted Core named transcript failed canonical re-read");
+            }
+            const promoted = await coreNamedClaudeRuntime.finalize({
+              terminalTranscript: verified,
+              canonicalMessages: persistedMessages,
+              providerState,
+              isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
+            });
+            const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
+            isCancelled ||= cancelledDuringFinalization;
+            logger.info("Core named Claude binding promotion", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              promoted,
+            });
+          }
+          if (corePrimaryClaudeRuntime && !isCancelled && canPublishCorePrimaryClaude) {
+            if (!providerState) {
+              throw new Error("Core primary Claude finalization requires provider history state");
+            }
+            const verified = params.transcriptStore.getRequestTranscript?.({
+              requestId: headers.request_id,
+            });
+            const verifiedManifest = params.transcriptStore.getCorePrimaryLineageManifest?.({
+              requestId: headers.request_id,
+            });
+            const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+            const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
+            if (
+              !verified ||
+              !verifiedManifest ||
+              verified.providerState != null ||
+              verified.messages.length !== persistedMessages.length ||
+              hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
+            ) {
+              throw new Error("persisted Core primary transcript failed canonical re-read");
+            }
+            const promoted = await corePrimaryClaudeRuntime.finalize({
+              terminalTranscript: verified,
+              canonicalMessages: terminalCanonicalMessages,
+              providerState,
+              isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
+            });
+            const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
+            isCancelled ||= cancelledDuringFinalization;
+            logger.info("Core primary Claude binding promotion", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              promoted,
+            });
+          } else if (corePrimaryClaudeRuntime && !isCancelled) {
+            corePrimaryClaudeRuntime.markTerminalFailure(false);
+          }
           if (isCompactionCheckpoint) {
             logger.info("compaction checkpoint persisted", {
               requestId: headers.request_id,
@@ -3995,12 +5402,17 @@ export async function startBusAgentRunner(params: {
             });
           }
         } catch (e) {
+          coreNamedClaudeRuntime?.markTerminalFailure(false);
+          corePrimaryClaudeRuntime?.markTerminalFailure(false);
           logger.error(
             "failed to persist transcript",
             { requestId: headers.request_id, sessionId: headers.session_id },
             e,
           );
         }
+      }
+      if (corePrimaryClaudeRuntime && shouldSkipSurfaceReply) {
+        corePrimaryClaudeRuntime.markTerminalFailure(false);
       }
 
       // Build stats in the js-llmcord-ish one-liner format.
@@ -4046,7 +5458,7 @@ export async function startBusAgentRunner(params: {
         tools: agent.state.tools,
       });
 
-      const modelLabel = resolved.modelId;
+      const modelLabel = activeBinding.resolved.modelId;
       const statsLine = buildStatsLine({
         modelLabel,
         usage: runStats.totalUsage,
@@ -4066,7 +5478,9 @@ export async function startBusAgentRunner(params: {
           })
         : undefined;
 
-      const estimatedCostUsdFromTotalUsage = estimateUsageCostUsd(runStats.totalUsage);
+      const estimatedCostUsdFromTotalUsage = didSwitchModel
+        ? undefined
+        : estimateUsageCostUsd(runStats.totalUsage);
       const estimatedCostUsdTotal = estimatedCostUsdFromTotalUsage ?? roundEstimatedCostUsdTotal;
       const resolvedCostEstimateStatus =
         estimatedCostUsdTotal !== undefined ? "estimated" : costEstimateStatus;
@@ -4113,6 +5527,7 @@ export async function startBusAgentRunner(params: {
       logger.info("agent run resolved", {
         requestId: headers.request_id,
         sessionId: headers.session_id,
+        model: activeBinding.resolved.spec,
         durationMs: Date.now() - runStartedAt,
         finalTextChars: finalText.length,
         turns: turnEndCount,
@@ -4122,6 +5537,17 @@ export async function startBusAgentRunner(params: {
       });
     } catch (e) {
       runIdleWatchdog?.stop();
+
+      if (e instanceof RestartDrainingAbort) {
+        coreNamedClaudeRuntime?.markUncertain();
+        corePrimaryClaudeRuntime?.markUncertain();
+      } else if (e instanceof PreAgentRunCancelledError) {
+        coreNamedClaudeRuntime?.markTerminalFailure(true);
+        corePrimaryClaudeRuntime?.markTerminalFailure(true);
+      } else {
+        coreNamedClaudeRuntime?.markTerminalFailure(false);
+        corePrimaryClaudeRuntime?.markTerminalFailure(false);
+      }
 
       if (activeCustomCommandTool) {
         const { toolCallId, display } = activeCustomCommandTool;
@@ -4223,6 +5649,20 @@ export async function startBusAgentRunner(params: {
             messages: persistedMessages,
             finalText: `Error: ${msg}`,
             modelLabel: resolvedModelLabel,
+            ...(runProfile === "primary"
+              ? {
+                  providerState: resolveCorePrimaryTranscriptProviderState({
+                    targetFamily: resolvedProviderFamily,
+                    lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                    transcriptStore: params.transcriptStore,
+                  }),
+                }
+              : {}),
+            ...(runProfile === "primary"
+              ? persistedCompleteLineage(
+                  state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                )
+              : {}),
           });
         } catch (err) {
           logger.error(
@@ -4307,6 +5747,20 @@ export async function startBusAgentRunner(params: {
       unsubscribe();
       unsubscribeCompaction();
       await outputPublisher.drain();
+      await coreNamedClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
+        logger.warn(
+          "failed to retire Core named Claude runtime",
+          { requestId: headers.request_id, sessionId: headers.session_id },
+          e,
+        );
+      });
+      await corePrimaryClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
+        logger.warn(
+          "failed to retire Core primary Claude runtime",
+          { requestId: headers.request_id, sessionId: headers.session_id },
+          e,
+        );
+      });
       await claudeCodeRun?.dispose().catch((e: unknown) => {
         logger.warn(
           "failed to dispose Claude Code run resources",
@@ -4384,6 +5838,7 @@ async function publishLifecycle(params: {
 
 function mergeQueuedForSameRequest(first: Enqueued, queue: Enqueued[]): ModelMessage[] {
   const merged: ModelMessage[] = [...first.messages];
+  let coalesced = false;
 
   // Pull in any already-queued items for the same request id so they become
   // additional user messages in the same initial run.
@@ -4396,6 +5851,14 @@ function mergeQueuedForSameRequest(first: Enqueued, queue: Enqueued[]): ModelMes
 
     merged.push(...next.messages);
     queue.splice(i, 1);
+    coalesced = true;
+  }
+
+  if (coalesced) {
+    first.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+      "queued-request-coalesced",
+      first.corePrimaryLineage?.currentCanonicalStart,
+    );
   }
 
   return merged;
@@ -4454,6 +5917,14 @@ async function applyToRunningAgent(
     const v = (raw as Record<string, unknown>)["cancel"];
     return v === true;
   })();
+  if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
+    activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+      entry.queue === "steer" || entry.queue === "interrupt"
+        ? "steering-transform"
+        : "follow-up-transform",
+      agent.state.messages.length,
+    );
+  }
 
   const hasBufferedCompletions = liveParent?.snapshot().hasPendingCompletions ?? false;
 

@@ -351,7 +351,7 @@ export type MiniLilacCompactionPhase = z.infer<typeof miniLilacCompactionPhaseSc
 
 export const miniLilacCompactionProgressSchema = z
   .object({
-    /** History and split-turn prefixes summarize concurrently; their deltas interleave. */
+    /** `split-turn` is accepted only for replaying events persisted by older runtimes. */
     stage: z.enum(["history", "split-turn"]),
     step: z.number().int().positive(),
     stepCount: z.number().int().positive(),
@@ -798,7 +798,12 @@ export const miniLilacHistoryFilesystemResultSchema = z.discriminatedUnion("stat
   z.strictObject({ status: z.literal("restored") }),
   z.strictObject({
     status: z.literal("skipped"),
-    reason: z.enum(["git-unavailable", "snapshot-unavailable", "platform-unsupported"]),
+    reason: z.enum([
+      "git-unavailable",
+      "non-git-workspace",
+      "snapshot-unavailable",
+      "platform-unsupported",
+    ]),
   }),
 ]);
 export type MiniLilacHistoryFilesystemResult = z.infer<

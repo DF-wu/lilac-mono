@@ -37,11 +37,15 @@ export function selectNewestReachableCheckpoint<T>(input: {
     if (resolvedSnapshotsBySurfaceMessageId.has(messageId)) {
       return resolvedSnapshotsBySurfaceMessageId.get(messageId) ?? null;
     }
-    const snapshot = input.transcriptStore!.getTranscriptBySurfaceMessage({
+    const resolved = input.transcriptStore!.getTranscriptBySurfaceMessage({
       platform: input.platform,
       channelId: input.channelId,
       messageId,
     });
+    const snapshot =
+      resolved?.requestClient === input.platform && resolved.sessionId === input.channelId
+        ? resolved
+        : null;
     resolvedSnapshotsBySurfaceMessageId.set(messageId, snapshot);
     return snapshot;
   };

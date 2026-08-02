@@ -241,6 +241,12 @@ function shouldAllowTelegramSession(params: {
   return isTelegramChatAllowed({ cfg: params.cfg, chatId });
 }
 
+function telegramOriginSessionId(ctx: RequestContext | undefined): string | undefined {
+  if (resolveContextClient(ctx) !== "telegram") return undefined;
+  if (ctx?.originSessionId) return ctx.originSessionId;
+  return ctx?.requestClient === "telegram" ? ctx.sessionId : undefined;
+}
+
 function parseIsoMs(iso: string | undefined): number {
   if (!iso) return 0;
   const ms = Date.parse(iso);
@@ -552,12 +558,14 @@ function withDefaultSessionId(
   // If explicitly provided (even null/empty), defer to schema validation.
   if (hasOwn && value !== undefined) return rawInput;
 
+  const authoritativeTelegramSessionId = telegramOriginSessionId(ctx);
   const ctxSessionId =
-    typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
+    authoritativeTelegramSessionId ??
+    (typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
       ? ctx.sessionId
       : (inferDiscordOriginFromRequestId(ctx?.requestId)?.sessionId ??
         inferGithubOriginFromRequestId(ctx?.requestId)?.sessionId ??
-        inferTelegramOriginFromRequestId(ctx?.requestId)?.sessionId);
+        inferTelegramOriginFromRequestId(ctx?.requestId)?.sessionId));
 
   if (ctxSessionId) {
     return { ...rawInput, sessionId: ctxSessionId };
@@ -1836,7 +1844,7 @@ export class Surface implements ServerTool {
           !shouldAllowTelegramSession({
             cfg,
             sessionId: row.sessionId,
-            originSessionId: ctx?.sessionId,
+            originSessionId: telegramOriginSessionId(ctx),
           })
         ) {
           continue;
@@ -2106,7 +2114,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       const sessionRef = asTelegramSessionRef(sessionId);
@@ -2279,7 +2293,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       const sessionRef = asTelegramSessionRef(sessionId);
@@ -2519,7 +2539,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       if ((input.paths ?? []).length > 0) {
@@ -2648,7 +2674,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       await this.adapterFor("telegram").editMsg(asTelegramMsgRef(sessionId, input.messageId), {
@@ -2721,7 +2753,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       await this.adapterFor("telegram").deleteMsg(asTelegramMsgRef(sessionId, input.messageId));
@@ -2977,7 +3015,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       await this.adapterFor("telegram").addReaction(
@@ -3083,7 +3127,13 @@ export class Surface implements ServerTool {
     if (client === "telegram") {
       const cfg = await this.getCfg();
       const sessionId = mustPresentString(input.sessionId, "sessionId");
-      if (!shouldAllowTelegramSession({ cfg, sessionId, originSessionId: ctx?.sessionId })) {
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
         throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
       }
       await this.adapterFor("telegram").removeReaction(

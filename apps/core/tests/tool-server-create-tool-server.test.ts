@@ -107,6 +107,7 @@ describe("createToolServer", () => {
           kind: "primary",
           requestId,
           sessionId: `session:${requestId}`,
+          originSessionId: `origin:${requestId}`,
           platform: "unknown",
           principal: { platform: "discord", userId: "user-1" },
           allowedCallables: null,
@@ -148,6 +149,7 @@ describe("createToolServer", () => {
         const headers = {
           "x-lilac-request-id": requestId,
           "x-lilac-session-id": `session:${requestId}`,
+          "x-lilac-origin-session-id": "caller-controlled-origin",
           "x-lilac-request-client": "unknown",
           "x-lilac-cwd": "/selected/child/cwd",
           "x-lilac-control-capability": capability,
@@ -168,23 +170,111 @@ describe("createToolServer", () => {
         expect(await call.json()).toMatchObject({ isError: false, output: { ok: true } });
       }
       expect(
-        contexts.map(({ cwd, subagentProfile, controlPolicy }) => ({
+        contexts.map(({ cwd, originSessionId, subagentProfile, controlPolicy }) => ({
           cwd,
+          originSessionId,
           subagentProfile,
           controlPolicy,
         })),
       ).toEqual([
         {
           cwd: "/selected/child/cwd",
+          originSessionId: "origin:sub:direct",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
         },
         {
           cwd: "/selected/child/cwd",
+          originSessionId: "origin:wfr:workflow",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
         },
       ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("scopes restricted Telegram workflow surface calls to the server-issued origin", async () => {
+    const authority = new RequestControlAuthority();
+    const requestId = "wfr:telegram-child";
+    const sessionId = "workflow:run-1:operation-1";
+    const originSessionId = "-100123:7";
+    const capability = authority.issue({
+      kind: "primary",
+      requestId,
+      sessionId,
+      originSessionId,
+      platform: "unknown",
+      principal: { platform: "telegram", userId: "user-7" },
+      allowedCallables: null,
+      profile: "general",
+      canonicalCwd: "/workspace",
+      safetyMode: "restricted",
+      expiresAt: Date.now() + 60_000,
+    });
+    const calls: RequestContext[] = [];
+    const tool: ServerTool = {
+      id: "telegram-origin-test",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "surface.messages.send",
+            name: "Send",
+            description: "Send",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) calls.push(options.context);
+        return { ok: true };
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      authorizeControlRequest: (input) => authority.authorize(input),
+    });
+    const headers = {
+      "content-type": "application/json",
+      "x-lilac-request-id": requestId,
+      "x-lilac-session-id": sessionId,
+      "x-lilac-request-client": "unknown",
+      "x-lilac-cwd": "/workspace",
+      "x-lilac-control-capability": capability,
+    };
+    await server.init();
+    try {
+      const allowed = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            callableId: "surface.messages.send",
+            input: { sessionId: originSessionId, text: "allowed" },
+          }),
+        }),
+      );
+      expect(await allowed.json()).toMatchObject({ isError: false, output: { ok: true } });
+      expect(calls[0]?.originSessionId).toBe(originSessionId);
+
+      const blocked = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            callableId: "surface.messages.send",
+            input: { sessionId: "-100123:8", text: "blocked" },
+          }),
+        }),
+      );
+      expect(await blocked.json()).toMatchObject({
+        isError: true,
+        output: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
+      });
+      expect(calls).toHaveLength(1);
     } finally {
       await server.stop();
     }

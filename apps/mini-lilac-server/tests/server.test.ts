@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp as mkdtempFs, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -42,6 +42,19 @@ import { z } from "zod";
 import { createMiniLilacServer, MINI_LILAC_API_PREFIX, withSseKeepAlive } from "../src/server";
 
 const temporaryDirectories: string[] = [];
+
+async function mkdtemp(prefix: string): Promise<string> {
+  const directory = await mkdtempFs(prefix);
+  const child = Bun.spawn(["git", "-C", directory, "init", "--quiet"], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+  if (exitCode !== 0) throw new Error(`git init failed: ${stderr}`);
+  return directory;
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -1069,6 +1082,12 @@ describe("createMiniLilacServer", () => {
     const { app, directory, service } = await testServer(model);
     const session = await service.createSession({ cwd: directory, model: "test/reasoner" });
     const visibleMessages = [
+      userMessage("earliest-user", "earliest request"),
+      {
+        id: "earliest-assistant",
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: "earliest answer" }],
+      },
       userMessage("old-user", `old request ${"a".repeat(6_000)}`),
       {
         id: "old-assistant",
@@ -1082,6 +1101,8 @@ describe("createMiniLilacServer", () => {
       session.id,
       "manual-compaction-seed",
       [
+        { role: "user", content: "earliest request" },
+        { role: "assistant", content: "earliest answer" },
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
         { role: "user", content: "latest request" },
@@ -1166,11 +1187,17 @@ describe("createMiniLilacServer", () => {
       session.id,
       "cancel-compaction-seed",
       [
+        { role: "user", content: "earliest request" },
+        { role: "assistant", content: "earliest answer" },
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
         { role: "user", content: "latest request" },
       ],
-      [userMessage("old-user", "old request"), userMessage("latest-user", "latest request")],
+      [
+        userMessage("earliest-user", "earliest request"),
+        userMessage("old-user", "old request"),
+        userMessage("latest-user", "latest request"),
+      ],
     );
     const before = service.store.getModelMessages(session.id);
 
@@ -1223,11 +1250,17 @@ describe("createMiniLilacServer", () => {
       session.id,
       "conflicting-compaction-seed",
       [
+        { role: "user", content: "earliest request" },
+        { role: "assistant", content: "earliest answer" },
         { role: "user", content: `old request ${"a".repeat(6_000)}` },
         { role: "assistant", content: `old answer ${"b".repeat(6_000)}` },
         { role: "user", content: "latest request" },
       ],
-      [userMessage("old-user", "old request"), userMessage("latest-user", "latest request")],
+      [
+        userMessage("earliest-user", "earliest request"),
+        userMessage("old-user", "old request"),
+        userMessage("latest-user", "latest request"),
+      ],
     );
 
     const compacting = app.handle(

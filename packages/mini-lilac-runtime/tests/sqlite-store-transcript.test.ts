@@ -133,13 +133,36 @@ async function createV2Database(): Promise<{ databasePath: string; directory: st
   return { databasePath, directory };
 }
 
-function seedLegacyTranscripts(databasePath: string): {
+function seedLegacyTranscripts(
+  databasePath: string,
+  options: { legacySessionParts?: boolean } = {},
+): {
   firstUser: MiniLilacUIMessage & { role: "user" };
   secondUser: MiniLilacUIMessage & { role: "user" };
-  divergentUiPrefix: MiniLilacUIMessage[];
-  sharedModelPrefix: ModelMessage[];
 } {
   const database = new Database(databasePath, { strict: true });
+  const legacySessionParts = options.legacySessionParts
+    ? [
+        {
+          type: "data-session",
+          data: {
+            id: "session-1",
+            activeRunId: null,
+            status: "idle",
+            cwd: path.dirname(databasePath),
+            model: "test/mock",
+            profile: "reader",
+            reasoning: "high",
+            title: "Migrated",
+            inputTokens: null,
+            contextWindow: null,
+            queuedSteeringCount: 0,
+            createdAt: "2026-07-27T00:00:00.000Z",
+            updatedAt: "2026-07-27T00:00:00.000Z",
+          },
+        },
+      ]
+    : [];
   const firstUser = {
     id: "user-1",
     role: "user" as const,
@@ -148,7 +171,7 @@ function seedLegacyTranscripts(databasePath: string): {
   const firstAssistant = {
     id: "assistant-1",
     role: "assistant" as const,
-    parts: [{ type: "text" as const, text: "first answer" }],
+    parts: [...legacySessionParts, { type: "text" as const, text: "first answer" }],
   };
   const secondUser = {
     id: "user-2",
@@ -158,7 +181,7 @@ function seedLegacyTranscripts(databasePath: string): {
   const secondAssistant = {
     id: "assistant-2",
     role: "assistant" as const,
-    parts: [{ type: "text" as const, text: "second answer" }],
+    parts: [...legacySessionParts, { type: "text" as const, text: "second answer" }],
   };
   const modelMessages: ModelMessage[] = [
     { role: "user", content: "first" },
@@ -166,8 +189,8 @@ function seedLegacyTranscripts(databasePath: string): {
     { role: "user", content: "second" },
     { role: "assistant", content: "second answer" },
   ];
-  const uiMessages: MiniLilacUIMessage[] = [firstUser, firstAssistant, secondUser, secondAssistant];
-  const divergentUiPrefix: MiniLilacUIMessage[] = [
+  const uiMessages = [firstUser, firstAssistant, secondUser, secondAssistant];
+  const divergentUiPrefix = [
     firstUser,
     firstAssistant,
     {
@@ -204,7 +227,7 @@ function seedLegacyTranscripts(databasePath: string): {
     .query("INSERT INTO run_chunks (run_id, seq, chunk_json) VALUES ('run-2', 1, ?)")
     .run(serialize({ type: "text-delta", id: "legacy", delta: "discarded" }));
   database.close();
-  return { firstUser, secondUser, divergentUiPrefix, sharedModelPrefix };
+  return { firstUser, secondUser };
 }
 
 describe("MiniLilacSqliteStore transcript schema", () => {
@@ -251,6 +274,41 @@ describe("MiniLilacSqliteStore transcript schema", () => {
       canUndo: false,
       canRedo: false,
     });
+    store.close();
+  });
+
+  it("removes legacy session snapshots while migrating v2 transcript storage", async () => {
+    const { databasePath } = await createV2Database();
+    seedLegacyTranscripts(databasePath, { legacySessionParts: true });
+
+    const store = openStoreWithSuppressedMigrationWarning(databasePath);
+
+    expect(store.getUiMessages("session-1")).toEqual([
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "first" }],
+      },
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "first answer" }],
+      },
+      {
+        id: "user-2",
+        role: "user",
+        parts: [{ type: "text", text: "second" }],
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        parts: [{ type: "text", text: "second answer" }],
+      },
+    ]);
+    expect(store.database.query("PRAGMA user_version").get()).toEqual({
+      user_version: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
+    expect(store.database.query("PRAGMA foreign_key_check").all()).toEqual([]);
     store.close();
   });
 

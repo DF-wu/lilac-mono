@@ -22,7 +22,12 @@ import {
 } from "../../tools/subagent";
 import { BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS } from "../../surface/bridge/bus-agent-runner/tool-failure-logging";
 import { BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS } from "../../tools/tool-args-display";
-import { markBoundedBuiltinOutput, type CoreLevel1ToolSpec, type CoreToolPlugin } from "../types";
+import {
+  markAggregateOutputBudgetExempt,
+  markBoundedBuiltinOutput,
+  type CoreLevel1ToolSpec,
+  type CoreToolPlugin,
+} from "../types";
 
 type CoreToolBuildContext = Parameters<CoreLevel1ToolSpec["createTool"]>[0];
 
@@ -239,11 +244,13 @@ export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
         }).bash;
       },
     }),
-    withBuiltinMetadata({
-      name: "read_file",
-      isEnabled: () => true,
-      createTool: (context) => getFsReadOnlyTool("read_file", context),
-    }),
+    markAggregateOutputBudgetExempt(
+      withBoundedOutput({
+        name: "read_file",
+        isEnabled: () => true,
+        createTool: (context) => getFsReadOnlyTool("read_file", context),
+      }),
+    ),
     withBuiltinMetadata({
       name: "glob",
       isEnabled: (context) => context.requestContext?.safetyMode !== "restricted",

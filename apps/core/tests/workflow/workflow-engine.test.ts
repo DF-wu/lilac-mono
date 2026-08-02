@@ -562,117 +562,161 @@ describe("WorkflowEngine", () => {
     }
   });
 
-  it("reuses the complete durable model request for stale redispatch", async () => {
-    const dbPath = join(tmpdir(), `workflow-stale-policy-${crypto.randomUUID()}.sqlite`);
-    const store = new DurableWorkflowStore(dbPath);
-    const bus = createLilacBus(new CapturingRawBus());
-    createApprovedRun(
-      store,
-      "run-1",
-      {},
-      { operation: 10_000, result: 10_000 },
-      { kind: "detached" },
-      true,
-    );
-    let now = 10;
-    let firstDispatched = false;
-    let replacementResolutions = 0;
-    const recoveredPolicies: WorkflowRequestPolicy[] = [];
-    const source = workflowSource(
-      "agent",
-      'return await agent("durable request", { profile: "general" });',
-    );
-    const first = new WorkflowEngine({
-      bus,
-      store,
-      dataDir: dirname(dbPath),
-      subscriptionId: "stale-policy-first",
-      pollMs: 5,
-      now: () => now,
-      loadSnapshot: async () => source,
-      compileSource: compileTestWorkflow,
-      validateAgentSelection: () => ({
-        model: "provider/model-a",
-        reasoning: "high",
-        request: {
-          alias: "durable-alias",
+  it("refreshes or clears only fallbacks while preserving the pinned head on stale redispatch", async () => {
+    const scenarios = [
+      {
+        model: "changed-head-alias",
+        currentFallbacks: [
+          {
+            alias: "current-fallback",
+            spec: "provider/model-c",
+            provider: "provider",
+            modelId: "model-c",
+            providerOptions: { provider: { route: "current" } },
+            reasoning: "medium" as const,
+            responseCommentary: true,
+            anthropicPromptCache: true,
+            reasoningDisplay: "none" as const,
+          },
+        ],
+      },
+      { model: "removed-head-alias", currentFallbacks: [] },
+    ];
+
+    for (const scenario of scenarios) {
+      const dbPath = join(tmpdir(), `workflow-stale-policy-${crypto.randomUUID()}.sqlite`);
+      const store = new DurableWorkflowStore(dbPath);
+      const bus = createLilacBus(new CapturingRawBus());
+      createApprovedRun(
+        store,
+        "run-1",
+        {},
+        { operation: 10_000, result: 10_000 },
+        { kind: "detached" },
+        true,
+      );
+      let now = 10;
+      let firstDispatched = false;
+      let staleFullValidations = 0;
+      let staleFallbackResolutions = 0;
+      const recoveredPolicies: WorkflowRequestPolicy[] = [];
+      const source = workflowSource(
+        "agent",
+        `return await agent("durable request", { profile: "general", model: ${JSON.stringify(scenario.model)} });`,
+      );
+      const first = new WorkflowEngine({
+        bus,
+        store,
+        dataDir: dirname(dbPath),
+        subscriptionId: `stale-policy-first-${scenario.model}`,
+        pollMs: 5,
+        now: () => now,
+        loadSnapshot: async () => source,
+        compileSource: compileTestWorkflow,
+        validateAgentSelection: () => ({
+          model: "provider/model-a",
+          reasoning: "high",
+          request: {
+            alias: scenario.model,
+            spec: "provider/model-a",
+            provider: "provider",
+            modelId: "model-a",
+            reasoningDisplay: "detailed",
+            providerOptions: { provider: { route: "pinned" } },
+            reasoning: "high",
+            responseCommentary: true,
+            anthropicPromptCache: true,
+            fallbacks: [
+              {
+                spec: "provider/model-old-fallback",
+                provider: "provider",
+                modelId: "model-old-fallback",
+                reasoningDisplay: "detailed",
+              },
+            ],
+          },
+        }),
+        dispatchAgentRequest: async (request) => {
+          firstDispatched = true;
+          return await new Promise((resolve) => {
+            request.signal.addEventListener(
+              "abort",
+              () => resolve({ state: "cancelled", output: "", detail: "paused", usage: null }),
+              { once: true },
+            );
+          });
+        },
+      });
+      const replacement = new WorkflowEngine({
+        bus,
+        store,
+        dataDir: dirname(dbPath),
+        subscriptionId: `stale-policy-replacement-${scenario.model}`,
+        pollMs: 5,
+        now: () => now,
+        loadSnapshot: async () => source,
+        compileSource: compileTestWorkflow,
+        validateAgentSelection: () => {
+          staleFullValidations += 1;
+          throw new Error("stale dispatch must not validate the pinned head");
+        },
+        resolveAgentFallbacks: () => {
+          staleFallbackResolutions += 1;
+          return scenario.currentFallbacks;
+        },
+        dispatchAgentRequest: async (request) => {
+          recoveredPolicies.push(request.policy);
+          return { state: "failed", output: "", detail: "test complete", usage: null };
+        },
+      });
+      try {
+        await first.start();
+        await waitFor(() => firstDispatched);
+        const pinnedRun = store.getRun("run-1");
+        const pinnedOperation = store
+          .listOperations("run-1")
+          .find((operation) => operation.kind === "agent");
+        if (!pinnedRun || !pinnedOperation) throw new Error("initial workflow dispatch is missing");
+        const pinnedRequestId = pinnedOperation.requestId;
+        if (!pinnedRequestId) throw new Error("initial workflow request ID is missing");
+        expect(store.pauseRunAndChildren({ runId: "run-1", now: 11, detail: "pause" })?.state).toBe(
+          "paused",
+        );
+        await first.stop();
+        now = 40_100;
+        expect(store.transitionRun({ runId: "run-1", from: "paused", to: "queued", now })).toBe(
+          true,
+        );
+        await replacement.start();
+        await waitFor(() => recoveredPolicies.length > 0);
+        expect(staleFullValidations).toBe(0);
+        expect(staleFallbackResolutions).toBe(1);
+        expect(recoveredPolicies[0]?.resolvedModelRequest).toEqual({
+          alias: scenario.model,
           spec: "provider/model-a",
           provider: "provider",
           modelId: "model-a",
-          reasoningDisplay: "detailed",
           providerOptions: { provider: { route: "pinned" } },
           reasoning: "high",
           responseCommentary: true,
           anthropicPromptCache: true,
-        },
-      }),
-      dispatchAgentRequest: async (request) => {
-        firstDispatched = true;
-        return await new Promise((resolve) => {
-          request.signal.addEventListener(
-            "abort",
-            () => resolve({ state: "cancelled", output: "", detail: "paused", usage: null }),
-            { once: true },
-          );
+          reasoningDisplay: "detailed",
+          fallbacks: scenario.currentFallbacks,
         });
-      },
-    });
-    const replacement = new WorkflowEngine({
-      bus,
-      store,
-      dataDir: dirname(dbPath),
-      subscriptionId: "stale-policy-replacement",
-      pollMs: 5,
-      now: () => now,
-      loadSnapshot: async () => source,
-      compileSource: compileTestWorkflow,
-      validateAgentSelection: () => {
-        replacementResolutions += 1;
-        return {
-          model: "provider/model-b",
-          reasoning: "low",
-          request: {
-            spec: "provider/model-b",
-            provider: "provider",
-            modelId: "model-b",
-            reasoningDisplay: "none",
-          },
-        };
-      },
-      dispatchAgentRequest: async (request) => {
-        recoveredPolicies.push(request.policy);
-        return { state: "failed", output: "", detail: "test complete", usage: null };
-      },
-    });
-    try {
-      await first.start();
-      await waitFor(() => firstDispatched);
-      expect(store.pauseRunAndChildren({ runId: "run-1", now: 11, detail: "pause" })?.state).toBe(
-        "paused",
-      );
-      await first.stop();
-      now = 40_100;
-      expect(store.transitionRun({ runId: "run-1", from: "paused", to: "queued", now })).toBe(true);
-      await replacement.start();
-      await waitFor(() => recoveredPolicies.length > 0);
-      expect(replacementResolutions).toBe(0);
-      expect(recoveredPolicies[0]?.resolvedModelRequest).toEqual({
-        alias: "durable-alias",
-        spec: "provider/model-a",
-        provider: "provider",
-        modelId: "model-a",
-        providerOptions: { provider: { route: "pinned" } },
-        reasoning: "high",
-        responseCommentary: true,
-        anthropicPromptCache: true,
-        reasoningDisplay: "detailed",
-      });
-    } finally {
-      await replacement.stop();
-      await first.stop();
-      await bus.close();
-      store.close();
-      rmSync(dbPath, { force: true });
+        const recoveredRun = store.getRun("run-1");
+        const recoveredOperation = store.getOperation("run-1", pinnedOperation.operationId);
+        expect(recoveredRun?.revisionId).toBe(pinnedRun.revisionId);
+        expect(recoveredRun?.argsSha256).toBe(pinnedRun.argsSha256);
+        expect(recoveredOperation?.operationId).toBe(pinnedOperation.operationId);
+        expect(recoveredOperation?.inputSha256).toBe(pinnedOperation.inputSha256);
+        expect(recoveredOperation?.requestId).toBe(pinnedRequestId);
+      } finally {
+        await replacement.stop();
+        await first.stop();
+        await bus.close();
+        store.close();
+        rmSync(dbPath, { force: true });
+      }
     }
   });
 
@@ -1002,6 +1046,7 @@ describe("WorkflowEngine", () => {
         childSessionId: "child-session",
         profile: "explore",
         sessionName: "crash-test",
+        stableNamedContinuation: true,
         depth: 1,
         reasoning: null,
         fallbackToSurface: false,
@@ -1054,6 +1099,10 @@ describe("WorkflowEngine", () => {
         platform: "unknown",
       });
       if (!authorized) throw new Error("Workflow command was not authorized");
+      expect(authorized.policy.stableNamedContinuation).toEqual({
+        sessionId: "child-session",
+        requestClient: "discord",
+      });
       expect(
         store.claimWorkflowRequest({
           requestId,

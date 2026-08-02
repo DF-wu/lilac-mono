@@ -8,6 +8,7 @@ import type { Message, Update } from "grammy/types";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 
+import { SurfaceMessageNotFoundError } from "../../../src/surface/adapter";
 import {
   buildTelegramActionKeyboard,
   TelegramAdapter,
@@ -167,6 +168,20 @@ describe("telegram adapter against a fake Bot API", () => {
       inline_keyboard: [[{ text: "Pause", callback_data: "pause-token" }]],
     });
 
+    const actionOnlyEdit = {
+      text: "**Queued**",
+      format: "markdown" as const,
+      actions: [{ actionId: "resume-token", label: "Resume", style: "primary" as const }],
+    };
+    await a.editMsg(ref, actionOnlyEdit);
+    expect(server.editablePayloadOf(Number(ref.messageId))).toMatchObject({
+      text: "<b>Queued</b>",
+      reply_markup: {
+        inline_keyboard: [[{ text: "Resume", callback_data: "resume-token" }]],
+      },
+    });
+    await expect(a.editMsg(ref, actionOnlyEdit)).resolves.toBeUndefined();
+
     await a.editMsg(ref, {
       text: "**Paused**",
       format: "markdown",
@@ -185,6 +200,35 @@ describe("telegram adapter against a fake Bot API", () => {
     expect(server.callsOf("editMessageText").at(-1)?.params.reply_markup).toEqual({
       inline_keyboard: [],
     });
+  });
+
+  it("tombstones the local cache when a direct edit confirms remote deletion", async () => {
+    const { adapter: a } = await connectAdapter({});
+    const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
+    const ref = await a.sendMsg(sessionRef, { text: "locally cached" });
+
+    expect(server.removeMessage(Number(ref.messageId))).toBe(true);
+    expect(await a.readMsg(ref)).not.toBeNull();
+    await expect(a.editMsg(ref, { text: "remote probe" })).rejects.toBeInstanceOf(
+      SurfaceMessageNotFoundError,
+    );
+    expect(await a.readMsg(ref)).toBeNull();
+  });
+
+  it("keeps a locally cached message when Telegram only says it cannot be edited", async () => {
+    const { adapter: a } = await connectAdapter({});
+    const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;
+    const ref = await a.sendMsg(sessionRef, { text: "still exists" });
+    server.failNext("editMessageText", {
+      errorCode: 400,
+      description: "Bad Request: message can't be edited",
+    });
+
+    await expect(a.editMsg(ref, { text: "not editable" })).rejects.toBeInstanceOf(
+      SurfaceMessageNotFoundError,
+    );
+    expect((await a.readMsg(ref))?.text).toBe("still exists");
+    expect(server.textOf(Number(ref.messageId))).toBe("still exists");
   });
 
   it("omits action ids that exceed Telegram's callback_data byte limit", () => {
@@ -573,7 +617,8 @@ describe("telegram adapter against a fake Bot API", () => {
     await a.editMsg(ref, { text: "hello again" });
     await a.deleteMsg(ref);
 
-    expect(server.textOf(Number(ref.messageId))).toBe("hello again");
+    expect(server.textOf(Number(ref.messageId))).toBeUndefined();
+    expect(await a.readMsg(ref)).toBeNull();
     expect(server.callsOf("deleteMessage")).toHaveLength(1);
   });
 

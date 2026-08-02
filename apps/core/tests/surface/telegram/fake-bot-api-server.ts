@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { z } from "zod";
 
 import type { Message, Update } from "grammy/types";
@@ -179,6 +181,27 @@ const editMessageTextSchema = z.object({
   text: z.string(),
 });
 
+const deleteMessageSchema = z.object({
+  chat_id: z.union([z.number(), z.string()]),
+  message_id: z.number(),
+});
+
+const editableMessagePayloadSchema = z.object({
+  text: z.string(),
+  parse_mode: z.string().optional(),
+  entities: z.array(z.unknown()).optional(),
+  link_preview_options: z.unknown().optional(),
+  disable_web_page_preview: z.boolean().optional(),
+  reply_markup: z.unknown().optional(),
+});
+
+type EditableMessagePayload = z.infer<typeof editableMessagePayloadSchema>;
+
+type StoredMessage = {
+  readonly chatId: number;
+  readonly editablePayload: EditableMessagePayload | null;
+};
+
 const getUpdatesSchema = z.object({
   offset: z.number().optional(),
 });
@@ -196,8 +219,8 @@ export class FakeBotApiServer {
   private readonly calls: RecordedCall[] = [];
   private readonly pending: Update[] = [];
   private readonly failures = new Map<string, ProgrammedFailure[]>();
-  /** message_id -> current text, so edits can be asserted against. */
-  private readonly sentText = new Map<number, string>();
+  /** Remote message state, including existence and all text-editable fields. */
+  private readonly messages = new Map<number, StoredMessage>();
 
   private nextUpdateId = 1;
   private nextMessageId = 1000;
@@ -282,7 +305,16 @@ export class FakeBotApiServer {
   }
 
   textOf(messageId: number): string | undefined {
-    return this.sentText.get(messageId);
+    return this.messages.get(messageId)?.editablePayload?.text;
+  }
+
+  editablePayloadOf(messageId: number): EditableMessagePayload | undefined {
+    return this.messages.get(messageId)?.editablePayload ?? undefined;
+  }
+
+  /** Simulates a user deleting a message without notifying the adapter. */
+  removeMessage(messageId: number): boolean {
+    return this.messages.delete(messageId);
   }
 
   // --- transport ------------------------------------------------------------
@@ -316,8 +348,12 @@ export class FakeBotApiServer {
     try {
       return Response.json({ ok: true, result: await this.dispatch(method, params) });
     } catch (error: unknown) {
-      if (error instanceof UnmodifiedEditError) {
-        return Response.json({ ok: false, error_code: 400, description: error.message });
+      if (error instanceof FakeBotApiError) {
+        return Response.json({
+          ok: false,
+          error_code: error.errorCode,
+          description: error.message,
+        });
       }
       throw error;
     }
@@ -348,7 +384,7 @@ export class FakeBotApiServer {
         return this.editMessageText(params);
 
       case "deleteMessage":
-        return true;
+        return this.deleteMessage(params);
 
       case "getFile":
         return { file_id: "f", file_unique_id: "u", file_path: "photos/file_0.jpg" };
@@ -397,8 +433,6 @@ export class FakeBotApiServer {
     const text = (parsed.success ? parsed.data.text : undefined) ?? "";
     const threadId = parsed.success ? parsed.data.message_thread_id : undefined;
 
-    if (method === "sendMessage") this.sentText.set(messageId, text);
-
     const message = {
       message_id: messageId,
       date: Math.floor(Date.now() / 1000),
@@ -408,7 +442,14 @@ export class FakeBotApiServer {
       ...(method === "sendMessage" ? { text } : {}),
     };
 
-    return message as Message;
+    const typedMessage = message as Message;
+    const editablePayload =
+      method === "sendMessage" ? editableMessagePayloadSchema.safeParse(params) : null;
+    this.messages.set(messageId, {
+      chatId,
+      editablePayload: editablePayload?.success ? editablePayload.data : null,
+    });
+    return typedMessage;
   }
 
   private editMessageText(params: Record<string, unknown>): Message | true {
@@ -416,24 +457,48 @@ export class FakeBotApiServer {
     if (!parsed.success) return true;
 
     const { message_id: messageId, text } = parsed.data;
-    if (this.sentText.get(messageId) === text) {
-      // Mirror the real API, which rejects an unchanged edit outright.
-      throw new UnmodifiedEditError();
+    const existing = this.messages.get(messageId);
+    if (!existing || existing.chatId !== Number(parsed.data.chat_id)) {
+      throw new FakeBotApiError(400, "Bad Request: message to edit not found");
     }
-    this.sentText.set(messageId, text);
+    const editablePayload = editableMessagePayloadSchema.safeParse(params);
+    if (!editablePayload.success) return true;
+    if (isDeepStrictEqual(existing.editablePayload, editablePayload.data)) {
+      // Mirror the real API, which rejects an unchanged edit outright.
+      throw new FakeBotApiError(400, "Bad Request: message is not modified");
+    }
 
-    return {
+    const message = {
       message_id: messageId,
       date: Math.floor(Date.now() / 1000),
       chat: { id: Number(parsed.data.chat_id), type: "private", first_name: "Ada" },
       text,
     } as Message;
+    this.messages.set(messageId, {
+      chatId: existing.chatId,
+      editablePayload: editablePayload.data,
+    });
+    return message;
+  }
+
+  private deleteMessage(params: Record<string, unknown>): true {
+    const parsed = deleteMessageSchema.safeParse(params);
+    if (!parsed.success) return true;
+    const existing = this.messages.get(parsed.data.message_id);
+    if (!existing || existing.chatId !== Number(parsed.data.chat_id)) {
+      throw new FakeBotApiError(400, "Bad Request: message to delete not found");
+    }
+    this.messages.delete(parsed.data.message_id);
+    return true;
   }
 }
 
-class UnmodifiedEditError extends Error {
-  constructor() {
-    super("Bad Request: message is not modified");
-    this.name = "UnmodifiedEditError";
+class FakeBotApiError extends Error {
+  constructor(
+    readonly errorCode: number,
+    description: string,
+  ) {
+    super(description);
+    this.name = "FakeBotApiError";
   }
 }

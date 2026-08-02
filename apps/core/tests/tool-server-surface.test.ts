@@ -362,15 +362,48 @@ describe("tool-server surface", () => {
     ).rejects.toThrow("Telegram adapter is unavailable");
   });
 
-  it("uses the authenticated Telegram principal when workflow requestClient is unknown", async () => {
+  it("uses the server-issued Telegram origin for workflow surface defaults and checks", async () => {
+    const baseCfg = testConfig({});
+    const cfg: CoreConfig = {
+      ...baseCfg,
+      surface: {
+        ...baseCfg.surface,
+        telegram: {
+          ...baseCfg.surface.telegram,
+          enabled: true,
+          allowedChatIds: ["-100123"],
+        },
+      },
+    };
     const adapter = new FakeAdapter([], {});
-    const tool = new Surface({ adapter, config: testConfig({}) });
+    const telegramAdapter = new FakeTelegramToolAdapter([], {});
+    const tool = new Surface({
+      adapter,
+      adapters: new Map([
+        ["discord", adapter],
+        ["telegram", telegramAdapter],
+      ]),
+      config: cfg,
+    });
     const context = {
       requestClient: "unknown",
       sessionId: "workflow:run-1:operation-1",
+      originSessionId: "-100123:7",
       authenticatedPrincipal: { platform: "telegram" as const, userId: "user-7" },
     } satisfies RequestContext;
 
+    await tool.call("surface.messages.send", { text: "origin-default" }, { context });
+    expect(telegramAdapter.sendCalls.at(-1)?.sessionRef).toEqual({
+      platform: "telegram",
+      channelId: "-100123:7",
+    });
+    await expect(
+      tool.call(
+        "surface.messages.send",
+        { sessionId: "-100123:8", text: "cross-topic" },
+        { context },
+      ),
+    ).rejects.toThrow("Not allowed: Telegram sessionId '-100123:8'");
     await expect(
       tool.call(
         "surface.messages.send",
@@ -2584,6 +2617,7 @@ describe("tool-server surface", () => {
 
     const githubApi: GithubSurfaceApi = {
       getIssue: async () => ({
+        id: 12,
         title: "t",
         body: "b",
         user: { login: "alice", id: 1 },

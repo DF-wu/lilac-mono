@@ -208,6 +208,7 @@ export type SubagentDelegationRegistration = {
   mode: SubagentMode;
   profile: SubagentProfile;
   sessionName: string;
+  stableNamedContinuation: true;
   task: string;
   idleTimeoutMs: number;
   depth: number;
@@ -319,6 +320,7 @@ export function subagentTools(params: {
 
         const idleTimeoutMs = params.idleTimeoutMs;
         const sessionName = parsed.sessionName ?? generateSessionName(profile);
+        const stableNamedContinuation = true as const;
         const childRequestId = `sub:${ctx.requestId}:${crypto.randomUUID()}`;
         const childSessionId = `sub:${ctx.sessionId}:named:${sessionName}`;
 
@@ -346,6 +348,7 @@ export function subagentTools(params: {
           parentDepth: depth,
           childDepth: depth + 1,
           sessionName,
+          stableNamedContinuation,
           idleTimeoutMs,
           task: truncateEnd(parsed.task.replace(/\s+/g, " ").trim(), 240),
           modelOverride: parsed.model,
@@ -360,6 +363,7 @@ export function subagentTools(params: {
           mode,
           profile,
           sessionName,
+          stableNamedContinuation,
           task: parsed.task,
           idleTimeoutMs,
           depth: depth + 1,

@@ -181,6 +181,23 @@ export function classifyTelegramNotFound(error: unknown): SurfaceMessageNotFound
     : null;
 }
 
+function isTelegramMessageAbsent(error: unknown): boolean {
+  if (!(error instanceof GrammyError)) return false;
+  const description = error.description.toLowerCase();
+  return (
+    description.includes("message to edit not found") ||
+    description.includes("message to delete not found") ||
+    description.includes("message not found")
+  );
+}
+
+function isTelegramMessageNotModified(error: unknown): boolean {
+  return (
+    error instanceof GrammyError &&
+    error.description.toLowerCase().includes("message is not modified")
+  );
+}
+
 /**
  * Whether a polling exit can ever succeed on a retry.
  *
@@ -649,8 +666,14 @@ export class TelegramAdapter implements SurfaceAdapter {
       );
       if (edited !== true) this.recordMessage(edited, { fromBot: true });
     } catch (error: unknown) {
+      if (isTelegramMessageNotModified(error)) return;
       const notFound = classifyTelegramNotFound(error);
-      if (notFound) throw notFound;
+      if (notFound) {
+        if (isTelegramMessageAbsent(error)) {
+          this.store?.markDeleted({ sessionId: msgRef.channelId, messageId: msgRef.messageId });
+        }
+        throw notFound;
+      }
       throw error;
     }
   }
@@ -663,7 +686,12 @@ export class TelegramAdapter implements SurfaceAdapter {
       await bot.api.deleteMessage(chatIdOf(msgRef), parseTelegramMessageId(msgRef.messageId));
     } catch (error: unknown) {
       const notFound = classifyTelegramNotFound(error);
-      if (notFound) throw notFound;
+      if (notFound) {
+        if (isTelegramMessageAbsent(error)) {
+          this.store?.markDeleted({ sessionId: msgRef.channelId, messageId: msgRef.messageId });
+        }
+        throw notFound;
+      }
       throw error;
     }
 

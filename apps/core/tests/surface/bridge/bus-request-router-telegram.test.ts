@@ -11,6 +11,10 @@ import {
 } from "@stanley2058/lilac-event-bus";
 
 import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
+import type {
+  RouterGateDecision,
+  RouterGateInput,
+} from "../../../src/surface/bridge/bus-request-router/gate";
 import type { SurfaceAdapter, SurfaceOutputStream } from "../../../src/surface/adapter";
 import type {
   AdapterCapabilities,
@@ -106,6 +110,9 @@ class FakeTelegramAdapter implements SurfaceAdapter {
     throw new Error("not implemented");
   }
   async readMsg(msgRef: MsgRef): Promise<SurfaceMessage | null> {
+    if (msgRef.platform !== "telegram") {
+      throw new Error(`expected telegram ref, received ${msgRef.platform}`);
+    }
     return this.messages[`${msgRef.channelId}:${msgRef.messageId}`] ?? null;
   }
   async listMsg(sessionRef: SessionRef, opts?: LimitOpts): Promise<SurfaceMessage[]> {
@@ -137,7 +144,12 @@ class FakeTelegramAdapter implements SurfaceAdapter {
  * Discord and Telegram deliberately carry different bot names here, so any path
  * that silently falls back to the Discord identity fails these tests.
  */
-function routerConfig(): Record<string, unknown> {
+function routerConfig(
+  input: {
+    defaultMode?: "active" | "mention";
+    sessionModes?: Record<string, { mode: "active" | "mention"; gate?: boolean }>;
+  } = {},
+): Record<string, unknown> {
   return {
     configVersion: 2,
     surface: {
@@ -149,8 +161,8 @@ function routerConfig(): Record<string, unknown> {
         allowedChatIds: [CHAT],
       },
       router: {
-        defaultMode: "active",
-        sessionModes: {},
+        defaultMode: input.defaultMode ?? "active",
+        sessionModes: input.sessionModes ?? {},
         activeDebounceMs: 1,
         activeGate: { enabled: false, timeoutMs: 2500 },
       },
@@ -189,7 +201,13 @@ function telegramRaw(overrides: Record<string, unknown> = {}) {
   };
 }
 
-async function startRouter(adapter: SurfaceAdapter) {
+async function startRouter(
+  adapter: SurfaceAdapter,
+  opts: {
+    config?: Record<string, unknown>;
+    routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
+  } = {},
+) {
   const bus = createLilacBus(createInMemoryRawBus());
   const published: Array<Message<unknown>> = [];
 
@@ -207,7 +225,8 @@ async function startRouter(adapter: SurfaceAdapter) {
     bus,
     platform: "telegram",
     subscriptionId: "telegram-router-test",
-    config: routerConfig(),
+    config: opts.config ?? routerConfig(),
+    routerGate: opts.routerGate,
   });
 
   return { bus, published, router };
@@ -307,6 +326,34 @@ describe("the shared router serving the telegram surface", () => {
     }
   });
 
+  it("ignores lifecycle state owned by another platform", async () => {
+    const adapter = new FakeTelegramAdapter({
+      [`${CHAT}:10`]: surfaceMessage({ messageId: "10", text: "mine" }),
+    });
+    const { bus, published, router } = await startRouter(adapter);
+
+    try {
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state: "running" },
+        {
+          headers: {
+            request_id: `discord:${CHAT}:foreign`,
+            session_id: CHAT,
+            request_client: "discord",
+          },
+        },
+      );
+      await publishTelegramMessage(bus, { messageId: "10", text: "mine" });
+      const msg = await waitForPublish(published);
+
+      expect(msg.headers?.request_id).toBe(`telegram:${CHAT}:10`);
+      expect(msg.headers?.request_client).toBe("telegram");
+    } finally {
+      await router.stop();
+    }
+  });
+
   it("parses a leading model override against the telegram name, not the discord one", async () => {
     // The directive only parses once the leading @handle is recognised as this
     // bot, so a Discord-name fallback would make this return undefined.
@@ -388,6 +435,55 @@ describe("the shared router serving the telegram surface", () => {
 
       const data = msg.data as { messages: Array<{ content: unknown }> };
       expect(JSON.stringify(data.messages)).toContain("the earlier answer worth remembering");
+    } finally {
+      await router.stop();
+    }
+  });
+
+  it("passes Telegram replied-to text into the direct-reply gate", async () => {
+    const repliedTo = surfaceMessage({
+      messageId: "9",
+      text: "the Telegram bot answer",
+      userId: TELEGRAM_BOT_ID,
+    });
+    const trigger = surfaceMessage({
+      messageId: "10",
+      text: "@otherbot what do you think?",
+      raw: telegramRaw({
+        messageId: "10",
+        isDMBased: false,
+        mentionsBot: false,
+        replyToBot: true,
+        replyToMessageId: "9",
+      }),
+    });
+    const adapter = new FakeTelegramAdapter({
+      [`${CHAT}:9`]: repliedTo,
+      [`${CHAT}:10`]: trigger,
+    });
+    const gateInputs: RouterGateInput[] = [];
+    const config = routerConfig({
+      defaultMode: "mention",
+      sessionModes: { [CHAT]: { mode: "mention", gate: true } },
+    });
+    const { bus, published, router } = await startRouter(adapter, {
+      config,
+      routerGate: async (input) => {
+        gateInputs.push(input);
+        return { forward: false, reason: "addressed-to-peer" };
+      },
+    });
+
+    try {
+      await publishTelegramMessage(bus, {
+        messageId: "10",
+        text: trigger.text,
+        raw: trigger.raw as Record<string, unknown>,
+      });
+
+      expect(published).toHaveLength(0);
+      expect(gateInputs[0]?.context?.mode).toBe("direct-reply-mention-disambiguation");
+      expect(gateInputs[0]?.context?.repliedToMessageText).toContain("Telegram bot answer");
     } finally {
       await router.stop();
     }

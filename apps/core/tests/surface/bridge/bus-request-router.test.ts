@@ -390,20 +390,22 @@ describe("startBusRequestRouter", () => {
     const evt = received[0];
     expect(evt.data.queue).toBe("prompt");
 
-    // Should include the replied-to root plus the merged user burst.
-    expect(evt.data.messages.length).toBe(2);
+    // Keep the replied-to root and historical burst, then isolate the current trigger.
+    expect(evt.data.messages.length).toBe(3);
 
     const rootText = evt.data.messages[0].content;
     const mergedText = evt.data.messages[1].content;
+    const currentText = evt.data.messages[2].content;
 
     expect(typeof rootText).toBe("string");
     expect(typeof mergedText).toBe("string");
+    expect(typeof currentText).toBe("string");
 
     expect(rootText).toContain("Root");
     expect(mergedText).toContain("user msg 1");
     expect(mergedText).toContain("user msg 2");
-    expect(mergedText).toContain("user msg 3");
-    expect(mergedText).toContain("<@bot>");
+    expect(currentText).toContain("user msg 3");
+    expect(currentText).toContain("<@bot>");
 
     expect(evt.data.raw?.chainMessageIds).toContain("root");
     expect(evt.data.raw?.chainMessageIds).toContain("m1");
@@ -540,6 +542,12 @@ describe("startBusRequestRouter", () => {
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
+    expect(received[0].data.corePrimaryLineage).toEqual({
+      state: "fresh-only",
+      lineageVersion: 1,
+      currentCanonicalStart: 1,
+      reason: "projection-store-unavailable",
+    });
     expect(received[0].headers?.request_id).toBe(`discord:${sessionId}:${msgId}`);
     expect(received[0].data.messages.length).toBe(2);
     expect(received[0].data.messages[0].role).toBe("assistant");
@@ -2750,6 +2758,7 @@ describe("startBusRequestRouter", () => {
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("followUp");
+    expect(received[0].data.corePrimaryLineage?.state).toBe("fresh-only");
     expect(received[0].headers?.request_id).toBe(requestId);
 
     await sub.stop();

@@ -1,0 +1,686 @@
+import { isDeepStrictEqual } from "node:util";
+
+import type { ModelMessage } from "ai";
+import {
+  hashCanonicalMessagesV1,
+  preparePlainTextReplayForTarget,
+  type HistoryProviderState,
+  type PrepareModelCall,
+} from "@stanley2058/lilac-agent";
+import {
+  ClaudeAttemptRuntimeOwner,
+  ClaudeNativeSessionPreflightError,
+  type ClaudeNativeSessionStart,
+  type MaterializedClaudeCodeRun,
+} from "@stanley2058/lilac-claude-code-bridge";
+import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
+
+import {
+  computeCorePrimaryClaudeTerminalHead,
+  type CorePrimaryClaudeSessionAttempt,
+  type CorePrimaryClaudeSessionBinding,
+  type TranscriptSnapshot,
+  type TranscriptStore,
+} from "../../../transcript/transcript-store";
+
+const TEXT_REPLAY_TOOL_INPUT_CHARS = 20_000;
+const TEXT_REPLAY_TOOL_RESULT_CHARS = 40_000;
+
+type CorePrimaryContinuationStore = Required<
+  Pick<
+    TranscriptStore,
+    | "getCorePrimaryClaudeSessionBinding"
+    | "getCorePrimaryLineageManifest"
+    | "getRequestTranscript"
+    | "getCorePrimaryClaudeSessionAttempt"
+    | "reserveCorePrimaryClaudeSessionAttempt"
+    | "recordCorePrimaryClaudeSessionAttemptOutcome"
+    | "publishCorePrimaryClaudeSuccess"
+    | "promoteCorePrimaryClaudeSessionBinding"
+  >
+>;
+
+export type CorePrimaryPrefixSelection =
+  | { readonly mode: "fork"; readonly canonicalEnd: number }
+  | {
+      readonly mode: "fresh";
+      readonly reason:
+        | "fresh-only"
+        | "missing-binding"
+        | "lineage-version-mismatch"
+        | "atom-count-unreachable"
+        | "missing-suffix"
+        | "prefix-digest-mismatch"
+        | "canonical-count-mismatch"
+        | "pre-input-head-mismatch"
+        | "scope-mismatch"
+        | "native-cwd-mismatch"
+        | "canonical-alignment-mismatch";
+    };
+
+export type CorePrimaryClaudeRuntime = {
+  readonly prepareModelCall: PrepareModelCall;
+  prepareFullBudgetView(
+    canonicalMessages: readonly ModelMessage[],
+    canonicalStartIndex?: number,
+  ): ModelMessage[];
+  prepareHistoryView(canonicalMessages: readonly ModelMessage[]): ModelMessage[];
+  inputEstimateFloor(input: {
+    readonly canonicalMessages: readonly ModelMessage[];
+    readonly overlay: readonly ModelMessage[];
+    readonly estimateMessagesTokens: (messages: readonly ModelMessage[]) => number;
+  }): number | null;
+  recordSuccessfulModelCall(canonicalMessages: readonly ModelMessage[]): Promise<void>;
+  retireForRetry(): Promise<void>;
+  retireForCanonicalReplacement(): Promise<void>;
+  finalize(input: {
+    readonly terminalTranscript: TranscriptSnapshot;
+    readonly canonicalMessages: readonly ModelMessage[];
+    readonly providerState: HistoryProviderState;
+    readonly isCancellationRequested: () => boolean;
+  }): Promise<boolean>;
+  markTerminalFailure(cancelled: boolean): void;
+  markUncertain(): void;
+  retireAtRunEnd(): Promise<void>;
+  currentRun(): MaterializedClaudeCodeRun | null;
+};
+
+export function supportsCorePrimaryContinuationStore(
+  store: TranscriptStore,
+): store is TranscriptStore & CorePrimaryContinuationStore {
+  return (
+    typeof store.getCorePrimaryClaudeSessionBinding === "function" &&
+    typeof store.getCorePrimaryLineageManifest === "function" &&
+    typeof store.getRequestTranscript === "function" &&
+    typeof store.getCorePrimaryClaudeSessionAttempt === "function" &&
+    typeof store.reserveCorePrimaryClaudeSessionAttempt === "function" &&
+    typeof store.recordCorePrimaryClaudeSessionAttemptOutcome === "function" &&
+    typeof store.publishCorePrimaryClaudeSuccess === "function" &&
+    typeof store.promoteCorePrimaryClaudeSessionBinding === "function"
+  );
+}
+
+export function selectCorePrimaryClaudePrefix(input: {
+  readonly lineage: CorePrimaryLineageV1 | undefined;
+  readonly canonicalMessages: readonly ModelMessage[];
+  readonly binding: CorePrimaryClaudeSessionBinding | null;
+  readonly executionScopeHash: string;
+  readonly executionCwd: string;
+}): CorePrimaryPrefixSelection {
+  if (input.lineage?.state !== "complete") return { mode: "fresh", reason: "fresh-only" };
+  const binding = input.binding;
+  if (!binding) return { mode: "fresh", reason: "missing-binding" };
+  if (binding.lineageVersion !== input.lineage.lineageVersion) {
+    return { mode: "fresh", reason: "lineage-version-mismatch" };
+  }
+  const segment = input.lineage.segments.find(
+    (candidate) => candidate.cumulativeAtomCount === binding.atomCount,
+  );
+  if (!segment) return { mode: "fresh", reason: "atom-count-unreachable" };
+  if (segment.cumulativePrefixDigest !== binding.prefixDigest) {
+    return { mode: "fresh", reason: "prefix-digest-mismatch" };
+  }
+  if (segment.canonicalEnd !== binding.canonicalMessageCount) {
+    return { mode: "fresh", reason: "canonical-count-mismatch" };
+  }
+  if (segment.canonicalEnd !== input.lineage.currentCanonicalStart) {
+    return { mode: "fresh", reason: "pre-input-head-mismatch" };
+  }
+  if (
+    binding.executionScopeHashVersion !== 1 ||
+    binding.executionScopeHash !== input.executionScopeHash
+  ) {
+    return { mode: "fresh", reason: "scope-mismatch" };
+  }
+  if (binding.nativeCwd !== input.executionCwd) {
+    return { mode: "fresh", reason: "native-cwd-mismatch" };
+  }
+  if (
+    !isDeepStrictEqual(
+      input.lineage.segments.flatMap((candidate) => candidate.canonicalMessages),
+      input.canonicalMessages,
+    )
+  ) {
+    return { mode: "fresh", reason: "canonical-alignment-mismatch" };
+  }
+  return { mode: "fork", canonicalEnd: segment.canonicalEnd };
+}
+
+export function shouldReplayCorePrimaryHistory(input: {
+  readonly lineage: CorePrimaryLineageV1 | undefined;
+  readonly historicalEnd: number;
+  readonly store: Pick<TranscriptStore, "getRequestTranscript">;
+  readonly targetFamily: "claude-code" | "ai-sdk";
+}): boolean {
+  if (input.historicalEnd <= 0) return false;
+  if (input.lineage?.state !== "complete") return true;
+  for (const segment of input.lineage.segments) {
+    if (segment.canonicalStart >= input.historicalEnd) break;
+    const atom = segment.atoms[0];
+    if (atom?.kind === "request") {
+      if (atom.providerFamily !== input.targetFamily || atom.containsCrossFamilyTurns) return true;
+      continue;
+    }
+    if (atom?.kind === "checkpoint") {
+      const state = input.store.getRequestTranscript?.({
+        requestId: atom.requestId,
+      })?.providerState;
+      if (!state || state.lastFamily !== input.targetFamily || state.containsCrossFamilyTurns) {
+        return true;
+      }
+      continue;
+    }
+    if (
+      segment.canonicalMessages.some(
+        (message) => message.role === "assistant" || message.role === "tool",
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function prepareCorePrimaryHistoryView(input: {
+  readonly canonicalMessages: readonly ModelMessage[];
+  readonly lineage: CorePrimaryLineageV1 | undefined;
+  readonly replayHistoricalPrefix: boolean;
+  readonly targetFamily: "claude-code" | "ai-sdk";
+  readonly modelSpecifier: string;
+  readonly canonicalStartIndex?: number;
+}): ModelMessage[] {
+  if (!input.replayHistoricalPrefix) return [...input.canonicalMessages];
+  const historicalEnd = Math.max(
+    0,
+    Math.min(
+      input.canonicalMessages.length,
+      (input.lineage?.currentCanonicalStart ?? 0) - (input.canonicalStartIndex ?? 0),
+    ),
+  );
+  return [
+    ...preparePlainTextReplayForTarget(input.canonicalMessages.slice(0, historicalEnd), {
+      providerFamily: input.targetFamily,
+      modelSpecifier: input.modelSpecifier,
+      maxToolInputChars: TEXT_REPLAY_TOOL_INPUT_CHARS,
+      maxToolResultChars: TEXT_REPLAY_TOOL_RESULT_CHARS,
+    }),
+    ...input.canonicalMessages.slice(historicalEnd),
+  ];
+}
+
+function lineageFingerprint(lineage: CorePrimaryLineageV1 | undefined): string {
+  if (!lineage) return "missing";
+  if (lineage.state === "fresh-only") return `fresh-only:${lineage.reason}`;
+  const last = lineage.segments[lineage.segments.length - 1];
+  return last
+    ? `complete:${lineage.currentCanonicalStart}:${last.cumulativeAtomCount}:${last.cumulativePrefixDigest}:${last.canonicalEnd}`
+    : "complete:empty";
+}
+
+export function createCorePrimaryClaudeRuntime(input: {
+  readonly store: CorePrimaryContinuationStore;
+  readonly sessionId: string;
+  readonly requestId: string;
+  readonly providerId: string;
+  readonly modelSpecifier: string;
+  readonly reasoning: string;
+  readonly executionScopeHash: string;
+  readonly executionCwd: string;
+  readonly getLineage: () => CorePrimaryLineageV1 | undefined;
+  readonly materialize: (start: ClaudeNativeSessionStart) => Promise<MaterializedClaudeCodeRun>;
+  readonly onDiagnostic?: (event: string, detail: Readonly<Record<string, unknown>>) => void;
+}): CorePrimaryClaudeRuntime {
+  const sourceBinding = input.store.getCorePrimaryClaudeSessionBinding({
+    providerId: input.providerId,
+    requestClient: "discord",
+    lilacSessionId: input.sessionId,
+  });
+  let selectedPayload: { readonly mode: "full" | "suffix"; readonly fresh: boolean } | null = null;
+  let currentAttempt: CorePrimaryClaudeSessionAttempt | null = null;
+  let currentAttemptLineageFingerprint: string | null = null;
+  const diagnostic = (event: string, detail: Readonly<Record<string, unknown>> = {}) =>
+    input.onDiagnostic?.(event, {
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      requestClient: "discord",
+      providerId: input.providerId,
+      model: input.modelSpecifier,
+      reasoning: input.reasoning,
+      bindingHead: sourceBinding?.prefixDigest ?? null,
+      bindingRevision: sourceBinding?.revision ?? null,
+      ...detail,
+    });
+
+  const selectionFor = (canonicalMessages: readonly ModelMessage[]) =>
+    selectCorePrimaryClaudePrefix({
+      lineage: input.getLineage(),
+      canonicalMessages,
+      binding: sourceBinding,
+      executionScopeHash: input.executionScopeHash,
+      executionCwd: input.executionCwd,
+    });
+
+  const recordAttemptOutcome = (state: "failed" | "cancelled" | "uncertain"): void => {
+    const attempt = currentAttempt;
+    if (!attempt) return;
+    input.store.recordCorePrimaryClaudeSessionAttemptOutcome({
+      providerId: input.providerId,
+      requestClient: "discord",
+      lilacSessionId: input.sessionId,
+      requestId: input.requestId,
+      attemptIndex: attempt.attemptIndex,
+      state,
+    });
+    diagnostic("attempt-outcome", {
+      outcome: state,
+      attemptIndex: attempt.attemptIndex,
+      candidateSessionId: attempt.candidateSessionId,
+      sourceSessionId: attempt.sourceSessionId,
+    });
+    currentAttempt = null;
+    currentAttemptLineageFingerprint = null;
+  };
+
+  const materializeAttempt = async (
+    attemptIndex: number,
+    binding: CorePrimaryClaudeSessionBinding | null,
+    canonicalEnd: number,
+  ) => {
+    const candidateSessionId = crypto.randomUUID();
+    const attempt = input.store.reserveCorePrimaryClaudeSessionAttempt({
+      providerId: input.providerId,
+      requestClient: "discord",
+      lilacSessionId: input.sessionId,
+      executionScopeHashVersion: 1,
+      executionScopeHash: input.executionScopeHash,
+      requestId: input.requestId,
+      attemptIndex,
+      candidateSessionId,
+      sourceSessionId: binding?.claudeSessionId ?? null,
+      expectedBindingRevision: sourceBinding?.revision ?? null,
+    });
+    currentAttempt = attempt;
+    currentAttemptLineageFingerprint = lineageFingerprint(input.getLineage());
+    diagnostic("attempt-materialized", {
+      mode: binding ? "fork" : "fresh",
+      reason: binding ? "exact-binding" : "fresh-selection",
+      attemptIndex,
+      candidateSessionId,
+      sourceSessionId: binding?.claudeSessionId ?? null,
+    });
+    try {
+      const run = await input.materialize(
+        binding
+          ? {
+              mode: "fork",
+              baseSessionId: binding.claudeSessionId,
+              sessionId: candidateSessionId,
+              expectedSourceLastModified: binding.nativeLastModified,
+            }
+          : { mode: "fresh", sessionId: candidateSessionId },
+      );
+      return {
+        run,
+        modelSpecifier: input.modelSpecifier,
+        initialPayload: binding
+          ? ({ mode: "suffix", startIndex: canonicalEnd } as const)
+          : ({ mode: "full" } as const),
+      };
+    } catch (error) {
+      recordAttemptOutcome("failed");
+      throw error;
+    }
+  };
+
+  const owner = new ClaudeAttemptRuntimeOwner<null>({
+    factoryInputs: null,
+    createCandidate: async ({ attemptIndex, prepareContext }) => {
+      const persistedAttemptIndex = attemptIndex * 2;
+      const selection = selectionFor(prepareContext.canonicalMessages);
+      const lineage = input.getLineage();
+      const mode =
+        selection.mode === "fork"
+          ? "fork"
+          : shouldReplayCorePrimaryHistory({
+                lineage,
+                historicalEnd: lineage?.currentCanonicalStart ?? 0,
+                store: input.store,
+                targetFamily: "claude-code",
+              })
+            ? "text-replay"
+            : "fresh";
+      diagnostic("selection", {
+        mode,
+        ...(selection.mode === "fresh" ? { reason: selection.reason } : {}),
+        ...(selection.mode === "fork" ? { reason: "exact-binding" } : {}),
+      });
+      if (selection.mode === "fork" && sourceBinding) {
+        try {
+          return await materializeAttempt(
+            persistedAttemptIndex,
+            sourceBinding,
+            selection.canonicalEnd,
+          );
+        } catch (error) {
+          if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
+          diagnostic("native-source-invalid", {
+            issues: error.issues.map((issue) => issue.code),
+            mode: "fresh",
+            reason: "native-source-invalid",
+          });
+        }
+      }
+      return await materializeAttempt(
+        persistedAttemptIndex + (selection.mode === "fork" ? 1 : 0),
+        null,
+        0,
+      );
+    },
+  });
+
+  const prepareModelCall: PrepareModelCall = async (context) => {
+    if (
+      currentAttempt &&
+      currentAttemptLineageFingerprint !== lineageFingerprint(input.getLineage())
+    ) {
+      recordAttemptOutcome("failed");
+      await owner.retireForCanonicalReplacement();
+    }
+    const cursor = owner.state.cursor;
+    if (
+      currentAttempt &&
+      cursor &&
+      hashCanonicalMessagesV1(context.canonicalMessages.slice(0, cursor.canonicalMessageCount))
+        .hash !== cursor.canonicalPrefixHash
+    ) {
+      recordAttemptOutcome("failed");
+    }
+    const prepared = await owner.prepare(context);
+    selectedPayload = {
+      mode: prepared.payload.mode,
+      fresh: owner.currentCandidate?.run.nativeSession?.getObservation().sourceSessionId === null,
+    };
+    return prepared;
+  };
+
+  return {
+    prepareModelCall,
+    prepareFullBudgetView: (canonicalMessages, canonicalStartIndex = 0) => {
+      const lineage = input.getLineage();
+      return prepareCorePrimaryHistoryView({
+        canonicalMessages,
+        lineage,
+        replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
+          lineage,
+          historicalEnd: lineage?.currentCanonicalStart ?? 0,
+          store: input.store,
+          targetFamily: "claude-code",
+        }),
+        targetFamily: "claude-code",
+        modelSpecifier: input.modelSpecifier,
+        canonicalStartIndex,
+      });
+    },
+    prepareHistoryView: (canonicalMessages) => {
+      const selected = selectedPayload;
+      selectedPayload = null;
+      const lineage = input.getLineage();
+      const historicalEnd = lineage?.currentCanonicalStart ?? 0;
+      const replayHistoricalPrefix =
+        selected?.mode === "full" &&
+        selected.fresh &&
+        shouldReplayCorePrimaryHistory({
+          lineage,
+          historicalEnd,
+          store: input.store,
+          targetFamily: "claude-code",
+        });
+      return prepareCorePrimaryHistoryView({
+        canonicalMessages,
+        lineage,
+        replayHistoricalPrefix,
+        targetFamily: "claude-code",
+        modelSpecifier: input.modelSpecifier,
+      });
+    },
+    inputEstimateFloor: ({ canonicalMessages, overlay, estimateMessagesTokens }) => {
+      const cursor = owner.state.cursor;
+      const cursorMatches =
+        cursor !== null &&
+        cursor.canonicalMessageCount <= canonicalMessages.length &&
+        hashCanonicalMessagesV1(canonicalMessages.slice(0, cursor.canonicalMessageCount)).hash ===
+          cursor.canonicalPrefixHash;
+      const selection = selectionFor(canonicalMessages);
+      const binding = selection.mode === "fork" ? sourceBinding : null;
+      const synchronizedMessageCount = cursorMatches
+        ? cursor.canonicalMessageCount
+        : binding?.canonicalMessageCount;
+      if (synchronizedMessageCount === undefined) return null;
+      const cursorIsBindingHead =
+        cursorMatches &&
+        binding !== null &&
+        cursor.canonicalMessageCount === binding.canonicalMessageCount;
+      return owner.getNativeInputEstimateFloor({
+        storedNativeContextTokens: cursorMatches
+          ? cursorIsBindingHead
+            ? binding.nativeContextTokens
+            : undefined
+          : binding?.nativeContextTokens,
+        unsynchronizedSuffixAndOverlayEstimate: estimateMessagesTokens([
+          ...canonicalMessages.slice(synchronizedMessageCount),
+          ...overlay,
+        ]),
+      });
+    },
+    recordSuccessfulModelCall: async (canonicalMessages) => {
+      try {
+        await owner.recordSuccessfulModelCall(canonicalMessages);
+        if (owner.state.phase !== "unusable") return;
+        throw new Error(owner.state.unusableReason ?? "Claude native observability failed");
+      } catch (error) {
+        recordAttemptOutcome("failed");
+        await owner.retireForCanonicalReplacement();
+        diagnostic("candidate-observability-lost", {
+          mode: "fresh",
+          reason: "native-observability-lost",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    retireForRetry: async () => {
+      recordAttemptOutcome("failed");
+      await owner.retireForRetry();
+    },
+    retireForCanonicalReplacement: async () => {
+      recordAttemptOutcome("failed");
+      await owner.retireForCanonicalReplacement();
+    },
+    finalize: async ({
+      terminalTranscript,
+      canonicalMessages,
+      providerState,
+      isCancellationRequested,
+    }) => {
+      const attempt = currentAttempt;
+      const candidate = owner.currentCandidate;
+      const cursor = owner.state.cursor;
+      const canonicalHash = hashCanonicalMessagesV1(canonicalMessages).hash;
+      const manifest = input.store.getCorePrimaryLineageManifest({
+        requestId: terminalTranscript.requestId,
+      });
+      if (
+        !attempt ||
+        !candidate?.run.nativeSession ||
+        !manifest ||
+        cursor === null ||
+        cursor.canonicalMessageCount !== canonicalMessages.length ||
+        cursor.canonicalPrefixHash !== canonicalHash ||
+        terminalTranscript.messages.length === 0 ||
+        terminalTranscript.transcriptDigest === undefined
+      ) {
+        recordAttemptOutcome("failed");
+        return false;
+      }
+      const expectedCanonicalMessages = [
+        ...manifest.segments.flatMap((segment) => segment.canonicalMessages),
+        ...terminalTranscript.messages,
+      ];
+      if (!isDeepStrictEqual(expectedCanonicalMessages, canonicalMessages)) {
+        recordAttemptOutcome("failed");
+        return false;
+      }
+      const terminalHead = computeCorePrimaryClaudeTerminalHead({
+        manifest,
+        requestId: terminalTranscript.requestId,
+        transcriptDigest: terminalTranscript.transcriptDigest,
+        responseMessageCount: terminalTranscript.messages.length,
+        providerState,
+      });
+      if (terminalHead.canonicalMessageCount !== canonicalMessages.length) {
+        recordAttemptOutcome("failed");
+        return false;
+      }
+      if (isCancellationRequested()) {
+        recordAttemptOutcome("cancelled");
+        return false;
+      }
+      let finalized: Awaited<
+        ReturnType<NonNullable<typeof candidate.run.nativeSession>["finalize"]>
+      >;
+      try {
+        finalized = await candidate.run.nativeSession.finalize();
+      } catch (error) {
+        recordAttemptOutcome(isCancellationRequested() ? "cancelled" : "failed");
+        diagnostic("candidate-finalization-failed", {
+          reason: "native-finalization-failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+      if (isCancellationRequested()) {
+        recordAttemptOutcome("cancelled");
+        return false;
+      }
+      if (
+        finalized.status !== "promotable" ||
+        finalized.candidate === null ||
+        finalized.observations.contextTokens === null ||
+        finalized.observations.contextMaxTokens === null
+      ) {
+        recordAttemptOutcome("failed");
+        diagnostic("candidate-unpromotable", {
+          reason: "native-finalization-unpromotable",
+          issues: finalized.issues.map((issue) => issue.code),
+        });
+        return false;
+      }
+      if (isCancellationRequested()) {
+        recordAttemptOutcome("cancelled");
+        return false;
+      }
+      let publicationRecovered = false;
+      try {
+        input.store.publishCorePrimaryClaudeSuccess({
+          providerId: input.providerId,
+          requestClient: "discord",
+          lilacSessionId: input.sessionId,
+          requestId: input.requestId,
+          attemptIndex: attempt.attemptIndex,
+          terminalRequestId: terminalTranscript.requestId,
+          terminalLineageVersion: terminalHead.lineageVersion,
+          terminalAtomCount: terminalHead.atomCount,
+          terminalPrefixDigest: terminalHead.prefixDigest,
+          terminalCanonicalMessageCount: terminalHead.canonicalMessageCount,
+          providerState,
+          nativeCwd: finalized.candidate.cwd,
+          nativeLastModified: finalized.candidate.lastModified,
+          nativeContextTokens: finalized.observations.contextTokens,
+          nativeContextMaxTokens: finalized.observations.contextMaxTokens,
+          lastModelSpecifier: input.modelSpecifier,
+          lastReasoning: input.reasoning,
+        });
+      } catch (error) {
+        let persistedState: CorePrimaryClaudeSessionAttempt["state"] | null = null;
+        try {
+          persistedState =
+            input.store.getCorePrimaryClaudeSessionAttempt({
+              providerId: input.providerId,
+              requestClient: "discord",
+              lilacSessionId: input.sessionId,
+              requestId: input.requestId,
+              attemptIndex: attempt.attemptIndex,
+            })?.state ?? null;
+        } catch {
+          // Leave an unknown publication outcome for startup recovery.
+        }
+        if (persistedState === "succeeded") {
+          publicationRecovered = true;
+        } else {
+          if (persistedState === "active") {
+            recordAttemptOutcome(isCancellationRequested() ? "cancelled" : "failed");
+          } else {
+            currentAttempt = null;
+            currentAttemptLineageFingerprint = null;
+          }
+          diagnostic("canonical-publication-failed", {
+            mode: "canonical-publication",
+            reason: "publication-failed",
+            persistedState,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return false;
+        }
+      }
+      diagnostic("canonical-published", {
+        mode: "canonical-publication",
+        reason: publicationRecovered
+          ? "verified-after-publication-error"
+          : "verified-terminal-head",
+        terminalCanonicalMessageCount: terminalHead.canonicalMessageCount,
+      });
+      diagnostic("attempt-outcome", {
+        outcome: "succeeded",
+        attemptIndex: attempt.attemptIndex,
+        candidateSessionId: attempt.candidateSessionId,
+        sourceSessionId: attempt.sourceSessionId,
+      });
+      currentAttempt = null;
+      currentAttemptLineageFingerprint = null;
+      let promoted: boolean;
+      try {
+        promoted = input.store.promoteCorePrimaryClaudeSessionBinding({
+          providerId: input.providerId,
+          requestClient: "discord",
+          lilacSessionId: input.sessionId,
+          requestId: input.requestId,
+          attemptIndex: attempt.attemptIndex,
+        });
+      } catch (error) {
+        diagnostic("promotion-failed", {
+          mode: "cas",
+          reason: "promotion-failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+      if (!promoted) {
+        diagnostic("promotion-rejected", {
+          mode: "cas",
+          reason: "promotion-rejected",
+          promoted: false,
+        });
+        return false;
+      }
+      diagnostic("promotion", {
+        mode: "cas",
+        reason: "binding-promoted",
+        promoted: true,
+      });
+      return true;
+    },
+    markTerminalFailure: (cancelled) => recordAttemptOutcome(cancelled ? "cancelled" : "failed"),
+    markUncertain: () => recordAttemptOutcome("uncertain"),
+    retireAtRunEnd: () => owner.retireAtRunEnd(),
+    currentRun: () => owner.currentCandidate?.run ?? null,
+  };
+}

@@ -2,7 +2,14 @@ import type { LanguageModel } from "ai";
 
 import { providers, type Providers } from "./model-provider";
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
-import type { CoreConfig, JSONObject, JSONValue, ModelReasoningEffort } from "./core-config";
+import type {
+  ConfiguredModelChainEntry,
+  ConfiguredModelRef,
+  CoreConfig,
+  JSONObject,
+  JSONValue,
+  ModelReasoningEffort,
+} from "./core-config";
 import { createLogger } from "./logging";
 import { parseModelSpecifier } from "./model-capability";
 import {
@@ -15,15 +22,6 @@ const logger = createLogger({ module: "utils:model-slot" });
 const warnedProviderOptions = new Set<string>();
 
 export type ModelSlot = "main" | "fast";
-
-export type ConfiguredModelRef = {
-  /** Model ref in provider/model format or alias from models.def. */
-  model: string;
-  /** Optional portable AI SDK reasoning effort. */
-  reasoning?: ModelReasoningEffort;
-  /** Optional providerOptions override. */
-  options?: JSONObject;
-};
 
 export type ResolvedModelSlot = {
   slot: ModelSlot;
@@ -41,11 +39,20 @@ export type ResolvedModelSlot = {
   reasoning?: ModelReasoningEffort;
   /** Optional Responses API commentary-phase behavior toggle for OpenAI/Codex providers. */
   responseCommentary?: boolean;
+  /** Explicit opt-in for OpenAI server-side compaction. */
+  openaiServerCompaction?: true;
   /** Opt-in Anthropic cache-control injection for system prompt + latest user message. */
   anthropicPromptCache?: boolean;
+  /** Durable workflow candidates may retain the display policy from their dispatch. */
+  reasoningDisplay?: CoreConfig["agent"]["reasoningDisplay"];
 };
 
 export type ResolvedModelRef = Omit<ResolvedModelSlot, "slot">;
+
+export type ResolvedModelPlan = {
+  head: ResolvedModelRef;
+  fallbacks: readonly ResolvedModelRef[];
+};
 
 export type DurableJsonValue =
   | null
@@ -59,7 +66,7 @@ export interface DurableJsonObject {
 }
 export interface DurableJsonArray extends Array<DurableJsonValue> {}
 
-export type DurableResolvedModelRequest = {
+type DurableResolvedModelRequestBase = {
   alias?: string;
   spec: string;
   provider: string;
@@ -67,8 +74,14 @@ export type DurableResolvedModelRequest = {
   providerOptions?: Record<string, DurableJsonObject>;
   reasoning?: ModelReasoningEffort;
   responseCommentary?: boolean;
+  openaiServerCompaction?: true;
   anthropicPromptCache?: boolean;
   reasoningDisplay: CoreConfig["agent"]["reasoningDisplay"];
+};
+
+export type DurableResolvedModelRequest = DurableResolvedModelRequestBase & {
+  /** Optional for compatibility with policies persisted before model fallback support. */
+  fallbacks?: DurableResolvedModelRequestBase[];
 };
 
 export function toDurableResolvedModelRequest(
@@ -102,8 +115,21 @@ export function toDurableResolvedModelRequest(
     ...(providerOptions ? { providerOptions } : {}),
     ...(resolved.reasoning ? { reasoning: resolved.reasoning } : {}),
     ...(resolved.responseCommentary ? { responseCommentary: true } : {}),
+    ...(resolved.openaiServerCompaction ? { openaiServerCompaction: true } : {}),
     ...(resolved.anthropicPromptCache ? { anthropicPromptCache: true } : {}),
-    reasoningDisplay,
+    reasoningDisplay: resolved.reasoningDisplay ?? reasoningDisplay,
+  };
+}
+
+export function toDurableResolvedModelPlan(
+  plan: ResolvedModelPlan,
+  reasoningDisplay: CoreConfig["agent"]["reasoningDisplay"],
+): DurableResolvedModelRequest {
+  return {
+    ...toDurableResolvedModelRequest(plan.head, reasoningDisplay),
+    fallbacks: plan.fallbacks.map((fallback) =>
+      toDurableResolvedModelRequest(fallback, reasoningDisplay),
+    ),
   };
 }
 
@@ -113,6 +139,15 @@ export function fromDurableResolvedModelRequest(
   const parsed = parseModelSpecifier(request.spec);
   if (parsed.provider !== request.provider || parsed.model !== request.modelId) {
     throw new Error("Durable model request does not match its canonical model spec");
+  }
+  if (
+    request.openaiServerCompaction &&
+    request.provider !== "openai" &&
+    request.provider !== "codex"
+  ) {
+    throw new Error(
+      "Durable OpenAI server compaction is supported only by openai and codex providers",
+    );
   }
   const provider = providers[request.provider as Providers];
   if (typeof provider !== "function") {
@@ -127,7 +162,18 @@ export function fromDurableResolvedModelRequest(
     ...(request.providerOptions ? { providerOptions: request.providerOptions } : {}),
     ...(request.reasoning ? { reasoning: request.reasoning } : {}),
     ...(request.responseCommentary ? { responseCommentary: true } : {}),
+    ...(request.openaiServerCompaction ? { openaiServerCompaction: true } : {}),
     ...(request.anthropicPromptCache ? { anthropicPromptCache: true } : {}),
+    reasoningDisplay: request.reasoningDisplay,
+  };
+}
+
+export function fromDurableResolvedModelPlan(
+  request: DurableResolvedModelRequest,
+): ResolvedModelPlan {
+  return {
+    head: fromDurableResolvedModelRequest(request),
+    fallbacks: (request.fallbacks ?? []).map(fromDurableResolvedModelRequest),
   };
 }
 
@@ -222,16 +268,22 @@ function withOpenAIParallelToolCallsDefault(
 function buildProviderOptions(params: { provider: string; options?: JSONObject }): {
   providerOptions?: { [x: string]: JSONObject };
   responseCommentary?: boolean;
+  openaiServerCompaction?: true;
   anthropicPromptCache?: boolean;
 } {
   const options = params.options ?? {};
 
-  const { anthropic_prompt_cache, codex_instructions, response_commentary } =
-    options as JSONObject & {
-      anthropic_prompt_cache?: JSONValue;
-      codex_instructions?: JSONValue;
-      response_commentary?: JSONValue;
-    };
+  const {
+    anthropic_prompt_cache,
+    codex_instructions,
+    openai_server_compaction,
+    response_commentary,
+  } = options as JSONObject & {
+    anthropic_prompt_cache?: JSONValue;
+    codex_instructions?: JSONValue;
+    openai_server_compaction?: JSONValue;
+    response_commentary?: JSONValue;
+  };
   const codexInstructions =
     typeof codex_instructions === "string" && codex_instructions.length > 0
       ? codex_instructions
@@ -241,6 +293,19 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
     response_commentary === true && (params.provider === "openai" || params.provider === "codex")
       ? true
       : undefined;
+
+  let openaiServerCompaction: true | undefined;
+  if (Object.hasOwn(options, "openai_server_compaction")) {
+    if (openai_server_compaction !== true) {
+      throw new Error("Model option 'openai_server_compaction' must be literal boolean true");
+    }
+    if (params.provider !== "openai" && params.provider !== "codex") {
+      throw new Error(
+        "Model option 'openai_server_compaction' is supported only by openai and codex providers",
+      );
+    }
+    openaiServerCompaction = true;
+  }
 
   const anthropicPromptCache = anthropic_prompt_cache === true ? true : undefined;
 
@@ -252,6 +317,7 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
     return {
       providerOptions: withOpenAIParallelToolCallsDefault(provider, providerOptions),
       responseCommentary,
+      openaiServerCompaction,
       anthropicPromptCache,
     };
   }
@@ -279,6 +345,7 @@ function buildProviderOptions(params: { provider: string; options?: JSONObject }
       [openaiKey]: nextOpenAI,
     }),
     responseCommentary,
+    openaiServerCompaction,
     anthropicPromptCache,
   };
 }
@@ -356,10 +423,11 @@ function resolveModel(params: {
   const parsed = parseModelSpecifier(params.spec);
   const provider = parsed.provider;
   const modelId = parsed.model;
-  const { providerOptions, responseCommentary, anthropicPromptCache } = buildProviderOptions({
-    provider,
-    options: params.options,
-  });
+  const { providerOptions, responseCommentary, openaiServerCompaction, anthropicPromptCache } =
+    buildProviderOptions({
+      provider,
+      options: params.options,
+    });
 
   const p = providers[provider as Providers];
   const hasProvider = Object.prototype.hasOwnProperty.call(providers, provider);
@@ -391,6 +459,7 @@ function resolveModel(params: {
     providerOptions,
     reasoning: params.reasoning,
     responseCommentary,
+    openaiServerCompaction,
     anthropicPromptCache,
   };
 }
@@ -412,6 +481,64 @@ export function resolveModelRef(
   });
 }
 
+export function resolveModelChain(
+  cfg: CoreConfig,
+  entries: readonly ConfiguredModelChainEntry[],
+  source: string,
+  reasoningOverride?: ModelReasoningEffort,
+): ResolvedModelRef[] {
+  return entries.map((entry, index) => {
+    const ref = typeof entry === "string" ? { model: entry } : entry;
+    return resolveModelRef(
+      cfg,
+      reasoningOverride === undefined ? ref : { ...ref, reasoning: reasoningOverride },
+      `${source}[${index}]`,
+    );
+  });
+}
+
+export function resolveModelPlan(
+  cfg: CoreConfig,
+  params: {
+    head: ConfiguredModelRef;
+    fallback?: readonly ConfiguredModelChainEntry[];
+    headSource: string;
+    fallbackSource: string;
+    reasoningOverride?: ModelReasoningEffort;
+  },
+): ResolvedModelPlan {
+  const aliasFallback = params.head.model.includes("/")
+    ? undefined
+    : cfg.models.def[params.head.model]?.fallback;
+  const fallback = params.fallback ?? aliasFallback ?? [];
+  const fallbackSource =
+    params.fallback === undefined && aliasFallback !== undefined
+      ? `models.def.${params.head.model}.fallback`
+      : params.fallbackSource;
+  const head = resolveModelRef(
+    cfg,
+    params.reasoningOverride === undefined
+      ? params.head
+      : { ...params.head, reasoning: params.reasoningOverride },
+    params.headSource,
+  );
+
+  return {
+    head,
+    fallbacks: resolveModelChain(cfg, fallback, fallbackSource, params.reasoningOverride),
+  };
+}
+
+export function withModelPlanReasoning(
+  plan: ResolvedModelPlan,
+  reasoning: ModelReasoningEffort,
+): ResolvedModelPlan {
+  return {
+    head: { ...plan.head, reasoning },
+    fallbacks: plan.fallbacks.map((fallback) => ({ ...fallback, reasoning })),
+  };
+}
+
 export function resolveModelSlot(cfg: CoreConfig, slot: ModelSlot): ResolvedModelSlot {
   const { spec, alias, presetOptions, presetReasoning, slotOptions, slotReasoning } =
     resolveSlotSpec(cfg, slot);
@@ -429,4 +556,19 @@ export function resolveModelSlot(cfg: CoreConfig, slot: ModelSlot): ResolvedMode
     slot,
     ...resolved,
   };
+}
+
+export function resolveModelSlotPlan(
+  cfg: CoreConfig,
+  slot: ModelSlot,
+  reasoningOverride?: ModelReasoningEffort,
+): ResolvedModelPlan {
+  const slotConfig = cfg.models[slot];
+  return resolveModelPlan(cfg, {
+    head: slotConfig,
+    fallback: slotConfig.fallback,
+    headSource: `models.${slot}.model`,
+    fallbackSource: `models.${slot}.fallback`,
+    reasoningOverride,
+  });
 }

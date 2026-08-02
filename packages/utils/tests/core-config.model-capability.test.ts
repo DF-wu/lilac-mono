@@ -13,6 +13,7 @@ describe("coreConfigSchema models.capability", () => {
       enabled: false,
       model: "fast",
       concurrency: 1,
+      batchSize: 32,
       includePromptContext: false,
     });
     expect(v1.conversation.thread.embedding).toEqual({
@@ -34,6 +35,7 @@ describe("coreConfigSchema models.capability", () => {
       enabled: false,
       model: "fast",
       concurrency: 1,
+      batchSize: 32,
       includePromptContext: false,
     });
     expect(v2.conversation.thread.embedding).toEqual({
@@ -60,6 +62,7 @@ describe("coreConfigSchema models.capability", () => {
             enabled: true,
             model: "openrouter/openai/gpt-4o-mini",
             concurrency: 4,
+            batchSize: 24,
             includePromptContext: true,
           },
         },
@@ -70,6 +73,7 @@ describe("coreConfigSchema models.capability", () => {
       enabled: true,
       model: "openrouter/openai/gpt-4o-mini",
       concurrency: 4,
+      batchSize: 24,
       includePromptContext: true,
     });
   });

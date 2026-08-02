@@ -163,7 +163,7 @@ export function createGrepInputSchema(hashlineEnabled = false) {
       .string()
       .optional()
       .describe(
-        "Optional base directory to search from (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured. Defaults to the tool root.",
+        "Optional file or base directory to search (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured. Defaults to the tool root.",
       ),
     regex: z
       .boolean()

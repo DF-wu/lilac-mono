@@ -86,6 +86,7 @@ function lilacRequestHeaders(includeJson = false): Record<string, string> {
   const values = [
     ["x-lilac-request-id", process.env.LILAC_REQUEST_ID],
     ["x-lilac-session-id", process.env.LILAC_SESSION_ID],
+    ["x-lilac-origin-session-id", process.env.LILAC_ORIGIN_SESSION_ID],
     ["x-lilac-request-client", process.env.LILAC_REQUEST_CLIENT],
     ["x-lilac-cwd", process.env.LILAC_CWD],
     ["x-lilac-tool-call-id", process.env.LILAC_TOOL_CALL_ID],

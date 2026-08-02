@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import {
   buildToolInput,
@@ -133,7 +134,7 @@ describe("tool-bridge build id", () => {
             loadedExternal: 2,
           },
         },
-      ),
+      ).map(stripVTControlCharacters),
     ).toEqual(["[commit: abc123def456]", "[build: deadbeef]", "[app-dirty]", "[plugins: 2]"]);
   });
 });
@@ -282,6 +283,7 @@ describe("tool-bridge CLI runtime", () => {
         env: {
           LILAC_REQUEST_ID: "request-123",
           LILAC_SESSION_ID: "session-456",
+          LILAC_ORIGIN_SESSION_ID: "origin-session-789",
           LILAC_REQUEST_CLIENT: "test-client",
           LILAC_CWD: "/workspace/project",
         },
@@ -300,6 +302,7 @@ describe("tool-bridge CLI runtime", () => {
       expect(request.headers.get("content-type")).toContain("application/json");
       expect(request.headers.get("x-lilac-request-id")).toBe("request-123");
       expect(request.headers.get("x-lilac-session-id")).toBe("session-456");
+      expect(request.headers.get("x-lilac-origin-session-id")).toBe("origin-session-789");
       expect(request.headers.get("x-lilac-request-client")).toBe("test-client");
       expect(request.headers.get("x-lilac-cwd")).toBe("/workspace/project");
       expect(request.body).toEqual({

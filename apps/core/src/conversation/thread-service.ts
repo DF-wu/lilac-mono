@@ -28,7 +28,8 @@ import {
   type ConversationThreadStore,
   type ConversationThreadSummary,
   type ConversationThreadSummaryInput,
-  CONVERSATION_THREAD_SUMMARY_VERSION,
+  type ConversationThreadSummarizationEligibility,
+  type ConversationThreadSummarizationEligibilityReason,
 } from "./thread-store";
 import type {
   ConversationThreadEmbeddingAdapterResolver,
@@ -45,6 +46,7 @@ const SUMMARY_MAX_MESSAGES = SUMMARY_HEAD_MESSAGES + SUMMARY_TAIL_MESSAGES;
 const DEFAULT_READ_LIMIT = 50;
 const DEFAULT_SEARCH_MIN_SCORE = 0.1;
 const SUMMARY_PARSE_MAX_ATTEMPTS = 3;
+const SUMMARY_FAILURE_RETRY_MS = 60 * 60 * 1000;
 const HYBRID_LEXICAL_WEIGHT = 0.35;
 const PROMPT_CONTEXT_FILES = ["MEMORY.md", "USER.md", "ENTITIES.md"] as const;
 const MULTI_QUERY_MAX = 10;
@@ -136,14 +138,22 @@ export type ConversationThreadAutoInjectQueryPlanner = (input: {
 
 export type ConversationThreadRunSummarizationInput = {
   jobId?: string;
+  trigger?: "manual" | "periodic";
   dryRun?: boolean;
   wait?: boolean;
   force?: boolean;
   clear?: boolean;
+  limit?: number;
   threadId?: string;
   beforeTs?: number;
   afterTs?: number;
   now?: number;
+};
+
+export type ConversationThreadEligibilityCounts = {
+  summary: number;
+  embeddingOnly: number;
+  reasons: Partial<Record<ConversationThreadSummarizationEligibilityReason, number>>;
 };
 
 export type ConversationThreadRunSummarizationResult = {
@@ -154,6 +164,8 @@ export type ConversationThreadRunSummarizationResult = {
     messages: number;
   };
   eligible: number;
+  eligibleTotal: number;
+  eligibility: ConversationThreadEligibilityCounts;
   cleared: number;
   summarized: number;
   failed: number;
@@ -926,6 +938,24 @@ function clampSummarizationConcurrency(input: number): number {
   return Math.min(128, Math.max(1, Math.floor(input)));
 }
 
+function countSummarizationEligibility(
+  items: readonly ConversationThreadSummarizationEligibility[],
+): ConversationThreadEligibilityCounts {
+  const counts: ConversationThreadEligibilityCounts = {
+    summary: 0,
+    embeddingOnly: 0,
+    reasons: {},
+  };
+  for (const item of items) {
+    if (item.summaryIsStale) counts.summary += 1;
+    else if (item.embeddingIsStale) counts.embeddingOnly += 1;
+    for (const reason of item.reasons) {
+      counts.reasons[reason] = (counts.reasons[reason] ?? 0) + 1;
+    }
+  }
+  return counts;
+}
+
 async function defaultSummarizer(input: {
   cfg: CoreConfig;
   jobId?: string;
@@ -1421,9 +1451,14 @@ export class ConversationThreadService {
     const jobId = input.jobId;
     const cfg = await this.params.getConfig();
     const refreshed = { channels: 0, threads: 0, messages: 0 };
+    const scope = {
+      threadId: input.threadId,
+      beforeTs: input.beforeTs,
+      afterTs: input.afterTs,
+    };
 
     if (input.clear === true && input.dryRun === true) {
-      const clearTargets = this.params.store.listThreadsForSummarizationClear();
+      const clearTargets = this.params.store.listThreadsForSummarizationClear(scope);
       this.logger.debug("thread summarization clear dry run completed", {
         jobId,
         clearTargets: clearTargets.length,
@@ -1435,6 +1470,8 @@ export class ConversationThreadService {
         dryRun: true,
         refreshed,
         eligible: clearTargets.length,
+        eligibleTotal: clearTargets.length,
+        eligibility: { summary: clearTargets.length, embeddingOnly: 0, reasons: {} },
         cleared: 0,
         summarized: 0,
         failed: 0,
@@ -1444,7 +1481,7 @@ export class ConversationThreadService {
     }
 
     const clearedThreadIds =
-      input.clear === true ? this.params.store.clearSummarizationState() : [];
+      input.clear === true ? this.params.store.clearSummarizationState(scope) : [];
     if (input.clear === true) {
       this.logger.debug("thread summarization state cleared", {
         jobId,
@@ -1468,7 +1505,7 @@ export class ConversationThreadService {
       });
     }
 
-    const eligible = this.params.store.listEligibleForSummarization({
+    const allEligible = this.params.store.listEligibleForSummarization({
       now: input.now,
       quietMs: SUMMARY_QUIET_MS,
       threadId: input.threadId,
@@ -1476,12 +1513,21 @@ export class ConversationThreadService {
       afterTs: input.afterTs,
       includeEmbeddingStale: !!embeddingAdapter && this.params.store.isVectorSearchAvailable(),
       embeddingModelId: embeddingAdapter?.modelId,
-      summaryPromptContextHash: promptContext?.hash,
       force: input.force === true,
     });
+    const limit =
+      input.limit === undefined
+        ? undefined
+        : Math.min(10_000, Math.max(1, Math.floor(input.limit)));
+    const eligible = limit === undefined ? allEligible : allEligible.slice(0, limit);
+    const eligibility = countSummarizationEligibility(allEligible);
     this.logger.debug("thread summarization eligibility completed", {
       jobId,
       eligible: eligible.length,
+      eligibleTotal: allEligible.length,
+      eligibility,
+      limit,
+      trigger: input.trigger ?? "manual",
       dryRun: input.dryRun === true,
       threadId: input.threadId,
       beforeTs: input.beforeTs,
@@ -1495,17 +1541,20 @@ export class ConversationThreadService {
       dryRun: input.dryRun ?? false,
       refreshed,
       eligible: eligible.length,
+      eligibleTotal: allEligible.length,
+      eligibility,
       cleared: clearedThreadIds.length,
       summarized: 0,
       failed: 0,
       failures: [],
-      threadIds: eligible.map((thread) => thread.thread_id),
+      threadIds: eligible.map((item) => item.thread.thread_id),
     };
 
     if (input.dryRun) {
       this.logger.debug("thread summarization dry run completed", {
         jobId,
         eligible: result.eligible,
+        eligibleTotal: result.eligibleTotal,
       });
       return result;
     }
@@ -1526,25 +1575,41 @@ export class ConversationThreadService {
     this.logger.info("thread summarization processing started", {
       jobId,
       eligible: eligible.length,
+      eligibleTotal: allEligible.length,
+      eligibility,
       concurrency,
       force: input.force === true,
+      trigger: input.trigger ?? "manual",
     });
 
     let nextIndex = 0;
-    let abortError: Error | null = null;
-
-    const processThread = async (thread: (typeof eligible)[number]): Promise<void> => {
+    const processThread = async (item: (typeof eligible)[number]): Promise<void> => {
+      const thread = item.thread;
       const threadStartedAt = Date.now();
-      this.logger.debug("thread summarization thread started", {
-        jobId,
-        threadId: thread.thread_id,
-        kind: thread.kind,
-        updatedAt: thread.updated_at,
-        lastSummarizedAt: thread.last_summarized_at,
-        summaryVersion: thread.summary_version,
-        embeddingVersion: thread.embedding_version,
-      });
+      const attemptedAt = input.now ?? Date.now();
       try {
+        const attemptRecorded = this.params.store.markMaintenanceAttempt({
+          threadId: thread.thread_id,
+          summaryInputHash: thread.summary_input_hash,
+          attemptedAt,
+        });
+        if (!attemptRecorded) {
+          this.logger.debug("thread summarization skipped after concurrent update", {
+            jobId,
+            threadId: thread.thread_id,
+          });
+          return;
+        }
+        this.logger.debug("thread summarization thread started", {
+          jobId,
+          threadId: thread.thread_id,
+          kind: thread.kind,
+          updatedAt: thread.updated_at,
+          lastSummarizedAt: thread.last_summarized_at,
+          summaryVersion: thread.summary_version,
+          embeddingVersion: thread.embedding_version,
+          reasons: item.reasons,
+        });
         const summaryRead = readSummaryMessages(this.params.store, thread.thread_id);
         if (summaryRead.totalMessages === 0) {
           this.logger.debug("thread summarization deleting empty thread", {
@@ -1555,12 +1620,7 @@ export class ConversationThreadService {
           return;
         }
         const summaryMessages = this.normalizeMessagesForSummarization(summaryRead.messages, cfg);
-        const summaryIsStale =
-          input.force === true ||
-          thread.last_summarized_at === null ||
-          thread.last_summarized_at < thread.updated_at ||
-          thread.summary_version !== CONVERSATION_THREAD_SUMMARY_VERSION ||
-          (promptContext !== null && thread.summary_prompt_context_hash !== promptContext.hash);
+        const summaryIsStale = item.summaryIsStale;
         const previousSummary = this.params.store.getSummary(thread.thread_id);
         if (summaryRead.omittedMessages > 0) {
           this.logger.debug("thread summarization transcript truncated", {
@@ -1624,6 +1684,11 @@ export class ConversationThreadService {
           embeddingInputHash: summaryWrite.embeddingInputHash,
           facets: summaryWrite.facets,
         });
+        this.params.store.clearMaintenanceFailure({
+          threadId: thread.thread_id,
+          summaryInputHash: thread.summary_input_hash,
+          attemptedAt,
+        });
         if (summaryIsStale) result.summarized += 1;
         this.logger.debug("thread summarization thread completed", {
           jobId,
@@ -1648,6 +1713,21 @@ export class ConversationThreadService {
         );
         result.failed += 1;
         result.failures.push({ threadId: thread.thread_id, error: failureMessage });
+        try {
+          const failureAt = input.now ?? Date.now();
+          this.params.store.markMaintenanceFailure({
+            threadId: thread.thread_id,
+            summaryInputHash: thread.summary_input_hash,
+            attemptedAt,
+            retryAfter: failureAt + SUMMARY_FAILURE_RETRY_MS,
+          });
+        } catch (stateError) {
+          this.logger.warn("thread summarization failure backoff could not be persisted", {
+            jobId,
+            threadId: thread.thread_id,
+            error: stateError instanceof Error ? stateError.message : String(stateError),
+          });
+        }
         if (e instanceof ConversationThreadSummaryParseError) {
           this.logger.warn("thread summarization continuing after parse failure", {
             jobId,
@@ -1671,39 +1751,32 @@ export class ConversationThreadService {
           return;
         }
 
-        this.logger.error("thread summarization run aborted after hard failure", {
+        this.logger.error("thread summarization continuing after hard failure", {
           jobId,
           threadId: thread.thread_id,
           eligible: result.eligible,
           summarized: result.summarized,
           failed: result.failed,
         });
-        throw new Error(
-          `thread summarization aborted after failure in ${thread.thread_id}: ${failureMessage}`,
-        );
+        return;
       }
     };
 
     const workerCount = Math.min(concurrency, eligible.length);
     const workers = Array.from({ length: workerCount }, async () => {
-      while (!abortError) {
-        const thread = eligible[nextIndex];
+      while (true) {
+        const item = eligible[nextIndex];
         nextIndex += 1;
-        if (!thread) return;
-        try {
-          await processThread(thread);
-        } catch (e) {
-          abortError = e instanceof Error ? e : new Error(String(e));
-          return;
-        }
+        if (!item) return;
+        await processThread(item);
       }
     });
     await Promise.all(workers);
-    if (abortError) throw abortError;
 
     this.logger.info("thread summarization run completed", {
       jobId,
       eligible: result.eligible,
+      eligibleTotal: result.eligibleTotal,
       summarized: result.summarized,
       failed: result.failed,
       concurrency,

@@ -1,4 +1,31 @@
 import type { ModelMessage } from "ai";
+import { z } from "zod";
+
+export const openAICompactionPartSchema = z
+  .object({
+    type: z.literal("custom"),
+    kind: z.literal("openai.compaction"),
+    providerOptions: z.unknown().optional(),
+  })
+  .passthrough();
+
+export type OpenAICompactionPart = z.infer<typeof openAICompactionPartSchema>;
+
+export const openAIMessagePhaseSchema = z.enum(["commentary", "final_answer"]);
+export type OpenAIMessagePhase = z.infer<typeof openAIMessagePhaseSchema>;
+
+const openAIMessagePhaseMetadataSchema = z.object({
+  openai: z.object({ phase: openAIMessagePhaseSchema }),
+});
+
+export function openAIMessagePhase(value: unknown): OpenAIMessagePhase | undefined {
+  const parsed = openAIMessagePhaseMetadataSchema.safeParse(value);
+  return parsed.success ? parsed.data.openai.phase : undefined;
+}
+
+export function isOpenAICompactionPart(value: unknown): value is OpenAICompactionPart {
+  return openAICompactionPartSchema.safeParse(value).success;
+}
 
 function withoutOpenAIItemId(
   providerOptions: ModelMessage["providerOptions"],
@@ -21,7 +48,12 @@ export function withoutOpenAIItemIds(messages: readonly ModelMessage[]): ModelMe
         ...message,
         content: message.content.map((part) =>
           "providerOptions" in part
-            ? { ...part, providerOptions: withoutOpenAIItemId(part.providerOptions) }
+            ? {
+                ...part,
+                providerOptions: isOpenAICompactionPart(part)
+                  ? part.providerOptions
+                  : withoutOpenAIItemId(part.providerOptions),
+              }
             : { ...part },
         ),
       };

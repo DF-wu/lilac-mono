@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@stanley2058/lilac-utils": "workspace:*",
-    "ai": "^7.0.22"
+    "ai": "^7.0.22",
+    "zod": "^4.3.6"
   }
 }

@@ -51,6 +51,27 @@ docker compose up -d --force-recreate lilac
 
 Filesystem-tool denylists and trusted Bash's direct static check reduce accidental reads of `/data/secret`; they are not isolation from trusted same-user execution. Core, trusted Bash, plugins, and MCP stdio children share the `lilac` UID and can access service-readable credentials. Use separate containers, users, or another OS security boundary when agent-executed code must not be able to read them.
 
+## Claude Code Authentication And Storage
+
+Core's image includes the Claude Agent SDK dependency and can use its bundled executable when no
+external `claude` executable is on `PATH`. Configure Claude authentication through one or both of
+these operator paths:
+
+- Pass `CLAUDE_CODE_OAUTH_TOKEN` into the Core container.
+- Mount an existing authenticated Claude config directory and point `CLAUDE_CONFIG_DIR` at it.
+
+Native continuation also writes Claude conversation transcripts. Set `CLAUDE_CONFIG_DIR` to a
+non-empty absolute path that is writable by the container's `lilac` UID and persistently mounted. For
+example, `/data/claude` uses the existing Compose `/data` bind mount; alternatively mount a dedicated
+host directory. The stock `compose.yaml` does not pass Claude authentication or set this path for you.
+If `CLAUDE_CONFIG_DIR` is unset, Claude falls back to `~/.claude` inside the container, which is not
+part of the stock persistent mounts.
+
+Environment variables and mounted config remain readable to processes with the same service-user
+authority. A dedicated Claude directory provides storage organization and independent retention, not
+an access-control or privacy boundary. Use a separate UID/container or another OS isolation boundary
+when agent-executed code must not be able to access Claude credentials or transcripts.
+
 ## Diagnostics
 
 ```sh

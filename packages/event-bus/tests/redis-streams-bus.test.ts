@@ -1,6 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import Redis from "ioredis";
-import { createLilacBus, createRedisStreamsBus, lilacEventTypes, outReqTopic } from "../index";
+import {
+  computeCoreLineagePrefixDigestV1,
+  createLilacBus,
+  createRedisStreamsBus,
+  lilacEventTypes,
+  outReqTopic,
+  type CoreLineageAtomV1,
+  type CoreLineageManifestV1,
+} from "../index";
 import { env } from "@stanley2058/lilac-utils";
 import type { ModelMessage } from "ai";
 
@@ -828,6 +836,53 @@ describe("RedisStreamsBus", () => {
 
     expect(received).toEqual(complexData);
     await sub.stop();
+    await bus.close();
+  });
+
+  it("preserves Core primary lineage through request transport", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("primary-lineage")}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix, ownsRedis: true });
+    const bus = createLilacBus(raw);
+    const messages = [{ role: "user" as const, content: "canonical prompt" }];
+    const atom = {
+      kind: "surface",
+      requestClient: "discord",
+      surfaceId: "discord",
+      sessionId: "channel-1",
+      messageId: "message-1",
+    } satisfies CoreLineageAtomV1;
+    const corePrimaryLineage = {
+      state: "complete",
+      lineageVersion: 1,
+      currentCanonicalStart: 0,
+      segments: [
+        {
+          atoms: [atom],
+          canonicalMessages: messages,
+          canonicalStart: 0,
+          canonicalEnd: 1,
+          cumulativeAtomCount: 1,
+          cumulativePrefixDigest: computeCoreLineagePrefixDigestV1([atom]),
+        },
+      ],
+    } satisfies CoreLineageManifestV1;
+
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "prompt", messages, corePrimaryLineage },
+      { headers: { request_id: randomId("req") } },
+    );
+    const fetched = await bus.fetchTopic("cmd.request", {
+      offset: { type: "begin" },
+      limit: 1,
+    });
+
+    expect(fetched.messages[0]?.msg.data).toEqual({
+      queue: "prompt",
+      messages,
+      corePrimaryLineage,
+    });
     await bus.close();
   });
 
