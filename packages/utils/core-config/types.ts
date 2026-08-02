@@ -1,3 +1,5 @@
+import { cloneDefaultWorkingIndicators } from "../working-indicators";
+
 export type JSONValue = null | string | number | boolean | JSONObject | JSONArray;
 export type JSONArray = JSONValue[];
 export type JSONObject = {
@@ -103,6 +105,38 @@ export type ModelCapabilityOverride = {
     output?: Array<"text" | "image" | "audio" | "video" | "pdf">;
   };
 };
+
+export const TELEGRAM_SURFACE_DEFAULTS = {
+  enabled: false,
+  tokenEnv: "TELEGRAM_BOT_TOKEN",
+  botName: "lilac",
+  outputMode: "preview",
+  parseMode: "html",
+  streamEditIntervalMs: 1500,
+  outputNotification: true,
+  commandMenu: true,
+  markdownTableRender: {
+    enabled: true,
+    style: "unicode",
+    maxWidth: 50,
+    fallbackMode: "list",
+  },
+} as const;
+
+/**
+ * Shared by the v2 schema and by the v1 fallback so both config versions
+ * produce an identical `surface.telegram` shape. The core-config drift test
+ * asserts this equivalence.
+ */
+export function cloneDefaultTelegramSurface(): UniversalCoreConfig["surface"]["telegram"] {
+  return {
+    ...TELEGRAM_SURFACE_DEFAULTS,
+    allowedChatIds: [],
+    allowedUserIds: [],
+    workingIndicators: cloneDefaultWorkingIndicators(),
+    markdownTableRender: { ...TELEGRAM_SURFACE_DEFAULTS.markdownTableRender },
+  };
+}
 
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
@@ -214,6 +248,47 @@ export type UniversalCoreConfig = {
       outputPreviewModeFinalStyle: "embed" | "plain";
       outputNotification?: boolean;
       workingIndicators: string[];
+      markdownTableRender: {
+        enabled: boolean;
+        style: "unicode" | "ascii";
+        maxWidth: number;
+        fallbackMode: "list" | "passthrough";
+      };
+    };
+
+    telegram: {
+      /** Telegram surface is opt-in; when false the adapter is never constructed. */
+      enabled: boolean;
+      tokenEnv: string;
+      /** Identity used for mention detection and prompt attribution. */
+      botName: string;
+      /** Resolved from getMe at connect time when omitted. */
+      botUsername?: string;
+      /** Empty means "deny all": the surface fails closed. */
+      allowedChatIds: string[];
+      /** Empty means "no user-level restriction" (chat allowlist still applies). */
+      allowedUserIds: string[];
+      dbPath?: string;
+      /**
+       * Bot API endpoint. Telegram supports self-hosted Bot API servers, which
+       * raise the file-size limits; this also lets a verification run point at
+       * a local endpoint. Defaults to https://api.telegram.org.
+       */
+      apiRoot?: string;
+      /**
+       * Telegram edits the streamed message in place, so on a successful run
+       * both modes produce the same result. The mode only changes what happens
+       * on cancellation: `preview` removes the streamed messages, `inline`
+       * leaves the partial answer visible.
+       */
+      outputMode: "inline" | "preview";
+      parseMode: "html" | "plain";
+      /** Minimum gap between streaming editMessageText calls, per Bot API rate limits. */
+      streamEditIntervalMs: number;
+      outputNotification: boolean;
+      workingIndicators: string[];
+      /** Register the bot command menu via setMyCommands on connect. */
+      commandMenu: boolean;
       markdownTableRender: {
         enabled: boolean;
         style: "unicode" | "ascii";

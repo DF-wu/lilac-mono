@@ -617,14 +617,14 @@ export class WorkflowEngine {
           );
         }
         if (
-          platform !== "discord" ||
+          (platform !== "discord" && platform !== "telegram") ||
           platform !== run.origin.client ||
           channelId !== run.origin.sessionId ||
           !run.origin.userId ||
           (options.fromUserId !== undefined && options.fromUserId !== run.origin.userId)
         ) {
           throw new Error(
-            "waitForReply is limited to the authenticated originating Discord session and user",
+            "waitForReply is limited to the authenticated originating Discord or Telegram session and user",
           );
         }
         wait = {

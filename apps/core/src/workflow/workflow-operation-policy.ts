@@ -48,7 +48,7 @@ export const workflowPipelineOptionsSchema = z.strictObject({
 
 export const workflowWaitForReplyOptionsSchema = z.strictObject({
   prompt: z.string().min(1).max(2_000).optional(),
-  platform: z.literal("discord").optional(),
+  platform: z.enum(["discord", "telegram"]).optional(),
   channelId: z.string().min(1).max(200).optional(),
   messageId: z.string().min(1).max(200).optional(),
   fromUserId: z.string().min(1).max(200).optional(),

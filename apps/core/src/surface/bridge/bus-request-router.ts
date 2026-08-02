@@ -17,7 +17,6 @@ import type { SurfaceAdapter } from "../adapter";
 import type { MsgRef } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { composeRequestMessages, composeSingleMessageWithLineage } from "./request-composition";
-import { formatDiscordMessageRequestId } from "./request-ids";
 
 import {
   type SessionMode,
@@ -35,14 +34,17 @@ import {
   consumerId,
   randomRequestId,
   bufferedPromptRequestIdForActiveRequest,
-  parseDiscordMsgRefFromAdapterEvent,
+  parseSurfaceMsgRefFromAdapterEvent,
   resolveSessionConfigId,
   getSessionMode,
   resolveSessionGateEnabled,
   resolveSessionModelOverride,
   buildDiscordUserAliasById,
-  getDiscordFlags,
+  getSurfaceFlags,
+  formatSurfaceMessageRequestId,
+  resolveSurfaceBotName,
   withDefaultToolsConfig,
+  type RoutedSurfacePlatform,
 } from "./bus-request-router/common";
 import {
   type BufferedMessage,
@@ -119,8 +121,33 @@ export async function startBusRequestRouter(params: {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
+  /**
+   * Surface this router instance serves. One router runs per adapter, so the
+   * platform is fixed for the lifetime of the closure rather than varying per
+   * message. Defaults to Discord so existing call sites are unchanged.
+   */
+  platform?: RoutedSurfacePlatform;
 }) {
   const { adapter, bus, subscriptionId, customCommands } = params;
+  const platform: RoutedSurfacePlatform = params.platform ?? "discord";
+
+  /**
+   * Names that count as addressing the bot on this surface.
+   *
+   * Resolving this per platform matters because directive parsing
+   * (`!model`, `!continue`, `!interrupt`) and mention stripping all key off it;
+   * falling back to the Discord name would mis-parse Telegram messages whenever
+   * the two names differ.
+   */
+  const botMentionNamesFor = async (botUserId?: string): Promise<string[]> => {
+    const self = await adapter.getSelf().catch(() => null);
+    return resolveBotMentionNames({
+      cfg,
+      platform,
+      ...(botUserId === undefined ? {} : { botUserId }),
+      ...(self?.userName === undefined ? {} : { botUsername: self.userName }),
+    });
+  };
 
   const logger = createLogger({
     module: "bus-request-router",
@@ -178,7 +205,10 @@ export async function startBusRequestRouter(params: {
     sessionId: string;
     replyToMessageId?: string;
   }): Promise<string | undefined> {
-    return resolveRepliedToMessageTextImpl({ adapter, input });
+    return resolveRepliedToMessageTextImpl({
+      adapter,
+      input: { platform, ...input },
+    });
   }
 
   async function resolvePreviousBatchMessageText(
@@ -227,6 +257,7 @@ export async function startBusRequestRouter(params: {
 
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
+      const requestClient = msg.headers?.request_client;
       if (!requestId || !sessionId) {
         // Don't ack: malformed.
         logger.error("router.message.invalid_headers", {
@@ -241,6 +272,11 @@ export async function startBusRequestRouter(params: {
         throw new Error(
           "evt.request.lifecycle.changed missing required headers.request_id/session_id",
         );
+      }
+
+      if (requestClient && requestClient !== platform) {
+        await ctx.commit();
+        return;
       }
 
       if (msg.data.state === "running") {
@@ -286,6 +322,7 @@ export async function startBusRequestRouter(params: {
 
       const requestId = msg.headers?.request_id;
       const sessionId = msg.headers?.session_id;
+      const requestClient = msg.headers?.request_client;
       if (!requestId || !sessionId) {
         logger.error("router.message.invalid_headers", {
           topic: "evt.surface",
@@ -301,6 +338,11 @@ export async function startBusRequestRouter(params: {
         );
       }
 
+      if (requestClient && requestClient !== platform) {
+        await ctx.commit();
+        return;
+      }
+
       const cur = activeBySession.get(sessionId);
       if (!cur || cur.requestId !== requestId) {
         await ctx.commit();
@@ -309,7 +351,7 @@ export async function startBusRequestRouter(params: {
 
       const msgRef = msg.data.msgRef;
       if (
-        msgRef?.platform === "discord" &&
+        msgRef?.platform === platform &&
         typeof msgRef.messageId === "string" &&
         msgRef.messageId
       ) {
@@ -334,7 +376,7 @@ export async function startBusRequestRouter(params: {
         await ctx.commit();
         return;
       }
-      if (msg.data.platform !== "discord") {
+      if (msg.data.platform !== platform) {
         await ctx.commit();
         return;
       }
@@ -389,15 +431,14 @@ export async function startBusRequestRouter(params: {
       await reloadCoreConfigIfNeeded();
 
       const sessionId = msg.data.channelId;
-      const msgRef = parseDiscordMsgRefFromAdapterEvent(msg.data);
+      const msgRef = parseSurfaceMsgRefFromAdapterEvent(msg.data);
 
-      const flags = getDiscordFlags(msg.data.raw);
+      const flags = getSurfaceFlags(msg.data.raw, platform);
       const isDm = flags.isDMBased === true;
       const parentChannelId = flags.parentChannelId;
-      const botMentionNames = resolveBotMentionNames({
-        cfg,
-        botUserId: flags.botUserId ?? (await adapter.getSelf()).userId,
-      });
+      const botMentionNames = await botMentionNamesFor(
+        flags.botUserId ?? (await adapter.getSelf()).userId,
+      );
       const requestModelOverride = parseLeadingModelOverride({
         text: msg.data.text,
         botNames: botMentionNames,
@@ -465,10 +506,17 @@ export async function startBusRequestRouter(params: {
             : undefined,
       });
 
-      const customName = customCommands?.peekTextName(msg.data.text) ?? null;
+      // A command may carry an `@target`; without the connected bot's username
+      // one addressed to a different bot in the same group would run here,
+      // since this branch is ahead of mention gating.
+      const selfUserName = (await adapter.getSelf().catch(() => null))?.userName;
+      const commandTargetOpts = selfUserName === undefined ? {} : { botUsername: selfUserName };
+
+      const customName = customCommands?.peekTextName(msg.data.text, commandTargetOpts) ?? null;
       if (customName) {
-        const requestId = formatDiscordMessageRequestId({
-          channelId: sessionId,
+        const requestId = formatSurfaceMessageRequestId({
+          platform,
+          sessionId: sessionId,
           messageId: msgRef.messageId,
         });
         const raw = (() => {
@@ -486,7 +534,7 @@ export async function startBusRequestRouter(params: {
           }
 
           try {
-            const parsed = customCommands?.parseText(msg.data.text);
+            const parsed = customCommands?.parseText(msg.data.text, commandTargetOpts);
             if (!parsed) {
               return {
                 customCommand: {
@@ -525,6 +573,7 @@ export async function startBusRequestRouter(params: {
           adapter,
           bus,
           cfg,
+          platform,
           requestId,
           sessionId,
           sessionConfigId,
@@ -563,7 +612,7 @@ export async function startBusRequestRouter(params: {
 
         const decision = await evaluateRouterGate({
           sessionId,
-          botName: cfg.surface.discord.botName,
+          botName: resolveSurfaceBotName(cfg, platform),
           messages: [
             {
               msgRef,
@@ -737,6 +786,7 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
+        platform,
         requestId: input.sourceRequestId,
         sessionId: input.sessionId,
         sessionConfigId: batch.sessionConfigId,
@@ -758,8 +808,9 @@ export async function startBusRequestRouter(params: {
     if (!batch || batch.items.length === 0) return;
 
     const last = batch.items[batch.items.length - 1]!;
-    const requestId = formatDiscordMessageRequestId({
-      channelId: input.sessionId,
+    const requestId = formatSurfaceMessageRequestId({
+      platform,
+      sessionId: input.sessionId,
       messageId: last.msgRef.messageId,
     });
 
@@ -767,9 +818,9 @@ export async function startBusRequestRouter(params: {
     const discordUserAliasById = buildDiscordUserAliasById(cfg);
 
     const composed = await composeRequestMessages(adapter, {
-      platform: "discord",
+      platform,
       botUserId: self.userId,
-      botName: cfg.surface.discord.botName,
+      botName: resolveSurfaceBotName(cfg, platform),
       transcriptStore: params.transcriptStore,
       currentRequestId: requestId,
       currentMessageIds: batch.items.map((item) => item.msgRef.messageId),
@@ -793,9 +844,9 @@ export async function startBusRequestRouter(params: {
       if (surfaceMessage?.userId) batchParticipantUserIds.push(surfaceMessage.userId);
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
       const extra = await composeSingleMessageWithLineage(adapter, {
-        platform: "discord",
+        platform,
         botUserId: self.userId,
-        botName: cfg.surface.discord.botName,
+        botName: resolveSurfaceBotName(cfg, platform),
         msgRef: item.msgRef,
         discordUserAliasById,
         transcriptStore: params.transcriptStore,
@@ -880,6 +931,7 @@ export async function startBusRequestRouter(params: {
     })();
 
     await publishBusRequest({
+      platform,
       requestId,
       sessionId: input.sessionId,
       sessionConfigId: batch.sessionConfigId,
@@ -965,8 +1017,10 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
-        requestId: formatDiscordMessageRequestId({
-          channelId: sessionId,
+        platform,
+        requestId: formatSurfaceMessageRequestId({
+          platform,
+          sessionId,
           messageId: msgRef.messageId,
         }),
         sessionId,
@@ -1007,6 +1061,7 @@ export async function startBusRequestRouter(params: {
 
           await publishSurfaceOutputReanchor({
             bus,
+            platform,
             requestId: active.requestId,
             sessionId,
             inheritReplyTo: false,
@@ -1019,6 +1074,7 @@ export async function startBusRequestRouter(params: {
             adapter,
             bus,
             cfg,
+            platform,
             requestId: active.requestId,
             sessionId,
             queue: steerMode,
@@ -1045,6 +1101,7 @@ export async function startBusRequestRouter(params: {
           adapter,
           bus,
           cfg,
+          platform,
           requestId: active.requestId,
           sessionId,
           queue: "followUp",
@@ -1061,8 +1118,9 @@ export async function startBusRequestRouter(params: {
       }
 
       if (replyToBot) {
-        const requestId = formatDiscordMessageRequestId({
-          channelId: sessionId,
+        const requestId = formatSurfaceMessageRequestId({
+          platform,
+          sessionId: sessionId,
           messageId: msgRef.messageId,
         });
 
@@ -1070,6 +1128,7 @@ export async function startBusRequestRouter(params: {
           adapter,
           bus,
           cfg,
+          platform,
           requestId,
           sessionId,
           triggerMsgRef: msgRef,
@@ -1092,6 +1151,7 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
+        platform,
         requestId: active.requestId,
         sessionId,
         queue: "followUp",
@@ -1104,8 +1164,9 @@ export async function startBusRequestRouter(params: {
       return;
     }
 
-    const requestId = formatDiscordMessageRequestId({
-      channelId: sessionId,
+    const requestId = formatSurfaceMessageRequestId({
+      platform,
+      sessionId: sessionId,
       messageId: msgRef.messageId,
     });
 
@@ -1120,6 +1181,7 @@ export async function startBusRequestRouter(params: {
       adapter,
       bus,
       cfg,
+      platform,
       requestId,
       sessionId,
       triggerMsgRef: msgRef,
@@ -1203,8 +1265,10 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
-        requestId: formatDiscordMessageRequestId({
-          channelId: sessionId,
+        platform,
+        requestId: formatSurfaceMessageRequestId({
+          platform,
+          sessionId,
           messageId: msgRef.messageId,
         }),
         sessionId,
@@ -1249,6 +1313,7 @@ export async function startBusRequestRouter(params: {
         case "active_mention_steer": {
           await publishSurfaceOutputReanchor({
             bus,
+            platform,
             requestId: active.requestId,
             sessionId,
             inheritReplyTo: routeDecision.inheritReplyTo,
@@ -1261,6 +1326,7 @@ export async function startBusRequestRouter(params: {
             adapter,
             bus,
             cfg,
+            platform,
             requestId: active.requestId,
             sessionId,
             queue: routeDecision.queue,
@@ -1289,6 +1355,7 @@ export async function startBusRequestRouter(params: {
             adapter,
             bus,
             cfg,
+            platform,
             requestId: active.requestId,
             sessionId,
             queue: "followUp",
@@ -1305,8 +1372,9 @@ export async function startBusRequestRouter(params: {
           return;
         }
         case "fork_reply_prompt": {
-          const requestId = formatDiscordMessageRequestId({
-            channelId: sessionId,
+          const requestId = formatSurfaceMessageRequestId({
+            platform,
+            sessionId: sessionId,
             messageId: msgRef.messageId,
           });
 
@@ -1314,6 +1382,7 @@ export async function startBusRequestRouter(params: {
             adapter,
             bus,
             cfg,
+            platform,
             requestId,
             sessionId,
             triggerMsgRef: msgRef,
@@ -1337,6 +1406,7 @@ export async function startBusRequestRouter(params: {
             adapter,
             bus,
             cfg,
+            platform,
             requestId: bufferedPromptRequestIdForActiveRequest(active.requestId),
             sessionId,
             sessionConfigId,
@@ -1365,6 +1435,7 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
+        platform,
         requestId: randomRequestId(),
         sessionId,
         triggerMsgRef: msgRef,
@@ -1390,8 +1461,9 @@ export async function startBusRequestRouter(params: {
       clearDebounceBuffer(sessionId);
 
       const triggerType: "mention" | "reply" = replyToBot ? "reply" : "mention";
-      const requestId = formatDiscordMessageRequestId({
-        channelId: sessionId,
+      const requestId = formatSurfaceMessageRequestId({
+        platform,
+        sessionId: sessionId,
         messageId: msgRef.messageId,
       });
 
@@ -1399,6 +1471,7 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
+        platform,
         requestId,
         sessionId,
         triggerMsgRef: msgRef,
@@ -1490,7 +1563,7 @@ export async function startBusRequestRouter(params: {
     const decision = gateEnabled
       ? await evaluateRouterGate({
           sessionId,
-          botName: cfg.surface.discord.botName,
+          botName: resolveSurfaceBotName(cfg, platform),
           messages: b.messages,
           context: {
             mode: "active-batch",
@@ -1554,6 +1627,7 @@ export async function startBusRequestRouter(params: {
     const modelOverride =
       overrideCarrier?.model ?? b.messages[b.messages.length - 1]?.sessionModelOverride;
     const self = await adapter.getSelf();
+    const overrideBotNames = await botMentionNamesFor(overrideCarrier?.botUserId);
 
     // Gate-forwarded prompt: do NOT reply-to a message.
     // Use newest message as the context anchor.
@@ -1561,6 +1635,7 @@ export async function startBusRequestRouter(params: {
       adapter,
       bus,
       cfg,
+      platform,
       requestId: randomRequestId(),
       sessionId,
       sessionConfigId: b.sessionConfigId,
@@ -1571,21 +1646,34 @@ export async function startBusRequestRouter(params: {
       triggerType: undefined,
       sessionMode: "active",
       modelOverride,
-      botMentionNames: resolveBotMentionNames({
-        cfg,
-        botUserId:
-          overrideCarrier?.botUserId ?? b.messages[b.messages.length - 1]?.botUserId ?? self.userId,
-      }),
+      botMentionNames: await botMentionNamesFor(
+        overrideCarrier?.botUserId ?? b.messages[b.messages.length - 1]?.botUserId ?? self.userId,
+      ),
       transformTriggerUserText: overrideCarrier
         ? (text: string) =>
             stripLeadingModelOverrideDirective({
               text,
-              botNames: resolveBotMentionNames({ cfg, botUserId: overrideCarrier?.botUserId }),
+              botNames: overrideBotNames,
             })
         : undefined,
       transformUserTextForMessageId: overrideCarrier?.messageId,
       markActive: true,
     });
+  }
+
+  async function drainPendingRouting(): Promise<void> {
+    const debounceSessionIds = [...buffers.keys()];
+    for (const sessionId of debounceSessionIds) {
+      await flushDebounce(sessionId);
+    }
+
+    const batches = [...pendingMentionReplyBatchBySession.entries()];
+    for (const [sessionId, batch] of batches) {
+      await flushPendingMentionReplyBatchAsPrompt({
+        sessionId,
+        sourceRequestId: batch.sourceRequestId,
+      });
+    }
   }
 
   async function handleMentionMode(input: {
@@ -1655,8 +1743,9 @@ export async function startBusRequestRouter(params: {
       return;
     }
 
-    const requestId = formatDiscordMessageRequestId({
-      channelId: sessionId,
+    const requestId = formatSurfaceMessageRequestId({
+      platform,
+      sessionId: sessionId,
       messageId: msgRef.messageId,
     });
 
@@ -1665,6 +1754,7 @@ export async function startBusRequestRouter(params: {
         adapter,
         bus,
         cfg,
+        platform,
         requestId,
         sessionId,
         queue: "prompt",
@@ -1701,6 +1791,7 @@ export async function startBusRequestRouter(params: {
 
         await publishSurfaceOutputReanchor({
           bus,
+          platform,
           requestId: active.requestId,
           sessionId,
           inheritReplyTo: false,
@@ -1713,6 +1804,7 @@ export async function startBusRequestRouter(params: {
           adapter,
           bus,
           cfg,
+          platform,
           requestId: active.requestId,
           sessionId,
           queue: steerMode,
@@ -1770,6 +1862,7 @@ export async function startBusRequestRouter(params: {
       adapter,
       bus,
       cfg,
+      platform,
       requestId,
       sessionId,
       queue: "prompt",
@@ -1887,7 +1980,9 @@ export async function startBusRequestRouter(params: {
   }
 
   return {
+    drain: drainPendingRouting,
     stop: async () => {
+      await drainPendingRouting();
       await adapterSub.stop();
       await lifecycleSub.stop();
       await surfaceSub.stop();

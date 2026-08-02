@@ -2,6 +2,41 @@ import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
 export type SurfacePlatform = Exclude<AdapterPlatform, "unknown"> | "unknown";
 
+/**
+ * Surfaces whose inbound messages flow through the shared request router and
+ * its message-composition pipeline.
+ *
+ * GitHub is deliberately absent: its webhook handlers publish
+ * `cmd.request.message` directly and never emit adapter message events.
+ */
+export type RoutedSurfacePlatform = "discord" | "telegram";
+
+/**
+ * Every platform a `SessionRef`/`MsgRef` can address. This is the single
+ * runtime source of truth for decoding persisted platform strings back into
+ * those discriminated unions; keep it in sync with `SessionRef`/`MsgRef`.
+ */
+export const SURFACE_REF_PLATFORMS = ["discord", "github", "telegram"] as const;
+
+export type SurfaceRefPlatform = (typeof SURFACE_REF_PLATFORMS)[number];
+
+export function isSurfaceRefPlatform(x: unknown): x is SurfaceRefPlatform {
+  return SURFACE_REF_PLATFORMS.some((platform) => platform === x);
+}
+
+/**
+ * Surfaces that can act as an authenticated principal for Level-2 tool
+ * authority. A request from one of these carries a real, attributable actor.
+ *
+ * Currently every referenceable surface is also a principal surface, so this
+ * reuses `SurfaceRefPlatform` instead of repeating the literal list.
+ */
+export type SurfacePrincipalPlatform = SurfaceRefPlatform;
+
+export function isSurfacePrincipalPlatform(x: unknown): x is SurfacePrincipalPlatform {
+  return isSurfaceRefPlatform(x);
+}
+
 export type DiscordSessionRef = {
   platform: "discord";
   channelId: string;
@@ -15,6 +50,19 @@ export type DiscordSessionRef = {
  */
 export type GithubSessionRef = {
   platform: "github";
+  channelId: string;
+};
+
+/**
+ * Telegram session:
+ * - channelId: "<chat_id>" for private chats, groups and channels,
+ *   "<chat_id>:<message_thread_id>" for forum topics.
+ *
+ * Use the helpers in `telegram/telegram-ids.ts` to build and parse this id
+ * rather than doing string surgery at call sites.
+ */
+export type TelegramSessionRef = {
+  platform: "telegram";
   channelId: string;
 };
 
@@ -34,8 +82,19 @@ export type GithubMsgRef = {
   messageId: string;
 };
 
-export type SessionRef = DiscordSessionRef | GithubSessionRef;
-export type MsgRef = DiscordMsgRef | GithubMsgRef;
+/**
+ * Telegram message reference:
+ * - channelId: the session id (see `TelegramSessionRef`).
+ * - messageId: Telegram `message_id`, stringified.
+ */
+export type TelegramMsgRef = {
+  platform: "telegram";
+  channelId: string;
+  messageId: string;
+};
+
+export type SessionRef = DiscordSessionRef | GithubSessionRef | TelegramSessionRef;
+export type MsgRef = DiscordMsgRef | GithubMsgRef | TelegramMsgRef;
 
 export type SurfaceSelf = {
   platform: SurfacePlatform;
@@ -139,7 +198,7 @@ export type ContentOpts = {
 
 export type SendOpts = {
   replyTo?: MsgRef;
-  /** Disable all Discord notifications for this send (mentions + reply ping). */
+  /** Suppress surface notifications for this send (mentions + reply ping). */
   silent?: boolean;
 };
 

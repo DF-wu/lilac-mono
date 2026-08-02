@@ -3,6 +3,7 @@ import { z } from "zod";
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
 
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { cloneDefaultTelegramSurface } from "./types";
 
 import type {
   ConfigParser,
@@ -777,6 +778,10 @@ export function parseCoreConfigV1ToUniversal(
         outputPreviewModeFinalStyle: previewFinalOutputStyle,
         markdownTableRender: experimental.markdownTableRender,
       },
+      // v1's input schema is frozen, so the Telegram surface cannot be
+      // configured on v1. Synthesise the v2 defaults (disabled) so both
+      // versions expose the same universal shape.
+      telegram: cloneDefaultTelegramSurface(),
     },
     agent: {
       ...agentRest,

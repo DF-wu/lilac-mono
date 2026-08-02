@@ -1,3 +1,4 @@
+import type { RoutedSurfacePlatform } from "../../types";
 import type { ModelMessage } from "ai";
 
 import type { TranscriptSnapshot } from "../../../transcript/transcript-store";
@@ -101,7 +102,8 @@ function formatMessageTime(messageTs: number | undefined): string | undefined {
   return new Date(messageTs).toISOString();
 }
 
-export function formatDiscordAttributionHeader(params: {
+export function formatSurfaceAttributionHeader(params: {
+  platform: RoutedSurfacePlatform;
   authorId: string;
   authorName: string;
   userAlias?: string;
@@ -113,7 +115,7 @@ export function formatDiscordAttributionHeader(params: {
   const messageTime = formatMessageTime(params.messageTs);
 
   return formatSurfaceMetadataLine({
-    platform: "discord",
+    platform: params.platform,
     user_id: params.authorId,
     user_name: params.authorName || `user_${params.authorId}`,
     ...(params.userAlias ? { user_alias: params.userAlias } : {}),

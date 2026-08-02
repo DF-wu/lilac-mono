@@ -1,13 +1,17 @@
 import { pathToFileURL } from "node:url";
 
 import {
+  buildCustomCommandMenuAlias,
   buildCustomCommandTextName,
-  CUSTOM_COMMAND_TEXT_PREFIX,
+  CUSTOM_COMMAND_MENU_ALIAS_MAX_LENGTH,
   CUSTOM_COMMAND_TOOL_NAME,
   discoverCustomCommands,
   isValidCustomCommandResult,
+  parseCustomCommandToken,
   type CustomCommandArgDef,
   type CustomCommandContext,
+  type CustomCommandToken,
+  type ParseCustomCommandTokenOpts,
   type CustomCommandModule,
   type CustomCommandResult,
   type DiscoveredCustomCommand,
@@ -54,6 +58,71 @@ function parseArgValue(type: "string" | "number" | "boolean", raw: string): unkn
   return parseBooleanToken(raw);
 }
 
+export type MenuAliasCandidate = {
+  readonly name: string;
+  readonly dir: string;
+  readonly textName: string;
+};
+
+export type MenuAliasAssignment = {
+  /** Registry name -> published alias, for the commands that got one. */
+  readonly aliases: ReadonlyMap<string, string>;
+  readonly warnings: readonly string[];
+};
+
+/**
+ * Assign one menu alias per command, dropping the ones that cannot get a
+ * unique, representable alias.
+ *
+ * Kept pure and exported so the collision branch is directly testable. With
+ * today's name grammar (`[a-z0-9]+(-[a-z0-9]+)*`, no underscores) the `-` to
+ * `_` mapping is injective and a collision cannot actually occur — but that is
+ * a property of the schema, not of this function, so the branch stays and is
+ * exercised with adversarial input rather than assumed unreachable.
+ *
+ * Candidates are walked in sorted-name order, so which command wins a
+ * collision does not depend on how the filesystem enumerated directories.
+ * The sort is by code point rather than `localeCompare`, because the latter
+ * orders punctuation by locale and ICU version — which is precisely the
+ * non-determinism this ordering exists to remove.
+ */
+export function assignMenuAliases(candidates: readonly MenuAliasCandidate[]): MenuAliasAssignment {
+  const aliases = new Map<string, string>();
+  const owners = new Map<string, string>();
+  const warnings: string[] = [];
+
+  for (const candidate of [...candidates].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+  )) {
+    const alias = buildCustomCommandMenuAlias(candidate.name);
+
+    if (alias === null) {
+      warnings.push(
+        `${candidate.dir}: '${candidate.name}' has no menu-safe alias (over ${CUSTOM_COMMAND_MENU_ALIAS_MAX_LENGTH} characters once prefixed); it stays available as /${candidate.textName}`,
+      );
+      continue;
+    }
+
+    const owner = owners.get(alias);
+    if (owner !== undefined) {
+      warnings.push(
+        `${candidate.dir}: menu alias '/${alias}' is already taken by '${owner}'; '${candidate.name}' stays available as /${candidate.textName}`,
+      );
+      continue;
+    }
+
+    owners.set(alias, candidate.name);
+    aliases.set(candidate.name, alias);
+  }
+
+  return { aliases, warnings };
+}
+
+/** Bot command menus render a single line, so embedded newlines break layout. */
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/gu, " ").trim();
+}
+
 function tokenize(text: string): string[] {
   const out: string[] = [];
   let cur = "";
@@ -97,6 +166,18 @@ function tokenize(text: string): string[] {
 
 export type LoadedCustomCommand = DiscoveredCustomCommand & {
   textName: string;
+  /**
+   * Menu-safe alias, or `null` when the command cannot be advertised in a bot
+   * command menu. A `null` here never removes the command — it stays reachable
+   * through `textName`.
+   */
+  menuAlias: string | null;
+};
+
+/** One entry of a bot command menu, shaped for Telegram's `setMyCommands`. */
+export type CustomCommandMenuEntry = {
+  readonly command: string;
+  readonly description: string;
 };
 
 export type ParsedCustomCommandInvocation = {
@@ -115,12 +196,14 @@ type ParsedArgsAndPrompt = {
 export class CustomCommandManager {
   private readonly reserved = new Set(["lilac", "model", "divider"]);
   private readonly byName = new Map<string, LoadedCustomCommand>();
+  private readonly byMenuAlias = new Map<string, LoadedCustomCommand>();
   private readonly warnings: string[] = [];
 
   constructor(private readonly dataDir: string) {}
 
   async init(): Promise<void> {
     this.byName.clear();
+    this.byMenuAlias.clear();
     this.warnings.length = 0;
 
     for (const entry of await discoverCustomCommands({ dataDir: this.dataDir })) {
@@ -142,12 +225,51 @@ export class CustomCommandManager {
       this.byName.set(cmd.def.name, {
         ...cmd,
         textName: buildCustomCommandTextName(cmd.def.name),
+        menuAlias: null,
       });
     }
+
+    this.assignMenuAliases();
   }
 
   list(): LoadedCustomCommand[] {
     return [...this.byName.values()].sort((a, b) => a.def.name.localeCompare(b.def.name));
+  }
+
+  /**
+   * The command menu to publish, in registry order.
+   *
+   * Only commands with an assigned alias appear; the rest stay invocable by
+   * their typed form, and the reason each was left out is in `listWarnings()`.
+   */
+  listMenuEntries(): CustomCommandMenuEntry[] {
+    return this.list().flatMap((cmd) =>
+      cmd.menuAlias === null
+        ? []
+        : [
+            {
+              command: cmd.menuAlias,
+              // Straight from the registry: a placeholder here would describe
+              // the menu rather than the command it invokes.
+              description: collapseWhitespace(cmd.def.description),
+            },
+          ],
+    );
+  }
+
+  private assignMenuAliases(): void {
+    const assignment = assignMenuAliases(
+      this.list().map((cmd) => ({ name: cmd.def.name, dir: cmd.dir, textName: cmd.textName })),
+    );
+    this.warnings.push(...assignment.warnings);
+
+    for (const [name, alias] of assignment.aliases) {
+      const cmd = this.byName.get(name);
+      if (!cmd) continue;
+      const withAlias: LoadedCustomCommand = { ...cmd, menuAlias: alias };
+      this.byName.set(name, withAlias);
+      this.byMenuAlias.set(alias, withAlias);
+    }
   }
 
   listWarnings(): string[] {
@@ -158,25 +280,42 @@ export class CustomCommandManager {
     return this.byName.get(name) ?? null;
   }
 
-  peekTextName(text: string): string | null {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return null;
-    const token = trimmed.slice(1).split(/\s/u, 1)[0]?.trim();
-    if (!token?.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return null;
-    const name = token.slice(CUSTOM_COMMAND_TEXT_PREFIX.length).trim();
-    return name.length > 0 ? name : null;
+  /**
+   * Menu aliases resolve through the alias index rather than by undoing the
+   * `-`/`_` mapping. An alias that was never advertised — because it collided
+   * or could not be represented — therefore does not silently invoke whichever
+   * command happens to share its de-normalized name.
+   */
+  private resolveToken(token: CustomCommandToken): LoadedCustomCommand | null {
+    if (token.form === "text") return this.get(token.name);
+    return (token.alias === undefined ? null : this.byMenuAlias.get(token.alias)) ?? null;
   }
 
-  parseText(text: string): ParsedCustomCommandInvocation | null {
+  /**
+   * `opts.botUsername` is required for a command carrying an `@target` to be
+   * recognized at all; without it such a command is treated as not ours.
+   */
+  peekTextName(text: string, opts: ParseCustomCommandTokenOpts = {}): string | null {
     const trimmed = text.trim();
-    if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return null;
+    if (!trimmed.startsWith("/")) return null;
+    const head = trimmed.slice(1).split(/\s/u, 1)[0];
+    const token = head === undefined ? null : parseCustomCommandToken(head, opts);
+    return token?.name ?? null;
+  }
+
+  parseText(
+    text: string,
+    opts: ParseCustomCommandTokenOpts = {},
+  ): ParsedCustomCommandInvocation | null {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) return null;
 
     const tokens = tokenize(trimmed.slice(1));
     const head = tokens.shift();
-    if (!head || !head.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return null;
+    const token = head === undefined ? null : parseCustomCommandToken(head, opts);
+    if (!token) return null;
 
-    const name = head.slice(CUSTOM_COMMAND_TEXT_PREFIX.length);
-    const command = this.get(name);
+    const command = this.resolveToken(token);
     if (!command) return null;
     const parsed = this.parseArgsAndPrompt(command, tokens);
 

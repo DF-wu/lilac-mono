@@ -194,6 +194,79 @@ surface:
       # - passthrough: keep original markdown table unchanged
       fallbackMode: list
 
+  # Telegram surface (opt-in). Requires configVersion 2.
+  # See docs/telegram-surface.md for BotFather setup and group privacy notes.
+  telegram:
+    # The adapter is only constructed when this is true.
+    enabled: false
+
+    tokenEnv: "TELEGRAM_BOT_TOKEN"
+
+    # Fails closed: while allowedChatIds is empty the bot ignores every chat.
+    # Use numeric chat ids (negative for groups/supergroups), as strings.
+    allowedChatIds: []
+
+    # Optional second gate. Empty means "any user in an allowed chat".
+    allowedUserIds: []
+
+    # Display name used in attribution + mention stripping. Must not contain spaces.
+    botName: "lilac"
+
+    # Optional: the @username of the bot, without the leading "@".
+    # Resolved from getMe on connect when omitted.
+    # botUsername: "Catalina_agentbot"
+
+    # Optional: override surface DB location (default: <dataDir>/telegram-surface.db).
+    # Telegram has no history API, so the adapter keeps its own message index.
+    # dbPath: "/path/to/telegram-surface.db"
+
+    # Optional: Bot API endpoint. Telegram supports self-hosted Bot API servers,
+    # which raise the file-size limits and keep traffic on your own network.
+    # Must be a full URL. Changing it takes effect on restart.
+    # Default: https://api.telegram.org
+    # apiRoot: "http://127.0.0.1:8081"
+
+    # What happens to the streamed messages when a request is cancelled.
+    # Telegram edits in place, so a successful run looks identical either way.
+    # - inline: leave the partial answer visible
+    # - preview: delete the streamed messages on cancellation
+    outputMode: preview
+
+    # Message formatting sent to the Bot API:
+    # - html: convert markdown to Telegram HTML (recommended)
+    # - plain: send unformatted text
+    parseMode: html
+
+    # Minimum gap between streaming edits. Telegram throttles edits at roughly
+    # one per second per chat; lowering this trips 429 retry_after responses.
+    streamEditIntervalMs: 1500
+
+    # - true: allow messages to notify chat members
+    # - false: send with disable_notification
+    outputNotification: true
+
+    # Publish the custom-command menu via setMyCommands on connect.
+    #
+    # Each command in <dataDir>/cmds is advertised as /lilac_<name>, with
+    # hyphens mapped to underscores because Telegram only accepts
+    # [a-z0-9_]{1,32}. The typed /lilac:<name> form keeps working either way.
+    # An empty registry publishes an empty menu, so removing a command also
+    # removes it from the menu.
+    #
+    # false leaves the bot's existing menu untouched.
+    commandMenu: true
+
+    # Streaming title phrases for in-progress updates.
+    # Defaults live in packages/utils/working-indicators.ts.
+    # workingIndicators: []
+
+    # Telegram renders fixed-width tables well inside <pre> blocks.
+    markdownTableRender:
+      enabled: true
+      style: unicode
+      maxWidth: 50
+      fallbackMode: list
+
   heartbeat:
     # Enable the internal autonomous heartbeat lane.
     enabled: false

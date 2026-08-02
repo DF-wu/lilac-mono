@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
+import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
 
 import type { RequestContext } from "../../src/tool-server/types";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
@@ -89,6 +90,200 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       const fetched = await tool.call("workflow.run.get", { runId: first.runId }, { context });
       expect(fetched).toMatchObject({ run: { runId: first.runId, state: "queued" } });
       expect(JSON.stringify(fetched)).not.toContain("approval");
+    } finally {
+      await tool.destroy();
+    }
+  });
+
+  it("creates a durable Telegram progress target from the request origin", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-telegram-tool-"));
+    const workspaceRoot = path.join(root, "workspace");
+    await fs.mkdir(workspaceRoot);
+    const cards: string[] = [];
+    let allowedChatIds = ["-100123"];
+    const tool = new ProgrammaticWorkflow({
+      dataDir: path.join(root, "data"),
+      dbPath: path.join(root, "workflow.sqlite"),
+      now: () => 100,
+      getConfig: () => {
+        const base = parseCoreConfigV1ToUniversal({});
+        return {
+          ...base,
+          surface: {
+            ...base.surface,
+            telegram: {
+              ...base.surface.telegram,
+              enabled: true,
+              allowedChatIds,
+            },
+          },
+        };
+      },
+      progressCards: {
+        ensureInitialCard: async (runId) => {
+          cards.push(runId);
+          return { platform: "telegram", channelId: "-100123:7", messageId: "501" };
+        },
+        requestProjection: () => {},
+      },
+    });
+    const context = {
+      requestId: "telegram:-100123:7:42",
+      sessionId: "-100123:7",
+      requestClient: "telegram",
+      cwd: workspaceRoot,
+      safetyMode: "restricted" as const,
+      authenticatedPrincipal: { platform: "telegram" as const, userId: "user-7" },
+      toolCallId: "tool-call-telegram",
+    } satisfies RequestContext;
+
+    await tool.init();
+    try {
+      await tool.call(
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      const invocation = invocationSchema.parse(
+        await tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          { context },
+        ),
+      );
+      expect(cards).toEqual([invocation.runId]);
+
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "discord", sessionId: "channel-1" },
+            idempotencyKey: "telegram-cross-surface",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "telegram", sessionId: "-100999" },
+            idempotencyKey: "telegram-cross-session",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            progress: { client: "discord", sessionId: "channel-1" },
+            idempotencyKey: "telegram-child-cross-surface",
+          },
+          {
+            context: {
+              ...context,
+              requestClient: "unknown",
+              sessionId: "workflow:run-1:operation-1",
+              originSessionId: "-100123:7",
+            },
+          },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+
+      await expect(
+        tool.call(
+          "workflow.trigger.create",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            schedule: { kind: "timestamp", at: 1_000 },
+            progress: { client: "telegram", sessionId: "-100999" },
+            idempotencyKey: "telegram-trigger-cross-session",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+      await expect(
+        tool.call(
+          "workflow.trigger.create",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "src" },
+            schedule: { kind: "timestamp", at: 1_000 },
+            progress: { client: "discord", sessionId: "channel-1" },
+            idempotencyKey: "telegram-child-trigger-cross-surface",
+          },
+          {
+            context: {
+              ...context,
+              requestClient: "unknown",
+              sessionId: "workflow:run-1:operation-1",
+              originSessionId: "-100123:7",
+            },
+          },
+        ),
+      ).rejects.toThrow("must use the current Telegram session");
+
+      allowedChatIds = [];
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "denied" },
+            idempotencyKey: "telegram-run-disallowed-current-config",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("is not in allowedChatIds");
+      await expect(
+        tool.call(
+          "workflow.trigger.create",
+          {
+            scope: "project",
+            name: "audit-routes",
+            args: { directory: "denied" },
+            schedule: { kind: "timestamp", at: 1_000 },
+            idempotencyKey: "telegram-trigger-disallowed-current-config",
+          },
+          { context },
+        ),
+      ).rejects.toThrow("is not in allowedChatIds");
+
+      const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
+      try {
+        expect(store.listRuns({ limit: 100 })).toHaveLength(1);
+        expect(store.listTriggers({ limit: 100 })).toHaveLength(0);
+        expect(store.getRun(invocation.runId)).toMatchObject({
+          origin: {
+            client: "telegram",
+            sessionId: "-100123:7",
+            userId: "user-7",
+          },
+          completionTarget: { kind: "durable_surface" },
+          progressTarget: {
+            platform: "telegram",
+            channelId: "-100123:7",
+            replyToMessageId: null,
+          },
+        });
+      } finally {
+        store.close();
+      }
     } finally {
       await tool.destroy();
     }

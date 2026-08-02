@@ -21,7 +21,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { createLogger, normalizeReplayMessages } from "@stanley2058/lilac-utils";
 
-import type { MsgRef } from "../surface/types";
+import { isSurfaceRefPlatform, SURFACE_REF_PLATFORMS, type MsgRef } from "../surface/types";
 
 const logger = createLogger({ module: "transcript-store" });
 const TRANSCRIPT_SCHEMA_VERSION = 5;
@@ -306,6 +306,17 @@ type CorePrimaryClaudeAttemptRow = {
   created_ts: number;
   updated_ts: number;
 };
+
+/**
+ * `surface_message_to_request.platform` is free-form text, so every read path
+ * has to narrow it back to the platforms `MsgRef` can represent. The narrowing
+ * happens in SQL rather than after the rows come back so that LIMIT/OFFSET
+ * paging stays honest: a page can no longer arrive short (or empty) because
+ * unsupported rows were dropped post-query.
+ */
+function surfaceRefPlatformPlaceholders(firstParamIndex: number): string {
+  return SURFACE_REF_PLATFORMS.map((_, index) => `?${firstParamIndex + index}`).join(", ");
+}
 
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 
@@ -2770,11 +2781,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
         `
         SELECT platform, channel_id, message_id
         FROM surface_message_to_request
-        WHERE request_id = ?
+        WHERE request_id = ?1
+          AND platform IN (${surfaceRefPlatformPlaceholders(2)})
         ORDER BY created_ts ASC, rowid ASC
         `,
       )
-      .all(input.requestId) as Array<{
+      .all(input.requestId, ...SURFACE_REF_PLATFORMS) as Array<{
       platform: string;
       channel_id: string;
       message_id: string;
@@ -2782,7 +2794,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     const refs: MsgRef[] = [];
     for (const row of rows) {
-      if (row.platform !== "discord" && row.platform !== "github") continue;
+      if (!isSurfaceRefPlatform(row.platform)) continue;
       refs.push({
         platform: row.platform,
         channelId: row.channel_id,
@@ -2825,11 +2837,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
           LIMIT 1
         )
           AND (?1 IS NULL OR sm.platform = ?1)
+          AND sm.platform IN (${surfaceRefPlatformPlaceholders(4)})
         ORDER BY rt.updated_ts DESC, rt.created_ts DESC, sm.created_ts DESC, sm.rowid DESC
         LIMIT ?2 OFFSET ?3
         `,
       )
-      .all(client, limit, offset) as Array<{
+      .all(client, limit, offset, ...SURFACE_REF_PLATFORMS) as Array<{
       request_id: string;
       platform: string;
       channel_id: string;
@@ -2840,7 +2853,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     const out: RecentAgentWriteSnapshot[] = [];
     for (const row of rows) {
-      if (row.platform !== "discord" && row.platform !== "github") continue;
+      if (!isSurfaceRefPlatform(row.platform)) continue;
       out.push({
         requestId: row.request_id,
         sessionId: row.channel_id,
@@ -2871,10 +2884,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
         FROM request_transcripts rt
         LEFT JOIN surface_message_to_request sm
           ON sm.request_id = rt.request_id
+          AND sm.platform IN (${surfaceRefPlatformPlaceholders(1)})
         ORDER BY rt.updated_ts DESC, rt.created_ts DESC, sm.created_ts ASC, sm.rowid ASC
         `,
       )
-      .all() as Array<{
+      .all(...SURFACE_REF_PLATFORMS) as Array<{
       request_id: string;
       session_id: string;
       request_client: string;
@@ -2901,10 +2915,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
       }
 
       if (
-        row.surface_platform !== null &&
         row.surface_channel_id !== null &&
         row.surface_message_id !== null &&
-        (row.surface_platform === "discord" || row.surface_platform === "github")
+        isSurfaceRefPlatform(row.surface_platform)
       ) {
         record.surfaceRefs.push({
           platform: row.surface_platform,

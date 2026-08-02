@@ -2857,13 +2857,19 @@ export class DiscordAdapter implements SurfaceAdapter {
 }
 
 // --- Bus mapping helpers (used by bridge) ---
+//
+// These are shared by every adapter, not just Discord: `bridgeAdapterToBus`
+// calls them for whichever adapter it is bridging. The platform therefore has
+// to come from the refs in the payload. Hardcoding it here previously labelled
+// Telegram events as Discord, so they were handed to the Discord router, which
+// read `raw.discord`, found nothing, and skipped every message.
 
 export function toBusEvtAdapterMessageCreated(evt: {
   message: SurfaceMessage;
   channelName?: string;
 }): EvtAdapterMessageCreatedData {
   return {
-    platform: "discord",
+    platform: evt.message.session.platform,
     channelId: evt.message.session.channelId,
     channelName: evt.channelName,
     messageId: evt.message.ref.messageId,
@@ -2880,7 +2886,7 @@ export function toBusEvtAdapterMessageUpdated(evt: {
   channelName?: string;
 }): EvtAdapterMessageUpdatedData {
   return {
-    platform: "discord",
+    platform: evt.message.session.platform,
     channelId: evt.message.session.channelId,
     channelName: evt.channelName,
     messageId: evt.message.ref.messageId,
@@ -2900,7 +2906,7 @@ export function toBusEvtAdapterMessageDeleted(evt: {
   raw?: unknown;
 }): EvtAdapterMessageDeletedData {
   return {
-    platform: "discord",
+    platform: evt.session.platform,
     channelId: evt.session.channelId,
     channelName: evt.channelName,
     messageId: evt.messageRef.messageId,
@@ -2920,7 +2926,7 @@ export function toBusEvtAdapterReactionAdded(evt: {
   raw?: unknown;
 }): EvtAdapterReactionAddedData {
   return {
-    platform: "discord",
+    platform: evt.session.platform,
     channelId: evt.session.channelId,
     channelName: evt.channelName,
     messageId: evt.messageRef.messageId,
@@ -2943,7 +2949,7 @@ export function toBusEvtAdapterReactionRemoved(evt: {
   raw?: unknown;
 }): EvtAdapterReactionRemovedData {
   return {
-    platform: "discord",
+    platform: evt.session.platform,
     channelId: evt.session.channelId,
     channelName: evt.channelName,
     messageId: evt.messageRef.messageId,

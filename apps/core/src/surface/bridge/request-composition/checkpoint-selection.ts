@@ -1,3 +1,4 @@
+import type { RoutedSurfacePlatform } from "../../types";
 import type { ModelMessage } from "ai";
 import { createLogger } from "@stanley2058/lilac-utils";
 
@@ -16,7 +17,7 @@ export type CheckpointSelection<T> = {
 export function selectNewestReachableCheckpoint<T>(input: {
   chainOldestToNewest: readonly T[];
   botUserId: string;
-  platform: "discord";
+  platform: RoutedSurfacePlatform;
   channelId: string;
   transcriptStore?: TranscriptStore;
   currentRequestId?: string;

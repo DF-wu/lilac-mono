@@ -1,3 +1,4 @@
+import type { SurfacePrincipalPlatform } from "../surface/types";
 import Elysia, { NotFoundError } from "elysia";
 import {
   createLogger,
@@ -103,6 +104,7 @@ function parseRequestContext(headers: Record<string, unknown>): RequestContext {
   return {
     requestId: headerStr(headers["x-lilac-request-id"]),
     sessionId: headerStr(headers["x-lilac-session-id"]),
+    originSessionId: headerStr(headers["x-lilac-origin-session-id"]),
     requestClient: headerStr(headers["x-lilac-request-client"]),
     cwd: headerStr(headers["x-lilac-cwd"]),
     toolCallId: headerStr(headers["x-lilac-tool-call-id"]),
@@ -181,10 +183,15 @@ function isRestrictedCallableAllowed(params: {
   ctx: RequestContext;
 }): boolean {
   if (!RESTRICTED_LEVEL2_ALLOWED.has(params.callableId)) return false;
+  const telegramContext =
+    params.ctx.requestClient === "telegram" ||
+    params.ctx.authenticatedPrincipal?.platform === "telegram";
   return isCurrentSessionScopedSurfaceCall({
     callableId: params.callableId,
     input: params.input,
-    sessionId: params.ctx.sessionId,
+    sessionId: telegramContext
+      ? (params.ctx.originSessionId ?? params.ctx.sessionId)
+      : params.ctx.sessionId,
   });
 }
 
@@ -213,7 +220,7 @@ export type ToolServerOptions = {
     getOrigin?(requestId: string):
       | {
           sessionId: string;
-          platform: "discord" | "github";
+          platform: SurfacePrincipalPlatform;
           actorUserId: string | null;
         }
       | undefined;
@@ -228,7 +235,8 @@ export type ToolServerOptions = {
     now: number;
   }) => {
     kind: "primary" | "heartbeat";
-    principal: { platform: "discord" | "github"; userId: string } | null;
+    originSessionId?: string;
+    principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
     allowedCallables: readonly string[] | null;
     profile: "primary" | NativeSubagentProfile;
     canonicalCwd: string;
@@ -459,6 +467,7 @@ export function createToolServer(options: ToolServerOptions) {
       });
       if (!authorized) throw new Error("Request control capability is invalid or expired");
       context.serverOwnedRequest = true;
+      context.originSessionId = authorized.originSessionId;
       context.cwd = authorized.canonicalCwd;
       context.safetyMode = authorized.safetyMode;
       context.controlPolicy = {

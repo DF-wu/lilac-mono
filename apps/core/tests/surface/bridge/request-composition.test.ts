@@ -186,6 +186,30 @@ describe("request-composition attachments", () => {
     expect(out!.content as string).toContain('"user_alias":"Stanley"');
   });
 
+  it("does not apply Discord user aliases to colliding Telegram user ids", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "telegram", channelId: "c", messageId: "m" },
+      session: { platform: "telegram", channelId: "c" },
+      userId: "u",
+      userName: "telegram-user",
+      text: "hi",
+      ts: 0,
+    };
+
+    const adapter = new FakeAdapter(msg, []);
+    const out = await composeSingleMessage(adapter, {
+      platform: "telegram",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+      discordUserAliasById: new Map([["u", "Stanley"]]),
+    });
+
+    expect(out?.role).toBe("user");
+    expect(typeof out?.content).toBe("string");
+    expect(out!.content as string).not.toContain("user_alias");
+  });
+
   it("escapes metadata tags anywhere in user-authored text", async () => {
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
@@ -2332,6 +2356,53 @@ describe("request-composition active channel burst rules", () => {
       .join("\n");
     expect(combined).not.toContain("!cont=");
     expect(combined).toContain("current request");
+  });
+
+  it("does not expand Telegram reply history from a visible !continue directive", async () => {
+    const sessionId = "1001";
+    const anchorTs = 10_000_000;
+    const mk = (
+      id: string,
+      ts: number,
+      text: string,
+      raw: Record<string, unknown>,
+    ): SurfaceMessage => ({
+      ref: { platform: "telegram", channelId: sessionId, messageId: id },
+      session: { platform: "telegram", channelId: sessionId },
+      userId: id === "4" ? "bot" : "u",
+      userName: id === "4" ? "lilac" : "user",
+      text,
+      ts,
+      raw,
+    });
+    const telegramRaw = (messageId: string, replyToMessageId?: string) => ({
+      telegram: {
+        chatId: sessionId,
+        messageId,
+        ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
+      },
+    });
+    const msgs = [
+      mk("1", anchorTs - 4 * 60 * 60 * 1000, "unrelated old one", telegramRaw("1")),
+      mk("2", anchorTs - 3 * 60 * 60 * 1000, "unrelated old two", telegramRaw("2")),
+      mk("3", anchorTs - 2_000, "recent", telegramRaw("3")),
+      mk("4", anchorTs - 1_000, "bot answer", telegramRaw("4")),
+      mk("5", anchorTs, "!continue reply only", telegramRaw("5", "4")),
+    ];
+    const adapter = new ListFakeAdapter(msgs);
+
+    const out = await composeRecentChannelMessages(adapter, {
+      platform: "telegram",
+      sessionId,
+      botUserId: "bot",
+      botName: "lilac",
+      limit: 3,
+      triggerMsgRef: { platform: "telegram", channelId: sessionId, messageId: "5" },
+      triggerType: "reply",
+    });
+
+    expect(out.chainMessageIds).toEqual(["3", "4", "5"]);
+    expect(JSON.stringify(out.messages)).not.toContain("unrelated old");
   });
 
   it("keeps visible !cont directives sticky and expands them recursively for later plain active messages", async () => {

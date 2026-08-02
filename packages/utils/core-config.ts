@@ -369,3 +369,28 @@ export function resolveDiscordToken(cfg: CoreConfig): string {
   }
   return value;
 }
+
+export function resolveTelegramDbPath(cfg: CoreConfig): string {
+  return cfg.surface.telegram.dbPath ?? path.join(env.dataDir, "telegram-surface.db");
+}
+
+export function resolveTelegramToken(cfg: CoreConfig): string {
+  const key = cfg.surface.telegram.tokenEnv;
+  const value = process.env[key];
+  if (!value) {
+    throw new Error(
+      `Telegram token missing: env var ${key} is not set (set it or change surface.telegram.tokenEnv in core-config.yaml)`,
+    );
+  }
+  return value;
+}
+
+/**
+ * The Telegram surface is opt-in and additionally needs a token, so a config
+ * that enables it without providing credentials must not fail startup for
+ * deployments that never wanted Telegram.
+ */
+export function isTelegramSurfaceUsable(cfg: CoreConfig): boolean {
+  if (!cfg.surface.telegram.enabled) return false;
+  return Boolean(process.env[cfg.surface.telegram.tokenEnv]);
+}

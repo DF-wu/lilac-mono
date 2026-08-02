@@ -15,6 +15,7 @@ import type {
   SurfaceReactionSummary,
   SurfaceSessionParticipantsResult,
   SurfaceSession,
+  SurfaceRefPlatform,
 } from "../../surface/types";
 import type { DiscordSearchService } from "../../surface/store/discord-search-store";
 import type { RequestContext, ServerTool } from "../types";
@@ -32,6 +33,13 @@ import {
   resolveToolPathForRequestContext,
 } from "../../shared/attachment-utils";
 import { getDiscordSurfaceDisplayText } from "../../surface/discord/discord-surface-display-text";
+import { isTelegramChatAllowed } from "../../surface/telegram/telegram-guards";
+import {
+  parseTelegramSessionId,
+  telegramMsgRef,
+  telegramSessionRef,
+} from "../../surface/telegram/telegram-ids";
+import { parseRequestId } from "../../surface/bridge/request-ids";
 import {
   DISCORD_REFERENCE_TYPE_DEFAULT,
   DISCORD_REFERENCE_TYPE_FORWARD,
@@ -97,17 +105,42 @@ function inferGithubOriginFromRequestId(
   return { sessionId: parsed.sessionId, messageId: parsed.triggerId };
 }
 
+function inferTelegramOriginFromRequestId(
+  requestId: string | undefined,
+): { sessionId: string; messageId: string } | null {
+  if (!requestId) return null;
+  const parsed = parseRequestId(requestId);
+  if (parsed?.kind !== "telegram_message") return null;
+  return { sessionId: parsed.sessionId, messageId: parsed.messageId };
+}
+
+function resolveContextClient(ctx: RequestContext | undefined): SurfaceClient | "unknown" {
+  const requestClientRaw = ctx?.requestClient;
+  const requestClient =
+    typeof requestClientRaw === "string" &&
+    isAdapterPlatform(requestClientRaw) &&
+    isSurfaceClient(requestClientRaw)
+      ? requestClientRaw
+      : "unknown";
+  const principalClient = ctx?.authenticatedPrincipal?.platform;
+
+  if (requestClient !== "unknown") {
+    if (principalClient && principalClient !== requestClient) {
+      throw new Error(
+        `Client mismatch: context requestClient is '${requestClient}' but authenticated principal is '${principalClient}'`,
+      );
+    }
+    return requestClient;
+  }
+
+  return principalClient ?? "unknown";
+}
+
 function resolveClient(params: {
   inputClient?: SurfaceClient;
   ctx?: RequestContext;
 }): SurfaceClient {
-  const ctxClientRaw = params.ctx?.requestClient;
-  const ctxClient =
-    typeof ctxClientRaw === "string" &&
-    isAdapterPlatform(ctxClientRaw) &&
-    isSurfaceClient(ctxClientRaw)
-      ? ctxClientRaw
-      : "unknown";
+  const ctxClient = resolveContextClient(params.ctx);
 
   if (ctxClient !== "unknown") {
     if (params.inputClient && params.inputClient !== ctxClient) {
@@ -131,7 +164,7 @@ function resolveClient(params: {
 function ensureDiscordClient(client: SurfaceClient): "discord" {
   if (client !== "discord") {
     throw new Error(
-      `surface tool: client '${client}' is not supported yet (supported: 'discord', 'github')`,
+      `surface tool: client '${client}' is not supported yet (supported: 'discord', 'github', 'telegram')`,
     );
   }
   return "discord";
@@ -186,6 +219,32 @@ function asGithubSessionRef(sessionId: string): SessionRef {
 
 function asGithubMsgRef(sessionId: string, messageId: string): MsgRef {
   return { platform: "github", channelId: sessionId, messageId };
+}
+
+function asTelegramSessionRef(sessionId: string): SessionRef {
+  const parsed = parseTelegramSessionId(sessionId);
+  return telegramSessionRef(parsed);
+}
+
+function asTelegramMsgRef(sessionId: string, messageId: string): MsgRef {
+  const parsed = parseTelegramSessionId(sessionId);
+  return telegramMsgRef({ ...parsed, messageId });
+}
+
+function shouldAllowTelegramSession(params: {
+  cfg: CoreConfig;
+  sessionId: string;
+  originSessionId?: string;
+}): boolean {
+  if (params.originSessionId && params.originSessionId !== params.sessionId) return false;
+  const { chatId } = parseTelegramSessionId(params.sessionId);
+  return isTelegramChatAllowed({ cfg: params.cfg, chatId });
+}
+
+function telegramOriginSessionId(ctx: RequestContext | undefined): string | undefined {
+  if (resolveContextClient(ctx) !== "telegram") return undefined;
+  if (ctx?.originSessionId) return ctx.originSessionId;
+  return ctx?.requestClient === "telegram" ? ctx.sessionId : undefined;
 }
 
 function parseIsoMs(iso: string | undefined): number {
@@ -499,11 +558,14 @@ function withDefaultSessionId(
   // If explicitly provided (even null/empty), defer to schema validation.
   if (hasOwn && value !== undefined) return rawInput;
 
+  const authoritativeTelegramSessionId = telegramOriginSessionId(ctx);
   const ctxSessionId =
-    typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
+    authoritativeTelegramSessionId ??
+    (typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
       ? ctx.sessionId
       : (inferDiscordOriginFromRequestId(ctx?.requestId)?.sessionId ??
-        inferGithubOriginFromRequestId(ctx?.requestId)?.sessionId);
+        inferGithubOriginFromRequestId(ctx?.requestId)?.sessionId ??
+        inferTelegramOriginFromRequestId(ctx?.requestId)?.sessionId));
 
   if (ctxSessionId) {
     return { ...rawInput, sessionId: ctxSessionId };
@@ -529,6 +591,11 @@ function withDefaultMessageId(
 
   const inferredGh = inferGithubOriginFromRequestId(ctx?.requestId);
   if (inferredGh?.messageId) return { ...rawInput, messageId: inferredGh.messageId };
+
+  const inferredTelegram = inferTelegramOriginFromRequestId(ctx?.requestId);
+  if (inferredTelegram?.messageId) {
+    return { ...rawInput, messageId: inferredTelegram.messageId };
+  }
 
   const rid = typeof ctx?.requestId === "string" ? ctx.requestId : undefined;
   const hint = rid ? ` (requestId='${rid}')` : " (no requestId in context)";
@@ -1368,6 +1435,7 @@ export class Surface implements ServerTool {
   constructor(
     private readonly params: {
       adapter: SurfaceAdapter;
+      adapters?: ReadonlyMap<SurfaceRefPlatform, SurfaceAdapter>;
       githubApi?: GithubSurfaceApi;
       config?: CoreConfig;
       getConfig?: () => Promise<CoreConfig>;
@@ -1409,7 +1477,7 @@ export class Surface implements ServerTool {
         description:
           "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
         inputSchema: activitiesRecentAgentWritesInputSchema,
-        handler: (input) => this.callActivitiesRecentAgentWrites(input),
+        handler: (input, opts) => this.callActivitiesRecentAgentWrites(input, opts.context),
       },
       {
         callableId: "surface.sessions.list",
@@ -1520,8 +1588,7 @@ export class Surface implements ServerTool {
   private async callHelp(rawInput: Record<string, unknown>, ctx: RequestContext | undefined) {
     const input = helpInputSchema.parse(rawInput);
 
-    const ctxClientRaw = ctx?.requestClient;
-    const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
+    const ctxClient = resolveContextClient(ctx);
     const effectiveClient = input.client ?? (ctxClient !== "unknown" ? ctxClient : undefined);
     const cfg = await this.getCfg();
     const contextSessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : null;
@@ -1535,7 +1602,7 @@ export class Surface implements ServerTool {
 
     return {
       tool: "surface" as const,
-      supportedClients: ["discord", "github"] as const,
+      supportedClients: ["discord", "github", "telegram"] as const,
       context: {
         requestClient: ctxClient,
         sessionId: contextSessionId,
@@ -1545,7 +1612,7 @@ export class Surface implements ServerTool {
         client:
           "Surface client/platform. If the request context has a known client (LILAC_REQUEST_CLIENT), --client is optional; otherwise pass --client explicitly.",
         session:
-          "A conversation container. For Discord, a session maps to a channel; for GitHub, a session maps to an issue/PR thread.",
+          "A conversation container. For Discord, a session maps to a channel; for GitHub, to an issue/PR thread; for Telegram, to a chat or forum topic.",
         sessionId:
           "The CLI/session selector used by most surface.* tools. If omitted, surface tools default to the current request session (LILAC_SESSION_ID, or inferred from requestId when available).",
         alias:
@@ -1598,17 +1665,32 @@ export class Surface implements ServerTool {
                   "For GitHub triggers, surface tools can default sessionId/messageId from requestId when it is 'github:<OWNER/REPO#N>:<triggerId>'.",
                 ],
               }
-            : {
-                client: effectiveClient,
-                accepted: [],
-                notes: ["Only Discord and GitHub are implemented today."],
-              },
+            : effectiveClient === "telegram"
+              ? {
+                  client: "telegram" as const,
+                  accepted: [
+                    { format: "1001", meaning: "Telegram private or group chat id" },
+                    {
+                      format: "-1001234567890:7",
+                      meaning: "Telegram supergroup chat id and forum topic id",
+                    },
+                  ],
+                  notes: [
+                    "The parent chat id must be present in cfg.surface.telegram.allowedChatIds.",
+                  ],
+                }
+              : {
+                  client: effectiveClient,
+                  accepted: [],
+                  notes: ["This surface client is not implemented today."],
+                },
       relatedConfigKeys: {
         requestClientEnv: "LILAC_REQUEST_CLIENT",
         sessionIdEnv: "LILAC_SESSION_ID",
         discordSessionAliases: "cfg.entity.sessions.discord",
         surfaceAllowlistChannels: "cfg.surface.discord.allowedChannelIds",
         surfaceAllowlistGuilds: "cfg.surface.discord.allowedGuildIds",
+        telegramAllowedChats: "cfg.surface.telegram.allowedChatIds",
       },
     };
   }
@@ -1621,6 +1703,15 @@ export class Surface implements ServerTool {
 
   private gh(): GithubSurfaceApi {
     return this.params.githubApi ?? defaultGithubApi;
+  }
+
+  private adapterFor(client: "discord" | "telegram"): SurfaceAdapter {
+    if (client === "discord") return this.params.adapters?.get("discord") ?? this.params.adapter;
+    const adapter = this.params.adapters?.get("telegram");
+    if (!adapter) {
+      throw new Error("surface tool: Telegram adapter is unavailable");
+    }
+    return adapter;
   }
 
   private async readRecentAgentWriteText(row: RecentAgentWriteSnapshot): Promise<string> {
@@ -1661,6 +1752,13 @@ export class Surface implements ServerTool {
       return typeof comment.body === "string" ? comment.body : (row.finalText ?? "");
     }
 
+    if (row.client === "telegram") {
+      const msg = await this.adapterFor("telegram").readMsg(
+        asTelegramMsgRef(row.sessionId, row.messageId),
+      );
+      return msg?.text ?? row.finalText ?? "";
+    }
+
     return row.finalText ?? "";
   }
 
@@ -1680,8 +1778,15 @@ export class Surface implements ServerTool {
     }
   }
 
-  private async callActivitiesRecentAgentWrites(rawInput: Record<string, unknown>) {
+  private async callActivitiesRecentAgentWrites(
+    rawInput: Record<string, unknown>,
+    ctx: RequestContext | undefined,
+  ) {
     const input = activitiesRecentAgentWritesInputSchema.parse(rawInput);
+    const resolvedContextClient = resolveContextClient(ctx);
+    const contextClient = resolvedContextClient === "unknown" ? undefined : resolvedContextClient;
+    const client =
+      contextClient || input.client ? resolveClient({ inputClient: input.client, ctx }) : undefined;
     const transcriptStore = this.params.transcriptStore;
 
     if (!transcriptStore?.listRecentAgentWrites) {
@@ -1711,7 +1816,7 @@ export class Surface implements ServerTool {
       const rows = transcriptStore.listRecentAgentWrites({
         limit: pageSize,
         offset,
-        client: input.client,
+        client,
       });
       if (rows.length === 0) break;
 
@@ -1733,6 +1838,16 @@ export class Surface implements ServerTool {
           ) {
             continue;
           }
+        }
+        if (
+          row.client === "telegram" &&
+          !shouldAllowTelegramSession({
+            cfg,
+            sessionId: row.sessionId,
+            originSessionId: telegramOriginSessionId(ctx),
+          })
+        ) {
+          continue;
         }
 
         let text = row.finalText ?? "";
@@ -1813,6 +1928,23 @@ export class Surface implements ServerTool {
         "surface.sessions.list is not supported for GitHub. Use `gh` to list issues/PRs and then pass `--session-id OWNER/REPO#<number>` to other surface.* tools.",
       );
     }
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const limit = input.limit ?? Number.POSITIVE_INFINITY;
+      const sessions = await this.adapterFor("telegram").listSessions();
+      return sessions
+        .filter(
+          (session) =>
+            session.ref.platform === "telegram" &&
+            shouldAllowTelegramSession({ cfg, sessionId: session.ref.channelId }),
+        )
+        .slice(0, limit)
+        .map((session) => ({
+          channelId: session.ref.channelId,
+          kind: session.kind,
+          title: session.title,
+        }));
+    }
     ensureDiscordClient(client);
 
     const cfg = await this.getCfg();
@@ -1872,6 +2004,11 @@ export class Surface implements ServerTool {
     if (client === "github") {
       throw new Error(
         "surface.sessions.listParticipants is not supported for GitHub. This callable is Discord-only.",
+      );
+    }
+    if (client === "telegram") {
+      throw new Error(
+        "surface.sessions.listParticipants is not supported for Telegram because the Bot API cannot enumerate arbitrary chat participants.",
       );
     }
     ensureDiscordClient(client);
@@ -1968,6 +2105,37 @@ export class Surface implements ServerTool {
       return buildMessagesListOutput({
         session: sessionRef,
         messages,
+        order,
+        includeRaw,
+        includeAttachments,
+      });
+    }
+
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      const sessionRef = asTelegramSessionRef(sessionId);
+      const messages = await this.adapterFor("telegram").listMsg(sessionRef, {
+        limit: input.limit ?? 50,
+        beforeMessageId: input.beforeMessageId,
+        afterMessageId: input.afterMessageId,
+      });
+      const filtered = messages.filter(
+        (message) =>
+          message.session.platform === "telegram" && message.session.channelId === sessionId,
+      );
+      return buildMessagesListOutput({
+        session: sessionRef,
+        messages: filtered,
         order,
         includeRaw,
         includeAttachments,
@@ -2122,6 +2290,32 @@ export class Surface implements ServerTool {
       });
     }
 
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      const sessionRef = asTelegramSessionRef(sessionId);
+      const message = await this.adapterFor("telegram").readMsg(
+        asTelegramMsgRef(sessionId, mustPresentString(input.messageId, "messageId")),
+      );
+      return buildMessagesReadOutput({
+        session: sessionRef,
+        message:
+          message?.session.platform === "telegram" && message.session.channelId === sessionId
+            ? message
+            : null,
+        includeRaw,
+      });
+    }
+
     ensureDiscordClient(client);
 
     const cfg = await this.getCfg();
@@ -2207,6 +2401,10 @@ export class Surface implements ServerTool {
 
     if (client === "github") {
       throw new Error("surface.messages.search for GitHub is not supported yet.");
+    }
+
+    if (client === "telegram") {
+      throw new Error("surface.messages.search for Telegram is not supported yet.");
     }
 
     ensureDiscordClient(client);
@@ -2338,6 +2536,41 @@ export class Surface implements ServerTool {
       return { ok: true as const, ref, session: toSessionMeta(sessionRef) };
     }
 
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      if ((input.paths ?? []).length > 0) {
+        throw new Error(
+          "surface.messages.send for Telegram does not support local file attachments yet.",
+        );
+      }
+      const sessionRef = asTelegramSessionRef(sessionId);
+      const replyTo = input.replyToMessageId
+        ? asTelegramMsgRef(sessionId, input.replyToMessageId)
+        : undefined;
+      const ref = await this.adapterFor("telegram").sendMsg(
+        sessionRef,
+        { text: input.text },
+        replyTo || input.silent === true
+          ? {
+              ...(replyTo ? { replyTo } : {}),
+              ...(input.silent === true ? { silent: true } : {}),
+            }
+          : undefined,
+      );
+      this.linkSentMessageToTranscript(ref, ctx);
+      return { ok: true as const, ref, session: toSessionMeta(sessionRef) };
+    }
+
     ensureDiscordClient(client);
 
     const cfg = await this.getCfg();
@@ -2438,6 +2671,24 @@ export class Surface implements ServerTool {
       return { ok: true as const };
     }
 
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      await this.adapterFor("telegram").editMsg(asTelegramMsgRef(sessionId, input.messageId), {
+        text: input.text,
+      });
+      return { ok: true as const };
+    }
+
     ensureDiscordClient(client);
 
     const cfg = await this.getCfg();
@@ -2499,6 +2750,22 @@ export class Surface implements ServerTool {
       return { ok: true as const };
     }
 
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      await this.adapterFor("telegram").deleteMsg(asTelegramMsgRef(sessionId, input.messageId));
+      return { ok: true as const };
+    }
+
     ensureDiscordClient(client);
 
     const cfg = await this.getCfg();
@@ -2555,6 +2822,12 @@ export class Surface implements ServerTool {
         emoji: githubReactionEmojiFromContent(content),
         count,
       }));
+    }
+
+    if (client === "telegram") {
+      throw new Error(
+        "surface.reactions.list is not supported for Telegram because the Bot API has no reaction query endpoint.",
+      );
     }
 
     ensureDiscordClient(client);
@@ -2655,6 +2928,12 @@ export class Surface implements ServerTool {
       return out;
     }
 
+    if (client === "telegram") {
+      throw new Error(
+        "surface.reactions.listDetailed is not supported for Telegram because the Bot API has no reaction query endpoint.",
+      );
+    }
+
     ensureDiscordClient(client);
 
     const cfg = await this.getCfg();
@@ -2730,6 +3009,25 @@ export class Surface implements ServerTool {
         });
       }
 
+      return { ok: true as const };
+    }
+
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      await this.adapterFor("telegram").addReaction(
+        asTelegramMsgRef(sessionId, mustPresentString(input.messageId, "messageId")),
+        input.reaction,
+      );
       return { ok: true as const };
     }
 
@@ -2823,6 +3121,25 @@ export class Surface implements ServerTool {
         }
       }
 
+      return { ok: true as const };
+    }
+
+    if (client === "telegram") {
+      const cfg = await this.getCfg();
+      const sessionId = mustPresentString(input.sessionId, "sessionId");
+      if (
+        !shouldAllowTelegramSession({
+          cfg,
+          sessionId,
+          originSessionId: telegramOriginSessionId(ctx),
+        })
+      ) {
+        throw new Error(`Not allowed: Telegram sessionId '${sessionId}'`);
+      }
+      await this.adapterFor("telegram").removeReaction(
+        asTelegramMsgRef(sessionId, mustPresentString(input.messageId, "messageId")),
+        input.reaction,
+      );
       return { ok: true as const };
     }
 

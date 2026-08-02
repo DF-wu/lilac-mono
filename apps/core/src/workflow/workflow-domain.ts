@@ -289,7 +289,7 @@ export type WorkflowOperation = z.infer<typeof workflowOperationSchema>;
 export const workflowWaitMatchSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("reply"),
-    platform: z.literal("discord"),
+    platform: z.enum(["discord", "telegram"]),
     channelId: idSchema,
     messageId: idSchema.nullable(),
     fromUserId: idSchema.nullable(),

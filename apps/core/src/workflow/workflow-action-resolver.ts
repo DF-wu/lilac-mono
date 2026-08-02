@@ -7,10 +7,10 @@ import { sha256 } from "./workflow-definition";
 
 const surfaceActionEventSchema = z.strictObject({
   actionId: z.string().min(16).max(200),
-  platform: z.enum(["discord", "github"]),
+  platform: z.enum(["discord", "github", "telegram"]),
   userId: z.string().min(1).max(200),
   messageRef: z.strictObject({
-    platform: z.enum(["discord", "github"]),
+    platform: z.enum(["discord", "github", "telegram"]),
     channelId: z.string().min(1).max(200),
     messageId: z.string().min(1).max(200),
   }),

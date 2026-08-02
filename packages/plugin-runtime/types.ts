@@ -5,6 +5,8 @@ export type PluginSource = "builtin" | "external";
 export type RequestContext = {
   requestId?: string;
   sessionId?: string;
+  /** Server-issued surface origin, kept separate when sessionId is a synthetic workflow session. */
+  originSessionId?: string;
   requestClient?: string;
   cwd?: string;
   safetyMode?: "trusted" | "restricted";
@@ -12,7 +14,7 @@ export type RequestContext = {
   serverOwnedRequest?: boolean;
   /** Set only after authenticating the root-only container operator token. */
   operator?: boolean;
-  authenticatedPrincipal?: { platform: "discord" | "github"; userId: string };
+  authenticatedPrincipal?: { platform: "discord" | "github" | "telegram"; userId: string };
   toolCallId?: string;
   controlCapability?: string;
   controlPolicy?: {
@@ -75,6 +77,7 @@ export type Level1SubagentConfig = {
 export type Level1ExecutionRequestContext = {
   requestId: string;
   sessionId: string;
+  originSessionId?: string;
   requestClient: string;
   subagentDepth: number;
   subagentProfile: Level1RunProfile;

@@ -176,6 +176,7 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
             store: runtime.durableWorkflowStore,
             bus: runtime.bus,
             progressCards: runtime.workflowProgressCards,
+            getConfig: getConfig ?? (config ? async () => config : undefined),
             getMaxActiveRuns: getConfig
               ? async () => (await getConfig()).workflows.maxActiveRuns
               : config
@@ -201,6 +202,7 @@ export function createBuiltinSurfacePlugin(): CoreToolPlugin {
         level2: [
           new Surface({
             adapter: runtime.adapter,
+            adapters: runtime.surfaceAdapters,
             config: runtime.config,
             getConfig: runtime.getConfig,
             discordSearch: runtime.discordSearch,

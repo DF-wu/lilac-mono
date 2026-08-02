@@ -991,6 +991,72 @@ describe("bridgeBusToAdapter", () => {
     await bridge.stop();
   });
 
+  for (const platform of ["discord", "telegram"] as const) {
+    it(`removes the final-answer phase boundary after a ${platform} reanchor`, async () => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const adapter = new FakeAdapter();
+      const sessionId = platform === "discord" ? "chan" : "1001";
+      const requestId = `${platform}:${sessionId}:phase_reanchor`;
+      const bridge = await bridgeBusToAdapter({
+        adapter,
+        bus,
+        platform,
+        subscriptionId: `${platform}-adapter`,
+        idleTimeoutMs: 10_000,
+      });
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestReply,
+        {},
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: platform,
+          },
+        },
+      );
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputDeltaText,
+        { delta: "Commentary.", phase: "commentary" },
+        { headers: { request_id: requestId } },
+      );
+      await bus.publish(
+        lilacEventTypes.CmdSurfaceOutputReanchor,
+        { inheritReplyTo: true },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: platform,
+          },
+        },
+      );
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputDeltaText,
+        {
+          delta: "\n\nFinal answer.",
+          phase: "final_answer",
+          phaseBoundaryPrefixChars: 2,
+        },
+        { headers: { request_id: requestId } },
+      );
+      await bus.publish(
+        lilacEventTypes.EvtAgentOutputResponseText,
+        { finalText: "Commentary.\n\nFinal answer." },
+        { headers: { request_id: requestId } },
+      );
+
+      expect(adapter.streams).toHaveLength(2);
+      expect(adapter.streams[1]?.parts).toEqual([
+        { type: "text.delta", delta: "\n\nFinal answer." },
+        { type: "text.set", text: "Final answer." },
+      ]);
+      expect(adapter.streams[1]?.finished).toBe(true);
+      await bridge.stop();
+    });
+  }
+
   it("defers OpenAI phase splitting until terminal finalization", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -2229,6 +2295,45 @@ describe("bridgeBusToAdapter", () => {
       detailText: "**Summary**\nitem",
     });
 
+    await bridge.stop();
+  });
+
+  it("restores Telegram reasoning status from snapshot", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "telegram",
+      subscriptionId: "telegram-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await bridge.restoreRelays([
+      {
+        requestId: "telegram:1001:42",
+        sessionId: "1001",
+        requestClient: "telegram",
+        platform: "telegram",
+        createdOutputRefs: [],
+        visibleText: "already visible",
+        reasoning: {
+          startedAtMs: 10_000,
+          frozenAtMs: 10_250,
+          detailText: "**Summary**\nitem",
+        },
+        toolStatus: [],
+      },
+    ]);
+
+    expect(adapter.stream?.parts).toContainEqual({
+      type: "reasoning.status",
+      update: {
+        startedAtMs: 10_000,
+        frozenAtMs: 10_250,
+        detailText: "**Summary**\nitem",
+      },
+    });
     await bridge.stop();
   });
 

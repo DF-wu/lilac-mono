@@ -1,3 +1,4 @@
+import type { SurfacePrincipalPlatform } from "../surface/types";
 import { createHash, randomBytes } from "node:crypto";
 import type { NativeSubagentProfile } from "@stanley2058/lilac-utils";
 
@@ -6,6 +7,7 @@ type SafetyMode = "trusted" | "restricted";
 type RequestControlPolicyBase = {
   requestId: string;
   sessionId: string;
+  originSessionId?: string;
   platform: string;
   canonicalCwd: string;
   safetyMode: SafetyMode;
@@ -32,7 +34,7 @@ export type RequestControlPolicy = RequestControlPolicyBase &
   (
     | {
         kind: "primary";
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
         allowedCallables: null;
       }
     | {

@@ -1,5 +1,6 @@
 /* oxlint-disable eslint/no-control-regex */
 
+import { isSurfacePrincipalPlatform, type SurfacePrincipalPlatform } from "../types";
 import {
   type CallWarning,
   type FinishReason,
@@ -1950,20 +1951,23 @@ export async function startBusAgentRunner(params: {
   issueControlCapability?: (input: {
     requestId: string;
     sessionId: string;
+    originSessionId?: string;
     requestClient: AdapterPlatform;
     profile: AgentRunProfile;
     canonicalCwd: string;
     safetyMode: SessionSafetyMode;
     expiresAt: number;
-    principal?: { platform: "discord" | "github"; userId: string };
+    principal?: { platform: SurfacePrincipalPlatform; userId: string };
   }) =>
     | {
         capability: string;
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        originSessionId?: string;
+        principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
       }
     | Promise<{
         capability: string;
-        principal: { platform: "discord" | "github"; userId: string } | null;
+        originSessionId?: string;
+        principal: { platform: SurfacePrincipalPlatform; userId: string } | null;
       }>;
   issueHeartbeatCapability?: (input: {
     requestId: string;
@@ -2755,6 +2759,7 @@ export async function startBusAgentRunner(params: {
     let workflowClaimTimer: ReturnType<typeof setInterval> | null = null;
     let preserveWorkflowClaim = false;
     let controlCapability: string | null = null;
+    let controlOriginSessionId: string | undefined;
     let trustedFallbackSurface: TrustedSubagentDelegationRegistration["fallbackSurface"] | null =
       null;
     const subagents = cfg.agent.subagents;
@@ -3032,8 +3037,7 @@ export async function startBusAgentRunner(params: {
         workflowPolicy = authorized.policy;
         trustedFallbackSurface =
           authorized.policy.originSession.sessionId &&
-          (authorized.policy.originSession.client === "discord" ||
-            authorized.policy.originSession.client === "github") &&
+          isSurfacePrincipalPlatform(authorized.policy.originSession.client) &&
           authorized.policy.originSession.userId
             ? {
                 platform: authorized.policy.originSession.client,
@@ -3304,20 +3308,20 @@ export async function startBusAgentRunner(params: {
         if (!controlCapability) {
           throw new Error("Heartbeat request is missing server-issued Level-2 authority");
         }
-      } else if (
-        workflowPolicy ||
-        next.requestClient === "discord" ||
-        next.requestClient === "github"
-      ) {
+      } else if (workflowPolicy || isSurfacePrincipalPlatform(next.requestClient)) {
         const capabilityPrincipal = trustedFallbackSurface
           ? {
               platform: trustedFallbackSurface.platform,
               userId: trustedFallbackSurface.userId,
             }
           : undefined;
+        const requestedOriginSessionId = workflowPolicy
+          ? (workflowPolicy.originSession.sessionId ?? undefined)
+          : (trustedFallbackSurface?.sessionId ?? next.sessionId);
         const issuedControl = await params.issueControlCapability?.({
           requestId: next.requestId,
           sessionId: next.sessionId,
+          ...(requestedOriginSessionId ? { originSessionId: requestedOriginSessionId } : {}),
           requestClient: next.requestClient,
           profile: runProfile,
           canonicalCwd: workflowPolicy?.cwd ?? cwd,
@@ -3331,10 +3335,15 @@ export async function startBusAgentRunner(params: {
           );
         }
         controlCapability = issuedControl.capability;
-        if (issuedControl.principal) {
+        controlOriginSessionId = issuedControl.originSessionId;
+        if (
+          issuedControl.principal &&
+          !trustedFallbackSurface &&
+          isSurfacePrincipalPlatform(next.requestClient)
+        ) {
           trustedFallbackSurface = {
             platform: issuedControl.principal.platform,
-            sessionId: next.sessionId,
+            sessionId: controlOriginSessionId ?? next.sessionId,
             userId: issuedControl.principal.userId,
           };
         }
@@ -3559,6 +3568,7 @@ export async function startBusAgentRunner(params: {
             requestContext: {
               requestId: next.requestId,
               sessionId: next.sessionId,
+              ...(controlOriginSessionId ? { originSessionId: controlOriginSessionId } : {}),
               requestClient: next.requestClient,
               subagentDepth: subagentMeta.depth,
               subagentProfile: runProfile,

@@ -10,11 +10,12 @@ import {
   type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
 import type { SurfaceAdapter } from "../adapter";
-import type { MsgRef, SurfaceMessage } from "../types";
+import type { MsgRef, RoutedSurfacePlatform, SessionRef, SurfaceMessage } from "../types";
 
 import {
   parseLeadingContinueDirective,
   stripLeadingContinueDirective,
+  isRoutedSurfacePlatform,
 } from "./bus-request-router/common";
 import {
   isDiscordSessionDividerSurfaceMessageAnyAuthor,
@@ -37,7 +38,7 @@ import {
 } from "./request-composition/attachments";
 import { selectNewestReachableCheckpoint } from "./request-composition/checkpoint-selection";
 import {
-  formatDiscordAttributionHeader,
+  formatSurfaceAttributionHeader,
   normalizeAssistantContextText,
   normalizeText,
 } from "./request-composition/normalization";
@@ -47,6 +48,7 @@ import {
   fetchReplyChainFrom,
   findEarliestReplyAnchor,
   getForwardSnapshotTextFromRaw,
+  hasReplyTargetInRaw,
   mergeChainByDiscordWindow,
   resolveMergeBlockEndingAt,
   toReplyChainMessage,
@@ -66,9 +68,6 @@ export type {
   ReplyChainMessage,
   RequestCompositionResult,
 } from "./request-composition/types";
-
-const DISCORD_REFERENCE_TYPE_FORWARD = 1;
-const DISCORD_SURFACE_ID_PREFIX = "discord:";
 
 type ProjectionCapableStore = TranscriptStore &
   Required<
@@ -94,14 +93,18 @@ function isProjectionCapableStore(
   );
 }
 
-function surfaceIdForDiscordSession(sessionId: string): string {
-  return `${DISCORD_SURFACE_ID_PREFIX}${sessionId}`;
+function surfaceIdForSession(platform: RoutedSurfacePlatform, sessionId: string): string {
+  return `${platform}:${sessionId}`;
 }
 
-function surfaceProjectionKey(sessionId: string, messageId: string) {
+function surfaceProjectionKey(
+  platform: RoutedSurfacePlatform,
+  sessionId: string,
+  messageId: string,
+) {
   return {
-    requestClient: "discord" as const,
-    surfaceId: surfaceIdForDiscordSession(sessionId),
+    requestClient: platform,
+    surfaceId: surfaceIdForSession(platform, sessionId),
     sessionId,
     messageId,
     projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
@@ -175,6 +178,7 @@ function storedNumberFact(
 }
 
 function collectStoredBoundaryBreaks(input: {
+  platform: RoutedSurfacePlatform;
   chain: readonly ReplyChainMessage[];
   sessionId: string;
   projections: ReadonlyMap<string, CoreSurfaceProjection | null>;
@@ -182,7 +186,7 @@ function collectStoredBoundaryBreaks(input: {
 }): Set<string> {
   const boundaryKeys = input.chain.map((message) => {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
-      surfaceProjectionKey(input.sessionId, message.messageId),
+      surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
     );
     if (stored) return `${stored.requestId}:${stored.segmentIndex}`;
     const admittedIds = storedProjectionSegmentIds(
@@ -238,6 +242,7 @@ function appendPersistedSyntheticSuffix(input: {
 }
 
 async function renderSurfaceProjectionCandidate(input: {
+  platform: RoutedSurfacePlatform;
   message: ReplyChainMessage;
   isBot: boolean;
   sessionId: string;
@@ -258,10 +263,14 @@ async function renderSurfaceProjectionCandidate(input: {
     };
   }
 
-  const header = formatDiscordAttributionHeader({
+  const header = formatSurfaceAttributionHeader({
+    platform: input.platform,
     authorId: input.message.authorId,
     authorName: input.message.authorName,
-    userAlias: input.discordUserAliasById?.get(input.message.authorId),
+    userAlias:
+      input.platform === "discord"
+        ? input.discordUserAliasById?.get(input.message.authorId)
+        : undefined,
     messageId: input.message.messageId,
     messageTs: input.message.ts,
     reactions: input.reactions,
@@ -283,8 +292,9 @@ async function renderSurfaceProjectionCandidate(input: {
   };
 }
 
-async function composeSelectedDiscordChain(input: {
+async function composeSelectedSurfaceChain(input: {
   adapter: SurfaceAdapter;
+  platform: RoutedSurfacePlatform;
   sessionId: string;
   botUserId: string;
   chain: readonly ReplyChainMessage[];
@@ -312,7 +322,7 @@ async function composeSelectedDiscordChain(input: {
       projections.set(
         message.messageId,
         projectionStore?.getCoreSurfaceProjection(
-          surfaceProjectionKey(input.sessionId, message.messageId),
+          surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
         ) ?? null,
       );
     }
@@ -327,6 +337,7 @@ async function composeSelectedDiscordChain(input: {
       };
     });
     const hardBreaks = collectStoredBoundaryBreaks({
+      platform: input.platform,
       chain: immutableChain,
       sessionId: input.sessionId,
       projections,
@@ -346,7 +357,7 @@ async function composeSelectedDiscordChain(input: {
       .map(
         (message) =>
           ({
-            platform: "discord",
+            platform: input.platform,
             channelId: input.sessionId,
             messageId: message.messageId,
           }) satisfies MsgRef,
@@ -364,7 +375,7 @@ async function composeSelectedDiscordChain(input: {
       for (const message of immutableChain) {
         if (message.authorId !== input.botUserId) continue;
         const snapshot = resolveTranscriptSnapshot({
-          platform: "discord",
+          platform: input.platform,
           channelId: input.sessionId,
           messageId: message.messageId,
           transcriptStore: input.transcriptStore,
@@ -372,7 +383,7 @@ async function composeSelectedDiscordChain(input: {
             input.checkpointSelection.resolvedSnapshotsBySurfaceMessageId,
         });
         if (!snapshot) continue;
-        if (snapshot.requestClient !== "discord" || snapshot.sessionId !== input.sessionId) {
+        if (snapshot.requestClient !== input.platform || snapshot.sessionId !== input.sessionId) {
           lineageComplete = false;
           continue;
         }
@@ -391,8 +402,10 @@ async function composeSelectedDiscordChain(input: {
           continue;
         }
         const source = messageById.get(messageId);
-        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        if (!source)
+          throw new Error(`Selected ${input.platform} message '${messageId}' was not found`);
         const candidate = await renderSurfaceProjectionCandidate({
+          platform: input.platform,
           message: source,
           isBot: source.authorId === input.botUserId,
           sessionId: input.sessionId,
@@ -434,13 +447,14 @@ async function composeSelectedDiscordChain(input: {
       for (const messageId of chunk.messageIds) {
         if (projections.get(messageId) || !projectionStore) continue;
         const source = messageById.get(messageId);
-        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        if (!source)
+          throw new Error(`Selected ${input.platform} message '${messageId}' was not found`);
         const segmentMessageIds = projectionSegmentIdsByMessageId.get(messageId) ?? [messageId];
         const segmentMessages = mergeProjectedSurfaceMessages(
           segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
         );
         const admitted = projectionStore.admitCoreSurfaceProjection({
-          ...surfaceProjectionKey(input.sessionId, messageId),
+          ...surfaceProjectionKey(input.platform, input.sessionId, messageId),
           canonicalMessages: projectedByMessageId.get(messageId) ?? [],
           sourceFacts: {
             authorId: source.authorId,
@@ -478,8 +492,8 @@ async function composeSelectedDiscordChain(input: {
           (messageId) =>
             ({
               kind: "surface",
-              requestClient: "discord",
-              surfaceId: surfaceIdForDiscordSession(input.sessionId),
+              requestClient: input.platform,
+              surfaceId: surfaceIdForSession(input.platform, input.sessionId),
               sessionId: input.sessionId,
               messageId,
             }) satisfies CoreLineageAtomV1,
@@ -530,8 +544,8 @@ async function composeSelectedDiscordChain(input: {
         };
         const aliases = [...new Set(aliasMessageIdsByRequestId.get(snapshot.requestId) ?? [])].map(
           (aliasMessageId) => ({
-            requestClient: "discord",
-            surfaceId: surfaceIdForDiscordSession(input.sessionId),
+            requestClient: input.platform,
+            surfaceId: surfaceIdForSession(input.platform, input.sessionId),
             sessionId: input.sessionId,
             messageId: aliasMessageId,
           }),
@@ -591,7 +605,7 @@ async function composeSelectedDiscordChain(input: {
 
 function resolveTranscriptSnapshot(input: {
   messageId: string;
-  platform: "discord";
+  platform: RoutedSurfacePlatform;
   channelId: string;
   transcriptStore: TranscriptStore;
   resolvedSnapshotsBySurfaceMessageId: ReadonlyMap<string, TranscriptSnapshot | null>;
@@ -667,48 +681,8 @@ function getSurfaceMessageContextText(message: SurfaceMessage): string {
     : (getForwardSnapshotTextFromRaw(message.raw) ?? message.text);
 }
 
-function getSurfaceMessageReplyTargetId(message: SurfaceMessage): string | undefined {
-  const raw = message.raw;
-  if (!raw || typeof raw !== "object") return undefined;
-
-  const o = raw as Record<string, unknown>;
-
-  if ("reference" in o) {
-    const ref = o.reference;
-    if (ref && typeof ref === "object") {
-      const replyTargetId =
-        typeof (ref as Record<string, unknown>).messageId === "string"
-          ? ((ref as Record<string, unknown>).messageId as string)
-          : undefined;
-      const referenceType =
-        typeof (ref as Record<string, unknown>).type === "number"
-          ? ((ref as Record<string, unknown>).type as number)
-          : undefined;
-      if (replyTargetId && referenceType !== DISCORD_REFERENCE_TYPE_FORWARD) {
-        return replyTargetId;
-      }
-    }
-  }
-
-  const discord =
-    "discord" in o && o.discord && typeof o.discord === "object"
-      ? (o.discord as Record<string, unknown>)
-      : null;
-  if (!discord) return undefined;
-
-  const referenceType =
-    typeof discord.referenceType === "number" ? discord.referenceType : undefined;
-  const replyTargetId =
-    typeof discord.replyToMessageId === "string" ? discord.replyToMessageId : undefined;
-  if (!replyTargetId || referenceType === DISCORD_REFERENCE_TYPE_FORWARD) {
-    return undefined;
-  }
-
-  return replyTargetId;
-}
-
 function shouldApplyContinueDirectiveToSurfaceMessage(message: SurfaceMessage): boolean {
-  return getSurfaceMessageReplyTargetId(message) === undefined;
+  return !hasReplyTargetInRaw(message.raw);
 }
 
 function stripContinueDirectiveFromReplyChainMessage(input: {
@@ -772,10 +746,9 @@ async function listRecentMessagesEndingAt(params: {
     fetchedPreviousMessages: number;
   }) => boolean;
 }): Promise<SurfaceMessage[]> {
-  const sessionRef = {
-    platform: "discord",
-    channelId: params.sessionId,
-  } as const;
+  // The anchor already carries the session it belongs to; rebuilding a ref
+  // here would hardcode a platform.
+  const sessionRef = params.anchor.session;
 
   const previousMessageTargets = (() => {
     const requested = params.previousMessageTargets ?? [params.maxPreviousMessages];
@@ -1089,15 +1062,16 @@ function applyDiscordSessionDividerCutoffToReplyChain(params: {
 
 async function findLastDiscordSessionDividerBefore(params: {
   adapter: SurfaceAdapter;
+  platform: RoutedSurfacePlatform;
   channelId: string;
   botUserId: string;
   beforeMessageId: string;
   /** Optional: stop scanning once we see this message id. */
   stopAtMessageId?: string;
 }): Promise<{ ts: number; messageId: string } | null> {
-  const { adapter, channelId, botUserId, beforeMessageId, stopAtMessageId } = params;
+  const { adapter, platform, channelId, botUserId, beforeMessageId, stopAtMessageId } = params;
 
-  const sessionRef = { platform: "discord", channelId } as const;
+  const sessionRef: SessionRef = { platform, channelId };
 
   let cursor: string | undefined = beforeMessageId;
   let scanned = 0;
@@ -1216,7 +1190,7 @@ export async function composeRequestMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRequestOpts,
 ): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(opts.platform)) {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
 
@@ -1287,8 +1261,9 @@ export async function composeRequestMessages(
     getMessageId: (message) => message.messageId,
   });
 
-  const composed = await composeSelectedDiscordChain({
+  const composed = await composeSelectedSurfaceChain({
     adapter,
+    platform: opts.platform,
     sessionId: opts.trigger.msgRef.channelId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
@@ -1310,7 +1285,7 @@ export async function composeRecentChannelMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRecentChannelMessagesOpts,
 ): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(opts.platform)) {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
 
@@ -1341,6 +1316,7 @@ export async function composeRecentChannelMessages(
         const divider = oldestAnchoredMessageId
           ? await findLastDiscordSessionDividerBefore({
               adapter,
+              platform: opts.platform,
               channelId: opts.sessionId,
               botUserId: opts.botUserId,
               beforeMessageId: triggerMsg.ref.messageId,
@@ -1388,8 +1364,9 @@ export async function composeRecentChannelMessages(
           getAuthorId: (message) => message.authorId,
           getMessageId: (message) => message.messageId,
         });
-        const composed = await composeSelectedDiscordChain({
+        const composed = await composeSelectedSurfaceChain({
           adapter,
+          platform: opts.platform,
           sessionId: opts.sessionId,
           botUserId: opts.botUserId,
           chain: checkpointSelection.descendants,
@@ -1409,10 +1386,10 @@ export async function composeRecentChannelMessages(
     }
   }
 
-  const sessionRef = {
-    platform: "discord",
+  const sessionRef: SessionRef = {
+    platform: opts.platform,
     channelId: opts.sessionId,
-  } as const;
+  };
   const continueDirectiveBotNames = opts.botMentionNames ?? [opts.botName];
 
   // Active-burst rules are intended for "latest view" prompts, including
@@ -1549,8 +1526,9 @@ export async function composeRecentChannelMessages(
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
-  const composed = await composeSelectedDiscordChain({
+  const composed = await composeSelectedSurfaceChain({
     adapter,
+    platform: opts.platform,
     sessionId: opts.sessionId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
@@ -1586,7 +1564,7 @@ export async function composeSingleMessageWithLineage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
 ): Promise<RequestCompositionResult | null> {
-  if (opts.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(opts.platform)) {
     throw new Error(`Unsupported platform '${opts.platform}'`);
   }
 
@@ -1614,14 +1592,15 @@ export async function composeSingleMessageWithLineage(
   const checkpointSelection = selectNewestReachableCheckpoint({
     chainOldestToNewest: chain,
     botUserId: opts.botUserId,
-    platform: "discord",
+    platform: opts.platform,
     channelId: opts.msgRef.channelId,
     transcriptStore: opts.transcriptStore,
     getAuthorId: (message) => message.authorId,
     getMessageId: (message) => message.messageId,
   });
-  const composed = await composeSelectedDiscordChain({
+  const composed = await composeSelectedSurfaceChain({
     adapter,
+    platform: opts.platform,
     sessionId: opts.msgRef.channelId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,

@@ -5,8 +5,13 @@ import {
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 
-import type { MsgRef } from "../../types";
-import { formatGenericRequestId, formatQueuedRequestId } from "../request-ids";
+import type { MsgRef, RoutedSurfacePlatform } from "../../types";
+import {
+  formatDiscordMessageRequestId,
+  formatGenericRequestId,
+  formatQueuedRequestId,
+  formatTelegramMessageRequestId,
+} from "../request-ids";
 
 export type SessionMode = "mention" | "active";
 export type SessionSafetyMode = "trusted" | "restricted";
@@ -44,7 +49,19 @@ function hasNonSelfMentionToken(input: { text: string; botNames: readonly string
   return false;
 }
 
-export function resolveBotMentionNames(input: { cfg: CoreConfig; botUserId?: string }): string[] {
+export type { RoutedSurfacePlatform };
+
+export function isRoutedSurfacePlatform(x: unknown): x is RoutedSurfacePlatform {
+  return x === "discord" || x === "telegram";
+}
+
+export function resolveBotMentionNames(input: {
+  cfg: CoreConfig;
+  botUserId?: string;
+  platform?: RoutedSurfacePlatform;
+  /** Telegram handle; a second way users address the bot. */
+  botUsername?: string;
+}): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
 
@@ -58,9 +75,16 @@ export function resolveBotMentionNames(input: { cfg: CoreConfig; botUserId?: str
     out.push(sanitized);
   };
 
-  addName(input.cfg.surface.discord.botName);
+  const platform = input.platform ?? "discord";
+  addName(
+    platform === "telegram"
+      ? input.cfg.surface.telegram.botName
+      : input.cfg.surface.discord.botName,
+  );
+  addName(input.botUsername);
 
-  if (input.botUserId) {
+  // Entity aliases are keyed by Discord user id, so they only apply there.
+  if (platform === "discord" && input.botUserId) {
     const users = input.cfg.entity?.users ?? {};
     for (const [alias, rec] of Object.entries(users)) {
       const resolved = getDiscordUserAliasValue(rec);
@@ -236,16 +260,40 @@ export function bufferedPromptRequestIdForActiveRequest(activeRequestId: string)
   return formatQueuedRequestId(activeRequestId);
 }
 
-export function parseDiscordMsgRefFromAdapterEvent(data: {
+export function resolveSurfaceBotName(cfg: CoreConfig, platform: RoutedSurfacePlatform): string {
+  return platform === "telegram" ? cfg.surface.telegram.botName : cfg.surface.discord.botName;
+}
+
+/**
+ * Request id for a surface message. Each platform owns its own prefix so
+ * `parseRequestId` can recover the reply target from the id alone.
+ */
+export function formatSurfaceMessageRequestId(input: {
+  platform: RoutedSurfacePlatform;
+  sessionId: string;
+  messageId: string;
+}): string {
+  return input.platform === "telegram"
+    ? formatTelegramMessageRequestId({
+        sessionId: input.sessionId,
+        messageId: input.messageId,
+      })
+    : formatDiscordMessageRequestId({
+        channelId: input.sessionId,
+        messageId: input.messageId,
+      });
+}
+
+export function parseSurfaceMsgRefFromAdapterEvent(data: {
   platform: string;
   channelId: string;
   messageId: string;
 }): MsgRef {
-  if (data.platform !== "discord") {
+  if (!isRoutedSurfacePlatform(data.platform)) {
     throw new Error(`Unsupported platform '${data.platform}'`);
   }
   return {
-    platform: "discord",
+    platform: data.platform,
     channelId: data.channelId,
     messageId: data.messageId,
   };
@@ -365,7 +413,7 @@ export function buildDiscordUserAliasById(cfg: CoreConfig): Map<string, string> 
   return out;
 }
 
-export function getDiscordFlags(raw: unknown): {
+export type SurfaceRouterFlags = {
   isDMBased?: boolean;
   mentionsBot?: boolean;
   replyToBot?: boolean;
@@ -373,12 +421,24 @@ export function getDiscordFlags(raw: unknown): {
   parentChannelId?: string;
   sessionModelOverride?: string;
   botUserId?: string;
-} {
-  if (!raw || typeof raw !== "object") return {};
-  const discord = (raw as { discord?: unknown }).discord;
-  if (!discord || typeof discord !== "object") return {};
+};
 
-  const o = discord as Record<string, unknown>;
+/**
+ * Reads the router flag envelope an adapter attaches to `raw`.
+ *
+ * Each adapter publishes its flags under a key named after its platform
+ * (`raw.discord`, `raw.telegram`) with the same structure, so the router can
+ * stay platform-agnostic while adapters keep their own normalization.
+ */
+export function getSurfaceFlags(
+  raw: unknown,
+  platform: RoutedSurfacePlatform = "discord",
+): SurfaceRouterFlags {
+  if (!raw || typeof raw !== "object") return {};
+  const envelope = (raw as Record<string, unknown>)[platform];
+  if (!envelope || typeof envelope !== "object") return {};
+
+  const o = envelope as Record<string, unknown>;
 
   return {
     isDMBased: typeof o.isDMBased === "boolean" ? o.isDMBased : undefined,

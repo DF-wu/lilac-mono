@@ -17,9 +17,16 @@ import {
   composeRequestMessages,
   composeSingleMessageWithLineage,
 } from "../request-composition";
-import { buildDiscordUserAliasById, previewText, type SessionMode } from "./common";
+import {
+  buildDiscordUserAliasById,
+  previewText,
+  resolveSurfaceBotName,
+  type RoutedSurfacePlatform,
+  type SessionMode,
+} from "./common";
 
 export type PublishBusRequestInput = {
+  platform: RoutedSurfacePlatform;
   requestId: string;
   sessionId: string;
   sessionConfigId: string;
@@ -92,7 +99,7 @@ export async function publishBusRequest(params: {
       headers: {
         request_id: params.input.requestId,
         session_id: params.input.sessionId,
-        request_client: "discord",
+        request_client: params.input.platform,
       },
     },
   );
@@ -105,6 +112,7 @@ export async function publishComposedRequest(params: {
   transcriptStore?: TranscriptStore;
   logger: Logger;
   input: {
+    platform: RoutedSurfacePlatform;
     requestId: string;
     sessionId: string;
     sessionConfigId: string;
@@ -124,9 +132,9 @@ export async function publishComposedRequest(params: {
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
   const composed = await composeRequestMessages(params.adapter, {
-    platform: "discord",
+    platform: params.input.platform,
     botUserId: self.userId,
-    botName: params.cfg.surface.discord.botName,
+    botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     transcriptStore: params.transcriptStore,
     currentRequestId: params.input.requestId,
     currentMessageIds: params.input.currentMessageIds ?? [params.input.msgRef.messageId],
@@ -143,6 +151,7 @@ export async function publishComposedRequest(params: {
     logger: params.logger,
     bus: params.bus,
     input: {
+      platform: params.input.platform,
       requestId: params.input.requestId,
       sessionId: params.input.sessionId,
       sessionConfigId: params.input.sessionConfigId,
@@ -155,7 +164,7 @@ export async function publishComposedRequest(params: {
       corePrimaryLineage: composed.corePrimaryLineage,
       raw: {
         authenticatedOrigin: {
-          platform: "discord",
+          platform: params.input.platform,
           userId: params.input.userId,
           messageRef: params.input.msgRef,
         },
@@ -178,6 +187,7 @@ export async function publishActiveChannelPrompt(params: {
   transcriptStore?: TranscriptStore;
   logger: Logger;
   input: {
+    platform: RoutedSurfacePlatform;
     requestId: string;
     sessionId: string;
     sessionConfigId: string;
@@ -198,9 +208,9 @@ export async function publishActiveChannelPrompt(params: {
   const composed =
     params.input.triggerMsgRef && params.input.triggerType === "reply"
       ? await composeRequestMessages(params.adapter, {
-          platform: "discord",
+          platform: params.input.platform,
           botUserId: self.userId,
-          botName: params.cfg.surface.discord.botName,
+          botName: resolveSurfaceBotName(params.cfg, params.input.platform),
           transcriptStore: params.transcriptStore,
           currentRequestId: params.input.requestId,
           currentMessageIds:
@@ -215,10 +225,10 @@ export async function publishActiveChannelPrompt(params: {
           },
         })
       : await composeRecentChannelMessages(params.adapter, {
-          platform: "discord",
+          platform: params.input.platform,
           sessionId: params.input.sessionId,
           botUserId: self.userId,
-          botName: params.cfg.surface.discord.botName,
+          botName: resolveSurfaceBotName(params.cfg, params.input.platform),
           botMentionNames: params.input.botMentionNames,
           limit: 8,
           transcriptStore: params.transcriptStore,
@@ -241,6 +251,7 @@ export async function publishActiveChannelPrompt(params: {
     logger: params.logger,
     bus: params.bus,
     input: {
+      platform: params.input.platform,
       requestId: params.input.requestId,
       sessionId: params.input.sessionId,
       sessionConfigId: params.input.sessionConfigId,
@@ -255,7 +266,7 @@ export async function publishActiveChannelPrompt(params: {
         ...(originMessage && params.input.triggerMsgRef
           ? {
               authenticatedOrigin: {
-                platform: "discord" as const,
+                platform: params.input.platform,
                 userId: originMessage.userId,
                 messageRef: params.input.triggerMsgRef,
               },
@@ -280,6 +291,7 @@ export async function publishSingleMessageToActiveRequest(params: {
   transcriptStore?: TranscriptStore;
   logger: Logger;
   input: {
+    platform: RoutedSurfacePlatform;
     requestId: string;
     sessionId: string;
     sessionConfigId: string;
@@ -295,9 +307,9 @@ export async function publishSingleMessageToActiveRequest(params: {
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
   const composed = await composeSingleMessageWithLineage(params.adapter, {
-    platform: "discord",
+    platform: params.input.platform,
     botUserId: self.userId,
-    botName: params.cfg.surface.discord.botName,
+    botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     msgRef: params.input.msgRef,
     discordUserAliasById,
     transcriptStore: params.transcriptStore,
@@ -312,6 +324,7 @@ export async function publishSingleMessageToActiveRequest(params: {
     logger: params.logger,
     bus: params.bus,
     input: {
+      platform: params.input.platform,
       requestId: params.input.requestId,
       sessionId: params.input.sessionId,
       sessionConfigId: params.input.sessionConfigId,
@@ -326,7 +339,7 @@ export async function publishSingleMessageToActiveRequest(params: {
         ...(surfaceMessage
           ? {
               authenticatedOrigin: {
-                platform: "discord" as const,
+                platform: params.input.platform,
                 userId: surfaceMessage.userId,
                 messageRef: params.input.msgRef,
               },
@@ -348,6 +361,7 @@ export async function publishSingleMessagePrompt(params: {
   transcriptStore?: TranscriptStore;
   logger: Logger;
   input: {
+    platform: RoutedSurfacePlatform;
     requestId: string;
     sessionId: string;
     sessionConfigId: string;
@@ -363,9 +377,9 @@ export async function publishSingleMessagePrompt(params: {
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
 
   const composed = await composeSingleMessageWithLineage(params.adapter, {
-    platform: "discord",
+    platform: params.input.platform,
     botUserId: self.userId,
-    botName: params.cfg.surface.discord.botName,
+    botName: resolveSurfaceBotName(params.cfg, params.input.platform),
     msgRef: params.input.msgRef,
     discordUserAliasById,
     transcriptStore: params.transcriptStore,
@@ -380,6 +394,7 @@ export async function publishSingleMessagePrompt(params: {
     logger: params.logger,
     bus: params.bus,
     input: {
+      platform: params.input.platform,
       requestId: params.input.requestId,
       sessionId: params.input.sessionId,
       sessionConfigId: params.input.sessionConfigId,
@@ -394,7 +409,7 @@ export async function publishSingleMessagePrompt(params: {
         ...(surfaceMessage
           ? {
               authenticatedOrigin: {
-                platform: "discord" as const,
+                platform: params.input.platform,
                 userId: surfaceMessage.userId,
                 messageRef: params.input.msgRef,
               },
@@ -413,6 +428,7 @@ export async function publishSingleMessagePrompt(params: {
 
 export async function publishSurfaceOutputReanchor(input: {
   bus: LilacBus;
+  platform: RoutedSurfacePlatform;
   requestId: string;
   sessionId: string;
   inheritReplyTo: boolean;
@@ -436,7 +452,7 @@ export async function publishSurfaceOutputReanchor(input: {
       headers: {
         request_id: input.requestId,
         session_id: input.sessionId,
-        request_client: "discord",
+        request_client: input.platform,
       },
     },
   );

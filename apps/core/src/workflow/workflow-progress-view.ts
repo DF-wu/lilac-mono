@@ -372,7 +372,7 @@ export function renderWorkflowProgressView(input: {
   view: WorkflowProgressView;
   platform: SurfacePlatform;
   actions: SurfaceAction[];
-}): { text: string; actions: SurfaceAction[]; attachments: [] } {
+}): { text: string; format: "markdown"; actions: SurfaceAction[]; attachments: [] } {
   const view = input.view;
   const terminal = ["succeeded", "failed", "cancelled"].includes(view.run.state);
   const lines = [
@@ -483,6 +483,7 @@ export function renderWorkflowProgressView(input: {
 
   return {
     text: bounded(lines.join("\n"), 4_000),
+    format: "markdown",
     actions: input.actions,
     attachments: [],
   };

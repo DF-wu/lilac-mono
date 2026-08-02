@@ -1,8 +1,10 @@
+import type { RoutedSurfacePlatform } from "../../types";
 import type { MsgRef, SurfaceMessage } from "../../types";
 
 import { hasReplyChainPlannerProvider, type SurfaceAdapter } from "../../adapter";
 import { buildDiscordRichTextFromContentAndEmbeds } from "../../discord/discord-embed-text";
 import { normalizeDiscordRaw } from "../../discord/discord-raw-normalizer";
+import { normalizeTelegramReplyReference } from "../../telegram/telegram-raw";
 
 import { splitByDiscordWindowOldestToNewest } from "../../discord/merge-window";
 
@@ -46,11 +48,16 @@ function getReferenceFromRaw(raw: unknown): {
   messageId?: string;
   channelId?: string;
 } {
-  const replyReference = normalizeDiscordRaw(raw)?.replyReference;
-  return replyReference ?? {};
+  // Each adapter publishes its own envelope shape, so try them in turn rather
+  // than assuming Discord. Without the Telegram branch, chain traversal stops
+  // at the trigger message and replies lose their ancestors.
+  const discordReference = normalizeDiscordRaw(raw)?.replyReference;
+  if (discordReference) return discordReference;
+
+  return normalizeTelegramReplyReference(raw) ?? {};
 }
 
-function hasReplyTargetInRaw(raw: unknown): boolean {
+export function hasReplyTargetInRaw(raw: unknown): boolean {
   return typeof getReferenceFromRaw(raw).messageId === "string";
 }
 
@@ -238,7 +245,7 @@ export function findEarliestReplyAnchor(block: readonly SurfaceMessage[]): Surfa
 export async function fetchReplyChainFrom(
   adapter: SurfaceAdapter,
   opts: {
-    platform: "discord";
+    platform: RoutedSurfacePlatform;
     botUserId: string;
     botName: string;
     trigger: { type: "mention" | "reply"; msgRef: MsgRef };
@@ -352,7 +359,7 @@ export async function fetchReplyChainFrom(
 export async function fetchMentionThreadContext(
   adapter: SurfaceAdapter,
   params: {
-    platform: "discord";
+    platform: RoutedSurfacePlatform;
     botUserId: string;
     botName: string;
     triggerMsg: SurfaceMessage;

@@ -25,6 +25,10 @@ const replyMetadataSchema = z
       .object({ replyToMessageId: z.string().min(1).optional() })
       .passthrough()
       .optional(),
+    telegram: z
+      .object({ replyToMessageId: z.string().min(1).optional() })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 
@@ -39,6 +43,7 @@ function replyToMessageId(raw: unknown): string | null {
     parsed.data.replyToMessageId ??
     parsed.data.discord?.replyToMessageId ??
     parsed.data.github?.replyToMessageId ??
+    parsed.data.telegram?.replyToMessageId ??
     null
   );
 }
