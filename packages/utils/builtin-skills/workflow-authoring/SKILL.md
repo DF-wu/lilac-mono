@@ -1,6 +1,6 @@
 ---
 name: workflow-authoring
-description: Author durable Lilac JavaScript workflows for fan-out, iterative repair, verification, Discord reply waits, delayed work, and recurring schedules.
+description: Author durable Lilac JavaScript workflows for fan-out, iterative repair, verification, Discord or Telegram reply waits, delayed work, and recurring schedules.
 ---
 
 # Workflow Authoring
@@ -91,7 +91,7 @@ Read [REFERENCE.md](REFERENCE.md) only when you need exact schema keywords, boun
 - `pipeline(items, callback, options?)` maps in stable item order. Concurrency defaults to `1`; set `{ concurrency }` for bounded fan-out.
 - `parallel(promises)` journals and joins already-created promises. It has no options.
 - `phase(name, callback)` groups operations for progress and deterministic scoping.
-- `waitForReply(options)` creates a durable authenticated-origin Discord wait and requires `waits: ["reply"]`. `prompt` labels progress but sends no message. The resolved object contains `platform`, `channelId`, `messageId`, `userId`, optional `userName`, `text`, and `ts`.
+- `waitForReply(options)` creates a durable authenticated-origin Discord or Telegram wait and requires `waits: ["reply"]`. It is restricted to the run's originating platform, session, and user. `prompt` labels progress but sends no message. `messageId`, when supplied, requires a direct reply to that message. A matching event resumes only the workflow and is normally suppressed from ordinary routing; the router fails open if the suppression hook itself fails. The resolved object contains `platform`, `channelId`, `messageId`, `userId`, optional `userName`, `text`, and `ts`.
 - `sleep(value)` creates a durable timer and requires `waits: ["sleep"]`. Values below `100000000000` are duration milliseconds; values at or above it are epoch milliseconds. ISO timestamps are accepted.
 
 Agent operations can run concurrently against the same cwd. Serialize dependent edits or use distinct directories.
