@@ -26,6 +26,8 @@ This document explains where things live, the words used in code, and the projec
 
 Workspace roots are Bun workspaces (`apps/*`, `packages/*`). `ref/` contains vendored upstreams as git submodules and is treated as read-only.
 
+External data is decoded at registered trust-boundary adapters into typed internal values, and expected failures travel as Results; exception and Panic mechanics are restricted to registered framework and defect boundaries. The standalone semantic checker and its architecture manifest live under `scripts/architecture/`.
+
 - `apps/core/`
   - The core runtime process (Discord + optional GitHub surfaces, event bus, router, agent runner, unified workflow engine, tool server, and runtime recovery/search services).
   - Entry: `apps/core/src/runtime/main.ts` (starts/stops `createCoreRuntime()`).

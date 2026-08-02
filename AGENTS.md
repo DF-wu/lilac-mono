@@ -7,7 +7,7 @@
 - Markdown plans/todos in `plan/*`.
 - Project mental model / terminology: search `PROJECT.md`.
 - `ref/` contains vendored/reference projects. Treat as read-only references.
-- Treat project as greenfield, breaking changes are usually ok. Consult with user whether to include backwards compatibility when introducing breaking changes.
+- Treat private internal APIs as greenfield and generally free to break. Preserve existing wire, persisted-data, filesystem-tool, and plugin contracts unless a separate compatibility change is explicitly approved.
 
 ## Finding Type Definitions (Bun + symlinks)
 
@@ -77,20 +77,39 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 
 ### Types (important)
 
-- ALWAYS prefer `zod` over manual type assertions/narrowing.
 - **No `any`** and **no `as any`**.
-  - If you must bridge unknown data, use `unknown` + narrowing.
-  - Prefer using `zod` schemas to parse/validate `unknown` at boundaries (tool inputs, JSON/YAML, external APIs) when possible.
-  - Prefer user-defined type guards:
-    - `function isFoo(x: unknown): x is Foo { ... }`
-- Prefer type narrowing over casting (`as Foo`) when possible.
 - Prefer unions and discriminated unions for error/results.
-- Avoid erasing discriminated unions by narrowing to generic shapes on values that are already strongly typed; prefer checking the discriminant (`part.type === "tool-result"`) or use a type guard that returns the precise union member.
-- Never introduce new `isRecord` helpers, use centralized utils instead.
-- Avoid `as unknown as SomeType` casts that effectively act like `as any` (they hide concrete types and break narrowing). Prefer proper narrowing, precise type guards, or compiler-assisted inspection (e.g. typehint) to find the real type.
 - Prefer `Record<string, T>` to `{ [k: string]: T }`.
 - Prefer `readonly T[]` when you don’t mutate.
 - Use `satisfies` when validating object shapes without widening.
+
+### Trust boundaries and runtime validation
+
+- Keep `unknown` at real trust boundaries. Decode it immediately and return a typed value.
+- Do not accept `unknown` in an internal function merely because its caller received external data. Decode in the caller's boundary adapter and type the internal parameter.
+- Decode again across each process, wire, persistence, plugin, or SDK boundary.
+- Use Zod for rich external structures. Validate the complete envelope and every payload field used after parsing.
+- Do not call `parse` or `safeParse` in ordinary service, domain, orchestration, or render functions. Use a registered boundary decoder, projection, or persistence codec; domain constructors accept typed values.
+- Keep boundary schemas and `z.output` types together. Use `z.input` explicitly when input and output differ.
+- Do not write generic `parseJson<T>` helpers that establish `T` only through an assertion.
+- Persisted-data codecs must explicitly handle valid current data, supported legacy data, unsupported versions, malformed serialization, and corrupt fields.
+
+### Predicates and unions
+
+- Use `isX` for semantic predicates over typed values or exact capability checks.
+- Do not use a partial `isX(value: unknown): value is RichType` guard. Use a complete schema-backed decoder when downstream code relies on a rich structure.
+- For project-owned discriminated unions, prefer direct discriminant checks, exhaustive switches, or precise `Extract`-based predicates.
+- Never add a local `isRecord`; use the centralized utility only for small boundary inspections.
+- Do not write nested ternaries. Extract the decision or use a switch.
+- Treat project-owned unions as closed and handle every member with an exhaustive switch or exhaustive typed map. Do not hide an unhandled member behind a silent `default`, generic fallback, or final ternary arm.
+- Treat third-party/open protocols as open only in their adapter. Normalize unknown variants to an explicit local fallback before internal use.
+
+### Assertions
+
+- Never cast `unknown` to a structured domain type and never use `as unknown as T`.
+- A cast is not a substitute for boundary validation or a typed function signature.
+- Assertions are allowed only for documented representation-preserving bridges where the source is already typed and TypeScript cannot express the relationship.
+- Prefer fixing producer and consumer signatures over adding a cast or guard.
 
 ### Imports
 
@@ -106,16 +125,33 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - Types/interfaces/classes: `PascalCase`.
 - Constants: `UPPER_SNAKE_CASE`.
 
-### Error handling
+### Errors as values
 
-- Convert unknown caught values safely:
-  - e.g., `const msg = e instanceof Error ? e.message : String(e)`
-  - For known error shapes, ensure logged error message is informative and traceable.
-- Avoid swallowing errors silently.
-- For library-like code:
-  - Throw for programmer/configuration errors.
-  - For runtime/IO failures, either throw with context or return a typed error object.
-- Avoid leaking secrets in logs; redact tokens/keys when printing command/env data.
+- Return expected failures as `Result<T, E>` or `Promise<Result<T, E>>`; do not throw or reject them.
+- Use `better-result` directly. The root catalog pins the exact version and every importing workspace declares `"better-result": "catalog:"`.
+- Define expected error variants in the owning domain's vocabulary. Prefer `TaggedError` variants with stable `_tag` discriminants over strings or generic `Error`.
+- Instantiate a `TaggedError` and return it with `Result.err`; never throw it.
+- Catch an external exception only in the smallest immediate adapter and map it to a specific typed error. Do not pass `unknown`, `UnhandledException`, SDK errors, or driver errors to consumers.
+- Use `Result.gen` and `Result.await` for multi-step linear workflows. Keep effects in named Result-returning functions and generator bodies declarative.
+- Use direct `result.status` branching for one or two steps. Handle or translate the complete error union at the next policy boundary.
+- Do not use `unwrap`, unsafe Result codecs, or generic `Result.try`/`tryPromise` in production flow.
+- Keep Result callbacks total. Capture throwing or rejecting operations before passing values into combinators, collection helpers, or a Result generator.
+- For a stream that can fail after yielding data, use `AsyncIterable<Result<TChunk, TTerminalError>>`; yield one terminal Err and close rather than rejecting for an expected failure.
+- Use Panic only for an individually registered unrecoverable defect or hard invariant. Never convert a Panic to an ordinary Err.
+- Do not wrap total helpers in Result or flatten meaningful state-machine outcomes such as cancelled, stale, expired, or skipped into generic success/error.
+- Do not serialize `better-result` objects or TaggedErrors onto existing contracts. Map them to the existing wire, storage, tool, or plugin representation at its compatibility adapter.
+- Never pass a TaggedError to implicit `JSON.stringify` or generic structured logging because `toJSON()` includes `cause`. Emit only an approved tag, message, and explicitly safe fields. Until the Stage 1 repository formatter lands, construct that safe representation explicitly; afterward, use the formatter.
+- Avoid leaking secrets in logs; redact tokens and keys when printing command or environment data.
+
+### Framework edges
+
+- `try/finally` is allowed for cleanup; catch clauses are restricted to registered adapters and defect supervisors.
+- A result-to-framework adapter may signal an exception only when the host contract requires rollback, delivery parking, stream termination, or callback failure.
+- SQLite transaction bodies must not return Err after partial writes unless a transaction adapter turns that Err into a private rollback sentinel and converts it back immediately outside.
+- Event handlers return typed delivery Results. After migration, subscription policy maps each error to commit, park-pending, dead-letter, or stop; handlers do not acknowledge messages directly.
+- Cancellation is a typed expected result. Capture external abort rejections using the exact owned `AbortSignal`; do not classify arbitrary errors solely by an `AbortError` name.
+- If `Result.tryPromise` stops an aborted retry delay, return its latest Err rather than synthesizing cancellation. When cancellation must remain distinct, use a cancellation-aware adapter that checks the owned signal around every attempt and delay, or do not use built-in retry.
+- Expected cleanup returns Result explicitly: cleanup Err wins after a successful main operation; if both fail, return a domain-owned combined failure preserving both. A rollback failure that leaves atomicity unknown is a Panic. Do not put expected throwing cleanup in a Result generator's `finally` block.
 
 ## Core Config
 

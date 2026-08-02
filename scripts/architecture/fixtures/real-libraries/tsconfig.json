@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "better-result": ["../../../../apps/core/node_modules/better-result/dist/index.d.mts"],
+      "zod": ["../../../../apps/core/node_modules/zod/index.d.ts"]
+    },
+    "noEmit": true
+  },
+  "include": ["fixture.ts"]
+}

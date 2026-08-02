@@ -7,7 +7,7 @@
     "**/dist/**",
     "apps/core/src/ssh/remote-js/remote-runner.cjs"
   ],
-  "jsPlugins": ["./scripts/oxlint-plugins/test-waits.mts"],
+  "jsPlugins": ["./scripts/oxlint-plugins/lilac.mts"],
   "globals": {
     "Bun": "readonly"
   },
