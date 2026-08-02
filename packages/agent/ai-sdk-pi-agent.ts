@@ -2487,7 +2487,15 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       : selectedCanonical;
     messagesForModel = normalizeReplayMessages(messagesForModel);
     if (messagesForModel.at(-1)?.role === "assistant") {
-      throw new Error("Cannot append an ephemeral overlay after an assistant message");
+      throw new Error("Cannot append an ephemeral overlay after an assistant message", {
+        cause: {
+          code: "INVALID_PRE_OVERLAY_MODEL_VIEW",
+          suffixStart,
+          canonicalMessageCount: canonicalMessages.length,
+          selectedCanonicalRoles: selectedCanonical.slice(-4).map((message) => message.role),
+          preparedModelRoles: messagesForModel.slice(-4).map((message) => message.role),
+        },
+      });
     }
     const payloadOverlay = this.buildEphemeralOverlay
       ? await this.buildEphemeralOverlay(preparationContext)

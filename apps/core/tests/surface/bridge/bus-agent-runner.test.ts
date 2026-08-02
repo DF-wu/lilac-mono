@@ -740,6 +740,13 @@ describe("deferred subagent result", () => {
     });
     expect(assistantOnly.consumedRunIds).toEqual([]);
     expect(assistantOnly.forceNextTurn).toBe(true);
+
+    const missingResult = planDeferredSubagentBoundary({
+      canonicalMessages: [buildDeferredSubagentResultMessages(completion)[0]!],
+      modelInputMessages: [],
+      completions: [completion],
+    });
+    expect(missingResult.append).toEqual([buildDeferredSubagentResultMessages(completion)[1]!]);
   });
 });
 

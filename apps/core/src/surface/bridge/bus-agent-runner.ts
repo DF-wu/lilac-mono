@@ -1086,23 +1086,31 @@ function hasToolResult(messages: readonly ModelMessage[], toolCallId: string): b
   );
 }
 
-function hasDeferredSubagentWorkflowRunId(
+function hasDeferredSubagentWorkflowCall(
   messages: readonly ModelMessage[],
   workflowRunId: string,
 ): boolean {
   for (const message of messages) {
-    if (message.role === "assistant" && Array.isArray(message.content)) {
-      for (const part of message.content) {
-        if (
-          part.type === "tool-call" &&
-          part.toolName === "subagent_result" &&
-          isRecord(part.input) &&
-          part.input["workflowRunId"] === workflowRunId
-        ) {
-          return true;
-        }
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (
+        part.type === "tool-call" &&
+        part.toolName === "subagent_result" &&
+        isRecord(part.input) &&
+        part.input["workflowRunId"] === workflowRunId
+      ) {
+        return true;
       }
     }
+  }
+  return false;
+}
+
+function hasDeferredSubagentWorkflowResult(
+  messages: readonly ModelMessage[],
+  workflowRunId: string,
+): boolean {
+  for (const message of messages) {
     if (message.role !== "tool") continue;
     for (const part of message.content) {
       if (
@@ -1144,9 +1152,19 @@ export function hasDeferredSubagentResult(
   completion: Pick<WorkflowLiveParentCompletion, "runId" | "childRequestId">,
 ): boolean {
   return (
-    hasDeferredSubagentWorkflowRunId(messages, completion.runId) ||
+    hasDeferredSubagentWorkflowResult(messages, completion.runId) ||
     hasToolResult(messages, buildSubagentResultToolCallId(completion.runId)) ||
     hasToolResult(messages, buildSubagentResultToolCallId(completion.childRequestId))
+  );
+}
+
+function hasCurrentDeferredSubagentResult(
+  messages: readonly ModelMessage[],
+  completion: Pick<WorkflowLiveParentCompletion, "runId">,
+): boolean {
+  return (
+    hasDeferredSubagentWorkflowResult(messages, completion.runId) ||
+    hasToolResult(messages, buildSubagentResultToolCallId(completion.runId))
   );
 }
 
@@ -1164,12 +1182,16 @@ export function planDeferredSubagentBoundary(input: {
     .map((completion) => completion.runId);
   const consumed = new Set(consumedRunIds);
   const unconsumed = input.completions.filter((completion) => !consumed.has(completion.runId));
-  const unseen = unconsumed.filter(
-    (completion) => !hasDeferredSubagentWorkflowRunId(input.canonicalMessages, completion.runId),
-  );
+  const append = unconsumed.flatMap((completion) => {
+    if (hasCurrentDeferredSubagentResult(input.canonicalMessages, completion)) return [];
+    const messages = buildDeferredSubagentResultMessages(completion);
+    return hasDeferredSubagentWorkflowCall(input.canonicalMessages, completion.runId)
+      ? messages.slice(1)
+      : messages;
+  });
 
   return {
-    append: unseen.flatMap(buildDeferredSubagentResultMessages),
+    append,
     consumedRunIds,
     forceNextTurn: unconsumed.length > 0,
   };
