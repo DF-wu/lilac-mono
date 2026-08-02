@@ -9,10 +9,17 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { executeBash, withLimitedBashOutput } from "../../src/tools/bash-impl";
+import {
+  BASH_NO_OUTPUT_TIMEOUT_MS,
+  executeBash,
+  withLimitedBashOutput,
+} from "../../src/tools/bash-impl";
 import { getPreOverflowRawByteLimit } from "../../src/tools/bash-output-sanitizer";
 import { bashToolWithCwd } from "../../src/tools/bash";
-import { executeRestrictedBash } from "../../src/tools/restricted-bash";
+import {
+  executeRestrictedBash,
+  RESTRICTED_BASH_WALL_TIMEOUT_MS,
+} from "../../src/tools/restricted-bash";
 import { resolveRestrictedSessionTmpDir } from "../../src/shared/attachment-utils";
 import {
   createToolResultArtifactStore,
@@ -242,14 +249,21 @@ rmdir "$media_dir"`,
   });
 
   it("returns a timeout executionError when exceeded", async () => {
-    const res = await executeBash({ command: "sleep 10", timeoutMs: 50 });
+    // test-wait-justification: verifies the explicit wall deadline while raw output remains active
+    const res = await executeBash({
+      command: "while true; do printf tick; sleep 0.01; done",
+      timeoutMs: 50,
+    });
 
     expect(res.executionError).toBeDefined();
     expect(res.executionError?.type).toBe("timeout");
     if (res.executionError?.type === "timeout") {
       expect(res.executionError.timeoutMs).toBe(50);
+      expect(res.executionError.timeoutKind).toBe("wall_clock");
       expect(res.executionError.signal.length).toBeGreaterThan(0);
     }
+    expect(res.stdout).toContain("tick");
+    expect(BASH_NO_OUTPUT_TIMEOUT_MS).toBe(3 * 60 * 1000);
     expect(res.exitCode).not.toBe(0);
   });
 
@@ -438,6 +452,27 @@ rmdir "$media_dir"`,
 });
 
 describe("executeRestrictedBash", () => {
+  it("uses caller timeoutMs as a restricted wall deadline", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-timeout-workspace-"),
+    );
+    try {
+      // test-wait-justification: verifies the restricted just-bash wall deadline
+      const result = await executeRestrictedBash(
+        { command: "sleep 1000", cwd: workspace, timeoutMs: 20 },
+        { workspaceRoot: workspace },
+      );
+      expect(result.executionError).toMatchObject({
+        type: "timeout",
+        timeoutMs: 20,
+        timeoutKind: "wall_clock",
+      });
+      expect(RESTRICTED_BASH_WALL_TIMEOUT_MS).toBe(3 * 60 * 1000);
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("preserves writable primary-profile behavior through the Bash tool", async () => {
     const workspace = await fs.mkdtemp(
       path.join(await fs.realpath("/tmp"), "lilac-restricted-primary-workspace-"),

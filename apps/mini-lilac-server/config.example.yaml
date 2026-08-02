@@ -49,7 +49,8 @@ agent:
     enabled: true
     # 1 permits Primary -> Subagent only. Distinct sibling sessions are uncapped.
     maxDepth: 1
-    idleTimeoutMs: 360000
+    # Subagent idle timeout is derived from agent.idleTimeoutMs: floor(2/3),
+    # with a 1000ms minimum.
   profiles:
     # "*" includes todowrite. Profiles with explicit tool lists must name todowrite to manage
     # durable session todos.

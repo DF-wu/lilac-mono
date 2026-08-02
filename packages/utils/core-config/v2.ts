@@ -217,11 +217,6 @@ const modelCapabilitySchemaV2 = z
 const subagentsSchemaV2 = z.object({
   enabled: z.boolean().default(true),
   maxDepth: z.number().int().min(0).max(2).default(2),
-  idleTimeoutMs: z
-    .number()
-    .int()
-    .positive()
-    .default(6 * 60 * 1000),
   delegatePromptOverlay: z.string().trim().min(1).optional(),
   profiles: z
     .object({
@@ -608,13 +603,12 @@ export const coreConfigInputSchemaV2 = z.object({
       idleTimeoutMs: z
         .number()
         .int()
-        .positive()
+        .min(1_500)
         .default(15 * 60 * 1000),
       retry: agentRetrySchema,
       subagents: subagentsSchemaV2.default({
         enabled: true,
         maxDepth: 2,
-        idleTimeoutMs: 6 * 60 * 1000,
         profiles: {
           explore: EXPLORE_PROFILE_DEFAULT,
           general: GENERAL_PROFILE_DEFAULT,
@@ -635,7 +629,6 @@ export const coreConfigInputSchemaV2 = z.object({
       subagents: {
         enabled: true,
         maxDepth: 2,
-        idleTimeoutMs: 6 * 60 * 1000,
         profiles: {
           explore: EXPLORE_PROFILE_DEFAULT,
           general: GENERAL_PROFILE_DEFAULT,

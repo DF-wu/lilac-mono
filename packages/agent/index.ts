@@ -5,6 +5,7 @@ export * from "./auto-compaction";
 export * from "./openai-server-compaction";
 export * from "./context-overflow";
 export * from "./recovery-checkpoint";
+export * from "./retry-backoff";
 export * from "./session-continuation";
 export * from "./tool-call-expansion";
 export * from "./tool-call-id-normalization";

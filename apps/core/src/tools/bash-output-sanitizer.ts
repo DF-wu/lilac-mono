@@ -436,7 +436,7 @@ export async function readSanitizedStreamTextCapped(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (value) {
+        if (value && value.byteLength > 0) {
           options?.onActivity?.();
           if (options?.outputBudget) {
             options.outputBudget.consumedBytes += value.byteLength;

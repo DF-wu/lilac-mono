@@ -9,7 +9,11 @@ import {
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
-import { AiSdkPiAgent, extractToolCallsFromMessages } from "../ai-sdk-pi-agent";
+import {
+  AiSdkPiAgent,
+  extractToolCallsFromMessages,
+  type IdleRecoveryResult,
+} from "../ai-sdk-pi-agent";
 import { ToolExpansion } from "../tool-call-expansion";
 
 function fakeModel(): LanguageModel {
@@ -3665,6 +3669,214 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     expect(JSON.stringify(agent.state.messages)).toContain("kept prefix");
     expect(JSON.stringify(agent.state.messages)).toContain("fast result");
     expect(JSON.stringify(agent.state.messages)).not.toContain('"toolCallId":"discarded"');
+  });
+});
+
+describe("AiSdkPiAgent idle recovery", () => {
+  it("rolls back an active model draft before retrying", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "partial" },
+              { type: "text-delta", id: "partial", delta: "discarded partial" },
+              { type: "text-end", id: "partial" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("recovered", "recovered answer"),
+      ],
+    });
+    let recovery: Promise<IdleRecoveryResult> | null = null;
+    const agent = new AiSdkPiAgent({ system: "test", model });
+    agent.subscribe((event) => {
+      if (
+        recovery === null &&
+        event.type === "message_update" &&
+        event.assistantMessageEvent.type === "text_end"
+      ) {
+        recovery = agent.requestIdleRecovery(new Error("model idle"), () => "retry");
+      }
+    });
+
+    await agent.prompt("start");
+
+    expect(recovery).not.toBeNull();
+    await expect(recovery!).resolves.toEqual({ status: "retried" });
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain("discarded partial");
+    expect(agent.state.messages).toEqual([
+      { role: "user", content: "start" },
+      { role: "assistant", content: [{ type: "text", text: "recovered answer" }] },
+    ]);
+  });
+
+  it("settles tools, rewinds completed parallel work, and retries in event order", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: "completed", toolName: "fast", input: "{}" },
+              { type: "tool-call", toolCallId: "incomplete", toolName: "slow", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("recovered", "recovered answer"),
+      ],
+    });
+    const idleError = new Error("agent idle timeout");
+    const order: string[] = [];
+    let recoveryPromise: Promise<IdleRecoveryResult> | null = null;
+    let overlappingPromise: Promise<IdleRecoveryResult> | null = null;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        fast: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "fast result",
+        }),
+        slow: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: (_input, { abortSignal }) =>
+            new Promise<string>((_resolve, reject) => {
+              const abort = () => {
+                order.push("slow-settled");
+                reject(new DOMException("recovery", "AbortError"));
+              };
+              if (abortSignal?.aborted) abort();
+              else abortSignal?.addEventListener("abort", abort, { once: true });
+            }),
+        }),
+      },
+    });
+    let turnStarts = 0;
+    agent.subscribe((event) => {
+      if (event.type === "turn_start") {
+        turnStarts += 1;
+        order.push(`turn-start-${turnStarts}`);
+      }
+      if (event.type === "tool_execution_end" && event.toolCallId === "completed") {
+        order.push("fast-completed");
+        recoveryPromise = agent.requestIdleRecovery(idleError, async (error, context) => {
+          expect(error).toBe(idleError);
+          expect(context.abortSignal.aborted).toBe(false);
+          order.push("decision");
+          return "retry" as const;
+        });
+        overlappingPromise = agent.requestIdleRecovery(idleError, () => "retry");
+        void overlappingPromise.catch(() => undefined);
+      }
+      if (event.type === "turn_abort" && event.reason === "recovery") {
+        order.push("turn-abort-recovery");
+      }
+      if (event.type === "messages_reset" && event.reason === "recovery") {
+        order.push("messages-reset-recovery");
+      }
+    });
+
+    await agent.prompt("run both");
+
+    expect(recoveryPromise).not.toBeNull();
+    await expect(recoveryPromise!).resolves.toEqual({ status: "retried" });
+    expect(overlappingPromise).not.toBeNull();
+    await expect(overlappingPromise!).rejects.toThrow("Idle recovery already pending");
+    expect(order).toEqual([
+      "turn-start-1",
+      "fast-completed",
+      "slow-settled",
+      "turn-abort-recovery",
+      "messages-reset-recovery",
+      "decision",
+      "turn-start-2",
+    ]);
+    const replay = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(replay).toContain("completed");
+    expect(replay).toContain("fast result");
+    expect(replay).not.toContain("incomplete");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("incomplete");
+  });
+
+  it("rewinds before refusal and fails the run with the original error", async () => {
+    const preparationEntered = deferred();
+    const releasePreparation = deferred();
+    const idleError = new Error("idle watchdog exhausted");
+    const events: string[] = [];
+    let preparationCalls = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      canonicalModelCallPreflight: async () => {
+        preparationCalls += 1;
+        if (preparationCalls === 1) {
+          preparationEntered.resolve();
+          await releasePreparation.promise;
+        }
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "turn_abort") events.push(`${event.type}:${event.reason}`);
+      if (event.type === "messages_reset") events.push(`${event.type}:${event.reason}`);
+      if (event.type === "agent_end") events.push(event.type);
+    });
+
+    const run = agent.prompt("refuse recovery");
+    void run.catch(() => undefined);
+    await preparationEntered.promise;
+    const recovery = agent.requestIdleRecovery(idleError, () => "fail");
+    releasePreparation.resolve();
+
+    await expect(recovery).resolves.toEqual({ status: "failed" });
+    await expect(run).rejects.toBe(idleError);
+    expect(events).toEqual(["turn_abort:recovery", "messages_reset:recovery", "agent_end"]);
+    expect(agent.state.error).toBe(idleError.message);
+    expect(agent.state.messages).toEqual([{ role: "user", content: "refuse recovery" }]);
+  });
+
+  it("lets cancellation supersede recovery before the retry decision", async () => {
+    const preparationEntered = deferred();
+    const releasePreparation = deferred();
+    let decisionCalls = 0;
+    const events: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: fakeModel(),
+      canonicalModelCallPreflight: async () => {
+        preparationEntered.resolve();
+        await releasePreparation.promise;
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "turn_abort") events.push(`${event.type}:${event.reason}`);
+      if (event.type === "messages_reset") events.push(`${event.type}:${event.reason}`);
+      if (event.type === "agent_end") events.push(event.type);
+    });
+
+    const run = agent.prompt("cancel recovery");
+    await preparationEntered.promise;
+    const recovery = agent.requestIdleRecovery(new Error("idle"), () => {
+      decisionCalls += 1;
+      return "retry";
+    });
+    agent.cancel();
+    releasePreparation.resolve();
+
+    await run;
+    await expect(recovery).resolves.toEqual({ status: "superseded", reason: "cancel" });
+    expect(decisionCalls).toBe(0);
+    expect(events).toEqual(["turn_abort:cancel", "messages_reset:cancel", "agent_end"]);
+    expect(agent.state.error).toBeUndefined();
   });
 });
 

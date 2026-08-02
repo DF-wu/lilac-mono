@@ -23,6 +23,7 @@ import type {
 import {
   CUSTOM_COMMAND_TOOL_NAME,
   discoverSkills,
+  deriveSubagentIdleTimeoutMs,
   env,
   extractAiErrorLogDetails,
   findWorkspaceRoot,
@@ -66,6 +67,7 @@ import {
   classifyHistoryProviderFamily,
   compactWithOpenAIResponses,
   createAgentRunIdleWatchdog,
+  createRetryBackoffBudget,
   hasMatchingOpenAIServerCompaction,
   hasOpenAIServerCompaction,
   hashCanonicalMessagesV1,
@@ -1591,6 +1593,17 @@ export function buildPersistedHeartbeatMessages(finalText: string): ModelMessage
   return [{ role: "assistant", content: finalText } satisfies ModelMessage];
 }
 
+function toolCallIdsFromMessages(messages: readonly ModelMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || typeof message.content === "string") continue;
+    for (const part of message.content) {
+      if (part.type === "tool-call") ids.add(part.toolCallId);
+    }
+  }
+  return ids;
+}
+
 export function shouldCancelIdleOnlyGlobalRequest(params: {
   runPolicy: RequestRunPolicy;
   sessionId: string;
@@ -2869,28 +2882,71 @@ export async function startBusAgentRunner(params: {
         });
       },
     });
+    const idleRetryBudget = createRetryBackoffBudget(cfg.agent.retry);
+    let idleRecoveryPromise: ReturnType<AiSdkPiAgent<ToolSet>["requestIdleRecovery"]> | null = null;
     const runIdleWatchdog =
       runProfile === "primary"
         ? createAgentRunIdleWatchdog({
             idleTimeoutMs: cfg.agent.idleTimeoutMs,
-            onTimeout: () => {
+            onTimeout: (error) => {
               logger.warn("agent run idle timeout", {
                 requestId: headers.request_id,
                 sessionId: headers.session_id,
                 idleTimeoutMs: cfg.agent.idleTimeoutMs,
               });
               customCommandAbortController?.abort();
-              activeAgent?.abort();
+              const agent = activeAgent;
+              if (!agent) return;
+              idleRecoveryPromise = agent.requestIdleRecovery(
+                error,
+                async (_idleError, { abortSignal }) => {
+                  await liveParentSession?.cancelAll("parent idle timeout recovery");
+
+                  await coreNamedClaudeRuntime?.retireForRetry();
+                  await corePrimaryClaudeRuntime?.retireForRetry();
+                  const retry = await idleRetryBudget.next(abortSignal).catch(() => null);
+                  if (!retry) return "fail";
+                  logger.warn("agent idle timeout; retrying", {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    attempt: retry.attempt,
+                    maxRetries: cfg.agent.retry.maxRetries,
+                    delayMs: retry.delayMs,
+                  });
+                  return "retry";
+                },
+              );
             },
           })
         : null;
-    const waitForRun = <T>(promise: Promise<T>): Promise<T> => {
+    const waitForRun = async <T>(promise: Promise<T>): Promise<T> => {
       let tracked: Promise<T>;
       tracked = promise.finally(() => {
         if (activeRunOperation === tracked) activeRunOperation = null;
       });
       activeRunOperation = tracked;
-      return runIdleWatchdog ? runIdleWatchdog.waitFor(tracked) : tracked;
+      if (!runIdleWatchdog) return await tracked;
+
+      while (true) {
+        try {
+          return await runIdleWatchdog.waitFor(tracked);
+        } catch (error) {
+          const recovery = idleRecoveryPromise;
+          if (!(error instanceof AgentIdleTimeoutError) || !recovery) throw error;
+          const result = await recovery;
+          if (idleRecoveryPromise === recovery) idleRecoveryPromise = null;
+          if (
+            result.status !== "retried" &&
+            !(
+              result.status === "superseded" &&
+              (result.reason === "cancel" || result.reason === "interrupt")
+            )
+          ) {
+            throw error;
+          }
+          runIdleWatchdog.restart();
+        }
+      }
     };
     const getActiveRunOperation = (): Promise<unknown> | null => activeRunOperation;
     const waitForPreAgent = <T>(promise: Promise<T>): Promise<T> =>
@@ -3575,7 +3631,7 @@ export async function startBusAgentRunner(params: {
             subagentDepth: subagentMeta.depth,
             subagentConfig: {
               enabled: subagents.enabled,
-              idleTimeoutMs: subagents.idleTimeoutMs,
+              idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
               maxDepth: subagents.maxDepth,
             },
             requestContext: {
@@ -4554,6 +4610,9 @@ export async function startBusAgentRunner(params: {
       let finalText = "";
       let stableFinalText = "";
       let stablePartialText = state.activeRun?.partialText ?? "";
+      let attemptStartFinalText = stableFinalText;
+      let attemptStartPartialText = stablePartialText;
+      const currentTurnToolCallIds = new Set<string>();
       let turnTextStartIndex = 0;
       let turnPartialTextStartIndex = stablePartialText.length;
       let pendingNoReplyTurnText = "";
@@ -4690,6 +4749,12 @@ export async function startBusAgentRunner(params: {
           runStats.finalMessages = event.messages;
         }
 
+        if (event.type === "turn_start") {
+          attemptStartFinalText = stableFinalText;
+          attemptStartPartialText = stablePartialText;
+          currentTurnToolCallIds.clear();
+        }
+
         if (event.type === "messages_reset") {
           removePendingSilentTurn();
         }
@@ -4792,11 +4857,25 @@ export async function startBusAgentRunner(params: {
           turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
         }
 
-        if (event.type === "turn_retry") {
+        if (
+          event.type === "turn_retry" ||
+          (event.type === "messages_reset" && event.reason === "recovery")
+        ) {
+          if (event.type === "messages_reset") {
+            const retainedToolCallIds = toolCallIdsFromMessages(event.messages);
+            const retainsCurrentTurn = [...currentTurnToolCallIds].some((toolCallId) =>
+              retainedToolCallIds.has(toolCallId),
+            );
+            if (!retainsCurrentTurn) {
+              stableFinalText = attemptStartFinalText;
+              stablePartialText = attemptStartPartialText;
+            }
+          }
           outputPublisher.flush();
           assistantTextPartBoundaryState.lastTextPartId = null;
           assistantTextPartBoundaryState.pendingTextPartStartIds.clear();
-          assistantTextPartBoundaryState.pendingRecoveryTextBoundary = event.hadPartialOutput;
+          assistantTextPartBoundaryState.pendingRecoveryTextBoundary =
+            event.type === "turn_retry" ? event.hadPartialOutput : true;
           finalText = stableFinalText;
           if (state.activeRun?.requestId === next.requestId) {
             state.activeRun.partialText = stablePartialText;
@@ -4810,6 +4889,13 @@ export async function startBusAgentRunner(params: {
           assistantTextPhaseByPartId.clear();
           turnTextStartIndex = stableFinalText.length;
           turnPartialTextStartIndex = stablePartialText.length;
+
+          if (event.type === "messages_reset") {
+            void outputPublisher.publishTextReset({
+              text: stablePartialText,
+              ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
+            });
+          }
 
           if (retryAttemptHadReasoning) {
             reasoningChunkState.chunks.clear();
@@ -4967,6 +5053,7 @@ export async function startBusAgentRunner(params: {
         if (event.type === "tool_execution_start") {
           const startedAt = Date.now();
           toolStartMs.set(event.toolCallId, startedAt);
+          currentTurnToolCallIds.add(event.toolCallId);
           state.activeRun?.activeTools.set(event.toolCallId, {
             toolName: event.toolName,
             startedAt,

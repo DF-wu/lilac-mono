@@ -152,6 +152,26 @@ exec "$@"
     expect(rawCopyCalls).toBe(0);
   });
 
+  it("reports activity only for non-empty raw chunks", async () => {
+    let activityCount = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array());
+        controller.enqueue(new TextEncoder().encode("output"));
+        controller.close();
+      },
+    });
+
+    const result = await readStreamTextCapped(stream, 100, {
+      onActivity: () => {
+        activityCount += 1;
+      },
+    });
+
+    expect(result.text).toBe("output");
+    expect(activityCount).toBe(1);
+  });
+
   it("creates secure byte-exact SSH overflow files only after the cap", async () => {
     const underLimitBase = path.join(tempDir, "under-limit");
     const underLimit = await sshExecBash({

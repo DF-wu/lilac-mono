@@ -4,6 +4,7 @@ import { createLogger, extractAiErrorLogDetails, isRecord } from "@stanley2058/l
 
 import { isLikelyContextOverflowError } from "./context-overflow";
 import type { TurnErrorHandler, TurnErrorHandlerDecision } from "./ai-sdk-pi-agent";
+import { computeRetryBackoffDelayMs, type RetryBackoffConfig } from "./retry-backoff";
 
 const TRANSIENT_MODEL_ERROR_PATTERN =
   /overloaded|server_is_overloaded|service[_\s-]*unavailable|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|socket connection was closed unexpectedly|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
@@ -11,12 +12,7 @@ const TRANSIENT_MODEL_ERROR_PATTERN =
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_NETWORK_ERROR_CODES = new Set(["ConnectionClosed", "ECONNRESET"]);
 
-export type TransientModelRetryConfig = {
-  enabled: boolean;
-  maxRetries: number;
-  baseDelayMs: number;
-  maxDelayMs: number;
-};
+export type TransientModelRetryConfig = RetryBackoffConfig;
 
 export type TransientModelRetryController = {
   handler: TurnErrorHandler;
@@ -112,10 +108,7 @@ export function computeTransientRetryDelayMs(params: {
   baseDelayMs: number;
   maxDelayMs: number;
 }): number {
-  const baseDelayMs = Math.max(0, params.baseDelayMs);
-  const maxDelayMs = Math.max(0, params.maxDelayMs);
-  const exponential = baseDelayMs * 2 ** Math.max(0, params.attempt - 1);
-  return Math.min(maxDelayMs, exponential);
+  return computeRetryBackoffDelayMs(params);
 }
 
 function defaultErrorSummary(error: unknown): string {

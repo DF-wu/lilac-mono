@@ -28,7 +28,7 @@ import { sanitizeBashOutputText } from "./bash-output-sanitizer";
 
 const WORKSPACE_MOUNT = "/workspace";
 const TMP_MOUNT = "/tmp";
-const DEFAULT_RESTRICTED_TIMEOUT_MS = 10 * 60 * 1000;
+export const RESTRICTED_BASH_WALL_TIMEOUT_MS = 3 * 60 * 1000;
 const MAX_RESTRICTED_FILE_READ_BYTES = 10 * 1024 * 1024;
 const TOOL_SERVER_BACKEND_URL = process.env.TOOL_SERVER_BACKEND_URL || "http://localhost:8080";
 const logger = createLogger({ module: "restricted-bash" });
@@ -639,18 +639,25 @@ export async function executeRestrictedBash(
     };
   }
 
-  const effectiveTimeoutMs = timeoutMs ?? DEFAULT_RESTRICTED_TIMEOUT_MS;
+  const wallClockTimeoutMs = Math.min(
+    timeoutMs ?? RESTRICTED_BASH_WALL_TIMEOUT_MS,
+    RESTRICTED_BASH_WALL_TIMEOUT_MS,
+  );
   const controller = new AbortController();
-  let timedOut = false;
-  const timeout = setTimeout(() => {
-    timedOut = true;
+  let termination: "wall_clock" | "aborted" | undefined;
+  const terminate = (reason: "wall_clock" | "aborted") => {
+    if (termination) return;
+    termination = reason;
     controller.abort();
-  }, effectiveTimeoutMs);
+  };
+  const timeout = setTimeout(() => {
+    terminate("wall_clock");
+  }, wallClockTimeoutMs);
   timeout.unref?.();
 
-  const abortListener = () => controller.abort();
+  const abortListener = () => terminate("aborted");
   if (options.abortSignal) {
-    if (options.abortSignal.aborted) controller.abort();
+    if (options.abortSignal.aborted) abortListener();
     else options.abortSignal.addEventListener("abort", abortListener, { once: true });
   }
 
@@ -666,10 +673,29 @@ export async function executeRestrictedBash(
       replaceEnv: false,
       signal: controller.signal,
     });
-    const output = {
+    clearTimeout(timeout);
+    options.abortSignal?.removeEventListener("abort", abortListener);
+    const output: BashToolOutput = {
       stdout: sanitizeBashOutputText(result.stdout),
       stderr: sanitizeBashOutputText(result.stderr),
       exitCode: result.exitCode,
+      ...(termination === "wall_clock"
+        ? {
+            executionError: {
+              type: "timeout",
+              timeoutMs: wallClockTimeoutMs,
+              timeoutKind: "wall_clock",
+              signal: "ABORT",
+            },
+          }
+        : termination === "aborted"
+          ? {
+              executionError: {
+                type: "aborted",
+                signal: "ABORT",
+              },
+            }
+          : {}),
     };
     const outputConfig = options.outputConfig ?? {
       maxPreviewBytes: 40 * 1024,
@@ -721,27 +747,28 @@ export async function executeRestrictedBash(
       originalStderrBytes: Buffer.byteLength(output.stderr, "utf8"),
     });
   } catch (error) {
-    const aborted = controller.signal.aborted;
     return {
       stdout: "",
       stderr: error instanceof Error ? error.message : String(error),
       exitCode: -1,
-      executionError: timedOut
-        ? {
-            type: "timeout",
-            timeoutMs: effectiveTimeoutMs,
-            signal: "ABORT",
-          }
-        : aborted
+      executionError:
+        termination === "wall_clock"
           ? {
-              type: "aborted",
+              type: "timeout",
+              timeoutMs: wallClockTimeoutMs,
+              timeoutKind: "wall_clock",
               signal: "ABORT",
             }
-          : {
-              type: "exception",
-              phase: "unknown",
-              message: error instanceof Error ? error.message : String(error),
-            },
+          : termination === "aborted"
+            ? {
+                type: "aborted",
+                signal: "ABORT",
+              }
+            : {
+                type: "exception",
+                phase: "unknown",
+                message: error instanceof Error ? error.message : String(error),
+              },
     };
   } finally {
     clearTimeout(timeout);

@@ -29,7 +29,7 @@ import {
 import { loadToolEnv } from "./tool-env";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 
-const DEFAULT_BASH_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+export const BASH_NO_OUTPUT_TIMEOUT_MS = 3 * 60 * 1000;
 const DEFAULT_KILL_SIGNAL = "SIGTERM";
 const DEFAULT_BASH_STDIN_MODE: BashStdinMode = "error";
 const BASH_TRUNCATED_OUTPUT_DIR = "/tmp";
@@ -69,6 +69,7 @@ export type BashExecutionError =
   | {
       type: "timeout";
       timeoutMs: number;
+      timeoutKind: "no_output" | "wall_clock";
       signal: string;
     }
   | {
@@ -591,7 +592,8 @@ export async function executeBash(
     cwd: displayCwd,
     target: cwdTarget.kind,
     ...remoteLogMeta,
-    timeoutMs: timeoutMs ?? DEFAULT_BASH_TIMEOUT_MS,
+    timeoutMs,
+    noOutputTimeoutMs: BASH_NO_OUTPUT_TIMEOUT_MS,
     stdinMode: effectiveStdinMode,
     dangerouslyAllow: dangerouslyAllow === true,
     requestId: context?.requestId,
@@ -641,11 +643,11 @@ export async function executeBash(
   const githubEnv = await getGithubEnvForBash({ dataDir: env.dataDir });
   const vcsEnv = resolveVcsEnv({ dataDir: env.dataDir });
 
-  const effectiveTimeoutMs = timeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
-
   const controller = new AbortController();
-  let timedOut = false;
-  let aborted = false;
+  let termination:
+    | { type: "aborted" }
+    | { type: "timeout"; timeoutKind: "no_output" | "wall_clock"; timeoutMs: number }
+    | undefined;
 
   let child: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -675,19 +677,27 @@ export async function executeBash(
         killProcessGroupBestEffort(pid, "SIGKILL");
       }
     }, HARD_KILL_DELAY_MS);
+    hardKillTimer.unref?.();
+  };
+
+  const terminate = (
+    reason:
+      | { type: "aborted" }
+      | { type: "timeout"; timeoutKind: "no_output" | "wall_clock"; timeoutMs: number },
+  ) => {
+    if (termination) return;
+    termination = reason;
+    controller.abort();
+    const pid = child?.pid;
+    if (pid) {
+      killProcessGroupBestEffort(pid, "SIGTERM");
+      scheduleHardKill();
+    }
   };
 
   let abortListener: (() => void) | null = null;
   if (abortSignal) {
-    const onAbort = () => {
-      aborted = true;
-      controller.abort();
-      const pid = child?.pid;
-      if (pid) {
-        killProcessGroupBestEffort(pid, "SIGTERM");
-        scheduleHardKill();
-      }
-    };
+    const onAbort = () => terminate({ type: "aborted" });
     if (abortSignal.aborted) {
       onAbort();
     } else {
@@ -696,33 +706,66 @@ export async function executeBash(
     }
   }
 
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-    const pid = child?.pid;
-    if (pid) {
-      killProcessGroupBestEffort(pid, "SIGTERM");
-      scheduleHardKill();
+  let noOutputTimer: ReturnType<typeof setTimeout> | null = null;
+  let wallClockTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetNoOutputTimer = () => {
+    if (termination) return;
+    if (noOutputTimer) clearTimeout(noOutputTimer);
+    noOutputTimer = setTimeout(
+      () =>
+        terminate({
+          type: "timeout",
+          timeoutKind: "no_output",
+          timeoutMs: BASH_NO_OUTPUT_TIMEOUT_MS,
+        }),
+      BASH_NO_OUTPUT_TIMEOUT_MS,
+    );
+  };
+  if (timeoutMs !== undefined) {
+    wallClockTimer = setTimeout(
+      () => terminate({ type: "timeout", timeoutKind: "wall_clock", timeoutMs }),
+      timeoutMs,
+    );
+  }
+  const onRawOutput = () => {
+    resetNoOutputTimer();
+    onActivity?.();
+  };
+  const stopWatchingExecution = () => {
+    if (noOutputTimer) {
+      clearTimeout(noOutputTimer);
+      noOutputTimer = null;
     }
-  }, effectiveTimeoutMs);
+    if (wallClockTimer) {
+      clearTimeout(wallClockTimer);
+      wallClockTimer = null;
+    }
+    if (hardKillTimer && !termination) {
+      clearTimeout(hardKillTimer);
+      hardKillTimer = null;
+    }
+    abortListener?.();
+    abortListener = null;
+  };
 
   try {
+    resetNoOutputTimer();
     const execResult =
       cwdTarget.kind === "ssh"
         ? await sshExecBash({
             host: cwdTarget.host,
             cmd: command,
             cwd: cwdTarget.cwd,
-            timeoutMs: effectiveTimeoutMs,
             stdinMode: effectiveStdinMode,
             signal: controller.signal,
             maxOutputChars: outputConfig.maxPreviewBytes,
             overflowOutputPath: truncatedOutputPaths.outputPath,
-            onActivity,
+            onActivity: onRawOutput,
           })
         : null;
 
     if (cwdTarget.kind === "ssh" && execResult) {
+      stopWatchingExecution();
       const stdout = execResult.stdout;
       const stderr = execResult.stderr;
       const exitCode = execResult.exitCode;
@@ -790,12 +833,13 @@ export async function executeBash(
 
       const durationMs = execResult.durationMs;
 
-      if (execResult.aborted && timedOut) {
+      if (termination?.type === "timeout") {
         logger.warn("bash timeout", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
-          timeoutMs: effectiveTimeoutMs,
+          timeoutMs: termination.timeoutMs,
+          timeoutKind: termination.timeoutKind,
           signal: DEFAULT_KILL_SIGNAL,
           exitCode,
           durationMs,
@@ -813,7 +857,8 @@ export async function executeBash(
             exitCode,
             executionError: {
               type: "timeout",
-              timeoutMs: effectiveTimeoutMs,
+              timeoutMs: termination.timeoutMs,
+              timeoutKind: termination.timeoutKind,
               signal: DEFAULT_KILL_SIGNAL,
             },
           },
@@ -821,12 +866,12 @@ export async function executeBash(
         );
       }
 
-      if (execResult.aborted || aborted) {
+      if (termination?.type === "aborted" || execResult.aborted) {
         logger.warn("bash aborted", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
-          timeoutMs: effectiveTimeoutMs,
+          timeoutMs,
           signal: DEFAULT_KILL_SIGNAL,
           exitCode,
           durationMs,
@@ -851,12 +896,13 @@ export async function executeBash(
         );
       }
 
-      if (execResult.timedOut || timedOut) {
+      if (execResult.timedOut) {
         logger.warn("bash timeout", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
-          timeoutMs: effectiveTimeoutMs,
+          timeoutMs,
+          timeoutKind: "wall_clock",
           signal: DEFAULT_KILL_SIGNAL,
           exitCode,
           durationMs,
@@ -874,7 +920,8 @@ export async function executeBash(
             exitCode,
             executionError: {
               type: "timeout",
-              timeoutMs: effectiveTimeoutMs,
+              timeoutMs: timeoutMs ?? execResult.durationMs,
+              timeoutKind: "wall_clock",
               signal: DEFAULT_KILL_SIGNAL,
             },
           },
@@ -972,15 +1019,16 @@ export async function executeBash(
       readSanitizedStreamTextCapped(child.stdout, outputConfig.maxPreviewBytes, {
         overflowFilePath: truncatedOutputPaths.stdoutOverflowPath,
         literalSecrets: outputSecrets,
-        onActivity,
+        onActivity: onRawOutput,
       }),
       readSanitizedStreamTextCapped(child.stderr, outputConfig.maxPreviewBytes, {
         overflowFilePath: truncatedOutputPaths.stderrOverflowPath,
         literalSecrets: outputSecrets,
-        onActivity,
+        onActivity: onRawOutput,
       }),
       child.exited,
     ]);
+    stopWatchingExecution();
 
     const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value.text : "";
     const stderr = stderrResult.status === "fulfilled" ? stderrResult.value.text : "";
@@ -1065,12 +1113,12 @@ export async function executeBash(
       originalStderrBytes,
     };
 
-    if (aborted && child.killed) {
+    if (termination?.type === "aborted") {
       logger.warn("bash aborted", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
-        timeoutMs: effectiveTimeoutMs,
+        timeoutMs,
         signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
         exitCode,
         durationMs,
@@ -1095,12 +1143,13 @@ export async function executeBash(
       );
     }
 
-    if (timedOut && child.killed) {
+    if (termination?.type === "timeout") {
       logger.warn("bash timeout", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
-        timeoutMs: effectiveTimeoutMs,
+        timeoutMs: termination.timeoutMs,
+        timeoutKind: termination.timeoutKind,
         signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
         exitCode,
         durationMs,
@@ -1118,7 +1167,8 @@ export async function executeBash(
           exitCode,
           executionError: {
             type: "timeout",
-            timeoutMs: effectiveTimeoutMs,
+            timeoutMs: termination.timeoutMs,
+            timeoutKind: termination.timeoutKind,
             signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
           },
         },
@@ -1286,24 +1336,25 @@ export async function executeBash(
       err,
     );
 
+    const executionError: BashExecutionError =
+      termination?.type === "timeout"
+        ? { ...termination, signal: DEFAULT_KILL_SIGNAL }
+        : termination?.type === "aborted"
+          ? { type: "aborted", signal: DEFAULT_KILL_SIGNAL }
+          : {
+              type: "exception",
+              phase: "spawn",
+              message: toErrorMessage(err),
+            };
     return {
       stdout: "",
       stderr: "",
       exitCode: -1,
-      executionError: {
-        type: "exception",
-        phase: "spawn",
-        message: toErrorMessage(err),
-      },
+      executionError,
     };
   } finally {
     await fs.unlink(truncatedOutputPaths.stdoutOverflowPath).catch(() => undefined);
     await fs.unlink(truncatedOutputPaths.stderrOverflowPath).catch(() => undefined);
-    clearTimeout(timeout);
-    if (hardKillTimer) {
-      clearTimeout(hardKillTimer);
-      hardKillTimer = null;
-    }
-    abortListener?.();
+    stopWatchingExecution();
   }
 }

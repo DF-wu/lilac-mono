@@ -245,7 +245,6 @@ export type UniversalCoreConfig = {
     subagents: {
       enabled: boolean;
       maxDepth: number;
-      idleTimeoutMs: number;
       delegatePromptOverlay?: string;
       profiles: {
         explore: SubagentProfileConfig;
