@@ -77,12 +77,10 @@ import {
   type TodoFloatingSummary,
 } from "./palette";
 import {
-  ChunkRenderer,
   editTranscriptAction,
   groupNearbyEdits,
   isShellTranscriptCollapsible,
   explorationTranscriptText,
-  renderInitialMessages,
   shellTranscriptPreview,
   type EditOperation,
   type EditTranscript,
@@ -93,6 +91,7 @@ import {
   type TranscriptEntry,
   type TranscriptTone,
 } from "./render";
+import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
 import {
   formatSessionTitle,
   formatTokenUsage,
@@ -102,7 +101,10 @@ import {
 } from "./presentation";
 import { COLORS, createMarkdownSyntaxStyle, type ThemeColors } from "./theme";
 import { createBufferedChunkOutput } from "./transcript-buffer";
-import { projectMiniLilacStreamChunk } from "./ui-message-chunk-projection";
+import {
+  projectMiniLilacStreamChunk,
+  UIMessageChunkProjectionState,
+} from "./ui-message-chunk-projection";
 
 registerCodeBlockParsers();
 
@@ -1185,6 +1187,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
           },
           { cwd: props.cwd },
         );
+        const streamProjection = new UIMessageChunkProjectionState({ cwd: props.cwd });
         const stream = await props.transport.streamSession(subagent.sessionId, {
           signal: abortController.signal,
         });
@@ -1193,7 +1196,7 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
         while (generation === subagentOpenGeneration) {
           const result = await reader.read();
           if (result.done) break;
-          const projected = projectMiniLilacStreamChunk(result.value);
+          const projected = projectMiniLilacStreamChunk(result.value, streamProjection);
           switch (projected.kind) {
             case "finish":
               renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });

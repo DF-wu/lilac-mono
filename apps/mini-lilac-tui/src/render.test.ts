@@ -5,14 +5,13 @@ import type { UIMessageChunk } from "ai";
 import type { MiniLilacTodoState, MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 
 import {
-  ChunkRenderer,
   explorationTranscriptText,
   groupNearbyEdits,
   isShellTranscriptCollapsible,
-  renderInitialMessages,
   shellTranscriptText,
   type TranscriptEntry,
 } from "./render";
+import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
 
 function createRendererHarness() {
   let sequence = 0;
@@ -146,8 +145,6 @@ describe("renderInitialMessages", () => {
   it("leaves open text state unchanged for every explicitly ignored chunk", () => {
     const ignoredChunks = [
       { type: "custom", kind: "provider.event" },
-      { type: "tool-approval-request", approvalId: "approval", toolCallId: "tool" },
-      { type: "tool-approval-response", approvalId: "approval", approved: false },
       { type: "tool-input-delta", toolCallId: "tool", inputTextDelta: '{"command":' },
       {
         type: "reasoning-file",
@@ -280,6 +277,54 @@ describe("renderInitialMessages", () => {
     });
   });
 
+  it("preserves status metadata when the delegate projection arrives later", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "data-subagentStatus",
+      id: "child-late-input",
+      data: {
+        toolCallId: "delegate-late-input",
+        runId: "child-run",
+        sessionId: "child-session",
+        sessionName: "research",
+        profile: "explore",
+        prompt: "Inspect metadata",
+        mode: "deferred",
+        state: "running",
+        toolCount: 2,
+        activity: "grep",
+        text: "partial report",
+      },
+    });
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "delegate-late-input",
+      toolName: "subagent_delegate",
+      input: {
+        profile: "explore",
+        prompt: "Inspect metadata",
+        mode: "deferred",
+        sessionName: "research",
+      },
+      dynamic: true,
+    });
+
+    expect(entries()).toHaveLength(1);
+    expect(entries()[0]?.subagent).toEqual({
+      toolCallId: "delegate-late-input",
+      runId: "child-run",
+      sessionId: "child-session",
+      sessionName: "research",
+      profile: "explore",
+      prompt: "Inspect metadata",
+      mode: "deferred",
+      state: "running",
+      toolCount: 2,
+      activity: "grep",
+      text: "partial report",
+    });
+  });
+
   it("reconciles a canonical delegation and status into one subagent block", () => {
     const entries = renderInitialMessages([
       {
@@ -295,6 +340,8 @@ describe("renderInitialMessages", () => {
             output: {
               status: "completed",
               childRunId: "child-1",
+              childSessionId: "session-1",
+              sessionName: "research",
               profile: "explore",
               text: "Done",
             },
@@ -396,7 +443,14 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "result-1",
-      output: { status: "completed", text: "Done" },
+      output: {
+        status: "completed",
+        childRunId: "child-1",
+        childSessionId: "session-1",
+        sessionName: "research",
+        profile: "explore",
+        text: "Done",
+      },
       dynamic: true,
     });
     expect(entries()).toEqual([]);
@@ -413,7 +467,14 @@ describe("renderInitialMessages", () => {
               toolCallId: "result-1",
               state: "output-available",
               input: { childRunId: "child-1", profile: "explore" },
-              output: { status: "completed", text: "Done" },
+              output: {
+                status: "completed",
+                childRunId: "child-1",
+                childSessionId: "session-1",
+                sessionName: "research",
+                profile: "explore",
+                text: "Done",
+              },
             },
           ],
         },
@@ -1123,7 +1184,7 @@ describe("renderInitialMessages", () => {
     });
   });
 
-  it("uses bounded raw exploration input when arguments are malformed", () => {
+  it("uses an explicit bounded safe preview when exploration arguments are malformed", () => {
     const [entry] = renderInitialMessages([
       {
         id: "assistant-invalid-exploration",
@@ -1141,11 +1202,12 @@ describe("renderInitialMessages", () => {
       },
     ]);
 
-    const operation = entry?.exploration?.operations[0];
-    expect(operation?.detail).toContain("path: 42");
-    expect(operation?.detail).not.toBe("file");
-    expect(operation?.detail.length).toBeLessThanOrEqual(180);
-    expect(operation).toMatchObject({ status: "error", error: "invalid read arguments" });
+    expect(entry).toMatchObject({
+      kind: "tool",
+      tone: "danger",
+      text: "Read File: invalid read arguments · malformed input: <object>",
+    });
+    expect(entry).not.toHaveProperty("exploration");
   });
 
   it("keeps canonical and live exploration operation outcomes in parity", () => {
@@ -1350,7 +1412,14 @@ describe("renderInitialMessages", () => {
               toolCallId: "edit-1",
               state: "output-available",
               input: { path: "/workspace/src/store.ts", oldText: "one\ntwo", newText: "a\nb\nc" },
-              output: { replacementsMade: 1 },
+              output: {
+                success: true,
+                resolvedPath: "/workspace/src/a.ts",
+                oldHash: "old-a",
+                newHash: "new-a",
+                changesMade: true,
+                replacementsMade: 1,
+              },
             },
             {
               type: "dynamic-tool",
@@ -1368,7 +1437,14 @@ describe("renderInitialMessages", () => {
                   },
                 ],
               },
-              output: { replacementsMade: 1 },
+              output: {
+                success: true,
+                resolvedPath: "/workspace/src/b.ts",
+                oldHash: "old-b",
+                newHash: "new-b",
+                changesMade: true,
+                replacementsMade: 1,
+              },
             },
           ],
         },
@@ -1423,7 +1499,13 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "child-1",
-      output: { stdout: "/workspace\n", stderr: "", exitCode: 0 },
+      output: {
+        stdout: "/workspace\n",
+        stderr: "",
+        exitCode: 0,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      },
       dynamic: true,
     });
     expect(entries()).toMatchObject([
@@ -1449,7 +1531,13 @@ describe("renderInitialMessages", () => {
             toolCallId: "child-1",
             state: "output-available",
             input: { command: "pwd" },
-            output: { stdout: "/workspace\n", stderr: "", exitCode: 0 },
+            output: {
+              stdout: "/workspace\n",
+              stderr: "",
+              exitCode: 0,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            },
           },
         ],
       },
@@ -1686,7 +1774,13 @@ describe("renderInitialMessages", () => {
     renderer.handle({
       type: "tool-output-available",
       toolCallId: "bash-live",
-      output: { stdout: "first\nwarning\nlast\n", stderr: "", exitCode: 0 },
+      output: {
+        stdout: "first\nwarning\nlast\n",
+        stderr: "",
+        exitCode: 0,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      },
       dynamic: true,
     });
     expect(entries[0]?.text).toBe("$ run-tests\n\nfirst\nwarning\nlast");
@@ -1715,6 +1809,8 @@ describe("renderInitialMessages", () => {
         stdout: "work completed before timeout\n",
         stderr: "",
         exitCode: 143,
+        stdoutTruncated: false,
+        stderrTruncated: false,
         executionError: {
           type: "timeout",
           timeoutMs: 500,
@@ -1743,6 +1839,8 @@ describe("renderInitialMessages", () => {
         stdout: "partial output",
         stderr: "",
         exitCode: 143,
+        stdoutTruncated: false,
+        stderrTruncated: false,
         executionError: {
           type: "timeout",
           timeoutMs: 180_000,
@@ -1771,6 +1869,9 @@ describe("renderInitialMessages", () => {
       output: {
         stdout: "",
         stderr: "",
+        exitCode: 143,
+        stdoutTruncated: false,
+        stderrTruncated: false,
         executionError: { type: "aborted", signal: "SIGTERM" },
       },
       dynamic: true,
@@ -1802,6 +1903,33 @@ describe("renderInitialMessages", () => {
       dynamic: true,
     });
     expect(entries().at(-1)?.text).toBe("$ odd-command\n\nretain me");
+  });
+
+  it("keeps accumulated Bash output visible when the terminal chunk is an error", () => {
+    const { renderer, entries } = createRendererHarness();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "bash-terminal-error",
+      toolName: "bash",
+      input: { command: "long-task" },
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "bash-terminal-error",
+      output: { type: "output-delta", delta: "kept output\n" },
+      preliminary: true,
+    });
+    renderer.handle({
+      type: "tool-output-error",
+      toolCallId: "bash-terminal-error",
+      errorText: "process disconnected",
+    });
+
+    expect(entries()[0]).toMatchObject({
+      kind: "shell",
+      tone: "danger",
+      text: "$ long-task\n\nkept output\nprocess disconnected",
+    });
   });
 
   it("settles every active tool row when the stream aborts", () => {
@@ -1866,7 +1994,10 @@ describe("renderInitialMessages", () => {
       output: {
         status: "accepted",
         childRunId: "child-active",
+        childSessionId: "session-active",
+        sessionName: "research",
         profile: "explore",
+        mode: "deferred",
       },
       dynamic: true,
     });
@@ -1902,7 +2033,7 @@ describe("renderInitialMessages", () => {
       {
         kind: "subagent",
         tone: "muted",
-        text: "Explore Task - Inspect aborts\n  ↳ Cancelled: user requested",
+        text: "Explore Task [research] - Inspect aborts\n  ↳ Cancelled: user requested",
         subagent: { state: "cancelled" },
       },
       { kind: "status", tone: "muted", text: "aborted: user requested" },

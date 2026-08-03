@@ -13,10 +13,17 @@ describe("Mini Lilac webfetch", () => {
       maxCharacters: 50_000,
     });
     expect(() => webfetchInputSchema.parse({ url: "file:///etc/passwd" })).toThrow();
+    expect(() => webfetchInputSchema.parse({ url: "ftp://example.com/file" })).toThrow();
     expect(() => webfetchInputSchema.parse({ url: "https://user:secret@example.com" })).toThrow(
       "credentials",
     );
     expect(() => webfetchInputSchema.parse({ url: "https://example.com", extra: true })).toThrow();
+    expect(webfetchInputSchema.parse({ url: "  https://example.com/path  " }).url).toBe(
+      "https://example.com/path",
+    );
+    expect(() =>
+      webfetchInputSchema.parse({ url: `https://example.com/${"x".repeat(2_048)}` }),
+    ).toThrow();
   });
 
   it("blocks local, private, mapped, metadata, and mixed DNS destinations before fetching", async () => {

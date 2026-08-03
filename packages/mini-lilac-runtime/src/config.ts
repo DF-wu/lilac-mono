@@ -1,16 +1,11 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { LEVEL1_TOOL_NAMES } from "@stanley2058/lilac-coding-tools";
 import { z } from "zod";
 
-const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set([
-  ...LEVEL1_TOOL_NAMES,
-  "skill",
-  "todowrite",
-  "webfetch",
-  "websearch",
-]);
+import { MINI_LILAC_EXECUTABLE_TOOL_NAMES } from "@stanley2058/mini-lilac-client";
+
+const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set(MINI_LILAC_EXECUTABLE_TOOL_NAMES);
 
 export const slugSchema = z
   .string()

@@ -67,8 +67,7 @@ import {
   miniLilacSessionSnapshotSchema,
   miniLilacSkillSummarySchema,
   miniLilacSteerResultSchema,
-  miniLilacTodoSchema,
-  miniLilacTodoStateSchema,
+  miniLilacTodoWriteInputSchema,
   miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageSchema,
   miniLilacUserUIMessageSchema,
@@ -683,23 +682,6 @@ function serializedUtf8Bytes(value: unknown): number {
     return Buffer.byteLength(String(value), "utf8");
   }
 }
-
-const todoWriteInputSchema = z
-  .object({
-    todos: z
-      .array(miniLilacTodoSchema)
-      .max(50)
-      .describe(
-        "The complete replacement todo list. Include every item that should remain in the session.",
-      ),
-  })
-  .strict()
-  .superRefine((input, context) => {
-    const parsed = miniLilacTodoStateSchema.safeParse({ revision: 0, todos: input.todos });
-    parsed.error?.issues.forEach((issue) =>
-      context.addIssue({ code: "custom", message: issue.message, path: issue.path }),
-    );
-  });
 
 const TODO_WRITE_DESCRIPTION = [
   "Create and maintain the structured task list for the current coding session.",
@@ -2773,7 +2755,7 @@ class SessionActor {
       context.depth === 0 && profileRequestsTool(profile, "todowrite")
         ? tool({
             description: TODO_WRITE_DESCRIPTION,
-            inputSchema: todoWriteInputSchema,
+            inputSchema: miniLilacTodoWriteInputSchema,
             execute: ({ todos }) => this.replaceTodos(context, todos),
           })
         : undefined;

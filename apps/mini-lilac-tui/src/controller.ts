@@ -25,14 +25,13 @@ import {
   type InputEvent,
   type InputState,
 } from "./input-state";
-import {
-  ChunkRenderer,
-  compactionEntry,
-  renderInitialMessages,
-  type TranscriptEntry,
-} from "./render";
+import { compactionEntry, type TranscriptEntry } from "./render";
+import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
 import { sessionPresentation, type SessionPresentation } from "./presentation";
-import { projectMiniLilacStreamChunk } from "./ui-message-chunk-projection";
+import {
+  projectMiniLilacStreamChunk,
+  UIMessageChunkProjectionState,
+} from "./ui-message-chunk-projection";
 
 export interface ControllerUISink {
   onState(state: InputState): void;
@@ -99,6 +98,7 @@ function errorMessage(error: unknown): string {
 export class Controller {
   private state: InputState = initialInputState();
   private readonly renderer: ChunkRenderer;
+  private readonly streamProjection: UIMessageChunkProjectionState;
   private messages: MiniLilacUIMessage[];
   private output: TranscriptEntry[];
   private steering: MiniLilacUserUIMessage[] = [];
@@ -150,6 +150,9 @@ export class Controller {
   private disposed = false;
 
   constructor(private readonly options: ControllerOptions) {
+    this.streamProjection = new UIMessageChunkProjectionState({
+      cwd: options.cwd ?? options.initialSnapshot?.cwd,
+    });
     this.activeRunId = options.initialSnapshot?.activeRunId ?? undefined;
     this.sessionExists =
       options.initialSnapshot !== undefined || (options.initialMessages?.length ?? 0) > 0;
@@ -701,7 +704,7 @@ export class Controller {
           return "superseded";
         }
         if (done) return terminalFinish ? "completed" : "disconnected";
-        const projected = projectMiniLilacStreamChunk(value);
+        const projected = projectMiniLilacStreamChunk(value, this.streamProjection);
         switch (projected.kind) {
           case "finish":
             terminalFinish = true;
@@ -1702,6 +1705,7 @@ export class Controller {
 
   private beginRun(): void {
     this.renderer.startRun();
+    this.streamProjection.reset();
   }
 
   private onPromptAdmitted(): void {

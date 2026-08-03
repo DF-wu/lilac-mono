@@ -10517,14 +10517,6 @@ export const syntaxBaseline = {
       },
       {
         workspace: "apps/mini-lilac-tui",
-        module: "src/render",
-        symbol: "rawExplorationInput",
-        kind: "catch-clause",
-        digest: "77804e627a84c69c29f89fb6bdd14d008000a9257723fec1990240ab88a8de1e",
-        reason: "Reviewed Stage 0 pre-existing exception-flow migration debt",
-      },
-      {
-        workspace: "apps/mini-lilac-tui",
         module: "src/startup",
         symbol: "resolveStartupSession",
         kind: "throw",

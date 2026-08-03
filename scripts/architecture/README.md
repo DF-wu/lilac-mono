@@ -55,3 +55,30 @@ family to exact cross-workspace delivery registrations and zero-baseline scopes,
 codec coverage. Enforced raw and typed APIs reject generic receive contracts, handler-owned `commit`
 contexts, legacy API aliases, generic message specialization assertions, and unregistered production
 consumers.
+
+Stage 5 adds an exact presentation codec registry resolved against the shared Mini Lilac protocol
+catalog of 14 canonical tool names, exact
+Result-decoder registrations, and recursively unknown-free presentation modules. Enforced tool
+registries must use an explicit or const-tuple-composed string tuple and an explicit object literal
+with one codec per tool; the shared catalog may combine explicit executable and transcript-only const tuples, while broad
+computed keys, duplicate keys, missing codecs, and extra codecs fail. Canonical and codec members are
+read from those source declarations rather than copied into the manifest. Enforced Result
+decoders are non-generic exact symbols that accept boundary data containing `unknown` and return a
+direct `Result<Decoded, SpecificError>` whose success and error types recursively exclude `unknown`,
+`any`, and `never`.
+
+An enforced unknown-free module rejects `unknown` recursively through parameters, returns, aliases,
+properties, nested imported contracts, method and call signatures, generics, maps, unions, callback
+contracts, and local variables. Traversal has a fixed property budget and fails closed if that budget
+is exhausted. Such a module may not own either kind of decoder registration. The syntax ratchet also
+rejects runtime `zod` imports and value imports or calls of registered projection/decoder boundaries in
+an enforced unknown-free module. Registered tool codec registry values and their exported or local
+aliases are covered as well; type-only projection imports remain allowed.
+
+The landed Mini Lilac tool catalog, codec registry, Result decoder, parser owners, and raw observation
+adapters are enforced. The six Zod parser calls are owned by `parseInput`, `decodeBash` (two calls),
+`decodeEditFile`, `decodeSubagentDelegate`, and `decodeWebsearch`; `projectToolObservation`,
+`observationFromCanonicalPart`, and `UIMessageChunkProjectionState.toolChunk` own the raw projection
+edges. `render.ts` and `transcript-buffer.ts` are recursively unknown-free, and runtime Zod imports are
+forbidden there. Module-wide zero-baseline scopes cover render, UI-message projection, tool-observation
+projection, and transcript buffering, including all descendant symbols.

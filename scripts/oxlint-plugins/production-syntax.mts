@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { defineRule } from "@oxlint/plugins";
 
 import ts from "typescript-codegen";
@@ -22,6 +24,7 @@ import {
 } from "./syntax-rule-utils.mts";
 
 export type LocalRecordGuardKind = "local-record-guard";
+export type PresentationDecoderImportKind = "presentation-decoder-import";
 export type ResultCallbackKind = "inline-async-result-callback";
 
 function sourceFileOf(sourceText: string, filePath: string): ts.SourceFile {
@@ -888,6 +891,206 @@ export function findLocalRecordGuardViolations(
   return findings;
 }
 
+function hasRuntimeImport(importDeclaration: ts.ImportDeclaration): boolean {
+  const clause = importDeclaration.importClause;
+  if (!clause) return true;
+  if (clause.isTypeOnly) return false;
+  if (clause.name) return true;
+  const bindings = clause.namedBindings;
+  if (!bindings || ts.isNamespaceImport(bindings)) return true;
+  return bindings.elements.some((specifier) => !specifier.isTypeOnly);
+}
+
+function moduleWithoutExtension(module: string): string {
+  return module.replace(/\.(?:[cm]?[jt]sx?)$/u, "");
+}
+
+function importedWorkspaceModule(
+  sourceModule: string,
+  sourceWorkspace: string,
+  specifier: string,
+  manifest: ArchitectureManifest,
+):
+  | { readonly module?: string; readonly workspace: ArchitectureManifest["workspaces"][number] }
+  | undefined {
+  if (specifier.startsWith(".")) {
+    const module = path.posix.normalize(
+      path.posix.join(path.posix.dirname(sourceModule), specifier),
+    );
+    const workspace = manifest.workspaces.find((candidate) => candidate.name === sourceWorkspace);
+    if (!workspace) return undefined;
+    return {
+      module: moduleWithoutExtension(module),
+      workspace,
+    };
+  }
+  const workspace = manifest.workspaces.find(
+    (candidate) =>
+      specifier === candidate.packageName || specifier.startsWith(`${candidate.packageName}/`),
+  );
+  if (!workspace) return undefined;
+  const suffix = specifier.slice(workspace.packageName.length).replace(/^\//u, "");
+  return { ...(suffix ? { module: moduleWithoutExtension(suffix) } : {}), workspace };
+}
+
+export function findPresentationDecoderImportViolations(
+  sourceText: string,
+  filePath = "apps/example/src/render.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<PresentationDecoderImportKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  const identity = sourceIdentity(filePath);
+  const sourceModule = `${identity.module}.ts`;
+  const enforced = manifest.workspaces
+    .find((workspace) => workspace.name === identity.workspace)
+    ?.unknownFreeModules.some(
+      (registration) =>
+        registration.status === "enforced" &&
+        registration.module.replace(/\.(?:[cm]?[jt]sx?)$/u, ".ts") === sourceModule,
+    );
+  if (!enforced) return [];
+
+  const sourceFile = sourceFileOf(sourceText, filePath);
+  const findings: SyntacticFinding<PresentationDecoderImportKind>[] = [];
+  const forbiddenValues = new Set<string>();
+  const forbiddenNamespaces = new Map<string, ReadonlySet<string>>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) {
+      continue;
+    }
+    if (statement.moduleSpecifier.text === "zod" && hasRuntimeImport(statement)) {
+      findings.push(
+        createFinding(
+          sourceFile,
+          filePath,
+          statement,
+          "presentation-decoder-import",
+          "Unknown-free presentation modules cannot import Zod parsers; decode in the registered projection boundary",
+        ),
+      );
+    }
+
+    const target = importedWorkspaceModule(
+      sourceModule,
+      identity.workspace,
+      statement.moduleSpecifier.text,
+      manifest,
+    );
+    const clause = statement.importClause;
+    if (!target || !clause || clause.isTypeOnly) continue;
+    const registered = [
+      ...target.workspace.boundaryDecoders.map(({ identity: decoder }) => decoder),
+      ...target.workspace.resultDecoders.map(({ identity: decoder }) => decoder),
+      ...target.workspace.openProtocolAdapters.map(({ identity: adapter }) => adapter),
+      ...target.workspace.toolCodecRegistries.flatMap((registry) => [
+        registry.identity,
+        ...registry.aliases,
+      ]),
+    ].filter(
+      (decoder) =>
+        target.module === undefined || moduleWithoutExtension(decoder.module) === target.module,
+    );
+    if (registered.length === 0) continue;
+    const registeredNames = new Set(registered.map(({ exportName }) => exportName.split(".")[0]!));
+    const bindings = clause.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) {
+      findings.push(
+        createFinding(
+          sourceFile,
+          filePath,
+          statement,
+          "presentation-decoder-import",
+          "Unknown-free presentation modules cannot value-import a registered projection or decoder boundary",
+        ),
+      );
+      forbiddenNamespaces.set(bindings.name.text, registeredNames);
+      continue;
+    }
+    if (!bindings || !ts.isNamedImports(bindings)) continue;
+    for (const specifier of bindings.elements) {
+      if (specifier.isTypeOnly) continue;
+      const importedName = specifier.propertyName?.text ?? specifier.name.text;
+      if (!registeredNames.has(importedName)) continue;
+      findings.push(
+        createFinding(
+          sourceFile,
+          filePath,
+          specifier,
+          "presentation-decoder-import",
+          `Unknown-free presentation modules cannot value-import registered boundary ${importedName}`,
+        ),
+      );
+      forbiddenValues.add(specifier.name.text);
+    }
+  }
+  if (forbiddenValues.size === 0 && forbiddenNamespaces.size === 0) return findings;
+
+  const isForbiddenValue = (expression: ts.Expression): boolean => {
+    const unwrapped = unwrappedExpression(expression);
+    if (ts.isIdentifier(unwrapped)) return forbiddenValues.has(unwrapped.text);
+    const parts = propertyAccessParts(unwrapped);
+    if (parts) {
+      const base = unwrappedExpression(parts[0]);
+      if (ts.isIdentifier(base) && forbiddenNamespaces.get(base.text)?.has(parts[1]) === true) {
+        return true;
+      }
+      return isForbiddenValue(parts[0]);
+    }
+    if (ts.isElementAccessExpression(unwrapped)) return isForbiddenValue(unwrapped.expression);
+    return false;
+  };
+
+  const bindingCounts = collectBindingNameCounts(sourceFile);
+  const aliases: { readonly name: string; readonly value: ts.Expression }[] = [];
+  const collectAliases = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      bindingCounts.get(node.name.text) === 1
+    ) {
+      aliases.push({ name: node.name.text, value: node.initializer });
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left) &&
+      bindingCounts.get(node.left.text) === 1
+    ) {
+      aliases.push({ name: node.left.text, value: node.right });
+    }
+    ts.forEachChild(node, collectAliases);
+  };
+  collectAliases(sourceFile);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const alias of aliases) {
+      if (!forbiddenValues.has(alias.name) && isForbiddenValue(alias.value)) {
+        forbiddenValues.add(alias.name);
+        changed = true;
+      }
+    }
+  }
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && isForbiddenValue(node.expression)) {
+      findings.push(
+        createFinding(
+          sourceFile,
+          filePath,
+          node,
+          "presentation-decoder-import",
+          "Unknown-free presentation modules cannot invoke a registered projection, decoder, or tool codec registry value",
+        ),
+      );
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
 const RESULT_COMBINATORS = new Set([
   "andThen",
   "andThenAsync",
@@ -1175,4 +1378,8 @@ export const noLocalIsRecordRule = ruleFromFinder(
 export const noInlineAsyncResultCallbackRule = ruleFromFinder(
   "Disallow inline async callbacks in proven Result combinators",
   findInlineAsyncResultCallbackViolations,
+);
+export const noPresentationDecoderImportRule = ruleFromFinder(
+  "Disallow Zod parser imports in activated unknown-free presentation modules",
+  findPresentationDecoderImportViolations,
 );

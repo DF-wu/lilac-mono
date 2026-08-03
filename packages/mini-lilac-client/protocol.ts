@@ -486,29 +486,38 @@ export const miniLilacTodosSchema = z
     }
   });
 
+function refineTodoStateSerializedSize(
+  todos: z.output<typeof miniLilacTodosSchema>,
+  context: z.RefinementCtx,
+): void {
+  // Explicit field ordering keeps the byte limit independent of input object key order.
+  const serialized = JSON.stringify({
+    // Reserve the maximum revision width so a schema-valid list stays writable at every revision.
+    revision: Number.MAX_SAFE_INTEGER,
+    todos: todos.map((todo) => ({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority,
+    })),
+  });
+  if (new TextEncoder().encode(serialized).byteLength > MAX_TODO_STATE_BYTES) {
+    context.addIssue({
+      code: "custom",
+      message: `Serialized todo state may not exceed ${MAX_TODO_STATE_BYTES} bytes`,
+    });
+  }
+}
+
+export const miniLilacTodoWriteInputSchema = z
+  .strictObject({ todos: miniLilacTodosSchema })
+  .superRefine((input, context) => refineTodoStateSerializedSize(input.todos, context));
+
 export const miniLilacTodoStateSchema = z
   .strictObject({
     revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     todos: miniLilacTodosSchema,
   })
-  .superRefine((state, context) => {
-    // Explicit field ordering keeps the byte limit independent of input object key order.
-    const serialized = JSON.stringify({
-      // Reserve the maximum revision width so a schema-valid list stays writable at every revision.
-      revision: Number.MAX_SAFE_INTEGER,
-      todos: state.todos.map((todo) => ({
-        content: todo.content,
-        status: todo.status,
-        priority: todo.priority,
-      })),
-    });
-    if (new TextEncoder().encode(serialized).byteLength > MAX_TODO_STATE_BYTES) {
-      context.addIssue({
-        code: "custom",
-        message: `Serialized todo state may not exceed ${MAX_TODO_STATE_BYTES} bytes`,
-      });
-    }
-  });
+  .superRefine((state, context) => refineTodoStateSerializedSize(state.todos, context));
 export type MiniLilacTodoState = z.infer<typeof miniLilacTodoStateSchema>;
 
 export const miniLilacTodoChunkSchema = z.strictObject({

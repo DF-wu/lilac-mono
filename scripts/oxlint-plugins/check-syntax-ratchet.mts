@@ -12,6 +12,7 @@ import { validateWorkspaceInventory } from "../architecture/workspace-inventory.
 import {
   findExceptionFlowViolations,
   findInlineAsyncResultCallbackViolations,
+  findPresentationDecoderImportViolations,
 } from "./production-syntax.mts";
 import { syntaxBaseline } from "./syntax-baseline.mts";
 import type { SyntacticFinding } from "./syntax-rule-utils.mts";
@@ -19,6 +20,7 @@ import type { SyntacticFinding } from "./syntax-rule-utils.mts";
 export const ACTIVE_SYNTAX_RULES = [
   "lilac/no-exception-flow",
   "lilac/no-inline-async-result-callback",
+  "lilac/no-presentation-decoder-import",
 ] as const;
 export type ActiveSyntaxRule = (typeof ACTIVE_SYNTAX_RULES)[number];
 
@@ -209,6 +211,11 @@ export async function scanSyntaxFindings(
           "lilac/no-inline-async-result-callback",
           findInlineAsyncResultCallbackViolations(source, path),
           "Reviewed Stage 0 pre-existing inline async Result callback debt",
+        ),
+        ...toSyntaxFindings(
+          "lilac/no-presentation-decoder-import",
+          findPresentationDecoderImportViolations(source, path, undefined, manifest),
+          "Stage 5 unknown-free presentation modules cannot own Zod parsing",
         ),
       );
     }

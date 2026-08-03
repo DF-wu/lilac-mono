@@ -8,8 +8,12 @@ import type {
   EventCodecRegistryRegistration,
   EventDeliveryApiRegistration,
   EventDeliveryConsumerRegistration,
+  PackageSymbolIdentity,
   RawEventMessageBoundaryRegistration,
+  ResultDecoderRegistration,
   SymbolIdentity,
+  ToolCodecRegistryRegistration,
+  UnknownFreeModuleRegistration,
   WorkspaceArchitecture,
 } from "./manifest.ts";
 import { ARCHITECTURE_RULES, type ArchitectureDiagnostic, type ArchitectureRule } from "./model.ts";
@@ -286,6 +290,125 @@ function parameterContractIdentity(
 
 function isUnknown(type: ts.Type): boolean {
   return (type.flags & ts.TypeFlags.Unknown) !== 0;
+}
+
+interface UnknownTraversalState {
+  readonly inspectMethodProperties: boolean;
+  readonly seen: Set<ts.Type>;
+  remainingProperties: number;
+}
+
+function typeContainsFlags(
+  type: ts.Type,
+  forbiddenFlags: ts.TypeFlags,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+  state: UnknownTraversalState = {
+    inspectMethodProperties: true,
+    seen: new Set(),
+    remainingProperties: MAX_VISITED_PROPERTIES,
+  },
+): boolean {
+  if ((type.flags & forbiddenFlags) !== 0) return true;
+  if (state.seen.has(type)) return false;
+  state.seen.add(type);
+
+  if (
+    type.isUnionOrIntersection() &&
+    type.types.some((member) => typeContainsFlags(member, forbiddenFlags, checker, location, state))
+  ) {
+    return true;
+  }
+  if (
+    typeArguments(type, checker).some((argument) =>
+      typeContainsFlags(argument, forbiddenFlags, checker, location, state),
+    )
+  ) {
+    return true;
+  }
+  const constraint = checker.getBaseConstraintOfType(type);
+  if (
+    constraint &&
+    constraint !== type &&
+    typeContainsFlags(constraint, forbiddenFlags, checker, location, state)
+  ) {
+    return true;
+  }
+  if ((type.flags & ts.TypeFlags.Object) === 0) return false;
+  for (const signature of [
+    ...checker.getSignaturesOfType(type, ts.SignatureKind.Call),
+    ...checker.getSignaturesOfType(type, ts.SignatureKind.Construct),
+  ]) {
+    if (typeContainsFlags(signature.getReturnType(), forbiddenFlags, checker, location, state)) {
+      return true;
+    }
+    for (const parameter of signature.getTypeParameters() ?? []) {
+      const parameterConstraint = checker.getBaseConstraintOfType(parameter);
+      if (
+        parameterConstraint &&
+        typeContainsFlags(parameterConstraint, forbiddenFlags, checker, location, state)
+      ) {
+        return true;
+      }
+    }
+    for (const parameter of signature.parameters) {
+      const declaration = parameter.valueDeclaration ?? parameter.declarations?.[0] ?? location;
+      if (
+        typeContainsFlags(
+          checker.getTypeOfSymbolAtLocation(parameter, declaration),
+          forbiddenFlags,
+          checker,
+          location,
+          state,
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  for (const kind of [ts.IndexKind.String, ts.IndexKind.Number]) {
+    const indexed = checker.getIndexTypeOfType(type, kind);
+    if (indexed && typeContainsFlags(indexed, forbiddenFlags, checker, location, state)) {
+      return true;
+    }
+  }
+  for (const property of checker.getPropertiesOfType(type)) {
+    if (state.remainingProperties <= 0) return true;
+    const declarations = property.declarations ?? [];
+    const propertyType = checker.getTypeOfSymbolAtLocation(
+      property,
+      property.valueDeclaration ?? property.declarations?.[0] ?? location,
+    );
+    if (
+      declarations.length > 0 &&
+      (declarations.some(isDefaultLibraryDeclaration) ||
+        (!state.inspectMethodProperties &&
+          declarations.every(
+            (declaration) =>
+              ts.isMethodDeclaration(declaration) ||
+              ts.isMethodSignature(declaration) ||
+              ts.isFunctionDeclaration(declaration),
+          )))
+    ) {
+      continue;
+    }
+    if (
+      !state.inspectMethodProperties &&
+      (checker.getSignaturesOfType(propertyType, ts.SignatureKind.Call).length > 0 ||
+        checker.getSignaturesOfType(propertyType, ts.SignatureKind.Construct).length > 0)
+    ) {
+      continue;
+    }
+    state.remainingProperties -= 1;
+    if (typeContainsFlags(propertyType, forbiddenFlags, checker, location, state)) return true;
+  }
+  return baseTypes(type).some((baseType) =>
+    typeContainsFlags(baseType, forbiddenFlags, checker, location, state),
+  );
+}
+
+function typeContainsUnknown(type: ts.Type, checker: ts.TypeChecker, location: ts.Node): boolean {
+  return typeContainsFlags(type, ts.TypeFlags.Unknown, checker, location);
 }
 
 function isStructured(type: ts.Type): boolean {
@@ -869,7 +992,12 @@ function analyzeCall(
     ZOD_PARSE_MEMBERS.has(member)
   ) {
     const identity = nodeIdentity(node, workspaceRoot);
-    if (!workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity))) {
+    const registered =
+      workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)) ||
+      workspace.resultDecoders.some(
+        (decoder) => decoder.status === "enforced" && identityOwns(decoder.identity, identity),
+      );
+    if (!registered) {
       diagnostics.push(
         makeDiagnostic(
           workspace,
@@ -2604,17 +2732,23 @@ function isNamedCallableDeclaration(node: ts.Node): node is ts.SignatureDeclarat
 }
 
 function registeredNodes<T extends ts.Node>(
-  identity: SymbolIdentity,
+  identity: PackageSymbolIdentity,
   workspaceRoot: string,
   program: ts.Program,
   predicate: (node: ts.Node) => node is T,
+  packageRoots: readonly WorkspacePackageRoot[] = [],
 ): readonly T[] {
+  const identityRoot =
+    identity.package === undefined
+      ? workspaceRoot
+      : packageRoots.find(({ packageName }) => packageName === identity.package)?.root;
+  if (!identityRoot) return [];
   const sourceFile = program
     .getSourceFiles()
     .find(
       (candidate) =>
         !candidate.isDeclarationFile &&
-        relativeModulePath(workspaceRoot, candidate) === identity.module,
+        relativeModulePath(identityRoot, candidate) === identity.module,
     );
   if (!sourceFile) return [];
   const matches: T[] = [];
@@ -2623,12 +2757,12 @@ function registeredNodes<T extends ts.Node>(
       const variableMatch =
         ts.isVariableDeclaration(node) &&
         ts.isIdentifier(node.name) &&
-        relativeModulePath(workspaceRoot, node.getSourceFile()) === identity.module &&
+        relativeModulePath(identityRoot, node.getSourceFile()) === identity.module &&
         node.name.text === identity.exportName;
       const nestedFunctionType = ts.isFunctionTypeNode(node) && ts.isParameter(node.parent);
       if (
         variableMatch ||
-        (!nestedFunctionType && identityMatches(identity, nodeIdentity(node, workspaceRoot)))
+        (!nestedFunctionType && identityMatches(identity, nodeIdentity(node, identityRoot)))
       ) {
         matches.push(node);
       }
@@ -2641,16 +2775,17 @@ function registeredNodes<T extends ts.Node>(
 
 function requireOneRegisteredNode<T extends ts.Node>(
   description: string,
-  identity: SymbolIdentity,
+  identity: PackageSymbolIdentity,
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
   program: ts.Program,
   predicate: (node: ts.Node) => node is T,
+  packageRoots: readonly WorkspacePackageRoot[] = [],
 ): T {
-  const matches = registeredNodes(identity, workspaceRoot, program, predicate);
+  const matches = registeredNodes(identity, workspaceRoot, program, predicate, packageRoots);
   if (matches.length !== 1) {
     throw new Error(
-      `${description} ${workspace.name}/${identity.module}#${identity.exportName} must resolve to exactly one declaration; found ${matches.length}.`,
+      `${description} ${identity.package ?? workspace.name}/${identity.module}#${identity.exportName} must resolve to exactly one declaration; found ${matches.length}.`,
     );
   }
   return matches[0]!;
@@ -2674,6 +2809,7 @@ function propertyStringValue(
 ): string | undefined {
   const name = property.name;
   if (!name) return undefined;
+  if (ts.isIdentifier(name) || ts.isNumericLiteral(name)) return name.text;
   if (ts.isStringLiteralLike(name)) return name.text;
   if (ts.isComputedPropertyName(name)) {
     const type = checker.getTypeAtLocation(name.expression);
@@ -2682,6 +2818,52 @@ function propertyStringValue(
       : undefined;
   }
   return undefined;
+}
+
+function canonicalToolExpressionValues(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol>,
+): readonly string[] | undefined {
+  const initializer = unwrapExpression(expression);
+  if (!ts.isArrayLiteralExpression(initializer)) {
+    let symbol = checker.getSymbolAtLocation(initializer);
+    if (symbol && (symbol.flags & ts.SymbolFlags.Alias) !== 0)
+      symbol = checker.getAliasedSymbol(symbol);
+    if (!symbol || seenSymbols.has(symbol)) return undefined;
+    seenSymbols.add(symbol);
+    const declaration = symbol.declarations?.find(
+      (candidate): candidate is ts.VariableDeclaration =>
+        ts.isVariableDeclaration(candidate) && candidate.initializer !== undefined,
+    );
+    const values = declaration?.initializer
+      ? canonicalToolExpressionValues(declaration.initializer, checker, seenSymbols)
+      : undefined;
+    seenSymbols.delete(symbol);
+    return values;
+  }
+  const values: string[] = [];
+  for (const element of initializer.elements) {
+    if (ts.isSpreadElement(element)) {
+      const spread = canonicalToolExpressionValues(element.expression, checker, seenSymbols);
+      if (!spread) return undefined;
+      values.push(...spread);
+      continue;
+    }
+    const value = unwrapExpression(element);
+    if (!ts.isStringLiteralLike(value)) return undefined;
+    values.push(value.text);
+  }
+  return values;
+}
+
+function canonicalToolValues(
+  declaration: ts.VariableDeclaration,
+  checker: ts.TypeChecker,
+): readonly string[] | undefined {
+  return declaration.initializer
+    ? canonicalToolExpressionValues(declaration.initializer, checker, new Set())
+    : undefined;
 }
 
 function canonicalEventValues(declaration: ts.VariableDeclaration): readonly string[] | undefined {
@@ -2783,6 +2965,260 @@ function analyzeEventCodecRegistry(
       "Keep the canonical event catalog and codec registry as exact, exhaustive one-to-one maps.",
     ),
   );
+}
+
+function analyzeToolCodecRegistry(
+  registration: ToolCodecRegistryRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const registry = requireOneRegisteredNode(
+    "Tool codec registry",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isObjectRegistryDeclaration,
+    packageRoots,
+  );
+  const registrySymbol = checker.getSymbolAtLocation(registry.name);
+  const invalidAliases: string[] = [];
+  for (const aliasIdentity of registration.aliases) {
+    const alias = requireOneRegisteredNode(
+      "Tool codec registry alias",
+      aliasIdentity,
+      workspace,
+      workspaceRoot,
+      program,
+      isObjectRegistryDeclaration,
+      packageRoots,
+    );
+    const initializer = alias.initializer && unwrapExpression(alias.initializer);
+    let aliasTarget = initializer && checker.getSymbolAtLocation(initializer);
+    if (aliasTarget && (aliasTarget.flags & ts.SymbolFlags.Alias) !== 0) {
+      aliasTarget = checker.getAliasedSymbol(aliasTarget);
+    }
+    if (!registrySymbol || aliasTarget !== registrySymbol) {
+      invalidAliases.push(aliasIdentity.exportName);
+    }
+  }
+  const canonical = requireOneRegisteredNode(
+    "Canonical tool catalog",
+    registration.canonicalTools,
+    workspace,
+    workspaceRoot,
+    program,
+    isObjectRegistryDeclaration,
+    packageRoots,
+  );
+  const sourceCanonicalValues = canonicalToolValues(canonical, checker);
+  const broadCatalog = !checker.isTupleType(checker.getTypeAtLocation(canonical.name));
+  const registryValues = codecRegistryValues(registry, checker);
+  const registryType = checker.getTypeAtLocation(registry.name);
+  const broadRegistry =
+    checker.getIndexTypeOfType(registryType, ts.IndexKind.String) !== undefined ||
+    checker.getIndexTypeOfType(registryType, ts.IndexKind.Number) !== undefined;
+  const sourceCanonical = new Set(sourceCanonicalValues ?? []);
+  const sourceRegistry = new Set(registryValues ?? []);
+  const malformed = sourceCanonicalValues === undefined || registryValues === undefined;
+  const codecMissing = setDifference(sourceCanonical, sourceRegistry);
+  const codecExtra = setDifference(sourceRegistry, sourceCanonical);
+  const duplicateCatalog =
+    sourceCanonicalValues !== undefined && sourceCanonical.size !== sourceCanonicalValues.length;
+  const duplicateRegistry =
+    registryValues !== undefined && sourceRegistry.size !== registryValues.length;
+  if (
+    !malformed &&
+    codecMissing.length === 0 &&
+    codecExtra.length === 0 &&
+    !duplicateCatalog &&
+    !duplicateRegistry &&
+    !broadCatalog &&
+    !broadRegistry &&
+    invalidAliases.length === 0
+  ) {
+    return;
+  }
+  const details = [
+    malformed
+      ? "catalog must be an explicit or const-tuple-composed string tuple and registry must be an explicit object literal with statically named members"
+      : undefined,
+    codecMissing.length ? `codecs missing ${codecMissing.join(", ")}` : undefined,
+    codecExtra.length ? `codecs contain noncanonical ${codecExtra.join(", ")}` : undefined,
+    duplicateCatalog ? "canonical tool catalog contains duplicates" : undefined,
+    duplicateRegistry ? "tool codec registry contains duplicate canonical keys" : undefined,
+    broadCatalog ? "canonical tool catalog is not a literal tuple" : undefined,
+    broadRegistry ? "tool codec registry has a broad index signature" : undefined,
+    invalidAliases.length
+      ? `registry aliases do not reference the registered value: ${invalidAliases.join(", ")}`
+      : undefined,
+  ].filter((detail): detail is string => detail !== undefined);
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/complete-tool-codec-registry",
+      registry,
+      `Registered tool codec registry is incomplete: ${details.join("; ")}.`,
+      "Keep the shared executable-plus-transcript tool catalog and codec registry as exhaustive one-to-one declarations without broad keys or manifest member copies.",
+    ),
+  );
+}
+
+function resultTypeArguments(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+): readonly [ts.Type, ts.Type] | undefined {
+  const arguments_ = type.aliasTypeArguments ?? typeArguments(type, checker);
+  const success = arguments_[0];
+  const error = arguments_[1];
+  if (success && error) return [success, error];
+  if (!type.isUnion()) return undefined;
+  let unionSuccess: ts.Type | undefined;
+  let unionError: ts.Type | undefined;
+  for (const member of type.types) {
+    const memberArguments = member.aliasTypeArguments ?? typeArguments(member, checker);
+    unionSuccess ??= memberArguments[0];
+    unionError ??= memberArguments[1];
+  }
+  return unionSuccess && unionError ? [unionSuccess, unionError] : undefined;
+}
+
+function analyzeResultDecoder(
+  registration: ResultDecoderRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const declaration = requireOneRegisteredNode(
+    "Result decoder",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isCallableImplementation,
+  );
+  const signature = checker.getSignatureFromDeclaration(declaration);
+  const input = declaration.parameters[registration.inputParameter];
+  const returnType = signature?.getReturnType();
+  const resultArguments =
+    returnType && isDirectResultType(returnType, packageRoots)
+      ? resultTypeArguments(returnType, checker)
+      : undefined;
+  const invalidFlags = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never;
+  const failures = [
+    declaration.typeParameters?.length ? "decoder is generic" : undefined,
+    input ? undefined : "registered input parameter does not exist",
+    input &&
+    typeContainsUnknown(
+      input.type ? checker.getTypeFromTypeNode(input.type) : checker.getTypeAtLocation(input),
+      checker,
+      input,
+    )
+      ? undefined
+      : "registered input does not contain unknown boundary data",
+    resultArguments ? undefined : "return type is not a direct better-result Result<T, E>",
+    resultArguments && !typeContainsFlags(resultArguments[0], invalidFlags, checker, declaration)
+      ? undefined
+      : "Result success type is not fully decoded",
+    resultArguments &&
+    !typeContainsFlags(resultArguments[1], invalidFlags, checker, declaration, {
+      inspectMethodProperties: false,
+      seen: new Set(),
+      remainingProperties: MAX_VISITED_PROPERTIES,
+    })
+      ? undefined
+      : "Result error type is not specific",
+  ].filter((failure): failure is string => failure !== undefined);
+  if (failures.length === 0) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/result-decoder-contract",
+      input ?? declaration,
+      `Registered Result decoder ${registration.identity.exportName} is invalid: ${failures.join("; ")}.`,
+      "Decode the exact boundary input with a non-generic callable returning Result<Decoded, SpecificError>.",
+    ),
+  );
+}
+
+function unknownFreeDeclarationType(node: ts.Node, checker: ts.TypeChecker): ts.Type | undefined {
+  if (ts.isTypeAliasDeclaration(node)) return checker.getTypeFromTypeNode(node.type);
+  if (
+    ts.isParameter(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isPropertyDeclaration(node) ||
+    ts.isPropertySignature(node)
+  ) {
+    return node.type ? checker.getTypeFromTypeNode(node.type) : checker.getTypeAtLocation(node);
+  }
+  if (ts.isFunctionLike(node) && !ts.isConstructorDeclaration(node)) {
+    return checker.getSignatureFromDeclaration(node)?.getReturnType();
+  }
+  return undefined;
+}
+
+function unknownFreeDeclarationDescription(node: ts.Node): string {
+  if (ts.isParameter(node)) return `parameter ${node.name.getText()}`;
+  if (ts.isVariableDeclaration(node)) return `local ${node.name.getText()}`;
+  if (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) {
+    return `property ${node.name.getText()}`;
+  }
+  if (ts.isTypeAliasDeclaration(node)) return `type alias ${node.name.text}`;
+  return "return type";
+}
+
+function analyzeUnknownFreeModule(
+  registration: UnknownFreeModuleRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const sourceFile = program
+    .getSourceFiles()
+    .find(
+      (candidate) =>
+        !candidate.isDeclarationFile &&
+        relativeModulePath(workspaceRoot, candidate) === registration.module,
+    );
+  if (!sourceFile) {
+    throw new Error(
+      `Unknown-free module ${workspace.name}/${registration.module} must resolve to exactly one source module; found 0.`,
+    );
+  }
+  const reported = new Set<number>();
+  const visit = (node: ts.Node): void => {
+    const type = unknownFreeDeclarationType(node, checker);
+    if (
+      type &&
+      typeContainsUnknown(type, checker, node) &&
+      !reported.has(node.getStart(sourceFile))
+    ) {
+      reported.add(node.getStart(sourceFile));
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/unknown-free-module",
+          node,
+          `Unknown-free module ${registration.module} exposes unknown through ${unknownFreeDeclarationDescription(node)}.`,
+          "Project boundary data before rendering; parameters, returns, aliases, properties, generics, maps, unions, and locals must be recursively unknown-free.",
+        ),
+      );
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
 }
 
 function messageTypeIsUnknown(
@@ -3233,6 +3669,57 @@ function analyzeRegisteredEventInfrastructure(
       )
     ) {
       analyzeEventCodecRegistry(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.toolCodecRegistries) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(
+        workspace,
+        "architecture/complete-tool-codec-registry",
+        registration.identity.module,
+      )
+    ) {
+      analyzeToolCodecRegistry(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.resultDecoders) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(workspace, "architecture/result-decoder-contract", registration.identity.module)
+    ) {
+      analyzeResultDecoder(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.unknownFreeModules) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(workspace, "architecture/unknown-free-module", registration.module)
+    ) {
+      analyzeUnknownFreeModule(
         registration,
         checker,
         workspace,

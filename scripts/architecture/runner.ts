@@ -67,7 +67,10 @@ export function inventoryManifest(manifest: ArchitectureManifest): ArchitectureM
       ruleZones: Object.fromEntries(
         ARCHITECTURE_RULES.map((rule) => [
           rule,
-          rule === "architecture/open-protocol-normalization"
+          rule === "architecture/open-protocol-normalization" ||
+          rule === "architecture/complete-tool-codec-registry" ||
+          rule === "architecture/result-decoder-contract" ||
+          rule === "architecture/unknown-free-module"
             ? (workspace.ruleZones[rule] ?? [])
             : [{ include: "**" }],
         ]),

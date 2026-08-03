@@ -94,6 +94,39 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - Do not write generic `parseJson<T>` helpers that establish `T` only through an assertion.
 - Persisted-data codecs must explicitly handle valid current data, supported legacy data, unsupported versions, malformed serialization, and corrupt fields.
 
+### Presentation boundaries
+
+- Keep third-party and otherwise open protocol values inside one registered adapter. The adapter validates or inspects the external value and returns a closed local projection; renderers and transcript builders accept only that projection.
+- Projection lifecycle unions must represent every supported state explicitly, including pending, active, approval, success, error, denied, and cancelled. Renderers exhaustively switch over those local states without a default arm.
+- Normalize unknown future protocol variants to an explicit bounded fallback such as `unsupported` or `unknown-tool` in the adapter. Do not pass raw payloads, parser functions, decoder functions, or `unknown` into presentation modules.
+- Type-only imports of closed projection contracts are allowed in renderers. Runtime imports or calls of projection/decoder boundaries are not; orchestration invokes the adapter before crossing the renderer API.
+
+```ts
+// Open external protocol edge: raw SDK variants are handled only here.
+function projectExternalChunk(chunk: ExternalUiChunk): ProjectedChunk {
+  switch (chunk.type) {
+    case "text-delta":
+      return { kind: "text", text: chunk.delta };
+    case "tool-output":
+      return { kind: "tool", projection: projectToolObservation(chunk.observation) };
+    default:
+      return { kind: "unsupported", chunkType: boundedChunkType(chunk) };
+  }
+}
+
+// Closed presentation edge: no SDK value, parser, decoder, or unknown payload is reachable.
+function renderProjectedChunk(chunk: ProjectedChunk): RenderEntry | undefined {
+  switch (chunk.kind) {
+    case "text":
+      return { kind: "text", text: chunk.text };
+    case "tool":
+      return renderToolProjection(chunk.projection);
+    case "unsupported":
+      return undefined;
+  }
+}
+```
+
 ### Predicates and unions
 
 - Use `isX` for semantic predicates over typed values or exact capability checks.

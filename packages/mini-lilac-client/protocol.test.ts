@@ -31,6 +31,7 @@ import {
   miniLilacTodoChunkSchema,
   miniLilacTodoSchema,
   miniLilacTodoStateSchema,
+  miniLilacTodoWriteInputSchema,
   miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageMetadataSchema,
   miniLilacUIMessageSchema,
@@ -195,6 +196,21 @@ describe("miniLilacUIMessageSchema", () => {
     ]) {
       expect(miniLilacTodoStateSchema.safeParse(malformed).success).toBe(false);
     }
+  });
+
+  it("applies the exact serialized todo-state byte limit to tool input", () => {
+    const oversizedTodos = Array.from({ length: 50 }, (_, index) => ({
+      content: `${index}-${"\u754c".repeat(497)}`,
+      status: "pending" as const,
+      priority: "medium" as const,
+    }));
+    expect(oversizedTodos.every((todo) => todo.content.length <= 500)).toBe(true);
+    expect(miniLilacTodoWriteInputSchema.safeParse({ todos: oversizedTodos }).success).toBe(false);
+    expect(
+      miniLilacTodoWriteInputSchema.safeParse({
+        todos: [{ content: "", status: "cancelled", priority: "low" }],
+      }).success,
+    ).toBe(true);
   });
 
   it("enforces the deterministic serialized todo state UTF-8 byte limit", () => {

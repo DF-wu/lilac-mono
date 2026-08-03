@@ -22,6 +22,10 @@ export interface SymbolIdentity {
   readonly exportName: string;
 }
 
+export interface PackageSymbolIdentity extends SymbolIdentity {
+  readonly package?: string;
+}
+
 export interface ExternalSymbolIdentity {
   readonly package: string;
   readonly exportName: string;
@@ -113,6 +117,25 @@ export interface EventCodecRegistryRegistration {
   readonly codecMembers: readonly string[];
 }
 
+export interface ToolCodecRegistryRegistration {
+  readonly status: ArchitectureRegistrationStatus;
+  readonly identity: SymbolIdentity;
+  readonly aliases: readonly SymbolIdentity[];
+  readonly canonicalTools: PackageSymbolIdentity;
+}
+
+export interface ResultDecoderRegistration {
+  readonly status: ArchitectureRegistrationStatus;
+  readonly identity: SymbolIdentity;
+  readonly category: BoundaryCategory;
+  readonly inputParameter: number;
+}
+
+export interface UnknownFreeModuleRegistration {
+  readonly status: ArchitectureRegistrationStatus;
+  readonly module: string;
+}
+
 export interface RawEventMessageBoundaryRegistration {
   readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
@@ -167,6 +190,9 @@ export interface WorkspaceArchitecture {
   readonly operationalResultApis: readonly SymbolIdentity[];
   readonly zeroBaselineScopes: readonly ZeroBaselineScope[];
   readonly eventCodecRegistries: readonly EventCodecRegistryRegistration[];
+  readonly toolCodecRegistries: readonly ToolCodecRegistryRegistration[];
+  readonly resultDecoders: readonly ResultDecoderRegistration[];
+  readonly unknownFreeModules: readonly UnknownFreeModuleRegistration[];
   readonly rawEventMessageBoundaries: readonly RawEventMessageBoundaryRegistration[];
   readonly eventDeliveryApis: readonly EventDeliveryApiRegistration[];
   readonly eventDeliveryConsumers: readonly EventDeliveryConsumerRegistration[];
@@ -192,6 +218,9 @@ const SCOPED_ARCHITECTURE_RULES = new Set<ArchitectureRule>([
   "architecture/open-protocol-normalization",
   "architecture/raw-event-message-boundary",
   "architecture/complete-event-codec-registry",
+  "architecture/complete-tool-codec-registry",
+  "architecture/result-decoder-contract",
+  "architecture/unknown-free-module",
   "architecture/event-handler-result",
   "architecture/event-delivery-policy-exhaustiveness",
 ]);
@@ -218,6 +247,9 @@ const EMPTY_POLICY = {
   operationalResultApis: [],
   zeroBaselineScopes: [],
   eventCodecRegistries: [],
+  toolCodecRegistries: [],
+  resultDecoders: [],
+  unknownFreeModules: [],
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
@@ -560,6 +592,23 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         },
         category: "projection",
       },
+      ...[
+        "parseInput",
+        "decodeBash",
+        "decodeEditFile",
+        "decodeSubagentDelegate",
+        "decodeWebsearch",
+        "projectToolObservation",
+      ].map((exportName) => ({
+        identity: { module: "src/tool-observation-projection.ts", exportName },
+        category: "projection" as const,
+      })),
+      ...["observationFromCanonicalPart", "UIMessageChunkProjectionState.toolChunk"].map(
+        (exportName) => ({
+          identity: { module: "src/ui-message-chunk-projection.ts", exportName },
+          category: "projection" as const,
+        }),
+      ),
     ],
   ],
   [
@@ -817,6 +866,50 @@ const OPEN_PROTOCOL_RULE_ZONES = new Map<string, readonly RuleZone[]>([
 ]);
 
 const INTEGRATED_EXCEPTION_ADAPTERS = new Map<string, readonly ExceptionAdapter[]>([
+  [
+    "apps/mini-lilac-tui",
+    [
+      {
+        identity: { module: "src/tool-observation-projection.ts", exportName: "parseInput" },
+        category: "external-to-result",
+        externalApi: { package: "zod", exportName: "ZodType.safeParse" },
+        direction: "capture-external",
+        reason:
+          "Contains hostile schema input access and maps ordinary parser failures to the projection-owned malformed Result while preserving Panic.",
+      },
+      {
+        identity: { module: "src/tool-observation-projection.ts", exportName: "parseInput" },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason: "Preserves Panic from hostile schema input access without converting it to an Err.",
+      },
+      {
+        identity: {
+          module: "src/tool-observation-projection.ts",
+          exportName: "decodeKnownToolObservation",
+        },
+        category: "external-to-result",
+        externalApi: {
+          package: "@stanley2058/mini-lilac-tui",
+          exportName: "toolObservationCodecRegistry",
+        },
+        direction: "capture-external",
+        reason:
+          "Contains one selected tool codec invocation and maps ordinary decoder failures to the projection-owned malformed Result while preserving Panic.",
+      },
+      {
+        identity: {
+          module: "src/tool-observation-projection.ts",
+          exportName: "decodeKnownToolObservation",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason: "Preserves Panic from a selected tool decoder without converting it to an Err.",
+      },
+    ],
+  ],
   [
     "apps/core",
     [
@@ -2174,6 +2267,47 @@ const EVENT_BUS_CODEC_REGISTRY: EventCodecRegistryRegistration = {
   codecMembers: CANONICAL_LILAC_EVENT_MEMBERS,
 };
 
+const TUI_TOOL_CODEC_REGISTRY: ToolCodecRegistryRegistration = {
+  status: "enforced",
+  identity: {
+    module: "src/tool-observation-projection.ts",
+    exportName: "toolObservationCodecRegistry",
+  },
+  aliases: [
+    {
+      module: "src/tool-observation-projection.ts",
+      exportName: "knownToolCodecRegistry",
+    },
+  ],
+  canonicalTools: {
+    package: "@stanley2058/mini-lilac-client",
+    module: "tool-catalog.ts",
+    exportName: "MINI_LILAC_TOOL_NAMES",
+  },
+};
+
+const TUI_RESULT_DECODER: ResultDecoderRegistration = {
+  status: "enforced",
+  identity: {
+    module: "src/tool-observation-projection.ts",
+    exportName: "decodeKnownToolObservation",
+  },
+  category: "projection",
+  inputParameter: 0,
+};
+
+const TUI_UNKNOWN_FREE_MODULES = [
+  { status: "enforced", module: "src/render.ts" },
+  { status: "enforced", module: "src/transcript-buffer.ts" },
+] as const satisfies readonly UnknownFreeModuleRegistration[];
+
+const STAGE_5_TUI_MODULES = [
+  "src/render.ts",
+  "src/ui-message-chunk-projection.ts",
+  "src/tool-observation-projection.ts",
+  "src/transcript-buffer.ts",
+] as const;
+
 function coreEventScope(module: string, symbol: string) {
   return { workspace: "apps/core", module, symbol } as const;
 }
@@ -2411,6 +2545,7 @@ export const architectureManifest = {
             })),
           ]
         : []),
+      ...(root === "apps/mini-lilac-tui" ? STAGE_5_TUI_MODULES.map((module) => ({ module })) : []),
     ];
     const stage3Zones = (STAGE_3_ZERO_BASELINE_MODULES.get(root) ?? []).map((include) => ({
       include,
@@ -2426,12 +2561,26 @@ export const architectureManifest = {
       ...Object.fromEntries(
         STAGE_3_RESULT_RULES.map((rule) => [
           rule,
-          [...(root === "apps/core" ? STAGE_1_CORE_RULE_ZONES : []), ...stage3Zones],
+          [
+            ...(root === "apps/core" ? STAGE_1_CORE_RULE_ZONES : []),
+            ...(root === "apps/mini-lilac-tui"
+              ? [{ include: "src/tool-observation-projection.ts" }]
+              : []),
+            ...stage3Zones,
+          ],
         ]),
       ),
       "architecture/open-protocol-normalization": OPEN_PROTOCOL_RULE_ZONES.get(root) ?? [],
       "architecture/complete-event-codec-registry":
         root === "packages/event-bus" ? [{ include: "lilac-codecs.ts" }] : [],
+      "architecture/complete-tool-codec-registry":
+        root === "apps/mini-lilac-tui" ? [{ include: "src/tool-observation-projection.ts" }] : [],
+      "architecture/result-decoder-contract":
+        root === "apps/mini-lilac-tui" ? [{ include: "src/tool-observation-projection.ts" }] : [],
+      "architecture/unknown-free-module":
+        root === "apps/mini-lilac-tui"
+          ? TUI_UNKNOWN_FREE_MODULES.map(({ module }) => ({ include: module }))
+          : [],
       "architecture/raw-event-message-boundary":
         root === "packages/event-bus"
           ? [{ include: "raw-bus.ts" }, { include: "redis-streams-bus.ts" }]
@@ -2446,6 +2595,9 @@ export const architectureManifest = {
       ruleZones,
       zeroBaselineScopes,
       eventCodecRegistries: root === "packages/event-bus" ? [EVENT_BUS_CODEC_REGISTRY] : [],
+      toolCodecRegistries: root === "apps/mini-lilac-tui" ? [TUI_TOOL_CODEC_REGISTRY] : [],
+      resultDecoders: root === "apps/mini-lilac-tui" ? [TUI_RESULT_DECODER] : [],
+      unknownFreeModules: root === "apps/mini-lilac-tui" ? TUI_UNKNOWN_FREE_MODULES : [],
       rawEventMessageBoundaries:
         root === "packages/event-bus"
           ? [
@@ -3134,6 +3286,14 @@ export const architectureManifest = {
             }))
           : [],
       operationalResultApis: [
+        ...(root === "apps/mini-lilac-tui"
+          ? [
+              {
+                module: "src/tool-observation-projection.ts",
+                exportName: "decodeKnownToolObservation",
+              },
+            ]
+          : []),
         ...(root === "apps/core"
           ? [
               { module: "src/mcp/config-file.ts", exportName: "readMcpConfigFile" },
@@ -3247,6 +3407,13 @@ function requireExactIdentity(identity: SymbolIdentity, description: string): vo
   }
 }
 
+function requireExactModule(module: string, description: string): void {
+  requireNonempty(module, `${description} module`);
+  if (module.includes("*")) {
+    throw new Error(`Architecture manifest ${description} must name an exact module: ${module}.`);
+  }
+}
+
 function identityKey(identity: SymbolIdentity): string {
   return `${identity.module}#${identity.exportName}`;
 }
@@ -3308,8 +3475,60 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
       }
       zeroScopeKeys.add(key);
     }
+    const unknownFreeModules = new Map<string, UnknownFreeModuleRegistration>();
+    for (const registration of workspace.unknownFreeModules) {
+      requireExactModule(registration.module, "unknown-free registration");
+      if (unknownFreeModules.has(registration.module)) {
+        throw new Error(
+          `Duplicate unknown-free module registration in ${workspace.name}: ${registration.module}.`,
+        );
+      }
+      unknownFreeModules.set(registration.module, registration);
+      if (
+        !(workspace.ruleZones["architecture/unknown-free-module"] ?? []).some(
+          (zone) => zone.include === registration.module,
+        )
+      ) {
+        throw new Error(
+          `Unknown-free module ${registration.module} in ${workspace.name} is outside its workspace rule zones.`,
+        );
+      }
+    }
+    const decoderIdentities = new Set<string>();
     for (const decoder of workspace.boundaryDecoders) {
       requireExactIdentity(decoder.identity, "boundary decoder");
+      const key = identityKey(decoder.identity);
+      if (decoderIdentities.has(key)) {
+        throw new Error(`Duplicate boundary decoder registration in ${workspace.name}: ${key}.`);
+      }
+      decoderIdentities.add(key);
+      if (unknownFreeModules.has(decoder.identity.module)) {
+        throw new Error(
+          `Unknown-free module ${decoder.identity.module} cannot own boundary decoder ${key}.`,
+        );
+      }
+    }
+    const resultDecoderIdentities = new Set<string>();
+    for (const decoder of workspace.resultDecoders) {
+      requireExactIdentity(decoder.identity, "Result decoder");
+      requireParameterIndex(decoder.inputParameter, "Result decoder inputParameter");
+      const key = identityKey(decoder.identity);
+      if (resultDecoderIdentities.has(key)) {
+        throw new Error(`Duplicate Result decoder registration in ${workspace.name}: ${key}.`);
+      }
+      resultDecoderIdentities.add(key);
+      if (unknownFreeModules.has(decoder.identity.module)) {
+        throw new Error(
+          `Unknown-free module ${decoder.identity.module} cannot own Result decoder ${key}.`,
+        );
+      }
+      if (
+        !(workspace.ruleZones["architecture/result-decoder-contract"] ?? []).some(
+          (zone) => zone.include === decoder.identity.module,
+        )
+      ) {
+        throw new Error(`Result decoder ${key} is outside its workspace rule zones.`);
+      }
     }
     for (const exception of [...workspace.opaqueUnknown, ...workspace.capabilityPredicates]) {
       requireExactIdentity(exception.identity, "reasoned symbol registration");
@@ -3329,6 +3548,11 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
       requireExactIdentity(registry.identity, "event codec registry");
       requireExactIdentity(registry.canonicalEvents, "canonical event catalog");
       const key = identityKey(registry.identity);
+      if (unknownFreeModules.has(registry.identity.module)) {
+        throw new Error(
+          `Unknown-free module ${registry.identity.module} cannot own event codec registry ${key}.`,
+        );
+      }
       if (codecRegistries.has(key)) {
         throw new Error(
           `Duplicate event codec registry registration in ${workspace.name}: ${key}.`,
@@ -3357,6 +3581,54 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
         throw new Error(
           `Enforced event codec registry ${key} must declare codec coverage for every canonical member.`,
         );
+      }
+    }
+    const toolCodecRegistries = new Set<string>();
+    for (const registry of workspace.toolCodecRegistries) {
+      requireExactIdentity(registry.identity, "tool codec registry");
+      requireExactIdentity(registry.canonicalTools, "canonical tool catalog");
+      if (
+        registry.canonicalTools.package !== undefined &&
+        !manifest.workspaces.some(
+          (candidate) => candidate.packageName === registry.canonicalTools.package,
+        )
+      ) {
+        throw new Error(
+          `Canonical tool catalog package ${registry.canonicalTools.package} is not an active workspace package.`,
+        );
+      }
+      const key = identityKey(registry.identity);
+      if (unknownFreeModules.has(registry.identity.module)) {
+        throw new Error(
+          `Unknown-free module ${registry.identity.module} cannot own tool codec registry ${key}.`,
+        );
+      }
+      if (toolCodecRegistries.has(key)) {
+        throw new Error(`Duplicate tool codec registry registration in ${workspace.name}: ${key}.`);
+      }
+      toolCodecRegistries.add(key);
+      const aliases = new Set<string>();
+      for (const alias of registry.aliases) {
+        requireExactIdentity(alias, "tool codec registry alias");
+        const aliasKey = identityKey(alias);
+        if (aliasKey === key || aliases.has(aliasKey)) {
+          throw new Error(
+            `Duplicate tool codec registry value registration in ${workspace.name}: ${aliasKey}.`,
+          );
+        }
+        aliases.add(aliasKey);
+        if (unknownFreeModules.has(alias.module)) {
+          throw new Error(
+            `Unknown-free module ${alias.module} cannot own tool codec registry alias ${aliasKey}.`,
+          );
+        }
+      }
+      if (
+        !(workspace.ruleZones["architecture/complete-tool-codec-registry"] ?? []).some(
+          (zone) => zone.include === registry.identity.module,
+        )
+      ) {
+        throw new Error(`Tool codec registry ${key} is outside its workspace rule zones.`);
       }
     }
     const rawBoundaryIdentities = new Set<string>();

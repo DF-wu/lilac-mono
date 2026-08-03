@@ -2,16 +2,87 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "bun:test";
 
-import type { ArchitectureManifest, ExceptionAdapter } from "../architecture/manifest.ts";
+import {
+  architectureManifest,
+  type ArchitectureManifest,
+  type ExceptionAdapter,
+} from "../architecture/manifest.ts";
 import {
   findExceptionFlowViolations,
   findInlineAsyncResultCallbackViolations,
   findLocalRecordGuardViolations,
+  findPresentationDecoderImportViolations,
 } from "./production-syntax.mts";
 import { type SyntacticPolicy, SYNTACTIC_POLICY } from "./syntax-policy.mts";
 
 function policyWith(overrides: Partial<SyntacticPolicy> = {}): SyntacticPolicy {
   return { ...SYNTACTIC_POLICY, ...overrides };
+}
+
+function manifestWithUnknownFreeModule(status: "advisory" | "enforced"): ArchitectureManifest {
+  const manifest = manifestWithAdapters([]);
+  const workspace = manifest.workspaces[0];
+  if (!workspace) throw new Error("fixture workspace missing");
+  return {
+    ...manifest,
+    workspaces: [
+      {
+        ...workspace,
+        unknownFreeModules: [{ status, module: "src/render.ts" }],
+      },
+    ],
+  };
+}
+
+function manifestWithPresentationBoundaries(): ArchitectureManifest {
+  const manifest = manifestWithUnknownFreeModule("enforced");
+  const workspace = manifest.workspaces[0];
+  if (!workspace) throw new Error("fixture workspace missing");
+  return {
+    ...manifest,
+    workspaces: [
+      {
+        ...workspace,
+        boundaryDecoders: [
+          {
+            identity: { module: "src/projection.ts", exportName: "projectToolObservation" },
+            category: "projection",
+          },
+        ],
+        resultDecoders: [
+          {
+            status: "enforced",
+            identity: { module: "src/projection.ts", exportName: "decodeKnownObservation" },
+            category: "projection",
+            inputParameter: 0,
+          },
+        ],
+        openProtocolAdapters: [
+          {
+            identity: { module: "src/projection.ts", exportName: "projectOpenChunk" },
+            externalProtocol: { package: "open-sdk", exportName: "Chunk" },
+            protocolParameter: 0,
+            fallbackVariant: { discriminant: "kind", value: "unsupported" },
+            reason: "Synthetic presentation projection boundary.",
+          },
+        ],
+        toolCodecRegistries: [
+          {
+            status: "enforced",
+            identity: {
+              module: "src/projection.ts",
+              exportName: "toolObservationCodecRegistry",
+            },
+            aliases: [{ module: "src/projection.ts", exportName: "knownToolCodecRegistry" }],
+            canonicalTools: {
+              module: "src/protocol.ts",
+              exportName: "TOOL_NAMES",
+            },
+          },
+        ],
+      },
+    ],
+  };
 }
 
 function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): ArchitectureManifest {
@@ -37,6 +108,9 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): Architectu
         operationalResultApis: [],
         zeroBaselineScopes: [],
         eventCodecRegistries: [],
+        toolCodecRegistries: [],
+        resultDecoders: [],
+        unknownFreeModules: [],
         rawEventMessageBoundaries: [],
         eventDeliveryApis: [],
         eventDeliveryConsumers: [],
@@ -332,6 +406,136 @@ describe("production exception syntax", () => {
         policyWith(),
       ),
     ).toHaveLength(1);
+  });
+});
+
+describe("Stage 5 presentation syntax", () => {
+  it("forbids runtime Zod imports only after an exact unknown-free module is enforced", () => {
+    const source = `
+      import { z } from "zod";
+      import type { ZodType } from "zod";
+      export function render(value: string) { return z.string().parse(value); }
+    `;
+    expect(
+      findPresentationDecoderImportViolations(
+        source,
+        "apps/example/src/render.ts",
+        policyWith(),
+        manifestWithUnknownFreeModule("enforced"),
+      ).map((finding) => finding.kind),
+    ).toEqual(["presentation-decoder-import"]);
+    expect(
+      findPresentationDecoderImportViolations(
+        source,
+        "apps/example/src/render.ts",
+        policyWith(),
+        manifestWithUnknownFreeModule("advisory"),
+      ),
+    ).toEqual([]);
+    expect(
+      findPresentationDecoderImportViolations(
+        source,
+        "apps/example/src/other.ts",
+        policyWith(),
+        manifestWithUnknownFreeModule("enforced"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("allows type-only Zod imports in an enforced unknown-free module", () => {
+    expect(
+      findPresentationDecoderImportViolations(
+        'import type { ZodType } from "zod";',
+        "apps/example/src/render.ts",
+        policyWith(),
+        manifestWithUnknownFreeModule("enforced"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("forbids registered projection and decoder value imports and calls but allows projection types", () => {
+    const findings = findPresentationDecoderImportViolations(
+      `
+        import {
+          type ToolProjection,
+          projectToolObservation as project,
+          decodeKnownObservation as decode,
+          projectOpenChunk,
+        } from "./projection";
+        import type { AnotherProjection } from "./projection";
+        import * as projection from "./projection";
+
+        declare const value: ToolProjection | AnotherProjection;
+        project(value);
+        decode(value);
+        projectOpenChunk(value);
+        projection.projectToolObservation(value);
+      `,
+      "apps/example/src/render.ts",
+      policyWith(),
+      manifestWithPresentationBoundaries(),
+    );
+
+    expect(findings).toHaveLength(8);
+    expect(findings.map(({ message }) => message)).toEqual([
+      expect.stringContaining("projectToolObservation"),
+      expect.stringContaining("decodeKnownObservation"),
+      expect.stringContaining("projectOpenChunk"),
+      expect.stringContaining("value-import"),
+      expect.stringContaining("cannot invoke"),
+      expect.stringContaining("cannot invoke"),
+      expect.stringContaining("cannot invoke"),
+      expect.stringContaining("cannot invoke"),
+    ]);
+  });
+
+  it("tracks tool codec registries through direct, renamed, namespace, and local aliases", () => {
+    const findings = findPresentationDecoderImportViolations(
+      `
+        import {
+          type ToolProjection,
+          toolObservationCodecRegistry,
+          knownToolCodecRegistry as knownCodecs,
+        } from "./projection";
+        import * as projection from "./projection";
+
+        declare const raw: ToolProjection;
+        toolObservationCodecRegistry.bash.decode(raw);
+        const renamedCodecs = knownCodecs;
+        const selectedDecoder = renamedCodecs.bash.decode;
+        const indirectDecoder = selectedDecoder;
+        indirectDecoder(raw);
+        projection.knownToolCodecRegistry.bash.decode(raw);
+      `,
+      "apps/example/src/render.ts",
+      policyWith(),
+      manifestWithPresentationBoundaries(),
+    );
+
+    expect(findings).toHaveLength(6);
+    expect(findings.filter(({ message }) => message.includes("value-import"))).toHaveLength(3);
+    expect(findings.filter(({ message }) => message.includes("cannot invoke"))).toHaveLength(3);
+  });
+
+  it("allows type-only ToolProjection imports from a registered boundary module", () => {
+    expect(
+      findPresentationDecoderImportViolations(
+        'import type { ToolProjection } from "./projection";',
+        "apps/example/src/render.ts",
+        policyWith(),
+        manifestWithPresentationBoundaries(),
+      ),
+    ).toEqual([]);
+  });
+
+  it("keeps the integrated renderer free of Zod imports and parser calls", () => {
+    const filePath = new URL("../../apps/mini-lilac-tui/src/render.ts", import.meta.url).pathname;
+    const source = readFileSync(filePath, "utf8");
+
+    expect(
+      findPresentationDecoderImportViolations(source, filePath, policyWith(), architectureManifest),
+    ).toEqual([]);
+    expect(source).not.toMatch(/\.(?:parse|parseAsync|safeParse|safeParseAsync)\s*\(/u);
   });
 });
 

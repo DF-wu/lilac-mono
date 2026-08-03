@@ -141,6 +141,12 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing raw event receiver awaiting an honest Message<unknown> contract.";
     case "architecture/complete-event-codec-registry":
       return "Existing canonical event awaiting complete receiver-side codec registration.";
+    case "architecture/complete-tool-codec-registry":
+      return "Existing known tool awaiting exact presentation codec registration.";
+    case "architecture/result-decoder-contract":
+      return "Existing decoder awaiting an exact typed Result contract.";
+    case "architecture/unknown-free-module":
+      return "Existing presentation module awaiting recursive removal of domain-bearing unknown.";
     case "architecture/event-handler-result":
       return "Existing event handler awaiting a typed Promise<Result<void, E>> delivery contract.";
     case "architecture/event-delivery-policy-exhaustiveness":

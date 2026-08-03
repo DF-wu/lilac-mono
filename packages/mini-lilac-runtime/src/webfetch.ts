@@ -6,34 +6,24 @@ import TurndownService from "turndown";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
+import {
+  MINI_LILAC_WEBFETCH_MAX_URL_CHARACTERS,
+  miniLilacWebfetchUrlSchema,
+} from "@stanley2058/mini-lilac-client";
+
 export const WEBFETCH_DEFAULT_TIMEOUT_MS = 30_000;
 export const WEBFETCH_MAX_TIMEOUT_MS = 120_000;
 export const WEBFETCH_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 export const WEBFETCH_DEFAULT_OUTPUT_CHARACTERS = 50_000;
 export const WEBFETCH_MAX_OUTPUT_CHARACTERS = 200_000;
 export const WEBFETCH_MAX_REDIRECTS = 5;
-const MAX_URL_CHARACTERS = 2_048;
 const MAX_HTML_DEPTH = 256;
 const MAX_HTML_TAGS = 50_000;
 
 const webfetchFormatSchema = z.enum(["text", "markdown", "html"]);
-const webfetchUrlSchema = z
-  .url()
-  .trim()
-  .max(MAX_URL_CHARACTERS)
-  .superRefine((value, context) => {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      context.addIssue({ code: "custom", message: "URL must use HTTP or HTTPS" });
-    }
-    if (url.username || url.password) {
-      context.addIssue({ code: "custom", message: "URL credentials are not allowed" });
-    }
-  });
-
 export const webfetchInputSchema = z
   .object({
-    url: webfetchUrlSchema.describe("Public HTTP or HTTPS URL to fetch"),
+    url: miniLilacWebfetchUrlSchema.describe("Public HTTP or HTTPS URL to fetch"),
     format: webfetchFormatSchema
       .optional()
       .default("markdown")
@@ -59,8 +49,8 @@ export const webfetchInputSchema = z
 
 export const webfetchOutputSchema = z
   .object({
-    requestedUrl: z.url().max(MAX_URL_CHARACTERS),
-    url: z.url().max(MAX_URL_CHARACTERS),
+    requestedUrl: miniLilacWebfetchUrlSchema,
+    url: miniLilacWebfetchUrlSchema,
     status: z.number().int().min(200).max(299),
     contentType: z.string().min(1).max(256),
     format: webfetchFormatSchema,
@@ -246,7 +236,9 @@ async function assertPublicDestination(
     throw new Error("webfetch URL must use HTTP or HTTPS");
   }
   if (url.username || url.password) throw new Error("webfetch URL credentials are not allowed");
-  if (url.href.length > MAX_URL_CHARACTERS) throw new Error("webfetch URL is too long");
+  if (url.href.length > MINI_LILAC_WEBFETCH_MAX_URL_CHARACTERS) {
+    throw new Error("webfetch URL is too long");
+  }
 
   const hostname = normalizedHostname(url);
   if (isBlockedHostname(hostname)) throw new Error(`webfetch blocked hostname '${hostname}'`);

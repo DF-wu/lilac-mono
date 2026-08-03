@@ -11,7 +11,7 @@
 
 ## Current Stage
 
-Stages 0 through 4 complete. Next: Stage 5, TUI Tool Observation Projection.
+Stages 0 through 5 complete. Next: Stage 6, Versioned Persistence Codecs And Transaction Results.
 
 ## Stage 0
 
@@ -92,13 +92,30 @@ Stages 0 through 4 complete. Next: Stage 5, TUI Tool Observation Projection.
 - [x] Run independent Stage 4 review and resolve all blocking findings.
 - [x] Run focused and full repository validation, then commit Stage 4 separately.
 
+## Stage 5
+
+- [x] Define the raw `ToolObservation` boundary model for tool name, lifecycle state, input, output,
+  partial output, denial, cancellation, and error.
+- [x] Add a Result-returning known-tool decoder and one `projectToolObservation` boundary that produces a
+  closed render-ready `ToolProjection` union.
+- [x] Add explicit malformed-known-tool and unknown-tool projections with bounded safe previews.
+- [x] Preserve partial Bash output, subagent lifecycle, cancellation, denial, and newly added tool states.
+- [x] Change transcript and render APIs to consume typed projections rather than raw tool payloads.
+- [x] Remove tool-payload Zod parsing and domain-bearing `unknown` from TUI render/transcript modules.
+- [x] Add exhaustive tests for every known projection plus malformed, unknown, partial, cancelled, denied,
+  and forward-compatible states.
+- [x] Add the presentation-boundary guidance and activate Stage 5 decoder, domain-unknown, Result, and
+  exhaustiveness enforcement with zero repaired baseline debt.
+- [x] Run independent Stage 5 review and resolve all blocking findings.
+- [x] Run focused and full repository validation, then commit Stage 5 separately.
+
 ## Later Stages
 
 - [x] Stage 1: `better-result` foundation and pilot migrations.
 - [x] Stage 2: mechanical union, predicate, and failure guardrails.
 - [x] Stage 3: high-risk process and extension boundaries.
 - [x] Stage 4: typed event-bus codec and delivery registry.
-- [ ] Stage 5: TUI tool-observation projection.
+- [x] Stage 5: TUI tool-observation projection.
 - [ ] Stage 6: versioned persistence codecs and transaction Results.
 - [ ] Stage 7: package-by-package internal API migration.
 - [ ] Stage 8: close ratchets and simplify governance.
@@ -172,3 +189,12 @@ Stages 0 through 4 complete. Next: Stage 5, TUI Tool Observation Projection.
   Final validation passed `bun run test:all` including 1,687 Core and 93 event-bus tests,
   `bun run typecheck`, `bun run lint:fix`, `bun run fmt`, `bun run lint`, `bun run fmt:check`, and
   `git diff --check`. The syntax ratchet contains 2,554 reviewed findings with zero errors.
+- 2026-08-03: Stage 5 introduced the closed TUI tool-observation projection, migrated canonical and live
+  render paths away from raw payloads and presentation-layer decoders, and activated exact registry,
+  Result, recursive unknown-free, exhaustiveness, and presentation-import enforcement. Reviews drove
+  fixes for hostile payloads, complete known-tool schemas, Bash partial errors, canonical/live lifecycle
+  parity, terminal cancellation, subagent links, shared runtime catalog drift, and total leak-free URL
+  validation. Final validation passed `bun run test:all`, including 300 TUI, 372 Mini runtime, 64
+  architecture, and 37 lint-rule tests, plus `bun run typecheck`, `bun run lint:fix`, `bun run fmt`,
+  `bun run lint`, `bun run fmt:check`, and `git diff --check`. The syntax ratchet contains 2,553 reviewed
+  findings with zero errors.

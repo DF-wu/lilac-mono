@@ -11,6 +11,8 @@ import { createFingerprint } from "./fingerprint.ts";
 import type {
   ArchitectureManifest,
   OpenProtocolAdapter,
+  ResultDecoderRegistration,
+  ToolCodecRegistryRegistration,
   WorkspaceArchitecture,
   ZeroBaselineScope,
 } from "./manifest.ts";
@@ -61,6 +63,9 @@ const BASE_WORKSPACE = {
   operationalResultApis: [],
   zeroBaselineScopes: [],
   eventCodecRegistries: [],
+  toolCodecRegistries: [],
+  resultDecoders: [],
+  unknownFreeModules: [],
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
@@ -135,6 +140,24 @@ function fixtureDeliveryApi(exportName: string, deliveryPolicy: string) {
     handlerContextParameter: 1,
     deliveryPolicy: { module: "stage4-events.ts", exportName: deliveryPolicy },
     deliveryErrorParameter: 0,
+  };
+}
+
+function fixtureToolCodecRegistry(exportName: string): ToolCodecRegistryRegistration {
+  return {
+    status: "enforced",
+    identity: { module: "stage5-tools.ts", exportName },
+    aliases: [],
+    canonicalTools: { module: "stage5-tools.ts", exportName: "canonicalTuiToolNames" },
+  };
+}
+
+function fixtureResultDecoder(exportName: string): ResultDecoderRegistration {
+  return {
+    status: "enforced",
+    identity: { module: "stage5-tools.ts", exportName },
+    category: "projection",
+    inputParameter: 0,
   };
 }
 
@@ -614,6 +637,23 @@ describe("Stage 2 union rules", () => {
         },
         category: "projection",
       },
+      ...[
+        "parseInput",
+        "decodeBash",
+        "decodeEditFile",
+        "decodeSubagentDelegate",
+        "decodeWebsearch",
+        "projectToolObservation",
+      ].map((exportName) => ({
+        identity: { module: "src/tool-observation-projection.ts", exportName },
+        category: "projection" as const,
+      })),
+      ...["observationFromCanonicalPart", "UIMessageChunkProjectionState.toolChunk"].map(
+        (exportName) => ({
+          identity: { module: "src/ui-message-chunk-projection.ts", exportName },
+          category: "projection" as const,
+        }),
+      ),
     ]);
     expect(miniClient?.boundaryDecoders).toEqual([
       {
@@ -1780,6 +1820,478 @@ describe("Stage 4 event architecture rules", () => {
   });
 });
 
+describe("Stage 5 presentation architecture rules", () => {
+  test("enforces the integrated Stage 5 projection and render modules", () => {
+    const tui = architectureManifest.workspaces.find(
+      (workspace) => workspace.name === "apps/mini-lilac-tui",
+    );
+    if (!tui) throw new Error("mini-lilac-tui workspace missing");
+
+    expect(tui.toolCodecRegistries).toEqual([
+      {
+        status: "enforced",
+        identity: {
+          module: "src/tool-observation-projection.ts",
+          exportName: "toolObservationCodecRegistry",
+        },
+        aliases: [
+          {
+            module: "src/tool-observation-projection.ts",
+            exportName: "knownToolCodecRegistry",
+          },
+        ],
+        canonicalTools: {
+          package: "@stanley2058/mini-lilac-client",
+          module: "tool-catalog.ts",
+          exportName: "MINI_LILAC_TOOL_NAMES",
+        },
+      },
+    ]);
+    expect(tui.resultDecoders).toEqual([
+      expect.objectContaining({
+        status: "enforced",
+        identity: {
+          module: "src/tool-observation-projection.ts",
+          exportName: "decodeKnownToolObservation",
+        },
+      }),
+    ]);
+    expect(tui.unknownFreeModules).toEqual([
+      { status: "enforced", module: "src/render.ts" },
+      { status: "enforced", module: "src/transcript-buffer.ts" },
+    ]);
+    expect(tui.zeroBaselineScopes).toEqual(
+      expect.arrayContaining([
+        { module: "src/render.ts" },
+        { module: "src/ui-message-chunk-projection.ts" },
+        { module: "src/tool-observation-projection.ts" },
+        { module: "src/transcript-buffer.ts" },
+      ]),
+    );
+    expect(tui.operationalResultApis).toContainEqual({
+      module: "src/tool-observation-projection.ts",
+      exportName: "decodeKnownToolObservation",
+    });
+    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
+  });
+
+  test("owns every landed projection parser and passes enforced Stage 5 contracts", () => {
+    const tui = architectureManifest.workspaces.find(
+      (workspace) => workspace.name === "apps/mini-lilac-tui",
+    );
+    if (!tui) throw new Error("mini-lilac-tui workspace missing");
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, tui);
+    const findings = analyzeWorkspace(
+      tui,
+      workspaceProgram.root,
+      workspaceProgram.program,
+      architectureManifest.workspaces.map((workspace) => ({
+        packageName: workspace.packageName,
+        root: path.join(REPOSITORY_ROOT, workspace.root),
+      })),
+    );
+    const stage5Modules = new Set([
+      "src/render.ts",
+      "src/ui-message-chunk-projection.ts",
+      "src/tool-observation-projection.ts",
+      "src/transcript-buffer.ts",
+    ]);
+    const stage5Findings = findings.filter(
+      (finding) => finding.location !== undefined && stage5Modules.has(finding.location.file),
+    );
+
+    expect(stage5Findings).toEqual([]);
+  }, 30_000);
+
+  test("requires an explicit exhaustive tool codec registry without spread, broad, missing, or extra keys", () => {
+    const complete = findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
+      toolCodecRegistries: [fixtureToolCodecRegistry("completeToolCodecs")],
+    });
+    expect(complete).toEqual([]);
+    expect(
+      findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
+        toolCodecRegistries: [
+          {
+            ...fixtureToolCodecRegistry("completeToolCodecs"),
+            aliases: [{ module: "stage5-tools.ts", exportName: "completeToolCodecsAlias" }],
+          },
+        ],
+      }),
+    ).toEqual([]);
+    const invalidAlias = findingsFor(
+      "architecture/complete-tool-codec-registry",
+      "stage5-tools.ts",
+      {
+        toolCodecRegistries: [
+          {
+            ...fixtureToolCodecRegistry("completeToolCodecs"),
+            aliases: [{ module: "stage5-tools.ts", exportName: "invalidToolCodecsAlias" }],
+          },
+        ],
+      },
+    );
+    expect(invalidAlias).toHaveLength(1);
+    expect(invalidAlias[0]?.message).toContain("aliases do not reference");
+
+    for (const exportName of [
+      "spreadToolCodecs",
+      "broadToolCodecs",
+      "broadTypedToolCodecs",
+      "incompleteToolCodecs",
+      "extraToolCodecs",
+    ]) {
+      const findings = findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
+        toolCodecRegistries: [fixtureToolCodecRegistry(exportName)],
+      });
+      expect(findings).toHaveLength(1);
+    }
+    expect(
+      findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
+        toolCodecRegistries: [fixtureToolCodecRegistry("incompleteToolCodecs")],
+      })[0]?.message,
+    ).toContain("codecs missing");
+    expect(
+      findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
+        toolCodecRegistries: [fixtureToolCodecRegistry("extraToolCodecs")],
+      })[0]?.message,
+    ).toContain("future_tool");
+    expect(
+      findingsFor("architecture/complete-tool-codec-registry", "stage5-tools.ts", {
+        toolCodecRegistries: [fixtureToolCodecRegistry("broadTypedToolCodecs")],
+      })[0]?.message,
+    ).toContain("broad index signature");
+    const duplicateCatalog = findingsFor(
+      "architecture/complete-tool-codec-registry",
+      "stage5-tools.ts",
+      {
+        toolCodecRegistries: [
+          {
+            ...fixtureToolCodecRegistry("completeToolCodecs"),
+            canonicalTools: {
+              module: "stage5-tools.ts",
+              exportName: "duplicateCanonicalTuiToolNames",
+            },
+          },
+        ],
+      },
+    );
+    expect(duplicateCatalog).toHaveLength(1);
+    expect(duplicateCatalog[0]?.message).toContain("catalog contains duplicates");
+    const broadCatalog = findingsFor(
+      "architecture/complete-tool-codec-registry",
+      "stage5-tools.ts",
+      {
+        toolCodecRegistries: [
+          {
+            ...fixtureToolCodecRegistry("completeToolCodecs"),
+            canonicalTools: {
+              module: "stage5-tools.ts",
+              exportName: "broadCanonicalTuiToolNames",
+            },
+          },
+        ],
+      },
+    );
+    expect(broadCatalog).toHaveLength(1);
+    expect(broadCatalog[0]?.message).toContain("not a literal tuple");
+  });
+
+  test("resolves a shared cross-workspace tool catalog and reports protocol drift", () => {
+    const registration = {
+      ...fixtureToolCodecRegistry("completeToolCodecs"),
+      canonicalTools: {
+        package: "fixture-shared-protocol",
+        module: "tool-catalog.ts",
+        exportName: "SHARED_TOOL_NAMES",
+      },
+    } satisfies ToolCodecRegistryRegistration;
+    const workspace = {
+      ...BASE_WORKSPACE,
+      ruleZones: {
+        "architecture/complete-tool-codec-registry": [{ include: "stage5-tools.ts" }],
+      },
+      toolCodecRegistries: [registration],
+    } satisfies WorkspaceArchitecture;
+    const packageRoots = [
+      { packageName: workspace.packageName, root: FIXTURE_ROOT },
+      {
+        packageName: "fixture-shared-protocol",
+        root: path.join(FIXTURE_ROOT, "shared-protocol"),
+      },
+    ];
+
+    expect(analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram, packageRoots)).toEqual([]);
+    const drifted = {
+      ...workspace,
+      toolCodecRegistries: [
+        {
+          ...registration,
+          canonicalTools: {
+            ...registration.canonicalTools,
+            exportName: "DRIFTED_SHARED_TOOL_NAMES",
+          },
+        },
+      ],
+    } satisfies WorkspaceArchitecture;
+    const findings = analyzeWorkspace(drifted, FIXTURE_ROOT, fixtureProgram, packageRoots);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("future_tool");
+  });
+
+  test("rejects duplicate values, unresolved packages, and non-exact tool registry declarations in manifest integrity", () => {
+    const registry = fixtureToolCodecRegistry("completeToolCodecs");
+    const valid = {
+      ...BASE_WORKSPACE,
+      ruleZones: {
+        "architecture/complete-tool-codec-registry": [{ include: "stage5-tools.ts" }],
+      },
+      toolCodecRegistries: [registry],
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [valid] }),
+    ).not.toThrow();
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [{ ...valid, toolCodecRegistries: [registry, registry] }],
+      }),
+    ).toThrow("Duplicate tool codec registry registration");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...valid,
+            toolCodecRegistries: [{ ...registry, aliases: [registry.identity] }],
+          },
+        ],
+      }),
+    ).toThrow("Duplicate tool codec registry value registration");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...valid,
+            toolCodecRegistries: [
+              {
+                ...registry,
+                canonicalTools: {
+                  package: "@fixture/missing-protocol",
+                  module: "tool-catalog.ts",
+                  exportName: "TOOL_NAMES",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("is not an active workspace package");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...valid,
+            toolCodecRegistries: [
+              {
+                ...registry,
+                identity: { module: "stage5-*.ts", exportName: "completeToolCodecs" },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("must name an exact symbol");
+  });
+
+  test("requires exact non-generic Result decoders with unknown boundary input and decoded outputs", () => {
+    expect(
+      findingsFor("architecture/result-decoder-contract", "stage5-tools.ts", {
+        resultDecoders: [fixtureResultDecoder("decodeKnownToolObservation")],
+      }),
+    ).toEqual([]);
+    for (const exportName of [
+      "genericToolDecoder",
+      "nonResultToolDecoder",
+      "unknownSuccessToolDecoder",
+      "unknownErrorToolDecoder",
+      "nestedUnknownErrorToolDecoder",
+      "nestedAnyErrorToolDecoder",
+      "nestedNeverErrorToolDecoder",
+      "typedInputToolDecoder",
+    ]) {
+      const findings = findingsFor("architecture/result-decoder-contract", "stage5-tools.ts", {
+        resultDecoders: [fixtureResultDecoder(exportName)],
+      });
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.message).toContain("invalid");
+    }
+  });
+
+  test("requires Result decoder registrations to be exact and unique", () => {
+    const decoder = fixtureResultDecoder("decodeKnownToolObservation");
+    const valid = {
+      ...BASE_WORKSPACE,
+      ruleZones: { "architecture/result-decoder-contract": [{ include: "stage5-tools.ts" }] },
+      resultDecoders: [decoder],
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [valid] }),
+    ).not.toThrow();
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [{ ...valid, resultDecoders: [decoder, decoder] }],
+      }),
+    ).toThrow("Duplicate Result decoder registration");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...valid,
+            resultDecoders: [
+              {
+                ...decoder,
+                identity: { module: "stage5-tools.ts", exportName: "decode*" },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("must name an exact symbol");
+  });
+
+  test("only enforced Result decoder registrations own Zod parser calls", () => {
+    const decoder = {
+      ...fixtureResultDecoder("registeredDecode"),
+      identity: { module: "boundary.ts", exportName: "registeredDecode" },
+    };
+    const enforced = findingsFor("architecture/no-unregistered-decoder", "boundary.ts", {
+      resultDecoders: [decoder],
+    });
+    expect(enforced).toHaveLength(1);
+    const advisory = findingsFor("architecture/no-unregistered-decoder", "boundary.ts", {
+      resultDecoders: [{ ...decoder, status: "advisory" }],
+    });
+    expect(advisory).toHaveLength(2);
+  });
+
+  test("recursively rejects unknown in parameters, returns, aliases, properties, generics, maps, unions, and locals", () => {
+    const findings = findingsFor("architecture/unknown-free-module", "stage5-render-bad.ts", {
+      unknownFreeModules: [{ status: "enforced", module: "stage5-render-bad.ts" }],
+    });
+    const messages = findings.map((finding) => finding.message);
+    const identities = findings.map((finding) => finding.identity);
+    expect(
+      messages.some((message) => message.includes("type alias DirectUnknownAlias")),
+    ).toBeTrue();
+    expect(
+      messages.some((message) => message.includes("type alias NestedUnknownAlias")),
+    ).toBeTrue();
+    expect(messages.some((message) => message.includes("property payload"))).toBeTrue();
+    expect(messages.some((message) => message.includes("parameter value"))).toBeTrue();
+    expect(messages.some((message) => message.includes("return type"))).toBeTrue();
+    expect(messages.some((message) => message.includes("local local"))).toBeTrue();
+    expect(messages.some((message) => message.includes("parameter contract"))).toBeTrue();
+    expect(identities.some((identity) => identity.includes("importedMethodOnly"))).toBeTrue();
+    expect(identities.some((identity) => identity.includes("importedCallOnly"))).toBeTrue();
+    expect(identities.some((identity) => identity.includes("importedNestedMethod"))).toBeTrue();
+    expect(identities.some((identity) => identity.includes("importedOverBudget"))).toBeTrue();
+    expect(identities.some((identity) => identity.includes("importedRecursive"))).toBeFalse();
+
+    expect(
+      findingsFor("architecture/unknown-free-module", "stage5-render-good.ts", {
+        unknownFreeModules: [{ status: "enforced", module: "stage5-render-good.ts" }],
+      }),
+    ).toEqual([]);
+  });
+
+  test("forbids every decoder registration inside an unknown-free render module", () => {
+    const unknownFreeModules = [{ status: "enforced" as const, module: "stage5-render-good.ts" }];
+    const ruleZones = {
+      "architecture/unknown-free-module": [{ include: "stage5-render-good.ts" }],
+      "architecture/result-decoder-contract": [{ include: "stage5-render-good.ts" }],
+    };
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...BASE_WORKSPACE,
+            ruleZones,
+            unknownFreeModules,
+            boundaryDecoders: [
+              {
+                identity: { module: "stage5-render-good.ts", exportName: "renderToolProjection" },
+                category: "projection",
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("cannot own boundary decoder");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...BASE_WORKSPACE,
+            ruleZones,
+            unknownFreeModules,
+            resultDecoders: [
+              {
+                ...fixtureResultDecoder("renderToolProjection"),
+                identity: {
+                  module: "stage5-render-good.ts",
+                  exportName: "renderToolProjection",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("cannot own Result decoder");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...BASE_WORKSPACE,
+            ruleZones: {
+              ...ruleZones,
+              "architecture/complete-tool-codec-registry": [{ include: "stage5-render-good.ts" }],
+            },
+            unknownFreeModules,
+            toolCodecRegistries: [
+              {
+                ...fixtureToolCodecRegistry("renderToolProjection"),
+                identity: {
+                  module: "stage5-render-good.ts",
+                  exportName: "renderToolProjection",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("cannot own tool codec registry");
+  });
+
+  test("keeps ToolProjection switches closed and exhaustive", () => {
+    expect(
+      findingsFor("architecture/closed-union-exhaustiveness", "stage5-render-good.ts"),
+    ).toEqual([]);
+    const findings = findingsFor(
+      "architecture/closed-union-exhaustiveness",
+      "stage5-render-bad.ts",
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain('"malformed-known-tool"');
+  });
+});
+
 describe("real declaration integration", () => {
   test("recognizes real installed zod and better-result 3.0 declarations", () => {
     const workspace = {
@@ -1807,6 +2319,35 @@ describe("real declaration integration", () => {
     expect(
       findings.filter((finding) => finding.rule === "architecture/no-unmapped-result-capture"),
     ).toHaveLength(1);
+  });
+
+  test("recursively rejects unknown error payloads through real better-result declarations", () => {
+    const resultDecoder = (exportName: string): ResultDecoderRegistration => ({
+      status: "enforced",
+      identity: { module: "fixture.ts", exportName },
+      category: "projection",
+      inputParameter: 0,
+    });
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-result-decoder",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: {
+        "architecture/result-decoder-contract": [{ include: "fixture.ts" }],
+      },
+      resultDecoders: [
+        resultDecoder("decodeRealResult"),
+        resultDecoder("decodeRealResultWithUnknownCause"),
+      ],
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.identity).toContain("decodeRealResultWithUnknownCause");
+    expect(findings[0]?.message).toContain("Result error type is not specific");
   });
 
   test("enforces Stage 1 contracts and TaggedError redaction against real better-result declarations", () => {

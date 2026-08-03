@@ -3,9 +3,24 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { LEVEL1_TOOL_NAMES } from "@stanley2058/lilac-coding-tools";
+import {
+  MINI_LILAC_EXECUTABLE_TOOL_NAMES,
+  MINI_LILAC_SYNTHETIC_TOOL_NAMES,
+} from "@stanley2058/mini-lilac-client";
+
 import { loadRuntimeConfig, runtimeConfigSchema } from "../src/config";
 
 const directories: string[] = [];
+
+describe("Mini Lilac tool catalog", () => {
+  it("stays aligned with Level 1 and runtime-owned tools", () => {
+    expect(new Set(MINI_LILAC_EXECUTABLE_TOOL_NAMES)).toEqual(
+      new Set([...LEVEL1_TOOL_NAMES, "skill", "todowrite", "webfetch", "websearch"]),
+    );
+    expect(MINI_LILAC_SYNTHETIC_TOOL_NAMES).toEqual(["subagent_result"]);
+  });
+});
 
 async function tempDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-config-"));
@@ -195,11 +210,22 @@ describe("runtime config", () => {
           profiles: {
             main: {
               ...baseConfig.agent.profiles.main,
-              tools: ["skill", "todowrite", "webfetch", "websearch"],
+              tools: [...MINI_LILAC_EXECUTABLE_TOOL_NAMES],
             },
           },
         },
       }).agent.profiles.main?.tools,
-    ).toEqual(["skill", "todowrite", "webfetch", "websearch"]);
+    ).toEqual([...MINI_LILAC_EXECUTABLE_TOOL_NAMES]);
+    expect(() =>
+      runtimeConfigSchema.parse({
+        ...baseConfig,
+        agent: {
+          ...baseConfig.agent,
+          profiles: {
+            main: { ...baseConfig.agent.profiles.main, tools: ["subagent_result"] },
+          },
+        },
+      }),
+    ).toThrow("unknown tool");
   });
 });
