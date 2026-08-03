@@ -521,7 +521,7 @@ export function createCoreNamedClaudeRuntime(input: {
       }
       let publicationRecovered = false;
       try {
-        input.store.publishCoreNamedClaudeSuccess({
+        const publication = input.store.publishCoreNamedClaudeSuccess({
           providerId: input.providerId,
           requestClient: input.requestClient,
           lilacSessionId: input.sessionId,
@@ -538,6 +538,14 @@ export function createCoreNamedClaudeRuntime(input: {
           lastModelSpecifier: input.modelSpecifier,
           lastReasoning: input.reasoning,
         });
+        if (publication.status === "error") {
+          recordAttemptOutcome("failed");
+          diagnostic("canonical-publication-failed", {
+            reason: "transcript-publication-error",
+            errorTag: publication.error.name,
+          });
+          return false;
+        }
       } catch (error) {
         let persistedState: CoreNamedClaudeSessionAttempt["state"] | null = null;
         try {

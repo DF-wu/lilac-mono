@@ -82,3 +82,23 @@ adapters are enforced. The six Zod parser calls are owned by `parseInput`, `deco
 edges. `render.ts` and `transcript-buffer.ts` are recursively unknown-free, and runtime Zod imports are
 forbidden there. Module-wide zero-baseline scopes cover render, UI-message projection, tool-observation
 projection, and transcript buffering, including all descendant symbols.
+
+Stage 6 adds registered persisted codecs, six-case compatibility fixture catalogs, exact persisted-store
+consumers, and SQLite Result transaction adapters and consumers. Codec contracts require a direct
+`Result<{ value; provenance }, SpecificStorageError>` with an exact declared provenance union. Fixture
+catalogs must explicitly cover current, legacy, missing-defaulted, unsupported-version,
+malformed-serialization, and corrupt-fields behavior; their static expected outcomes must agree with the
+contract provenance.
+
+An enforced persisted-store consumer must call every codec named by its registration. The syntax ratchet
+then rejects inline `JSON.parse` and schema parse calls in that exact symbol and all descendants. An
+enforced SQLite consumer must call its exact registered adapter; the syntax ratchet rejects direct
+`.transaction()` and manual `BEGIN`, `COMMIT`, or `ROLLBACK` in the same descendant-aware scope. The
+semantic callback rule resolves real `bun:sqlite` and `better-result` declarations and rejects a raw
+driver callback whose return type or body can produce `Err`.
+
+Transaction adapter validation requires one non-exported rollback sentinel, a raw callback returning a
+plain value, exact `better-result#Panic.is` observation, an exact registered driver classifier, and
+unknown-defect rethrow. Codec, adapter, and consumer identities must also be listed in
+`operationalResultApis`. Enforced consumers require a zero-baseline scope that owns the registered symbol
+and descendants in both semantic and syntax ratchets. See `STAGE6.md` for activation and fixture details.

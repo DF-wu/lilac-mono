@@ -357,14 +357,14 @@ rmdir "$media_dir"`,
       const uri = res.truncation?.artifactUri;
       if (!uri) throw new Error("expected truncated output artifact URI");
       const artifact = await artifacts.read(uri, sessionId);
-      expect(artifact.ok).toBe(true);
-      if (artifact.ok) {
-        expect(artifact.content).toContain("<bash_tool_full_output>");
-        expect(artifact.content).toContain("--- stdout ---");
-        expect(artifact.content).toContain("--- stderr ---");
-        expect(artifact.content).toContain("API_TOKEN=<redacted>");
-        expect(artifact.content).not.toContain("secret-value");
-        expect(artifact.content).toContain("END");
+      expect(artifact.status).toBe("ok");
+      if (artifact.status === "ok") {
+        expect(artifact.value.content).toContain("<bash_tool_full_output>");
+        expect(artifact.value.content).toContain("--- stdout ---");
+        expect(artifact.value.content).toContain("--- stderr ---");
+        expect(artifact.value.content).toContain("API_TOKEN=<redacted>");
+        expect(artifact.value.content).not.toContain("secret-value");
+        expect(artifact.value.content).toContain("END");
       }
     } finally {
       await fs.rm(artifactDir, { recursive: true, force: true });
@@ -556,11 +556,11 @@ describe("executeRestrictedBash", () => {
         result.truncation?.artifactUri ?? "",
         "restricted-sanitize-session",
       );
-      expect(stored.ok).toBe(true);
-      if (stored.ok) {
-        expect(stored.content).not.toContain("\u001b");
-        expect(stored.content).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
-        expect(stored.content).toContain("<redacted>");
+      expect(stored.status).toBe("ok");
+      if (stored.status === "ok") {
+        expect(stored.value.content).not.toContain("\u001b");
+        expect(stored.value.content).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
+        expect(stored.value.content).toContain("<redacted>");
       }
     } finally {
       await fs.rm(workspace, { recursive: true, force: true });

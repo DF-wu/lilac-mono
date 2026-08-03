@@ -6,8 +6,6 @@ import { modelMessageSchema, type ModelMessage } from "ai";
 import { z } from "zod";
 import {
   hashCanonicalMessagesV1,
-  historyProviderFamilySchema,
-  historyProviderStateSchema,
   type HistoryProviderFamily,
   type HistoryProviderState,
 } from "@stanley2058/lilac-agent";
@@ -19,16 +17,91 @@ import {
   type CoreLineageAtomV1,
   type CoreLineageManifestV1,
 } from "@stanley2058/lilac-event-bus";
-import { createLogger, normalizeReplayMessages } from "@stanley2058/lilac-utils";
+import {
+  classifyBunSqliteError,
+  createLogger,
+  CorruptPersistedFields,
+  normalizeReplayMessages,
+  runBunSqliteTransaction,
+  type DecodedPersistedValue,
+  type PersistedDataError,
+  type PersistedDataIssueCode,
+} from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { MsgRef } from "../surface/types";
+import {
+  decodeCoreLineageManifestRow as decodePersistedCoreLineageManifestRow,
+  decodeCoreSurfaceProjectionRow as decodePersistedCoreSurfaceProjectionRow,
+  decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
+  decodeTranscriptMessages,
+  decodeTranscriptProviderState as decodePersistedTranscriptProviderState,
+  decodeTranscriptRow as decodePersistedTranscriptRow,
+  TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION,
+  type CompactionCheckpointMeta as PersistedCompactionCheckpointMeta,
+  type DecodedCoreLineageManifestV1,
+  type DecodedCoreSurfaceProjectionRow,
+  type PersistedCoreLineageManifestRow,
+  type PersistedCoreSurfaceProjectionRow,
+} from "./transcript-persistence-codec";
 
 const logger = createLogger({ module: "transcript-store" });
-const TRANSCRIPT_SCHEMA_VERSION = 5;
+const TRANSCRIPT_SCHEMA_VERSION = TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION;
 const CORE_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
 const CORE_NAMED_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
 const CORE_PRIMARY_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
 const CORE_PRIMARY_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
+const MAX_DEFERRED_TRANSCRIPT_EVENTS = 128;
+
+function decodeTranscriptCompactionContext(
+  input: Parameters<typeof decodePersistedTranscriptCompactionContext>[0],
+) {
+  return decodePersistedTranscriptCompactionContext(input);
+}
+
+function decodeTranscriptProviderState(
+  input: Parameters<typeof decodePersistedTranscriptProviderState>[0],
+) {
+  return decodePersistedTranscriptProviderState(input);
+}
+
+function decodeTranscriptRow(input: Parameters<typeof decodePersistedTranscriptRow>[0]) {
+  return decodePersistedTranscriptRow(input);
+}
+
+function decodeCoreSurfaceProjectionRow(input: {
+  readonly row: PersistedCoreSurfaceProjectionRow;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<DecodedCoreSurfaceProjectionRow>, PersistedDataError>;
+function decodeCoreSurfaceProjectionRow(input: {
+  readonly row: null;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<null>, PersistedDataError>;
+function decodeCoreSurfaceProjectionRow(input: {
+  readonly row: PersistedCoreSurfaceProjectionRow | null;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<DecodedCoreSurfaceProjectionRow | null>, PersistedDataError> {
+  return input.row === null
+    ? decodePersistedCoreSurfaceProjectionRow({ ...input, row: null })
+    : decodePersistedCoreSurfaceProjectionRow({ ...input, row: input.row });
+}
+
+function decodeCoreLineageManifestRow(input: {
+  readonly row: PersistedCoreLineageManifestRow;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<DecodedCoreLineageManifestV1>, PersistedDataError>;
+function decodeCoreLineageManifestRow(input: {
+  readonly row: null;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<null>, PersistedDataError>;
+function decodeCoreLineageManifestRow(input: {
+  readonly row: PersistedCoreLineageManifestRow | null;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<DecodedCoreLineageManifestV1 | null>, PersistedDataError> {
+  return input.row === null
+    ? decodePersistedCoreLineageManifestRow({ ...input, row: null })
+    : decodePersistedCoreLineageManifestRow({ ...input, row: input.row });
+}
 
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
 export const CORE_TRANSCRIPT_DIGEST_VERSION = 1 as const;
@@ -60,17 +133,6 @@ export type CoreProjectionSourceFact =
   | string
   | CoreProjectionSourceFact[]
   | { [key: string]: CoreProjectionSourceFact };
-const coreProjectionSourceFactSchema: z.ZodType<CoreProjectionSourceFact> = z.lazy(() =>
-  z.union([
-    z.null(),
-    z.boolean(),
-    z.number().finite(),
-    z.string(),
-    z.array(coreProjectionSourceFactSchema),
-    z.record(z.string(), coreProjectionSourceFactSchema),
-  ]),
-);
-const coreProjectionSourceFactsSchema = z.record(z.string(), coreProjectionSourceFactSchema);
 const coreOwnedBlobReferenceSchema = z.object({
   sha256: sha256HexSchema,
   mediaType: z.string().min(1),
@@ -83,11 +145,6 @@ const coreSurfaceProjectionKeySchema = z.strictObject({
   sessionId: z.string().min(1),
   messageId: z.string().min(1),
   projectionFormatVersion: z.literal(CORE_SURFACE_PROJECTION_FORMAT_VERSION),
-});
-const admitCoreSurfaceProjectionSchema = coreSurfaceProjectionKeySchema.extend({
-  canonicalMessages: modelMessagesSchema.min(1),
-  sourceFacts: coreProjectionSourceFactsSchema,
-  ownedBlobs: z.array(coreOwnedBlobReferenceSchema),
 });
 const coreNamedClaudeOwnerSchema = z.strictObject({
   providerId: z.string().min(1),
@@ -108,23 +165,6 @@ const recordCoreNamedClaudeSessionAttemptOutcomeSchema = coreNamedClaudeOwnerSch
   attemptIndex: nonNegativeIntegerSchema,
   state: z.enum(["failed", "cancelled", "uncertain"]),
 });
-const publishCoreNamedClaudeSuccessSchema = coreNamedClaudeOwnerSchema.extend({
-  requestId: z.string().min(1),
-  attemptIndex: nonNegativeIntegerSchema,
-  terminalRequestId: z.string().min(1),
-  terminalCanonicalHeadHash: z.string().min(1),
-  terminalCanonicalMessageCount: nonNegativeIntegerSchema,
-  providerState: historyProviderStateSchema.refine(
-    (state) => state.lastFamily === "claude-code",
-    "Core named Claude success must publish a Claude provider head",
-  ),
-  nativeCwd: z.string().min(1),
-  nativeLastModified: z.number().finite().nonnegative(),
-  nativeContextTokens: nonNegativeIntegerSchema,
-  nativeContextMaxTokens: positiveIntegerSchema,
-  lastModelSpecifier: z.string().min(1),
-  lastReasoning: z.string().min(1),
-});
 const corePrimaryClaudeOwnerSchema = z.strictObject({
   providerId: z.string().min(1),
   requestClient: z.literal("discord"),
@@ -143,25 +183,6 @@ const recordCorePrimaryClaudeSessionAttemptOutcomeSchema = corePrimaryClaudeOwne
   requestId: z.string().min(1),
   attemptIndex: nonNegativeIntegerSchema,
   state: z.enum(["failed", "cancelled", "uncertain"]),
-});
-const publishCorePrimaryClaudeSuccessSchema = corePrimaryClaudeOwnerSchema.extend({
-  requestId: z.string().min(1),
-  attemptIndex: nonNegativeIntegerSchema,
-  terminalRequestId: z.string().min(1),
-  terminalLineageVersion: z.literal(1),
-  terminalAtomCount: positiveIntegerSchema,
-  terminalPrefixDigest: sha256HexSchema,
-  terminalCanonicalMessageCount: positiveIntegerSchema,
-  providerState: historyProviderStateSchema.refine(
-    (state) => state.lastFamily === "claude-code",
-    "Core primary Claude success must publish a Claude provider head",
-  ),
-  nativeCwd: z.string().min(1),
-  nativeLastModified: z.number().finite().nonnegative(),
-  nativeContextTokens: nonNegativeIntegerSchema,
-  nativeContextMaxTokens: positiveIntegerSchema,
-  lastModelSpecifier: z.string().min(1),
-  lastReasoning: z.string().min(1),
 });
 
 type TranscriptRow = {
@@ -309,12 +330,7 @@ type CorePrimaryClaudeAttemptRow = {
 
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 
-const compactionCheckpointMetaSchema = z.object({
-  type: z.literal("compaction"),
-  formatVersion: z.literal(COMPACTION_CHECKPOINT_FORMAT_VERSION),
-});
-
-export type CompactionCheckpointMeta = z.infer<typeof compactionCheckpointMetaSchema>;
+export type CompactionCheckpointMeta = PersistedCompactionCheckpointMeta;
 
 export type TranscriptSnapshot = {
   requestId: string;
@@ -470,6 +486,165 @@ export type TranscriptStoreLifecycleDiagnostic = (
   event: string,
   detail: Readonly<Record<string, unknown>>,
 ) => void;
+
+export type TranscriptStorePersistenceDiagnostic = {
+  readonly table: string;
+  readonly field: string;
+  readonly version: number;
+  readonly issueCode: PersistedDataIssueCode;
+  readonly recordId: string;
+};
+
+export class TranscriptStoreSqliteDriverFailure extends TaggedError(
+  "TranscriptStoreSqliteDriverFailure",
+)<{
+  readonly operation: string;
+  readonly code: string;
+  readonly message: string;
+}> {}
+
+export type TranscriptStoreReadError = PersistedDataError | TranscriptStoreSqliteDriverFailure;
+
+export class TranscriptRetainedByLineage extends TaggedError("TranscriptRetainedByLineage")<{
+  readonly requestId: string;
+  readonly message: string;
+}> {}
+
+type TranscriptTransactionOperation =
+  | "save-request-transcript"
+  | "admit-core-surface-projection"
+  | "save-core-primary-lineage-manifest"
+  | "publish-core-named-claude-success"
+  | "publish-core-primary-claude-success";
+
+type TranscriptTransactionConflictReason =
+  | "attempt-not-found"
+  | "attempt-not-retained"
+  | "attempt-terminal"
+  | "lineage-immutable"
+  | "lineage-invalid"
+  | "projection-not-retained"
+  | "publication-fence-lost"
+  | "publication-verification-failed"
+  | "terminal-request-mismatch"
+  | "transcript-not-found";
+
+class TranscriptTransactionConflict extends TaggedError("TranscriptTransactionConflict")<{
+  readonly operation: TranscriptTransactionOperation;
+  readonly reason: TranscriptTransactionConflictReason;
+  readonly message: string;
+}> {}
+
+class TranscriptTransactionPersistenceFailure extends TaggedError(
+  "TranscriptTransactionPersistenceFailure",
+)<{
+  readonly error: PersistedDataError;
+  readonly diagnostics: readonly [TranscriptStorePersistenceDiagnostic];
+}> {}
+
+type DeferredTranscriptEvent =
+  | {
+      readonly kind: "persistence-diagnostic";
+      readonly diagnostic: TranscriptStorePersistenceDiagnostic;
+    }
+  | {
+      readonly kind: "log";
+      readonly event: string;
+      readonly detail: Readonly<Record<string, unknown>>;
+    };
+
+type PreparedCorePrimaryLineageManifest = {
+  readonly requestId: string;
+  readonly manifest: CoreLineageManifestV1;
+  readonly manifestJson: string;
+  readonly createdAt: number;
+  readonly requestClient: AdapterPlatform;
+  readonly sessionId: string;
+  readonly existingManifestJson: string | null;
+};
+
+type PreparedCorePrimaryLineageRead = {
+  readonly manifest: CoreLineageManifestV1;
+  readonly manifestJson: string;
+};
+
+type CoreSurfaceProjectionAdmissionOutcome =
+  | { readonly kind: "existing" }
+  | { readonly kind: "inserted"; readonly projection: CoreSurfaceProjection };
+
+type ClaudePublicationOutcome<TAttempt> = {
+  readonly attempt: TAttempt;
+  readonly events: readonly DeferredTranscriptEvent[];
+};
+
+export type TranscriptStoreWriteError =
+  | TranscriptStoreReadError
+  | TranscriptRetainedByLineage
+  | CoreOwnedBlobIntegrityError;
+
+function transactionConflict(
+  operation: TranscriptTransactionOperation,
+  reason: TranscriptTransactionConflictReason,
+  message: string,
+): TranscriptTransactionConflict {
+  return new TranscriptTransactionConflict({ operation, reason, message });
+}
+
+function toTranscriptPersistenceDiagnostic(
+  error: PersistedDataError,
+): TranscriptStorePersistenceDiagnostic {
+  return {
+    table: error.table,
+    field: error.field,
+    version: error.version,
+    issueCode: error.issueCode,
+    recordId: error.recordId.slice(0, 160),
+  };
+}
+
+function deferTranscriptPersistenceFailure(
+  error: PersistedDataError,
+): TranscriptTransactionPersistenceFailure {
+  return new TranscriptTransactionPersistenceFailure({
+    error,
+    diagnostics: [toTranscriptPersistenceDiagnostic(error)],
+  });
+}
+
+function appendDeferredTranscriptEvent(
+  events: DeferredTranscriptEvent[],
+  event: DeferredTranscriptEvent,
+): void {
+  if (events.length < MAX_DEFERRED_TRANSCRIPT_EVENTS) events.push(event);
+}
+
+function adaptTranscriptTransactionResultToStoreHost<T, TError>(
+  result: ResultType<T, TError | TranscriptTransactionConflict>,
+): ResultType<T, TError> {
+  if (result.status === "ok") return Result.ok(result.value);
+  if (!TranscriptTransactionConflict.is(result.error)) return Result.err(result.error);
+  throw new Error(result.error.message);
+}
+
+function adaptCoreOwnedBlobResultToStoreHost<T>(
+  result: ResultType<T, CoreOwnedBlobIntegrityError>,
+): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function classifyTranscriptSqliteDriverFailure(
+  operation: string,
+  cause: Error,
+): TranscriptStoreSqliteDriverFailure | undefined {
+  const sqliteError = classifyBunSqliteError(cause);
+  if (sqliteError === undefined) return undefined;
+  return new TranscriptStoreSqliteDriverFailure({
+    operation,
+    code: sqliteError.code,
+    message: "Transcript SQLite operation failed",
+  });
+}
 
 export type CorePrimaryClaudeSessionAttempt = {
   readonly product: "core-primary";
@@ -658,7 +833,7 @@ export type TranscriptStore = {
     providerState?: HistoryProviderState;
     stableNamedRequestClient?: AdapterPlatform;
     corePrimaryLineage?: CoreLineageManifestV1;
-  }): void;
+  }): ResultType<void, TranscriptStoreWriteError>;
 
   putCoreOwnedBlob?(input: {
     bytes: Uint8Array;
@@ -670,27 +845,40 @@ export type TranscriptStore = {
 
   deleteCoreOwnedBlobIfUnreferenced?(input: { sha256: string }): boolean;
 
-  admitCoreSurfaceProjection?(input: AdmitCoreSurfaceProjection): CoreSurfaceProjection;
+  admitCoreSurfaceProjection?(
+    input: AdmitCoreSurfaceProjection,
+  ): ResultType<CoreSurfaceProjection, TranscriptStoreReadError | CoreOwnedBlobIntegrityError>;
 
-  getCoreSurfaceProjection?(input: CoreSurfaceProjectionKey): CoreSurfaceProjection | null;
+  getCoreSurfaceProjection?(
+    input: CoreSurfaceProjectionKey,
+  ): ResultType<
+    CoreSurfaceProjection | null,
+    TranscriptStoreReadError | CoreOwnedBlobIntegrityError
+  >;
 
-  getLatestCoreSurfaceSegment?(input: CoreSurfaceProjectionKey): CoreStoredSurfaceSegment | null;
+  getLatestCoreSurfaceSegment?(
+    input: CoreSurfaceProjectionKey,
+  ): ResultType<CoreStoredSurfaceSegment | null, TranscriptStoreReadError>;
 
   saveCorePrimaryLineageManifest?(input: {
     requestId: string;
     manifest: CoreLineageManifestV1;
-  }): CoreLineageManifestV1;
+  }): ResultType<CoreLineageManifestV1, TranscriptStoreReadError | CoreOwnedBlobIntegrityError>;
 
-  getCorePrimaryLineageManifest?(input: { requestId: string }): CoreLineageManifestV1 | null;
+  getCorePrimaryLineageManifest?(input: {
+    requestId: string;
+  }): ResultType<CoreLineageManifestV1 | null, TranscriptStoreReadError>;
 
-  getCoreRequestAtomMetadata?(input: { requestId: string }): CoreRequestAtomMetadata | null;
+  getCoreRequestAtomMetadata?(input: {
+    requestId: string;
+  }): ResultType<CoreRequestAtomMetadata | null, TranscriptStoreReadError>;
 
   validateCorePrimaryLineageReferences?(input: {
     manifest: CoreLineageManifestV1;
     requestClient: AdapterPlatform;
     sessionId: string;
     surfaceId: string;
-  }): string | null;
+  }): ResultType<string | null, TranscriptStoreReadError | CoreOwnedBlobIntegrityError>;
 
   linkSurfaceMessagesToRequest(input: {
     requestId: string;
@@ -702,24 +890,30 @@ export type TranscriptStore = {
     platform: AdapterPlatform;
     channelId: string;
     messageId: string;
-  }): TranscriptSnapshot | null;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError>;
 
   unlinkSurfaceMessage?(input: {
     platform: AdapterPlatform;
     channelId: string;
     messageId: string;
-  }): UnlinkSurfaceMessageResult;
+  }): ResultType<UnlinkSurfaceMessageResult, TranscriptStoreReadError>;
 
-  deleteUnlinkedCheckpointCandidate?(input: { requestId: string }): boolean;
+  deleteUnlinkedCheckpointCandidate?(input: {
+    requestId: string;
+  }): ResultType<boolean, TranscriptStoreReadError>;
 
-  getLatestTranscriptBySession?(input: { sessionId: string }): TranscriptSnapshot | null;
+  getLatestTranscriptBySession?(input: {
+    sessionId: string;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError>;
 
-  getRequestTranscript?(input: { requestId: string }): TranscriptSnapshot | null;
+  getRequestTranscript?(input: {
+    requestId: string;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError>;
 
   getLatestCompleteNamedTranscript?(input: {
     requestClient: AdapterPlatform;
     sessionId: string;
-  }): TranscriptSnapshot | null;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError>;
 
   getCoreNamedClaudeSessionBinding?(input: {
     providerId: string;
@@ -745,7 +939,7 @@ export type TranscriptStore = {
 
   publishCoreNamedClaudeSuccess?(
     input: PublishCoreNamedClaudeSuccess,
-  ): CoreNamedClaudeSessionAttempt;
+  ): ResultType<CoreNamedClaudeSessionAttempt, TranscriptStoreReadError>;
 
   promoteCoreNamedClaudeSessionBinding?(input: {
     providerId: string;
@@ -781,7 +975,7 @@ export type TranscriptStore = {
 
   publishCorePrimaryClaudeSuccess?(
     input: PublishCorePrimaryClaudeSuccess,
-  ): CorePrimaryClaudeSessionAttempt;
+  ): ResultType<CorePrimaryClaudeSessionAttempt, TranscriptStoreReadError>;
 
   promoteCorePrimaryClaudeSessionBinding?(input: {
     providerId: string;
@@ -818,6 +1012,11 @@ export class SqliteTranscriptStore implements TranscriptStore {
   constructor(
     dbPath: string,
     private readonly onLifecycleDiagnostic?: TranscriptStoreLifecycleDiagnostic,
+    private readonly onPersistenceDiagnostic: (
+      diagnostic: TranscriptStorePersistenceDiagnostic,
+    ) => void = (diagnostic) => {
+      logger.warn("transcript persisted value decode failed", diagnostic);
+    },
   ) {
     this.db = new Database(dbPath);
     this.migrate();
@@ -827,6 +1026,65 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   close(): void {
     this.db.close();
+  }
+
+  private reportPersistenceError(error: PersistedDataError): void {
+    this.onPersistenceDiagnostic(toTranscriptPersistenceDiagnostic(error));
+  }
+
+  private emitPersistenceDiagnosticsAfterTransaction(
+    diagnostics: readonly TranscriptStorePersistenceDiagnostic[],
+  ): void {
+    for (const diagnostic of diagnostics) {
+      try {
+        this.onPersistenceDiagnostic(diagnostic);
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+      }
+    }
+  }
+
+  private emitDeferredTranscriptEvents(events: readonly DeferredTranscriptEvent[]): void {
+    for (const event of events) {
+      switch (event.kind) {
+        case "persistence-diagnostic":
+          this.emitPersistenceDiagnosticsAfterTransaction([event.diagnostic]);
+          break;
+        case "log":
+          try {
+            logger.info(event.event, event.detail);
+          } catch (cause) {
+            if (Panic.is(cause)) throw cause;
+          }
+          break;
+      }
+    }
+  }
+
+  private finalizeTransactionPersistenceDiagnostics<T, TError>(
+    result: ResultType<T, TranscriptTransactionPersistenceFailure | TError>,
+  ): ResultType<T, PersistedDataError | TError> {
+    if (result.status === "ok") return Result.ok(result.value);
+    if (!TranscriptTransactionPersistenceFailure.is(result.error)) {
+      return Result.err(result.error);
+    }
+    this.emitPersistenceDiagnosticsAfterTransaction(result.error.diagnostics);
+    return Result.err(result.error.error);
+  }
+
+  private readFromSqlite<T>(
+    operation: string,
+    read: () => T,
+  ): ResultType<T, TranscriptStoreSqliteDriverFailure> {
+    try {
+      return Result.ok(read());
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyTranscriptSqliteDriverFailure(operation, cause);
+      if (failure) return Result.err(failure);
+      throw cause;
+    }
   }
 
   private migrate() {
@@ -1087,17 +1345,20 @@ export class SqliteTranscriptStore implements TranscriptStore {
           .query("SELECT request_id, messages_json FROM request_transcripts")
           .all() as Array<{ request_id: string; messages_json: string }>;
         for (const row of rows) {
-          let messages: ModelMessage[];
-          try {
-            messages = parseNormalizedCanonicalMessages(JSON.parse(row.messages_json));
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            throw new Error(
-              `Cannot migrate transcript '${row.request_id}' to schema v2: ${message}`,
-            );
+          const decoded = decodeTranscriptMessages({
+            raw: row.messages_json,
+            schemaVersion: 1,
+            recordId: row.request_id,
+          });
+          if (decoded.status === "error") {
+            this.reportPersistenceError(decoded.error);
+            throw new Panic({
+              message: "Cannot migrate corrupt transcript messages to schema v2",
+              cause: decoded.error,
+            });
           }
           this.db.run("UPDATE request_transcripts SET transcript_digest = ? WHERE request_id = ?", [
-            hashCanonicalMessagesV1(messages).hash,
+            hashCanonicalMessagesV1(decoded.value.value).hash,
             row.request_id,
           ]);
         }
@@ -1323,59 +1584,95 @@ export class SqliteTranscriptStore implements TranscriptStore {
     providerState?: HistoryProviderState;
     stableNamedRequestClient?: AdapterPlatform;
     corePrimaryLineage?: CoreLineageManifestV1;
-  }): void {
+  }): ResultType<void, TranscriptStoreWriteError> {
     const now = Date.now();
     const normalizedMessages = parseNormalizedCanonicalMessages(input.messages);
     const transcriptDigest = hashCanonicalMessagesV1(normalizedMessages).hash;
-    const providerState = input.providerState
-      ? historyProviderStateSchema.parse(input.providerState)
-      : null;
-    const stableNamedRequestClient = input.stableNamedRequestClient
-      ? adapterPlatformSchema.parse(input.stableNamedRequestClient)
-      : null;
+    const providerState = input.providerState ?? null;
+    const stableNamedRequestClient = input.stableNamedRequestClient ?? null;
     const lineage = input.corePrimaryLineage
       ? this.parseCompleteCorePrimaryLineage(input.corePrimaryLineage)
       : null;
+    const preparedLineage = lineage
+      ? adaptTranscriptTransactionResultToStoreHost(
+          this.finalizeTransactionPersistenceDiagnostics(
+            this.prepareCorePrimaryLineageManifest({
+              requestId: input.requestId,
+              manifest: lineage,
+              requestClient: input.requestClient,
+              sessionId: input.sessionId,
+              createdAt: now,
+              operation: "save-request-transcript",
+            }),
+          ),
+        )
+      : Result.ok<PreparedCorePrimaryLineageManifest | null>(null);
+    if (preparedLineage.status === "error") return Result.err(preparedLineage.error);
 
     // Persist the full transcript, but repair provider-shaped stringified assistant
     // tool inputs into canonical object form so resumed sessions remain executable.
     // Do not prune/compact tool outputs at persistence time; do that (if needed)
     // only in the model-facing view right before sending.
     const finalJson = JSON.stringify(normalizedMessages);
+    const contextMetaJson = input.contextMeta ? JSON.stringify(input.contextMeta) : null;
+    const providerStateJson = providerState ? JSON.stringify(providerState) : null;
 
-    const save = this.db.transaction(() => {
-      const existing = this.db
-        .query(
-          `SELECT transcript_digest, provider_state_json
+    const save = runBunSqliteTransaction<
+      readonly DeferredTranscriptEvent[],
+      | TranscriptTransactionPersistenceFailure
+      | TranscriptRetainedByLineage
+      | CoreOwnedBlobIntegrityError
+      | TranscriptStoreReadError
+      | TranscriptTransactionConflict,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () => {
+        const existing = this.db
+          .query<
+            { transcript_digest: string | null; provider_state_json: string | null },
+            [string]
+          >(
+            `SELECT transcript_digest, provider_state_json
            FROM request_transcripts WHERE request_id = ?`,
-        )
-        .get(input.requestId) as {
-        transcript_digest: string | null;
-        provider_state_json: string | null;
-      } | null;
-      if (existing) {
-        const digestRetained = this.db
-          .query("SELECT 1 FROM core_lineage_request_refs WHERE referenced_request_id = ? LIMIT 1")
-          .get(input.requestId);
-        const requestMetadataRetained = this.db
-          .query(
-            `SELECT 1 FROM core_lineage_request_refs
-             WHERE referenced_request_id = ? AND reference_kind = 'request' LIMIT 1`,
           )
           .get(input.requestId);
-        const existingProviderState = parseHistoryProviderState(existing.provider_state_json);
-        if (
-          (digestRetained && existing.transcript_digest !== transcriptDigest) ||
-          (requestMetadataRetained && !isDeepStrictEqual(existingProviderState, providerState))
-        ) {
-          throw new Error(
-            `Request transcript '${input.requestId}' is retained by a Core primary lineage manifest`,
-          );
+        if (existing) {
+          const digestRetained = this.db
+            .query(
+              "SELECT 1 FROM core_lineage_request_refs WHERE referenced_request_id = ? LIMIT 1",
+            )
+            .get(input.requestId);
+          const requestMetadataRetained = this.db
+            .query(
+              `SELECT 1 FROM core_lineage_request_refs
+             WHERE referenced_request_id = ? AND reference_kind = 'request' LIMIT 1`,
+            )
+            .get(input.requestId);
+          const existingProviderState = decodeTranscriptProviderState({
+            raw: existing.provider_state_json,
+            schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+            recordId: input.requestId,
+          });
+          if (existingProviderState.status === "error") {
+            return Result.err(deferTranscriptPersistenceFailure(existingProviderState.error));
+          }
+          if (
+            (digestRetained && existing.transcript_digest !== transcriptDigest) ||
+            (requestMetadataRetained &&
+              !isDeepStrictEqual(existingProviderState.value.value, providerState))
+          ) {
+            return Result.err(
+              new TranscriptRetainedByLineage({
+                requestId: input.requestId,
+                message: "Request transcript is retained by a Core primary lineage manifest",
+              }),
+            );
+          }
         }
-      }
 
-      this.db.run(
-        `
+        this.db.run(
+          `
         INSERT INTO request_transcripts (
           request_id, session_id, request_client, created_ts, updated_ts, model_label, final_text,
           messages_json, context_meta_json, provider_state_json, stable_named_request_client,
@@ -1393,26 +1690,38 @@ export class SqliteTranscriptStore implements TranscriptStore {
           stable_named_request_client=excluded.stable_named_request_client,
           transcript_digest=excluded.transcript_digest;
         `,
-        [
-          input.requestId,
-          input.sessionId,
-          input.requestClient,
-          now,
-          now,
-          input.modelLabel ?? null,
-          input.finalText ?? null,
-          finalJson,
-          input.contextMeta ? JSON.stringify(input.contextMeta) : null,
-          providerState ? JSON.stringify(providerState) : null,
-          stableNamedRequestClient,
-          transcriptDigest,
-        ],
-      );
-      if (lineage) this.saveCorePrimaryLineageManifestInTransaction(input.requestId, lineage);
-    });
-    save.immediate();
-
-    this.pruneRetention();
+          [
+            input.requestId,
+            input.sessionId,
+            input.requestClient,
+            now,
+            now,
+            input.modelLabel ?? null,
+            input.finalText ?? null,
+            finalJson,
+            contextMetaJson,
+            providerStateJson,
+            stableNamedRequestClient,
+            transcriptDigest,
+          ],
+        );
+        if (preparedLineage.value) {
+          const savedLineage = this.saveCorePrimaryLineageManifestInTransaction(
+            preparedLineage.value,
+            "save-request-transcript",
+          );
+          if (savedLineage.status === "error") return Result.err(savedLineage.error);
+        }
+        return Result.ok(this.pruneRetention(now));
+      },
+      (cause) => classifyTranscriptSqliteDriverFailure("save-request-transcript", cause),
+    );
+    const finalized = adaptTranscriptTransactionResultToStoreHost(
+      this.finalizeTransactionPersistenceDiagnostics(save),
+    );
+    if (finalized.status === "error") return Result.err(finalized.error);
+    this.emitDeferredTranscriptEvents(finalized.value);
+    return Result.ok(undefined);
   }
 
   putCoreOwnedBlob(inputValue: {
@@ -1428,7 +1737,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       })
       .parse(inputValue);
     const sha256 = createHash("sha256").update(input.bytes).digest("hex");
-    const existing = this.getCoreOwnedBlobOrNull(sha256);
+    const existing = adaptCoreOwnedBlobResultToStoreHost(this.readCoreOwnedBlob(sha256));
     if (existing) return existing;
 
     const createdAt = Date.now();
@@ -1438,15 +1747,23 @@ export class SqliteTranscriptStore implements TranscriptStore {
        ) VALUES (?, ?, ?, ?, ?, ?)`,
       [sha256, input.mediaType, input.filename, input.bytes.byteLength, input.bytes, createdAt],
     );
-    const stored = this.getCoreOwnedBlobOrNull(sha256);
-    if (!stored) throw new CoreOwnedBlobIntegrityError(`Owned blob '${sha256}' was not retained`);
+    const stored = adaptCoreOwnedBlobResultToStoreHost(this.readCoreOwnedBlob(sha256));
+    if (!stored) {
+      return adaptCoreOwnedBlobResultToStoreHost(
+        Result.err(new CoreOwnedBlobIntegrityError(`Owned blob '${sha256}' was not retained`)),
+      );
+    }
     return stored;
   }
 
   getCoreOwnedBlob(inputValue: { sha256: string }): CoreOwnedBlob {
     const sha256 = sha256HexSchema.parse(inputValue.sha256);
-    const blob = this.getCoreOwnedBlobOrNull(sha256);
-    if (!blob) throw new CoreOwnedBlobIntegrityError(`Owned blob '${sha256}' is missing`);
+    const blob = adaptCoreOwnedBlobResultToStoreHost(this.readCoreOwnedBlob(sha256));
+    if (!blob) {
+      return adaptCoreOwnedBlobResultToStoreHost(
+        Result.err(new CoreOwnedBlobIntegrityError(`Owned blob '${sha256}' is missing`)),
+      );
+    }
     return blob;
   }
 
@@ -1470,11 +1787,18 @@ export class SqliteTranscriptStore implements TranscriptStore {
     return deleted;
   }
 
-  admitCoreSurfaceProjection(inputValue: AdmitCoreSurfaceProjection): CoreSurfaceProjection {
-    const parsed = admitCoreSurfaceProjectionSchema.parse(inputValue);
+  admitCoreSurfaceProjection(
+    inputValue: AdmitCoreSurfaceProjection,
+  ): ResultType<CoreSurfaceProjection, TranscriptStoreReadError | CoreOwnedBlobIntegrityError> {
     const input = {
-      ...parsed,
-      canonicalMessages: parseNormalizedCanonicalMessages(parsed.canonicalMessages),
+      ...inputValue,
+      canonicalMessages: parseNormalizedCanonicalMessages(inputValue.canonicalMessages),
+      ownedBlobs: inputValue.ownedBlobs.map((reference) => ({
+        sha256: reference.sha256,
+        mediaType: reference.mediaType,
+        filename: reference.filename,
+        byteLength: reference.byteLength,
+      })),
     };
     const key: CoreSurfaceProjectionKey = {
       requestClient: input.requestClient,
@@ -1483,94 +1807,173 @@ export class SqliteTranscriptStore implements TranscriptStore {
       messageId: input.messageId,
       projectionFormatVersion: input.projectionFormatVersion,
     };
-    const admit = this.db.transaction(() => {
-      const existing = this.getCoreSurfaceProjection(key);
-      if (existing) return existing;
-
-      for (const reference of input.ownedBlobs) {
-        const blob = this.getCoreOwnedBlob({ sha256: reference.sha256 });
-        if (!isDeepStrictEqual(toCoreOwnedBlobReference(blob), reference)) {
-          throw new CoreOwnedBlobIntegrityError(
-            `Owned blob reference '${reference.sha256}' does not match stored metadata`,
-          );
-        }
+    const existing = this.getCoreSurfaceProjection(key);
+    if (existing.status === "error") return Result.err(existing.error);
+    if (existing.value) return Result.ok(existing.value);
+    for (const reference of input.ownedBlobs) {
+      const blobRead = this.readCoreOwnedBlob(reference.sha256);
+      if (blobRead.status === "error") return Result.err(blobRead.error);
+      const blob = blobRead.value;
+      if (!blob) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(`Owned blob '${reference.sha256}' is missing`),
+        );
       }
-      const createdAt = Date.now();
-      this.db.run(
-        `INSERT INTO core_surface_projections (
+      if (!isDeepStrictEqual(toCoreOwnedBlobReference(blob), reference)) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(
+            `Owned blob reference '${reference.sha256}' does not match stored metadata`,
+          ),
+        );
+      }
+    }
+    const createdAt = Date.now();
+    const canonicalMessagesJson = JSON.stringify(input.canonicalMessages);
+    const sourceFactsJson = JSON.stringify(input.sourceFacts);
+    const insertedProjection: CoreSurfaceProjection = {
+      ...key,
+      canonicalMessages: input.canonicalMessages,
+      sourceFacts: input.sourceFacts,
+      ownedBlobs: input.ownedBlobs,
+      createdAt,
+    };
+    const admission = runBunSqliteTransaction<
+      CoreSurfaceProjectionAdmissionOutcome,
+      TranscriptTransactionConflict,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () => {
+        const retained = this.db
+          .query<{ request_client: string }, [AdapterPlatform, string, string, string, number]>(
+            `SELECT request_client FROM core_surface_projections
+             WHERE request_client = ? AND surface_id = ? AND session_id = ?
+               AND message_id = ? AND projection_format_version = ?`,
+          )
+          .get(
+            key.requestClient,
+            key.surfaceId,
+            key.sessionId,
+            key.messageId,
+            key.projectionFormatVersion,
+          );
+        if (retained) return Result.ok({ kind: "existing" });
+        this.db.run(
+          `INSERT INTO core_surface_projections (
            request_client, surface_id, session_id, message_id, projection_format_version,
            canonical_messages_json, source_facts_json, created_ts
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          input.requestClient,
-          input.surfaceId,
-          input.sessionId,
-          input.messageId,
-          input.projectionFormatVersion,
-          JSON.stringify(input.canonicalMessages),
-          JSON.stringify(input.sourceFacts),
-          createdAt,
-        ],
-      );
-      for (const [position, reference] of input.ownedBlobs.entries()) {
-        this.db.run(
-          `INSERT INTO core_surface_projection_blobs (
-             request_client, surface_id, session_id, message_id, projection_format_version,
-             position, blob_sha256
-           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [
             input.requestClient,
             input.surfaceId,
             input.sessionId,
             input.messageId,
             input.projectionFormatVersion,
-            position,
-            reference.sha256,
+            canonicalMessagesJson,
+            sourceFactsJson,
+            createdAt,
           ],
         );
-      }
-      const stored = this.getCoreSurfaceProjection(key);
-      if (!stored) throw new Error("Core surface projection was not retained");
-      return stored;
-    });
-    return admit.immediate();
+        for (const [position, reference] of input.ownedBlobs.entries()) {
+          this.db.run(
+            `INSERT INTO core_surface_projection_blobs (
+             request_client, surface_id, session_id, message_id, projection_format_version,
+             position, blob_sha256
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              input.requestClient,
+              input.surfaceId,
+              input.sessionId,
+              input.messageId,
+              input.projectionFormatVersion,
+              position,
+              reference.sha256,
+            ],
+          );
+        }
+        const stored = this.db
+          .query<{ request_client: string }, [AdapterPlatform, string, string, string, number]>(
+            `SELECT request_client FROM core_surface_projections
+             WHERE request_client = ? AND surface_id = ? AND session_id = ?
+               AND message_id = ? AND projection_format_version = ?`,
+          )
+          .get(
+            key.requestClient,
+            key.surfaceId,
+            key.sessionId,
+            key.messageId,
+            key.projectionFormatVersion,
+          );
+        if (!stored) {
+          return Result.err(
+            transactionConflict(
+              "admit-core-surface-projection",
+              "projection-not-retained",
+              "Core surface projection was not retained",
+            ),
+          );
+        }
+        return Result.ok({ kind: "inserted", projection: insertedProjection });
+      },
+      (cause) => classifyTranscriptSqliteDriverFailure("admit-core-surface-projection", cause),
+    );
+    const finalized = adaptTranscriptTransactionResultToStoreHost(admission);
+    if (finalized.status === "error") return Result.err(finalized.error);
+    if (finalized.value.kind === "inserted") return Result.ok(finalized.value.projection);
+    const raced = this.getCoreSurfaceProjection(key);
+    if (raced.status === "error") return Result.err(raced.error);
+    if (raced.value) return Result.ok(raced.value);
+    return adaptTranscriptTransactionResultToStoreHost(
+      Result.err(
+        transactionConflict(
+          "admit-core-surface-projection",
+          "projection-not-retained",
+          "Core surface projection was not retained",
+        ),
+      ),
+    );
   }
 
-  getCoreSurfaceProjection(inputValue: CoreSurfaceProjectionKey): CoreSurfaceProjection | null {
+  getCoreSurfaceProjection(
+    inputValue: CoreSurfaceProjectionKey,
+  ): ResultType<
+    CoreSurfaceProjection | null,
+    TranscriptStoreReadError | CoreOwnedBlobIntegrityError
+  > {
     const input = coreSurfaceProjectionKeySchema.parse(inputValue);
-    const row = this.db
-      .query(
-        `SELECT * FROM core_surface_projections
+    const read = this.readFromSqlite("get-core-surface-projection", () => {
+      const row = this.db
+        .query<CoreSurfaceProjectionRow, [AdapterPlatform, string, string, string, number]>(
+          `SELECT * FROM core_surface_projections
          WHERE request_client = ? AND surface_id = ? AND session_id = ?
            AND message_id = ? AND projection_format_version = ?`,
-      )
-      .get(
-        input.requestClient,
-        input.surfaceId,
-        input.sessionId,
-        input.messageId,
-        input.projectionFormatVersion,
-      ) as CoreSurfaceProjectionRow | null;
-    if (!row) return null;
+        )
+        .get(
+          input.requestClient,
+          input.surfaceId,
+          input.sessionId,
+          input.messageId,
+          input.projectionFormatVersion,
+        );
+      if (!row) return null;
 
-    const references = this.db
-      .query(
-        `SELECT b.* FROM core_surface_projection_blobs pb
+      const references = this.db
+        .query<CoreOwnedBlobRow, [AdapterPlatform, string, string, string, number]>(
+          `SELECT b.* FROM core_surface_projection_blobs pb
          JOIN core_owned_blobs b ON b.sha256 = pb.blob_sha256
          WHERE pb.request_client = ? AND pb.surface_id = ? AND pb.session_id = ?
            AND pb.message_id = ? AND pb.projection_format_version = ?
          ORDER BY pb.position ASC`,
-      )
-      .all(
-        input.requestClient,
-        input.surfaceId,
-        input.sessionId,
-        input.messageId,
-        input.projectionFormatVersion,
-      ) as CoreOwnedBlobRow[];
-    const expectedReferenceCount = z.object({ count: nonNegativeIntegerSchema }).parse(
-      this.db
-        .query(
+        )
+        .all(
+          input.requestClient,
+          input.surfaceId,
+          input.sessionId,
+          input.messageId,
+          input.projectionFormatVersion,
+        );
+      const count = this.db
+        .query<{ count: number }, [AdapterPlatform, string, string, string, number]>(
           `SELECT COUNT(*) AS count FROM core_surface_projection_blobs
            WHERE request_client = ? AND surface_id = ? AND session_id = ?
              AND message_id = ? AND projection_format_version = ?`,
@@ -1581,144 +1984,393 @@ export class SqliteTranscriptStore implements TranscriptStore {
           input.sessionId,
           input.messageId,
           input.projectionFormatVersion,
-        ),
-    ).count;
-    if (references.length !== expectedReferenceCount) {
-      throw new CoreOwnedBlobIntegrityError("A Core surface projection references a missing blob");
+        );
+      return { row, references, expectedReferenceCount: count?.count ?? 0 };
+    });
+    if (read.status === "error") return Result.err(read.error);
+    if (read.value === null) return Result.ok(null);
+    if (read.value.references.length !== read.value.expectedReferenceCount) {
+      return Result.err(
+        new CoreOwnedBlobIntegrityError("A Core surface projection references a missing blob"),
+      );
     }
-    const ownedBlobs = references.map((reference) =>
-      toCoreOwnedBlobReference(validateCoreOwnedBlobRow(reference)),
-    );
-    return {
-      requestClient: adapterPlatformSchema.parse(row.request_client),
-      surfaceId: row.surface_id,
-      sessionId: row.session_id,
-      messageId: row.message_id,
-      projectionFormatVersion: z.literal(1).parse(row.projection_format_version),
-      canonicalMessages: modelMessagesSchema.parse(
-        parseSerializedUnknown(row.canonical_messages_json, "Core surface canonical messages"),
-      ),
-      sourceFacts: coreProjectionSourceFactsSchema.parse(
-        parseSerializedUnknown(row.source_facts_json, "Core surface source facts"),
-      ),
-      ownedBlobs,
-      createdAt: nonNegativeIntegerSchema.parse(row.created_ts),
-    };
+    const ownedBlobs: CoreOwnedBlobReference[] = [];
+    for (const reference of read.value.references) {
+      const decoded = decodeCoreOwnedBlobRow(reference);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      ownedBlobs.push(toCoreOwnedBlobReference(decoded.value));
+    }
+    const decoded = decodeCoreSurfaceProjectionRow({
+      row: read.value.row,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      this.reportPersistenceError(decoded.error);
+      return Result.err(decoded.error);
+    }
+    return Result.ok({ ...decoded.value.value, ownedBlobs });
   }
 
   getLatestCoreSurfaceSegment(
     inputValue: CoreSurfaceProjectionKey,
-  ): CoreStoredSurfaceSegment | null {
+  ): ResultType<CoreStoredSurfaceSegment | null, TranscriptStoreReadError> {
     const input = coreSurfaceProjectionKeySchema.parse(inputValue);
-    const row = this.db
-      .query(
-        `SELECT r.request_id, r.segment_index, m.manifest_json
+    const read = this.readFromSqlite("get-latest-core-surface-segment", () =>
+      this.db
+        .query<
+          PersistedCoreLineageManifestRow & { segment_index: number },
+          [AdapterPlatform, string, string, string, number]
+        >(
+          `SELECT r.request_id, r.segment_index, m.lineage_version, m.manifest_json
          FROM core_lineage_projection_refs r
          JOIN core_primary_lineage_manifests m ON m.request_id = r.request_id
          WHERE r.request_client = ? AND r.surface_id = ? AND r.session_id = ?
            AND r.message_id = ? AND r.projection_format_version = ?
          ORDER BY m.created_ts DESC, r.request_id DESC
          LIMIT 1`,
-      )
-      .get(
-        input.requestClient,
-        input.surfaceId,
-        input.sessionId,
-        input.messageId,
-        input.projectionFormatVersion,
-      ) as { request_id: string; segment_index: number; manifest_json: string } | null;
-    if (!row) return null;
-
-    const manifest = this.parseCompleteCorePrimaryLineage(
-      parseSerializedUnknown(row.manifest_json, "Core primary lineage manifest"),
+        )
+        .get(
+          input.requestClient,
+          input.surfaceId,
+          input.sessionId,
+          input.messageId,
+          input.projectionFormatVersion,
+        ),
     );
-    const segment = manifest.segments[row.segment_index];
-    if (!segment) throw new Error(`Stored Core lineage segment ${row.segment_index} is missing`);
-    return {
-      requestId: row.request_id,
-      segmentIndex: row.segment_index,
+    if (read.status === "error") return Result.err(read.error);
+    if (!read.value) return Result.ok(null);
+    const decoded = decodeCoreLineageManifestRow({
+      row: read.value,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      this.reportPersistenceError(decoded.error);
+      return Result.err(decoded.error);
+    }
+    const segment = decoded.value.value.segments[read.value.segment_index];
+    if (!segment) {
+      const error = new CorruptPersistedFields({
+        table: "core_primary_lineage_manifests",
+        field: "segment_index",
+        version: TRANSCRIPT_SCHEMA_VERSION,
+        issueCode: "invalid-lineage-manifest",
+        recordId: read.value.request_id,
+        message: "Persisted Core lineage segment is missing",
+      });
+      this.reportPersistenceError(error);
+      return Result.err(error);
+    }
+    return Result.ok({
+      requestId: read.value.request_id,
+      segmentIndex: read.value.segment_index,
       messageIds: segment.atoms
         .filter((atom) => atom.kind === "surface")
         .map((atom) => atom.messageId),
       canonicalMessages: segment.canonicalMessages,
-    };
+    });
+  }
+
+  private readRequestTranscriptForTransactionPreparation(
+    requestId: string,
+  ): ResultType<
+    TranscriptSnapshot | null,
+    TranscriptStoreSqliteDriverFailure | TranscriptTransactionPersistenceFailure
+  > {
+    const read = this.readFromSqlite("prepare-request-transcript-transaction", () =>
+      this.db
+        .query<TranscriptRow, [string]>(
+          `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
+                  final_text, messages_json, context_meta_json, provider_state_json,
+                  stable_named_request_client, transcript_digest
+           FROM request_transcripts WHERE request_id = ?`,
+        )
+        .get(requestId),
+    );
+    if (read.status === "error") return Result.err(read.error);
+    if (!read.value) return Result.ok(null);
+    const decoded = decodeTranscriptRow({
+      row: read.value,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      return Result.err(deferTranscriptPersistenceFailure(decoded.error));
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  private readCorePrimaryLineageForTransactionPreparation(
+    requestId: string,
+  ): ResultType<
+    PreparedCorePrimaryLineageRead | null,
+    TranscriptStoreSqliteDriverFailure | TranscriptTransactionPersistenceFailure
+  > {
+    const read = this.readFromSqlite("prepare-core-primary-lineage-transaction", () =>
+      this.db
+        .query<PersistedCoreLineageManifestRow, [string]>(
+          "SELECT request_id, lineage_version, manifest_json FROM core_primary_lineage_manifests WHERE request_id = ?",
+        )
+        .get(requestId),
+    );
+    if (read.status === "error") return Result.err(read.error);
+    if (!read.value) return Result.ok(null);
+    const decoded = decodeCoreLineageManifestRow({
+      row: read.value,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      return Result.err(deferTranscriptPersistenceFailure(decoded.error));
+    }
+    return Result.ok({ manifest: decoded.value.value, manifestJson: read.value.manifest_json });
+  }
+
+  private prepareCorePrimaryLineageManifest(input: {
+    readonly requestId: string;
+    readonly manifest: CoreLineageManifestV1;
+    readonly requestClient: AdapterPlatform;
+    readonly sessionId: string;
+    readonly createdAt: number;
+    readonly operation: "save-request-transcript" | "save-core-primary-lineage-manifest";
+  }): ResultType<
+    PreparedCorePrimaryLineageManifest,
+    | TranscriptStoreReadError
+    | CoreOwnedBlobIntegrityError
+    | TranscriptTransactionConflict
+    | TranscriptTransactionPersistenceFailure
+  > {
+    const existing = this.readFromSqlite("prepare-core-primary-lineage-manifest", () =>
+      this.db
+        .query<PersistedCoreLineageManifestRow, [string]>(
+          "SELECT request_id, lineage_version, manifest_json FROM core_primary_lineage_manifests WHERE request_id = ?",
+        )
+        .get(input.requestId),
+    );
+    if (existing.status === "error") return Result.err(existing.error);
+    if (existing.value) {
+      const decoded = decodeCoreLineageManifestRow({
+        row: existing.value,
+        schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+      });
+      if (decoded.status === "error") {
+        return Result.err(deferTranscriptPersistenceFailure(decoded.error));
+      }
+      if (!isDeepStrictEqual(decoded.value.value, input.manifest)) {
+        return Result.err(
+          transactionConflict(
+            input.operation,
+            "lineage-immutable",
+            `Core primary lineage manifest '${input.requestId}' is immutable`,
+          ),
+        );
+      }
+      return Result.ok({
+        requestId: input.requestId,
+        manifest: decoded.value.value,
+        manifestJson: existing.value.manifest_json,
+        createdAt: input.createdAt,
+        requestClient: input.requestClient,
+        sessionId: input.sessionId,
+        existingManifestJson: existing.value.manifest_json,
+      });
+    }
+
+    const invalidReason = this.validateCorePrimaryLineageReferences({
+      manifest: input.manifest,
+      requestClient: input.requestClient,
+      sessionId: input.sessionId,
+      surfaceId: `${input.requestClient}:${input.sessionId}`,
+    });
+    if (invalidReason.status === "error") return Result.err(invalidReason.error);
+    if (invalidReason.value) {
+      return Result.err(
+        transactionConflict(
+          input.operation,
+          "lineage-invalid",
+          `Core primary lineage manifest '${input.requestId}' is invalid: ${invalidReason.value}`,
+        ),
+      );
+    }
+    return Result.ok({
+      requestId: input.requestId,
+      manifest: input.manifest,
+      manifestJson: JSON.stringify(input.manifest),
+      createdAt: input.createdAt,
+      requestClient: input.requestClient,
+      sessionId: input.sessionId,
+      existingManifestJson: null,
+    });
   }
 
   saveCorePrimaryLineageManifest(input: {
     requestId: string;
     manifest: CoreLineageManifestV1;
-  }): CoreLineageManifestV1 {
-    const requestId = z.string().min(1).parse(input.requestId);
-    const save = this.db.transaction(() => {
-      const transcript = this.getRequestTranscript({ requestId });
-      if (!transcript) throw new Error(`Request transcript '${requestId}' was not found`);
-      const manifest = this.parseCompleteCorePrimaryLineage(input.manifest);
-      return this.saveCorePrimaryLineageManifestInTransaction(requestId, manifest);
-    });
-    return save.immediate();
-  }
-
-  getCorePrimaryLineageManifest(input: { requestId: string }): CoreLineageManifestV1 | null {
-    const requestId = z.string().min(1).parse(input.requestId);
-    const row = this.db
-      .query("SELECT manifest_json FROM core_primary_lineage_manifests WHERE request_id = ?")
-      .get(requestId) as { manifest_json: string } | null;
-    if (!row) return null;
-    if (!this.getRequestTranscript({ requestId })) {
-      throw new Error(`Core primary lineage transcript '${requestId}' is missing`);
-    }
-    return this.parseCompleteCorePrimaryLineage(
-      parseSerializedUnknown(row.manifest_json, "Core primary lineage manifest"),
+  }): ResultType<CoreLineageManifestV1, TranscriptStoreReadError | CoreOwnedBlobIntegrityError> {
+    const requestId = input.requestId;
+    const manifest = this.parseCompleteCorePrimaryLineage(input.manifest);
+    const owner = this.finalizeTransactionPersistenceDiagnostics(
+      this.readRequestTranscriptForTransactionPreparation(requestId),
     );
+    if (owner.status === "error") return Result.err(owner.error);
+    if (!owner.value) {
+      return adaptTranscriptTransactionResultToStoreHost(
+        Result.err(
+          transactionConflict(
+            "save-core-primary-lineage-manifest",
+            "transcript-not-found",
+            `Request transcript '${requestId}' was not found`,
+          ),
+        ),
+      );
+    }
+    const prepared = adaptTranscriptTransactionResultToStoreHost(
+      this.finalizeTransactionPersistenceDiagnostics(
+        this.prepareCorePrimaryLineageManifest({
+          requestId,
+          manifest,
+          requestClient: owner.value.requestClient,
+          sessionId: owner.value.sessionId,
+          createdAt: Date.now(),
+          operation: "save-core-primary-lineage-manifest",
+        }),
+      ),
+    );
+    if (prepared.status === "error") return Result.err(prepared.error);
+    const save = runBunSqliteTransaction<
+      CoreLineageManifestV1,
+      TranscriptTransactionConflict,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        this.saveCorePrimaryLineageManifestInTransaction(
+          prepared.value,
+          "save-core-primary-lineage-manifest",
+        ),
+      (cause) => classifyTranscriptSqliteDriverFailure("save-core-primary-lineage-manifest", cause),
+    );
+    return adaptTranscriptTransactionResultToStoreHost(save);
   }
 
-  getCoreRequestAtomMetadata(input: { requestId: string }): CoreRequestAtomMetadata | null {
+  getCorePrimaryLineageManifest(input: {
+    requestId: string;
+  }): ResultType<CoreLineageManifestV1 | null, TranscriptStoreReadError> {
+    const requestId = z.string().min(1).parse(input.requestId);
+    const read = this.readFromSqlite("get-core-primary-lineage-manifest", () =>
+      this.db
+        .query<PersistedCoreLineageManifestRow, [string]>(
+          "SELECT request_id, lineage_version, manifest_json FROM core_primary_lineage_manifests WHERE request_id = ?",
+        )
+        .get(requestId),
+    );
+    if (read.status === "error") return Result.err(read.error);
+    if (!read.value) return Result.ok(null);
+    const transcript = this.getRequestTranscript({ requestId });
+    if (transcript.status === "error") return Result.err(transcript.error);
+    if (!transcript.value) {
+      const error = new CorruptPersistedFields({
+        table: "core_primary_lineage_manifests",
+        field: "request_id",
+        version: TRANSCRIPT_SCHEMA_VERSION,
+        issueCode: "invalid-lineage-manifest",
+        recordId: requestId,
+        message: `Core primary lineage transcript '${requestId}' is missing`,
+      });
+      this.reportPersistenceError(error);
+      return Result.err(error);
+    }
+    const decoded = decodeCoreLineageManifestRow({
+      row: read.value,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      this.reportPersistenceError(decoded.error);
+      return Result.err(decoded.error);
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  getCoreRequestAtomMetadata(input: {
+    requestId: string;
+  }): ResultType<CoreRequestAtomMetadata | null, TranscriptStoreReadError> {
     const transcript = this.getRequestTranscript(input);
-    if (!transcript?.providerState) return null;
-    return {
-      requestId: transcript.requestId,
+    if (transcript.status === "error") return Result.err(transcript.error);
+    if (!transcript.value?.providerState) return Result.ok(null);
+    return Result.ok({
+      requestId: transcript.value.requestId,
       transcriptDigest:
-        transcript.transcriptDigest ?? hashCanonicalMessagesV1(transcript.messages).hash,
-      providerFamily: transcript.providerState.lastFamily,
-      containsCrossFamilyTurns: transcript.providerState.containsCrossFamilyTurns,
-    };
+        transcript.value.transcriptDigest ??
+        hashCanonicalMessagesV1(transcript.value.messages).hash,
+      providerFamily: transcript.value.providerState.lastFamily,
+      containsCrossFamilyTurns: transcript.value.providerState.containsCrossFamilyTurns,
+    });
   }
 
   private saveCorePrimaryLineageManifestInTransaction(
-    requestId: string,
-    manifest: CoreLineageManifestV1,
-  ): CoreLineageManifestV1 {
-    const existing = this.db
-      .query("SELECT manifest_json FROM core_primary_lineage_manifests WHERE request_id = ?")
-      .get(requestId) as { manifest_json: string } | null;
-    if (existing) {
-      const stored = coreLineageManifestV1Schema.parse(
-        parseSerializedUnknown(existing.manifest_json, "Core primary lineage manifest"),
+    prepared: PreparedCorePrimaryLineageManifest,
+    operation: "save-request-transcript" | "save-core-primary-lineage-manifest",
+  ): ResultType<CoreLineageManifestV1, TranscriptTransactionConflict> {
+    const owner = this.db
+      .query<{ request_id: string }, [string, AdapterPlatform, string]>(
+        `SELECT request_id FROM request_transcripts
+         WHERE request_id = ? AND request_client = ? AND session_id = ?`,
+      )
+      .get(prepared.requestId, prepared.requestClient, prepared.sessionId);
+    if (!owner) {
+      return Result.err(
+        transactionConflict(
+          operation,
+          "transcript-not-found",
+          `Request transcript '${prepared.requestId}' was not found`,
+        ),
       );
-      if (!isDeepStrictEqual(stored, manifest)) {
-        throw new Error(`Core primary lineage manifest '${requestId}' is immutable`);
-      }
-      return stored;
     }
 
-    const owner = this.getRequestTranscript({ requestId });
-    if (!owner) throw new Error(`Request transcript '${requestId}' was not found`);
-    const invalidReason = this.validateCorePrimaryLineageReferences({
-      manifest,
-      requestClient: owner.requestClient,
-      sessionId: owner.sessionId,
-      surfaceId: `${owner.requestClient}:${owner.sessionId}`,
-    });
-    if (invalidReason) {
-      throw new Error(`Core primary lineage manifest '${requestId}' is invalid: ${invalidReason}`);
+    if (prepared.existingManifestJson !== null) {
+      const existing = this.db
+        .query<{ request_id: string }, [string, string]>(
+          `SELECT request_id FROM core_primary_lineage_manifests
+           WHERE request_id = ? AND lineage_version = 1 AND manifest_json = ?`,
+        )
+        .get(prepared.requestId, prepared.existingManifestJson);
+      if (!existing) {
+        return Result.err(
+          transactionConflict(
+            operation,
+            "lineage-immutable",
+            `Core primary lineage manifest '${prepared.requestId}' is immutable`,
+          ),
+        );
+      }
+      return Result.ok(prepared.manifest);
+    }
+
+    const racedManifest = this.db
+      .query<{ lineage_version: number; manifest_json: string }, [string]>(
+        `SELECT lineage_version, manifest_json FROM core_primary_lineage_manifests
+         WHERE request_id = ?`,
+      )
+      .get(prepared.requestId);
+    if (racedManifest) {
+      if (
+        racedManifest.lineage_version === 1 &&
+        racedManifest.manifest_json === prepared.manifestJson
+      ) {
+        return Result.ok(prepared.manifest);
+      }
+      return Result.err(
+        transactionConflict(
+          operation,
+          "lineage-immutable",
+          `Core primary lineage manifest '${prepared.requestId}' is immutable`,
+        ),
+      );
     }
     this.db.run(
       `INSERT INTO core_primary_lineage_manifests (
          request_id, lineage_version, manifest_json, created_ts
        ) VALUES (?, 1, ?, ?)`,
-      [requestId, JSON.stringify(manifest), Date.now()],
+      [prepared.requestId, prepared.manifestJson, prepared.createdAt],
     );
-    for (const [segmentIndex, segment] of manifest.segments.entries()) {
+    for (const [segmentIndex, segment] of prepared.manifest.segments.entries()) {
       for (const [atomIndex, atom] of segment.atoms.entries()) {
         if (atom.kind === "surface") {
           this.db.run(
@@ -1727,7 +2379,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
                session_id, message_id, projection_format_version
              ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
             [
-              requestId,
+              prepared.requestId,
               segmentIndex,
               atomIndex,
               atom.requestClient,
@@ -1742,7 +2394,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
                request_id, segment_index, atom_index, reference_kind,
                referenced_request_id, transcript_digest
              ) VALUES (?, ?, ?, ?, ?, ?)`,
-            [requestId, segmentIndex, atomIndex, atom.kind, atom.requestId, atom.transcriptDigest],
+            [
+              prepared.requestId,
+              segmentIndex,
+              atomIndex,
+              atom.kind,
+              atom.requestId,
+              atom.transcriptDigest,
+            ],
           );
         }
       }
@@ -1755,7 +2414,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
                request_client, surface_id, session_id, message_id, projection_format_version
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
             [
-              requestId,
+              prepared.requestId,
               segmentIndex,
               aliasIndex,
               requestAtom.requestId,
@@ -1768,7 +2427,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         }
       }
     }
-    return manifest;
+    return Result.ok(prepared.manifest);
   }
 
   validateCorePrimaryLineageReferences(input: {
@@ -1776,7 +2435,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     requestClient: AdapterPlatform;
     sessionId: string;
     surfaceId: string;
-  }): string | null {
+  }): ResultType<string | null, TranscriptStoreReadError | CoreOwnedBlobIntegrityError> {
     const manifest = this.parseCompleteCorePrimaryLineage(input.manifest);
     for (const segment of manifest.segments) {
       for (const atom of segment.atoms) {
@@ -1786,7 +2445,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
             atom.sessionId !== input.sessionId ||
             atom.surfaceId !== input.surfaceId
           ) {
-            return "stale-surface-lineage";
+            return Result.ok("stale-surface-lineage");
           }
           const projection = this.getCoreSurfaceProjection({
             requestClient: adapterPlatformSchema.parse(atom.requestClient),
@@ -1795,41 +2454,43 @@ export class SqliteTranscriptStore implements TranscriptStore {
             messageId: atom.messageId,
             projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
           });
-          if (!projection) return "stale-surface-lineage";
+          if (projection.status === "error") return Result.err(projection.error);
+          if (!projection.value) return Result.ok("stale-surface-lineage");
           continue;
         }
         if (atom.kind === "synthetic") {
           if (hashCanonicalMessagesV1(segment.canonicalMessages).hash !== atom.messageDigest) {
-            return "stale-synthetic-lineage";
+            return Result.ok("stale-synthetic-lineage");
           }
           continue;
         }
 
         const transcript = this.getRequestTranscript({ requestId: atom.requestId });
-        const transcriptDigest = transcript
-          ? (transcript.transcriptDigest ?? hashCanonicalMessagesV1(transcript.messages).hash)
+        if (transcript.status === "error") return Result.err(transcript.error);
+        const transcriptDigest = transcript.value
+          ? (transcript.value.transcriptDigest ??
+            hashCanonicalMessagesV1(transcript.value.messages).hash)
           : null;
         if (
-          !transcript ||
-          transcript.requestClient !== input.requestClient ||
-          transcript.sessionId !== input.sessionId ||
+          !transcript.value ||
+          transcript.value.requestClient !== input.requestClient ||
+          transcript.value.sessionId !== input.sessionId ||
           transcriptDigest !== atom.transcriptDigest
         ) {
-          return "stale-request-lineage";
+          return Result.ok("stale-request-lineage");
         }
-        if (!isDeepStrictEqual(transcript.messages, segment.canonicalMessages)) {
-          return "transformed-request-lineage";
+        if (!isDeepStrictEqual(transcript.value.messages, segment.canonicalMessages)) {
+          return Result.ok("transformed-request-lineage");
         }
         if (atom.kind === "request") {
-          const providerFamily = historyProviderFamilySchema.safeParse(
-            transcript.providerState?.lastFamily,
-          );
+          const providerFamily = transcript.value.providerState?.lastFamily;
           if (
-            !providerFamily.success ||
-            providerFamily.data !== atom.providerFamily ||
-            transcript.providerState?.containsCrossFamilyTurns !== atom.containsCrossFamilyTurns
+            providerFamily === undefined ||
+            providerFamily !== atom.providerFamily ||
+            transcript.value.providerState?.containsCrossFamilyTurns !==
+              atom.containsCrossFamilyTurns
           ) {
-            return "stale-request-provider-lineage";
+            return Result.ok("stale-request-provider-lineage");
           }
           for (const alias of segment.requestSource?.aliases ?? []) {
             if (
@@ -1837,14 +2498,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
               alias.sessionId !== input.sessionId ||
               alias.surfaceId !== input.surfaceId
             ) {
-              return "stale-request-alias-lineage";
+              return Result.ok("stale-request-alias-lineage");
             }
             const projection = this.getCoreSurfaceProjection({
               ...alias,
               requestClient: adapterPlatformSchema.parse(alias.requestClient),
               projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
             });
-            if (!projection) return "stale-request-alias-lineage";
+            if (projection.status === "error") return Result.err(projection.error);
+            if (!projection.value) return Result.ok("stale-request-alias-lineage");
             const mapping = this.db
               .query(
                 `SELECT request_id FROM surface_message_to_request
@@ -1854,12 +2516,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
               request_id: string;
             } | null;
             if (mapping?.request_id !== atom.requestId) {
-              return "stale-request-alias-lineage";
+              return Result.ok("stale-request-alias-lineage");
             }
           }
         } else {
-          if (transcript.contextMeta?.type !== "compaction") {
-            return "stale-checkpoint-lineage";
+          if (transcript.value.contextMeta?.type !== "compaction") {
+            return Result.ok("stale-checkpoint-lineage");
           }
           const linkedOutput = this.db
             .query(
@@ -1868,7 +2530,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
                LIMIT 1`,
             )
             .get(atom.requestId, input.requestClient, input.sessionId);
-          if (!linkedOutput) return "stale-checkpoint-lineage";
+          if (!linkedOutput) return Result.ok("stale-checkpoint-lineage");
         }
       }
       const surfaceAtoms = segment.atoms.filter((atom) => atom.kind === "surface");
@@ -1883,17 +2545,21 @@ export class SqliteTranscriptStore implements TranscriptStore {
             messageId: atom.messageId,
             projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
           });
+          if (projection.status === "error") return Result.err(projection.error);
           if (
-            !projection ||
-            !isDeepStrictEqual(projection.sourceFacts["segmentMessageIds"], surfaceMessageIds) ||
-            projection.sourceFacts["segmentDigest"] !== segmentDigest
+            !projection.value ||
+            !isDeepStrictEqual(
+              projection.value.sourceFacts["segmentMessageIds"],
+              surfaceMessageIds,
+            ) ||
+            projection.value.sourceFacts["segmentDigest"] !== segmentDigest
           ) {
-            return "transformed-surface-lineage";
+            return Result.ok("transformed-surface-lineage");
           }
         }
       }
     }
-    return null;
+    return Result.ok(null);
   }
 
   private parseCompleteCorePrimaryLineage(value: unknown): CoreLineageManifestV1 {
@@ -1906,71 +2572,116 @@ export class SqliteTranscriptStore implements TranscriptStore {
     return lineage;
   }
 
-  private getCoreOwnedBlobOrNull(sha256: string): CoreOwnedBlob | null {
+  private readCoreOwnedBlob(
+    sha256: string,
+  ): ResultType<CoreOwnedBlob | null, CoreOwnedBlobIntegrityError> {
     const row = this.db
-      .query("SELECT * FROM core_owned_blobs WHERE sha256 = ?")
-      .get(sha256) as CoreOwnedBlobRow | null;
-    return row ? validateCoreOwnedBlobRow(row) : null;
+      .query<CoreOwnedBlobRow, [string]>("SELECT * FROM core_owned_blobs WHERE sha256 = ?")
+      .get(sha256);
+    if (!row) return Result.ok(null);
+    return decodeCoreOwnedBlobRow(row);
   }
 
   unlinkSurfaceMessage(input: {
     platform: AdapterPlatform;
     channelId: string;
     messageId: string;
-  }): UnlinkSurfaceMessageResult {
-    const unlink = this.db.transaction((): UnlinkSurfaceMessageResult => {
-      const mapping = this.db
-        .query(
-          "SELECT request_id FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
-        )
-        .get(input.platform, input.channelId, input.messageId) as { request_id: string } | null;
-      if (!mapping) return { checkpointDeleted: false };
+  }): ResultType<UnlinkSurfaceMessageResult, TranscriptStoreReadError> {
+    const unlink = runBunSqliteTransaction<
+      UnlinkSurfaceMessageResult,
+      TranscriptTransactionPersistenceFailure,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () => {
+        const mapping = this.db
+          .query<{ request_id: string }, [AdapterPlatform, string, string]>(
+            "SELECT request_id FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
+          )
+          .get(input.platform, input.channelId, input.messageId);
+        if (!mapping) return Result.ok({ checkpointDeleted: false });
 
-      this.db.run(
-        "DELETE FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
-        [input.platform, input.channelId, input.messageId],
-      );
+        this.db.run(
+          "DELETE FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
+          [input.platform, input.channelId, input.messageId],
+        );
 
-      const remaining = this.db
-        .query("SELECT 1 FROM surface_message_to_request WHERE request_id = ? LIMIT 1")
-        .get(mapping.request_id);
-      if (remaining) return { requestId: mapping.request_id, checkpointDeleted: false };
+        const remaining = this.db
+          .query("SELECT 1 FROM surface_message_to_request WHERE request_id = ? LIMIT 1")
+          .get(mapping.request_id);
+        if (remaining)
+          return Result.ok({ requestId: mapping.request_id, checkpointDeleted: false });
 
-      const transcript = this.db
-        .query("SELECT context_meta_json FROM request_transcripts WHERE request_id = ?")
-        .get(mapping.request_id) as { context_meta_json: string | null } | null;
-      if (!isCompactionContextMetaJson(transcript?.context_meta_json)) {
-        return { requestId: mapping.request_id, checkpointDeleted: false };
-      }
-      if (this.isRequestTranscriptRetainedByLineage(mapping.request_id)) {
-        return { requestId: mapping.request_id, checkpointDeleted: false };
-      }
+        const transcript = this.db
+          .query<{ context_meta_json: string | null }, [string]>(
+            "SELECT context_meta_json FROM request_transcripts WHERE request_id = ?",
+          )
+          .get(mapping.request_id);
+        if (!transcript) {
+          return Result.ok({ requestId: mapping.request_id, checkpointDeleted: false });
+        }
+        const contextMeta = decodeTranscriptCompactionContext({
+          raw: transcript.context_meta_json,
+          schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+          recordId: mapping.request_id,
+        });
+        if (contextMeta.status === "error") {
+          return Result.err(deferTranscriptPersistenceFailure(contextMeta.error));
+        }
+        if (!contextMeta.value.value) {
+          return Result.ok({ requestId: mapping.request_id, checkpointDeleted: false });
+        }
+        if (this.isRequestTranscriptRetainedByLineage(mapping.request_id)) {
+          return Result.ok({ requestId: mapping.request_id, checkpointDeleted: false });
+        }
 
-      this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [mapping.request_id]);
-      return { requestId: mapping.request_id, checkpointDeleted: true };
-    });
-
-    return unlink();
+        this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [mapping.request_id]);
+        return Result.ok({ requestId: mapping.request_id, checkpointDeleted: true });
+      },
+      (cause) => classifyTranscriptSqliteDriverFailure("unlink-surface-message", cause),
+    );
+    return this.finalizeTransactionPersistenceDiagnostics(unlink);
   }
 
-  deleteUnlinkedCheckpointCandidate(input: { requestId: string }): boolean {
-    const remove = this.db.transaction(() => {
-      const linked = this.db
-        .query("SELECT 1 FROM surface_message_to_request WHERE request_id = ? LIMIT 1")
-        .get(input.requestId);
-      if (linked) return false;
+  deleteUnlinkedCheckpointCandidate(input: {
+    requestId: string;
+  }): ResultType<boolean, TranscriptStoreReadError> {
+    const deletion = runBunSqliteTransaction<
+      boolean,
+      TranscriptTransactionPersistenceFailure,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () => {
+        const linked = this.db
+          .query("SELECT 1 FROM surface_message_to_request WHERE request_id = ? LIMIT 1")
+          .get(input.requestId);
+        if (linked) return Result.ok(false);
 
-      const transcript = this.db
-        .query("SELECT context_meta_json FROM request_transcripts WHERE request_id = ?")
-        .get(input.requestId) as { context_meta_json: string | null } | null;
-      if (!isCompactionContextMetaJson(transcript?.context_meta_json)) return false;
-      if (this.isRequestTranscriptRetainedByLineage(input.requestId)) return false;
+        const transcript = this.db
+          .query<{ context_meta_json: string | null }, [string]>(
+            "SELECT context_meta_json FROM request_transcripts WHERE request_id = ?",
+          )
+          .get(input.requestId);
+        if (!transcript) return Result.ok(false);
+        const contextMeta = decodeTranscriptCompactionContext({
+          raw: transcript.context_meta_json,
+          schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+          recordId: input.requestId,
+        });
+        if (contextMeta.status === "error") {
+          return Result.err(deferTranscriptPersistenceFailure(contextMeta.error));
+        }
+        if (!contextMeta.value.value) return Result.ok(false);
+        if (this.isRequestTranscriptRetainedByLineage(input.requestId)) return Result.ok(false);
 
-      this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [input.requestId]);
-      return true;
-    });
-
-    return remove();
+        this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [input.requestId]);
+        return Result.ok(true);
+      },
+      (cause) =>
+        classifyTranscriptSqliteDriverFailure("delete-unlinked-checkpoint-candidate", cause),
+    );
+    return this.finalizeTransactionPersistenceDiagnostics(deletion);
   }
 
   linkSurfaceMessagesToRequest(input: {
@@ -2009,36 +2720,39 @@ export class SqliteTranscriptStore implements TranscriptStore {
     platform: AdapterPlatform;
     channelId: string;
     messageId: string;
-  }): TranscriptSnapshot | null {
-    const mapRow = this.db
-      .query(
-        "SELECT request_id FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
-      )
-      .get(input.platform, input.channelId, input.messageId) as {
-      request_id: string;
-    } | null;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError> {
+    const read = this.readFromSqlite("get-transcript-by-surface-message", () => {
+      const mapRow = this.db
+        .query<{ request_id: string }, [AdapterPlatform, string, string]>(
+          "SELECT request_id FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
+        )
+        .get(input.platform, input.channelId, input.messageId);
 
-    if (!mapRow) return null;
+      if (!mapRow) return null;
 
-    const row = this.db
-      .query(
-        `
+      return this.db
+        .query<TranscriptRow, [string]>(
+          `
         SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label, final_text,
                messages_json, context_meta_json, provider_state_json, stable_named_request_client,
                transcript_digest
         FROM request_transcripts
         WHERE request_id = ?
         `,
-      )
-      .get(mapRow.request_id) as TranscriptRow | null;
-
-    return this.rowToSnapshot(row);
+        )
+        .get(mapRow.request_id);
+    });
+    if (read.status === "error") return Result.err(read.error);
+    return this.rowToSnapshot(read.value);
   }
 
-  getLatestTranscriptBySession(input: { sessionId: string }): TranscriptSnapshot | null {
-    const row = this.db
-      .query(
-        `
+  getLatestTranscriptBySession(input: {
+    sessionId: string;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError> {
+    const read = this.readFromSqlite("get-latest-transcript-by-session", () =>
+      this.db
+        .query<TranscriptRow, [string]>(
+          `
         SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label, final_text,
                messages_json, context_meta_json, provider_state_json, stable_named_request_client,
                transcript_digest
@@ -2047,40 +2761,49 @@ export class SqliteTranscriptStore implements TranscriptStore {
         ORDER BY updated_ts DESC, created_ts DESC, rowid DESC
         LIMIT 1
         `,
-      )
-      .get(input.sessionId) as TranscriptRow | null;
-
-    return this.rowToSnapshot(row);
+        )
+        .get(input.sessionId),
+    );
+    if (read.status === "error") return Result.err(read.error);
+    return this.rowToSnapshot(read.value);
   }
 
-  getRequestTranscript(input: { requestId: string }): TranscriptSnapshot | null {
-    const row = this.db
-      .query(
-        `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
+  getRequestTranscript(input: {
+    requestId: string;
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError> {
+    const read = this.readFromSqlite("get-request-transcript", () =>
+      this.db
+        .query<TranscriptRow, [string]>(
+          `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
                 final_text, messages_json, context_meta_json, provider_state_json,
                  stable_named_request_client, transcript_digest
          FROM request_transcripts WHERE request_id = ?`,
-      )
-      .get(input.requestId) as TranscriptRow | null;
-    return this.rowToSnapshot(row);
+        )
+        .get(input.requestId),
+    );
+    if (read.status === "error") return Result.err(read.error);
+    return this.rowToSnapshot(read.value);
   }
 
   getLatestCompleteNamedTranscript(input: {
     requestClient: AdapterPlatform;
     sessionId: string;
-  }): TranscriptSnapshot | null {
+  }): ResultType<TranscriptSnapshot | null, TranscriptStoreReadError> {
     const ownerClient = adapterPlatformSchema.parse(input.requestClient);
-    const marked = this.db
-      .query(
-        `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
+    const read = this.readFromSqlite("get-latest-complete-named-transcript", () =>
+      this.db
+        .query<TranscriptRow, [string, AdapterPlatform]>(
+          `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
                 final_text, messages_json, context_meta_json, provider_state_json,
                  stable_named_request_client, transcript_digest
          FROM request_transcripts
          WHERE session_id = ? AND stable_named_request_client = ?
          ORDER BY updated_ts DESC, created_ts DESC, rowid DESC LIMIT 1`,
-      )
-      .get(input.sessionId, ownerClient) as TranscriptRow | null;
-    return this.rowToSnapshot(marked);
+        )
+        .get(input.sessionId, ownerClient),
+    );
+    if (read.status === "error") return Result.err(read.error);
+    return this.rowToSnapshot(read.value);
   }
 
   getCoreNamedClaudeSessionBinding(inputValue: {
@@ -2246,99 +2969,172 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   publishCoreNamedClaudeSuccess(
     inputValue: PublishCoreNamedClaudeSuccess,
-  ): CoreNamedClaudeSessionAttempt {
-    const input = publishCoreNamedClaudeSuccessSchema.parse(inputValue);
-    const publish = this.db.transaction(() => {
-      if (input.terminalRequestId !== input.requestId) {
-        throw new Error("Core named Claude terminal request does not match its attempt");
-      }
-      const attemptKey = {
-        providerId: input.providerId,
-        requestClient: input.requestClient,
-        lilacSessionId: input.lilacSessionId,
-        requestId: input.requestId,
-        attemptIndex: input.attemptIndex,
-      } as const;
-      const current = this.getCoreNamedClaudeSessionAttempt(attemptKey);
-      if (!current) throw new Error(`Core named Claude attempt '${input.requestId}' was not found`);
-      if (current.state === "succeeded") {
-        this.assertVerifiedCoreNamedTerminal({
+  ): ResultType<CoreNamedClaudeSessionAttempt, TranscriptStoreReadError> {
+    const input = inputValue;
+    const now = Date.now();
+    const providerStateJson = JSON.stringify(input.providerState);
+    const transcriptRead = this.finalizeTransactionPersistenceDiagnostics(
+      this.readRequestTranscriptForTransactionPreparation(input.terminalRequestId),
+    );
+    if (transcriptRead.status === "error") return Result.err(transcriptRead.error);
+    const transcript = transcriptRead.value;
+    const transcriptHash = transcript ? hashCanonicalMessagesV1(transcript.messages).hash : null;
+    const transcriptDigest = transcript?.transcriptDigest ?? transcriptHash;
+    const isVerifiedRecoveryTranscript =
+      transcript !== null &&
+      transcript.sessionId === input.lilacSessionId &&
+      transcript.stableNamedRequestClient === undefined &&
+      transcript.providerState == null &&
+      transcript.messages.length === input.terminalCanonicalMessageCount &&
+      transcriptHash === input.terminalCanonicalHeadHash;
+    const isVerifiedSucceededTranscript =
+      transcript !== null &&
+      transcript.sessionId === input.lilacSessionId &&
+      transcript.stableNamedRequestClient === input.requestClient &&
+      transcript.providerState?.lastFamily === "claude-code" &&
+      transcript.messages.length === input.terminalCanonicalMessageCount &&
+      transcriptHash === input.terminalCanonicalHeadHash;
+    const publication = runBunSqliteTransaction<
+      ClaudePublicationOutcome<CoreNamedClaudeSessionAttempt>,
+      TranscriptTransactionConflict,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () => {
+        if (input.terminalRequestId !== input.requestId) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "terminal-request-mismatch",
+              "Core named Claude terminal request does not match its attempt",
+            ),
+          );
+        }
+        const attemptKey = {
+          providerId: input.providerId,
           requestClient: input.requestClient,
           lilacSessionId: input.lilacSessionId,
-          terminalRequestId: input.terminalRequestId,
-          canonicalHeadHash: input.terminalCanonicalHeadHash,
-          canonicalMessageCount: input.terminalCanonicalMessageCount,
-        });
-        return current;
-      }
-      if (current.state !== "active") {
-        throw new Error(`Core named Claude attempt is already terminal as '${current.state}'`);
-      }
-      const transcript = this.getRequestTranscript({ requestId: input.terminalRequestId });
-      if (
-        !transcript ||
-        transcript.sessionId !== input.lilacSessionId ||
-        transcript.stableNamedRequestClient !== undefined ||
-        transcript.providerState != null ||
-        transcript.messages.length !== input.terminalCanonicalMessageCount ||
-        hashCanonicalMessagesV1(transcript.messages).hash !== input.terminalCanonicalHeadHash
-      ) {
-        throw new Error("Core named Claude recovery transcript failed publication verification");
-      }
+          requestId: input.requestId,
+          attemptIndex: input.attemptIndex,
+        } as const;
+        const current = this.getCoreNamedClaudeSessionAttempt(attemptKey);
+        if (!current) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "attempt-not-found",
+              `Core named Claude attempt '${input.requestId}' was not found`,
+            ),
+          );
+        }
+        if (current.state === "succeeded") {
+          if (!isVerifiedSucceededTranscript) {
+            return Result.err(
+              transactionConflict(
+                "publish-core-named-claude-success",
+                "publication-verification-failed",
+                "Core named Claude terminal transcript failed canonical verification",
+              ),
+            );
+          }
+          return Result.ok({ attempt: current, events: [] });
+        }
+        if (current.state !== "active") {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "attempt-terminal",
+              `Core named Claude attempt is already terminal as '${current.state}'`,
+            ),
+          );
+        }
+        if (!isVerifiedRecoveryTranscript || !transcript) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "publication-verification-failed",
+              "Core named Claude recovery transcript failed publication verification",
+            ),
+          );
+        }
 
-      const now = Date.now();
-      const published = this.db.run(
-        `UPDATE request_transcripts
+        const published = this.db.run(
+          `UPDATE request_transcripts
          SET provider_state_json = ?, stable_named_request_client = ?, updated_ts = ?
          WHERE request_id = ? AND provider_state_json IS NULL
-           AND stable_named_request_client IS NULL`,
-        [JSON.stringify(input.providerState), input.requestClient, now, input.terminalRequestId],
-      );
-      if (published.changes !== 1) {
-        throw new Error("Core named Claude transcript publication lost its unmarked fence");
-      }
-      const succeeded = this.db.run(
-        `UPDATE core_named_claude_attempts SET
+           AND stable_named_request_client IS NULL AND session_id = ? AND transcript_digest = ?`,
+          [
+            providerStateJson,
+            input.requestClient,
+            now,
+            input.terminalRequestId,
+            input.lilacSessionId,
+            transcriptDigest,
+          ],
+        );
+        if (published.changes !== 1) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "publication-fence-lost",
+              "Core named Claude transcript publication lost its unmarked fence",
+            ),
+          );
+        }
+        const succeeded = this.db.run(
+          `UPDATE core_named_claude_attempts SET
            state = 'succeeded', terminal_request_id = ?, terminal_canonical_head_hash = ?,
            terminal_canonical_message_count = ?, native_cwd = ?, native_last_modified = ?,
            native_context_tokens = ?, native_context_max_tokens = ?, last_model_specifier = ?,
            last_reasoning = ?, updated_ts = ?
          WHERE request_client = ? AND session_id = ? AND provider_id = ?
            AND request_id = ? AND attempt_index = ? AND state = 'active'`,
-        [
-          input.terminalRequestId,
-          input.terminalCanonicalHeadHash,
-          input.terminalCanonicalMessageCount,
-          input.nativeCwd,
-          input.nativeLastModified,
-          input.nativeContextTokens,
-          input.nativeContextMaxTokens,
-          input.lastModelSpecifier,
-          input.lastReasoning,
-          now,
-          input.requestClient,
-          input.lilacSessionId,
-          input.providerId,
-          input.requestId,
-          input.attemptIndex,
-        ],
-      );
-      if (succeeded.changes !== 1) {
-        throw new Error("Core named Claude success publication lost its active attempt fence");
-      }
-      this.assertVerifiedCoreNamedTerminal({
-        requestClient: input.requestClient,
-        lilacSessionId: input.lilacSessionId,
-        terminalRequestId: input.terminalRequestId,
-        canonicalHeadHash: input.terminalCanonicalHeadHash,
-        canonicalMessageCount: input.terminalCanonicalMessageCount,
-      });
-      this.pruneCoreNamedClaudeAttempts(input);
-      const attempt = this.getCoreNamedClaudeSessionAttempt(attemptKey);
-      if (!attempt) throw new Error("Published Core named Claude attempt was not retained");
-      return attempt;
-    });
-    return publish.immediate();
+          [
+            input.terminalRequestId,
+            input.terminalCanonicalHeadHash,
+            input.terminalCanonicalMessageCount,
+            input.nativeCwd,
+            input.nativeLastModified,
+            input.nativeContextTokens,
+            input.nativeContextMaxTokens,
+            input.lastModelSpecifier,
+            input.lastReasoning,
+            now,
+            input.requestClient,
+            input.lilacSessionId,
+            input.providerId,
+            input.requestId,
+            input.attemptIndex,
+          ],
+        );
+        if (succeeded.changes !== 1) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "publication-fence-lost",
+              "Core named Claude success publication lost its active attempt fence",
+            ),
+          );
+        }
+        const pruneEvent = this.pruneCoreNamedClaudeAttemptsInTransaction(input);
+        const attempt = this.getCoreNamedClaudeSessionAttempt(attemptKey);
+        if (!attempt) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-named-claude-success",
+              "attempt-not-retained",
+              "Published Core named Claude attempt was not retained",
+            ),
+          );
+        }
+        return Result.ok({ attempt, events: pruneEvent ? [pruneEvent] : [] });
+      },
+      (cause) => classifyTranscriptSqliteDriverFailure("publish-core-named-claude-success", cause),
+    );
+    const finalized = adaptTranscriptTransactionResultToStoreHost(publication);
+    if (finalized.status === "error") return Result.err(finalized.error);
+    this.emitDeferredTranscriptEvents(finalized.value.events);
+    return Result.ok(finalized.value.attempt);
   }
 
   promoteCoreNamedClaudeSessionBinding(inputValue: {
@@ -2645,73 +3441,162 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
   publishCorePrimaryClaudeSuccess(
     inputValue: PublishCorePrimaryClaudeSuccess,
-  ): CorePrimaryClaudeSessionAttempt {
-    const input = publishCorePrimaryClaudeSuccessSchema.parse(inputValue);
-    const publish = this.db.transaction(() => {
-      if (input.terminalRequestId !== input.requestId) {
-        throw new Error("Core primary Claude terminal request does not match its attempt");
-      }
-      const attemptKey = {
-        providerId: input.providerId,
-        requestClient: input.requestClient,
-        lilacSessionId: input.lilacSessionId,
-        requestId: input.requestId,
-        attemptIndex: input.attemptIndex,
-      } as const;
-      const current = this.getCorePrimaryClaudeSessionAttempt(attemptKey);
-      if (!current)
-        throw new Error(`Core primary Claude attempt '${input.requestId}' was not found`);
-      if (current.state === "succeeded") {
-        this.assertVerifiedCorePrimaryTerminal(input);
-        return current;
-      }
-      if (current.state !== "active") {
-        throw new Error(`Core primary Claude attempt is already terminal as '${current.state}'`);
-      }
-      const transcript = this.getRequestTranscript({ requestId: input.terminalRequestId });
-      if (
-        !transcript ||
-        transcript.requestClient !== input.requestClient ||
-        transcript.sessionId !== input.lilacSessionId ||
-        transcript.providerState != null ||
-        transcript.stableNamedRequestClient !== undefined ||
-        transcript.contextMeta !== undefined ||
-        transcript.messages.length === 0
-      ) {
-        throw new Error("Core primary Claude recovery transcript failed publication verification");
-      }
-      const manifest = this.getCorePrimaryLineageManifest({ requestId: input.terminalRequestId });
-      if (!manifest) {
-        throw new Error("Core primary Claude recovery manifest failed publication verification");
-      }
-      const terminalHead = computeCorePrimaryClaudeTerminalHead({
-        manifest,
-        requestId: transcript.requestId,
-        transcriptDigest:
-          transcript.transcriptDigest ?? hashCanonicalMessagesV1(transcript.messages).hash,
-        responseMessageCount: transcript.messages.length,
-        providerState: input.providerState,
-      });
-      if (
-        terminalHead.lineageVersion !== input.terminalLineageVersion ||
-        terminalHead.atomCount !== input.terminalAtomCount ||
-        terminalHead.prefixDigest !== input.terminalPrefixDigest ||
-        terminalHead.canonicalMessageCount !== input.terminalCanonicalMessageCount
-      ) {
-        throw new Error("Core primary Claude terminal lineage failed publication verification");
-      }
-      const now = Date.now();
-      const published = this.db.run(
-        `UPDATE request_transcripts SET provider_state_json = ?, updated_ts = ?
+  ): ResultType<CorePrimaryClaudeSessionAttempt, TranscriptStoreReadError> {
+    const input = inputValue;
+    const now = Date.now();
+    const providerStateJson = JSON.stringify(input.providerState);
+    const transcriptRead = this.finalizeTransactionPersistenceDiagnostics(
+      this.readRequestTranscriptForTransactionPreparation(input.terminalRequestId),
+    );
+    if (transcriptRead.status === "error") return Result.err(transcriptRead.error);
+    const lineageRead = this.finalizeTransactionPersistenceDiagnostics(
+      this.readCorePrimaryLineageForTransactionPreparation(input.terminalRequestId),
+    );
+    if (lineageRead.status === "error") return Result.err(lineageRead.error);
+    const transcript = transcriptRead.value;
+    const lineage = lineageRead.value;
+    const transcriptDigest = transcript
+      ? (transcript.transcriptDigest ?? hashCanonicalMessagesV1(transcript.messages).hash)
+      : null;
+    const recoveryHead =
+      transcript && lineage && transcriptDigest !== null && transcript.messages.length > 0
+        ? computeCorePrimaryClaudeTerminalHead({
+            manifest: lineage.manifest,
+            requestId: transcript.requestId,
+            transcriptDigest,
+            responseMessageCount: transcript.messages.length,
+            providerState: input.providerState,
+          })
+        : null;
+    const succeededHead =
+      transcript?.providerState &&
+      lineage &&
+      transcriptDigest !== null &&
+      transcript.messages.length > 0
+        ? computeCorePrimaryClaudeTerminalHead({
+            manifest: lineage.manifest,
+            requestId: transcript.requestId,
+            transcriptDigest,
+            responseMessageCount: transcript.messages.length,
+            providerState: transcript.providerState,
+          })
+        : null;
+    const headMatchesInput = (head: CorePrimaryClaudeBindingHead | null) =>
+      head !== null &&
+      head.lineageVersion === input.terminalLineageVersion &&
+      head.atomCount === input.terminalAtomCount &&
+      head.prefixDigest === input.terminalPrefixDigest &&
+      head.canonicalMessageCount === input.terminalCanonicalMessageCount;
+    const isVerifiedRecoveryTerminal =
+      transcript !== null &&
+      lineage !== null &&
+      transcript.requestClient === input.requestClient &&
+      transcript.sessionId === input.lilacSessionId &&
+      transcript.providerState == null &&
+      transcript.stableNamedRequestClient === undefined &&
+      transcript.contextMeta === undefined &&
+      headMatchesInput(recoveryHead);
+    const isVerifiedSucceededTerminal =
+      transcript !== null &&
+      lineage !== null &&
+      transcript.requestClient === input.requestClient &&
+      transcript.sessionId === input.lilacSessionId &&
+      transcript.providerState?.lastFamily === "claude-code" &&
+      transcript.contextMeta === undefined &&
+      headMatchesInput(succeededHead);
+    const publication = runBunSqliteTransaction<
+      ClaudePublicationOutcome<CorePrimaryClaudeSessionAttempt>,
+      TranscriptTransactionConflict,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () => {
+        if (input.terminalRequestId !== input.requestId) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "terminal-request-mismatch",
+              "Core primary Claude terminal request does not match its attempt",
+            ),
+          );
+        }
+        const attemptKey = {
+          providerId: input.providerId,
+          requestClient: input.requestClient,
+          lilacSessionId: input.lilacSessionId,
+          requestId: input.requestId,
+          attemptIndex: input.attemptIndex,
+        } as const;
+        const current = this.getCorePrimaryClaudeSessionAttempt(attemptKey);
+        if (!current) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "attempt-not-found",
+              `Core primary Claude attempt '${input.requestId}' was not found`,
+            ),
+          );
+        }
+        if (current.state === "succeeded") {
+          if (!isVerifiedSucceededTerminal) {
+            return Result.err(
+              transactionConflict(
+                "publish-core-primary-claude-success",
+                "publication-verification-failed",
+                "Core primary Claude terminal transcript failed canonical verification",
+              ),
+            );
+          }
+          return Result.ok({ attempt: current, events: [] });
+        }
+        if (current.state !== "active") {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "attempt-terminal",
+              `Core primary Claude attempt is already terminal as '${current.state}'`,
+            ),
+          );
+        }
+        if (!isVerifiedRecoveryTerminal || !transcript || !lineage || transcriptDigest === null) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "publication-verification-failed",
+              "Core primary Claude recovery transcript failed publication verification",
+            ),
+          );
+        }
+        const published = this.db.run(
+          `UPDATE request_transcripts SET provider_state_json = ?, updated_ts = ?
          WHERE request_id = ? AND provider_state_json IS NULL
-           AND stable_named_request_client IS NULL`,
-        [JSON.stringify(input.providerState), now, input.terminalRequestId],
-      );
-      if (published.changes !== 1) {
-        throw new Error("Core primary Claude transcript publication lost its unmarked fence");
-      }
-      const succeeded = this.db.run(
-        `UPDATE core_primary_claude_attempts SET
+           AND stable_named_request_client IS NULL AND request_client = ? AND session_id = ?
+           AND transcript_digest = ? AND EXISTS (
+             SELECT 1 FROM core_primary_lineage_manifests
+             WHERE request_id = ? AND lineage_version = 1 AND manifest_json = ?
+           )`,
+          [
+            providerStateJson,
+            now,
+            input.terminalRequestId,
+            input.requestClient,
+            input.lilacSessionId,
+            transcriptDigest,
+            input.terminalRequestId,
+            lineage.manifestJson,
+          ],
+        );
+        if (published.changes !== 1) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "publication-fence-lost",
+              "Core primary Claude transcript publication lost its unmarked fence",
+            ),
+          );
+        }
+        const succeeded = this.db.run(
+          `UPDATE core_primary_claude_attempts SET
            state = 'succeeded', terminal_request_id = ?, terminal_lineage_version = 1,
            terminal_atom_count = ?, terminal_prefix_digest = ?,
            terminal_canonical_message_count = ?, native_cwd = ?, native_last_modified = ?,
@@ -2719,35 +3604,54 @@ export class SqliteTranscriptStore implements TranscriptStore {
            last_reasoning = ?, updated_ts = ?
          WHERE request_client = ? AND session_id = ? AND provider_id = ?
            AND request_id = ? AND attempt_index = ? AND state = 'active'`,
-        [
-          input.terminalRequestId,
-          input.terminalAtomCount,
-          input.terminalPrefixDigest,
-          input.terminalCanonicalMessageCount,
-          input.nativeCwd,
-          input.nativeLastModified,
-          input.nativeContextTokens,
-          input.nativeContextMaxTokens,
-          input.lastModelSpecifier,
-          input.lastReasoning,
-          now,
-          input.requestClient,
-          input.lilacSessionId,
-          input.providerId,
-          input.requestId,
-          input.attemptIndex,
-        ],
-      );
-      if (succeeded.changes !== 1) {
-        throw new Error("Core primary Claude success publication lost its active attempt fence");
-      }
-      this.assertVerifiedCorePrimaryTerminal(input);
-      this.pruneCorePrimaryClaudeAttempts(input);
-      const attempt = this.getCorePrimaryClaudeSessionAttempt(attemptKey);
-      if (!attempt) throw new Error("Published Core primary Claude attempt was not retained");
-      return attempt;
-    });
-    return publish.immediate();
+          [
+            input.terminalRequestId,
+            input.terminalAtomCount,
+            input.terminalPrefixDigest,
+            input.terminalCanonicalMessageCount,
+            input.nativeCwd,
+            input.nativeLastModified,
+            input.nativeContextTokens,
+            input.nativeContextMaxTokens,
+            input.lastModelSpecifier,
+            input.lastReasoning,
+            now,
+            input.requestClient,
+            input.lilacSessionId,
+            input.providerId,
+            input.requestId,
+            input.attemptIndex,
+          ],
+        );
+        if (succeeded.changes !== 1) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "publication-fence-lost",
+              "Core primary Claude success publication lost its active attempt fence",
+            ),
+          );
+        }
+        const pruneEvent = this.pruneCorePrimaryClaudeAttemptsInTransaction(input);
+        const attempt = this.getCorePrimaryClaudeSessionAttempt(attemptKey);
+        if (!attempt) {
+          return Result.err(
+            transactionConflict(
+              "publish-core-primary-claude-success",
+              "attempt-not-retained",
+              "Published Core primary Claude attempt was not retained",
+            ),
+          );
+        }
+        return Result.ok({ attempt, events: pruneEvent ? [pruneEvent] : [] });
+      },
+      (cause) =>
+        classifyTranscriptSqliteDriverFailure("publish-core-primary-claude-success", cause),
+    );
+    const finalized = adaptTranscriptTransactionResultToStoreHost(publication);
+    if (finalized.status === "error") return Result.err(finalized.error);
+    this.emitDeferredTranscriptEvents(finalized.value.events);
+    return Result.ok(finalized.value.attempt);
   }
 
   promoteCorePrimaryClaudeSessionBinding(inputValue: {
@@ -2923,8 +3827,10 @@ export class SqliteTranscriptStore implements TranscriptStore {
     terminalRequestId: string;
     canonicalHeadHash: string;
     canonicalMessageCount: number;
-  }): TranscriptSnapshot {
-    const transcript = this.getRequestTranscript({ requestId: input.terminalRequestId });
+  }): ResultType<TranscriptSnapshot, TranscriptStoreReadError | TranscriptTransactionConflict> {
+    const read = this.getRequestTranscript({ requestId: input.terminalRequestId });
+    if (read.status === "error") return Result.err(read.error);
+    const transcript = read.value;
     if (
       !transcript ||
       transcript.sessionId !== input.lilacSessionId ||
@@ -2933,9 +3839,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
       transcript.messages.length !== input.canonicalMessageCount ||
       hashCanonicalMessagesV1(transcript.messages).hash !== input.canonicalHeadHash
     ) {
-      throw new Error("Core named Claude terminal transcript failed canonical verification");
+      return Result.err(
+        transactionConflict(
+          "publish-core-named-claude-success",
+          "publication-verification-failed",
+          "Core named Claude terminal transcript failed canonical verification",
+        ),
+      );
     }
-    return transcript;
+    return Result.ok(transcript);
   }
 
   private promoteCoreNamedClaudeAttempt(input: {
@@ -2961,15 +3873,14 @@ export class SqliteTranscriptStore implements TranscriptStore {
     ) {
       return false;
     }
-    try {
-      this.assertVerifiedCoreNamedTerminal({
-        requestClient: attempt.requestClient,
-        lilacSessionId: attempt.lilacSessionId,
-        terminalRequestId: attempt.terminalRequestId,
-        canonicalHeadHash: attempt.terminalCanonicalHeadHash,
-        canonicalMessageCount: attempt.terminalCanonicalMessageCount,
-      });
-    } catch {
+    const verified = this.assertVerifiedCoreNamedTerminal({
+      requestClient: attempt.requestClient,
+      lilacSessionId: attempt.lilacSessionId,
+      terminalRequestId: attempt.terminalRequestId,
+      canonicalHeadHash: attempt.terminalCanonicalHeadHash,
+      canonicalMessageCount: attempt.terminalCanonicalMessageCount,
+    });
+    if (verified.status === "error") {
       this.failSucceededCoreNamedAttempt(attempt);
       return false;
     }
@@ -3210,6 +4121,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
     lilacSessionId: string;
     providerId: string;
   }): void {
+    const event = this.pruneCoreNamedClaudeAttemptsInTransaction(input);
+    if (event) this.emitDeferredTranscriptEvents([event]);
+  }
+
+  private pruneCoreNamedClaudeAttemptsInTransaction(input: {
+    requestClient: AdapterPlatform;
+    lilacSessionId: string;
+    providerId: string;
+  }): DeferredTranscriptEvent | undefined {
     const pruned = this.db.run(
       `DELETE FROM core_named_claude_attempts
        WHERE rowid IN (
@@ -3226,14 +4146,19 @@ export class SqliteTranscriptStore implements TranscriptStore {
       ],
     ).changes;
     if (pruned > 0) {
-      logger.info("core_named_claude.orphan_metadata_pruned", {
-        requestClient: input.requestClient,
-        sessionId: input.lilacSessionId,
-        providerId: input.providerId,
-        attemptCount: pruned,
-        reason: "terminal-count-bound",
-      });
+      return {
+        kind: "log",
+        event: "core_named_claude.orphan_metadata_pruned",
+        detail: {
+          requestClient: input.requestClient,
+          sessionId: input.lilacSessionId,
+          providerId: input.providerId,
+          attemptCount: pruned,
+          reason: "terminal-count-bound",
+        },
+      };
     }
+    return undefined;
   }
 
   private assertVerifiedCorePrimaryTerminal(input: {
@@ -3244,9 +4169,13 @@ export class SqliteTranscriptStore implements TranscriptStore {
     terminalAtomCount: number;
     terminalPrefixDigest: string;
     terminalCanonicalMessageCount: number;
-  }): TranscriptSnapshot {
-    const transcript = this.getRequestTranscript({ requestId: input.terminalRequestId });
-    const manifest = this.getCorePrimaryLineageManifest({ requestId: input.terminalRequestId });
+  }): ResultType<TranscriptSnapshot, TranscriptStoreReadError | TranscriptTransactionConflict> {
+    const transcriptRead = this.getRequestTranscript({ requestId: input.terminalRequestId });
+    if (transcriptRead.status === "error") return Result.err(transcriptRead.error);
+    const manifestRead = this.getCorePrimaryLineageManifest({ requestId: input.terminalRequestId });
+    if (manifestRead.status === "error") return Result.err(manifestRead.error);
+    const transcript = transcriptRead.value;
+    const manifest = manifestRead.value;
     if (
       !transcript ||
       !manifest ||
@@ -3256,7 +4185,13 @@ export class SqliteTranscriptStore implements TranscriptStore {
       transcript.contextMeta !== undefined ||
       transcript.messages.length === 0
     ) {
-      throw new Error("Core primary Claude terminal transcript failed canonical verification");
+      return Result.err(
+        transactionConflict(
+          "publish-core-primary-claude-success",
+          "publication-verification-failed",
+          "Core primary Claude terminal transcript failed canonical verification",
+        ),
+      );
     }
     const head = computeCorePrimaryClaudeTerminalHead({
       manifest,
@@ -3272,9 +4207,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
       head.prefixDigest !== input.terminalPrefixDigest ||
       head.canonicalMessageCount !== input.terminalCanonicalMessageCount
     ) {
-      throw new Error("Core primary Claude terminal lineage failed canonical verification");
+      return Result.err(
+        transactionConflict(
+          "publish-core-primary-claude-success",
+          "publication-verification-failed",
+          "Core primary Claude terminal lineage failed canonical verification",
+        ),
+      );
     }
-    return transcript;
+    return Result.ok(transcript);
   }
 
   private findCorePrimaryTerminalRequestId(binding: CorePrimaryClaudeBindingRow): string | null {
@@ -3317,7 +4258,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
 
     for (const terminalRequestId of candidates) {
       try {
-        this.assertVerifiedCorePrimaryTerminal({
+        const verified = this.assertVerifiedCorePrimaryTerminal({
           requestClient: z.literal("discord").parse(binding.request_client),
           lilacSessionId: binding.session_id,
           terminalRequestId,
@@ -3328,7 +4269,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
             binding.canonical_message_count,
           ),
         });
-        return terminalRequestId;
+        if (verified.status === "ok") return terminalRequestId;
       } catch {
         // A v4 candidate is accepted only when its durable transcript and lineage recompute exactly.
       }
@@ -3342,7 +4283,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     if (row.terminal_request_id === null) return null;
     try {
       const binding = toCorePrimaryClaudeBinding(row);
-      this.assertVerifiedCorePrimaryTerminal({
+      const verified = this.assertVerifiedCorePrimaryTerminal({
         requestClient: binding.requestClient,
         lilacSessionId: binding.lilacSessionId,
         terminalRequestId: binding.terminalRequestId,
@@ -3351,7 +4292,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
         terminalPrefixDigest: binding.prefixDigest,
         terminalCanonicalMessageCount: binding.canonicalMessageCount,
       });
-      return binding;
+      return verified.status === "ok" ? binding : null;
     } catch {
       return null;
     }
@@ -3382,17 +4323,16 @@ export class SqliteTranscriptStore implements TranscriptStore {
     ) {
       return false;
     }
-    try {
-      this.assertVerifiedCorePrimaryTerminal({
-        requestClient: attempt.requestClient,
-        lilacSessionId: attempt.lilacSessionId,
-        terminalRequestId: attempt.terminalRequestId,
-        terminalLineageVersion: attempt.terminalLineageVersion,
-        terminalAtomCount: attempt.terminalAtomCount,
-        terminalPrefixDigest: attempt.terminalPrefixDigest,
-        terminalCanonicalMessageCount: attempt.terminalCanonicalMessageCount,
-      });
-    } catch {
+    const verified = this.assertVerifiedCorePrimaryTerminal({
+      requestClient: attempt.requestClient,
+      lilacSessionId: attempt.lilacSessionId,
+      terminalRequestId: attempt.terminalRequestId,
+      terminalLineageVersion: attempt.terminalLineageVersion,
+      terminalAtomCount: attempt.terminalAtomCount,
+      terminalPrefixDigest: attempt.terminalPrefixDigest,
+      terminalCanonicalMessageCount: attempt.terminalCanonicalMessageCount,
+    });
+    if (verified.status === "error") {
       this.failSucceededCorePrimaryAttempt(attempt);
       return false;
     }
@@ -3629,6 +4569,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
     lilacSessionId: string;
     providerId: string;
   }): void {
+    const event = this.pruneCorePrimaryClaudeAttemptsInTransaction(input);
+    if (event) this.emitDeferredTranscriptEvents([event]);
+  }
+
+  private pruneCorePrimaryClaudeAttemptsInTransaction(input: {
+    requestClient: "discord";
+    lilacSessionId: string;
+    providerId: string;
+  }): DeferredTranscriptEvent | undefined {
     const pruned = this.db.run(
       `DELETE FROM core_primary_claude_attempts
        WHERE rowid IN (
@@ -3645,64 +4594,43 @@ export class SqliteTranscriptStore implements TranscriptStore {
       ],
     ).changes;
     if (pruned > 0) {
-      logger.info("core_primary_claude.orphan_metadata_pruned", {
-        requestClient: input.requestClient,
-        sessionId: input.lilacSessionId,
-        providerId: input.providerId,
-        attemptCount: pruned,
-        reason: "terminal-count-bound",
-      });
+      return {
+        kind: "log",
+        event: "core_primary_claude.orphan_metadata_pruned",
+        detail: {
+          requestClient: input.requestClient,
+          sessionId: input.lilacSessionId,
+          providerId: input.providerId,
+          attemptCount: pruned,
+          reason: "terminal-count-bound",
+        },
+      };
     }
+    return undefined;
   }
 
-  private rowToSnapshot(row: TranscriptRow | null): TranscriptSnapshot | null {
-    if (!row) return null;
-
-    let messages: ModelMessage[];
-    try {
-      messages = parseNormalizedCanonicalMessages(JSON.parse(row.messages_json));
-    } catch {
-      return null;
+  private rowToSnapshot(
+    row: TranscriptRow | null,
+  ): ResultType<TranscriptSnapshot | null, PersistedDataError> {
+    if (!row) return Result.ok(null);
+    const decoded = decodeTranscriptRow({
+      row,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      this.reportPersistenceError(decoded.error);
+      return Result.err(decoded.error);
     }
-    const computedDigest = hashCanonicalMessagesV1(messages).hash;
-    const transcriptDigest = sha256HexSchema.safeParse(row.transcript_digest);
-    if (transcriptDigest.success && transcriptDigest.data !== computedDigest) {
-      throw new Error(`Request transcript '${row.request_id}' failed digest validation`);
-    }
-
-    const contextMeta = parseCompactionContextMeta(row.context_meta_json);
-    const providerState = parseHistoryProviderState(row.provider_state_json);
-    const requestClient = adapterPlatformSchema.safeParse(row.request_client);
-    if (!requestClient.success) return null;
-    const stableNamedRequestClient = adapterPlatformSchema.safeParse(
-      row.stable_named_request_client,
-    );
-
-    return {
-      requestId: row.request_id,
-      sessionId: row.session_id,
-      requestClient: requestClient.data,
-      createdTs: row.created_ts,
-      updatedTs: row.updated_ts,
-      messages,
-      modelLabel: row.model_label ?? undefined,
-      finalText: row.final_text ?? undefined,
-      contextMeta,
-      providerState,
-      canonicalHashVersion: CORE_TRANSCRIPT_DIGEST_VERSION,
-      transcriptDigest: computedDigest,
-      ...(stableNamedRequestClient.success
-        ? { stableNamedRequestClient: stableNamedRequestClient.data }
-        : {}),
-    };
+    return Result.ok(decoded.value.value);
   }
 
-  private pruneRetention() {
+  private pruneRetention(now: number): readonly DeferredTranscriptEvent[] {
     const TTL_MS = 30 * 24 * 60 * 60 * 1000;
     const MAX_REQUESTS = 10_000;
+    const events: DeferredTranscriptEvent[] = [];
 
-    const cutoff = Date.now() - TTL_MS;
-    const checkpointCandidateCutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const cutoff = now - TTL_MS;
+    const checkpointCandidateCutoff = now - 24 * 60 * 60 * 1000;
     const candidates = this.db
       .query(
         `
@@ -3725,11 +4653,27 @@ export class SqliteTranscriptStore implements TranscriptStore {
       context_meta_json: string;
     }>;
     for (const candidate of candidates) {
-      if (!isCompactionContextMetaJson(candidate.context_meta_json)) continue;
+      const contextMeta = decodeTranscriptCompactionContext({
+        raw: candidate.context_meta_json,
+        schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+        recordId: candidate.request_id,
+      });
+      if (contextMeta.status === "error") {
+        appendDeferredTranscriptEvent(events, {
+          kind: "persistence-diagnostic",
+          diagnostic: toTranscriptPersistenceDiagnostic(contextMeta.error),
+        });
+        continue;
+      }
+      if (!contextMeta.value.value) continue;
       this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [candidate.request_id]);
-      logger.info("compaction checkpoint deleted", {
-        requestId: candidate.request_id,
-        reason: "unlinked_candidate_cleanup",
+      appendDeferredTranscriptEvent(events, {
+        kind: "log",
+        event: "compaction checkpoint deleted",
+        detail: {
+          requestId: candidate.request_id,
+          reason: "unlinked_candidate_cleanup",
+        },
       });
     }
     this.db.run(
@@ -3779,6 +4723,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     `,
       [cutoff],
     );
+    return events;
   }
 
   private isRequestTranscriptRetainedByLineage(requestId: string): boolean {
@@ -3790,44 +4735,47 @@ export class SqliteTranscriptStore implements TranscriptStore {
   }
 }
 
-function parseSerializedUnknown(raw: string, label: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${label} is not valid serialized data: ${message}`);
-  }
-}
-
 function parseNormalizedCanonicalMessages(value: unknown): ModelMessage[] {
   const messages = modelMessagesSchema.parse(value);
   return modelMessagesSchema.parse(normalizeReplayMessages(messages));
 }
 
-function validateCoreOwnedBlobRow(row: CoreOwnedBlobRow): CoreOwnedBlob {
-  const reference = coreOwnedBlobReferenceSchema.parse({
+function decodeCoreOwnedBlobRow(
+  row: CoreOwnedBlobRow,
+): ResultType<CoreOwnedBlob, CoreOwnedBlobIntegrityError> {
+  if (
+    !/^[0-9a-f]{64}$/.test(row.sha256) ||
+    row.media_type.length === 0 ||
+    row.filename.length === 0 ||
+    !Number.isSafeInteger(row.byte_length) ||
+    row.byte_length < 0 ||
+    !(row.bytes instanceof Uint8Array) ||
+    !Number.isSafeInteger(row.created_ts) ||
+    row.created_ts < 0
+  ) {
+    return Result.err(
+      new CoreOwnedBlobIntegrityError(`Owned blob '${row.sha256}' has invalid persisted metadata`),
+    );
+  }
+  if (row.bytes.byteLength !== row.byte_length) {
+    return Result.err(
+      new CoreOwnedBlobIntegrityError(`Owned blob '${row.sha256}' has an invalid byte length`),
+    );
+  }
+  const digest = createHash("sha256").update(row.bytes).digest("hex");
+  if (digest !== row.sha256) {
+    return Result.err(
+      new CoreOwnedBlobIntegrityError(`Owned blob '${row.sha256}' failed SHA-256 validation`),
+    );
+  }
+  return Result.ok({
     sha256: row.sha256,
     mediaType: row.media_type,
     filename: row.filename,
     byteLength: row.byte_length,
+    bytes: new Uint8Array(row.bytes),
+    createdAt: row.created_ts,
   });
-  const bytes = z.instanceof(Uint8Array).parse(row.bytes);
-  if (bytes.byteLength !== reference.byteLength) {
-    throw new CoreOwnedBlobIntegrityError(
-      `Owned blob '${reference.sha256}' has an invalid byte length`,
-    );
-  }
-  const digest = createHash("sha256").update(bytes).digest("hex");
-  if (digest !== reference.sha256) {
-    throw new CoreOwnedBlobIntegrityError(
-      `Owned blob '${reference.sha256}' failed SHA-256 validation`,
-    );
-  }
-  return {
-    ...reference,
-    bytes: new Uint8Array(bytes),
-    createdAt: nonNegativeIntegerSchema.parse(row.created_ts),
-  };
 }
 
 function toCoreOwnedBlobReference(blob: CoreOwnedBlob): CoreOwnedBlobReference {
@@ -3837,28 +4785,6 @@ function toCoreOwnedBlobReference(blob: CoreOwnedBlob): CoreOwnedBlobReference {
     filename: blob.filename,
     byteLength: blob.byteLength,
   };
-}
-
-function parseCompactionContextMeta(
-  raw: string | null | undefined,
-): CompactionCheckpointMeta | undefined {
-  if (!raw) return undefined;
-  try {
-    const parsed = compactionCheckpointMetaSchema.safeParse(JSON.parse(raw));
-    return parsed.success ? parsed.data : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function parseHistoryProviderState(raw: string | null | undefined): HistoryProviderState | null {
-  if (!raw) return null;
-  try {
-    const parsed = historyProviderStateSchema.safeParse(JSON.parse(raw));
-    return parsed.success ? parsed.data : null;
-  } catch {
-    return null;
-  }
 }
 
 function toCoreNamedClaudeBinding(row: CoreNamedClaudeBindingRow): CoreNamedClaudeSessionBinding {
@@ -4027,8 +4953,4 @@ function toCorePrimaryClaudeAttempt(
     createdAt: nonNegativeIntegerSchema.parse(row.created_ts),
     updatedAt: nonNegativeIntegerSchema.parse(row.updated_ts),
   };
-}
-
-function isCompactionContextMetaJson(raw: string | null | undefined): boolean {
-  return parseCompactionContextMeta(raw) !== undefined;
 }

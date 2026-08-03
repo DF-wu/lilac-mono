@@ -201,7 +201,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
     field: "client_id" | "client_secret",
   ): Promise<ResultType<string, McpOAuthCredentialResolutionError>> {
     const resolved = await resolveMcpValueSource(source, this.valueContext);
-    if (resolved.status === "ok") return resolved;
+    if (resolved.status === "ok") return Result.ok(resolved.value);
     return Result.err(
       new McpOAuthCredentialResolutionError({
         serverId: this.serverId,

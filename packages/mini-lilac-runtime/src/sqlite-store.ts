@@ -4,7 +4,15 @@ import { chmodSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
-import { createLogger } from "@stanley2058/lilac-utils";
+import {
+  CorruptPersistedFields,
+  createLogger,
+  MalformedSerialization,
+  runBunSqliteTransaction,
+  UnsupportedVersion,
+  type DecodedPersistedValue,
+  type PersistedDataError,
+} from "@stanley2058/lilac-utils";
 import type {
   MiniLilacTodo,
   MiniLilacTodoState,
@@ -28,14 +36,12 @@ import {
   miniLilacOutputRollbackSchema,
   miniLilacProviderMetadataSchema,
   miniLilacRedoResultSchema,
-  miniLilacReasoningSchema,
   miniLilacSessionSnapshotSchema,
   miniLilacSessionStatusSchema,
   miniLilacSteeringCommittedChunkSchema,
   miniLilacSteeringChunkSchema,
   miniLilacSubagentStatusSchema,
   miniLilacTodoChunkSchema,
-  miniLilacTodoStateSchema,
   miniLilacTodosSchema,
   miniLilacTranscriptResetSchema,
   miniLilacUIMessageMetadataSchema,
@@ -43,8 +49,47 @@ import {
   miniLilacUserUIMessageSchema,
 } from "@stanley2058/mini-lilac-client";
 import type { ModelMessage } from "ai";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import superjson from "superjson";
 import { z } from "zod";
+
+import {
+  decodeMiniLilacMigrationRunRow,
+  decodeMiniLilacStructuralHistoryRow,
+  type MiniLilacMigrationRunRowProjection,
+  type MiniLilacStructuralHistoryRecord,
+  type MiniLilacStructuralHistoryRecordKind,
+} from "./sqlite-history-persistence-codec";
+import {
+  decodeMiniLilacDatabaseVersion,
+  decodeMiniLilacMigrationModelPrefix,
+  decodeMiniLilacMigrationTranscriptRows,
+  decodeMiniLilacMigrationUiPrefix,
+  decodeMiniLilacMigrationUiTranscript,
+  decodeMiniLilacMigrationUserUiMessage,
+  decodeMiniLilacModelTranscript as decodePersistedMiniLilacModelTranscript,
+  decodeMiniLilacSteeringCommandRequest,
+  decodeMiniLilacSuperJsonPayload,
+  decodeMiniLilacTranscriptChain,
+  decodeMiniLilacUiTranscript as decodePersistedMiniLilacUiTranscript,
+} from "./sqlite-persistence-codec";
+import {
+  MiniLilacHistoryRecordMissing,
+  MiniLilacSchemaMigrationFailure,
+  MiniLilacSchemaInitializationCombinedFailure,
+  MiniLilacSqliteDriverFailure,
+  classifyMiniLilacSqliteDriverFailure,
+} from "./sqlite-persistence-errors";
+import {
+  decodeMiniLilacTodos as decodePersistedMiniLilacTodos,
+  readMiniLilacTodos,
+} from "./sqlite-todo-persistence-codec";
+import {
+  adaptPersistedModelMessagesToSdk,
+  adaptPersistedUiMessagesToSdk,
+} from "./sqlite-transcript-representation-adapter";
+
+export { MiniLilacSqliteDriverFailure } from "./sqlite-persistence-errors";
 
 const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
@@ -52,6 +97,32 @@ export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 8;
 export const MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
 export const MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
 const logger = createLogger({ module: "mini-lilac-runtime:sqlite-store" });
+
+function decodeMiniLilacModelTranscript(
+  input: Parameters<typeof decodePersistedMiniLilacModelTranscript>[0],
+) {
+  const decoded = decodePersistedMiniLilacModelTranscript(input);
+  if (decoded.status === "error") return Result.err(decoded.error);
+  return Result.ok({
+    value: adaptPersistedModelMessagesToSdk(decoded.value.value),
+    provenance: decoded.value.provenance,
+  });
+}
+
+function decodeMiniLilacUiTranscript(
+  input: Parameters<typeof decodePersistedMiniLilacUiTranscript>[0],
+) {
+  const decoded = decodePersistedMiniLilacUiTranscript(input);
+  if (decoded.status === "error") return Result.err(decoded.error);
+  return Result.ok({
+    value: adaptPersistedUiMessagesToSdk(decoded.value.value),
+    provenance: decoded.value.provenance,
+  });
+}
+
+function decodeMiniLilacTodos(input: Parameters<typeof decodePersistedMiniLilacTodos>[0]) {
+  return decodePersistedMiniLilacTodos(input);
+}
 
 export class MiniLilacDatabaseVersionError extends Error {
   constructor(
@@ -63,6 +134,121 @@ export class MiniLilacDatabaseVersionError extends Error {
     );
     this.name = "MiniLilacDatabaseVersionError";
   }
+}
+
+export type MiniLilacPersistenceError =
+  | PersistedDataError
+  | MiniLilacSqliteDriverFailure
+  | MiniLilacHistoryRecordMissing;
+export type MiniLilacPersistenceDiagnostic = {
+  readonly table: string;
+  readonly field: string;
+  readonly version: number;
+  readonly issueCode: string;
+  readonly recordId: string;
+  readonly message: string;
+};
+export type MiniLilacCleanupDefectReport = {
+  readonly operation:
+    | "initializeSchema.restorePragmas"
+    | "constructor.closeAfterInitializationFailure"
+    | "readHistoryRecovery.close";
+  readonly cleanupFailure: unknown;
+};
+export type MiniLilacSqliteStoreOptions = {
+  readonly onPersistenceDiagnostic?: (diagnostic: MiniLilacPersistenceDiagnostic) => void;
+  readonly onCleanupDefect?: (report: MiniLilacCleanupDefectReport) => void;
+};
+type MiniLilacStructuralHistoryRecordFor<K extends MiniLilacStructuralHistoryRecordKind> = Extract<
+  MiniLilacStructuralHistoryRecord,
+  { readonly kind: K }
+>;
+type MiniLilacStructuralHistoryValueByKind = {
+  [K in MiniLilacStructuralHistoryRecordKind]: MiniLilacStructuralHistoryRecordFor<K>["value"];
+};
+
+type MiniLilacSchemaInitializationError =
+  | MiniLilacDatabaseVersionError
+  | MiniLilacPersistenceError
+  | MiniLilacSchemaMigrationFailure
+  | MiniLilacSchemaInitializationCombinedFailure;
+
+type MiniLilacCleanupOutcome =
+  | { readonly status: "ok" }
+  | { readonly status: "expected-error"; readonly error: MiniLilacSqliteDriverFailure }
+  | { readonly status: "defect"; readonly cause: unknown };
+type MiniLilacCaughtDefect =
+  | { readonly kind: "panic"; readonly cause: Panic }
+  | { readonly kind: "error"; readonly cause: Error }
+  | { readonly kind: "hostile"; readonly cause: unknown };
+
+function captureMiniLilacCleanup(
+  cleanup: () => ResultType<void, MiniLilacSqliteDriverFailure>,
+): MiniLilacCleanupOutcome {
+  try {
+    const result = cleanup();
+    return result.status === "ok"
+      ? { status: "ok" }
+      : { status: "expected-error", error: result.error };
+  } catch (cause) {
+    return { status: "defect", cause };
+  }
+}
+
+function reportMiniLilacCleanupFailure(
+  reporter: (report: MiniLilacCleanupDefectReport) => void,
+  report: MiniLilacCleanupDefectReport,
+): void {
+  try {
+    reporter(report);
+  } catch {
+    try {
+      logger.error("Mini Lilac cleanup defect reporter failed", { operation: report.operation });
+    } catch {
+      // A reporter failure must never replace the defect whose cleanup it was reporting.
+    }
+  }
+}
+
+function throwPrimaryAfterCleanup(
+  primary: MiniLilacCaughtDefect,
+  operation: MiniLilacCleanupDefectReport["operation"],
+  cleanup: MiniLilacCleanupOutcome,
+  reporter: (report: MiniLilacCleanupDefectReport) => void,
+): never {
+  switch (cleanup.status) {
+    case "ok":
+      break;
+    case "expected-error":
+      reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cleanup.error });
+      break;
+    case "defect":
+      reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cleanup.cause });
+      break;
+  }
+  throw primary.cause;
+}
+
+function defaultMiniLilacCleanupDefectReporter(report: MiniLilacCleanupDefectReport): void {
+  logger.error("Mini Lilac cleanup failed while preserving a prior defect", {
+    operation: report.operation,
+  });
+}
+
+function isExpectedSchemaInitializationFailure(cause: Error): boolean {
+  if (Panic.is(cause)) return false;
+  if (
+    cause instanceof MiniLilacDatabaseVersionError ||
+    cause instanceof CorruptPersistedFields ||
+    cause instanceof MalformedSerialization ||
+    cause instanceof UnsupportedVersion ||
+    cause instanceof MiniLilacSchemaMigrationFailure ||
+    cause instanceof MiniLilacSqliteDriverFailure ||
+    cause instanceof MiniLilacSchemaInitializationCombinedFailure
+  ) {
+    return true;
+  }
+  return classifyMiniLilacSqliteDriverFailure("constructor.initializeSchema", cause) !== undefined;
 }
 
 const sessionRowSchema = z.object({
@@ -96,11 +282,6 @@ const runRowSchema = z.object({
   finished_at: z.string().nullable(),
 });
 
-const jsonRowSchema = z.object({ value_json: z.string() });
-const todosRowSchema = z.object({
-  revision: z.number().int().nonnegative(),
-  todos_json: z.string(),
-});
 const transcriptNodeRowSchema = z.object({
   id: z.number().int().positive(),
   parent_id: z.number().int().positive().nullable(),
@@ -195,27 +376,6 @@ const historyWorkspaceOutcomeSchema = z.discriminatedUnion("workspaceStatus", [
   }),
 ]);
 
-const workspaceRowSchema = z.object({
-  id: z.string(),
-  canonical_cwd: z.string(),
-  health_status: z.enum(["healthy", "corrupt"]),
-  health_detail: z.string().nullable(),
-  created_at: z.string(),
-});
-const historyStoreMetadataRowSchema = z.object({
-  namespace_id: z.string().min(1),
-  created_at: z.string(),
-});
-const workspaceSnapshotRowSchema = z.object({
-  id: z.string(),
-  workspace_id: z.string(),
-  root_tree_oid: z.string(),
-  git_ref: z.string(),
-  format_version: z.number().int().positive(),
-  availability: z.enum(["available", "missing", "corrupt"]),
-  availability_detail: z.string().nullable(),
-  created_at: z.string(),
-});
 const workspaceSnapshotAvailabilityUpdateSchema = z.discriminatedUnion("availability", [
   z.strictObject({
     snapshotId: z.string().min(1),
@@ -228,20 +388,6 @@ const workspaceSnapshotAvailabilityUpdateSchema = z.discriminatedUnion("availabi
     detail: z.string().min(1),
   }),
 ]);
-const historyStateRowSchema = z.object({
-  id: z.string(),
-  session_id: z.string(),
-  workspace_id: z.string(),
-  model_head_id: z.number().int().positive().nullable(),
-  ui_head_id: z.number().int().positive().nullable(),
-  workspace_snapshot_id: z.string().nullable(),
-  workspace_status: historyWorkspaceStatusSchema,
-  workspace_unavailable_reason: historyWorkspaceUnavailableReasonSchema.nullable(),
-  origin: historyStateOriginSchema,
-  last_provider_family: historyProviderFamilySchema.nullable(),
-  contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
-  created_at: z.string(),
-});
 const miniMainClaudeBindingRowSchema = z.object({
   session_id: z.string().min(1),
   history_state_id: z.string().min(1),
@@ -362,84 +508,6 @@ const promoteMiniNamedClaudeSessionBindingSchema = promoteMiniMainClaudeSessionB
     canonicalHeadHash: z.string().min(1),
   },
 );
-const historyTransitionRowSchema = z.object({
-  id: z.string(),
-  session_id: z.string(),
-  from_state_id: z.string(),
-  to_state_id: z.string().nullable(),
-  kind: historyTransitionKindSchema,
-  delivery: historyDeliverySchema.nullable(),
-  command_id: z.string().nullable(),
-  user_message_json: z.string().nullable(),
-  root_run_id: z.string().nullable(),
-  replay_after_seq: z.number().int().nonnegative().nullable(),
-  created_at: z.string(),
-  completed_at: z.string().nullable(),
-});
-const sessionHistoryRowSchema = z.object({
-  session_id: z.string(),
-  root_state_id: z.string(),
-  current_state_id: z.string(),
-  undo_floor_state_id: z.string(),
-  updated_at: z.string(),
-});
-const historyRedoRowSchema = z.object({
-  session_id: z.string(),
-  position: z.number().int().nonnegative(),
-  target_state_id: z.string(),
-  user_transition_id: z.string(),
-  created_at: z.string(),
-});
-const historyOperationRowSchema = z.object({
-  id: z.string(),
-  session_id: z.string(),
-  workspace_id: z.string(),
-  command_id: z.string(),
-  kind: z.literal("navigate"),
-  requested_action: historyOperationActionSchema,
-  source_state_id: z.string(),
-  observed_source_state_id: z.string().nullable(),
-  target_state_id: z.string(),
-  user_transition_id: z.string(),
-  filesystem_mode: historyFilesystemModeSchema,
-  skip_reason: historySkipReasonSchema.nullable(),
-  phase: historyOperationPhaseSchema,
-  prepared_at: z.string(),
-  updated_at: z.string(),
-});
-const pendingRunFinalizationRowSchema = z.object({
-  run_id: z.string(),
-  session_id: z.string(),
-  workspace_id: z.string(),
-  open_transition_id: z.string(),
-  model_head_id: z.number().int().positive().nullable(),
-  ui_head_id: z.number().int().positive().nullable(),
-  run_status: z.enum(["completed", "cancelled", "error"]),
-  session_status: z.enum(["idle", "error"]),
-  error: z.string().nullable(),
-  terminal_result_json: z.string().nullable(),
-  input_tokens: z.number().int().nonnegative().nullable(),
-  last_provider_family: historyProviderFamilySchema.nullable(),
-  contains_cross_family_turns: z.number().int().min(0).max(1).nullable(),
-  claude_binding_promotion_json: z.string().nullable(),
-  named_claude_binding_promotion_json: z.string().nullable(),
-  prepared_at: z.string(),
-});
-const historyAccountingRowSchema = z.object({
-  state_count: z.number().int().nonnegative(),
-  transition_count: z.number().int().nonnegative(),
-  branch_tip_count: z.number().int().nonnegative(),
-  snapshot_count: z.number().int().nonnegative(),
-  redo_stack_count: z.number().int().nonnegative(),
-  active_operation_count: z.number().int().nonnegative(),
-  pending_finalization_count: z.number().int().nonnegative(),
-});
-const historyRecoveryOperationRowSchema = historyOperationRowSchema.extend({
-  canonical_cwd: z.string(),
-});
-const historyRecoveryPendingFinalizationRowSchema = pendingRunFinalizationRowSchema.extend({
-  canonical_cwd: z.string(),
-});
 const migrationSessionRowSchema = z.object({
   id: z.string(),
   active_run_id: z.string().nullable(),
@@ -470,127 +538,6 @@ const migrationRunRowSchema = z.object({
   status: runStatusSchema,
   parent_run_id: z.string().nullable(),
 });
-const migrationIdentifierSchema = z.string().trim().min(1);
-const migrationSessionSnapshotV4Schema = z.strictObject({
-  id: migrationIdentifierSchema,
-  activeRunId: migrationIdentifierSchema.nullable(),
-  activeCompactionCommandId: migrationIdentifierSchema.nullable().optional(),
-  status: z.enum(["idle", "streaming", "compacting", "cancelling", "error"]),
-  cwd: z.string().min(1),
-  model: migrationIdentifierSchema.nullable(),
-  profile: migrationIdentifierSchema.nullable(),
-  reasoning: miniLilacReasoningSchema.nullable(),
-  title: z.string().max(100).optional(),
-  inputTokens: z.number().int().nonnegative().nullable().optional(),
-  inputTokensEstimated: z.boolean().optional(),
-  contextWindow: z.number().int().positive().nullable().optional(),
-  compactionThreshold: z.number().positive().max(1).optional(),
-  queuedSteeringCount: z.number().int().nonnegative(),
-  createdAt: z.string().datetime({ offset: true }).optional(),
-  updatedAt: z.string().datetime({ offset: true }).optional(),
-});
-const migrationSessionDataPartV4Schema = z.strictObject({
-  type: z.literal("data-session"),
-  id: migrationIdentifierSchema.optional(),
-  data: migrationSessionSnapshotV4Schema,
-});
-const migrationCompactionMetricsV4Schema = {
-  status: z.enum(["completed", "failed"]),
-  messageCountBefore: z.number().int().nonnegative(),
-  messageCountAfter: z.number().int().nonnegative().optional(),
-  estimatedInputTokensBefore: z.number().int().nonnegative().optional(),
-  estimatedInputTokensAfter: z.number().int().nonnegative().optional(),
-  error: z.string().optional(),
-} as const;
-const migrationCompactionEventV4Schema = z.discriminatedUnion("source", [
-  z.strictObject({
-    source: z.literal("automatic"),
-    reason: z.enum(["threshold", "overflow"]),
-    ...migrationCompactionMetricsV4Schema,
-  }),
-  z.strictObject({
-    source: z.literal("manual"),
-    reason: z.literal("manual"),
-    ...migrationCompactionMetricsV4Schema,
-  }),
-]);
-const migrationCompactionDataPartV4Schema = z.strictObject({
-  type: z.literal("data-compaction"),
-  id: migrationIdentifierSchema.optional(),
-  data: migrationCompactionEventV4Schema,
-});
-const migrationUiMessageEnvelopeSchema = z.looseObject({
-  role: z.enum(["system", "user", "assistant"]),
-  parts: z.array(z.unknown()),
-});
-
-type MigratedUiMessages = {
-  readonly messages: MiniLilacUIMessage[];
-  readonly changed: boolean;
-};
-
-function parseMigratedUiMessage(value: unknown): {
-  readonly message: MiniLilacUIMessage | null;
-  readonly changed: boolean;
-} {
-  const envelope = migrationUiMessageEnvelopeSchema.parse(value);
-  const parts: unknown[] = [];
-  let changed = false;
-  for (const part of envelope.parts) {
-    if (migrationSessionDataPartV4Schema.safeParse(part).success) {
-      changed = true;
-      continue;
-    }
-    const legacyCompaction = migrationCompactionDataPartV4Schema.safeParse(part);
-    if (legacyCompaction.success) {
-      const { status, ...data } = legacyCompaction.data.data;
-      parts.push({
-        type: legacyCompaction.data.type,
-        ...(legacyCompaction.data.id === undefined ? {} : { id: legacyCompaction.data.id }),
-        data: {
-          ...data,
-          phase: status,
-          ...(status === "completed" ? { outcome: "compacted" as const } : {}),
-        },
-      });
-      changed = true;
-      continue;
-    }
-    parts.push(part);
-  }
-  if (!changed) {
-    return { message: miniLilacMessagesSchema.element.parse(value), changed: false };
-  }
-  if (parts.length === 0) {
-    if (envelope.role === "user") {
-      throw new Error("Legacy user UI message contains only session snapshot parts");
-    }
-    return { message: null, changed: true };
-  }
-  return {
-    message: miniLilacMessagesSchema.element.parse({ ...envelope, parts }),
-    changed: true,
-  };
-}
-
-function parseMigratedUiMessages(values: readonly unknown[]): MigratedUiMessages {
-  const messages: MiniLilacUIMessage[] = [];
-  let changed = false;
-  for (const value of values) {
-    const migrated = parseMigratedUiMessage(value);
-    changed ||= migrated.changed;
-    if (migrated.message !== null) messages.push(migrated.message);
-  }
-  return { messages, changed };
-}
-
-function parseMigratedUserUiMessage(value: unknown): MiniLilacUserUIMessage {
-  const migrated = parseMigratedUiMessage(value);
-  if (migrated.message === null) {
-    throw new Error("Legacy user UI message cannot be empty after migration");
-  }
-  return miniLilacUserUIMessageSchema.parse(migrated.message);
-}
 export const storedHistoryCommandErrorSchema = z.strictObject({
   type: z.literal("history-command-error"),
   code: z.literal("history-recovery-abandoned"),
@@ -603,13 +550,6 @@ export const storedHistoryNavigationResultSchema = z.union([
   storedUndoHistoryResultSchema,
   storedRedoHistoryResultSchema,
 ]);
-const storedSteeringCommandPayloadSchema = z.object({
-  message: miniLilacUserUIMessageSchema,
-  sessionId: z.string().optional(),
-  runId: z.string().optional(),
-  clientCommandId: z.string().optional(),
-});
-
 const providerMetadataFields = {
   providerMetadata: miniLilacProviderMetadataSchema.optional(),
 };
@@ -1327,10 +1267,6 @@ function serialize(value: unknown): string {
   return superjson.stringify(value);
 }
 
-function deserialize(value: string): unknown {
-  return superjson.parse(value);
-}
-
 function canonicalJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
   if (value !== null && typeof value === "object") {
@@ -1423,6 +1359,13 @@ function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
 
 function toRun(rowValue: unknown): StoredRun {
   const row = runRowSchema.parse(rowValue);
+  const terminalResult = decodeMiniLilacSuperJsonPayload({
+    raw: row.terminal_result_json,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId: row.id,
+    field: "terminal_result",
+  });
+  if (terminalResult.status === "error") throw terminalResult.error;
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -1431,60 +1374,9 @@ function toRun(rowValue: unknown): StoredRun {
     depth: row.depth,
     status: row.status,
     error: row.error,
-    terminalResult: row.terminal_result_json ? deserialize(row.terminal_result_json) : undefined,
+    terminalResult: terminalResult.value.value ?? undefined,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
-  };
-}
-
-function toWorkspace(rowValue: unknown): StoredWorkspace {
-  const row = workspaceRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    canonicalCwd: row.canonical_cwd,
-    healthStatus: row.health_status,
-    healthDetail: row.health_detail,
-    createdAt: row.created_at,
-  };
-}
-
-function toWorkspaceSnapshot(rowValue: unknown): StoredWorkspaceSnapshot {
-  const row = workspaceSnapshotRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    workspaceId: row.workspace_id,
-    rootTreeOid: row.root_tree_oid,
-    gitRef: row.git_ref,
-    formatVersion: row.format_version,
-    availability: row.availability,
-    availabilityDetail: row.availability_detail,
-    createdAt: row.created_at,
-  };
-}
-
-function toHistoryState(rowValue: unknown): StoredHistoryState {
-  const row = historyStateRowSchema.parse(rowValue);
-  if ((row.last_provider_family === null) !== (row.contains_cross_family_turns === null)) {
-    throw new Error(`History state '${row.id}' has incomplete provider metadata`);
-  }
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    workspaceId: row.workspace_id,
-    modelHeadId: row.model_head_id,
-    uiHeadId: row.ui_head_id,
-    workspaceSnapshotId: row.workspace_snapshot_id,
-    workspaceStatus: row.workspace_status,
-    workspaceUnavailableReason: row.workspace_unavailable_reason,
-    origin: row.origin,
-    providerState:
-      row.last_provider_family === null || row.contains_cross_family_turns === null
-        ? null
-        : historyProviderStateSchema.parse({
-            lastFamily: row.last_provider_family,
-            containsCrossFamilyTurns: row.contains_cross_family_turns === 1,
-          }),
-    createdAt: row.created_at,
   };
 }
 
@@ -1542,108 +1434,6 @@ function toMiniNamedClaudeAttempt(rowValue: unknown): MiniNamedClaudeSessionAtte
   return toMiniMainClaudeAttempt(miniNamedClaudeAttemptRowSchema.parse(rowValue));
 }
 
-function toHistoryTransition(rowValue: unknown): StoredHistoryTransition {
-  const row = historyTransitionRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    fromStateId: row.from_state_id,
-    toStateId: row.to_state_id,
-    kind: row.kind,
-    delivery: row.delivery,
-    commandId: row.command_id,
-    userMessage:
-      row.user_message_json === null
-        ? null
-        : miniLilacUserUIMessageSchema.parse(deserialize(row.user_message_json)),
-    rootRunId: row.root_run_id,
-    replayAfterSeq: row.replay_after_seq,
-    createdAt: row.created_at,
-    completedAt: row.completed_at,
-  };
-}
-
-function toSessionHistory(rowValue: unknown): StoredSessionHistory {
-  const row = sessionHistoryRowSchema.parse(rowValue);
-  return {
-    sessionId: row.session_id,
-    rootStateId: row.root_state_id,
-    currentStateId: row.current_state_id,
-    undoFloorStateId: row.undo_floor_state_id,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toHistoryRedoEntry(rowValue: unknown): StoredHistoryRedoEntry {
-  const row = historyRedoRowSchema.parse(rowValue);
-  return {
-    sessionId: row.session_id,
-    position: row.position,
-    targetStateId: row.target_state_id,
-    userTransitionId: row.user_transition_id,
-    createdAt: row.created_at,
-  };
-}
-
-function toHistoryOperation(rowValue: unknown): StoredHistoryOperation {
-  const row = historyOperationRowSchema.parse(rowValue);
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    workspaceId: row.workspace_id,
-    commandId: row.command_id,
-    kind: row.kind,
-    requestedAction: row.requested_action,
-    sourceStateId: row.source_state_id,
-    observedSourceStateId: row.observed_source_state_id,
-    targetStateId: row.target_state_id,
-    userTransitionId: row.user_transition_id,
-    filesystemMode: row.filesystem_mode,
-    skipReason: row.skip_reason,
-    phase: row.phase,
-    preparedAt: row.prepared_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toPendingRunFinalization(rowValue: unknown): PendingStoredRunFinalization {
-  const row = pendingRunFinalizationRowSchema.parse(rowValue);
-  return {
-    runId: row.run_id,
-    sessionId: row.session_id,
-    workspaceId: row.workspace_id,
-    openTransitionId: row.open_transition_id,
-    modelHeadId: row.model_head_id,
-    uiHeadId: row.ui_head_id,
-    runStatus: row.run_status,
-    sessionStatus: row.session_status,
-    error: row.error,
-    terminalResult:
-      row.terminal_result_json === null ? undefined : deserialize(row.terminal_result_json),
-    inputTokens: row.input_tokens,
-    providerState:
-      row.last_provider_family === null || row.contains_cross_family_turns === null
-        ? null
-        : historyProviderStateSchema.parse({
-            lastFamily: row.last_provider_family,
-            containsCrossFamilyTurns: row.contains_cross_family_turns === 1,
-          }),
-    claudeBindingPromotion:
-      row.claude_binding_promotion_json === null
-        ? null
-        : promoteMiniMainClaudeSessionBindingSchema.parse(
-            deserialize(row.claude_binding_promotion_json),
-          ),
-    namedClaudeBindingPromotion:
-      row.named_claude_binding_promotion_json === null
-        ? null
-        : promoteMiniNamedClaudeSessionBindingSchema.parse(
-            deserialize(row.named_claude_binding_promotion_json),
-          ),
-    preparedAt: row.prepared_at,
-  };
-}
-
 export type ReadonlyStoredHistoryRecoveryStatus = {
   readonly navigation: readonly {
     readonly canonicalCwd: string;
@@ -1667,57 +1457,270 @@ export class MiniLilacHistoryRecoveryVersionError extends Error {
   }
 }
 
+export class MiniLilacHistoryRecoveryPathFailure extends TaggedError(
+  "MiniLilacHistoryRecoveryPathFailure",
+)<{
+  readonly filename: string;
+  readonly message: string;
+}> {}
+
+export type MiniLilacHistoryRecoveryReadError =
+  | PersistedDataError
+  | MiniLilacSqliteDriverFailure
+  | MiniLilacHistoryRecoveryVersionError
+  | MiniLilacHistoryRecoveryPathFailure
+  | MiniLilacHistoryRecordMissing;
+
 export function readMiniLilacHistoryRecoveryStatus(
   filename: string,
 ): ReadonlyStoredHistoryRecoveryStatus {
+  const result = readMiniLilacHistoryRecoveryStatusResult(filename);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function closeMiniLilacHistoryRecoveryDatabase(
+  database: Database,
+): ResultType<void, MiniLilacSqliteDriverFailure> {
+  try {
+    database.close();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
+    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.close", cause);
+    if (failure !== undefined) return Result.err(failure);
+    throw cause;
+  }
+}
+
+export function readMiniLilacHistoryRecoveryStatusResult(
+  filename: string,
+  options: MiniLilacSqliteStoreOptions = {},
+): ResultType<ReadonlyStoredHistoryRecoveryStatus, MiniLilacHistoryRecoveryReadError> {
   const resolvedFilename = path.resolve(filename);
   if (existsSync(resolvedFilename) && lstatSync(resolvedFilename).isSymbolicLink()) {
-    throw new Error(`Mini Lilac database path '${resolvedFilename}' must not be a symbolic link`);
+    return Result.err(
+      new MiniLilacHistoryRecoveryPathFailure({
+        filename: resolvedFilename,
+        message: `Mini Lilac database path '${resolvedFilename}' must not be a symbolic link`,
+      }),
+    );
   }
-  const database = new Database(resolvedFilename, { readonly: true, strict: true });
+  let database: Database;
   try {
-    const version = z
-      .object({ user_version: z.number().int() })
-      .parse(database.query("PRAGMA user_version").get()).user_version;
-    if (version !== MINI_LILAC_DATABASE_SCHEMA_VERSION) {
-      throw new MiniLilacHistoryRecoveryVersionError(version);
-    }
-    const navigation = z
-      .array(historyRecoveryOperationRowSchema)
-      .parse(
-        database
-          .query(
-            `SELECT history_operations.*, workspaces.canonical_cwd
-             FROM history_operations
-             JOIN workspaces ON workspaces.id = history_operations.workspace_id
-             ORDER BY history_operations.prepared_at, history_operations.rowid`,
-          )
-          .all(),
-      )
-      .map((row) => ({
-        canonicalCwd: row.canonical_cwd,
-        operation: toHistoryOperation(row),
-      }));
-    const pendingFinalizations = z
-      .array(historyRecoveryPendingFinalizationRowSchema)
-      .parse(
-        database
-          .query(
-            `SELECT pending_run_finalizations.*, workspaces.canonical_cwd
-             FROM pending_run_finalizations
-             JOIN workspaces ON workspaces.id = pending_run_finalizations.workspace_id
-             ORDER BY pending_run_finalizations.prepared_at, pending_run_finalizations.rowid`,
-          )
-          .all(),
-      )
-      .map((row) => ({
-        canonicalCwd: row.canonical_cwd,
-        finalization: toPendingRunFinalization(row),
-      }));
-    return { navigation, pendingFinalizations };
-  } finally {
-    database.close();
+    database = new Database(resolvedFilename, { readonly: true, strict: true });
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
+    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.open", cause);
+    if (failure !== undefined) return Result.err(failure);
+    throw cause;
   }
+  const diagnostics: MiniLilacPersistenceDiagnostic[] = [];
+  let outcome:
+    | ResultType<ReadonlyStoredHistoryRecoveryStatus, MiniLilacHistoryRecoveryReadError>
+    | undefined;
+  let readDefect: MiniLilacCaughtDefect | undefined;
+  try {
+    const decodedVersion = decodeMiniLilacDatabaseVersion(
+      database.query("PRAGMA user_version").get(),
+    );
+    if (decodedVersion.status === "error") {
+      diagnostics.push({
+        table: decodedVersion.error.table,
+        field: decodedVersion.error.field,
+        version: decodedVersion.error.version,
+        issueCode: decodedVersion.error.issueCode,
+        recordId: decodedVersion.error.recordId,
+        message: decodedVersion.error.message,
+      });
+      outcome = Result.err(decodedVersion.error);
+    } else if (decodedVersion.value !== MINI_LILAC_DATABASE_SCHEMA_VERSION) {
+      outcome = Result.err(new MiniLilacHistoryRecoveryVersionError(decodedVersion.value));
+    } else {
+      const navigation: Array<{
+        readonly canonicalCwd: string;
+        readonly operation: StoredHistoryOperation;
+      }> = [];
+      const operationRows = database
+        .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
+        .all();
+      for (const [index, row] of operationRows.entries()) {
+        const operation = decodeMiniLilacStructuralHistoryRow({
+          kind: "operation",
+          row,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: `recovery-operation:${index}`,
+        });
+        if (operation.status === "error") {
+          diagnostics.push({
+            table: operation.error.table,
+            field: operation.error.field,
+            version: operation.error.version,
+            issueCode: operation.error.issueCode,
+            recordId: operation.error.recordId,
+            message: operation.error.message,
+          });
+          outcome = Result.err(operation.error);
+          break;
+        }
+        if (operation.value.value?.kind !== "operation") {
+          outcome = Result.err(
+            new MiniLilacHistoryRecordMissing({
+              recordKind: "operation",
+              recordId: `recovery-operation:${index}`,
+              message: "Mini Lilac recovery operation was not found",
+            }),
+          );
+          break;
+        }
+        const workspace = decodeMiniLilacStructuralHistoryRow({
+          kind: "workspace",
+          row: database
+            .query("SELECT * FROM workspaces WHERE id = ?")
+            .get(operation.value.value.value.workspaceId),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: operation.value.value.value.workspaceId,
+        });
+        if (workspace.status === "error") {
+          diagnostics.push({
+            table: workspace.error.table,
+            field: workspace.error.field,
+            version: workspace.error.version,
+            issueCode: workspace.error.issueCode,
+            recordId: workspace.error.recordId,
+            message: workspace.error.message,
+          });
+          outcome = Result.err(workspace.error);
+          break;
+        }
+        if (workspace.value.value?.kind !== "workspace") {
+          outcome = Result.err(
+            new MiniLilacHistoryRecordMissing({
+              recordKind: "workspace",
+              recordId: operation.value.value.value.workspaceId,
+              message: "Mini Lilac recovery workspace was not found",
+            }),
+          );
+          break;
+        }
+        navigation.push({
+          canonicalCwd: workspace.value.value.value.canonicalCwd,
+          operation: operation.value.value.value,
+        });
+      }
+
+      if (outcome === undefined) {
+        const pendingFinalizations: Array<{
+          readonly canonicalCwd: string;
+          readonly finalization: PendingStoredRunFinalization;
+        }> = [];
+        const finalizationRows = database
+          .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+          .all();
+        for (const [index, row] of finalizationRows.entries()) {
+          const finalization = decodeMiniLilacStructuralHistoryRow({
+            kind: "pending-finalization",
+            row,
+            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+            recordId: `recovery-finalization:${index}`,
+          });
+          if (finalization.status === "error") {
+            diagnostics.push({
+              table: finalization.error.table,
+              field: finalization.error.field,
+              version: finalization.error.version,
+              issueCode: finalization.error.issueCode,
+              recordId: finalization.error.recordId,
+              message: finalization.error.message,
+            });
+            outcome = Result.err(finalization.error);
+            break;
+          }
+          if (finalization.value.value?.kind !== "pending-finalization") {
+            outcome = Result.err(
+              new MiniLilacHistoryRecordMissing({
+                recordKind: "pending-finalization",
+                recordId: `recovery-finalization:${index}`,
+                message: "Mini Lilac recovery finalization was not found",
+              }),
+            );
+            break;
+          }
+          const workspace = decodeMiniLilacStructuralHistoryRow({
+            kind: "workspace",
+            row: database
+              .query("SELECT * FROM workspaces WHERE id = ?")
+              .get(finalization.value.value.value.workspaceId),
+            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+            recordId: finalization.value.value.value.workspaceId,
+          });
+          if (workspace.status === "error") {
+            diagnostics.push({
+              table: workspace.error.table,
+              field: workspace.error.field,
+              version: workspace.error.version,
+              issueCode: workspace.error.issueCode,
+              recordId: workspace.error.recordId,
+              message: workspace.error.message,
+            });
+            outcome = Result.err(workspace.error);
+            break;
+          }
+          if (workspace.value.value?.kind !== "workspace") {
+            outcome = Result.err(
+              new MiniLilacHistoryRecordMissing({
+                recordKind: "workspace",
+                recordId: finalization.value.value.value.workspaceId,
+                message: "Mini Lilac recovery workspace was not found",
+              }),
+            );
+            break;
+          }
+          pendingFinalizations.push({
+            canonicalCwd: workspace.value.value.value.canonicalCwd,
+            finalization: finalization.value.value.value,
+          });
+        }
+        if (outcome === undefined) outcome = Result.ok({ navigation, pendingFinalizations });
+      }
+    }
+  } catch (cause) {
+    if (Panic.is(cause)) {
+      readDefect = { kind: "panic", cause };
+    } else if (cause instanceof Error) {
+      const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery", cause);
+      if (failure === undefined) readDefect = { kind: "error", cause };
+      else outcome = Result.err(failure);
+    } else {
+      readDefect = { kind: "hostile", cause };
+    }
+  }
+  const closed = captureMiniLilacCleanup(() => closeMiniLilacHistoryRecoveryDatabase(database));
+  if (readDefect !== undefined) {
+    throwPrimaryAfterCleanup(
+      readDefect,
+      "readHistoryRecovery.close",
+      closed,
+      options.onCleanupDefect ?? defaultMiniLilacCleanupDefectReporter,
+    );
+  }
+  for (const diagnostic of diagnostics) {
+    (
+      options.onPersistenceDiagnostic ??
+      ((value) => logger.warn("Mini Lilac persisted data is invalid", value))
+    )(diagnostic);
+  }
+  if (closed.status === "expected-error") return Result.err(closed.error);
+  if (closed.status === "defect") throw closed.cause;
+  if (outcome === undefined) {
+    throw new Panic({
+      message: "Mini Lilac history recovery read completed without an outcome",
+      cause: resolvedFilename,
+    });
+  }
+  return outcome;
 }
 
 export class MiniLilacSqliteStore {
@@ -1725,8 +1728,16 @@ export class MiniLilacSqliteStore {
   readonly filename: string;
   private closeBlockers = 0;
   private closed = false;
+  private transactionDepth = 0;
+  private readonly pendingPersistenceDiagnostics: MiniLilacPersistenceDiagnostic[] = [];
+  private readonly onPersistenceDiagnostic: (diagnostic: MiniLilacPersistenceDiagnostic) => void;
+  private readonly onCleanupDefect: (report: MiniLilacCleanupDefectReport) => void;
 
-  constructor(filename: string) {
+  constructor(filename: string, options: MiniLilacSqliteStoreOptions = {}) {
+    this.onPersistenceDiagnostic =
+      options.onPersistenceDiagnostic ??
+      ((diagnostic) => logger.warn("Mini Lilac persisted data is invalid", diagnostic));
+    this.onCleanupDefect = options.onCleanupDefect ?? defaultMiniLilacCleanupDefectReporter;
     this.filename = filename === ":memory:" ? filename : path.resolve(filename);
     if (this.filename !== ":memory:" && existsSync(this.filename)) {
       if (lstatSync(this.filename).isSymbolicLink()) {
@@ -1738,9 +1749,53 @@ export class MiniLilacSqliteStore {
       this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
       this.secureDatabaseFiles();
       this.initializeSchema();
-    } catch (error) {
+    } catch (primary) {
+      let primaryFailure: MiniLilacCaughtDefect;
+      if (Panic.is(primary)) {
+        primaryFailure = { kind: "panic", cause: primary };
+      } else if (primary instanceof Error) {
+        primaryFailure = { kind: "error", cause: primary };
+      } else {
+        primaryFailure = { kind: "hostile", cause: primary };
+      }
+      const cleanup = captureMiniLilacCleanup(() => this.closeAfterInitializationFailure());
+      if (
+        primaryFailure.kind !== "error" ||
+        !isExpectedSchemaInitializationFailure(primaryFailure.cause)
+      ) {
+        throwPrimaryAfterCleanup(
+          primaryFailure,
+          "constructor.closeAfterInitializationFailure",
+          cleanup,
+          this.onCleanupDefect,
+        );
+      }
+      if (cleanup.status === "expected-error") {
+        throw new MiniLilacSchemaInitializationCombinedFailure({
+          operation: "closeAfterInitializationFailure",
+          primary: primaryFailure.cause,
+          cleanup: cleanup.error,
+          message: "Mini Lilac schema initialization and database cleanup both failed",
+        });
+      }
+      if (cleanup.status === "defect") throw cleanup.cause;
+      throw primaryFailure.cause;
+    }
+  }
+
+  private closeAfterInitializationFailure(): ResultType<void, MiniLilacSqliteDriverFailure> {
+    try {
       this.database.close();
-      throw error;
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyMiniLilacSqliteDriverFailure(
+        "closeAfterInitializationFailure",
+        cause,
+      );
+      if (failure !== undefined) return Result.err(failure);
+      throw cause;
     }
   }
 
@@ -1757,53 +1812,171 @@ export class MiniLilacSqliteStore {
   }
 
   private initializeSchema(): void {
-    const version = z
-      .object({ user_version: z.number().int() })
-      .parse(this.database.query("PRAGMA user_version").get()).user_version;
-    if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return;
-    if (
-      version !== 0 &&
-      version !== 2 &&
-      version !== 3 &&
-      version !== 4 &&
-      version !== 5 &&
-      version !== 6 &&
-      version !== 7
-    ) {
-      throw new MiniLilacDatabaseVersionError(version);
-    }
+    const initialized = this.initializeSchemaResult();
+    if (initialized.status === "error") throw initialized.error;
+  }
 
-    // Session and run composite ownership require SQLite's documented table
-    // rebuild. These pragmas cannot be changed from inside the transaction.
-    this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+  private initializeSchemaResult(): ResultType<void, MiniLilacSchemaInitializationError> {
     try {
-      this.database.transaction(() => {
-        if (version === 0) {
-          this.createSchemaV6();
+      const decodedVersion = decodeMiniLilacDatabaseVersion(
+        this.database.query("PRAGMA user_version").get(),
+      );
+      if (decodedVersion.status === "error") return Result.err(decodedVersion.error);
+      const version = decodedVersion.value;
+      if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return Result.ok(undefined);
+      if (
+        version !== 0 &&
+        version !== 2 &&
+        version !== 3 &&
+        version !== 4 &&
+        version !== 5 &&
+        version !== 6 &&
+        version !== 7
+      ) {
+        return Result.err(new MiniLilacDatabaseVersionError(version));
+      }
+
+      // Session and run composite ownership require SQLite's documented table
+      // rebuild. These pragmas cannot be changed from inside the transaction.
+      this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+      let migrated: ResultType<
+        void,
+        MiniLilacSchemaMigrationFailure | MiniLilacSqliteDriverFailure | PersistedDataError
+      >;
+      let migrationDefect: MiniLilacCaughtDefect | undefined;
+      try {
+        migrated = runBunSqliteTransaction(
+          this.database,
+          () => {
+            if (version === 0) {
+              this.createSchemaV6();
+            } else {
+              if (version === 2) {
+                const migration = this.migrateSchemaV2ToV3();
+                if (migration.status === "error") return Result.err(migration.error);
+              }
+              if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
+              if (version === 2 || version === 3 || version === 4) {
+                const migration = this.migrateSchemaV4ToV5();
+                if (migration.status === "error") return Result.err(migration.error);
+              }
+              if (version === 5) this.migrateSchemaV5ToV6();
+            }
+            if (version <= 6) this.migrateSchemaV6ToV7();
+            this.migrateSchemaV7ToV8();
+            const violations = this.database.query("PRAGMA foreign_key_check").all();
+            if (violations.length > 0) {
+              return Result.err(
+                new MiniLilacSchemaMigrationFailure({
+                  operation: "initializeSchema",
+                  message: `Mini Lilac schema migration left ${violations.length} foreign key violation(s)`,
+                }),
+              );
+            }
+            this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
+            return Result.ok(undefined);
+          },
+          (cause) => classifyMiniLilacSqliteDriverFailure("initializeSchema", cause),
+        );
+      } catch (cause) {
+        if (cause instanceof z.ZodError) {
+          migrated = Result.err(
+            new MiniLilacSchemaMigrationFailure({
+              operation: "initializeSchema",
+              message: "Mini Lilac schema migration encountered corrupt structural fields",
+            }),
+          );
+        } else if (
+          cause instanceof MiniLilacSchemaMigrationFailure ||
+          cause instanceof MiniLilacSqliteDriverFailure ||
+          cause instanceof CorruptPersistedFields ||
+          cause instanceof MalformedSerialization ||
+          cause instanceof UnsupportedVersion
+        ) {
+          migrated = Result.err(cause);
         } else {
-          if (version === 2) this.migrateSchemaV2ToV3();
-          if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
-          if (version === 2 || version === 3 || version === 4) this.migrateSchemaV4ToV5();
-          if (version === 5) this.migrateSchemaV5ToV6();
+          if (Panic.is(cause)) {
+            migrationDefect = { kind: "panic", cause };
+          } else if (cause instanceof Error) {
+            migrationDefect = { kind: "error", cause };
+          } else {
+            migrationDefect = { kind: "hostile", cause };
+          }
+          migrated = Result.ok(undefined);
         }
-        if (version <= 6) this.migrateSchemaV6ToV7();
-        this.migrateSchemaV7ToV8();
-        const violations = this.database.query("PRAGMA foreign_key_check").all();
-        if (violations.length > 0) {
-          throw new Error(
-            `Mini Lilac schema migration to v${MINI_LILAC_DATABASE_SCHEMA_VERSION} left ${violations.length} foreign key violation(s)`,
+      }
+      const cleanup = captureMiniLilacCleanup(() => this.restoreSchemaMigrationPragmas());
+      if (migrationDefect !== undefined) {
+        throwPrimaryAfterCleanup(
+          migrationDefect,
+          "initializeSchema.restorePragmas",
+          cleanup,
+          this.onCleanupDefect,
+        );
+      }
+      if (cleanup.status === "expected-error") {
+        if (migrated.status === "error") {
+          return Result.err(
+            new MiniLilacSchemaInitializationCombinedFailure({
+              operation: "initializeSchema",
+              primary: migrated.error,
+              cleanup: cleanup.error,
+              message: "Mini Lilac schema migration and cleanup both failed",
+            }),
           );
         }
-        this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
-      })();
-    } finally {
-      this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
+        return Result.err(cleanup.error);
+      }
+      if (cleanup.status === "defect") throw cleanup.cause;
+      if (migrated.status === "error") return Result.err(migrated.error);
+      const violations = this.database.query("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "initializeSchema",
+            message: `Mini Lilac migrated schema has ${violations.length} foreign key violation(s)`,
+          }),
+        );
+      }
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (
+        cause instanceof MiniLilacDatabaseVersionError ||
+        cause instanceof CorruptPersistedFields ||
+        cause instanceof MalformedSerialization ||
+        cause instanceof UnsupportedVersion ||
+        cause instanceof MiniLilacSchemaMigrationFailure ||
+        cause instanceof MiniLilacSqliteDriverFailure ||
+        cause instanceof MiniLilacSchemaInitializationCombinedFailure
+      ) {
+        return Result.err(cause);
+      }
+      if (cause instanceof z.ZodError) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "initializeSchema",
+            message: "Mini Lilac schema migration encountered corrupt structural fields",
+          }),
+        );
+      }
+      if (!(cause instanceof Error)) throw cause;
+      const driverFailure = classifyMiniLilacSqliteDriverFailure("initializeSchema", cause);
+      if (driverFailure !== undefined) return Result.err(driverFailure);
+      throw cause;
     }
-    const violations = this.database.query("PRAGMA foreign_key_check").all();
-    if (violations.length > 0) {
-      throw new Error(
-        `Mini Lilac schema migration to v${MINI_LILAC_DATABASE_SCHEMA_VERSION} left ${violations.length} foreign key violation(s)`,
-      );
+  }
+
+  private restoreSchemaMigrationPragmas(): ResultType<void, MiniLilacSqliteDriverFailure> {
+    try {
+      this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyMiniLilacSqliteDriverFailure("initializeSchema.cleanup", cause);
+      if (failure !== undefined) return Result.err(failure);
+      throw cause;
     }
   }
 
@@ -2332,13 +2505,21 @@ export class MiniLilacSqliteStore {
     `);
   }
 
-  private migrateSchemaV4ToV5(): void {
+  private migrateSchemaV4ToV5(): ResultType<
+    void,
+    MiniLilacSchemaMigrationFailure | PersistedDataError
+  > {
     const existingViolations = this.database.query("PRAGMA foreign_key_check").all();
     if (existingViolations.length > 0) {
-      throw new Error(
-        `Mini Lilac v4 database has ${existingViolations.length} structural foreign key violation(s)`,
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSchemaV4ToV5",
+          message: `Mini Lilac v4 database has ${existingViolations.length} structural foreign key violation(s)`,
+        }),
       );
     }
+    const rehashed = this.rehashTranscriptNodesForMigration();
+    if (rehashed.status === "error") return Result.err(rehashed.error);
     const sessions = z
       .array(migrationSessionRowSchema)
       .parse(this.database.query("SELECT * FROM sessions ORDER BY rowid").all());
@@ -2471,11 +2652,81 @@ export class MiniLilacSqliteStore {
       );
     }
     this.createHistorySchemaTables();
-    for (const session of sessions) this.migrateSessionHistoryV4(session.id);
+    for (const session of sessions) {
+      const migrated = this.migrateSessionHistoryV4(session.id);
+      if (migrated.status === "error") return Result.err(migrated.error);
+    }
     this.database.exec("DROP TABLE user_checkpoints;");
+    return Result.ok(undefined);
   }
 
-  private migrateSessionHistoryV4(sessionId: string): void {
+  private rehashTranscriptNodesForMigration(): ResultType<
+    void,
+    PersistedDataError | MiniLilacSchemaMigrationFailure
+  > {
+    const decodedRows = decodeMiniLilacMigrationTranscriptRows({
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: "v4-transcript-migration",
+      rows: this.database
+        .query(
+          `SELECT id, session_id AS sessionId, lane, parent_id AS parentId, depth,
+                  value_json AS valueJson, hash
+           FROM transcript_nodes ORDER BY session_id, lane, depth, id`,
+        )
+        .all(),
+    });
+    if (decodedRows.status === "error") return Result.err(decodedRows.error);
+    const rows = decodedRows.value.value;
+    const migrationNonce = randomUUID();
+    const updateHash = this.database.query("UPDATE transcript_nodes SET hash = ? WHERE id = ?");
+    for (const row of rows) updateHash.run(`${migrationNonce}:${row.id}`, row.id);
+
+    const migrated = new Map<
+      number,
+      {
+        readonly sessionId: string;
+        readonly lane: "model" | "ui";
+        readonly depth: number;
+        readonly hash: string;
+      }
+    >();
+    for (const row of rows) {
+      const parent = row.parentId === null ? null : migrated.get(row.parentId);
+      if (
+        (row.parentId !== null && parent === undefined) ||
+        (parent !== null &&
+          parent !== undefined &&
+          (parent.sessionId !== row.sessionId ||
+            parent.lane !== row.lane ||
+            row.depth !== parent.depth + 1)) ||
+        (parent === null && row.depth !== 1)
+      ) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "rehashTranscriptNodesForMigration",
+            message: `Mini Lilac legacy transcript '${row.sessionId}' lane '${row.lane}' has an invalid parent`,
+          }),
+        );
+      }
+      const hash = new Bun.CryptoHasher("sha256")
+        .update(parent?.hash ?? "root")
+        .update("\0")
+        .update(row.valueJson)
+        .digest("hex");
+      updateHash.run(hash, row.id);
+      migrated.set(row.id, {
+        sessionId: row.sessionId,
+        lane: row.lane,
+        depth: row.depth,
+        hash,
+      });
+    }
+    return Result.ok(undefined);
+  }
+
+  private migrateSessionHistoryV4(
+    sessionId: string,
+  ): ResultType<void, MiniLilacSchemaMigrationFailure | PersistedDataError> {
     const session = z
       .object({
         id: z.string(),
@@ -2494,15 +2745,22 @@ export class MiniLilacSqliteStore {
           .get(sessionId),
       );
     let currentHeads = this.getTranscriptHeads(sessionId);
-    modelMessagesSchema.parse(
-      this.readSerializedChain(sessionId, "model", currentHeads.model_head_id).map(deserialize),
-    );
-    const migratedCurrentUi = parseMigratedUiMessages(
-      this.readSerializedChain(sessionId, "ui", currentHeads.ui_head_id).map(deserialize),
-    );
+    const currentModel = decodeMiniLilacModelTranscript({
+      rawValues: this.readSerializedChain(sessionId, "model", currentHeads.model_head_id),
+      schemaVersion: 4,
+      recordId: sessionId,
+    });
+    if (currentModel.status === "error") return Result.err(currentModel.error);
+    const decodedCurrentUi = decodeMiniLilacMigrationUiTranscript({
+      rawValues: this.readSerializedChain(sessionId, "ui", currentHeads.ui_head_id),
+      schemaVersion: 4,
+      recordId: sessionId,
+    });
+    if (decodedCurrentUi.status === "error") return Result.err(decodedCurrentUi.error);
+    const migratedCurrentUi = decodedCurrentUi.value.value;
     const currentUi = migratedCurrentUi.messages;
     if (migratedCurrentUi.changed) {
-      const uiHeadId = this.internChain(sessionId, "ui", currentUi);
+      const uiHeadId = this.internChain(sessionId, "ui", currentUi, false);
       this.setTranscriptHeads(sessionId, currentHeads.model_head_id, uiHeadId);
       currentHeads = { ...currentHeads, ui_head_id: uiHeadId };
     }
@@ -2532,36 +2790,65 @@ export class MiniLilacSqliteStore {
       (!hasActiveLifecycle && activeRootRuns.length > 0) ||
       (!hasActiveLifecycle && ["streaming", "cancelling"].includes(session.status))
     ) {
-      throw new Error(`Session '${sessionId}' has an invalid active root run during v4 migration`);
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSessionHistoryV4",
+          message: `Session '${sessionId}' has an invalid active root run during v4 migration`,
+        }),
+      );
     }
 
-    const parsedCheckpoints = checkpoints.map((checkpoint) => {
-      const run = migrationRunRowSchema.parse(
-        this.database
+    const parsedCheckpoints: Array<{
+      readonly row: z.output<typeof migrationCheckpointRowSchema>;
+      readonly run: MiniLilacMigrationRunRowProjection;
+      readonly message: MiniLilacUserUIMessage;
+      readonly uiPrefix: MiniLilacUIMessage[];
+    }> = [];
+    for (const checkpoint of checkpoints) {
+      const decodedRun = decodeMiniLilacMigrationRunRow({
+        row: this.database
           .query("SELECT id, status, parent_run_id FROM runs WHERE id = ? AND session_id = ?")
           .get(checkpoint.root_run_id, sessionId),
-      );
-      if (run.parent_run_id !== null) {
-        throw new Error(
-          `Checkpoint ${checkpoint.ui_position} for session '${sessionId}' references a child run`,
+        recordId: checkpoint.root_run_id,
+      });
+      if (decodedRun.status === "error") return Result.err(decodedRun.error);
+      if (decodedRun.value.parent_run_id !== null) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Checkpoint ${checkpoint.ui_position} for session '${sessionId}' references a child run`,
+          }),
         );
       }
-      modelMessagesSchema.parse(
-        this.readSerializedChain(sessionId, "model", checkpoint.model_head_id).map(deserialize),
-      );
-      const migratedUiPrefix = parseMigratedUiMessages(
-        this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id).map(deserialize),
-      );
+      const modelPrefix = decodeMiniLilacModelTranscript({
+        rawValues: this.readSerializedChain(sessionId, "model", checkpoint.model_head_id),
+        schemaVersion: 4,
+        recordId: `${sessionId}:${checkpoint.ui_position}:model`,
+      });
+      if (modelPrefix.status === "error") return Result.err(modelPrefix.error);
+      const decodedUiPrefix = decodeMiniLilacMigrationUiTranscript({
+        rawValues: this.readSerializedChain(sessionId, "ui", checkpoint.ui_head_id),
+        schemaVersion: 4,
+        recordId: `${sessionId}:${checkpoint.ui_position}:ui`,
+      });
+      if (decodedUiPrefix.status === "error") return Result.err(decodedUiPrefix.error);
+      const migratedUiPrefix = decodedUiPrefix.value.value;
       const uiHeadId = migratedUiPrefix.changed
-        ? this.internChain(sessionId, "ui", migratedUiPrefix.messages)
+        ? this.internChain(sessionId, "ui", migratedUiPrefix.messages, false)
         : checkpoint.ui_head_id;
-      return {
+      const decodedMessage = decodeMiniLilacMigrationUserUiMessage({
+        raw: checkpoint.user_message_json,
+        schemaVersion: 4,
+        recordId: `${sessionId}:${checkpoint.ui_position}:user`,
+      });
+      if (decodedMessage.status === "error") return Result.err(decodedMessage.error);
+      parsedCheckpoints.push({
         row: { ...checkpoint, ui_head_id: uiHeadId },
-        run,
-        message: parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json)),
+        run: decodedRun.value,
+        message: decodedMessage.value.value,
         uiPrefix: migratedUiPrefix.messages,
-      };
-    });
+      });
+    }
     if (hasActiveLifecycle) {
       const activeCheckpointIndex = parsedCheckpoints.findIndex(
         (checkpoint) => checkpoint.run.id === session.active_run_id,
@@ -2577,7 +2864,12 @@ export class MiniLilacSqliteStore {
           .slice(0, activeCheckpointIndex)
           .some((checkpoint) => checkpoint.run.status === "active")
       ) {
-        throw new Error(`Session '${sessionId}' cannot recover its active run from v4 checkpoints`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' cannot recover its active run from v4 checkpoints`,
+          }),
+        );
       }
     }
 
@@ -2614,7 +2906,7 @@ export class MiniLilacSqliteStore {
           "preserved its readable transcript as a single migration state with undo disabled",
       );
       this.insertMigratedSingleState(session, currentHeads);
-      return;
+      return Result.ok(undefined);
     }
 
     if (parsedCheckpoints.length === 0) {
@@ -2622,7 +2914,7 @@ export class MiniLilacSqliteStore {
         throw new Error(`Session '${sessionId}' has an active run without a v4 checkpoint`);
       }
       this.insertMigratedSingleState(session, currentHeads);
-      return;
+      return Result.ok(undefined);
     }
 
     const stateIds = parsedCheckpoints.map(() => randomUUID());
@@ -2703,6 +2995,7 @@ export class MiniLilacSqliteStore {
       )
       .run(sessionId, rootStateId, currentStateId, rootStateId, session.updated_at);
     this.assertStateConnectedToRoot(sessionId, currentStateId);
+    return Result.ok(undefined);
   }
 
   private insertMigratedSingleState(
@@ -2770,7 +3063,7 @@ export class MiniLilacSqliteStore {
     `);
   }
 
-  private migrateSchemaV2ToV3(): void {
+  private migrateSchemaV2ToV3(): ResultType<void, PersistedDataError> {
     this.database.exec(`
       CREATE TABLE transcript_nodes (
         id INTEGER PRIMARY KEY,
@@ -2831,8 +3124,19 @@ export class MiniLilacSqliteStore {
         )
         .all(sessionId)
         .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
-      modelMessagesSchema.parse(modelValues.map(deserialize));
-      const migratedUi = parseMigratedUiMessages(uiValues.map(deserialize));
+      const modelTranscript = decodeMiniLilacModelTranscript({
+        rawValues: modelValues,
+        schemaVersion: 2,
+        recordId: sessionId,
+      });
+      if (modelTranscript.status === "error") return Result.err(modelTranscript.error);
+      const decodedUi = decodeMiniLilacMigrationUiTranscript({
+        rawValues: uiValues,
+        schemaVersion: 2,
+        recordId: sessionId,
+      });
+      if (decodedUi.status === "error") return Result.err(decodedUi.error);
+      const migratedUi = decodedUi.value.value;
       const modelHeadId = this.internSerializedChain(sessionId, "model", modelValues);
       const uiHeadId = migratedUi.changed
         ? this.internChain(sessionId, "ui", migratedUi.messages)
@@ -2854,11 +3158,28 @@ export class MiniLilacSqliteStore {
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const checkpoint of checkpoints) {
-      const message = parseMigratedUserUiMessage(deserialize(checkpoint.user_message_json));
-      const modelPrefix = modelMessagesSchema.parse(deserialize(checkpoint.model_prefix_json));
-      const uiPrefix = parseMigratedUiMessages(
-        z.array(z.unknown()).parse(deserialize(checkpoint.ui_prefix_json)),
-      ).messages;
+      const recordId = `${checkpoint.session_id}:${checkpoint.ui_position}`;
+      const decodedMessage = decodeMiniLilacMigrationUserUiMessage({
+        raw: checkpoint.user_message_json,
+        schemaVersion: 2,
+        recordId: `${recordId}:user`,
+      });
+      if (decodedMessage.status === "error") return Result.err(decodedMessage.error);
+      const decodedModelPrefix = decodeMiniLilacMigrationModelPrefix({
+        raw: checkpoint.model_prefix_json,
+        schemaVersion: 2,
+        recordId: `${recordId}:model`,
+      });
+      if (decodedModelPrefix.status === "error") return Result.err(decodedModelPrefix.error);
+      const decodedUiPrefix = decodeMiniLilacMigrationUiPrefix({
+        raw: checkpoint.ui_prefix_json,
+        schemaVersion: 2,
+        recordId: `${recordId}:ui`,
+      });
+      if (decodedUiPrefix.status === "error") return Result.err(decodedUiPrefix.error);
+      const message = decodedMessage.value.value;
+      const modelPrefix = decodedModelPrefix.value.value;
+      const uiPrefix = decodedUiPrefix.value.value.messages;
       const modelHeadId = this.internChain(checkpoint.session_id, "model", modelPrefix);
       const uiHeadId = this.internChain(checkpoint.session_id, "ui", uiPrefix);
       insertCheckpoint.run(
@@ -2879,6 +3200,7 @@ export class MiniLilacSqliteStore {
       DROP TABLE ui_messages;
       ALTER TABLE user_checkpoints_v3 RENAME TO user_checkpoints;
     `);
+    return Result.ok(undefined);
   }
 
   close(): void {
@@ -2906,16 +3228,22 @@ export class MiniLilacSqliteStore {
   createSession(input: CreateStoredSession): MiniLilacSessionSnapshot {
     const now = new Date().toISOString();
     const canonicalCwd = canonicalizeStoredCwd(input.cwd);
-    this.database.transaction(() => {
+    this.runStoreTransaction("createSession", () => {
       this.database
         .query(
           `INSERT INTO workspaces (id, canonical_cwd, created_at)
            VALUES (?, ?, ?) ON CONFLICT(canonical_cwd) DO NOTHING`,
         )
         .run(randomUUID(), canonicalCwd, now);
-      const workspace = workspaceRowSchema.parse(
-        this.database.query("SELECT * FROM workspaces WHERE canonical_cwd = ?").get(canonicalCwd),
-      );
+      const decodedWorkspace = this.decodeRequiredStructuralHistoryRow({
+        kind: "workspace",
+        row: this.database
+          .query("SELECT * FROM workspaces WHERE canonical_cwd = ?")
+          .get(canonicalCwd),
+        recordId: input.id,
+      });
+      if (decodedWorkspace.status === "error") throw decodedWorkspace.error;
+      const workspace = decodedWorkspace.value;
       this.database
         .query(
           `INSERT INTO sessions
@@ -2954,7 +3282,7 @@ export class MiniLilacSqliteStore {
            VALUES (?, ?, ?, ?, ?)`,
         )
         .run(input.id, rootStateId, rootStateId, rootStateId, now);
-    })();
+    });
     return this.getSession(input.id);
   }
 
@@ -3042,7 +3370,7 @@ export class MiniLilacSqliteStore {
     bindings: StoredSessionBindingUpdate,
   ): MiniLilacSessionSnapshot {
     const command = canonicalCommandPayload(request.payload);
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("updateSessionBindings", () => {
       const previous = this.getCommandResult(sessionId, commandId, request);
       if (previous !== undefined) return miniLilacSessionSnapshotSchema.parse(previous);
       const snapshot = this.getSession(sessionId);
@@ -3104,7 +3432,7 @@ export class MiniLilacSqliteStore {
           now,
         );
       return result;
-    })();
+    });
   }
 
   createRun(input: CreateStoredRun): StoredRun {
@@ -3191,24 +3519,20 @@ export class MiniLilacSqliteStore {
   }
 
   getTodos(sessionId: string): MiniLilacTodoState {
-    const session = this.database.query("SELECT 1 FROM sessions WHERE id = ?").get(sessionId);
-    if (!session) throw new Error(`Session '${sessionId}' was not found`);
-    const value = this.database
-      .query("SELECT revision, todos_json FROM session_todos WHERE session_id = ?")
-      .get(sessionId);
-    if (!value) return miniLilacTodoStateSchema.parse({ revision: 0, todos: [] });
-    const row = todosRowSchema.parse(value);
-    return miniLilacTodoStateSchema.parse({
-      revision: row.revision,
-      todos: JSON.parse(row.todos_json),
-    });
+    const result = this.getTodosResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getTodosResult(sessionId: string): ResultType<MiniLilacTodoState, MiniLilacPersistenceError> {
+    return readMiniLilacTodos(this.database, sessionId);
   }
 
   replaceTodosForRun(input: ReplaceTodosForRun): ReplaceTodosForRunResult {
     const todos = miniLilacTodosSchema.parse(input.todos);
     const todosJson = JSON.stringify(canonicalJsonValue(todos));
 
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("replaceTodosForRun", () => {
       const activeRun = this.database
         .query(
           `SELECT 1
@@ -3244,66 +3568,235 @@ export class MiniLilacSqliteStore {
         .get(input.sessionId, todosJson, now);
       if (!updatedValue) return { state: this.getTodos(input.sessionId) };
 
-      const updated = todosRowSchema.parse(updatedValue);
-      const state = miniLilacTodoStateSchema.parse({
-        revision: updated.revision,
-        todos: JSON.parse(updated.todos_json),
+      const decodedState = decodeMiniLilacTodos({
+        row: updatedValue,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: input.sessionId,
       });
+      if (decodedState.status === "error") throw decodedState.error;
+      const state = decodedState.value.value;
       this.database
         .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
         .run(now, input.sessionId);
       return { state };
-    })();
+    });
   }
 
-  private runImmediateTransaction<T>(operation: () => T): T {
-    return this.database.transaction(operation).immediate();
+  private runStoreTransaction<T>(operationName: string, operation: () => T): T {
+    const result = this.runStoreTransactionResult(operationName, () => Result.ok(operation()));
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  private runStoreTransactionResult<T, E>(
+    operationName: string,
+    operation: () => ResultType<T, E>,
+  ): ResultType<T, E | MiniLilacSqliteDriverFailure> {
+    this.transactionDepth += 1;
+    try {
+      return runBunSqliteTransaction(this.database, operation, (cause) =>
+        classifyMiniLilacSqliteDriverFailure(operationName, cause),
+      );
+    } finally {
+      this.transactionDepth -= 1;
+      if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
+    }
+  }
+
+  private decodeStructuralHistoryRow<K extends MiniLilacStructuralHistoryRecordKind>(input: {
+    readonly kind: K;
+    readonly row: unknown;
+    readonly recordId: string;
+  }): ResultType<MiniLilacStructuralHistoryValueByKind[K] | null, PersistedDataError> {
+    const decoded = decodeMiniLilacStructuralHistoryRow({
+      ...input,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      this.queuePersistenceDiagnostic(decoded.error);
+      return Result.err(decoded.error);
+    }
+    if (decoded.value.value === null) return Result.ok(null);
+    // The codec preserves the input kind; this bridges that correlation, which
+    // TypeScript cannot retain through the generic Extract-based predicate.
+    return Result.ok(decoded.value.value.value as MiniLilacStructuralHistoryValueByKind[K]);
+  }
+
+  private decodeRequiredStructuralHistoryRow<
+    K extends MiniLilacStructuralHistoryRecordKind,
+  >(input: {
+    readonly kind: K;
+    readonly row: unknown;
+    readonly recordId: string;
+  }): ResultType<
+    MiniLilacStructuralHistoryValueByKind[K],
+    PersistedDataError | MiniLilacHistoryRecordMissing
+  > {
+    const decoded = this.decodeStructuralHistoryRow(input);
+    if (decoded.status === "error") return Result.err(decoded.error);
+    if (decoded.value !== null) return Result.ok(decoded.value);
+    return Result.err(
+      new MiniLilacHistoryRecordMissing({
+        recordKind: input.kind,
+        recordId: input.recordId.slice(0, 128),
+        message: `Mini Lilac ${input.kind} record was not found`,
+      }),
+    );
+  }
+
+  private runHistoryReadResult<T, E>(
+    operationName: string,
+    operation: () => ResultType<T, E>,
+  ): ResultType<T, E | MiniLilacSqliteDriverFailure> {
+    try {
+      return operation();
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      const failure = classifyMiniLilacSqliteDriverFailure(operationName, cause);
+      if (failure !== undefined) return Result.err(failure);
+      throw cause;
+    } finally {
+      if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
+    }
+  }
+
+  private flushPersistenceDiagnostics(): void {
+    for (const diagnostic of this.pendingPersistenceDiagnostics.splice(0)) {
+      this.onPersistenceDiagnostic(diagnostic);
+    }
+  }
+
+  private queuePersistenceDiagnostic(error: PersistedDataError): void {
+    this.pendingPersistenceDiagnostics.push({
+      table: error.table,
+      field: error.field,
+      version: error.version,
+      issueCode: error.issueCode,
+      recordId: error.recordId,
+      message: error.message,
+    });
   }
 
   getHistoryStoreMetadata(): StoredHistoryStoreMetadata {
-    const row = historyStoreMetadataRowSchema.parse(
-      this.database
-        .query("SELECT namespace_id, created_at FROM history_store_metadata WHERE singleton = 1")
-        .get(),
+    const result = this.getHistoryStoreMetadataResult();
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryStoreMetadataResult(): ResultType<
+    StoredHistoryStoreMetadata,
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("getHistoryStoreMetadata", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "store-metadata",
+        row: this.database
+          .query("SELECT namespace_id, created_at FROM history_store_metadata WHERE singleton = 1")
+          .get(),
+        recordId: "singleton",
+      }),
     );
-    return { namespaceId: row.namespace_id, createdAt: row.created_at };
   }
 
   getWorkspaceForSession(sessionId: string): StoredWorkspace {
-    const row = this.database
-      .query(
-        `SELECT workspaces.* FROM sessions
-         JOIN workspaces ON workspaces.id = sessions.workspace_id
-         WHERE sessions.id = ?`,
-      )
-      .get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' was not found`);
-    return toWorkspace(row);
+    const result = this.getWorkspaceForSessionResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getWorkspaceForSessionResult(
+    sessionId: string,
+  ): ResultType<StoredWorkspace, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getWorkspaceForSession", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "workspace",
+        row: this.database
+          .query(
+            `SELECT workspaces.* FROM sessions
+             JOIN workspaces ON workspaces.id = sessions.workspace_id
+             WHERE sessions.id = ?`,
+          )
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   listWorkspaces(): readonly StoredWorkspace[] {
-    return this.database
-      .query("SELECT * FROM workspaces ORDER BY created_at, rowid")
-      .all()
-      .map(toWorkspace);
+    const result = this.listWorkspacesResult();
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listWorkspacesResult(): ResultType<readonly StoredWorkspace[], MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("listWorkspaces", () => {
+      const workspaces: StoredWorkspace[] = [];
+      for (const [index, row] of this.database
+        .query("SELECT * FROM workspaces ORDER BY created_at, rowid")
+        .all()
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "workspace",
+          row,
+          recordId: `workspace:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        workspaces.push(decoded.value);
+      }
+      return Result.ok(workspaces);
+    });
   }
 
   listWorkspaceSnapshots(workspaceId: string): readonly StoredWorkspaceSnapshot[] {
-    z.string().min(1).parse(workspaceId);
-    return this.database
-      .query(
-        `SELECT * FROM workspace_snapshots
-         WHERE workspace_id = ? ORDER BY created_at, rowid`,
-      )
-      .all(workspaceId)
-      .map(toWorkspaceSnapshot);
+    const result = this.listWorkspaceSnapshotsResult(workspaceId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listWorkspaceSnapshotsResult(
+    workspaceId: string,
+  ): ResultType<readonly StoredWorkspaceSnapshot[], MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("listWorkspaceSnapshots", () => {
+      const snapshots: StoredWorkspaceSnapshot[] = [];
+      for (const [index, row] of this.database
+        .query(
+          `SELECT * FROM workspace_snapshots
+           WHERE workspace_id = ? ORDER BY created_at, rowid`,
+        )
+        .all(workspaceId)
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "workspace-snapshot",
+          row,
+          recordId: `${workspaceId}:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        snapshots.push(decoded.value);
+      }
+      return Result.ok(snapshots);
+    });
   }
 
   listWorkspaceSnapshotGroups(): readonly StoredWorkspaceSnapshotGroup[] {
-    return this.listWorkspaces().map((workspace) => ({
-      workspace,
-      snapshots: this.listWorkspaceSnapshots(workspace.id),
-    }));
+    const result = this.listWorkspaceSnapshotGroupsResult();
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listWorkspaceSnapshotGroupsResult(): ResultType<
+    readonly StoredWorkspaceSnapshotGroup[],
+    MiniLilacPersistenceError
+  > {
+    const workspaces = this.listWorkspacesResult();
+    if (workspaces.status === "error") return Result.err(workspaces.error);
+    const groups: StoredWorkspaceSnapshotGroup[] = [];
+    for (const workspace of workspaces.value) {
+      const snapshots = this.listWorkspaceSnapshotsResult(workspace.id);
+      if (snapshots.status === "error") return Result.err(snapshots.error);
+      groups.push({ workspace, snapshots: snapshots.value });
+    }
+    return Result.ok(groups);
   }
 
   setWorkspaceSnapshotAvailability(input: SetStoredWorkspaceSnapshotAvailability): void {
@@ -3312,7 +3805,7 @@ export class MiniLilacSqliteStore {
     if (new Set(updates.map((update) => update.snapshotId)).size !== updates.length) {
       throw new Error("Workspace snapshot availability updates contain duplicate snapshot IDs");
     }
-    this.runImmediateTransaction(() => {
+    this.runStoreTransaction("setWorkspaceSnapshotAvailability", () => {
       const workspace = this.database
         .query("SELECT 1 FROM workspaces WHERE id = ?")
         .get(input.workspaceId);
@@ -3344,7 +3837,7 @@ export class MiniLilacSqliteStore {
     if (snapshotIds && new Set(snapshotIds).size !== snapshotIds.length) {
       throw new Error("Unreferenced workspace snapshot deletion contains duplicate snapshot IDs");
     }
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("deleteUnreferencedWorkspaceSnapshots", () => {
       const workspace = this.database
         .query("SELECT 1 FROM workspaces WHERE id = ?")
         .get(input.workspaceId);
@@ -3394,7 +3887,7 @@ export class MiniLilacSqliteStore {
     z.string().min(1).parse(input.rootTreeOid);
     z.string().min(1).parse(input.gitRef);
     z.number().int().positive().parse(input.formatVersion);
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("createOrReuseWorkspaceSnapshot", () => {
       this.database
         .query(
           `INSERT INTO workspace_snapshots
@@ -3424,49 +3917,143 @@ export class MiniLilacSqliteStore {
            WHERE workspace_id = ? AND root_tree_oid = ? AND format_version = ?`,
         )
         .get(input.workspaceId, input.rootTreeOid, input.formatVersion);
-      return toWorkspaceSnapshot(row);
-    })();
+      const decoded = this.decodeRequiredStructuralHistoryRow({
+        kind: "workspace-snapshot",
+        row,
+        recordId: input.id,
+      });
+      if (decoded.status === "error") throw decoded.error;
+      return decoded.value;
+    });
   }
 
   getWorkspaceSnapshot(snapshotId: string): StoredWorkspaceSnapshot | null {
-    z.string().min(1).parse(snapshotId);
-    const row = this.database
-      .query("SELECT * FROM workspace_snapshots WHERE id = ?")
-      .get(snapshotId);
-    return row ? toWorkspaceSnapshot(row) : null;
+    const result = this.getWorkspaceSnapshotResult(snapshotId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getWorkspaceSnapshotResult(
+    snapshotId: string,
+  ): ResultType<StoredWorkspaceSnapshot | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getWorkspaceSnapshot", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "workspace-snapshot",
+        row: this.database.query("SELECT * FROM workspace_snapshots WHERE id = ?").get(snapshotId),
+        recordId: snapshotId,
+      }),
+    );
   }
 
   getHistoryState(stateId: string): StoredHistoryState {
-    const row = this.database.query("SELECT * FROM history_states WHERE id = ?").get(stateId);
-    if (!row) throw new Error(`History state '${stateId}' was not found`);
-    return toHistoryState(row);
+    const result = this.getHistoryStateResult(stateId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryStateResult(
+    stateId: string,
+  ): ResultType<StoredHistoryState, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getHistoryState", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "state",
+        row: this.database.query("SELECT * FROM history_states WHERE id = ?").get(stateId),
+        recordId: stateId,
+      }),
+    );
   }
 
   getHistoryStateModelMessages(stateId: string): ModelMessage[] {
-    const state = this.getHistoryState(stateId);
-    return modelMessagesSchema.parse(
-      this.readSerializedChain(state.sessionId, "model", state.modelHeadId).map(deserialize),
-    );
+    const result = this.getHistoryStateModelMessagesResult(stateId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryStateModelMessagesResult(
+    stateId: string,
+  ): ResultType<ModelMessage[], MiniLilacPersistenceError> {
+    const state = this.getHistoryStateResult(stateId);
+    if (state.status === "error") return Result.err(state.error);
+    return this.runHistoryReadResult("getHistoryStateModelMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        state.value.sessionId,
+        "model",
+        state.value.modelHeadId,
+      );
+      if (rawValues.status === "error") {
+        this.queuePersistenceDiagnostic(rawValues.error);
+        return Result.err(rawValues.error);
+      }
+      const decoded = decodeMiniLilacModelTranscript({
+        rawValues: rawValues.value,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: state.value.id,
+      });
+      if (decoded.status === "error") {
+        this.queuePersistenceDiagnostic(decoded.error);
+        return Result.err(decoded.error);
+      }
+      return Result.ok(decoded.value.value);
+    });
   }
 
   getHistoryStateUiMessages(stateId: string): MiniLilacUIMessage[] {
-    const state = this.getHistoryState(stateId);
-    return miniLilacMessagesSchema.parse(
-      this.readSerializedChain(state.sessionId, "ui", state.uiHeadId).map(deserialize),
-    );
+    const result = this.getHistoryStateUiMessagesResult(stateId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryStateUiMessagesResult(
+    stateId: string,
+  ): ResultType<MiniLilacUIMessage[], MiniLilacPersistenceError> {
+    const state = this.getHistoryStateResult(stateId);
+    if (state.status === "error") return Result.err(state.error);
+    return this.runHistoryReadResult("getHistoryStateUiMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        state.value.sessionId,
+        "ui",
+        state.value.uiHeadId,
+      );
+      if (rawValues.status === "error") {
+        this.queuePersistenceDiagnostic(rawValues.error);
+        return Result.err(rawValues.error);
+      }
+      const decoded = decodeMiniLilacUiTranscript({
+        rawValues: rawValues.value,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: state.value.id,
+      });
+      if (decoded.status === "error") {
+        this.queuePersistenceDiagnostic(decoded.error);
+        return Result.err(decoded.error);
+      }
+      return Result.ok(decoded.value.value);
+    });
   }
 
   getCurrentHistoryState(sessionId: string): StoredHistoryState {
-    const row = this.database
-      .query(
-        `SELECT state.* FROM session_history AS history
-         JOIN history_states AS state
-           ON state.id = history.current_state_id AND state.session_id = history.session_id
-         WHERE history.session_id = ?`,
-      )
-      .get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' has no history cursor`);
-    return toHistoryState(row);
+    const result = this.getCurrentHistoryStateResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getCurrentHistoryStateResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryState, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getCurrentHistoryState", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "state",
+        row: this.database
+          .query(
+            `SELECT state.* FROM session_history AS history
+             JOIN history_states AS state
+               ON state.id = history.current_state_id AND state.session_id = history.session_id
+             WHERE history.session_id = ?`,
+          )
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   getMiniMainClaudeState(inputValue: {
@@ -3475,7 +4062,7 @@ export class MiniLilacSqliteStore {
     readonly providerId: string;
   }): MiniMainClaudeState {
     const input = miniMainClaudeStateLookupSchema.parse(inputValue);
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("getMiniMainClaudeState", () => {
       const row = this.database
         .query("SELECT * FROM history_states WHERE id = ? AND session_id = ?")
         .get(input.historyStateId, input.sessionId);
@@ -3484,7 +4071,13 @@ export class MiniLilacSqliteStore {
           `History state '${input.historyStateId}' does not belong to session '${input.sessionId}'`,
         );
       }
-      const historyState = toHistoryState(row);
+      const decodedState = this.decodeRequiredStructuralHistoryRow({
+        kind: "state",
+        row,
+        recordId: input.historyStateId,
+      });
+      if (decodedState.status === "error") throw decodedState.error;
+      const historyState = decodedState.value;
       const bindingRow = this.database
         .query(
           `SELECT * FROM mini_main_claude_bindings
@@ -3496,7 +4089,7 @@ export class MiniLilacSqliteStore {
         providerState: historyState.providerState,
         binding: bindingRow ? toMiniMainClaudeBinding(bindingRow) : null,
       };
-    })();
+    });
   }
 
   getMiniMainClaudeSessionAttempt(inputValue: {
@@ -3522,7 +4115,7 @@ export class MiniLilacSqliteStore {
     if ((input.sourceSessionId === null) !== (input.expectedBindingRevision === null)) {
       throw new Error("A Claude fork attempt requires both source session and binding revision");
     }
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("reserveMiniMainClaudeSessionAttempt", () => {
       const source = this.getMiniMainClaudeState({
         sessionId: input.lilacSessionId,
         historyStateId: input.sourceHistoryStateId,
@@ -3594,7 +4187,7 @@ export class MiniLilacSqliteStore {
     inputValue: RecordMiniMainClaudeSessionAttemptOutcome,
   ): MiniMainClaudeSessionAttempt {
     const input = recordMiniMainClaudeSessionAttemptOutcomeSchema.parse(inputValue);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("recordMiniMainClaudeSessionAttemptOutcome", () => {
       const attemptKey = {
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
@@ -3710,7 +4303,7 @@ export class MiniLilacSqliteStore {
     inputValue: ReserveMiniNamedClaudeSessionAttempt,
   ): MiniNamedClaudeSessionAttempt {
     const input = reserveMiniNamedClaudeSessionAttemptSchema.parse(inputValue);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("reserveMiniNamedClaudeSessionAttempt", () => {
       const source = this.getHistoryState(input.sourceHistoryStateId);
       if (source.sessionId !== input.lilacSessionId) {
         throw new Error(
@@ -3790,7 +4383,7 @@ export class MiniLilacSqliteStore {
     inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
   ): MiniNamedClaudeSessionAttempt {
     const input = recordMiniNamedClaudeSessionAttemptOutcomeSchema.parse(inputValue);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("recordMiniNamedClaudeSessionAttemptOutcome", () => {
       const attemptKey = {
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
@@ -3831,26 +4424,62 @@ export class MiniLilacSqliteStore {
   }
 
   getSessionHistory(sessionId: string): StoredSessionHistory {
-    const row = this.database
-      .query("SELECT * FROM session_history WHERE session_id = ?")
-      .get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' has no history cursor`);
-    return toSessionHistory(row);
+    const result = this.getSessionHistoryResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getSessionHistoryResult(
+    sessionId: string,
+  ): ResultType<StoredSessionHistory, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getSessionHistory", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "session-history",
+        row: this.database
+          .query("SELECT * FROM session_history WHERE session_id = ?")
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   getHistoryNavigation(sessionId: string): StoredHistoryNavigation {
-    const history = this.getSessionHistory(sessionId);
-    return {
-      currentStateId: history.currentStateId,
-      canUndo: this.findLatestUndoableUserTransition(sessionId) !== null,
-      canRedo: this.peekHistoryRedo(sessionId) !== null,
-    };
+    const result = this.getHistoryNavigationResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryNavigationResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryNavigation, MiniLilacPersistenceError> {
+    const history = this.getSessionHistoryResult(sessionId);
+    if (history.status === "error") return Result.err(history.error);
+    const undo = this.findLatestUndoableUserTransitionResult(sessionId);
+    if (undo.status === "error") return Result.err(undo.error);
+    const redo = this.peekHistoryRedoResult(sessionId);
+    if (redo.status === "error") return Result.err(redo.error);
+    return Result.ok({
+      currentStateId: history.value.currentStateId,
+      canUndo: undo.value !== null,
+      canRedo: redo.value !== null,
+    });
   }
 
   findLatestUndoableUserTransition(sessionId: string): StoredHistoryTransition | null {
-    const row = this.database
-      .query(
-        `WITH RECURSIVE ancestry(state_id, distance, floor_state_id) AS (
+    const result = this.findLatestUndoableUserTransitionResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  findLatestUndoableUserTransitionResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryTransition | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("findLatestUndoableUserTransition", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "transition",
+        row: this.database
+          .query(
+            `WITH RECURSIVE ancestry(state_id, distance, floor_state_id) AS (
            SELECT current_state_id, 0, undo_floor_state_id
            FROM session_history WHERE session_id = ?
            UNION ALL
@@ -3868,51 +4497,119 @@ export class MiniLilacSqliteStore {
            AND transition.kind = 'user-message'
          ORDER BY ancestry.distance
          LIMIT 1`,
-      )
-      .get(sessionId, sessionId, sessionId);
-    return row ? toHistoryTransition(row) : null;
+          )
+          .get(sessionId, sessionId, sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   peekHistoryRedo(sessionId: string): StoredHistoryRedoEntry | null {
-    const row = this.database
-      .query(
-        `SELECT * FROM history_redo_stack
-         WHERE session_id = ? ORDER BY position DESC LIMIT 1`,
-      )
-      .get(sessionId);
-    return row ? toHistoryRedoEntry(row) : null;
+    const result = this.peekHistoryRedoResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  peekHistoryRedoResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryRedoEntry | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("peekHistoryRedo", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "redo",
+        row: this.database
+          .query(
+            `SELECT * FROM history_redo_stack
+             WHERE session_id = ? ORDER BY position DESC LIMIT 1`,
+          )
+          .get(sessionId),
+        recordId: sessionId,
+      }),
+    );
   }
 
   listHistoryTopology(sessionId: string): StoredHistoryTopology {
-    return {
-      history: this.getSessionHistory(sessionId),
-      states: this.database
+    const result = this.listHistoryTopologyResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listHistoryTopologyResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryTopology, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("listHistoryTopology", () => {
+      const history = this.getSessionHistoryResult(sessionId);
+      if (history.status === "error") return Result.err(history.error);
+      const states: StoredHistoryState[] = [];
+      for (const [index, row] of this.database
         .query("SELECT * FROM history_states WHERE session_id = ? ORDER BY created_at, rowid")
         .all(sessionId)
-        .map(toHistoryState),
-      transitions: this.database
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "state",
+          row,
+          recordId: `${sessionId}:state:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        states.push(decoded.value);
+      }
+      const transitions: StoredHistoryTransition[] = [];
+      for (const [index, row] of this.database
         .query("SELECT * FROM history_transitions WHERE session_id = ? ORDER BY created_at, rowid")
         .all(sessionId)
-        .map(toHistoryTransition),
-      redoStack: this.database
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "transition",
+          row,
+          recordId: `${sessionId}:transition:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        transitions.push(decoded.value);
+      }
+      const redoStack: StoredHistoryRedoEntry[] = [];
+      for (const [index, row] of this.database
         .query("SELECT * FROM history_redo_stack WHERE session_id = ? ORDER BY position")
         .all(sessionId)
-        .map(toHistoryRedoEntry),
-    };
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "redo",
+          row,
+          recordId: `${sessionId}:redo:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        redoStack.push(decoded.value);
+      }
+      return Result.ok({ history: history.value, states, transitions, redoStack });
+    });
   }
 
   getHistoryAccounting(workspaceId?: string): StoredHistoryAccounting {
-    const filter = workspaceId === undefined ? null : z.string().min(1).parse(workspaceId);
+    const result = this.getHistoryAccountingResult(workspaceId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryAccountingResult(
+    workspaceId?: string,
+  ): ResultType<StoredHistoryAccounting, MiniLilacPersistenceError> {
+    const filter = workspaceId ?? null;
     if (
       filter !== null &&
       !this.database.query("SELECT 1 FROM workspaces WHERE id = ?").get(filter)
     ) {
-      throw new Error(`Workspace '${filter}' was not found`);
+      return Result.err(
+        new MiniLilacHistoryRecordMissing({
+          recordKind: "workspace",
+          recordId: filter,
+          message: `Workspace '${filter}' was not found`,
+        }),
+      );
     }
-    const row = historyAccountingRowSchema.parse(
-      this.database
-        .query(
-          `WITH workspace_filter(workspace_id) AS (VALUES (?))
+    return this.runHistoryReadResult("getHistoryAccounting", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "accounting",
+        row: this.database
+          .query(
+            `WITH workspace_filter(workspace_id) AS (VALUES (?))
            SELECT
              (SELECT COUNT(*) FROM history_states AS state, workspace_filter AS filter
               WHERE filter.workspace_id IS NULL OR state.workspace_id = filter.workspace_id)
@@ -3948,18 +4645,11 @@ export class MiniLilacSqliteStore {
               WHERE filter.workspace_id IS NULL
                 OR finalization.workspace_id = filter.workspace_id)
                AS pending_finalization_count`,
-        )
-        .get(filter),
+          )
+          .get(filter),
+        recordId: filter ?? "all",
+      }),
     );
-    return {
-      stateCount: row.state_count,
-      transitionCount: row.transition_count,
-      branchTipCount: row.branch_tip_count,
-      snapshotCount: row.snapshot_count,
-      redoStackCount: row.redo_stack_count,
-      activeOperationCount: row.active_operation_count,
-      pendingFinalizationCount: row.pending_finalization_count,
-    };
   }
 
   internHistoryTranscriptHeads(
@@ -3970,10 +4660,10 @@ export class MiniLilacSqliteStore {
     modelMessagesSchema.parse(modelMessages);
     miniLilacMessagesSchema.parse(uiMessages);
     this.getSession(sessionId);
-    return this.database.transaction(() => ({
+    return this.runStoreTransaction("internHistoryTranscriptHeads", () => ({
       modelHeadId: this.internChain(sessionId, "model", modelMessages),
       uiHeadId: this.internChain(sessionId, "ui", uiMessages),
-    }))();
+    }));
   }
 
   admitRootPromptHistory(input: AdmitStoredRootPromptHistory): AdmittedStoredRootPromptHistory {
@@ -3988,7 +4678,7 @@ export class MiniLilacSqliteStore {
       throw new Error("Root prompt history admission requires a final model user message");
     }
     const command = canonicalCommandPayload(input.commandPayload);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("admitRootPromptHistory", () => {
       this.requireQuiescentHistorySession(input.run.sessionId, input.expectedCurrentStateId);
       const workspace = this.getWorkspaceForSession(input.run.sessionId);
       this.assertWorkspaceHasNoHistoryJournal(workspace.id);
@@ -4127,7 +4817,7 @@ export class MiniLilacSqliteStore {
         throw new Error("Steering entries must be the exact final canonical model suffix");
       }
     });
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("commitSteeringHistoryBoundary", () => {
       const session = this.getSession(input.sessionId);
       const activeRun = this.getActiveRootRun(input.sessionId);
       if (
@@ -4178,9 +4868,13 @@ export class MiniLilacSqliteStore {
           historyProviderStateSchema.parse(input.providerState),
         );
       }
-      const fromUiMessages = miniLilacMessagesSchema.parse(
-        this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId).map(deserialize),
-      );
+      const decodedFromUiMessages = decodeMiniLilacUiTranscript({
+        rawValues: this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: fromState.id,
+      });
+      if (decodedFromUiMessages.status === "error") throw decodedFromUiMessages.error;
+      const fromUiMessages = decodedFromUiMessages.value.value;
       if (
         previous.userMessage === null ||
         !canonicalValuesEqual(canonicalUiMessages[fromUiMessages.length], previous.userMessage) ||
@@ -4212,9 +4906,13 @@ export class MiniLilacSqliteStore {
             `Steering command '${entry.commandId}' is not admitted for this root run`,
           );
         }
-        const commandPayload = storedSteeringCommandPayloadSchema.parse(
-          z.json().parse(JSON.parse(commandRow.request_json)),
-        );
+        const decodedCommandPayload = decodeMiniLilacSteeringCommandRequest({
+          raw: commandRow.request_json,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: entry.commandId,
+        });
+        if (decodedCommandPayload.status === "error") throw decodedCommandPayload.error;
+        const commandPayload = decodedCommandPayload.value.value;
         if (
           !canonicalValuesEqual(commandPayload.message, entry.message) ||
           (commandPayload.sessionId !== undefined &&
@@ -4320,7 +5018,7 @@ export class MiniLilacSqliteStore {
       throw new Error("History compaction requires a session-scoped compact command");
     }
     const command = canonicalCommandPayload(input.request.payload);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("commitHistoryCompaction", () => {
       this.requireQuiescentHistorySession(input.sessionId, input.expectedCurrentStateId, [
         "idle",
         "error",
@@ -4455,7 +5153,7 @@ export class MiniLilacSqliteStore {
     readonly select?: boolean;
     readonly clearRedo?: boolean;
   }): { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition } {
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("appendHistoryTransition", () => {
       if (input.state.sessionId !== input.transition.sessionId) {
         throw new Error(`History transition '${input.transition.id}' crosses sessions`);
       }
@@ -4492,7 +5190,7 @@ export class MiniLilacSqliteStore {
         state: this.getHistoryState(input.state.id),
         transition: this.getHistoryTransition(input.transition.id),
       };
-    })();
+    });
   }
 
   private closeHistoryTransition(
@@ -4500,7 +5198,7 @@ export class MiniLilacSqliteStore {
     destination: CreateStoredHistoryState,
     options: { readonly select?: boolean; readonly clearRedo?: boolean } = {},
   ): StoredHistoryTransition {
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("closeHistoryTransition", () => {
       const transition = this.getHistoryTransition(transitionId);
       if (transition.toStateId !== null || transition.kind !== "user-message") {
         throw new Error(`History transition '${transitionId}' is not an open user transition`);
@@ -4554,11 +5252,11 @@ export class MiniLilacSqliteStore {
           .run(destination.id, new Date().toISOString(), transition.sessionId);
       }
       return this.getHistoryTransition(transitionId);
-    })();
+    });
   }
 
   private setHistoryUndoFloor(sessionId: string, stateId: string): void {
-    this.database.transaction(() => {
+    this.runStoreTransaction("setHistoryUndoFloor", () => {
       const state = this.getHistoryState(stateId);
       if (state.sessionId !== sessionId) {
         throw new Error(`History state '${stateId}' does not belong to session '${sessionId}'`);
@@ -4575,7 +5273,7 @@ export class MiniLilacSqliteStore {
         )
         .run(stateId, new Date().toISOString(), sessionId);
       if (updated.changes !== 1) throw new Error(`Session '${sessionId}' has no history cursor`);
-    })();
+    });
   }
 
   private pushHistoryRedo(
@@ -4583,7 +5281,7 @@ export class MiniLilacSqliteStore {
     targetStateId: string,
     userTransitionId: string,
   ): StoredHistoryRedoEntry {
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("pushHistoryRedo", () => {
       const target = this.getHistoryState(targetStateId);
       const transition = this.getHistoryTransition(userTransitionId);
       if (
@@ -4614,18 +5312,18 @@ export class MiniLilacSqliteStore {
       const entry = this.peekHistoryRedo(sessionId);
       if (entry === null) throw new Error(`Redo entry for session '${sessionId}' was not created`);
       return entry;
-    })();
+    });
   }
 
   private popHistoryRedo(sessionId: string): StoredHistoryRedoEntry | null {
-    return this.database.transaction(() => {
+    return this.runStoreTransaction("popHistoryRedo", () => {
       const entry = this.peekHistoryRedo(sessionId);
       if (entry === null) return null;
       this.database
         .query("DELETE FROM history_redo_stack WHERE session_id = ? AND position = ?")
         .run(sessionId, entry.position);
       return entry;
-    })();
+    });
   }
 
   private clearHistoryRedo(sessionId: string): void {
@@ -4654,7 +5352,7 @@ export class MiniLilacSqliteStore {
       throw new Error("Empty history navigation must persist an empty result");
     }
     const canonicalCommand = canonicalCommandPayload(input.request.payload);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("commitEmptyHistoryNavigation", () => {
       const command = this.getStoredCommand(input.sessionId, input.commandId);
       if (
         command.kind !== input.requestedAction ||
@@ -4665,9 +5363,16 @@ export class MiniLilacSqliteStore {
         throw new Error(`Command '${input.commandId}' does not own this history navigation`);
       }
       if (command.result_json !== null) {
+        const decodedResult = decodeMiniLilacSuperJsonPayload({
+          raw: command.result_json,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: input.commandId,
+          field: "command_result",
+        });
+        if (decodedResult.status === "error") throw decodedResult.error;
         const replayed = this.parseHistoryNavigationResult(
           input.requestedAction,
-          deserialize(command.result_json),
+          decodedResult.value.value,
           input.commandId,
           null,
         );
@@ -4720,7 +5425,7 @@ export class MiniLilacSqliteStore {
     }
     if (input.filesystemMode === "skip") historySkipReasonSchema.parse(input.skipReason);
     if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("reserveHistoryOperation", () => {
       this.requireQuiescentHistorySession(input.sessionId, input.expectedSourceStateId);
       const workspace = this.getWorkspaceForSession(input.sessionId);
       this.assertWorkspaceHasNoHistoryJournal(workspace.id);
@@ -4821,17 +5526,49 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryOperation(operationId: string): StoredHistoryOperation | null {
-    const row = this.database
-      .query("SELECT * FROM history_operations WHERE id = ?")
-      .get(operationId);
-    return row ? toHistoryOperation(row) : null;
+    const result = this.getHistoryOperationResult(operationId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryOperationResult(
+    operationId: string,
+  ): ResultType<StoredHistoryOperation | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getHistoryOperation", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "operation",
+        row: this.database.query("SELECT * FROM history_operations WHERE id = ?").get(operationId),
+        recordId: operationId,
+      }),
+    );
   }
 
   listHistoryOperations(): readonly StoredHistoryOperation[] {
-    return this.database
-      .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
-      .all()
-      .map(toHistoryOperation);
+    const result = this.listHistoryOperationsResult();
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listHistoryOperationsResult(): ResultType<
+    readonly StoredHistoryOperation[],
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("listHistoryOperations", () => {
+      const operations: StoredHistoryOperation[] = [];
+      for (const [index, row] of this.database
+        .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
+        .all()
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "operation",
+          row,
+          recordId: `operation:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        operations.push(decoded.value);
+      }
+      return Result.ok(operations);
+    });
   }
 
   skipPreparedHistoryRestore(
@@ -4839,7 +5576,7 @@ export class MiniLilacSqliteStore {
     reasonValue: z.infer<typeof historySkipReasonSchema>,
   ): StoredHistoryOperation {
     const reason = historySkipReasonSchema.parse(reasonValue);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("skipPreparedHistoryRestore", () => {
       const operation = this.getHistoryOperation(operationId);
       if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
       if (operation.filesystemMode !== "restore" || operation.phase !== "prepared") {
@@ -4866,7 +5603,7 @@ export class MiniLilacSqliteStore {
     phaseValue: z.infer<typeof historyOperationPhaseSchema>,
   ): StoredHistoryOperation {
     const phase = historyOperationPhaseSchema.parse(phaseValue);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("updateHistoryOperationPhase", () => {
       const operation = this.getHistoryOperation(operationId);
       if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
       const allowed =
@@ -4892,7 +5629,7 @@ export class MiniLilacSqliteStore {
   }
 
   commitHistoryNavigation(input: CommitStoredHistoryNavigation): CommittedStoredHistoryNavigation {
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("commitHistoryNavigation", () => {
       const operation = this.getHistoryOperation(input.operationId);
       if (operation === null)
         throw new Error(`History operation '${input.operationId}' was not found`);
@@ -5008,7 +5745,7 @@ export class MiniLilacSqliteStore {
   ): StoredHistoryCommandError {
     z.literal(true).parse(input.acknowledgePartialWorktree);
     const parsedMessage = z.string().min(1).parse(input.message);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("abandonHistoryNavigation", () => {
       const operation = this.getHistoryOperation(input.operationId);
       if (operation === null) {
         throw new Error(`History operation '${input.operationId}' was not found`);
@@ -5071,7 +5808,7 @@ export class MiniLilacSqliteStore {
       throw new Error("A Claude binding promotion requires Claude provider-state metadata");
     }
     if (input.inputTokens !== null) z.number().int().nonnegative().parse(input.inputTokens);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("reservePendingRunFinalization", () => {
       const workspace = this.getWorkspaceForSession(input.sessionId);
       if (
         this.database
@@ -5111,9 +5848,13 @@ export class MiniLilacSqliteStore {
         throw new Error("Final UI transcript does not extend the canonical active transcript");
       }
       const fromState = this.getHistoryState(transition.fromStateId);
-      const fromUiMessages = miniLilacMessagesSchema.parse(
-        this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId).map(deserialize),
-      );
+      const decodedFromUiMessages = decodeMiniLilacUiTranscript({
+        rawValues: this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: fromState.id,
+      });
+      if (decodedFromUiMessages.status === "error") throw decodedFromUiMessages.error;
+      const fromUiMessages = decodedFromUiMessages.value.value;
       const admittedMessage = transition.userMessage;
       if (
         admittedMessage === null ||
@@ -5160,34 +5901,68 @@ export class MiniLilacSqliteStore {
   }
 
   getPendingRunFinalization(runId: string): PendingStoredRunFinalization | null {
-    const row = this.database
-      .query("SELECT * FROM pending_run_finalizations WHERE run_id = ?")
-      .get(runId);
-    return row ? toPendingRunFinalization(row) : null;
+    const result = this.getPendingRunFinalizationResult(runId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getPendingRunFinalizationResult(
+    runId: string,
+  ): ResultType<PendingStoredRunFinalization | null, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getPendingRunFinalization", () =>
+      this.decodeStructuralHistoryRow({
+        kind: "pending-finalization",
+        row: this.database
+          .query("SELECT * FROM pending_run_finalizations WHERE run_id = ?")
+          .get(runId),
+        recordId: runId,
+      }),
+    );
   }
 
   listPendingRunFinalizations(): readonly PendingStoredRunFinalization[] {
-    return this.database
-      .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
-      .all()
-      .map(toPendingRunFinalization);
+    const result = this.listPendingRunFinalizationsResult();
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listPendingRunFinalizationsResult(): ResultType<
+    readonly PendingStoredRunFinalization[],
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("listPendingRunFinalizations", () => {
+      const finalizations: PendingStoredRunFinalization[] = [];
+      for (const [index, row] of this.database
+        .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+        .all()
+        .entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "pending-finalization",
+          row,
+          recordId: `pending-finalization:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        finalizations.push(decoded.value);
+      }
+      return Result.ok(finalizations);
+    });
   }
 
   listRecoverableOpenRootRuns(): readonly RecoverableStoredOpenRootRun[] {
-    return z
-      .array(
-        z.object({
-          run_id: z.string(),
-          session_id: z.string(),
-          workspace_id: z.string(),
-          open_transition_id: z.string(),
-          input_tokens: z.number().int().nonnegative().nullable(),
-        }),
-      )
-      .parse(
-        this.database
-          .query(
-            `SELECT runs.id AS run_id, sessions.id AS session_id,
+    const result = this.listRecoverableOpenRootRunsResult();
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  listRecoverableOpenRootRunsResult(): ResultType<
+    readonly RecoverableStoredOpenRootRun[],
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("listRecoverableOpenRootRuns", () => {
+      const runs: RecoverableStoredOpenRootRun[] = [];
+      const rows = this.database
+        .query(
+          `SELECT runs.id AS run_id, sessions.id AS session_id,
                     sessions.workspace_id, transition.id AS open_transition_id,
                     sessions.input_tokens
              FROM history_transitions AS transition
@@ -5201,21 +5976,24 @@ export class MiniLilacSqliteStore {
                AND sessions.status IN ('streaming', 'cancelling')
                AND pending.run_id IS NULL
              ORDER BY runs.started_at, runs.rowid`,
-          )
-          .all(),
-      )
-      .map((row) => ({
-        runId: row.run_id,
-        sessionId: row.session_id,
-        workspaceId: row.workspace_id,
-        openTransitionId: row.open_transition_id,
-        inputTokens: row.input_tokens,
-      }));
+        )
+        .all();
+      for (const [index, row] of rows.entries()) {
+        const decoded = this.decodeRequiredStructuralHistoryRow({
+          kind: "recoverable-open-root-run",
+          row,
+          recordId: `recoverable:${index}`,
+        });
+        if (decoded.status === "error") return Result.err(decoded.error);
+        runs.push(decoded.value);
+      }
+      return Result.ok(runs);
+    });
   }
 
   recoverInterruptedRuntimeState(): void {
     const now = new Date().toISOString();
-    this.runImmediateTransaction(() => {
+    const recovery = this.runStoreTransaction("recoverInterruptedRuntimeState", () => {
       const interruptedAttempts = z
         .array(
           z.object({
@@ -5316,29 +6094,32 @@ export class MiniLilacSqliteStore {
       for (const owner of namedOwners) {
         this.pruneMiniNamedClaudeAttempts(owner.session_id, owner.provider_id);
       }
-      for (const attempt of interruptedAttempts) {
-        logger.debug("mini_claude.attempt_recovered", {
-          requestId: attempt.request_id,
-          sessionId: attempt.session_id,
-          providerId: attempt.provider_id,
-          requestClient: attempt.request_client,
-          owner: attempt.product,
-          mode: "recovery",
-          outcome: "uncertain",
-          reason: "runtime-restart",
-          bindingHead: attempt.source_history_state_id,
-          bindingRevision: attempt.expected_binding_revision,
-          model: attempt.model,
-          reasoning: attempt.reasoning,
-        });
-      }
-      const diagnostics = this.getMiniClaudeRetentionDiagnostics();
-      if (diagnostics.orphanBindingCount > 0 || diagnostics.orphanAttemptCount > 0) {
-        logger.warn("mini_claude.retention_orphans_detected", diagnostics);
-      } else {
-        logger.debug("mini_claude.retention_diagnostics", diagnostics);
-      }
+      return { interruptedAttempts, diagnostics: this.getMiniClaudeRetentionDiagnostics() };
     });
+    for (const attempt of recovery.interruptedAttempts) {
+      logger.debug("mini_claude.attempt_recovered", {
+        requestId: attempt.request_id,
+        sessionId: attempt.session_id,
+        providerId: attempt.provider_id,
+        requestClient: attempt.request_client,
+        owner: attempt.product,
+        mode: "recovery",
+        outcome: "uncertain",
+        reason: "runtime-restart",
+        bindingHead: attempt.source_history_state_id,
+        bindingRevision: attempt.expected_binding_revision,
+        model: attempt.model,
+        reasoning: attempt.reasoning,
+      });
+    }
+    if (
+      recovery.diagnostics.orphanBindingCount > 0 ||
+      recovery.diagnostics.orphanAttemptCount > 0
+    ) {
+      logger.warn("mini_claude.retention_orphans_detected", recovery.diagnostics);
+    } else {
+      logger.debug("mini_claude.retention_diagnostics", recovery.diagnostics);
+    }
   }
 
   commitPendingRunFinalization(
@@ -5357,7 +6138,7 @@ export class MiniLilacSqliteStore {
       input.namedClaudeBindingPromotion === undefined
         ? null
         : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
-    return this.runImmediateTransaction(() => {
+    return this.runStoreTransaction("commitPendingRunFinalization", () => {
       const pending = this.getPendingRunFinalization(input.runId);
       if (pending === null)
         throw new Error(`Pending finalization for run '${input.runId}' was not found`);
@@ -5825,10 +6606,13 @@ export class MiniLilacSqliteStore {
     sessionId: string | null,
     owner: WorkspaceHistoryAvailabilityOwner | undefined,
   ): void {
-    const workspace = workspaceRowSchema.parse(
-      this.database.query("SELECT * FROM workspaces WHERE id = ?").get(workspaceId),
-    );
-    if (workspace.health_status !== "healthy") {
+    const decodedWorkspace = this.decodeRequiredStructuralHistoryRow({
+      kind: "workspace",
+      row: this.database.query("SELECT * FROM workspaces WHERE id = ?").get(workspaceId),
+      recordId: workspaceId,
+    });
+    if (decodedWorkspace.status === "error") throw decodedWorkspace.error;
+    if (decodedWorkspace.value.healthStatus !== "healthy") {
       throw new Error(`Workspace '${workspaceId}' history store is corrupt`);
     }
     const operations = z
@@ -5936,7 +6720,13 @@ export class MiniLilacSqliteStore {
     const row = this.database
       .query("SELECT * FROM history_transitions WHERE session_id = ? AND to_state_id = ?")
       .get(sessionId, stateId);
-    return row ? toHistoryTransition(row) : null;
+    const decoded = this.decodeStructuralHistoryRow({
+      kind: "transition",
+      row,
+      recordId: stateId,
+    });
+    if (decoded.status === "error") throw decoded.error;
+    return decoded.value;
   }
 
   private parseHistoryNavigationResult(
@@ -6001,11 +6791,23 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryTransition(transitionId: string): StoredHistoryTransition {
-    const row = this.database
-      .query("SELECT * FROM history_transitions WHERE id = ?")
-      .get(transitionId);
-    if (!row) throw new Error(`History transition '${transitionId}' was not found`);
-    return toHistoryTransition(row);
+    const result = this.getHistoryTransitionResult(transitionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getHistoryTransitionResult(
+    transitionId: string,
+  ): ResultType<StoredHistoryTransition, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getHistoryTransition", () =>
+      this.decodeRequiredStructuralHistoryRow({
+        kind: "transition",
+        row: this.database
+          .query("SELECT * FROM history_transitions WHERE id = ?")
+          .get(transitionId),
+        recordId: transitionId,
+      }),
+    );
   }
 
   private insertHistoryStateRow(input: CreateStoredHistoryState): void {
@@ -6239,21 +7041,81 @@ export class MiniLilacSqliteStore {
   }
 
   getModelMessages(sessionId: string): ModelMessage[] {
-    const values = this.readSerializedChain(
-      sessionId,
-      "model",
-      this.getTranscriptHeads(sessionId).model_head_id,
-    ).map(deserialize);
-    return modelMessagesSchema.parse(values);
+    const result = this.getModelMessagesResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getModelMessagesResult(sessionId: string): ResultType<ModelMessage[], MiniLilacPersistenceError> {
+    const transcript = this.getModelTranscriptResult(sessionId);
+    if (transcript.status === "error") return Result.err(transcript.error);
+    return Result.ok(transcript.value.value);
+  }
+
+  getModelTranscriptResult(
+    sessionId: string,
+  ): ResultType<DecodedPersistedValue<ModelMessage[]>, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getModelMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        sessionId,
+        "model",
+        this.getTranscriptHeads(sessionId).model_head_id,
+      );
+      if (rawValues.status === "error") {
+        this.queuePersistenceDiagnostic(rawValues.error);
+        return Result.err(rawValues.error);
+      }
+      const decoded = decodeMiniLilacModelTranscript({
+        rawValues: rawValues.value,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: sessionId,
+      });
+      if (decoded.status === "error") {
+        this.queuePersistenceDiagnostic(decoded.error);
+        return Result.err(decoded.error);
+      }
+      return Result.ok(decoded.value);
+    });
   }
 
   getUiMessages(sessionId: string): MiniLilacUIMessage[] {
-    const values = this.readSerializedChain(
-      sessionId,
-      "ui",
-      this.getTranscriptHeads(sessionId).ui_head_id,
-    ).map(deserialize);
-    return miniLilacMessagesSchema.parse(values);
+    const result = this.getUiMessagesResult(sessionId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  getUiMessagesResult(
+    sessionId: string,
+  ): ResultType<MiniLilacUIMessage[], MiniLilacPersistenceError> {
+    const transcript = this.getUiTranscriptResult(sessionId);
+    if (transcript.status === "error") return Result.err(transcript.error);
+    return Result.ok(transcript.value.value);
+  }
+
+  getUiTranscriptResult(
+    sessionId: string,
+  ): ResultType<DecodedPersistedValue<MiniLilacUIMessage[]>, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getUiMessages", () => {
+      const rawValues = this.readSerializedChainResult(
+        sessionId,
+        "ui",
+        this.getTranscriptHeads(sessionId).ui_head_id,
+      );
+      if (rawValues.status === "error") {
+        this.queuePersistenceDiagnostic(rawValues.error);
+        return Result.err(rawValues.error);
+      }
+      const decoded = decodeMiniLilacUiTranscript({
+        rawValues: rawValues.value,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: sessionId,
+      });
+      if (decoded.status === "error") {
+        this.queuePersistenceDiagnostic(decoded.error);
+        return Result.err(decoded.error);
+      }
+      return Result.ok(decoded.value);
+    });
   }
 
   getSessionResume(sessionId: string): StoredSessionResume {
@@ -6268,29 +7130,43 @@ export class MiniLilacSqliteStore {
     sessionId: string,
     lane: "model" | "ui",
     values: readonly unknown[],
+    compareEquivalent = true,
   ): number | null {
-    return this.internSerializedChain(sessionId, lane, values.map(serialize));
+    return this.internSerializedChain(sessionId, lane, values.map(serialize), compareEquivalent);
   }
 
   private internSerializedChain(
     sessionId: string,
     lane: "model" | "ui",
     values: readonly string[],
+    compareEquivalent = true,
   ): number | null {
     let parentId: number | null = null;
     let parentDepth = 0;
     let parentHash = "root";
     for (const valueJson of values) {
-      const equivalent: z.infer<typeof transcriptNodeRowSchema> | undefined = this.database
-        .query(
-          `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
-           WHERE session_id = ? AND lane = ? AND parent_id IS ?`,
-        )
-        .all(sessionId, lane, parentId)
-        .map((value) => transcriptNodeRowSchema.parse(value))
-        .find((value) =>
-          canonicalValuesEqual(deserialize(value.value_json), deserialize(valueJson)),
-        );
+      const equivalent: z.infer<typeof transcriptNodeRowSchema> | undefined = compareEquivalent
+        ? this.database
+            .query(
+              `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
+               WHERE session_id = ? AND lane = ? AND parent_id IS ?`,
+            )
+            .all(sessionId, lane, parentId)
+            .map((value) => transcriptNodeRowSchema.parse(value))
+            .find((value) => {
+              const stored = this.decodeTranscriptNodeValue(
+                lane,
+                value.value_json,
+                `${sessionId}:${value.id}`,
+              );
+              const candidate = this.decodeTranscriptNodeValue(
+                lane,
+                valueJson,
+                `${sessionId}:candidate`,
+              );
+              return canonicalValuesEqual(stored, candidate);
+            })
+        : undefined;
       if (equivalent !== undefined) {
         parentId = equivalent.id;
         parentDepth = equivalent.depth;
@@ -6338,6 +7214,35 @@ export class MiniLilacSqliteStore {
     return parentId;
   }
 
+  private decodeTranscriptNodeValue(
+    lane: "model" | "ui",
+    raw: string,
+    recordId: string,
+  ): ModelMessage | MiniLilacUIMessage {
+    if (lane === "model") {
+      const decoded = decodeMiniLilacModelTranscript({
+        rawValues: [raw],
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId,
+      });
+      if (decoded.status === "error") throw decoded.error;
+      const messages = decoded.value.value;
+      const message = messages[0];
+      if (message === undefined) throw new Error("Decoded model transcript node was empty");
+      return message;
+    }
+    const decoded = decodeMiniLilacUiTranscript({
+      rawValues: [raw],
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId,
+    });
+    if (decoded.status === "error") throw decoded.error;
+    const messages = decoded.value.value;
+    const message = messages[0];
+    if (message === undefined) throw new Error("Decoded UI transcript node was empty");
+    return message;
+  }
+
   private getTranscriptHeads(sessionId: string): z.infer<typeof transcriptHeadRowSchema> {
     const value = this.database
       .query("SELECT model_head_id, ui_head_id FROM session_transcript_heads WHERE session_id = ?")
@@ -6365,23 +7270,44 @@ export class MiniLilacSqliteStore {
     sessionId: string,
     lane: "model" | "ui",
     headId: number | null,
-  ): string[] {
-    if (headId === null) return [];
-    return this.database
-      .query(
-        `WITH RECURSIVE chain(id, parent_id, depth, value_json) AS (
-           SELECT id, parent_id, depth, value_json FROM transcript_nodes
-           WHERE id = ? AND session_id = ? AND lane = ?
-           UNION ALL
-           SELECT parent.id, parent.parent_id, parent.depth, parent.value_json
-           FROM transcript_nodes AS parent
-           JOIN chain AS child ON child.parent_id = parent.id
-           WHERE parent.session_id = ? AND parent.lane = ?
-         )
-         SELECT value_json FROM chain ORDER BY depth`,
-      )
-      .all(headId, sessionId, lane, sessionId, lane)
-      .map((value) => jsonRowSchema.parse(value).value_json);
+  ): string[] | null {
+    const result = this.readSerializedChainResult(sessionId, lane, headId);
+    if (result.status === "error") throw result.error;
+    return result.value;
+  }
+
+  private readSerializedChainResult(
+    sessionId: string,
+    lane: "model" | "ui",
+    headId: number | null,
+  ): ResultType<string[] | null, PersistedDataError> {
+    const rows =
+      headId === null
+        ? []
+        : this.database
+            .query(
+              `WITH RECURSIVE chain(id, parent_id, depth, value_json, hash) AS (
+                 SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
+                 WHERE id = ? AND session_id = ? AND lane = ?
+                 UNION ALL
+                 SELECT parent.id, parent.parent_id, parent.depth, parent.value_json, parent.hash
+                 FROM transcript_nodes AS parent
+                 JOIN chain AS child ON child.parent_id = parent.id
+                 WHERE parent.session_id = ? AND parent.lane = ?
+               )
+               SELECT id, parent_id AS parentId, depth, value_json AS valueJson, hash
+               FROM chain ORDER BY depth`,
+            )
+            .all(headId, sessionId, lane, sessionId, lane);
+    const decoded = decodeMiniLilacTranscriptChain({
+      headId,
+      lane,
+      rows,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: sessionId,
+    });
+    if (decoded.status === "error") return Result.err(decoded.error);
+    return Result.ok(headId === null ? null : decoded.value.value);
   }
 
   getCommandResult(
@@ -6408,7 +7334,14 @@ export class MiniLilacSqliteStore {
       throw new Error(`Command '${commandId}' was already used with a different payload`);
     }
     if (row.result_json === null) throw new Error(`Command '${commandId}' is pending`);
-    return deserialize(row.result_json);
+    const decoded = decodeMiniLilacSuperJsonPayload({
+      raw: row.result_json,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: commandId,
+      field: "command_result",
+    });
+    if (decoded.status === "error") throw decoded.error;
+    return decoded.value.value;
   }
 
   reserveCommand(sessionId: string, commandId: string, request: StoredCommandRequest): void {

@@ -44,6 +44,19 @@ export function analyzeArchitecture(
       workspace.eventDeliveryConsumers.map((registration) => registration.apiPackage),
     ),
   ]);
+  const activePersistenceInfrastructure = {
+    persistedCodecs: manifest.workspaces.flatMap((workspace) =>
+      workspace.persistedCodecs
+        .filter(({ status }) => status === "enforced")
+        .map(({ identity }) => ({ packageName: workspace.packageName, identity })),
+    ),
+    sqliteTransactionAdapters: manifest.workspaces.flatMap((workspace) =>
+      workspace.sqliteTransactionAdapters
+        .filter(({ status }) => status === "enforced")
+        .map(({ identity }) => ({ packageName: workspace.packageName, identity })),
+    ),
+    scanAllProductionModules: true,
+  };
   for (const workspace of manifest.workspaces) {
     const workspaceProgram = programFactory(repositoryRoot, workspace);
     diagnostics.push(
@@ -53,6 +66,7 @@ export function analyzeArchitecture(
         workspaceProgram.program,
         packageRoots,
         activeEventDeliveryApiPackages,
+        activePersistenceInfrastructure,
       ),
     );
   }

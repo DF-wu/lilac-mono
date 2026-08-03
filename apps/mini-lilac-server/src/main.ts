@@ -15,7 +15,10 @@ import {
   type PendingStoredRunFinalization,
   type StoredHistoryOperation,
 } from "@stanley2058/mini-lilac-runtime";
-import { createToolResultArtifactStore } from "@stanley2058/lilac-tool-results";
+import {
+  adaptToolResultArtifactStoreInitToHost,
+  createToolResultArtifactStore,
+} from "@stanley2058/lilac-tool-results";
 import {
   clearCodexTokens,
   createCodexOAuthProvider,
@@ -696,7 +699,8 @@ export async function main(
     });
     const initialModelCatalog = await modelCatalog.get();
     const toolResultArtifacts = createToolResultArtifactStore(statePaths.toolResultsDirectory);
-    await toolResultArtifacts.init();
+    const artifactStoreInit = await toolResultArtifacts.init();
+    adaptToolResultArtifactStoreInitToHost(artifactStoreInit);
 
     const runtime = new SessionService({
       config,

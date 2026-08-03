@@ -1,15 +1,48 @@
-import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
+import fs from "node:fs/promises";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { Panic } from "better-result";
 
 import {
-  createToolResultArtifactStore,
+  adaptToolResultArtifactReadToAvailability,
+  adaptToolResultArtifactReadToUnavailablePolicy,
+  createToolResultArtifactStore as createResultToolResultArtifactStore,
   TOOL_RESULT_MAX_PAGE_CHARACTERS,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
+  ToolResultArtifactContentMismatch,
+  ToolResultArtifactDecryptAuthenticationFailed,
+  ToolResultArtifactMaintenanceAndCleanupFailure,
   ToolResultArtifactTooLargeError,
 } from "../src/tool-result-artifact-store";
+import { ToolResultArtifactMetadataAbsent } from "../src/tool-result-artifact-metadata-codec";
+
+function createToolResultArtifactStore(rootDir: string) {
+  const store = createResultToolResultArtifactStore(rootDir);
+  const value = async <T>(
+    resultPromise: Promise<{ status: "ok"; value: T } | { status: "error"; error: Error }>,
+  ) => {
+    const result = await resultPromise;
+    if (result.status === "error") throw result.error;
+    return result.value;
+  };
+  return {
+    rootDir: store.rootDir,
+    init: () => value(store.init()),
+    create: (params: Parameters<typeof store.create>[0]) => value(store.create(params)),
+    createFromFile: (params: Parameters<typeof store.createFromFile>[0]) =>
+      value(store.createFromFile(params)),
+    createFromStream: (params: Parameters<typeof store.createFromStream>[0]) =>
+      value(store.createFromStream(params)),
+    read: async (...params: Parameters<typeof store.read>) =>
+      adaptToolResultArtifactReadToAvailability(await store.read(...params)),
+    readWindow: async (...params: Parameters<typeof store.readWindow>) =>
+      adaptToolResultArtifactReadToAvailability(await store.readWindow(...params)),
+    maintain: (now?: number) => value(store.maintain(now)),
+  };
+}
 
 describe("tool result artifact store", () => {
   let baseDir: string;
@@ -140,6 +173,33 @@ describe("tool result artifact store", () => {
     expect(await readdir(store.rootDir)).toEqual([]);
   });
 
+  it("escalates failed atomic cleanup as Panic", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const source = new Readable({
+      read() {
+        this.destroy(new Error("source failed"));
+      },
+    });
+    const remove = spyOn(fs, "rm").mockRejectedValue(new Error("cleanup failed"));
+
+    try {
+      await expect(
+        store.createFromStream({
+          scopeId: "scope-a",
+          requestId: "request-a",
+          toolCallId: "tool-a",
+          toolName: "plugin-tool",
+          source,
+          ttlMs: 1000,
+          maxBytesPerScope: 100,
+        }),
+      ).rejects.toBeInstanceOf(Panic);
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
   it("expires artifacts without extending lifetime on read", async () => {
     setSystemTime(new Date("2026-01-01T00:00:00Z"));
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
@@ -149,6 +209,7 @@ describe("tool result artifact store", () => {
 
     setSystemTime(new Date("2026-01-01T00:00:02Z"));
     expect(await store.read(created.uri, "session-a")).toEqual({ ok: false });
+    expect(await readdir(store.rootDir)).toHaveLength(2);
   });
 
   it("removes artifacts encrypted by a previous runtime", async () => {
@@ -161,6 +222,155 @@ describe("tool result artifact store", () => {
     await restartedRuntime.init();
     expect(await restartedRuntime.read(created.uri, "session-a")).toEqual({ ok: false });
     expect(await readdir(rootDir)).toEqual([]);
+  });
+
+  it("writes current v1 metadata and does not rewrite it while reading", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("no-read-rewrite"));
+    if (created.status === "error") throw created.error;
+    const metadataEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".meta"));
+    if (!metadataEntry) throw new Error("expected metadata entry");
+    const metadataFile = path.join(store.rootDir, metadataEntry);
+    const before = await readFile(metadataFile);
+
+    const read = await store.read(created.value.uri, "session-a");
+
+    expect(read.status).toBe("ok");
+    expect(await readFile(metadataFile)).toEqual(before);
+  });
+
+  it("classifies metadata authentication corruption and emits redacted diagnostics", async () => {
+    const diagnostics: object[] = [];
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"), {
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("secret-content-never-diagnosed"));
+    if (created.status === "error") throw created.error;
+    const entries = await readdir(store.rootDir);
+    const metadataEntry = entries.find((entry) => entry.endsWith(".meta"));
+    if (!metadataEntry) throw new Error("expected metadata entry");
+    const metadataFile = path.join(store.rootDir, metadataEntry);
+    const encrypted = await readFile(metadataFile);
+    encrypted[12] = (encrypted[12] ?? 0) ^ 1;
+    await writeFile(metadataFile, encrypted);
+    const entriesBeforeRead = await readdir(store.rootDir);
+    const metadataBeforeRead = await readFile(metadataFile);
+
+    const read = await store.read(created.value.uri, "session-a");
+
+    expect(read.status === "error" && read.error).toBeInstanceOf(
+      ToolResultArtifactDecryptAuthenticationFailed,
+    );
+    expect(diagnostics).toEqual([{ operation: "read-metadata", issueCode: "decrypt-auth-failed" }]);
+    const serializedDiagnostics = JSON.stringify(diagnostics);
+    expect(serializedDiagnostics.length).toBeLessThan(160);
+    expect(serializedDiagnostics).not.toContain("secret-content-never-diagnosed");
+    expect(serializedDiagnostics).not.toContain(metadataEntry.slice(0, -".meta".length));
+    expect(await readdir(store.rootDir)).toEqual(entriesBeforeRead);
+    expect(await readFile(metadataFile)).toEqual(metadataBeforeRead);
+
+    expect(await adaptToolResultArtifactReadToUnavailablePolicy(store, read)).toEqual({
+      ok: false,
+    });
+    expect(await readdir(store.rootDir)).toEqual([]);
+  });
+
+  it("classifies absent metadata without mutation until maintenance", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("orphaned-content"));
+    if (created.status === "error") throw created.error;
+    const metadataEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".meta"));
+    if (!metadataEntry) throw new Error("expected metadata entry");
+    await rm(path.join(store.rootDir, metadataEntry));
+
+    const read = await store.read(created.value.uri, "session-a");
+
+    expect(read.status === "error" && read.error).toBeInstanceOf(ToolResultArtifactMetadataAbsent);
+    expect(await readdir(store.rootDir)).toHaveLength(1);
+    const maintained = await store.maintain();
+    expect(maintained).toMatchObject({
+      status: "ok",
+      value: { removedInvalid: 1, removedExpired: 0 },
+    });
+    expect(await readdir(store.rootDir)).toEqual([]);
+  });
+
+  it("classifies content mismatch without mutation until maintenance", async () => {
+    const diagnostics: object[] = [];
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"), {
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    const contentFile = path.join(store.rootDir, contentEntry);
+    await writeFile(contentFile, Buffer.concat([await readFile(contentFile), Buffer.from([0])]));
+    const entriesBeforeRead = await readdir(store.rootDir);
+    const contentBeforeRead = await readFile(contentFile);
+
+    const read = await store.read(created.value.uri, "session-a");
+
+    expect(read.status === "error" && read.error).toBeInstanceOf(ToolResultArtifactContentMismatch);
+    expect(diagnostics).toEqual([{ operation: "read-content", issueCode: "content-mismatch" }]);
+    expect(await readdir(store.rootDir)).toEqual(entriesBeforeRead);
+    expect(await readFile(contentFile)).toEqual(contentBeforeRead);
+    expect(await store.maintain()).toMatchObject({
+      status: "ok",
+      value: { removedInvalid: 1, removedExpired: 0 },
+    });
+    expect(await readdir(store.rootDir)).toEqual([]);
+  });
+
+  it("returns a combined maintenance error when invalidation cleanup fails", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    const contentFile = path.join(store.rootDir, contentEntry);
+    await writeFile(contentFile, Buffer.concat([await readFile(contentFile), Buffer.from([0])]));
+    const remove = spyOn(fs, "rm").mockRejectedValue(new Error("cleanup failed"));
+
+    try {
+      const maintained = await store.maintain();
+      expect(maintained.status === "error" && maintained.error).toBeInstanceOf(
+        ToolResultArtifactMaintenanceAndCleanupFailure,
+      );
+      if (
+        maintained.status === "error" &&
+        maintained.error instanceof ToolResultArtifactMaintenanceAndCleanupFailure
+      ) {
+        expect(maintained.error.primaryError).toBeInstanceOf(ToolResultArtifactContentMismatch);
+        expect(maintained.error.cleanupError.operation).toBe("remove-artifact");
+      }
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
+  it("preserves cleanup Panic identity from explicit maintenance", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    const contentFile = path.join(store.rootDir, contentEntry);
+    await writeFile(contentFile, Buffer.concat([await readFile(contentFile), Buffer.from([0])]));
+    const panic = new Panic({ message: "cleanup invariant failed" });
+    const remove = spyOn(fs, "rm").mockRejectedValue(panic);
+
+    try {
+      await expect(store.maintain()).rejects.toBe(panic);
+    } finally {
+      remove.mockRestore();
+    }
   });
 
   it("removes prior-runtime managed temporary and orphan files on startup", async () => {
@@ -178,7 +388,7 @@ describe("tool result artifact store", () => {
     expect(await readdir(rootDir)).toEqual(["unmanaged.keep"]);
   });
 
-  it("removes all expired artifacts when any artifact is read", async () => {
+  it("removes expired artifacts only through explicit maintenance", async () => {
     setSystemTime(new Date("2026-01-01T00:00:00Z"));
     const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
     await store.init();
@@ -191,6 +401,8 @@ describe("tool result artifact store", () => {
 
     setSystemTime(new Date("2026-01-01T00:00:02Z"));
     expect((await store.read(retained.uri, "live-session")).ok).toBe(true);
+    expect(await readdir(store.rootDir)).toHaveLength(4);
+    expect(await store.maintain()).toEqual({ removedInvalid: 0, removedExpired: 1 });
     expect(await readdir(store.rootDir)).toHaveLength(2);
   });
 

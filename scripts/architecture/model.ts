@@ -11,6 +11,8 @@ export const ARCHITECTURE_RULES = [
   "architecture/complete-tool-codec-registry",
   "architecture/result-decoder-contract",
   "architecture/unknown-free-module",
+  "architecture/persisted-codec-contract",
+  "architecture/persisted-codec-fixture-catalog",
   "architecture/event-handler-result",
   "architecture/event-delivery-policy-exhaustiveness",
   "architecture/no-production-unwrap",
@@ -20,6 +22,9 @@ export const ARCHITECTURE_RULES = [
   "architecture/no-result-wire-leak",
   "architecture/no-unredacted-tagged-error-log",
   "architecture/fallible-api-result",
+  "architecture/sqlite-transaction-adapter-contract",
+  "architecture/sqlite-transaction-consumer",
+  "architecture/no-result-err-in-sqlite-callback",
 ] as const;
 
 export type ArchitectureRule = (typeof ARCHITECTURE_RULES)[number];
@@ -39,6 +44,8 @@ export const RULE_GROUPS = {
   "architecture/complete-tool-codec-registry": "boundary-validation",
   "architecture/result-decoder-contract": "boundary-validation",
   "architecture/unknown-free-module": "boundary-validation",
+  "architecture/persisted-codec-contract": "boundary-validation",
+  "architecture/persisted-codec-fixture-catalog": "boundary-validation",
   "architecture/event-handler-result": "failure-flow",
   "architecture/event-delivery-policy-exhaustiveness": "failure-flow",
   "architecture/no-production-unwrap": "failure-flow",
@@ -48,6 +55,9 @@ export const RULE_GROUPS = {
   "architecture/no-result-wire-leak": "failure-flow",
   "architecture/no-unredacted-tagged-error-log": "failure-flow",
   "architecture/fallible-api-result": "failure-flow",
+  "architecture/sqlite-transaction-adapter-contract": "failure-flow",
+  "architecture/sqlite-transaction-consumer": "failure-flow",
+  "architecture/no-result-err-in-sqlite-callback": "failure-flow",
 } as const satisfies Readonly<Record<ArchitectureRule, RuleGroup>>;
 
 export interface SourceLocation {

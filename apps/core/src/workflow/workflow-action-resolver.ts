@@ -52,6 +52,11 @@ class WorkflowActionResolverStopping extends TaggedError("WorkflowActionResolver
   readonly message: string;
 }> {}
 
+class WorkflowActionPersistenceFailed extends TaggedError("WorkflowActionPersistenceFailed")<{
+  readonly storeErrorTag: string;
+  readonly message: string;
+}> {}
+
 class WorkflowActionOutboxInvalid extends TaggedError("WorkflowActionOutboxInvalid")<{
   readonly outboxId: string;
   readonly message: string;
@@ -70,7 +75,10 @@ class WorkflowActionOutboxCompletionConflict extends TaggedError(
   readonly message: string;
 }> {}
 
-type WorkflowActionResolverDeliveryError = WorkflowActionMalformed | WorkflowActionResolverStopping;
+type WorkflowActionResolverDeliveryError =
+  | WorkflowActionMalformed
+  | WorkflowActionPersistenceFailed
+  | WorkflowActionResolverStopping;
 type WorkflowActionOutboxFailure =
   | WorkflowActionOutboxInvalid
   | WorkflowActionOutboxPublishFailed
@@ -95,6 +103,8 @@ function workflowActionResolverDeliveryPolicy(
   switch (error._tag) {
     case "WorkflowActionMalformed":
       return "commit";
+    case "WorkflowActionPersistenceFailed":
+      return "park-pending";
     case "WorkflowActionResolverStopping":
       return "stop";
   }
@@ -209,7 +219,11 @@ export async function startWorkflowActionResolver(input: {
     try {
       const now = input.now?.() ?? Date.now();
       const entries = input.store.listPendingActionOutboxEvents(now);
-      for (const entry of entries) {
+      if (entries.status === "error") {
+        logger.warn("Workflow action outbox read failed", formatTaggedErrorForLog(entries.error));
+        return;
+      }
+      for (const entry of entries.value) {
         const decoded = decodeWorkflowActionOutboxEvent(entry);
         const published: ResultType<
           void,
@@ -293,9 +307,21 @@ export async function startWorkflowActionResolver(input: {
           sourceMessageId: event.value.sourceMessageId,
           now: input.now?.() ?? Date.now(),
         });
-        if (result.status !== "applied") {
+        if (result.status === "error") {
+          logger.warn("Workflow surface action persistence failed", {
+            eventId: message.id,
+            ...formatTaggedErrorForLog(result.error),
+          });
+          return Result.err(
+            new WorkflowActionPersistenceFailed({
+              storeErrorTag: result.error._tag,
+              message: "Workflow surface action could not be persisted",
+            }),
+          );
+        }
+        if (result.value.status !== "applied") {
           logger.info("Workflow surface action rejected", {
-            status: result.status,
+            status: result.value.status,
             platform: event.value.platform,
             messageId: event.value.messageRef.messageId,
           });

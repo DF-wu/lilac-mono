@@ -5,6 +5,7 @@ import path from "node:path";
 
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
+import type { Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import type {
   ClaudeNativeAttemptObservation,
@@ -31,6 +32,25 @@ import {
 } from "../../../src/transcript/transcript-store";
 
 const directories: string[] = [];
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function getRequestTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getRequestTranscript"]>[0],
+) {
+  return resultValue(store.getRequestTranscript(input));
+}
+
+function getCoreRequestAtomMetadata(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCoreRequestAtomMetadata"]>[0],
+) {
+  return resultValue(store.getCoreRequestAtomMetadata(input));
+}
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true })));
@@ -471,7 +491,7 @@ describe("Core primary Claude continuation", () => {
       messages: [firstTerminal[1]!],
       corePrimaryLineage: firstManifest,
     });
-    const firstTranscript = store.getRequestTranscript({ requestId: "request-1" });
+    const firstTranscript = getRequestTranscript(store, { requestId: "request-1" });
     if (!firstTranscript) throw new Error("first transcript missing");
     expect(
       await firstRuntime.finalize({
@@ -542,7 +562,7 @@ describe("Core primary Claude continuation", () => {
       created: [{ platform: "discord", channelId: sessionId, messageId: "output-1" }],
       last: { platform: "discord", channelId: sessionId, messageId: "output-1" },
     });
-    const metadata = store.getCoreRequestAtomMetadata({ requestId: "request-1" });
+    const metadata = getCoreRequestAtomMetadata(store, { requestId: "request-1" });
     if (!metadata) throw new Error("request metadata missing");
     const secondCurrent = [{ role: "user", content: "second" }] satisfies ModelMessage[];
     const secondManifest = buildCoreLineageManifestV1([
@@ -717,7 +737,7 @@ describe("Core primary Claude continuation", () => {
       messages: responseMessages,
       corePrimaryLineage: manifest,
     });
-    const terminal = store.getRequestTranscript({ requestId: "promotion-error" });
+    const terminal = getRequestTranscript(store, { requestId: "promotion-error" });
     if (!terminal) throw new Error("terminal transcript missing");
     store.promoteCorePrimaryClaudeSessionBinding = () => {
       throw new Error("simulated promotion database failure");

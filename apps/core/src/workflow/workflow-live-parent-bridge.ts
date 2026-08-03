@@ -17,9 +17,15 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { type ChildToolState, renderSubagentDisplay } from "../tools/subagent";
-import { DurableWorkflowStore } from "./durable-workflow-store";
+import {
+  DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+} from "./durable-workflow-store";
 import type { WorkflowRun } from "./workflow-domain";
-import { readWorkflowValueArtifact } from "./workflow-artifact-store";
+import {
+  adaptWorkflowArtifactResultToException,
+  readWorkflowValueArtifact,
+} from "./workflow-artifact-store";
 import { resolveWorkflowSubagentToolResult } from "./workflow-subagent-output";
 
 export type WorkflowLiveParentCompletion = {
@@ -193,9 +199,9 @@ function toCompletionIdentity(
   if (run.completionTarget.kind !== "live_parent") {
     throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
   }
-  const timedOut = store
-    .listOperations(run.runId, { limit: 1_000 })
-    .some((operation) => operation.state === "timed_out");
+  const operations = store.listOperations(run.runId, { limit: 1_000 });
+  if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
+  const timedOut = operations.value.some((operation) => operation.state === "timed_out");
   const status = toCompletionStatus(run.state, timedOut);
   return {
     runId: run.runId,
@@ -219,15 +225,18 @@ async function toCompletion(
   if (run.completionTarget.kind !== "live_parent") {
     throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
   }
-  const revision = store.getRevision(run.revisionId);
-  const result =
-    run.state === "succeeded" && run.resultArtifactId && revision
-      ? await readWorkflowValueArtifact({
-          dataDir,
-          artifactId: run.resultArtifactId,
-          maxBytes: revision.limits.maxResultBytes,
-        })
-      : run.result;
+  const revisionResult = store.getRevision(run.revisionId);
+  if (revisionResult.status === "error") signalDurableWorkflowReadErrorToHost(revisionResult.error);
+  const revision = revisionResult.value;
+  let result = run.result;
+  if (run.state === "succeeded" && run.resultArtifactId && revision) {
+    const loaded = await readWorkflowValueArtifact({
+      dataDir,
+      artifactId: run.resultArtifactId,
+      maxBytes: revision.limits.maxResultBytes,
+    });
+    result = adaptWorkflowArtifactResultToException(loaded);
+  }
   let rawFinalText = "";
   if (run.state === "succeeded") {
     rawFinalText = typeof result === "string" ? result : JSON.stringify(result);
@@ -351,14 +360,18 @@ export class WorkflowLiveParentBridge {
     this.parents.set(input.parentRequestId, signal);
     this.notify(signal);
     const runsById = new Map<string, WorkflowRun>();
-    for (const run of this.input.store.listActiveLiveParentRuns(input.parentRequestId)) {
+    const activeRuns = this.input.store.listActiveLiveParentRuns(input.parentRequestId);
+    if (activeRuns.status === "error") signalDurableWorkflowReadErrorToHost(activeRuns.error);
+    for (const run of activeRuns.value) {
       runsById.set(run.runId, run);
     }
-    for (const run of this.input.store.listPendingLiveParentCompletions(
+    const pendingRuns = this.input.store.listPendingLiveParentCompletions(
       input.parentRequestId,
       1_000,
       input.recoverSynchronousDeliveries,
-    )) {
+    );
+    if (pendingRuns.status === "error") signalDurableWorkflowReadErrorToHost(pendingRuns.error);
+    for (const run of pendingRuns.value) {
       runsById.set(run.runId, run);
     }
     const ready = Promise.all(
@@ -382,69 +395,72 @@ export class WorkflowLiveParentBridge {
           hasOutstandingRuns: durable.outstandingRunCount > 0,
         };
       },
-      listPending: (): WorkflowLiveParentCompletion[] =>
-        this.input.store
-          .listPendingLiveParentCompletions(
-            input.parentRequestId,
-            1_000,
-            input.recoverSynchronousDeliveries,
-          )
-          .map((run) => {
-            if (run.resultArtifactId) {
-              throw new Error("Artifact-backed completion requires listPendingAsync");
-            }
-            if (
-              typeof run.result === "string" &&
-              run.result.includes("Complete output: tool-result://")
-            ) {
-              throw new Error("Tool-result-backed completion requires listPendingAsync");
-            }
-            if (run.completionTarget.kind !== "live_parent") {
-              throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
-            }
-            const status = toCompletionStatus(run.state, false);
-            let finalText = "";
-            if (run.state === "succeeded") {
-              finalText = typeof run.result === "string" ? run.result : JSON.stringify(run.result);
-            }
-            return {
-              runId: run.runId,
-              parentToolCallId: run.completionTarget.parentToolCallId,
-              childRequestId: run.completionTarget.childRequestId,
-              profile: run.completionTarget.profile,
-              sessionName: run.completionTarget.sessionName,
-              status,
-              ok: status === "resolved",
-              finalText,
-              ...(run.terminalDetail ? { detail: run.terminalDetail } : {}),
-            };
-          }),
-      listPendingAsync: async (): Promise<WorkflowLiveParentCompletion[]> =>
-        await Promise.all(
-          this.input.store
-            .listPendingLiveParentCompletions(
-              input.parentRequestId,
-              1_000,
-              input.recoverSynchronousDeliveries,
-            )
-            .map(
-              async (run) =>
-                await toCompletion(
-                  run,
-                  this.input.store,
-                  this.input.dataDir ?? env.dataDir,
-                  this.input.toolResultArtifacts,
-                ),
-            ),
-        ),
-      listPendingIdentities: (): WorkflowLiveParentCompletionIdentity[] =>
-        this.input.store
-          .listPendingLiveParentCompletions(
-            input.parentRequestId,
-            1_000,
-            input.recoverSynchronousDeliveries,
-          )
-          .map((run) => toCompletionIdentity(run, this.input.store)),
+      listPending: (): WorkflowLiveParentCompletion[] => {
+        const listed = this.input.store.listPendingLiveParentCompletions(
+          input.parentRequestId,
+          1_000,
+          input.recoverSynchronousDeliveries,
+        );
+        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+        return listed.value.map((run) => {
+          if (run.resultArtifactId) {
+            throw new Error("Artifact-backed completion requires listPendingAsync");
+          }
+          if (
+            typeof run.result === "string" &&
+            run.result.includes("Complete output: tool-result://")
+          ) {
+            throw new Error("Tool-result-backed completion requires listPendingAsync");
+          }
+          if (run.completionTarget.kind !== "live_parent") {
+            throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
+          }
+          const status = toCompletionStatus(run.state, false);
+          let finalText = "";
+          if (run.state === "succeeded") {
+            finalText = typeof run.result === "string" ? run.result : JSON.stringify(run.result);
+          }
+          return {
+            runId: run.runId,
+            parentToolCallId: run.completionTarget.parentToolCallId,
+            childRequestId: run.completionTarget.childRequestId,
+            profile: run.completionTarget.profile,
+            sessionName: run.completionTarget.sessionName,
+            status,
+            ok: status === "resolved",
+            finalText,
+            ...(run.terminalDetail ? { detail: run.terminalDetail } : {}),
+          };
+        });
+      },
+      listPendingAsync: async (): Promise<WorkflowLiveParentCompletion[]> => {
+        const listed = this.input.store.listPendingLiveParentCompletions(
+          input.parentRequestId,
+          1_000,
+          input.recoverSynchronousDeliveries,
+        );
+        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+        return await Promise.all(
+          listed.value.map(
+            async (run) =>
+              await toCompletion(
+                run,
+                this.input.store,
+                this.input.dataDir ?? env.dataDir,
+                this.input.toolResultArtifacts,
+              ),
+          ),
+        );
+      },
+      listPendingIdentities: (): WorkflowLiveParentCompletionIdentity[] => {
+        const listed = this.input.store.listPendingLiveParentCompletions(
+          input.parentRequestId,
+          1_000,
+          input.recoverSynchronousDeliveries,
+        );
+        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+        return listed.value.map((run) => toCompletionIdentity(run, this.input.store));
+      },
       isPending: (runId: string): boolean =>
         this.input.store.getLiveParentDeliveryState(runId) === "pending",
       listPendingSettledAsync: async (): Promise<
@@ -452,31 +468,32 @@ export class WorkflowLiveParentBridge {
           | { loaded: true; completion: WorkflowLiveParentCompletion }
           | { loaded: false; identity: WorkflowLiveParentCompletionIdentity; error: unknown }
         >
-      > =>
-        await Promise.all(
-          this.input.store
-            .listPendingLiveParentCompletions(
-              input.parentRequestId,
-              1_000,
-              input.recoverSynchronousDeliveries,
-            )
-            .map(async (run) => {
-              const identity = toCompletionIdentity(run, this.input.store);
-              try {
-                return {
-                  loaded: true as const,
-                  completion: await toCompletion(
-                    run,
-                    this.input.store,
-                    this.input.dataDir ?? env.dataDir,
-                    this.input.toolResultArtifacts,
-                  ),
-                };
-              } catch (error) {
-                return { loaded: false as const, identity, error };
-              }
-            }),
-        ),
+      > => {
+        const listed = this.input.store.listPendingLiveParentCompletions(
+          input.parentRequestId,
+          1_000,
+          input.recoverSynchronousDeliveries,
+        );
+        if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+        return await Promise.all(
+          listed.value.map(async (run) => {
+            const identity = toCompletionIdentity(run, this.input.store);
+            try {
+              return {
+                loaded: true as const,
+                completion: await toCompletion(
+                  run,
+                  this.input.store,
+                  this.input.dataDir ?? env.dataDir,
+                  this.input.toolResultArtifacts,
+                ),
+              };
+            } catch (error) {
+              return { loaded: false as const, identity, error };
+            }
+          }),
+        );
+      },
       acknowledge: async (runIds: readonly string[]) => {
         const now = this.now();
         for (const runId of runIds) {
@@ -545,7 +562,9 @@ export class WorkflowLiveParentBridge {
   }
 
   private async handleRunEvent(runId: string): Promise<void> {
-    const run = this.input.store.getRun(runId);
+    const runResult = this.input.store.getRun(runId);
+    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+    const run = runResult.value;
     if (!run || run.completionTarget.kind !== "live_parent") return;
     const signal = this.parents.get(run.completionTarget.parentRequestId);
     if (signal) {
@@ -661,7 +680,9 @@ export class WorkflowLiveParentBridge {
 
   private resolveChildRequestIds(run: WorkflowRun, target: LiveParentTarget): string[] {
     const requestIds = new Set([target.childRequestId]);
-    for (const operation of this.input.store.listOperations(run.runId, { limit: 1_000 })) {
+    const operations = this.input.store.listOperations(run.runId, { limit: 1_000 });
+    if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
+    for (const operation of operations.value) {
       if (operation.kind === "agent" && operation.requestId !== null) {
         requestIds.add(operation.requestId);
       }
@@ -817,14 +838,17 @@ export class WorkflowLiveParentBridge {
         reasoning?: "provider-default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
       }
     | undefined {
-    const requestIds = this.input.store
-      .listOperations(runId, { limit: 1_000 })
+    const operations = this.input.store.listOperations(runId, { limit: 1_000 });
+    if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
+    const requestIds = operations.value
       .flatMap((operation) =>
         operation.kind === "agent" && operation.requestId ? [operation.requestId] : [],
       )
       .reverse();
     for (const requestId of requestIds) {
-      const policy = this.input.store.getWorkflowRequestDispatchPolicy(requestId);
+      const policyResult = this.input.store.getWorkflowRequestDispatchPolicy(requestId);
+      if (policyResult.status === "error") signalDurableWorkflowReadErrorToHost(policyResult.error);
+      const policy = policyResult.value;
       if (!policy) continue;
       const reasoning = policy.resolvedModelRequest.reasoning;
       return {

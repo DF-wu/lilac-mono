@@ -35,7 +35,10 @@ import {
   type RawDeliveryHandler,
 } from "@stanley2058/lilac-event-bus";
 import { setGithubLatestRequestForSession } from "../../../src/github/github-state";
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  TranscriptStoreSqliteDriverFailure,
+  type TranscriptStore,
+} from "../../../src/transcript/transcript-store";
 
 type DeliveryObservation = {
   readonly topic: string;
@@ -1878,13 +1881,21 @@ describe("bridgeBusToAdapter", () => {
     const adapter = new FakeAdapter();
     const requestId = "discord:chan:msg_skip_cleanup_failure";
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       deleteUnlinkedCheckpointCandidate() {
-        throw new Error("cleanup failed");
+        return Result.err(
+          new TranscriptStoreSqliteDriverFailure({
+            operation: "delete-unlinked-checkpoint-candidate",
+            code: "SQLITE_IOERR",
+            message: "cleanup failed",
+          }),
+        );
       },
       close() {},
     };

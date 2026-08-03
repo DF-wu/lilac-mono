@@ -677,6 +677,45 @@ describe("createMiniLilacServer", () => {
     service.close();
   });
 
+  it("maps persistence decode and driver Results only at the HTTP host adapter", async () => {
+    const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
+    const { app, directory, service } = await testServer(model);
+    const session = await service.createSession({
+      id: "corrupt-todo-session",
+      cwd: directory,
+      model: "test/plain",
+    });
+    service.store.database
+      .query(
+        "INSERT INTO session_todos (session_id, revision, todos_json, updated_at) VALUES (?, 1, ?, ?)",
+      )
+      .run(session.id, "[", new Date().toISOString());
+
+    const decoded = service.getTodosResult(session.id);
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") expect(decoded.error._tag).toBe("MalformedSerialization");
+    const corruptResponse = await app.handle(
+      jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/todos`),
+    );
+    expect(corruptResponse.status).toBe(500);
+    expect(await responseJson(corruptResponse)).toEqual({
+      error: {
+        code: "persistence_failure",
+        message: "The persisted Mini Lilac session could not be read",
+      },
+    });
+
+    service.store.database.exec("DROP TABLE session_todos");
+    const driver = service.getTodosResult(session.id);
+    expect(driver.status).toBe("error");
+    if (driver.status === "error") expect(driver.error._tag).toBe("MiniLilacSqliteDriverFailure");
+    const driverResponse = await app.handle(
+      jsonRequest("GET", `${MINI_LILAC_API_PREFIX}/sessions/${session.id}/todos`),
+    );
+    expect(driverResponse.status).toBe(500);
+    service.close();
+  });
+
   it("serves populated todo state after reopening the durable store", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("unused", "unused") });
     const { app, config, directory, modelCatalog, service } = await testServer(model);

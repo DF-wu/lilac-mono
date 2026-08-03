@@ -147,6 +147,10 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing decoder awaiting an exact typed Result contract.";
     case "architecture/unknown-free-module":
       return "Existing presentation module awaiting recursive removal of domain-bearing unknown.";
+    case "architecture/persisted-codec-contract":
+      return "Existing persistence decoder awaiting an explicit versioned Result and provenance contract.";
+    case "architecture/persisted-codec-fixture-catalog":
+      return "Existing persisted codec awaiting complete current, legacy, absent, unsupported, malformed, and corrupt fixtures.";
     case "architecture/event-handler-result":
       return "Existing event handler awaiting a typed Promise<Result<void, E>> delivery contract.";
     case "architecture/event-delivery-policy-exhaustiveness":
@@ -165,6 +169,12 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing TaggedError serialization awaiting approved redaction.";
     case "architecture/fallible-api-result":
       return "Existing fallible API awaiting a typed Result return contract.";
+    case "architecture/sqlite-transaction-adapter-contract":
+      return "Existing SQLite transaction wrapper awaiting exact rollback, Panic, and driver-failure handling.";
+    case "architecture/sqlite-transaction-consumer":
+      return "Existing SQLite transaction consumer awaiting the registered Result adapter.";
+    case "architecture/no-result-err-in-sqlite-callback":
+      return "Existing raw SQLite callback may return Err without forcing driver rollback.";
   }
 }
 

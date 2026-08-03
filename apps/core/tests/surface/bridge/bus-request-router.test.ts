@@ -735,18 +735,18 @@ describe("startBusRequestRouter", () => {
     ];
 
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript: () => {},
+      saveRequestTranscript: () => Result.ok(undefined),
       linkSurfaceMessagesToRequest: () => {},
       getTranscriptBySurfaceMessage: ({ messageId }) => {
-        if (messageId !== replyToMessageId) return null;
-        return {
+        if (messageId !== replyToMessageId) return Result.ok(null);
+        return Result.ok({
           requestId: "r1",
           sessionId,
           requestClient: "discord",
           createdTs: Date.now(),
           updatedTs: Date.now(),
           messages: baseTranscript,
-        };
+        });
       },
       close: () => {},
     };

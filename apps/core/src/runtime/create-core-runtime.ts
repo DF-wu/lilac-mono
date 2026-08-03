@@ -54,6 +54,7 @@ import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscoveryService } from "../discovery/discovery-service";
 import {
+  createConversationThreadToolService,
   ConversationThreadService,
   type ConversationThreadRunSummarizationInput,
   type ConversationThreadToolService,
@@ -111,7 +112,10 @@ import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
-import { createToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
+import {
+  adaptToolResultArtifactStoreInitToHost,
+  createToolResultArtifactStore,
+} from "../artifacts/tool-result-artifact-store";
 import {
   createEmptyMcpConfig,
   McpOAuthCallbackService,
@@ -1104,7 +1108,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
 
       // Ensure data dir exists before creating sqlite-backed stores.
       await fs.mkdir(env.dataDir, { recursive: true });
-      await toolResultArtifacts.init();
+      const artifactStoreInit = await toolResultArtifacts.init();
+      adaptToolResultArtifactStoreInitToHost(artifactStoreInit);
 
       const mcpStartup = await startCoreMcpServices({
         configPath: mcpConfigPath,
@@ -1411,11 +1416,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
           ? (() => {
               const service = conversationThreadService;
               const summarizationRunner = conversationThreadSummarizationRunner;
+              const toolService = createConversationThreadToolService(service);
               return {
-                search: (input) => service.search(input),
-                metadata: (input) => service.metadata(input),
-                read: (input) => service.read(input),
-                planAutoInjectSearch: (input) => service.planAutoInjectSearch(input),
+                ...toolService,
                 runSummarization: (input) =>
                   resolveConversationThreadSummarizationToolOperation(
                     summarizationRunner
@@ -1525,33 +1528,37 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
         logger.info("GitHub App secret missing; skipping GitHub surface");
       }
 
-      const restartLoad = gracefulRestartStore?.loadAndConsumeCompletedSnapshotDetailed() ?? {
-        snapshot: null,
-        reason: "empty" as const,
-      };
+      const restartLoadResult = gracefulRestartStore?.loadAndConsumeCompletedSnapshot();
+      const restartLoad =
+        restartLoadResult?.status === "ok"
+          ? restartLoadResult.value
+          : ({ state: "absent", provenance: "missing-defaulted" } as const);
+      if (restartLoadResult?.status === "error") {
+        logger.warn(
+          "Graceful restart snapshot load failed",
+          formatTaggedErrorForLog(restartLoadResult.error),
+        );
+      }
+      const restartSnapshot = restartLoad.state === "loaded" ? restartLoad.snapshot : null;
 
-      const initialHeartbeatExternalState = restartLoad.snapshot
+      const initialHeartbeatExternalState = restartSnapshot
         ? {
-            activeRequestIds: restartLoad.snapshot.agent
+            activeRequestIds: restartSnapshot.agent
               .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
               .map((entry) => entry.requestId),
           }
         : undefined;
 
-      if (!restartLoad.snapshot && restartLoad.reason === "stale") {
+      if (restartLoad.state === "stale") {
         logger.warn("Graceful restart snapshot discarded (stale)", {
           createdAt: restartLoad.createdAt,
           ageMs: restartLoad.ageMs,
           deadlineMs: restartLoad.deadlineMs,
         });
-      } else if (restartLoad.reason !== "empty" && restartLoad.reason !== "loaded") {
-        logger.warn("Graceful restart snapshot discarded", {
-          reason: restartLoad.reason,
-        });
       }
 
       const recoverableRootParentRequestIds =
-        restartLoad.snapshot?.agent
+        restartSnapshot?.agent
           .filter(
             (entry) =>
               entry.kind === "active" &&
@@ -1559,8 +1566,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
               !isWorkflowAgentRecoveryEntry(entry),
           )
           .map((entry) => entry.requestId) ?? [];
-      const remainingSnapshotProtectionMs = restartLoad.snapshot
-        ? Math.max(1, restartLoad.snapshot.createdAt + restartLoad.snapshot.deadlineMs - Date.now())
+      const remainingSnapshotProtectionMs = restartSnapshot
+        ? Math.max(1, restartSnapshot.createdAt + restartSnapshot.deadlineMs - Date.now())
         : GRACEFUL_SNAPSHOT_TTL_MS;
       await workflowLiveParentBridge.enableOrphanHandling({
         protectedParentRequestIds: recoverableRootParentRequestIds,
@@ -1635,8 +1642,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
         cwd: canonicalWorkspaceRoot,
       });
 
-      if (restartLoad.snapshot) {
-        await restoreGracefulSnapshot(restartLoad.snapshot).catch((e: unknown) => {
+      if (restartSnapshot) {
+        await restoreGracefulSnapshot(restartSnapshot).catch((e: unknown) => {
           logger.error("Failed to restore graceful restart snapshot", e);
         });
       }
@@ -1804,24 +1811,37 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
 
       if (agentRecoverables.length > 0 || relayRecoverables.length > 0) {
         await safe("graceful.store.saveCompletedSnapshot", async () => {
-          gracefulRestartStore?.saveCompletedSnapshot({
+          const saved = gracefulRestartStore?.saveCompletedSnapshot({
             version: 2,
             createdAt: Date.now(),
             deadlineMs: GRACEFUL_SNAPSHOT_TTL_MS,
             agent: agentRecoverables,
             relays: relayRecoverables,
           });
-        });
+          if (saved?.status === "error") {
+            logger.warn(
+              "Graceful restart snapshot save failed",
+              formatTaggedErrorForLog(saved.error),
+            );
+            return;
+          }
 
-        logger.info("Saved graceful restart snapshot", {
-          drainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
-          snapshotTtlMs: GRACEFUL_SNAPSHOT_TTL_MS,
-          agentEntries: agentRecoverables.length,
-          relayEntries: relayRecoverables.length,
+          logger.info("Saved graceful restart snapshot", {
+            drainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
+            snapshotTtlMs: GRACEFUL_SNAPSHOT_TTL_MS,
+            agentEntries: agentRecoverables.length,
+            relayEntries: relayRecoverables.length,
+          });
         });
       } else {
         await safe("graceful.store.clear", async () => {
-          gracefulRestartStore?.clear();
+          const cleared = gracefulRestartStore?.clear();
+          if (cleared?.status === "error") {
+            logger.warn(
+              "Graceful restart snapshot clear failed",
+              formatTaggedErrorForLog(cleared.error),
+            );
+          }
         });
       }
     }

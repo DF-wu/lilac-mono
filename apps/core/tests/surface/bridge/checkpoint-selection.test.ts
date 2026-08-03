@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 
 import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
 import { selectNewestReachableCheckpoint } from "../../../src/surface/bridge/request-composition/checkpoint-selection";
@@ -19,10 +20,12 @@ function checkpoint(requestId: string, text: string): TranscriptSnapshot {
 
 function storeFor(snapshots: Record<string, TranscriptSnapshot | undefined>): TranscriptStore {
   return {
-    saveRequestTranscript() {},
+    saveRequestTranscript() {
+      return Result.ok(undefined);
+    },
     linkSurfaceMessagesToRequest() {},
     getTranscriptBySurfaceMessage(input) {
-      return snapshots[input.messageId] ?? null;
+      return Result.ok(snapshots[input.messageId] ?? null);
     },
     close() {},
   };

@@ -293,7 +293,7 @@ async function resolveMcpValueSourceEntry(
   context: McpValueResolutionContext,
 ): Promise<ResultType<string, McpValueMapResolutionError>> {
   const resolution = await resolveMcpValueSource(source, context);
-  if (resolution.status === "ok") return resolution;
+  if (resolution.status === "ok") return Result.ok(resolution.value);
   return Result.err(
     new McpValueMapResolutionError({
       key,

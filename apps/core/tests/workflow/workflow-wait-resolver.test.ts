@@ -1,3 +1,4 @@
+import { workflowStoreValue } from "./workflow-store-test-helpers";
 import { describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
@@ -12,7 +13,6 @@ import {
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 import { Panic } from "better-result";
-
 import {
   subscribeForTest,
   testDeliveriesRemainOpenOnPolicyStop,
@@ -27,10 +27,13 @@ import {
 } from "../../src/workflow/workflow-domain";
 import { shouldSuppressRouterForWorkflowReply } from "../../src/workflow/workflow-router-suppression";
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
-
 class IdleRawBus implements RawBus {
   readonly subscribe = subscribeForTest;
-  readonly retiredGroups: Array<{ topic: string; group: string; activated: boolean }> = [];
+  readonly retiredGroups: Array<{
+    topic: string;
+    group: string;
+    activated: boolean;
+  }> = [];
   private sequence = 0;
   private readonly watermarks = new Map<string, string>();
   private readonly history: Message<unknown>[];
@@ -38,11 +41,9 @@ class IdleRawBus implements RawBus {
     topic: string;
     handler: TestRawMessageHandler;
   }> = [];
-
   constructor(history: readonly Message<unknown>[] = []) {
     this.history = [...history];
   }
-
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
     const id = `${++this.sequence}-0`;
     this.watermarks.set(message.topic, id);
@@ -54,7 +55,6 @@ class IdleRawBus implements RawBus {
     }
     return { id, cursor: id };
   }
-
   async openTestSubscription(
     topic: string,
     options: SubscriptionOptions,
@@ -80,7 +80,6 @@ class IdleRawBus implements RawBus {
       },
     };
   }
-
   async fetch(topic: string, _options: FetchOptions) {
     return {
       messages: this.history
@@ -104,16 +103,13 @@ class IdleRawBus implements RawBus {
   }
   async close() {}
 }
-
 class HistoricalReplyRawBus extends IdleRawBus {
   constructor(historical: Message<unknown>) {
     super([historical]);
   }
 }
-
 class FailingFirstWakeupRawBus extends IdleRawBus {
   wakeupFailures = 0;
-
   override async publish<TData>(
     message: Omit<Message<TData>, "id" | "ts">,
     options: PublishOptions,
@@ -128,11 +124,9 @@ class FailingFirstWakeupRawBus extends IdleRawBus {
     return await super.publish(message, options);
   }
 }
-
 class ConfigurablePublicationFailureRawBus extends IdleRawBus {
   barrierFailure: Error | null = null;
   wakeupFailure: Error | null = null;
-
   override async publish<TData>(
     message: Omit<Message<TData>, "id" | "ts">,
     options: PublishOptions,
@@ -146,12 +140,10 @@ class ConfigurablePublicationFailureRawBus extends IdleRawBus {
     return await super.publish(message, options);
   }
 }
-
 class RetirementFailingRawBus extends IdleRawBus {
   subscriptionStops = 0;
   retirementFailure: Error | null = null;
   subscriptionStopFailure: Error | null = null;
-
   override async openTestSubscription(
     topic: string,
     options: SubscriptionOptions,
@@ -166,32 +158,26 @@ class RetirementFailingRawBus extends IdleRawBus {
       },
     };
   }
-
   override async retireConsumerGroup(topic: string, group: string) {
     if (this.retirementFailure) throw this.retirementFailure;
     return await super.retireConsumerGroup(topic, group);
   }
 }
-
 class HeartbeatTrackingWaitStore extends DurableWorkflowStore {
   readonly resolverLeaseRefreshes: number[] = [];
-
   override refreshWorkflowWaitResolverLease(ownerId: string, now: number): boolean {
     this.resolverLeaseRefreshes.push(now);
     return super.refreshWorkflowWaitResolverLease(ownerId, now);
   }
 }
-
 class LeaseTrackingWaitStore extends DurableWorkflowStore {
   resolverLeaseReleases = 0;
   private nextLeaseClaimObserver: (() => void) | null = null;
-
   observeNextLeaseClaim(): Promise<void> {
     return new Promise((resolve) => {
       this.nextLeaseClaimObserver = resolve;
     });
   }
-
   override claimWorkflowWaitResolverLease(
     input: Parameters<DurableWorkflowStore["claimWorkflowWaitResolverLease"]>[0],
   ): boolean {
@@ -201,22 +187,18 @@ class LeaseTrackingWaitStore extends DurableWorkflowStore {
     observer?.();
     return claimed;
   }
-
   override releaseWorkflowWaitResolverLease(ownerId: string): void {
     this.resolverLeaseReleases += 1;
     super.releaseWorkflowWaitResolverLease(ownerId);
   }
 }
-
 class CheckpointRejectingWaitStore extends DurableWorkflowStore {
   checkpointAttempts = 0;
-
   override advanceWorkflowWaitResolverCheckpoint(): boolean {
     this.checkpointAttempts += 1;
     return false;
   }
 }
-
 class CompletingRawBus extends IdleRawBus {
   subscriptionCount = 0;
   subscriptionAttempts = 0;
@@ -227,24 +209,20 @@ class CompletingRawBus extends IdleRawBus {
     reject: (reason?: unknown) => void;
   }> = [];
   private nextSubscriptionObserver: (() => void) | null = null;
-
   observeNextSubscription(): Promise<void> {
     return new Promise((resolve) => {
       this.nextSubscriptionObserver = resolve;
     });
   }
-
   failNextSubscriptions(count: number): void {
     this.failingSubscriptions = count;
   }
-
   terminate(index: number, error?: unknown): void {
     const completion = this.completions[index];
     if (!completion) throw new Error(`Missing subscription completion ${index}`);
     if (error === undefined) completion.resolve();
     else completion.reject(error);
   }
-
   override async openTestSubscription(
     topic: string,
     options: SubscriptionOptions,
@@ -271,10 +249,13 @@ class CompletingRawBus extends IdleRawBus {
     };
   }
 }
-
 function createRunAndWait(
   store: DurableWorkflowStore,
-  input: { runId: string; operationId: string; wait: Omit<WorkflowWait, "runId" | "operationId"> },
+  input: {
+    runId: string;
+    operationId: string;
+    wait: Omit<WorkflowWait, "runId" | "operationId">;
+  },
 ): void {
   const revisionId = `revision-${input.runId}`;
   store.createInvocation({
@@ -297,14 +278,14 @@ function createRunAndWait(
           maxTotal: 1,
         },
         maxNestingDepth: 2,
-        operationIdleTimeoutMs: 10_000,
+        operationIdleTimeoutMs: 10000,
         waits: ["reply", "sleep"],
       }),
       limits: {
-        maxSourceBytes: 10_000,
-        maxInputBytes: 10_000,
-        maxOperationOutputBytes: 10_000,
-        maxResultBytes: 10_000,
+        maxSourceBytes: 10000,
+        maxInputBytes: 10000,
+        maxOperationOutputBytes: 10000,
+        maxResultBytes: 10000,
       },
       runtimeVersion: "lilac-workflow-js-v4",
       createdAt: 1,
@@ -366,16 +347,14 @@ function createRunAndWait(
   );
   store.createWait({ ...input.wait, runId: input.runId, operationId: input.operationId }, "engine");
 }
-
 async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + 2000;
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error("Timed out waiting for resolver");
     // test-wait-justification: polls for resolver work performed by its independently scheduled bus consumer
     await Bun.sleep(5);
   }
 }
-
 describe("WorkflowWaitResolver", () => {
   it("paces lease heartbeats independently of timer polls and adapter events", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-heartbeat-${crypto.randomUUID()}.sqlite`);
@@ -387,8 +366,8 @@ describe("WorkflowWaitResolver", () => {
       store,
       subscriptionId: "resolver-heartbeat-pacing",
       now: () => now,
-      pollMs: 1_000_000,
-      leaseHeartbeatMs: 1_000,
+      pollMs: 1000000,
+      leaseHeartbeatMs: 1000,
     });
     const publishAdapterEvent = async (messageId: string): Promise<void> => {
       await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
@@ -404,23 +383,20 @@ describe("WorkflowWaitResolver", () => {
     try {
       await resolver.start();
       expect(store.resolverLeaseRefreshes).toEqual([]);
-
       now = 350;
       await resolver.reconcileTimers();
       now = 600;
       await publishAdapterEvent("early-event");
-      now = 1_099;
+      now = 1099;
       await resolver.reconcileTimers();
       expect(store.resolverLeaseRefreshes).toEqual([]);
-
-      now = 1_100;
+      now = 1100;
       await publishAdapterEvent("due-event");
       await publishAdapterEvent("same-time-event");
-      expect(store.resolverLeaseRefreshes).toEqual([1_100]);
-
-      now = 2_100;
+      expect(store.resolverLeaseRefreshes).toEqual([1100]);
+      now = 2100;
       await resolver.reconcileTimers();
-      expect(store.resolverLeaseRefreshes).toEqual([1_100, 2_100]);
+      expect(store.resolverLeaseRefreshes).toEqual([1100, 2100]);
     } finally {
       await resolver.stop();
       await bus.close();
@@ -428,7 +404,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("checks lease ownership without refreshing before timer side effects", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-read-ownership-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -439,8 +414,8 @@ describe("WorkflowWaitResolver", () => {
       store,
       subscriptionId: "resolver-read-ownership",
       now: () => now,
-      pollMs: 1_000_000,
-      leaseHeartbeatMs: 1_000,
+      pollMs: 1000000,
+      leaseHeartbeatMs: 1000,
     });
     try {
       createRunAndWait(store, {
@@ -470,10 +445,11 @@ describe("WorkflowWaitResolver", () => {
           staleBefore: Number.MAX_SAFE_INTEGER,
         }),
       ).toBe(true);
-
       now = 100;
       await resolver.reconcileTimers();
-      expect(store.getWait("lease-lost-sleep", "sleep-1")?.state).toBe("pending");
+      expect(workflowStoreValue(store.getWait("lease-lost-sleep", "sleep-1"))?.state).toBe(
+        "pending",
+      );
       expect(store.isWorkflowWaitResolverLeaseOwner("successor")).toBe(true);
     } finally {
       await resolver.stop();
@@ -483,7 +459,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   for (const termination of ["completion", "failure"] as const) {
     it(`releases its lease and resubscribes after unexpected subscription ${termination}`, async () => {
       const dbPath = join(tmpdir(), `workflow-wait-subscription-${crypto.randomUUID()}.sqlite`);
@@ -494,7 +469,7 @@ describe("WorkflowWaitResolver", () => {
         bus,
         store,
         subscriptionId: `resolver-${termination}`,
-        pollMs: 1_000_000,
+        pollMs: 1000000,
         subscriptionRecoveryRetryMs: 0,
       });
       try {
@@ -502,7 +477,6 @@ describe("WorkflowWaitResolver", () => {
         const resubscribed = raw.observeNextSubscription();
         raw.terminate(0, termination === "failure" ? new Error("subscription failed") : undefined);
         await resubscribed;
-
         expect(raw.subscriptionCount).toBe(2);
         expect(store.resolverLeaseReleases).toBe(1);
         expect(
@@ -520,7 +494,6 @@ describe("WorkflowWaitResolver", () => {
       }
     });
   }
-
   it("continues subscription recovery beyond transient startup failures", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-subscription-retry-${crypto.randomUUID()}.sqlite`);
     const store = new LeaseTrackingWaitStore(dbPath);
@@ -530,7 +503,7 @@ describe("WorkflowWaitResolver", () => {
       bus,
       store,
       subscriptionId: "resolver-retry-until-recovered",
-      pollMs: 1_000_000,
+      pollMs: 1000000,
       subscriptionRecoveryRetryMs: 0,
     });
     try {
@@ -539,7 +512,6 @@ describe("WorkflowWaitResolver", () => {
       const resubscribed = raw.observeNextSubscription();
       raw.terminate(0, new Error("subscription failed"));
       await resubscribed;
-
       expect(raw.subscriptionAttempts).toBe(8);
       expect(raw.subscriptionCount).toBe(2);
       expect(store.resolverLeaseReleases).toBe(7);
@@ -550,7 +522,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("keeps the startup failure primary when subscription cleanup returns an error", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-startup-cleanup-${crypto.randomUUID()}.sqlite`);
     const store = new LeaseTrackingWaitStore(dbPath);
@@ -578,7 +549,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("cleans up startup and preserves consumer-group retirement Panic identity", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-startup-panic-${crypto.randomUUID()}.sqlite`);
     const store = new LeaseTrackingWaitStore(dbPath);
@@ -606,7 +576,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("releases its lease when the public stop adapter rejects a cleanup Result", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-stop-result-${crypto.randomUUID()}.sqlite`);
     const store = new LeaseTrackingWaitStore(dbPath);
@@ -630,7 +599,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("does not recover a subscription completed by intentional stop", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-subscription-stop-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -640,7 +608,7 @@ describe("WorkflowWaitResolver", () => {
       bus,
       store,
       subscriptionId: "resolver-intentional-stop",
-      pollMs: 1_000_000,
+      pollMs: 1000000,
       subscriptionRecoveryRetryMs: 0,
     });
     try {
@@ -655,7 +623,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("advances its checkpoint and processes the next reply after wakeup publication fails", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-advisory-wakeup-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -683,7 +650,7 @@ describe("WorkflowWaitResolver", () => {
             },
             matchKey: `discord:channel-${index}`,
             dueAt: null,
-            deadlineAt: 1_000,
+            deadlineAt: 1000,
             resolverCursor: null,
             result: null,
             resolvedBy: null,
@@ -714,10 +681,9 @@ describe("WorkflowWaitResolver", () => {
         ts: 10,
         raw: { discord: { replyToMessageId: "anchor-2" } },
       });
-
       expect(raw.wakeupFailures).toBe(1);
-      expect(store.getWait("run-1", "wait-1")?.state).toBe("resolved");
-      expect(store.getWait("run-2", "wait-2")?.state).toBe("resolved");
+      expect(workflowStoreValue(store.getWait("run-1", "wait-1"))?.state).toBe("resolved");
+      expect(workflowStoreValue(store.getWait("run-2", "wait-2"))?.state).toBe("resolved");
       expect(store.getWorkflowWaitResolverCheckpoint("evt.adapter")).toBe(second.cursor);
       expect(first.cursor).not.toBe(second.cursor);
     } finally {
@@ -727,7 +693,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("preserves wakeup publication Panic identity after durable reply resolution", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-wakeup-panic-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -739,7 +704,7 @@ describe("WorkflowWaitResolver", () => {
       store,
       subscriptionId: "wakeup-panic",
       now: () => 10,
-      pollMs: 1_000_000,
+      pollMs: 1000000,
     });
     try {
       createRunAndWait(store, {
@@ -756,7 +721,7 @@ describe("WorkflowWaitResolver", () => {
           },
           matchKey: "discord:channel-1",
           dueAt: null,
-          deadlineAt: 1_000,
+          deadlineAt: 1000,
           resolverCursor: null,
           result: null,
           resolvedBy: null,
@@ -783,7 +748,9 @@ describe("WorkflowWaitResolver", () => {
           "wakeup-panic-cursor",
         ),
       ).rejects.toBe(panic);
-      expect(store.getWait("wakeup-panic-run", "wakeup-panic-wait")?.state).toBe("resolved");
+      expect(
+        workflowStoreValue(store.getWait("wakeup-panic-run", "wakeup-panic-wait"))?.state,
+      ).toBe("resolved");
     } finally {
       raw.wakeupFailure = null;
       await resolver.stop();
@@ -792,7 +759,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("clears reconciliation state and preserves barrier publication Panic identity", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-barrier-panic-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -805,7 +771,7 @@ describe("WorkflowWaitResolver", () => {
       store,
       subscriptionId: "barrier-panic",
       now: () => now,
-      pollMs: 1_000_000,
+      pollMs: 1000000,
     });
     try {
       createRunAndWait(store, {
@@ -837,13 +803,16 @@ describe("WorkflowWaitResolver", () => {
       now = 100;
       raw.barrierFailure = panic;
       await expect(resolver.reconcileTimers()).rejects.toBe(panic);
-      expect(store.getWait("barrier-panic-run", "barrier-panic-wait")?.state).toBe("pending");
-
+      expect(
+        workflowStoreValue(store.getWait("barrier-panic-run", "barrier-panic-wait"))?.state,
+      ).toBe("pending");
       raw.barrierFailure = null;
-      now = 5_101;
+      now = 5101;
       await resolver.reconcileTimers();
       await resolver.reconcileTimers();
-      expect(store.getWait("barrier-panic-run", "barrier-panic-wait")?.state).toBe("expired");
+      expect(
+        workflowStoreValue(store.getWait("barrier-panic-run", "barrier-panic-wait"))?.state,
+      ).toBe("expired");
     } finally {
       raw.barrierFailure = null;
       await resolver.stop();
@@ -852,7 +821,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("enforces one ordered resolver consumer and releases its durable lease", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-lease-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -891,7 +859,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("waits for and takes over a crashed resolver lease after it becomes stale", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-crash-lease-${crypto.randomUUID()}.sqlite`);
     const store = new LeaseTrackingWaitStore(dbPath);
@@ -928,7 +895,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("resolves an offline on-time reply before expiring its deadline on restart", async () => {
     const dbPath = join(tmpdir(), `workflow-reply-catchup-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -984,7 +950,7 @@ describe("WorkflowWaitResolver", () => {
         pollMs: 10,
       });
       await resolver.start();
-      expect(store.getWait("reply-catchup", "wait-catchup")).toMatchObject({
+      expect(workflowStoreValue(store.getWait("reply-catchup", "wait-catchup"))).toMatchObject({
         state: "resolved",
         resolverCursor: "9-0",
         result: { text: "on time", messageId: "reply-before-deadline" },
@@ -996,7 +962,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("resumes after its durable checkpoint and processes replies published during downtime", async () => {
     const dbPath = join(tmpdir(), `workflow-reply-checkpoint-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1045,7 +1010,7 @@ describe("WorkflowWaitResolver", () => {
           },
           matchKey: "discord:channel-1",
           dueAt: null,
-          deadlineAt: 1_000,
+          deadlineAt: 1000,
           resolverCursor: null,
           result: null,
           resolvedBy: null,
@@ -1068,9 +1033,11 @@ describe("WorkflowWaitResolver", () => {
         ts: 19,
         raw: { discord: { replyToMessageId: "anchor-1" } },
       });
-      expect(store.getWait("checkpoint-run", "checkpoint-wait")?.state).toBe("pending");
+      expect(workflowStoreValue(store.getWait("checkpoint-run", "checkpoint-wait"))?.state).toBe(
+        "pending",
+      );
       await restarted.start();
-      expect(store.getWait("checkpoint-run", "checkpoint-wait")).toMatchObject({
+      expect(workflowStoreValue(store.getWait("checkpoint-run", "checkpoint-wait"))).toMatchObject({
         state: "resolved",
         result: { messageId: "reply-during-downtime", text: "resume" },
       });
@@ -1082,7 +1049,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("does not advance the tail when the SQLite checkpoint cannot advance", async () => {
     const dbPath = join(
       tmpdir(),
@@ -1128,7 +1094,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("replays an offline reply, persists its cursor, and expires router suppression after consumption", async () => {
     const dbPath = join(tmpdir(), `workflow-reply-wait-${crypto.randomUUID()}.sqlite`);
     let store = new DurableWorkflowStore(dbPath);
@@ -1158,7 +1123,7 @@ describe("WorkflowWaitResolver", () => {
           },
           matchKey: "discord:channel-1",
           dueAt: null,
-          deadlineAt: 1_000,
+          deadlineAt: 1000,
           resolverCursor: null,
           result: null,
           resolvedBy: null,
@@ -1179,18 +1144,20 @@ describe("WorkflowWaitResolver", () => {
       });
       await resolver.start();
       await resolver.resolveAdapterEvent({ ...event, messageId: "historical", ts: 2 }, "0-1");
-      await resolver.resolveAdapterEvent({ ...event, messageId: "late", ts: 1_001 }, "0-2");
-      expect(store.getWait("reply-wait", "wait-1")?.state).toBe("pending");
+      await resolver.resolveAdapterEvent({ ...event, messageId: "late", ts: 1001 }, "0-2");
+      expect(workflowStoreValue(store.getWait("reply-wait", "wait-1"))?.state).toBe("pending");
       expect(
         shouldSuppressRouterForWorkflowReply({
           store,
-          event: { ...event, messageId: "exact", ts: 1_000 },
+          event: { ...event, messageId: "exact", ts: 1000 },
           now: 20,
         }).suppress,
       ).toBe(false);
       await resolver.resolveAdapterEvent(event, "1-0");
-      await waitFor(() => store.getWait("reply-wait", "wait-1")?.state === "resolved");
-      const resolved = store.getWait("reply-wait", "wait-1");
+      await waitFor(
+        () => workflowStoreValue(store.getWait("reply-wait", "wait-1"))?.state === "resolved",
+      );
+      const resolved = workflowStoreValue(store.getWait("reply-wait", "wait-1"));
       expect(resolved).toMatchObject({
         resolverCursor: "1-0",
         result: { text: "continue", messageId: "reply-1" },
@@ -1198,7 +1165,7 @@ describe("WorkflowWaitResolver", () => {
       expect(shouldSuppressRouterForWorkflowReply({ store, event, now: 21 }).suppress).toBe(true);
       expect(shouldSuppressRouterForWorkflowReply({ store, event, now: 22 }).suppress).toBe(true);
       expect(
-        shouldSuppressRouterForWorkflowReply({ store, event, now: 20 + 5 * 60_000 }).suppress,
+        shouldSuppressRouterForWorkflowReply({ store, event, now: 20 + 5 * 60000 }).suppress,
       ).toBe(false);
       await resolver.stop();
     } finally {
@@ -1207,7 +1174,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("expires an exact-deadline reply deterministically regardless of resolver order", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-deadline-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1255,11 +1221,11 @@ describe("WorkflowWaitResolver", () => {
       });
       await resolver.start();
       await resolver.resolveAdapterEvent(event, "1-0");
-      expect(store.getWait("exact-deadline", "wait-1")?.state).toBe("pending");
+      expect(workflowStoreValue(store.getWait("exact-deadline", "wait-1"))?.state).toBe("pending");
       await resolver.reconcileTimers();
-      expect(store.getWait("exact-deadline", "wait-1")?.state).toBe("expired");
+      expect(workflowStoreValue(store.getWait("exact-deadline", "wait-1"))?.state).toBe("expired");
       await resolver.resolveAdapterEvent(event, "1-1");
-      expect(store.getWait("exact-deadline", "wait-1")?.state).toBe("expired");
+      expect(workflowStoreValue(store.getWait("exact-deadline", "wait-1"))?.state).toBe("expired");
     } finally {
       await resolver.stop();
       await bus.close();
@@ -1267,7 +1233,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("waits until its ordered adapter barrier is processed before expiring a reply", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-watermark-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -1306,9 +1271,9 @@ describe("WorkflowWaitResolver", () => {
         },
       });
       await resolver.start();
-      expect(store.getWait("watermark-wait", "wait-1")?.state).toBe("pending");
+      expect(workflowStoreValue(store.getWait("watermark-wait", "wait-1"))?.state).toBe("pending");
       await resolver.reconcileTimers();
-      expect(store.getWait("watermark-wait", "wait-1")?.state).toBe("expired");
+      expect(workflowStoreValue(store.getWait("watermark-wait", "wait-1"))?.state).toBe("expired");
     } finally {
       await resolver.stop();
       await bus.close();
@@ -1316,7 +1281,6 @@ describe("WorkflowWaitResolver", () => {
       rmSync(dbPath, { force: true });
     }
   });
-
   it("resolves sleeps once, expires reply deadlines, and recovers both after restart", async () => {
     const dbPath = join(tmpdir(), `workflow-timer-wait-${crypto.randomUUID()}.sqlite`);
     let store = new DurableWorkflowStore(dbPath);
@@ -1376,7 +1340,7 @@ describe("WorkflowWaitResolver", () => {
       });
       await resolver.start();
       await resolver.stop();
-      expect(store.getWait("sleep-wait", "sleep-1")?.state).toBe("pending");
+      expect(workflowStoreValue(store.getWait("sleep-wait", "sleep-1"))?.state).toBe("pending");
       store.close();
       store = new DurableWorkflowStore(dbPath);
       now = 100;
@@ -1388,9 +1352,15 @@ describe("WorkflowWaitResolver", () => {
         pollMs: 5,
       });
       await restarted.start();
-      await waitFor(() => store.getWait("sleep-wait", "sleep-1")?.state === "resolved");
-      await waitFor(() => store.getWait("timeout-wait", "reply-2")?.state === "expired");
-      expect(store.getWait("sleep-wait", "sleep-1")?.result).toMatchObject({ dueAt: 100 });
+      await waitFor(
+        () => workflowStoreValue(store.getWait("sleep-wait", "sleep-1"))?.state === "resolved",
+      );
+      await waitFor(
+        () => workflowStoreValue(store.getWait("timeout-wait", "reply-2"))?.state === "expired",
+      );
+      expect(workflowStoreValue(store.getWait("sleep-wait", "sleep-1"))?.result).toMatchObject({
+        dueAt: 100,
+      });
       await restarted.stop();
     } finally {
       await resolver.stop();

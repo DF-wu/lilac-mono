@@ -1,8 +1,12 @@
 import { createLogger } from "@stanley2058/lilac-utils";
 import type { ToolModelMessage } from "ai";
+import { Panic } from "better-result";
 import { stripVTControlCharacters } from "node:util";
 
-import type { ToolResultArtifactStore } from "./tool-result-artifact-store";
+import {
+  ToolResultArtifactTooLargeError,
+  type ToolResultArtifactStore,
+} from "./tool-result-artifact-store";
 
 const GENERATED_OVERFLOW_REFERENCE =
   /^\[tool result overflow\]\nThe tool completed, but its output exceeded the inline limit\.\n(?:Complete captured output: tool-result:\/\/[0-9a-f-]{36}\nUse read_file with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse nextStart unchanged while more content remains\. Do not re-run the original tool\.|The complete output could not be retained\. Narrow the request or re-run the tool\.)$/u;
@@ -142,8 +146,9 @@ export function createOverflowReferenceNormalizer(
     if (!spill) return value;
 
     let uri: string | undefined;
+    let artifact: Awaited<ReturnType<ToolResultArtifactStore["create"]>> | undefined;
     try {
-      const artifact = await params.artifacts?.create({
+      artifact = await params.artifacts?.create({
         scopeId: ownerScopeId(params.owner),
         requestId: params.owner.requestId,
         ...context,
@@ -154,11 +159,22 @@ export function createOverflowReferenceNormalizer(
           ? {}
           : { maxArtifactBytes: config.maxArtifactBytes }),
       });
-      uri = artifact?.uri;
-    } catch (error) {
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
       logger.warn("tool.artifact.write_failed", {
         toolName: context.toolName,
-        error: error instanceof Error ? error.message : String(error),
+        errorTag: "ArtifactPersistenceRejected",
+      });
+    }
+    if (artifact?.status === "ok") {
+      uri = artifact.value.uri;
+    } else if (artifact?.status === "error") {
+      logger.warn("tool.artifact.write_failed", {
+        toolName: context.toolName,
+        errorTag:
+          artifact.error instanceof ToolResultArtifactTooLargeError
+            ? artifact.error.name
+            : artifact.error._tag,
       });
     }
 

@@ -23,10 +23,39 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
-import { z } from "zod";
+import { errorCode as nodeErrorCode } from "@stanley2058/lilac-utils";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
-const FORMAT_VERSION = 1;
-const IMPLEMENTATION_VERSION = "mini-lilac-private-git-v1";
+import {
+  decodeWorkspaceHistoryCaptureCache,
+  decodeWorkspaceHistoryOwnership,
+  decodeWorkspaceHistoryRestoreOwnership,
+  decodeWorkspaceHistoryRestorePlan,
+  decodeWorkspaceHistorySnapshotManifest,
+  decodeWorkspaceHistorySnapshotRefCreated,
+  encodeWorkspaceHistoryRecord,
+  WorkspaceHistoryPersistenceCorrupt,
+  WorkspaceHistoryPersistenceMalformed,
+  WorkspaceHistoryPersistenceUnsupportedVersion,
+  WORKSPACE_HISTORY_FORMAT_VERSION,
+  WORKSPACE_HISTORY_IMPLEMENTATION_VERSION,
+  type WorkspaceHistoryCachedEntry,
+  type WorkspaceHistoryCaptureCache,
+  type WorkspaceHistoryOwnership,
+  type WorkspaceHistoryPersistenceCodecError,
+  type WorkspaceHistoryPersistenceIssueCode,
+  type WorkspaceHistoryPersistenceRecordKind,
+  type WorkspaceHistoryPersistenceVersionCategory,
+  type WorkspaceHistoryRestoreArtifact,
+  type WorkspaceHistoryRestoreArtifactRole,
+  type WorkspaceHistoryRestoreOwnership,
+  type WorkspaceHistoryRestorePlan,
+  type WorkspaceHistorySnapshotManifest,
+  type WorkspaceHistorySnapshotRefCreated,
+} from "./workspace-history-persistence-codec";
+
+const FORMAT_VERSION = WORKSPACE_HISTORY_FORMAT_VERSION;
+const IMPLEMENTATION_VERSION = WORKSPACE_HISTORY_IMPLEMENTATION_VERSION;
 const POSIX_FILE_MODE = 0o100644;
 const POSIX_EXECUTABLE_MODE = 0o100755;
 const POSIX_SYMLINK_MODE = 0o120000;
@@ -35,115 +64,6 @@ const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const SNAPSHOT_REF_PREFIX = "refs/mini-lilac/snapshots/";
 const RESTORE_TEMP_PATTERN =
   /^\.mini-lilac-restore-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-const ownershipMarkerSchema = z.strictObject({
-  formatVersion: z.literal(FORMAT_VERSION),
-  namespaceId: z.string().min(1),
-  databasePathHash: z.string().min(1),
-  workspaceId: z.string().regex(SAFE_ID_PATTERN),
-  canonicalCwd: z.string().min(1),
-});
-
-const manifestSchema = z.strictObject({
-  formatVersion: z.literal(FORMAT_VERSION),
-  implementationVersion: z.literal(IMPLEMENTATION_VERSION),
-  managedRoot: z.literal("."),
-  emptyDirectories: z.literal("excluded"),
-  platform: z.enum(["linux", "darwin"]),
-  pathComparison: z.enum(["case-sensitive", "case-insensitive"]),
-});
-
-const cachedEntrySchema = z.strictObject({
-  kind: z.enum(["regular", "symlink"]),
-  mode: z.number().int(),
-  oid: z.string().regex(OID_PATTERN),
-  size: z.string(),
-  mtimeNs: z.string(),
-  ctimeNs: z.string(),
-  dev: z.string(),
-  ino: z.string(),
-});
-
-const captureCacheSchema = z.strictObject({
-  implementationVersion: z.literal(IMPLEMENTATION_VERSION),
-  indexVersion: z.literal(1),
-  workspaceId: z.string().regex(SAFE_ID_PATTERN),
-  canonicalCwd: z.string().min(1),
-  pathComparison: z.enum(["case-sensitive", "case-insensitive"]),
-  workspaceTreeOid: z.string().regex(OID_PATTERN),
-  entries: z.record(z.string(), cachedEntrySchema),
-});
-
-const snapshotRefCreationSchema = z.strictObject({
-  formatVersion: z.literal(FORMAT_VERSION),
-  rootTreeOid: z.string().regex(OID_PATTERN),
-  gitRef: z.string().min(1),
-  createdAtMs: z.number().int().nonnegative(),
-});
-
-const frozenTreeEntrySchema = z.strictObject({
-  relativePath: z.string().min(1),
-  mode: z.number().int(),
-  oid: z.string().regex(OID_PATTERN),
-});
-const frozenSignatureSchema = z.strictObject({
-  relativePath: z.string().min(1),
-  signature: z.string(),
-});
-const restorePlanManifestSchema = z.strictObject({
-  formatVersion: z.literal(FORMAT_VERSION),
-  implementationVersion: z.literal(IMPLEMENTATION_VERSION),
-  operationId: z.string().regex(SAFE_ID_PATTERN),
-  workspaceId: z.string().regex(SAFE_ID_PATTERN),
-  canonicalCwd: z.string().min(1),
-  sourceRootTreeOid: z.string().regex(OID_PATTERN),
-  targetRootTreeOid: z.string().regex(OID_PATTERN),
-  workspaceIdentity: z.string().min(1),
-  pathComparison: z.enum(["case-sensitive", "case-insensitive"]),
-  platform: z.enum(["linux", "darwin"]),
-  createdAtMs: z.number().int().nonnegative(),
-  phase: z.enum(["prepared", "mutation-ready"]),
-  privateStagingDirectory: z.string().min(1).optional(),
-  managedEntries: z.array(frozenTreeEntrySchema),
-  managedSignatures: z.array(frozenSignatureSchema),
-  ignoredSignatures: z.array(frozenSignatureSchema),
-  protectedSignatures: z.array(frozenSignatureSchema),
-  boundaryRoots: z.array(z.string().min(1)),
-  targetEntries: z.array(frozenTreeEntrySchema),
-});
-
-const nodeErrorCodeSchema = z.object({ code: z.string() });
-const gitObjectTypeSchema = z.enum(["blob", "tree", "commit", "tag"]);
-const restoreArtifactSchema = z.strictObject({
-  path: z.string().min(1),
-  dev: z.string().optional(),
-  ino: z.string().optional(),
-  kind: z.enum(["file", "directory"]),
-  role: z.enum([
-    "destination-regular",
-    "destination-symlink",
-    "replacement-root",
-    "replacement-directory",
-    "hard-link-probe",
-    "capability-file",
-    "capability-symlink",
-    "capability-hard-link-probe",
-  ]),
-  expectedOid: z.string().regex(OID_PATTERN).optional(),
-  expectedMode: z.number().int().optional(),
-  expectedSourceDev: z.string().optional(),
-  expectedSourceIno: z.string().optional(),
-  parentDev: z.string(),
-  parentIno: z.string(),
-});
-const restoreOwnershipManifestSchema = z.strictObject({
-  formatVersion: z.literal(FORMAT_VERSION),
-  workspaceId: z.string().regex(SAFE_ID_PATTERN),
-  canonicalCwd: z.string().min(1),
-  rootTreeOid: z.string().regex(OID_PATTERN),
-  privateStagingDirectory: z.string().min(1).optional(),
-  artifacts: z.array(restoreArtifactSchema),
-});
 
 export type WorkspaceHistoryCapability =
   | {
@@ -318,6 +238,13 @@ export interface WorkspaceHistoryStoreOptions {
   };
 }
 
+export interface WorkspaceHistoryPersistenceDiagnostic {
+  readonly operation: "invalidate-capture-cache";
+  readonly recordKind: WorkspaceHistoryPersistenceRecordKind;
+  readonly issueCode: WorkspaceHistoryPersistenceIssueCode;
+  readonly versionCategory?: WorkspaceHistoryPersistenceVersionCategory;
+}
+
 export type WorkspaceHistoryPathComparison = "case-sensitive" | "case-insensitive";
 
 export type WorkspaceHistoryPrepareRestoreResult =
@@ -349,6 +276,8 @@ export type WorkspaceHistoryExpectedCurrent =
 
 export interface LockedWorkspaceHistoryStore {
   capture(): Promise<WorkspaceHistoryCaptureResult>;
+  captureResult(): Promise<ResultType<WorkspaceHistoryCaptureResult, WorkspaceHistoryCaptureError>>;
+  invalidateCaptureCacheResult(): Promise<ResultType<void, WorkspaceHistoryStoreError>>;
   prepareRestore(
     rootTreeOid: string,
     expectedCurrent?: WorkspaceHistoryExpectedCurrent,
@@ -398,7 +327,7 @@ export type WorkspaceHistoryOrphanCleanupResult =
     }
   | { status: "unavailable"; reason: "git-unavailable" | "platform-unsupported" };
 
-export type RestoreArtifactRole = z.infer<typeof restoreArtifactSchema>["role"];
+export type RestoreArtifactRole = WorkspaceHistoryRestoreArtifactRole;
 
 export type WorkspaceHistoryErrorCode =
   | "filesystem-error"
@@ -433,6 +362,10 @@ export class WorkspaceHistoryStoreError extends Error {
     this.exitCode = params.exitCode;
   }
 }
+
+export type WorkspaceHistoryCaptureError =
+  | WorkspaceHistoryStoreError
+  | WorkspaceHistoryPersistenceCodecError;
 
 interface ScannedEntry {
   relativePath: string;
@@ -508,7 +441,7 @@ interface PreparedRestoreData {
   state: "prepared" | "applying" | "applied" | "disposed";
 }
 
-type RestorePlanManifest = z.infer<typeof restorePlanManifestSchema>;
+type RestorePlanManifest = WorkspaceHistoryRestorePlan;
 
 interface OwnedTemporaryPath {
   path: string;
@@ -528,8 +461,8 @@ interface ReplacementDirectoryRoot {
   published: boolean;
 }
 
-type RestoreOwnershipManifest = z.infer<typeof restoreOwnershipManifestSchema>;
-type RestoreArtifactRecord = z.infer<typeof restoreArtifactSchema>;
+type RestoreOwnershipManifest = WorkspaceHistoryRestoreOwnership;
+type RestoreArtifactRecord = WorkspaceHistoryRestoreArtifact;
 
 interface GitResult {
   stdout: Uint8Array;
@@ -579,8 +512,7 @@ async function withStoreLock<T>(key: string, operation: () => Promise<T>): Promi
 }
 
 function isMissingExecutable(error: unknown): boolean {
-  const parsed = nodeErrorCodeSchema.safeParse(error);
-  return parsed.success && parsed.data.code === "ENOENT";
+  return nodeErrorCode(error) === "ENOENT";
 }
 
 function bytesToText(bytes: Uint8Array, operation: string): string {
@@ -743,7 +675,7 @@ function assertSafeRelativePath(relativePath: string, operation: string): void {
   }
 }
 
-function sameStat(entry: ScannedEntry, cached: z.infer<typeof cachedEntrySchema>): boolean {
+function sameStat(entry: ScannedEntry, cached: WorkspaceHistoryCachedEntry): boolean {
   // Warm reuse is conservative for ordinary edits: identity, size, mode, mtime, and ctime must all
   // match. Filesystems or adversarial writes that preserve every observed stat remain a residual risk.
   return (
@@ -770,11 +702,32 @@ function sameScannedFingerprint(left: ScannedEntry, right: ScannedEntry): boolea
 }
 
 function canonicalJson(value: object): Uint8Array {
-  return new TextEncoder().encode(`${JSON.stringify(value)}\n`);
+  return encodeWorkspaceHistoryRecord(value);
 }
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+type WorkspaceHistoryCaughtFailure =
+  | { readonly kind: "panic"; readonly cause: Panic }
+  | { readonly kind: "error"; readonly cause: Error }
+  | { readonly kind: "hostile"; readonly cause: unknown };
+
+async function preserveWorkspaceHistoryFailureDuringCleanup(
+  primary: WorkspaceHistoryCaughtFailure,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  try {
+    await cleanup();
+  } catch (cleanupFailure) {
+    if (primary.kind === "panic") throw primary.cause;
+    if (Panic.is(cleanupFailure)) throw cleanupFailure;
+    throw new AggregateError(
+      [primary.cause, cleanupFailure],
+      "Workspace history operation and cleanup both failed",
+    );
+  }
 }
 
 function mapsEqual(left: ReadonlyMap<string, string>, right: ReadonlyMap<string, string>): boolean {
@@ -807,8 +760,7 @@ async function lstatIfExists(
   try {
     return bigint ? await lstat(targetPath, { bigint: true }) : await lstat(targetPath);
   } catch (error) {
-    const parsed = nodeErrorCodeSchema.safeParse(error);
-    if (parsed.success && parsed.data.code === "ENOENT") return undefined;
+    if (nodeErrorCode(error) === "ENOENT") return undefined;
     throw error;
   }
 }
@@ -969,6 +921,10 @@ export class WorkspaceHistoryStore {
     }
   }
 
+  capabilityResult(): Promise<ResultType<WorkspaceHistoryCapability, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("probe workspace history capability", () => this.capability());
+  }
+
   async withWorkspaceLock<T>(
     callback: (lockedStore: LockedWorkspaceHistoryStore) => Promise<T>,
   ): Promise<T> {
@@ -985,12 +941,24 @@ export class WorkspaceHistoryStore {
           });
         }
       };
+      const captureResult = async (): Promise<
+        ResultType<WorkspaceHistoryCaptureResult, WorkspaceHistoryCaptureError>
+      > => {
+        assertActive();
+        const captured = await this.captureLockedResult();
+        if (captured.status === "ok") lastCapture = captured.value;
+        return captured;
+      };
       const lockedStore: LockedWorkspaceHistoryStore = {
-        capture: async () => {
+        captureResult,
+        invalidateCaptureCacheResult: async () => {
           assertActive();
-          const captured = await this.captureLocked();
-          lastCapture = captured;
-          return captured;
+          return await this.invalidateCaptureCacheResult();
+        },
+        capture: async () => {
+          const captured = await captureResult();
+          if (captured.status === "error") throw captured.error;
+          return captured.value;
         },
         prepareRestore: async (rootTreeOid, expectedCurrent, operationId) => {
           assertActive();
@@ -1013,17 +981,91 @@ export class WorkspaceHistoryStore {
           return await this.resumePreparedRestoreLocked(input, assertActive, preparedPlans);
         },
       };
+      let callbackOutcome:
+        | { status: "ok"; value: T }
+        | { status: "error"; failure: WorkspaceHistoryCaughtFailure };
       try {
-        return await callback(lockedStore);
-      } finally {
-        active = false;
-        await Promise.all([...preparedPlans].map((plan) => this.disposePreparedRestore(plan)));
+        callbackOutcome = { status: "ok", value: await callback(lockedStore) };
+      } catch (cause) {
+        if (Panic.is(cause)) {
+          callbackOutcome = { status: "error", failure: { kind: "panic", cause } };
+        } else if (cause instanceof Error) {
+          callbackOutcome = { status: "error", failure: { kind: "error", cause } };
+        } else {
+          callbackOutcome = { status: "error", failure: { kind: "hostile", cause } };
+        }
       }
+      active = false;
+      const cleanupFailures: WorkspaceHistoryCaughtFailure[] = [];
+      for (const plan of preparedPlans) {
+        try {
+          await this.disposePreparedRestore(plan);
+        } catch (cause) {
+          if (Panic.is(cause)) {
+            cleanupFailures.push({ kind: "panic", cause });
+          } else if (cause instanceof Error) {
+            cleanupFailures.push({ kind: "error", cause });
+          } else {
+            cleanupFailures.push({ kind: "hostile", cause });
+          }
+        }
+      }
+      if (cleanupFailures.length > 0) {
+        if (callbackOutcome.status === "error" && callbackOutcome.failure.kind === "panic") {
+          throw callbackOutcome.failure.cause;
+        }
+        const cleanupPanic = cleanupFailures.find((failure) => failure.kind === "panic");
+        if (cleanupPanic !== undefined) throw cleanupPanic.cause;
+        const cleanupFailure =
+          cleanupFailures.length === 1
+            ? cleanupFailures[0]!.cause
+            : new AggregateError(
+                cleanupFailures.map((failure) => failure.cause),
+                "Multiple workspace restore cleanups failed",
+              );
+        if (callbackOutcome.status === "error") {
+          throw new AggregateError(
+            [callbackOutcome.failure.cause, cleanupFailure],
+            "Workspace history operation and cleanup both failed",
+          );
+        }
+        throw cleanupFailure;
+      }
+      if (callbackOutcome.status === "error") throw callbackOutcome.failure.cause;
+      return callbackOutcome.value;
     });
   }
 
   async capture(): Promise<WorkspaceHistoryCaptureResult> {
     return await this.withWorkspaceLock(async (lockedStore) => await lockedStore.capture());
+  }
+
+  captureResult(): Promise<
+    ResultType<WorkspaceHistoryCaptureResult, WorkspaceHistoryCaptureError>
+  > {
+    return this.withWorkspaceLock(async (lockedStore) => await lockedStore.captureResult());
+  }
+
+  private async captureLockedResult(): Promise<
+    ResultType<WorkspaceHistoryCaptureResult, WorkspaceHistoryCaptureError>
+  > {
+    try {
+      return Result.ok(await this.captureLocked());
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (
+        cause instanceof WorkspaceHistoryPersistenceUnsupportedVersion ||
+        cause instanceof WorkspaceHistoryPersistenceMalformed ||
+        cause instanceof WorkspaceHistoryPersistenceCorrupt ||
+        cause instanceof WorkspaceHistoryStoreError
+      ) {
+        return Result.err(cause);
+      }
+      if (cause instanceof Error) {
+        return Result.err(this.withContext(cause, "capture workspace"));
+      }
+      throw cause;
+    }
   }
 
   private async captureLocked(): Promise<WorkspaceHistoryCaptureResult> {
@@ -1058,6 +1100,13 @@ export class WorkspaceHistoryStore {
         return { status: "skipped", reason: "git-unavailable" };
       }
       this.emitCaptureMetric(startedAt, observation, "failed");
+      if (
+        error instanceof WorkspaceHistoryPersistenceUnsupportedVersion ||
+        error instanceof WorkspaceHistoryPersistenceMalformed ||
+        error instanceof WorkspaceHistoryPersistenceCorrupt
+      ) {
+        throw error;
+      }
       throw this.withContext(error, "capture workspace");
     }
   }
@@ -1066,7 +1115,9 @@ export class WorkspaceHistoryStore {
     classified: ClassifiedWorkspace,
     metric?: CaptureMetricObservation,
   ): Promise<Extract<WorkspaceHistoryCaptureResult, { status: "captured" }>> {
-    const cache = await this.readCaptureCache();
+    const cacheRead = await this.readCaptureCache();
+    if (cacheRead.status === "error") throw cacheRead.error;
+    const cache = cacheRead.value;
     const cachedOids = new Set<string>();
     for (const [relativePath, entry] of classified.managed) {
       if (entry.kind === "special") {
@@ -1081,7 +1132,7 @@ export class WorkspaceHistoryStore {
     }
     const existingCachedOids = await this.existingObjects(cachedOids, "blob");
     const treeEntries: TreeEntry[] = [];
-    const nextCacheEntries: Record<string, z.infer<typeof cachedEntrySchema>> = {};
+    const nextCacheEntries: Record<string, WorkspaceHistoryCachedEntry> = {};
 
     for (const relativePath of [...classified.managed.keys()].sort()) {
       const entry = classified.managed.get(relativePath);
@@ -1172,9 +1223,11 @@ export class WorkspaceHistoryStore {
     verifiedTargetEntries: ReadonlyMap<string, ScannedEntry>,
   ): Promise<void> {
     const classified = await this.classifyWorkspace();
-    const cache = await this.readCaptureCache();
+    const cacheRead = await this.readCaptureCache();
+    if (cacheRead.status === "error") throw cacheRead.error;
+    const cache = cacheRead.value;
     const treeEntries: TreeEntry[] = [];
-    const nextCacheEntries: Record<string, z.infer<typeof cachedEntrySchema>> = {};
+    const nextCacheEntries: Record<string, WorkspaceHistoryCachedEntry> = {};
     for (const relativePath of [...classified.managed.keys()].sort()) {
       const classifiedEntry = classified.managed.get(relativePath);
       if (!classifiedEntry) continue;
@@ -1260,6 +1313,15 @@ export class WorkspaceHistoryStore {
     });
   }
 
+  restoreResult(
+    rootTreeOid: string,
+    expectedCurrent?: WorkspaceHistoryExpectedCurrent,
+  ): Promise<ResultType<WorkspaceHistoryRestoreResult, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("restore workspace", () =>
+      this.restore(rootTreeOid, expectedCurrent),
+    );
+  }
+
   async resumeRestore(
     input: WorkspaceHistoryResumeRestoreInput,
   ): Promise<WorkspaceHistoryRestoreResult> {
@@ -1277,15 +1339,32 @@ export class WorkspaceHistoryStore {
     });
   }
 
+  resumeRestoreResult(
+    input: WorkspaceHistoryResumeRestoreInput,
+  ): Promise<ResultType<WorkspaceHistoryRestoreResult, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("resume prepared workspace restore", () =>
+      this.resumeRestore(input),
+    );
+  }
+
   async deleteRestorePlan(operationId: string): Promise<void> {
     this.validateOperationId(operationId, "delete restore plan");
     await withStoreLock(this.storeDirectory, async () => {
       if (!(await this.verifyExistingStoreOwnership())) return;
-      const manifest = await this.readRestorePlanManifest(operationId).catch(() => undefined);
+      const planStats = await lstatIfExists(this.restorePlanPath(operationId));
+      const manifest = planStats ? await this.readRestorePlanManifest(operationId) : undefined;
       if (manifest) await this.cleanupRestorePlanStaging(manifest);
       await rm(this.restorePlanPath(operationId), { force: true });
       await this.fsyncDirectory(this.restorePlanDirectory);
     });
+  }
+
+  deleteRestorePlanResult(
+    operationId: string,
+  ): Promise<ResultType<void, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("delete restore plan", () =>
+      this.deleteRestorePlan(operationId),
+    );
   }
 
   async cleanupRestorePlans(
@@ -1320,8 +1399,8 @@ export class WorkspaceHistoryStore {
         const match = /^([A-Za-z0-9_-]{1,128})\.json$/.exec(child.name);
         if (!match?.[1] || !child.isFile() || child.isSymbolicLink()) continue;
         const operationId = match[1];
-        const manifest = await this.readRestorePlanManifest(operationId).catch(() => undefined);
-        if (active.has(operationId) || !manifest || manifest.createdAtMs >= cutoff) {
+        const manifest = await this.readRestorePlanManifest(operationId);
+        if (active.has(operationId) || manifest.createdAtMs >= cutoff) {
           preservedOperationIds.push(operationId);
           continue;
         }
@@ -1335,6 +1414,15 @@ export class WorkspaceHistoryStore {
         preservedOperationIds: preservedOperationIds.sort(),
       };
     });
+  }
+
+  cleanupRestorePlansResult(
+    activeOperationIds: readonly string[],
+    gracePeriodMs: number,
+  ): Promise<ResultType<WorkspaceHistoryRestorePlanCleanupResult, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("clean restore plans", () =>
+      this.cleanupRestorePlans(activeOperationIds, gracePeriodMs),
+    );
   }
 
   async verifySnapshot(rootTreeOid: string): Promise<WorkspaceHistoryVerifyResult> {
@@ -1374,6 +1462,14 @@ export class WorkspaceHistoryStore {
       this.emitVerificationFailure(startedAt, "verify", managedPathCount, error);
       throw error;
     }
+  }
+
+  verifySnapshotResult(
+    rootTreeOid: string,
+  ): Promise<ResultType<WorkspaceHistoryVerifyResult, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("verify workspace snapshot", () =>
+      this.verifySnapshot(rootTreeOid),
+    );
   }
 
   private async prepareRestoreLocked(
@@ -1757,6 +1853,13 @@ export class WorkspaceHistoryStore {
     }
   }
 
+  objectExistsResult(
+    oid: string,
+    type: "blob" | "tree" | "object" = "object",
+  ): Promise<ResultType<boolean, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("check private object", () => this.objectExists(oid, type));
+  }
+
   async reconcileSnapshotRef(
     rootTreeOid: string,
   ): Promise<
@@ -1766,6 +1869,19 @@ export class WorkspaceHistoryStore {
     const reconciliation = await this.reconcileExpectedSnapshotRefs([rootTreeOid]);
     if (reconciliation.status === "unavailable") return reconciliation.reason;
     return reconciliation.expected[0]?.status ?? "missing";
+  }
+
+  reconcileSnapshotRefResult(
+    rootTreeOid: string,
+  ): Promise<
+    ResultType<
+      "present" | "repaired" | "missing" | "corrupt" | "git-unavailable" | "platform-unsupported",
+      WorkspaceHistoryStoreError
+    >
+  > {
+    return this.capturePublicResult("reconcile snapshot ref", () =>
+      this.reconcileSnapshotRef(rootTreeOid),
+    );
   }
 
   async reconcileExpectedSnapshotRefs(
@@ -1787,6 +1903,14 @@ export class WorkspaceHistoryStore {
       }
       throw error;
     }
+  }
+
+  reconcileExpectedSnapshotRefsResult(
+    expectedRootTreeOids: readonly string[],
+  ): Promise<ResultType<WorkspaceHistoryRefReconciliation, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("reconcile expected snapshot refs", () =>
+      this.reconcileExpectedSnapshotRefs(expectedRootTreeOids),
+    );
   }
 
   async cleanupOrphanSnapshotRefs(
@@ -1827,6 +1951,15 @@ export class WorkspaceHistoryStore {
     }
   }
 
+  cleanupOrphanSnapshotRefsResult(
+    expectedRootTreeOids: readonly string[],
+    gracePeriodMs: number,
+  ): Promise<ResultType<WorkspaceHistoryOrphanCleanupResult, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("clean orphan snapshot refs", () =>
+      this.cleanupOrphanSnapshotRefs(expectedRootTreeOids, gracePeriodMs),
+    );
+  }
+
   async getObjectAccounting(): Promise<WorkspaceHistoryObjectAccountingResult> {
     try {
       return await withStoreLock(this.storeDirectory, async () => {
@@ -1844,6 +1977,14 @@ export class WorkspaceHistoryStore {
       }
       throw error;
     }
+  }
+
+  getObjectAccountingResult(): Promise<
+    ResultType<WorkspaceHistoryObjectAccountingResult, WorkspaceHistoryStoreError>
+  > {
+    return this.capturePublicResult("account private Git objects", () =>
+      this.getObjectAccounting(),
+    );
   }
 
   async runMaintenance(
@@ -1954,6 +2095,14 @@ export class WorkspaceHistoryStore {
     }
   }
 
+  runMaintenanceResult(
+    options: WorkspaceHistoryMaintenanceOptions,
+  ): Promise<ResultType<WorkspaceHistoryMaintenanceResult, WorkspaceHistoryStoreError>> {
+    return this.capturePublicResult("maintain private Git store", () =>
+      this.runMaintenance(options),
+    );
+  }
+
   async cleanupStaleRestoreArtifacts(): Promise<WorkspaceHistoryCleanupResult> {
     const capability = await this.capability();
     if (capability.status === "unavailable") return { removed: [], preserved: [] };
@@ -1961,6 +2110,14 @@ export class WorkspaceHistoryStore {
       await this.ensureStore();
       return await this.cleanupStaleRestoreArtifactsLocked();
     });
+  }
+
+  cleanupStaleRestoreArtifactsResult(): Promise<
+    ResultType<WorkspaceHistoryCleanupResult, WorkspaceHistoryStoreError>
+  > {
+    return this.capturePublicResult("clean stale restore staging", () =>
+      this.cleanupStaleRestoreArtifacts(),
+    );
   }
 
   private validateExpectedRootTreeOids(expectedRootTreeOids: readonly string[]): Set<string> {
@@ -2078,8 +2235,8 @@ export class WorkspaceHistoryStore {
     const workspaceStoreRoot = path.dirname(this.storeDirectory);
     await rm(this.storeDirectory, { recursive: true });
     await rmdir(workspaceStoreRoot).catch((error: unknown) => {
-      const parsed = nodeErrorCodeSchema.safeParse(error);
-      if (!parsed.success || (parsed.data.code !== "ENOTEMPTY" && parsed.data.code !== "ENOENT")) {
+      const code = nodeErrorCode(error);
+      if (code !== "ENOTEMPTY" && code !== "ENOENT") {
         throw error;
       }
     });
@@ -2195,7 +2352,7 @@ export class WorkspaceHistoryStore {
   }
 
   private signatureMap(
-    records: readonly z.infer<typeof frozenSignatureSchema>[],
+    records: readonly RestorePlanManifest["ignoredSignatures"][number][],
   ): Map<string, string> {
     const signatures = new Map<string, string>();
     for (const record of records) {
@@ -2227,8 +2384,11 @@ export class WorkspaceHistoryStore {
   }
 
   private async writeRestorePlanManifest(manifest: RestorePlanManifest): Promise<void> {
-    const parsed = restorePlanManifestSchema.parse(manifest);
-    const existing = await this.readRestorePlanManifest(parsed.operationId).catch(() => undefined);
+    const parsed = manifest;
+    const existingStats = await lstatIfExists(this.restorePlanPath(parsed.operationId));
+    const existing = existingStats
+      ? await this.readRestorePlanManifest(parsed.operationId)
+      : undefined;
     if (
       existing &&
       (existing.sourceRootTreeOid !== parsed.sourceRootTreeOid ||
@@ -2281,40 +2441,19 @@ export class WorkspaceHistoryStore {
         message: `Durable restore plan does not exist: ${operationId}`,
       });
     }
-    let value: unknown;
-    try {
-      value = JSON.parse(await readFile(planPath, "utf8"));
-    } catch (error) {
-      throw new WorkspaceHistoryStoreError({
-        code: "snapshot-invalid",
-        operation: "read durable restore plan",
-        message: "Durable restore plan is malformed",
-        cause: error,
-      });
+    const platform = this.supportedPlatform("read durable restore plan");
+    const decoded = this.decodeRestorePlan(await readFile(planPath, "utf8"), operationId, platform);
+    if (decoded.status === "error") {
+      throw decoded.error;
     }
-    const parsed = restorePlanManifestSchema.safeParse(value);
-    if (
-      !parsed.success ||
-      parsed.data.operationId !== operationId ||
-      parsed.data.workspaceId !== this.workspaceId ||
-      parsed.data.canonicalCwd !== this.cwd ||
-      parsed.data.pathComparison !== this.pathComparison ||
-      parsed.data.platform !== this.platform
-    ) {
-      throw new WorkspaceHistoryStoreError({
-        code: "snapshot-invalid",
-        operation: "read durable restore plan",
-        message: "Durable restore plan identity or policy does not match this workspace",
-        detail: parsed.success ? undefined : z.prettifyError(parsed.error),
-      });
-    }
-    for (const entry of [...parsed.data.managedEntries, ...parsed.data.targetEntries]) {
+    const manifest = decoded.value;
+    for (const entry of [...manifest.managedEntries, ...manifest.targetEntries]) {
       assertSafeRelativePath(entry.relativePath, "read durable restore plan");
     }
-    this.signatureMap(parsed.data.managedSignatures);
-    this.signatureMap(parsed.data.ignoredSignatures);
-    this.signatureMap(parsed.data.protectedSignatures);
-    return parsed.data;
+    this.signatureMap(manifest.managedSignatures);
+    this.signatureMap(manifest.ignoredSignatures);
+    this.signatureMap(manifest.protectedSignatures);
+    return manifest;
   }
 
   private async listSnapshotRefsUnlocked(): Promise<Map<string, string>> {
@@ -2376,7 +2515,7 @@ export class WorkspaceHistoryStore {
     return path.join(this.storeDirectory, "empty-excludes");
   }
 
-  private expectedMarker(): z.infer<typeof ownershipMarkerSchema> {
+  private expectedMarker(): WorkspaceHistoryOwnership {
     return {
       formatVersion: FORMAT_VERSION,
       namespaceId: this.namespaceId,
@@ -2458,30 +2597,8 @@ export class WorkspaceHistoryStore {
         message: "Private Git store ownership marker is not a regular file",
       });
     }
-    const markerBytes = markerStats ? await readFile(this.markerPath) : undefined;
-    if (markerBytes) {
-      let markerValue: unknown;
-      try {
-        markerValue = JSON.parse(markerBytes.toString("utf8"));
-      } catch (error) {
-        throw new WorkspaceHistoryStoreError({
-          code: "ownership-mismatch",
-          operation: "verify store ownership",
-          message: "Private Git store ownership marker is malformed",
-          cause: error,
-        });
-      }
-      const marker = ownershipMarkerSchema.safeParse(markerValue);
-      if (
-        !marker.success ||
-        JSON.stringify(marker.data) !== JSON.stringify(this.expectedMarker())
-      ) {
-        throw new WorkspaceHistoryStoreError({
-          code: "ownership-mismatch",
-          operation: "verify store ownership",
-          message: "Private Git store belongs to a different database or workspace",
-        });
-      }
+    if (markerStats) {
+      await this.verifyOwnershipMarker();
     } else {
       const existingStore = await lstatIfExists(this.storeDirectory);
       if (existingStore) {
@@ -2569,25 +2686,9 @@ export class WorkspaceHistoryStore {
         message: "Private Git store ownership marker is not a regular file",
       });
     }
-    const raw = await readFile(this.markerPath, "utf8");
-    let value: unknown;
-    try {
-      value = JSON.parse(raw);
-    } catch (error) {
-      throw new WorkspaceHistoryStoreError({
-        code: "ownership-mismatch",
-        operation: "verify store ownership",
-        message: "Private Git store ownership marker is malformed",
-        cause: error,
-      });
-    }
-    const parsed = ownershipMarkerSchema.safeParse(value);
-    if (!parsed.success || JSON.stringify(parsed.data) !== JSON.stringify(this.expectedMarker())) {
-      throw new WorkspaceHistoryStoreError({
-        code: "ownership-mismatch",
-        operation: "verify store ownership",
-        message: "Private Git store ownership changed during initialization",
-      });
+    const decoded = this.decodeOwnership(await readFile(this.markerPath, "utf8"));
+    if (decoded.status === "error") {
+      throw decoded.error;
     }
   }
 
@@ -2835,32 +2936,51 @@ export class WorkspaceHistoryStore {
     return ignored;
   }
 
-  private async readCaptureCache(): Promise<z.infer<typeof captureCacheSchema> | undefined> {
-    const raw = await readFile(this.captureCachePath, "utf8").catch((error: unknown) => {
-      const parsed = nodeErrorCodeSchema.safeParse(error);
-      if (parsed.success && parsed.data.code === "ENOENT") return undefined;
-      throw error;
-    });
-    if (raw === undefined) return undefined;
-    let value: unknown;
+  private async readCaptureCache(): Promise<
+    ResultType<WorkspaceHistoryCaptureCache | undefined, WorkspaceHistoryCaptureError>
+  > {
+    let serialized: string | null;
     try {
-      value = JSON.parse(raw);
-    } catch {
-      return undefined;
+      serialized = await readFile(this.captureCachePath, "utf8");
+    } catch (error) {
+      if (nodeErrorCode(error) === "ENOENT") {
+        serialized = null;
+      } else {
+        if (Panic.is(error)) throw error;
+        if (error instanceof Error) {
+          return Result.err(this.withContext(error, "read capture cache"));
+        }
+        throw error;
+      }
     }
-    const parsed = captureCacheSchema.safeParse(value);
-    if (
-      !parsed.success ||
-      parsed.data.workspaceId !== this.workspaceId ||
-      parsed.data.canonicalCwd !== this.cwd ||
-      parsed.data.pathComparison !== this.pathComparison
-    ) {
-      return undefined;
-    }
-    return parsed.data;
+    const decoded = decodeWorkspaceHistoryCaptureCache({
+      serialized,
+      workspaceId: this.workspaceId,
+      canonicalCwd: this.cwd,
+      pathComparison: this.pathComparison,
+    });
+    if (decoded.status === "error") return Result.err(decoded.error);
+    return Result.ok(decoded.value.value);
   }
 
-  private async writeCaptureCache(cache: z.infer<typeof captureCacheSchema>): Promise<void> {
+  private async invalidateCaptureCacheResult(): Promise<
+    ResultType<void, WorkspaceHistoryStoreError>
+  > {
+    try {
+      await rm(this.captureCachePath, { force: true });
+      await this.fsyncDirectory(this.storeDirectory);
+      return Result.ok(undefined);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof WorkspaceHistoryStoreError) return Result.err(cause);
+      if (cause instanceof Error) {
+        return Result.err(this.withContext(cause, "invalidate capture cache"));
+      }
+      throw cause;
+    }
+  }
+
+  private async writeCaptureCache(cache: WorkspaceHistoryCaptureCache): Promise<void> {
     const bytes = canonicalJson(cache);
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const temporaryPath = `${this.captureCachePath}.${randomUUID()}.tmp`;
@@ -2883,14 +3003,24 @@ export class WorkspaceHistoryStore {
         await rename(temporaryPath, this.captureCachePath);
         return;
       } catch (error) {
-        const parsed = nodeErrorCodeSchema.safeParse(error);
-        if (owned) {
-          const current = await lstatIfExists(owned.path, true);
-          if (current && current.dev === owned.dev && current.ino === owned.ino) {
-            await rm(owned.path);
-          }
+        const code = nodeErrorCode(error);
+        let primary: WorkspaceHistoryCaughtFailure;
+        if (Panic.is(error)) {
+          primary = { kind: "panic", cause: error };
+        } else if (error instanceof Error) {
+          primary = { kind: "error", cause: error };
+        } else {
+          primary = { kind: "hostile", cause: error };
         }
-        if (parsed.success && parsed.data.code === "EEXIST") continue;
+        await preserveWorkspaceHistoryFailureDuringCleanup(primary, async () => {
+          if (owned) {
+            const current = await lstatIfExists(owned.path, true);
+            if (current && current.dev === owned.dev && current.ino === owned.ino) {
+              await rm(owned.path);
+            }
+          }
+        });
+        if (code === "EEXIST") continue;
         throw error;
       }
     }
@@ -2970,7 +3100,7 @@ export class WorkspaceHistoryStore {
 
   private async writeCaptureTree(
     entries: readonly TreeEntry[],
-    cache: z.infer<typeof captureCacheSchema> | undefined,
+    cache: WorkspaceHistoryCaptureCache | undefined,
   ): Promise<string> {
     let retainedIndex = false;
     if (cache) {
@@ -3110,25 +3240,11 @@ export class WorkspaceHistoryStore {
     const manifestResult = await this.runPrivateGit(["cat-file", "blob", manifestEntry.oid], {
       operation: "read snapshot manifest",
     });
-    let manifestValue: unknown;
-    try {
-      manifestValue = JSON.parse(bytesToText(manifestResult.stdout, "read snapshot manifest"));
-    } catch (error) {
-      throw new WorkspaceHistoryStoreError({
-        code: "snapshot-invalid",
-        operation: "read snapshot manifest",
-        message: "Snapshot manifest is not valid JSON",
-        cause: error,
-      });
-    }
-    const manifest = manifestSchema.safeParse(manifestValue);
-    if (!manifest.success) {
-      throw new WorkspaceHistoryStoreError({
-        code: "snapshot-invalid",
-        operation: "read snapshot manifest",
-        message: "Snapshot manifest has an unsupported format",
-        detail: z.prettifyError(manifest.error),
-      });
+    const manifest = this.decodeSnapshotManifest(
+      bytesToText(manifestResult.stdout, "read snapshot manifest"),
+    );
+    if (manifest.status === "error") {
+      throw manifest.error;
     }
     const workspaceResult = await this.runPrivateGit(["ls-tree", "-rz", workspaceEntry.oid], {
       operation: "read snapshot workspace tree",
@@ -3767,9 +3883,9 @@ export class WorkspaceHistoryStore {
         await this.completeRestoreArtifactIdentity(manifestPath, manifest, intent, owned);
         return owned;
       } catch (error) {
-        const parsed = nodeErrorCodeSchema.safeParse(error);
+        const code = nodeErrorCode(error);
         if (!created) await this.removeRestoreArtifactRecord(manifestPath, manifest, candidate);
-        if (parsed.success && parsed.data.code === "EEXIST") continue;
+        if (code === "EEXIST") continue;
         throw error;
       }
     }
@@ -3852,7 +3968,7 @@ export class WorkspaceHistoryStore {
         await this.fsyncDirectory(destinationDirectory);
         return owned;
       } catch (error) {
-        const parsed = nodeErrorCodeSchema.safeParse(error);
+        const code = nodeErrorCode(error);
         if (owned) {
           const current = await lstatIfExists(owned.path, true);
           if (current && current.dev === owned.dev && current.ino === owned.ino) {
@@ -3860,7 +3976,7 @@ export class WorkspaceHistoryStore {
           }
         }
         if (!created) await this.removeRestoreArtifactRecord(manifestPath, manifest, candidate);
-        if (parsed.success && parsed.data.code === "EEXIST") continue;
+        if (code === "EEXIST") continue;
         throw error;
       }
     }
@@ -3911,7 +4027,7 @@ export class WorkspaceHistoryStore {
     } finally {
       await handle.close();
     }
-    const directoryHandle = await open(this.snapshotRefCreationDirectory, "r");
+    const directoryHandle = await open(path.dirname(manifestPath), "r");
     try {
       await directoryHandle.sync();
     } finally {
@@ -3919,6 +4035,17 @@ export class WorkspaceHistoryStore {
     }
     await rename(temporaryPath, manifestPath);
     await this.fsyncDirectory(path.dirname(manifestPath));
+  }
+
+  private async readRestoreOwnershipManifest(
+    manifestPath: string,
+    operation: string,
+  ): Promise<RestoreOwnershipManifest> {
+    const decoded = this.decodeRestoreOwnership(await readFile(manifestPath, "utf8"), operation);
+    if (decoded.status === "error") {
+      throw decoded.error;
+    }
+    return decoded.value;
   }
 
   private async parentIdentity(
@@ -4160,8 +4287,7 @@ export class WorkspaceHistoryStore {
           );
         }
         await rmdir(absolutePath).catch((error: unknown) => {
-          const parsed = nodeErrorCodeSchema.safeParse(error);
-          if (!parsed.success || parsed.data.code !== "ENOTEMPTY") throw error;
+          if (nodeErrorCode(error) !== "ENOTEMPTY") throw error;
         });
       }
 
@@ -4351,8 +4477,7 @@ export class WorkspaceHistoryStore {
     try {
       await link(temporary.path, absolutePath);
     } catch (error) {
-      const parsed = nodeErrorCodeSchema.safeParse(error);
-      if (parsed.success && parsed.data.code === "EEXIST") {
+      if (nodeErrorCode(error) === "EEXIST") {
         throw this.restoreConflict(`Target appeared before publication: ${entry.relativePath}`);
       }
       throw error;
@@ -4427,8 +4552,7 @@ export class WorkspaceHistoryStore {
       const stats = await lstatIfExists(directory.path, true);
       if (!stats || stats.dev !== directory.dev || stats.ino !== directory.ino) continue;
       await rmdir(directory.path).catch((error: unknown) => {
-        const parsed = nodeErrorCodeSchema.safeParse(error);
-        if (!parsed.success || parsed.data.code !== "ENOTEMPTY") throw error;
+        if (nodeErrorCode(error) !== "ENOTEMPTY") throw error;
       });
     }
     ownedDirectories.clear();
@@ -4463,32 +4587,10 @@ export class WorkspaceHistoryStore {
     for (const manifestEntry of manifestEntries) {
       if (!manifestEntry.isFile() || !manifestEntry.name.endsWith(".json")) continue;
       const manifestPath = path.join(this.restoreOwnershipDirectory, manifestEntry.name);
-      let value: unknown;
-      try {
-        value = JSON.parse(await readFile(manifestPath, "utf8"));
-      } catch (error) {
-        throw new WorkspaceHistoryStoreError({
-          code: "ownership-mismatch",
-          operation: "clean stale restore staging",
-          message: "Restore ownership manifest is malformed",
-          detail: manifestEntry.name,
-          cause: error,
-        });
-      }
-      const parsed = restoreOwnershipManifestSchema.safeParse(value);
-      if (
-        !parsed.success ||
-        parsed.data.workspaceId !== this.workspaceId ||
-        parsed.data.canonicalCwd !== this.cwd
-      ) {
-        throw new WorkspaceHistoryStoreError({
-          code: "ownership-mismatch",
-          operation: "clean stale restore staging",
-          message: "Restore ownership manifest belongs to another workspace",
-          detail: manifestEntry.name,
-        });
-      }
-      const manifest = parsed.data;
+      const manifest = await this.readRestoreOwnershipManifest(
+        manifestPath,
+        "clean stale restore staging",
+      );
       const artifacts = manifest.artifacts;
       const resolved = new Set<RestoreArtifactRecord>();
       const recognizableRoots = artifacts
@@ -4557,8 +4659,7 @@ export class WorkspaceHistoryStore {
           removed.push(artifact.path);
           resolved.add(artifact);
         } catch (error) {
-          const errorCode = nodeErrorCodeSchema.safeParse(error);
-          if (!errorCode.success || errorCode.data.code !== "ENOTEMPTY") throw error;
+          if (nodeErrorCode(error) !== "ENOTEMPTY") throw error;
           preserved.push(artifact.path);
         }
       }
@@ -4599,30 +4700,11 @@ export class WorkspaceHistoryStore {
     for (const entry of await readdir(this.restoreOwnershipDirectory, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const manifestPath = path.join(this.restoreOwnershipDirectory, entry.name);
-      let value: unknown;
-      try {
-        value = JSON.parse(await readFile(manifestPath, "utf8"));
-      } catch (error) {
-        throw new WorkspaceHistoryStoreError({
-          code: "ownership-mismatch",
-          operation: "classify restore staging",
-          message: "Restore ownership manifest is malformed",
-          cause: error,
-        });
-      }
-      const parsed = restoreOwnershipManifestSchema.safeParse(value);
-      if (
-        !parsed.success ||
-        parsed.data.workspaceId !== this.workspaceId ||
-        parsed.data.canonicalCwd !== this.cwd
-      ) {
-        throw new WorkspaceHistoryStoreError({
-          code: "ownership-mismatch",
-          operation: "classify restore staging",
-          message: "Restore ownership manifest belongs to another workspace",
-        });
-      }
-      for (const artifact of parsed.data.artifacts) {
+      const manifest = await this.readRestoreOwnershipManifest(
+        manifestPath,
+        "classify restore staging",
+      );
+      for (const artifact of manifest.artifacts) {
         if (
           artifact.dev === undefined ||
           artifact.ino === undefined ||
@@ -5117,7 +5199,7 @@ export class WorkspaceHistoryStore {
     rootTreeOid: string,
     gitRef: string,
     preserveExistingAge: boolean,
-  ): Promise<z.infer<typeof snapshotRefCreationSchema>> {
+  ): Promise<WorkspaceHistorySnapshotRefCreated> {
     if (preserveExistingAge) {
       const existing = await this.readSnapshotRefCreationMetadata(rootTreeOid, gitRef);
       if (existing) return existing;
@@ -5131,12 +5213,12 @@ export class WorkspaceHistoryStore {
       this.snapshotRefCreationDirectory,
       `.${rootTreeOid}.${randomUUID()}.tmp`,
     );
-    const metadata = snapshotRefCreationSchema.parse({
+    const metadata: WorkspaceHistorySnapshotRefCreated = {
       formatVersion: FORMAT_VERSION,
       rootTreeOid,
       gitRef,
       createdAtMs: this.now(),
-    });
+    };
     try {
       const handle = await open(
         temporaryPath,
@@ -5153,7 +5235,17 @@ export class WorkspaceHistoryStore {
       await this.fsyncDirectory(this.snapshotRefCreationDirectory);
       return metadata;
     } catch (error) {
-      await rm(temporaryPath, { force: true });
+      let primary: WorkspaceHistoryCaughtFailure;
+      if (Panic.is(error)) {
+        primary = { kind: "panic", cause: error };
+      } else if (error instanceof Error) {
+        primary = { kind: "error", cause: error };
+      } else {
+        primary = { kind: "hostile", cause: error };
+      }
+      await preserveWorkspaceHistoryFailureDuringCleanup(primary, async () => {
+        await rm(temporaryPath, { force: true });
+      });
       throw error;
     }
   }
@@ -5161,30 +5253,36 @@ export class WorkspaceHistoryStore {
   private async readSnapshotRefCreationMetadata(
     rootTreeOid: string,
     gitRef: string,
-  ): Promise<z.infer<typeof snapshotRefCreationSchema> | undefined> {
+  ): Promise<WorkspaceHistorySnapshotRefCreated | undefined> {
     if (gitRef !== this.snapshotRef(rootTreeOid)) return undefined;
     const directoryStats = await lstatIfExists(this.snapshotRefCreationDirectory);
-    if (!directoryStats || !directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
-      return undefined;
+    if (!directoryStats) return undefined;
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()) {
+      throw new WorkspaceHistoryStoreError({
+        code: "ownership-mismatch",
+        operation: "read snapshot-ref metadata",
+        message: "Snapshot-ref metadata path is not an owned directory",
+      });
     }
     const metadataPath = this.snapshotRefCreationPath(rootTreeOid);
     const stats = await lstatIfExists(metadataPath);
-    if (!stats || !stats.isFile() || stats.isSymbolicLink()) return undefined;
-    let value: unknown;
-    try {
-      value = JSON.parse(await readFile(metadataPath, "utf8"));
-    } catch {
-      return undefined;
+    if (!stats) return undefined;
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      throw new WorkspaceHistoryStoreError({
+        code: "ownership-mismatch",
+        operation: "read snapshot-ref metadata",
+        message: "Snapshot-ref metadata is not a regular file",
+      });
     }
-    const parsed = snapshotRefCreationSchema.safeParse(value);
-    if (
-      !parsed.success ||
-      parsed.data.rootTreeOid !== rootTreeOid ||
-      parsed.data.gitRef !== gitRef
-    ) {
-      return undefined;
+    const decoded = this.decodeSnapshotRefCreationMetadata(
+      await readFile(metadataPath, "utf8"),
+      rootTreeOid,
+      gitRef,
+    );
+    if (decoded.status === "error") {
+      throw decoded.error;
     }
-    return parsed.data;
+    return decoded.value;
   }
 
   private async validateSnapshotGraphs(
@@ -5377,7 +5475,20 @@ export class WorkspaceHistoryStore {
           detail: (line ?? "").slice(0, 200),
         });
       }
-      types.set(oid, gitObjectTypeSchema.parse(match[2]));
+      const objectType = match[2];
+      if (
+        objectType !== "blob" &&
+        objectType !== "tree" &&
+        objectType !== "commit" &&
+        objectType !== "tag"
+      ) {
+        throw new WorkspaceHistoryStoreError({
+          code: "malformed-git-output",
+          operation: "check private object",
+          message: "Git returned an unsupported object type",
+        });
+      }
+      types.set(oid, objectType);
     }
     return types;
   }
@@ -5730,6 +5841,118 @@ export class WorkspaceHistoryStore {
           // Metrics are observational and must never affect workspace operations.
         });
     });
+  }
+
+  private supportedPlatform(operation: string): "linux" | "darwin" {
+    if (this.platform === "linux" || this.platform === "darwin") return this.platform;
+    throw new WorkspaceHistoryStoreError({
+      code: "platform-unsupported",
+      operation,
+      message: "Workspace history is supported only on Linux and macOS",
+    });
+  }
+
+  private decodeOwnership(
+    serialized: string,
+  ): ResultType<WorkspaceHistoryOwnership, WorkspaceHistoryStoreError> {
+    const decoded = decodeWorkspaceHistoryOwnership({
+      serialized,
+      expected: this.expectedMarker(),
+    });
+    if (decoded.status === "error") {
+      return Result.err(
+        this.persistenceStoreError(decoded.error, "ownership-mismatch", "verify store ownership"),
+      );
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  private decodeSnapshotManifest(
+    serialized: string,
+  ): ResultType<WorkspaceHistorySnapshotManifest, WorkspaceHistoryStoreError> {
+    const decoded = decodeWorkspaceHistorySnapshotManifest({ serialized });
+    if (decoded.status === "error") {
+      return Result.err(
+        this.persistenceStoreError(decoded.error, "snapshot-invalid", "read snapshot manifest"),
+      );
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  private decodeRestorePlan(
+    serialized: string,
+    operationId: string,
+    platform: "linux" | "darwin",
+  ): ResultType<WorkspaceHistoryRestorePlan, WorkspaceHistoryStoreError> {
+    const decoded = decodeWorkspaceHistoryRestorePlan({
+      serialized,
+      operationId,
+      workspaceId: this.workspaceId,
+      canonicalCwd: this.cwd,
+      pathComparison: this.pathComparison,
+      platform,
+    });
+    if (decoded.status === "error") {
+      return Result.err(
+        this.persistenceStoreError(decoded.error, "snapshot-invalid", "read durable restore plan"),
+      );
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  private decodeSnapshotRefCreationMetadata(
+    serialized: string,
+    rootTreeOid: string,
+    gitRef: string,
+  ): ResultType<WorkspaceHistorySnapshotRefCreated | undefined, WorkspaceHistoryStoreError> {
+    const decoded = decodeWorkspaceHistorySnapshotRefCreated({ serialized, rootTreeOid, gitRef });
+    if (decoded.status === "error") {
+      return Result.err(
+        this.persistenceStoreError(decoded.error, "snapshot-invalid", "read snapshot-ref metadata"),
+      );
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  private decodeRestoreOwnership(
+    serialized: string,
+    operation: string,
+  ): ResultType<WorkspaceHistoryRestoreOwnership, WorkspaceHistoryStoreError> {
+    const decoded = decodeWorkspaceHistoryRestoreOwnership({
+      serialized,
+      workspaceId: this.workspaceId,
+      canonicalCwd: this.cwd,
+    });
+    if (decoded.status === "error") {
+      return Result.err(this.persistenceStoreError(decoded.error, "ownership-mismatch", operation));
+    }
+    return Result.ok(decoded.value.value);
+  }
+
+  private persistenceStoreError(
+    error: WorkspaceHistoryPersistenceCodecError,
+    code: WorkspaceHistoryErrorCode,
+    operation: string,
+  ): WorkspaceHistoryStoreError {
+    return new WorkspaceHistoryStoreError({
+      code,
+      operation,
+      message: `Workspace history ${error.recordKind} is invalid: ${error.issueCode}`,
+    });
+  }
+
+  private async capturePublicResult<T>(
+    operation: string,
+    effect: () => Promise<T>,
+  ): Promise<ResultType<T, WorkspaceHistoryStoreError>> {
+    try {
+      return Result.ok(await effect());
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof WorkspaceHistoryStoreError) return Result.err(cause);
+      if (cause instanceof Error) return Result.err(this.withContext(cause, operation));
+      throw cause;
+    }
   }
 
   private withContext(error: unknown, operation: string): WorkspaceHistoryStoreError {

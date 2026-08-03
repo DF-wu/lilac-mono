@@ -94,6 +94,15 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - Do not write generic `parseJson<T>` helpers that establish `T` only through an assertion.
 - Persisted-data codecs must explicitly handle valid current data, supported legacy data, unsupported versions, malformed serialization, and corrupt fields.
 
+### Persistence and SQLite
+
+- A persisted codec returns explicit provenance for successful reads: `current`, `migrated`, or `missing-defaulted`. Keep unsupported versions, malformed serialization, and corrupt fields as distinct owned errors; do not collapse these outcomes into absence or a generic parse failure.
+- Reads must not rewrite persisted data as a side effect of decoding or migration. Perform upgrades only through an explicit write or migration operation with its own failure contract.
+- Route Result-returning SQLite transactions through the registered adapter. The raw driver callback returns only the success value and uses the adapter's private rollback sentinel to escape an `Err`; the sentinel must never cross the adapter boundary.
+- In SQLite adapters, preserve `Panic` by exact `Panic.is` classification, map only recognized driver failures through the exact registered classifier, and rethrow every unrecognized exception unchanged.
+- Cleanup failures are expected values: cleanup `Err` wins after successful work, and a domain-owned combined error preserves both failures when work and cleanup fail. A rollback failure that leaves atomicity unknown is a `Panic`.
+- Persist state transitions and their outbox records in the same transaction. Never expose committed state without its corresponding durable publication intent, or publish an outbox record for state that did not commit.
+
 ### Presentation boundaries
 
 - Keep third-party and otherwise open protocol values inside one registered adapter. The adapter validates or inspects the external value and returns a closed local projection; renderers and transcript builders accept only that projection.

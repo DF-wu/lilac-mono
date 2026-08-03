@@ -7,10 +7,12 @@ import { isToolExpansion } from "@stanley2058/lilac-agent";
 import {
   createToolResultArtifactStore,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
+  ToolResultArtifactStorageFailure,
   type ToolResultArtifactStore,
   type ToolResultOutput,
 } from "@stanley2058/lilac-tool-results";
 import { asSchema, tool, type ToolExecutionOptions, type ToolSet } from "ai";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
 import {
@@ -524,7 +526,7 @@ describe("coding tools", () => {
     ).rejects.toThrow("artifactIntegration.maxSpoolBytes must be a non-negative finite number");
   });
 
-  it("cleans Bash spools after timeout, abort, and artifact persistence failure", async () => {
+  it("cleans Bash spools after timeout, abort, and rejected artifact persistence", async () => {
     const artifacts = createToolResultArtifactStore(path.join(cwd, "cleanup-artifacts"));
     await artifacts.init();
     const before = await bashSpoolDirectories();
@@ -575,11 +577,85 @@ describe("coding tools", () => {
     ).execute({ command: "printf '%0100d' 0" }, options("bash-artifact-failure"));
     expect(failedPersistence).toMatchObject({
       exitCode: 0,
+      stdout: expect.stringContaining("0"),
       truncation: {
         completeOutputRetained: false,
         retentionStatus: "artifact-write-failed",
       },
     });
+    expect(failedPersistence).not.toHaveProperty("executionError");
+    expect(await bashSpoolDirectories()).toEqual(before);
+  });
+
+  it("maps an artifact Result Err to truncation retention failure", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "result-error-artifacts"));
+    await artifacts.init();
+    const before = await bashSpoolDirectories();
+    const failingArtifacts: ToolResultArtifactStore = {
+      ...artifacts,
+      async createFromStream() {
+        return Result.err(
+          new ToolResultArtifactStorageFailure({
+            operation: "write-content",
+            code: "ENOSPC",
+            message: "Tool result artifact write-content failed",
+          }),
+        );
+      },
+    };
+
+    const result = await executable(
+      createCodingToolset({
+        cwd,
+        bashMaxOutputBytes: 32,
+        artifactIntegration: {
+          artifacts: failingArtifacts,
+          scopeId: "scope-result-error",
+          requestId: "request-result-error",
+          maxSpoolBytes: 1024 * 1024,
+        },
+      }),
+      "bash",
+    ).execute({ command: "printf '%0100d' 0" }, options("bash-artifact-result-error"));
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stdout: expect.stringContaining("0"),
+      truncation: {
+        completeOutputRetained: false,
+        retentionStatus: "artifact-write-failed",
+      },
+    });
+    expect(result).not.toHaveProperty("executionError");
+    expect(await bashSpoolDirectories()).toEqual(before);
+  });
+
+  it("preserves artifact Panic identity after cleaning the Bash spool", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "panic-artifacts"));
+    await artifacts.init();
+    const before = await bashSpoolDirectories();
+    const panic = new Panic({ message: "artifact invariant failed" });
+    const failingArtifacts: ToolResultArtifactStore = {
+      ...artifacts,
+      async createFromStream() {
+        throw panic;
+      },
+    };
+    const execution = executable(
+      createCodingToolset({
+        cwd,
+        bashMaxOutputBytes: 32,
+        artifactIntegration: {
+          artifacts: failingArtifacts,
+          scopeId: "scope-panic",
+          requestId: "request-panic",
+          maxSpoolBytes: 1024 * 1024,
+        },
+      }),
+      "bash",
+    ).execute({ command: "printf '%0100d' 0" }, options("bash-artifact-panic"));
+
+    await expect(Promise.resolve(execution)).rejects.toBe(panic);
     expect(await bashSpoolDirectories()).toEqual(before);
   });
 
@@ -963,6 +1039,7 @@ describe("coding tools", () => {
       ttlMs: 60_000,
       maxBytesPerScope: 1024,
     });
+    if (created.status === "error") throw created.error;
     const read = executable(
       createCodingToolset({
         cwd,
@@ -977,7 +1054,7 @@ describe("coding tools", () => {
     );
     const first = await read.execute(
       {
-        path: created.uri,
+        path: created.value.uri,
         cwd: "ignored-host:/not-a-local-path",
         start: { type: "offset", offset: 2 },
         maxCharacters: 3,
@@ -988,7 +1065,7 @@ describe("coding tools", () => {
     expect(first).toEqual({
       success: true,
       kind: "artifact",
-      resolvedPath: created.uri,
+      resolvedPath: created.value.uri,
       content: "😀c",
       startOffset: 2,
       endOffset: 4,
@@ -1009,15 +1086,15 @@ describe("coding tools", () => {
         },
       }),
       "read_file",
-    ).execute({ path: created.uri }, options("read-artifact-foreign"));
+    ).execute({ path: created.value.uri }, options("read-artifact-foreign"));
     expect(foreign).toMatchObject({
       success: false,
-      resolvedPath: created.uri,
+      resolvedPath: created.value.uri,
       error: { code: "UNKNOWN", message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
     });
 
     const unavailable = await executable(createCodingToolset({ cwd }), "read_file").execute(
-      { path: created.uri },
+      { path: created.value.uri },
       options("read-artifact-no-authority"),
     );
     expect(unavailable).toMatchObject({

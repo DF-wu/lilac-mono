@@ -5,7 +5,22 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
-import { createLogger } from "@stanley2058/lilac-utils";
+import { createLogger, errorCode } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
+import {
+  decodeToolResultArtifactMetadata,
+  encodeToolResultArtifactMetadata,
+  ToolResultArtifactMetadataAbsent,
+  ToolResultArtifactMetadataCorrupt,
+  ToolResultArtifactMetadataMalformed,
+  ToolResultArtifactMetadataStorageKeyMismatch,
+  ToolResultArtifactMetadataUnsupportedVersion,
+  type DecodedToolResultArtifactMetadata,
+  type ToolResultArtifactMetadata,
+  type ToolResultArtifactMetadataCodecError,
+  type ToolResultArtifactMetadataIssueCode,
+} from "./tool-result-artifact-metadata-codec";
 
 export const TOOL_RESULT_URI_PREFIX = "tool-result://";
 export const TOOL_RESULT_UNAVAILABLE_MESSAGE =
@@ -17,18 +32,7 @@ export type ToolResultArtifactStart =
   | { type: "offset"; offset: number }
   | { type: "line"; line: number; column?: number };
 
-type ArtifactMetadata = {
-  id: string;
-  storageKey: string;
-  scopeId?: string;
-  sessionId?: string;
-  requestId: string;
-  toolCallId: string;
-  toolName: string;
-  createdAt: number;
-  expiresAt: number;
-  bytes: number;
-};
+type ArtifactMetadata = ToolResultArtifactMetadata;
 
 type ToolResultArtifactScope =
   | { scopeId: string; sessionId?: string }
@@ -80,21 +84,133 @@ export class ToolResultArtifactTooLargeError extends Error {
   }
 }
 
+export class ToolResultArtifactStorageFailure extends TaggedError(
+  "ToolResultArtifactStorageFailure",
+)<{
+  readonly operation: ToolResultArtifactStorageOperation;
+  readonly code: string;
+  readonly message: string;
+}> {}
+
+export class ToolResultArtifactInvalidInput extends TaggedError("ToolResultArtifactInvalidInput")<{
+  readonly message: string;
+}> {}
+
+export class ToolResultArtifactDecryptAuthenticationFailed extends TaggedError(
+  "ToolResultArtifactDecryptAuthenticationFailed",
+)<{
+  readonly target: "metadata" | "content";
+  readonly issueCode: "decrypt-auth-failed";
+  readonly message: string;
+}> {}
+
+export class ToolResultArtifactContentMismatch extends TaggedError(
+  "ToolResultArtifactContentMismatch",
+)<{
+  readonly issueCode: "content-mismatch";
+  readonly message: string;
+}> {}
+
+export class ToolResultArtifactUnavailable extends TaggedError("ToolResultArtifactUnavailable")<{
+  readonly reason: "invalid-uri" | "absent" | "scope-mismatch" | "expired-or-evicted";
+  readonly message: string;
+}> {}
+
+export class ToolResultArtifactMaintenanceAndCleanupFailure extends TaggedError(
+  "ToolResultArtifactMaintenanceAndCleanupFailure",
+)<{
+  readonly primaryError: ToolResultArtifactReadError;
+  readonly cleanupError: ToolResultArtifactStorageFailure;
+  readonly message: string;
+}> {}
+
+type ToolResultArtifactStorageOperation =
+  | "initialize"
+  | "list-metadata"
+  | "read-metadata"
+  | "read-content"
+  | "write-content"
+  | "write-metadata"
+  | "remove-artifact"
+  | "maintenance";
+
+export type ToolResultArtifactDiagnostic = {
+  readonly operation: "read-metadata" | "read-content";
+  readonly issueCode:
+    | ToolResultArtifactMetadataIssueCode
+    | "decrypt-auth-failed"
+    | "content-mismatch";
+  readonly version?: number;
+};
+
+export type ToolResultArtifactStoreOptions = {
+  readonly onDiagnostic?: (diagnostic: ToolResultArtifactDiagnostic) => void;
+};
+
+export type ToolResultArtifactMetadataReadError =
+  | ToolResultArtifactMetadataCodecError
+  | ToolResultArtifactDecryptAuthenticationFailed
+  | ToolResultArtifactStorageFailure;
+
+export type ToolResultArtifactWriteError =
+  | ToolResultArtifactMetadataReadError
+  | ToolResultArtifactContentMismatch
+  | ToolResultArtifactInvalidInput
+  | ToolResultArtifactTooLargeError;
+
+export type ToolResultArtifactReadError =
+  | ToolResultArtifactMetadataReadError
+  | ToolResultArtifactContentMismatch
+  | ToolResultArtifactUnavailable;
+
+export type ToolResultArtifactError = ToolResultArtifactWriteError | ToolResultArtifactReadError;
+
+export type ToolResultArtifactMaintenanceError =
+  | ToolResultArtifactReadError
+  | ToolResultArtifactStorageFailure
+  | ToolResultArtifactMaintenanceAndCleanupFailure;
+
+export type ToolResultArtifactMaintenanceResult = {
+  readonly removedInvalid: number;
+  readonly removedExpired: number;
+};
+
+export type ToolResultArtifactRead = {
+  readonly content: string;
+  readonly id: string;
+  readonly bytes: number;
+  readonly createdAt: number;
+  readonly expiresAt: number;
+};
+
+export type ToolResultArtifactReadWindow = ToolResultArtifactRead & {
+  readonly startOffset: number;
+  readonly endOffset: number;
+  readonly totalCharacters: number;
+  readonly hasMore: boolean;
+  readonly nextStart?: ToolResultArtifactStart;
+};
+
+export type ToolResultArtifactAvailability<T> =
+  | ({ readonly ok: true } & T)
+  | { readonly ok: false };
+
 export type ToolResultArtifactStore = {
   readonly rootDir: string;
-  init(): Promise<void>;
-  create(params: CreateToolResultArtifactParams): Promise<CreatedToolResultArtifact>;
-  createFromFile(params: CreateToolResultArtifactFileParams): Promise<CreatedToolResultArtifact>;
+  init(): Promise<ResultType<void, ToolResultArtifactError>>;
+  create(
+    params: CreateToolResultArtifactParams,
+  ): Promise<ResultType<CreatedToolResultArtifact, ToolResultArtifactError>>;
+  createFromFile(
+    params: CreateToolResultArtifactFileParams,
+  ): Promise<ResultType<CreatedToolResultArtifact, ToolResultArtifactError>>;
   createFromStream(
     params: CreateToolResultArtifactStreamParams,
-  ): Promise<CreatedToolResultArtifact>;
+  ): Promise<ResultType<CreatedToolResultArtifact, ToolResultArtifactError>>;
   read(
     uri: string,
     scopeId: string,
-  ): Promise<
-    | { ok: true; content: string; id: string; bytes: number; createdAt: number; expiresAt: number }
-    | { ok: false }
-  >;
+  ): Promise<ResultType<ToolResultArtifactRead, ToolResultArtifactError>>;
   readWindow(
     uri: string,
     scopeId: string,
@@ -105,44 +221,40 @@ export type ToolResultArtifactStore = {
       /** Maximum payload bytes. Must be at least 4 when set. */
       maxOutputBytes?: number;
     },
-  ): Promise<
-    | {
-        ok: true;
-        content: string;
-        id: string;
-        bytes: number;
-        createdAt: number;
-        expiresAt: number;
-        startOffset: number;
-        endOffset: number;
-        totalCharacters: number;
-        hasMore: boolean;
-        nextStart?: ToolResultArtifactStart;
-      }
-    | { ok: false }
-  >;
+  ): Promise<ResultType<ToolResultArtifactReadWindow, ToolResultArtifactError>>;
+  maintain(
+    now?: number,
+  ): Promise<ResultType<ToolResultArtifactMaintenanceResult, ToolResultArtifactMaintenanceError>>;
 };
 
-function isArtifactMetadata(value: unknown): value is ArtifactMetadata {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record["id"] === "string" &&
-    typeof record["storageKey"] === "string" &&
-    (typeof record["scopeId"] === "string" || typeof record["sessionId"] === "string") &&
-    typeof record["requestId"] === "string" &&
-    typeof record["toolCallId"] === "string" &&
-    typeof record["toolName"] === "string" &&
-    typeof record["createdAt"] === "number" &&
-    typeof record["expiresAt"] === "number" &&
-    typeof record["bytes"] === "number"
-  );
+export function adaptToolResultArtifactReadToAvailability<T extends object>(
+  result: ResultType<T, ToolResultArtifactError>,
+): ToolResultArtifactAvailability<T> {
+  if (result.status === "ok") return { ok: true, ...result.value };
+  if (result.error instanceof ToolResultArtifactInvalidInput) {
+    throw new RangeError(result.error.message);
+  }
+  return { ok: false };
+}
+
+export async function adaptToolResultArtifactReadToUnavailablePolicy<T extends object>(
+  store: ToolResultArtifactStore,
+  result: ResultType<T, ToolResultArtifactError>,
+): Promise<ToolResultArtifactAvailability<T>> {
+  if (result.status === "error" && !(result.error instanceof ToolResultArtifactInvalidInput)) {
+    await store.maintain();
+  }
+  return adaptToolResultArtifactReadToAvailability(result);
+}
+
+export function adaptToolResultArtifactStoreInitToHost(
+  result: ResultType<void, ToolResultArtifactError>,
+): void {
+  if (result.status === "error") throw new Error(result.error.message);
 }
 
 function metadataScopeId(metadata: ArtifactMetadata): string {
-  const scopeId = metadata.scopeId ?? metadata.sessionId;
-  if (!scopeId) throw new Error("Invalid artifact scope");
-  return scopeId;
+  return metadata.scopeId;
 }
 
 function artifactScopeId(params: ToolResultArtifactScope): string {
@@ -177,11 +289,97 @@ function artifactIdFromUri(uri: string): string | null {
   return /^[0-9a-f-]{36}$/u.test(id) ? id : null;
 }
 
-export function createToolResultArtifactStore(rootDir: string): ToolResultArtifactStore {
+export function createToolResultArtifactStore(
+  rootDir: string,
+  options: ToolResultArtifactStoreOptions = {},
+): ToolResultArtifactStore {
   const resolvedRoot = path.resolve(rootDir);
   const logger = createLogger({ module: "tool-result-artifacts" });
   const encryptionKey = randomBytes(32);
   let operationQueue = Promise.resolve();
+
+  function reportDiagnostic(
+    error:
+      | ToolResultArtifactMetadataCodecError
+      | ToolResultArtifactDecryptAuthenticationFailed
+      | ToolResultArtifactContentMismatch,
+  ): void {
+    let diagnostic: ToolResultArtifactDiagnostic;
+    if (error instanceof ToolResultArtifactMetadataUnsupportedVersion) {
+      diagnostic = {
+        operation: "read-metadata",
+        issueCode: error.issueCode,
+        version: error.version,
+      };
+    } else if (error instanceof ToolResultArtifactDecryptAuthenticationFailed) {
+      diagnostic = {
+        operation: error.target === "metadata" ? "read-metadata" : "read-content",
+        issueCode: error.issueCode,
+      };
+    } else if (error instanceof ToolResultArtifactContentMismatch) {
+      diagnostic = { operation: "read-content", issueCode: error.issueCode };
+    } else {
+      diagnostic = { operation: "read-metadata", issueCode: error.issueCode };
+    }
+    if (options.onDiagnostic) options.onDiagnostic(diagnostic);
+    else logger.warn("tool.artifact.persistence_invalid", diagnostic);
+  }
+
+  function storageFailure(
+    operation: ToolResultArtifactStorageOperation,
+    cause: Error,
+  ): ToolResultArtifactStorageFailure {
+    return new ToolResultArtifactStorageFailure({
+      operation,
+      code: errorCode(cause) ?? "UNKNOWN",
+      message: `Tool result artifact ${operation} failed`,
+    });
+  }
+
+  async function rethrowAfterCleanup(primary: Error, cleanup: () => Promise<void>): Promise<never> {
+    try {
+      await cleanup();
+    } catch (cleanupCause) {
+      if (Panic.is(primary)) throw primary;
+      if (Panic.is(cleanupCause)) throw cleanupCause;
+      throw new Panic({
+        message: "Tool result artifact failure cleanup did not complete",
+        cause: { primary, cleanupCause },
+      });
+    }
+    throw primary;
+  }
+
+  async function captureOperation<T>(
+    operation: ToolResultArtifactStorageOperation,
+    effect: () => Promise<T>,
+  ): Promise<ResultType<T, ToolResultArtifactError>> {
+    try {
+      return Result.ok(await effect());
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (
+        cause instanceof ToolResultArtifactMetadataAbsent ||
+        cause instanceof ToolResultArtifactMetadataUnsupportedVersion ||
+        cause instanceof ToolResultArtifactMetadataMalformed ||
+        cause instanceof ToolResultArtifactMetadataCorrupt ||
+        cause instanceof ToolResultArtifactMetadataStorageKeyMismatch ||
+        cause instanceof ToolResultArtifactDecryptAuthenticationFailed ||
+        cause instanceof ToolResultArtifactContentMismatch ||
+        cause instanceof ToolResultArtifactUnavailable ||
+        cause instanceof ToolResultArtifactStorageFailure ||
+        cause instanceof ToolResultArtifactTooLargeError ||
+        cause instanceof ToolResultArtifactInvalidInput
+      ) {
+        return Result.err(cause);
+      }
+      if (cause instanceof RangeError) {
+        return Result.err(new ToolResultArtifactInvalidInput({ message: cause.message }));
+      }
+      if (cause instanceof Error) return Result.err(storageFailure(operation, cause));
+      throw cause;
+    }
+  }
 
   function contentPath(storageKey: string): string {
     return path.join(resolvedRoot, `${storageKey}.bin`);
@@ -209,34 +407,75 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     );
   }
 
-  async function readMetadata(storageKey: string): Promise<ArtifactMetadata | null> {
+  async function readMetadata(
+    storageKey: string,
+  ): Promise<ResultType<DecodedToolResultArtifactMetadata, ToolResultArtifactMetadataReadError>> {
+    let encrypted: Buffer;
     try {
-      const parsed = JSON.parse(decrypt(await fs.readFile(metadataPath(storageKey)))) as unknown;
-      return isArtifactMetadata(parsed) && parsed.storageKey === storageKey ? parsed : null;
-    } catch {
-      return null;
+      encrypted = await fs.readFile(metadataPath(storageKey));
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof Error && errorCode(cause) === "ENOENT") {
+        const absent = decodeToolResultArtifactMetadata({
+          serialized: null,
+          expectedStorageKey: storageKey,
+        });
+        if (absent.status === "error") reportDiagnostic(absent.error);
+        return absent;
+      }
+      if (cause instanceof Error) return Result.err(storageFailure("read-metadata", cause));
+      throw cause;
     }
+
+    let serialized: string;
+    try {
+      serialized = decrypt(encrypted);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      const error = new ToolResultArtifactDecryptAuthenticationFailed({
+        target: "metadata",
+        issueCode: "decrypt-auth-failed",
+        message: "Tool result artifact metadata authentication failed",
+      });
+      reportDiagnostic(error);
+      return Result.err(error);
+    }
+    const decoded = decodeToolResultArtifactMetadata({
+      serialized,
+      expectedStorageKey: storageKey,
+    });
+    if (decoded.status === "error") reportDiagnostic(decoded.error);
+    return decoded;
   }
 
-  async function listMetadata(): Promise<ArtifactMetadata[]> {
+  async function listMetadata(ignoredStorageKey?: string): Promise<ArtifactMetadata[]> {
     let entries: string[];
     try {
       entries = await fs.readdir(resolvedRoot);
-    } catch {
-      return [];
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof Error) throw storageFailure("list-metadata", cause);
+      throw cause;
     }
 
     const metadata = await Promise.all(
-      entries
-        .filter((entry) => entry.endsWith(".meta"))
-        .map(async (entry) => {
-          const storageKey = entry.slice(0, -".meta".length);
+      [
+        ...new Set(
+          entries.flatMap((entry) => {
+            if (entry.endsWith(".meta")) return [entry.slice(0, -".meta".length)];
+            if (entry.endsWith(".bin")) return [entry.slice(0, -".bin".length)];
+            return [];
+          }),
+        ),
+      ]
+        .filter((storageKey) => storageKey !== ignoredStorageKey)
+        .map(async (storageKey) => {
           const item = await readMetadata(storageKey);
-          if (!item) await removeArtifact(storageKey);
-          return item;
+          if (item.status === "error") throw item.error;
+          return item.value.value;
         }),
     );
-    return metadata.filter((item): item is ArtifactMetadata => item !== null);
+    return metadata;
   }
 
   async function removeArtifact(storageKey: string): Promise<void> {
@@ -246,13 +485,91 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     ]);
   }
 
-  async function cleanupExpired(now: number): Promise<number> {
-    const expired = (await listMetadata()).filter((item) => item.expiresAt <= now);
-    await Promise.all(expired.map((item) => removeArtifact(item.storageKey)));
-    if (expired.length > 0) {
-      logger.info("tool.artifact.expired", { count: expired.length });
+  function maintenancePrimaryError(cause: Error): ToolResultArtifactReadError {
+    if (
+      cause instanceof ToolResultArtifactMetadataAbsent ||
+      cause instanceof ToolResultArtifactMetadataUnsupportedVersion ||
+      cause instanceof ToolResultArtifactMetadataMalformed ||
+      cause instanceof ToolResultArtifactMetadataCorrupt ||
+      cause instanceof ToolResultArtifactMetadataStorageKeyMismatch ||
+      cause instanceof ToolResultArtifactDecryptAuthenticationFailed ||
+      cause instanceof ToolResultArtifactContentMismatch ||
+      cause instanceof ToolResultArtifactStorageFailure ||
+      cause instanceof ToolResultArtifactUnavailable
+    ) {
+      return cause;
     }
-    return expired.length;
+    return storageFailure("maintenance", cause);
+  }
+
+  async function removeInvalidArtifact(
+    storageKey: string,
+    primaryError: ToolResultArtifactReadError,
+  ): Promise<void> {
+    try {
+      await removeArtifact(storageKey);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (!(cause instanceof Error)) throw cause;
+      throw new ToolResultArtifactMaintenanceAndCleanupFailure({
+        primaryError,
+        cleanupError: storageFailure("remove-artifact", cause),
+        message: "Tool result artifact invalidation cleanup failed",
+      });
+    }
+  }
+
+  async function maintainArtifacts(now: number): Promise<ToolResultArtifactMaintenanceResult> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(resolvedRoot);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof Error) throw storageFailure("maintenance", cause);
+      throw cause;
+    }
+    const storageKeys = [
+      ...new Set(
+        entries.flatMap((entry) => {
+          if (entry.endsWith(".meta")) return [entry.slice(0, -".meta".length)];
+          if (entry.endsWith(".bin")) return [entry.slice(0, -".bin".length)];
+          return [];
+        }),
+      ),
+    ];
+    let removedInvalid = 0;
+    let removedExpired = 0;
+    for (const storageKey of storageKeys) {
+      const decoded = await readMetadata(storageKey);
+      if (decoded.status === "error") {
+        await removeInvalidArtifact(storageKey, decoded.error);
+        removedInvalid += 1;
+        continue;
+      }
+      const metadata = decoded.value.value;
+      if (metadata.expiresAt <= now) {
+        try {
+          await removeArtifact(storageKey);
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
+          if (cause instanceof Error) throw storageFailure("remove-artifact", cause);
+          throw cause;
+        }
+        removedExpired += 1;
+        continue;
+      }
+      try {
+        await readEncryptedContent(storageKey, metadata.bytes);
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        if (!(cause instanceof Error)) throw cause;
+        await removeInvalidArtifact(storageKey, maintenancePrimaryError(cause));
+        removedInvalid += 1;
+      }
+    }
+    if (removedExpired > 0) logger.info("tool.artifact.expired", { count: removedExpired });
+    if (removedInvalid > 0) logger.info("tool.artifact.invalid_removed", { count: removedInvalid });
+    return { removedInvalid, removedExpired };
   }
 
   function exclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -271,8 +588,8 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
       await fs.rename(temporaryPath, filePath);
       await fs.chmod(filePath, 0o600);
     } catch (error) {
-      await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
-      throw error;
+      if (!(error instanceof Error)) throw error;
+      return rethrowAfterCleanup(error, () => fs.rm(temporaryPath, { force: true }));
     }
   }
 
@@ -308,8 +625,8 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
       await fs.chmod(filePath, 0o600);
       return bytes;
     } catch (error) {
-      await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
-      throw error;
+      if (!(error instanceof Error)) throw error;
+      return rethrowAfterCleanup(error, () => fs.rm(temporaryPath, { force: true }));
     }
   }
 
@@ -320,7 +637,6 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     return exclusive(async () => {
       assertWithinHardLimit(0, params.maxArtifactBytes);
       const now = Date.now();
-      await cleanupExpired(now);
       const scopeId = artifactScopeId(params);
       const scopeLimit = maxBytesPerScope(params);
 
@@ -330,12 +646,12 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
       try {
         bytes = await writeContent(contentPath(storageKey));
       } catch (error) {
-        await removeArtifact(storageKey).catch(() => undefined);
-        throw error;
+        if (!(error instanceof Error)) throw error;
+        return rethrowAfterCleanup(error, () => removeArtifact(storageKey));
       }
 
-      const scopeArtifacts = (await listMetadata())
-        .filter((item) => metadataScopeId(item) === scopeId)
+      const scopeArtifacts = (await listMetadata(storageKey))
+        .filter((item) => item.expiresAt > now && metadataScopeId(item) === scopeId)
         .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
       let scopeBytes = scopeArtifacts.reduce((sum, item) => sum + item.bytes, 0);
       let evicted = 0;
@@ -369,10 +685,13 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
       };
 
       try {
-        await writeAtomic(metadataPath(storageKey), encrypt(JSON.stringify(metadata)));
+        await writeAtomic(
+          metadataPath(storageKey),
+          encrypt(encodeToolResultArtifactMetadata(metadata)),
+        );
       } catch (error) {
-        await removeArtifact(storageKey).catch(() => undefined);
-        throw error;
+        if (!(error instanceof Error)) throw error;
+        return rethrowAfterCleanup(error, () => removeArtifact(storageKey));
       }
 
       logger.info("tool.artifact.created", {
@@ -401,6 +720,7 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
 
   async function readEncryptedWindow(
     storageKey: string,
+    expectedBytes: number,
     start: ToolResultArtifactStart,
     maxCharacters: number,
     maxLines: number,
@@ -420,7 +740,14 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     let authTag: Buffer;
     try {
       size = (await handle.stat()).size;
-      if (size < 28) throw new Error("Invalid encrypted artifact");
+      if (size < 28) {
+        const error = new ToolResultArtifactContentMismatch({
+          issueCode: "content-mismatch",
+          message: "Tool result artifact content does not match its metadata",
+        });
+        reportDiagnostic(error);
+        throw error;
+      }
       nonce = Buffer.alloc(12);
       authTag = Buffer.alloc(16);
       await handle.read(nonce, 0, nonce.length, 0);
@@ -488,13 +815,38 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     };
 
     const ciphertextBytes = size - 28;
-    if (ciphertextBytes > 0) {
-      const decrypted = createReadStream(filePath, { start: 12, end: size - 17 }).pipe(decipher);
-      for await (const chunk of decrypted) {
-        consume(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    if (ciphertextBytes !== expectedBytes) {
+      const error = new ToolResultArtifactContentMismatch({
+        issueCode: "content-mismatch",
+        message: "Tool result artifact content does not match its metadata",
+      });
+      reportDiagnostic(error);
+      throw error;
+    }
+    try {
+      if (ciphertextBytes > 0) {
+        const decrypted = createReadStream(filePath, { start: 12, end: size - 17 }).pipe(decipher);
+        for await (const chunk of decrypted) {
+          consume(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        }
+      } else {
+        decipher.final();
       }
-    } else {
-      decipher.final();
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof Error) {
+        const code = errorCode(cause);
+        if (code !== undefined && !code.startsWith("ERR_CRYPTO")) {
+          throw storageFailure("read-content", cause);
+        }
+      }
+      const error = new ToolResultArtifactDecryptAuthenticationFailed({
+        target: "content",
+        issueCode: "decrypt-auth-failed",
+        message: "Tool result artifact content authentication failed",
+      });
+      reportDiagnostic(error);
+      throw error;
     }
     consume(decoder.end());
     const startOffset = selectedStartOffset ?? totalCharacters;
@@ -508,82 +860,138 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
     };
   }
 
+  async function readEncryptedContent(storageKey: string, expectedBytes: number): Promise<string> {
+    let encrypted: Buffer;
+    try {
+      encrypted = await fs.readFile(contentPath(storageKey));
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      if (cause instanceof Error) throw storageFailure("read-content", cause);
+      throw cause;
+    }
+    if (encrypted.byteLength - 28 !== expectedBytes) {
+      const error = new ToolResultArtifactContentMismatch({
+        issueCode: "content-mismatch",
+        message: "Tool result artifact content does not match its metadata",
+      });
+      reportDiagnostic(error);
+      throw error;
+    }
+    try {
+      return decrypt(encrypted);
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      const error = new ToolResultArtifactDecryptAuthenticationFailed({
+        target: "content",
+        issueCode: "decrypt-auth-failed",
+        message: "Tool result artifact content authentication failed",
+      });
+      reportDiagnostic(error);
+      throw error;
+    }
+  }
+
   return {
     rootDir: resolvedRoot,
     async init() {
-      await fs.mkdir(resolvedRoot, { recursive: true, mode: 0o700 });
-      const entries = await fs.readdir(resolvedRoot);
-      await Promise.all(
-        entries
-          .filter(
-            (entry) =>
-              entry.endsWith(".bin") ||
-              entry.endsWith(".meta") ||
-              entry.endsWith(".tmp") ||
-              entry.endsWith(".txt") ||
-              entry.endsWith(".json"),
-          )
-          .map(async (entry) => {
-            const entryPath = path.join(resolvedRoot, entry);
-            const entryStat = await fs.lstat(entryPath).catch(() => null);
-            if (entryStat?.isFile() || entryStat?.isSymbolicLink()) {
-              await fs.rm(entryPath, { force: true });
-            }
-          }),
-      );
-    },
-    async create(params) {
-      const { content, ...metadata } = params;
-      return createArtifact(metadata, async (filePath) => {
-        const bytes = Buffer.byteLength(content, "utf8");
-        assertWithinHardLimit(bytes, params.maxArtifactBytes);
-        await writeAtomic(filePath, encrypt(content));
-        return bytes;
-      });
-    },
-    async createFromFile(params) {
-      const { sourcePath, ...metadata } = params;
-      return createArtifact(metadata, async (filePath) => {
-        const sourceBytes = (await fs.stat(sourcePath)).size;
-        assertWithinHardLimit(sourceBytes, params.maxArtifactBytes);
-        return writeEncryptedStreamAtomic(
-          filePath,
-          createReadStream(sourcePath),
-          params.maxArtifactBytes,
+      return captureOperation("initialize", async () => {
+        await fs.mkdir(resolvedRoot, { recursive: true, mode: 0o700 });
+        const entries = await fs.readdir(resolvedRoot);
+        await Promise.all(
+          entries
+            .filter(
+              (entry) =>
+                entry.endsWith(".bin") ||
+                entry.endsWith(".meta") ||
+                entry.endsWith(".tmp") ||
+                entry.endsWith(".txt") ||
+                entry.endsWith(".json"),
+            )
+            .map(async (entry) => {
+              const entryPath = path.join(resolvedRoot, entry);
+              const entryStat = await fs.lstat(entryPath);
+              if (entryStat.isFile() || entryStat.isSymbolicLink()) {
+                await fs.rm(entryPath, { force: true });
+              }
+            }),
         );
       });
     },
+    async create(params) {
+      return captureOperation("write-content", async () => {
+        const { content, ...metadata } = params;
+        return createArtifact(metadata, async (filePath) => {
+          const bytes = Buffer.byteLength(content, "utf8");
+          assertWithinHardLimit(bytes, params.maxArtifactBytes);
+          await writeAtomic(filePath, encrypt(content));
+          return bytes;
+        });
+      });
+    },
+    async createFromFile(params) {
+      return captureOperation("write-content", async () => {
+        const { sourcePath, ...metadata } = params;
+        return createArtifact(metadata, async (filePath) => {
+          const sourceBytes = (await fs.stat(sourcePath)).size;
+          assertWithinHardLimit(sourceBytes, params.maxArtifactBytes);
+          return writeEncryptedStreamAtomic(
+            filePath,
+            createReadStream(sourcePath),
+            params.maxArtifactBytes,
+          );
+        });
+      });
+    },
     async createFromStream(params) {
-      const { source, ...metadata } = params;
-      return createArtifact(metadata, (filePath) =>
-        writeEncryptedStreamAtomic(filePath, source, params.maxArtifactBytes),
-      );
+      return captureOperation("write-content", async () => {
+        const { source, ...metadata } = params;
+        return createArtifact(metadata, (filePath) =>
+          writeEncryptedStreamAtomic(filePath, source, params.maxArtifactBytes),
+        );
+      });
     },
     async read(uri, scopeId) {
-      return exclusive(async () => {
-        const now = Date.now();
-        await cleanupExpired(now);
-        const id = artifactIdFromUri(uri);
-        if (!id) return { ok: false };
-        const metadata = (await listMetadata()).find((item) => item.id === id);
-        if (!metadata || metadataScopeId(metadata) !== scopeId) return { ok: false };
+      return captureOperation("read-content", () =>
+        exclusive(async () => {
+          const now = Date.now();
+          const id = artifactIdFromUri(uri);
+          if (!id) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "invalid-uri",
+              message: "Tool result artifact URI is invalid",
+            });
+          }
+          const metadata = (await listMetadata()).find((item) => item.id === id);
+          if (!metadata) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "expired-or-evicted",
+              message: "Tool result artifact is unavailable",
+            });
+          }
+          if (metadata.expiresAt <= now) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "expired-or-evicted",
+              message: "Tool result artifact is unavailable",
+            });
+          }
+          if (metadataScopeId(metadata) !== scopeId) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "scope-mismatch",
+              message: "Tool result artifact is unavailable to this scope",
+            });
+          }
 
-        try {
-          const content = decrypt(await fs.readFile(contentPath(metadata.storageKey)));
+          const content = await readEncryptedContent(metadata.storageKey, metadata.bytes);
           logger.info("tool.artifact.read", { bytes: metadata.bytes });
           return {
-            ok: true,
             content,
             id,
             bytes: metadata.bytes,
             createdAt: metadata.createdAt,
             expiresAt: metadata.expiresAt,
           };
-        } catch {
-          await removeArtifact(metadata.storageKey);
-          return { ok: false };
-        }
-      });
+        }),
+      );
     },
     async readWindow(uri, scopeId, options) {
       if (
@@ -591,19 +999,43 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
         Number.isFinite(options.maxOutputBytes) &&
         Math.floor(options.maxOutputBytes) < 4
       ) {
-        throw new RangeError(
-          "Tool result artifact maxOutputBytes must be at least 4 to fit one Unicode character",
+        return Result.err(
+          new ToolResultArtifactInvalidInput({
+            message:
+              "Tool result artifact maxOutputBytes must be at least 4 to fit one Unicode character",
+          }),
         );
       }
-      return exclusive(async () => {
-        const now = Date.now();
-        await cleanupExpired(now);
-        const id = artifactIdFromUri(uri);
-        if (!id) return { ok: false };
-        const metadata = (await listMetadata()).find((item) => item.id === id);
-        if (!metadata || metadataScopeId(metadata) !== scopeId) return { ok: false };
+      return captureOperation("read-content", () =>
+        exclusive(async () => {
+          const now = Date.now();
+          const id = artifactIdFromUri(uri);
+          if (!id) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "invalid-uri",
+              message: "Tool result artifact URI is invalid",
+            });
+          }
+          const metadata = (await listMetadata()).find((item) => item.id === id);
+          if (!metadata) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "expired-or-evicted",
+              message: "Tool result artifact is unavailable",
+            });
+          }
+          if (metadata.expiresAt <= now) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "expired-or-evicted",
+              message: "Tool result artifact is unavailable",
+            });
+          }
+          if (metadataScopeId(metadata) !== scopeId) {
+            throw new ToolResultArtifactUnavailable({
+              reason: "scope-mismatch",
+              message: "Tool result artifact is unavailable to this scope",
+            });
+          }
 
-        try {
           const start: ToolResultArtifactStart =
             options.start.type === "offset"
               ? {
@@ -638,6 +1070,7 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
               : Number.POSITIVE_INFINITY;
           const window = await readEncryptedWindow(
             metadata.storageKey,
+            metadata.bytes,
             start,
             maxCharacters,
             maxLines,
@@ -652,7 +1085,6 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
           }
           logger.info("tool.artifact.read", { bytes: metadata.bytes });
           return {
-            ok: true,
             content: window.content,
             id,
             bytes: metadata.bytes,
@@ -664,11 +1096,31 @@ export function createToolResultArtifactStore(rootDir: string): ToolResultArtifa
             hasMore,
             ...(nextStart ? { nextStart } : {}),
           };
-        } catch {
-          await removeArtifact(metadata.storageKey);
-          return { ok: false };
+        }),
+      );
+    },
+    async maintain(now = Date.now()) {
+      try {
+        return Result.ok(await exclusive(() => maintainArtifacts(now)));
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        if (
+          cause instanceof ToolResultArtifactMaintenanceAndCleanupFailure ||
+          cause instanceof ToolResultArtifactStorageFailure ||
+          cause instanceof ToolResultArtifactMetadataAbsent ||
+          cause instanceof ToolResultArtifactMetadataUnsupportedVersion ||
+          cause instanceof ToolResultArtifactMetadataMalformed ||
+          cause instanceof ToolResultArtifactMetadataCorrupt ||
+          cause instanceof ToolResultArtifactMetadataStorageKeyMismatch ||
+          cause instanceof ToolResultArtifactDecryptAuthenticationFailed ||
+          cause instanceof ToolResultArtifactContentMismatch ||
+          cause instanceof ToolResultArtifactUnavailable
+        ) {
+          return Result.err(cause);
         }
-      });
+        if (cause instanceof Error) return Result.err(storageFailure("maintenance", cause));
+        throw cause;
+      }
     },
   };
 }

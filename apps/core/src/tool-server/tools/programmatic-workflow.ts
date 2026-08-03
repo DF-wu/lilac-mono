@@ -3,11 +3,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { env } from "@stanley2058/lilac-utils";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
+import { Result, type Result as ResultType } from "better-result";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
 import {
   DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
   DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+  type CreateWorkflowInvocationError,
+  type CreateWorkflowInvocationResult,
 } from "../../workflow/durable-workflow-store";
 import {
   canonicalJsonSha256,
@@ -29,8 +33,18 @@ import type { RequestContext, ServerTool } from "../types";
 import type { WorkflowProgressCardService } from "../../workflow/workflow-progress-projector";
 import { parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
-import { readWorkflowValueArtifact } from "../../workflow/workflow-artifact-store";
+import {
+  adaptWorkflowArtifactResultToException,
+  readWorkflowValueArtifact,
+} from "../../workflow/workflow-artifact-store";
 import { redactWorkflowValue } from "../../workflow/workflow-progress-view";
+
+function adaptWorkflowInvocationResultToToolHost(
+  result: ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>,
+): CreateWorkflowInvocationResult {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const definitionScopeSchema = z.enum(["project", "personal", "auto"]);
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -563,7 +577,10 @@ export class ProgrammaticWorkflow implements ServerTool {
         createdAt: now,
       };
       this.store().createRevision(revision);
-      const storedRevision = this.store().findRevisionByIdentity(revisionIdentity);
+      const storedRevisionResult = this.store().findRevisionByIdentity(revisionIdentity);
+      if (storedRevisionResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(storedRevisionResult.error);
+      const storedRevision = storedRevisionResult.value;
       if (!storedRevision || storedRevision.revisionId !== revisionId) {
         throw new Error("Scheduled workflow revision identity collision");
       }
@@ -644,20 +661,31 @@ export class ProgrammaticWorkflow implements ServerTool {
         input: rawInput,
         schema: scheduledTriggerGetInputSchema,
       });
-      const trigger = this.store().getTrigger(input.triggerId);
+      const triggerResult = this.store().getTrigger(input.triggerId);
+      if (triggerResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(triggerResult.error);
+      const trigger = triggerResult.value;
       if (!trigger) throw new Error(`Workflow trigger not found: ${input.triggerId}`);
-      const revision = this.store().getRevision(trigger.revisionId);
+      const revisionResult = this.store().getRevision(trigger.revisionId);
+      if (revisionResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(revisionResult.error);
+      const revision = revisionResult.value;
       if (!revision) throw new Error(`Workflow revision not found: ${trigger.revisionId}`);
       assertProjectScope({
         canonicalProjectId: projectScope.canonicalProjectId,
         revision,
       });
+      let lastRun = null;
+      if (trigger.lastRunId) {
+        const lastRunResult = this.store().getRun(trigger.lastRunId);
+        if (lastRunResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(lastRunResult.error);
+        lastRun = lastRunResult.value ? redactRun(lastRunResult.value) : null;
+      }
       return {
         ok: true as const,
         trigger: redactTrigger(trigger, revision),
-        lastRun: trigger.lastRunId
-          ? ((run) => (run ? redactRun(run) : null))(this.store().getRun(trigger.lastRunId))
-          : null,
+        lastRun,
       };
     }
     if (callableId === "workflow.trigger.list") {
@@ -666,16 +694,27 @@ export class ProgrammaticWorkflow implements ServerTool {
         input: rawInput,
         schema: scheduledTriggerListInputSchema,
       });
-      const triggers = this.store().listTriggers({
+      const triggersResult = this.store().listTriggers({
         ...input,
         canonicalProjectId: projectScope.canonicalProjectId,
       });
+      if (triggersResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(triggersResult.error);
+      const triggers = triggersResult.value;
       return {
         ok: true as const,
         triggers: triggers.map((trigger) => {
-          const revision = this.store().getRevision(trigger.revisionId);
+          const revisionResult = this.store().getRevision(trigger.revisionId);
+          if (revisionResult.status === "error")
+            signalDurableWorkflowReadErrorToHost(revisionResult.error);
+          const revision = revisionResult.value;
           if (!revision) throw new Error(`Workflow revision not found: ${trigger.revisionId}`);
-          const lastRun = trigger.lastRunId ? this.store().getRun(trigger.lastRunId) : null;
+          const lastRunResult = trigger.lastRunId
+            ? this.store().getRun(trigger.lastRunId)
+            : Result.ok(null);
+          if (lastRunResult.status === "error")
+            signalDurableWorkflowReadErrorToHost(lastRunResult.error);
+          const lastRun = lastRunResult.value;
           return {
             trigger: redactTrigger(trigger, revision),
             lastRun: lastRun ? redactRun(lastRun) : null,
@@ -689,9 +728,15 @@ export class ProgrammaticWorkflow implements ServerTool {
         input: rawInput,
         schema: scheduledTriggerCancelInputSchema,
       });
-      const trigger = this.store().getTrigger(input.triggerId);
+      const triggerResult = this.store().getTrigger(input.triggerId);
+      if (triggerResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(triggerResult.error);
+      const trigger = triggerResult.value;
       if (!trigger) throw new Error(`Workflow trigger not found: ${input.triggerId}`);
-      const revision = this.store().getRevision(trigger.revisionId);
+      const revisionResult = this.store().getRevision(trigger.revisionId);
+      if (revisionResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(revisionResult.error);
+      const revision = revisionResult.value;
       if (!revision) throw new Error(`Workflow revision not found: ${trigger.revisionId}`);
       assertProjectScope({
         canonicalProjectId: projectScope.canonicalProjectId,
@@ -711,7 +756,10 @@ export class ProgrammaticWorkflow implements ServerTool {
         now: this.params.now?.() ?? Date.now(),
         nextFireAt: null,
       });
-      const updated = this.store().getTrigger(trigger.triggerId);
+      const updatedResult = this.store().getTrigger(trigger.triggerId);
+      if (updatedResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(updatedResult.error);
+      const updated = updatedResult.value;
       return {
         ok: true as const,
         trigger: updated ? redactTrigger(updated, revision) : null,
@@ -802,12 +850,15 @@ export class ProgrammaticWorkflow implements ServerTool {
         updatedAt: now,
         terminalAt: null,
       };
-      const invocation = this.store().createInvocation({
-        revision,
-        run,
-        idempotency: { key: idempotencyKey, fingerprintSha256: invocationFingerprint },
-        maxActiveRuns: (await this.params.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
-      });
+      const invocation = adaptWorkflowInvocationResultToToolHost(
+        this.store().createInvocation({
+          revision,
+          run,
+          idempotency: { key: idempotencyKey, fingerprintSha256: invocationFingerprint },
+          maxActiveRuns:
+            (await this.params.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
+        }),
+      );
       if (invocation.status === "rejected_capacity") {
         return {
           ok: false as const,
@@ -858,14 +909,28 @@ export class ProgrammaticWorkflow implements ServerTool {
     }
     if (callableId === "workflow.run.get") {
       const input = parseToolInput({ callableId, input: rawInput, schema: runGetInputSchema });
-      const run = this.store().getRun(input.runId);
+      const runResult = this.store().getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-      const revision = this.store().getRevision(run.revisionId);
+      const revisionResult = this.store().getRevision(run.revisionId);
+      if (revisionResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(revisionResult.error);
+      const revision = revisionResult.value;
       if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
       assertProjectScope({
         canonicalProjectId: projectScope.canonicalProjectId,
         revision,
       });
+      let resultArtifact;
+      if (input.includeResultArtifact && run.resultArtifactId) {
+        const loaded = await readWorkflowValueArtifact({
+          dataDir: this.params.dataDir ?? env.dataDir,
+          artifactId: run.resultArtifactId,
+          maxBytes: revision.limits.maxResultBytes,
+        });
+        resultArtifact = adaptWorkflowArtifactResultToException(loaded);
+      }
       return {
         ok: true as const,
         run: redactRun(run),
@@ -876,33 +941,31 @@ export class ProgrammaticWorkflow implements ServerTool {
                 await this.definitions(projectScope.canonicalRoot)
               ).readSnapshot(revision.sourceSha256)
             : undefined,
-        resultArtifact:
-          input.includeResultArtifact && run.resultArtifactId
-            ? await readWorkflowValueArtifact({
-                dataDir: this.params.dataDir ?? env.dataDir,
-                artifactId: run.resultArtifactId,
-                maxBytes: revision.limits.maxResultBytes,
-              })
-            : undefined,
+        resultArtifact,
       };
     }
     if (callableId === "workflow.run.list") {
       const input = parseToolInput({ callableId, input: rawInput, schema: runListInputSchema });
+      const runs = this.store().listRuns({
+        ...input,
+        canonicalProjectId: projectScope.canonicalProjectId,
+      });
+      if (runs.status === "error") signalDurableWorkflowReadErrorToHost(runs.error);
       return {
         ok: true as const,
-        runs: this.store()
-          .listRuns({
-            ...input,
-            canonicalProjectId: projectScope.canonicalProjectId,
-          })
-          .map(redactRun),
+        runs: runs.value.map(redactRun),
       };
     }
     if (callableId === "workflow.run.cancel") {
       const input = parseToolInput({ callableId, input: rawInput, schema: runCancelInputSchema });
-      const run = this.store().getRun(input.runId);
+      const runResult = this.store().getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-      const revision = this.store().getRevision(run.revisionId);
+      const revisionResult = this.store().getRevision(run.revisionId);
+      if (revisionResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(revisionResult.error);
+      const revision = revisionResult.value;
       if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
       assertProjectScope({
         canonicalProjectId: projectScope.canonicalProjectId,
@@ -911,9 +974,11 @@ export class ProgrammaticWorkflow implements ServerTool {
       const terminal = ["succeeded", "failed", "cancelled"].includes(run.state);
       if (terminal) return { ok: true as const, run: redactRun(run), changed: false };
       const now = this.params.now?.() ?? Date.now();
-      const activeRequests = this.store()
-        .listOperations(run.runId, { limit: 1_000 })
-        .flatMap((operation) => (operation.requestId ? [operation.requestId] : []));
+      const operations = this.store().listOperations(run.runId, { limit: 1_000 });
+      if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
+      const activeRequests = operations.value.flatMap((operation) =>
+        operation.requestId ? [operation.requestId] : [],
+      );
       const cancelled = this.store().cancelRunAndChildren({
         runId: run.runId,
         now,
@@ -954,9 +1019,14 @@ export class ProgrammaticWorkflow implements ServerTool {
       const schema =
         callableId === "workflow.run.pause" ? runPauseInputSchema : runResumeInputSchema;
       const input = parseToolInput({ callableId, input: rawInput, schema });
-      const run = this.store().getRun(input.runId);
+      const runResult = this.store().getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-      const revision = this.store().getRevision(run.revisionId);
+      const revisionResult = this.store().getRevision(run.revisionId);
+      if (revisionResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(revisionResult.error);
+      const revision = revisionResult.value;
       if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
       assertProjectScope({
         canonicalProjectId: projectScope.canonicalProjectId,
@@ -986,7 +1056,10 @@ export class ProgrammaticWorkflow implements ServerTool {
               to,
               now,
             });
-      const updated = paused ?? this.store().getRun(run.runId);
+      const updatedResult = paused === null ? this.store().getRun(run.runId) : Result.ok(paused);
+      if (updatedResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(updatedResult.error);
+      const updated = updatedResult.value;
       if (to === "queued" && !changed) {
         const ambiguity = this.store().getManualReconciliationDetail(run.runId);
         if (ambiguity) throw new Error(ambiguity);

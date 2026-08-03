@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Surface } from "../src/tool-server/tools/surface";
 import type { GithubSurfaceApi } from "../src/tool-server/tools/surface";
@@ -1852,12 +1853,14 @@ describe("tool-server surface", () => {
 
     const linked: Array<{ requestId: string; created: readonly MsgRef[]; last: MsgRef }> = [];
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest(input) {
         linked.push(input);
       },
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       close() {},
     };
@@ -1906,12 +1909,14 @@ describe("tool-server surface", () => {
 
     const linked: Array<{ requestId: string; created: readonly MsgRef[]; last: MsgRef }> = [];
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest(input) {
         linked.push(input);
       },
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       close() {},
     };

@@ -8,6 +8,7 @@ import { Readable } from "node:stream";
 import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { tool, type ToolSet } from "ai";
+import { Panic } from "better-result";
 
 import {
   DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
@@ -376,34 +377,52 @@ async function persistBashArtifact(params: {
   toolCallId: string;
   spool: BashSpool;
   literalSecrets: readonly string[];
-}): Promise<{ uri: string; bytes: number }> {
-  const artifact = await params.integration.artifacts.createFromStream({
-    scopeId: params.integration.scopeId,
-    requestId: params.integration.requestId,
-    toolCallId: params.toolCallId,
-    toolName: "bash",
-    source: createBashArtifactSource(params.spool, params.literalSecrets),
-    ttlMs: normalizedNonnegativeInteger(
-      params.integration.ttlMs,
-      DEFAULT_ARTIFACT_TTL_MS,
-      "artifactIntegration.ttlMs",
-    ),
-    maxBytesPerScope: normalizedNonnegativeInteger(
-      params.integration.maxBytesPerScope,
-      DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
-      "artifactIntegration.maxBytesPerScope",
-    ),
-    ...(params.integration.maxArtifactBytes === undefined
-      ? {}
-      : {
-          maxArtifactBytes: normalizedNonnegativeInteger(
-            params.integration.maxArtifactBytes,
-            0,
-            "artifactIntegration.maxArtifactBytes",
-          ),
-        }),
-  });
-  return { uri: artifact.uri, bytes: artifact.bytes };
+}): Promise<{ uri: string; bytes: number } | undefined> {
+  try {
+    const artifact = await params.integration.artifacts.createFromStream({
+      scopeId: params.integration.scopeId,
+      requestId: params.integration.requestId,
+      toolCallId: params.toolCallId,
+      toolName: "bash",
+      source: createBashArtifactSource(params.spool, params.literalSecrets),
+      ttlMs: normalizedNonnegativeInteger(
+        params.integration.ttlMs,
+        DEFAULT_ARTIFACT_TTL_MS,
+        "artifactIntegration.ttlMs",
+      ),
+      maxBytesPerScope: normalizedNonnegativeInteger(
+        params.integration.maxBytesPerScope,
+        DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
+        "artifactIntegration.maxBytesPerScope",
+      ),
+      ...(params.integration.maxArtifactBytes === undefined
+        ? {}
+        : {
+            maxArtifactBytes: normalizedNonnegativeInteger(
+              params.integration.maxArtifactBytes,
+              0,
+              "artifactIntegration.maxArtifactBytes",
+            ),
+          }),
+    });
+    if (artifact.status === "error") return undefined;
+    return { uri: artifact.value.uri, bytes: artifact.value.bytes };
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return undefined;
+  }
+}
+
+async function cleanupBashSpoolAfterExecution(
+  spool: BashSpool | undefined,
+  operationPanic: Panic | undefined,
+): Promise<void> {
+  try {
+    await spool?.cleanup();
+  } catch (cleanupCause) {
+    if (operationPanic) throw operationPanic;
+    throw cleanupCause;
+  }
 }
 
 export async function executeLocalBash(
@@ -519,6 +538,7 @@ export async function executeLocalBash(
   let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
   let noOutputTimer: ReturnType<typeof setTimeout> | undefined;
   let wallClockTimer: ReturnType<typeof setTimeout> | undefined;
+  let operationPanic: Panic | undefined;
   const terminate = (
     reason:
       | { type: "aborted" }
@@ -648,17 +668,17 @@ export async function executeLocalBash(
       } else if (!options.toolCallId) {
         retentionStatus = "identity-unavailable";
       } else {
-        try {
-          const artifact = await persistBashArtifact({
-            integration: options.artifactIntegration,
-            toolCallId: options.toolCallId,
-            spool,
-            literalSecrets,
-          });
+        const artifact = await persistBashArtifact({
+          integration: options.artifactIntegration,
+          toolCallId: options.toolCallId,
+          spool,
+          literalSecrets,
+        });
+        if (artifact) {
           artifactUri = artifact.uri;
           artifactBytes = artifact.bytes;
           retentionStatus = "retained";
-        } catch {
+        } else {
           retentionStatus = "artifact-write-failed";
         }
       }
@@ -686,6 +706,10 @@ export async function executeLocalBash(
       ...(truncation ? { truncation } : {}),
     };
   } catch (error: unknown) {
+    if (Panic.is(error)) {
+      operationPanic = error;
+      throw error;
+    }
     killProcessGroup(child.pid, "SIGTERM");
     const forceKill = setTimeout(() => killProcessGroup(child.pid, "SIGKILL"), HARD_KILL_DELAY_MS);
     await child.exited.catch(() => undefined);
@@ -703,7 +727,7 @@ export async function executeLocalBash(
     };
   } finally {
     stopWatchingExecution();
-    await spool?.cleanup();
+    await cleanupBashSpoolAfterExecution(spool, operationPanic);
   }
 }
 

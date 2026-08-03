@@ -1,7 +1,13 @@
-import { Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings } from "bun:sqlite";
 import path from "node:path";
 import { z } from "zod";
-import { env } from "@stanley2058/lilac-utils";
+import {
+  classifyBunSqliteError,
+  env,
+  runBunSqliteTransaction,
+  type PersistedDataError,
+} from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { configureSqliteConnection } from "../shared/sqlite";
 import {
@@ -36,7 +42,19 @@ import {
   type WorkflowWait,
   type WorkflowWaitState,
 } from "./workflow-domain";
-import { applyWorkflowSchemaMigrations } from "./workflow-migrations";
+import {
+  applyWorkflowSchemaMigrations,
+  WORKFLOW_SCHEMA_VERSION,
+  type WorkflowMigrationError,
+} from "./workflow-migrations";
+import {
+  decodeWorkflowPersistenceRow,
+  type DecodedWorkflowActionOutboxEntry,
+  type DecodedWorkflowRequestDispatch,
+  type DecodedWorkflowRequestTerminalReceipt,
+  type WorkflowPersistedRow,
+  type WorkflowPersistenceDiagnostic,
+} from "./workflow-persistence-codec";
 import {
   workflowRequestPolicyIdentityProjection,
   workflowRequestPolicySchema,
@@ -50,53 +68,6 @@ function resolveWorkflowDbPath(): string {
   return path.resolve(env.sqliteUrl);
 }
 
-const nullableStringSchema = z.string().nullable();
-const nullableNumberSchema = z.number().nullable();
-
-const revisionRowSchema = z.object({
-  revision_id: z.string(),
-  canonical_project_id: z.string(),
-  canonical_workspace_root: z.string(),
-  scope: z.string(),
-  normalized_path: z.string(),
-  name: z.string(),
-  snapshot_artifact_id: z.string(),
-  source_sha256: z.string(),
-  input_schema_sha256: z.string(),
-  capability_sha256: z.string(),
-  metadata_json: z.string(),
-  input_schema_json: z.string(),
-  capabilities_json: z.string(),
-  limits_json: z.string(),
-  runtime_version: z.string(),
-  created_at: z.number(),
-});
-
-const runRowSchema = z.object({
-  run_id: z.string(),
-  revision_id: z.string(),
-  state: z.string(),
-  input_schema_json: z.string(),
-  args_json: z.string(),
-  args_sha256: z.string(),
-  origin_request_id: nullableStringSchema,
-  origin_session_id: nullableStringSchema,
-  origin_client: nullableStringSchema,
-  origin_user_id: nullableStringSchema,
-  origin_project_cwd: z.string(),
-  completion_target_json: z.string(),
-  progress_target_json: nullableStringSchema,
-  terminal_detail: nullableStringSchema,
-  result_json: nullableStringSchema,
-  result_artifact_id: nullableStringSchema,
-  claimed_by: nullableStringSchema,
-  claimed_at: nullableNumberSchema,
-  created_at: z.number(),
-  started_at: nullableNumberSchema,
-  updated_at: z.number(),
-  terminal_at: nullableNumberSchema,
-});
-
 const liveParentDeliverySnapshotRowSchema = z.object({
   pending_completion_count: z.number(),
   outstanding_run_count: z.number(),
@@ -106,379 +77,124 @@ const materializationAttemptRowSchema = z.object({
   materialization_attempt_count: z.number(),
 });
 
-const operationRowSchema = z.object({
-  run_id: z.string(),
-  operation_id: z.string(),
-  call_site_id: z.string(),
-  parent_operation_id: nullableStringSchema,
-  phase: nullableStringSchema,
-  label: nullableStringSchema,
-  kind: z.string(),
-  input_json: z.string(),
-  input_sha256: z.string(),
-  state: z.string(),
-  attempt: z.number(),
-  request_id: nullableStringSchema,
-  output_json: nullableStringSchema,
-  result_artifact_id: nullableStringSchema,
-  error: nullableStringSchema,
-  usage_json: nullableStringSchema,
-  claimed_by: nullableStringSchema,
-  claimed_at: nullableNumberSchema,
-  created_at: z.number(),
-  started_at: nullableNumberSchema,
-  updated_at: z.number(),
-  terminal_at: nullableNumberSchema,
-});
+type WorkflowRowDecoder<T> = (input: {
+  readonly row: WorkflowPersistedRow;
+  readonly schemaVersion: number;
+}) => ResultType<{ readonly value: T }, PersistedDataError>;
 
-const waitRowSchema = z.object({
-  run_id: z.string(),
-  operation_id: z.string(),
-  state: z.string(),
-  match_json: z.string(),
-  match_key: z.string(),
-  due_at: nullableNumberSchema,
-  deadline_at: nullableNumberSchema,
-  resolver_cursor: nullableStringSchema,
-  result_json: nullableStringSchema,
-  resolved_by: nullableStringSchema,
-  claimed_by: nullableStringSchema,
-  claimed_at: nullableNumberSchema,
-  created_at: z.number(),
-  updated_at: z.number(),
-  resolved_at: nullableNumberSchema,
-});
+function decodeWorkflowRevisionRow(input: Parameters<WorkflowRowDecoder<WorkflowRevision>>[0]) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "revision" });
+}
 
-const triggerRowSchema = z.object({
-  trigger_id: z.string(),
-  revision_id: z.string(),
-  state: z.string(),
-  definition_json: z.string(),
-  args_json: z.string(),
-  args_sha256: z.string(),
-  scheduling_policy_json: z.string(),
-  origin_json: z.string(),
-  completion_target_json: z.string(),
-  progress_target_json: nullableStringSchema,
-  next_fire_at: nullableNumberSchema,
-  last_fire_at: nullableNumberSchema,
-  last_run_id: nullableStringSchema,
-  claimed_by: nullableStringSchema,
-  claimed_at: nullableNumberSchema,
-  created_at: z.number(),
-  updated_at: z.number(),
-});
+function decodeWorkflowRunRow(input: Parameters<WorkflowRowDecoder<WorkflowRun>>[0]) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "run" });
+}
 
-const bindingRowSchema = z.object({
-  run_id: z.string(),
-  target_json: z.string(),
-  message_ref_json: nullableStringSchema,
-  last_rendered_sha256: nullableStringSchema,
-  last_error: nullableStringSchema,
-  retry_count: z.number(),
-  next_attempt_at: nullableNumberSchema,
-  created_at: z.number(),
-  updated_at: z.number(),
-});
+function decodeWorkflowOperationRow(input: Parameters<WorkflowRowDecoder<WorkflowOperation>>[0]) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "operation" });
+}
 
-const actionRowSchema = z.object({
-  action_id: z.string(),
-  token_sha256: z.string(),
-  run_id: z.string(),
-  kind: z.string(),
-  expected_platform: z.string(),
-  expected_user_id: z.string(),
-  expected_message_ref_json: nullableStringSchema,
-  expires_at: z.number(),
-  consumed_at: nullableNumberSchema,
-  consumed_by_platform: nullableStringSchema,
-  consumed_by_user_id: nullableStringSchema,
-  created_at: z.number(),
-});
+function decodeWorkflowWaitRow(input: Parameters<WorkflowRowDecoder<WorkflowWait>>[0]) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "wait" });
+}
 
-const requestDispatchRowSchema = z.object({
-  request_id: z.string(),
-  run_id: z.string(),
-  operation_id: z.string(),
-  dispatch_epoch: z.string(),
-  session_id: z.string(),
-  platform: z.string(),
-  policy_json: z.string(),
-  owner_id: nullableStringSchema,
-  owner_heartbeat_at: nullableNumberSchema,
-  active: z.number(),
-  created_at: z.number(),
-  updated_at: z.number(),
-});
+function decodeWorkflowTriggerRow(input: Parameters<WorkflowRowDecoder<WorkflowTrigger>>[0]) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "trigger" });
+}
 
-const requestTerminalReceiptRowSchema = z.object({
-  request_id: z.string(),
-  run_id: z.string(),
-  operation_id: z.string(),
-  dispatch_epoch: z.string(),
-  state: z.enum(["resolved", "failed", "cancelled"]),
-  detail: nullableStringSchema,
-  output_json: nullableStringSchema,
-  result_artifact_id: nullableStringSchema,
-  usage_json: nullableStringSchema,
-  created_at: z.number(),
-});
+function decodeWorkflowSurfaceBindingRow(
+  input: Parameters<WorkflowRowDecoder<WorkflowSurfaceBinding>>[0],
+) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "binding" });
+}
 
-const actionOutboxRowSchema = z.object({
-  outbox_id: z.string(),
-  action_id: z.string(),
-  run_id: z.string(),
-  event_type: z.string(),
-  payload_json: z.string(),
-  published_at: nullableNumberSchema,
-  projected_at: nullableNumberSchema,
-  attempt_count: z.number(),
-  next_attempt_at: nullableNumberSchema,
-  last_error: nullableStringSchema,
-  created_at: z.number(),
-  updated_at: z.number(),
-});
+function decodeWorkflowSurfaceActionRow(
+  input: Parameters<WorkflowRowDecoder<WorkflowSurfaceAction>>[0],
+) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "action" });
+}
 
-function parseJson(raw: string, context: string): unknown {
+function decodeWorkflowRequestDispatchRow(
+  input: Parameters<WorkflowRowDecoder<DecodedWorkflowRequestDispatch>>[0],
+) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "dispatch" });
+}
+
+function decodeWorkflowRequestTerminalReceiptRow(
+  input: Parameters<WorkflowRowDecoder<DecodedWorkflowRequestTerminalReceipt>>[0],
+) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "receipt" });
+}
+
+function decodeWorkflowActionOutboxRow(
+  input: Parameters<WorkflowRowDecoder<DecodedWorkflowActionOutboxEntry>>[0],
+) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "outbox" });
+}
+
+export class DurableWorkflowSqliteDriverFailure extends TaggedError(
+  "DurableWorkflowSqliteDriverFailure",
+)<{
+  readonly operation: string;
+  readonly code: string;
+  readonly message: string;
+}> {}
+
+export type DurableWorkflowReadError = PersistedDataError | DurableWorkflowSqliteDriverFailure;
+
+export function signalDurableWorkflowReadErrorToHost(error: DurableWorkflowReadError): never {
+  throw error;
+}
+
+function classifyWorkflowSqliteDriverFailure(
+  operation: string,
+  cause: Error,
+): DurableWorkflowSqliteDriverFailure | undefined {
+  const sqliteError = classifyBunSqliteError(cause);
+  if (sqliteError === undefined) return undefined;
+  return new DurableWorkflowSqliteDriverFailure({
+    operation,
+    code: sqliteError.code,
+    message: "Durable workflow SQLite operation failed",
+  });
+}
+
+function captureWorkflowRead<T>(
+  operation: string,
+  read: () => ResultType<T, PersistedDataError>,
+): ResultType<T, DurableWorkflowReadError> {
   try {
-    return JSON.parse(raw);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid workflow JSON in ${context}: ${message}`);
+    return read();
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    if (!(cause instanceof Error)) throw cause;
+    const failure = classifyWorkflowSqliteDriverFailure(operation, cause);
+    if (failure === undefined) throw cause;
+    return Result.err(failure);
   }
 }
 
-function parseNullableJson(raw: string | null, context: string): unknown | null {
-  return raw === null ? null : parseJson(raw, context);
+function adaptWorkflowTransactionResultToStoreHost<T>(
+  result: ResultType<T, DurableWorkflowSqliteDriverFailure>,
+): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
 }
 
-function parseRevision(value: unknown): WorkflowRevision {
-  const row = revisionRowSchema.parse(value);
-  return workflowRevisionSchema.parse({
-    revisionId: row.revision_id,
-    canonicalProjectId: row.canonical_project_id,
-    canonicalWorkspaceRoot: row.canonical_workspace_root,
-    scope: row.scope,
-    normalizedPath: row.normalized_path,
-    name: row.name,
-    snapshotArtifactId: row.snapshot_artifact_id,
-    sourceSha256: row.source_sha256,
-    inputSchemaSha256: row.input_schema_sha256,
-    resourcePolicySha256: row.capability_sha256,
-    metadata: parseJson(row.metadata_json, "workflow_revisions.metadata_json"),
-    inputSchema: parseJson(row.input_schema_json, "workflow_revisions.input_schema_json"),
-    resources: parseJson(row.capabilities_json, "workflow_revisions.capabilities_json"),
-    limits: parseJson(row.limits_json, "workflow_revisions.limits_json"),
-    runtimeVersion: row.runtime_version,
-    createdAt: row.created_at,
-  });
-}
-
-function parseRun(value: unknown): WorkflowRun {
-  const row = runRowSchema.parse(value);
-  return workflowRunSchema.parse({
-    runId: row.run_id,
-    revisionId: row.revision_id,
-    state: row.state,
-    inputSchemaSnapshot: parseJson(row.input_schema_json, "workflow_runs.input_schema_json"),
-    args: parseJson(row.args_json, "workflow_runs.args_json"),
-    argsSha256: row.args_sha256,
-    origin: {
-      requestId: row.origin_request_id,
-      sessionId: row.origin_session_id,
-      client: row.origin_client,
-      userId: row.origin_user_id,
-      projectCwd: row.origin_project_cwd,
-    },
-    completionTarget: parseJson(row.completion_target_json, "workflow_runs.completion_target_json"),
-    progressTarget: parseNullableJson(
-      row.progress_target_json,
-      "workflow_runs.progress_target_json",
+function runWorkflowTransaction<T>(db: Database, operation: string, callback: () => T): T {
+  return adaptWorkflowTransactionResultToStoreHost(
+    runBunSqliteTransaction(
+      db,
+      () => Result.ok(callback()),
+      (cause) => classifyWorkflowSqliteDriverFailure(operation, cause),
     ),
-    terminalDetail: row.terminal_detail,
-    result: parseNullableJson(row.result_json, "workflow_runs.result_json"),
-    resultArtifactId: row.result_artifact_id,
-    claimedBy: row.claimed_by,
-    claimedAt: row.claimed_at,
-    createdAt: row.created_at,
-    startedAt: row.started_at,
-    updatedAt: row.updated_at,
-    terminalAt: row.terminal_at,
-  });
+  );
 }
 
-function parseOperation(value: unknown): WorkflowOperation {
-  const row = operationRowSchema.parse(value);
-  return workflowOperationSchema.parse({
-    runId: row.run_id,
-    operationId: row.operation_id,
-    callSiteId: row.call_site_id,
-    parentOperationId: row.parent_operation_id,
-    phase: row.phase,
-    label: row.label,
-    kind: row.kind,
-    input: parseJson(row.input_json, "workflow_operations.input_json"),
-    inputSha256: row.input_sha256,
-    state: row.state,
-    attempt: row.attempt,
-    requestId: row.request_id,
-    output: parseNullableJson(row.output_json, "workflow_operations.output_json"),
-    resultArtifactId: row.result_artifact_id,
-    error: row.error,
-    usage: parseNullableJson(row.usage_json, "workflow_operations.usage_json"),
-    claimedBy: row.claimed_by,
-    claimedAt: row.claimed_at,
-    createdAt: row.created_at,
-    startedAt: row.started_at,
-    updatedAt: row.updated_at,
-    terminalAt: row.terminal_at,
-  });
-}
-
-function parseWait(value: unknown): WorkflowWait {
-  const row = waitRowSchema.parse(value);
-  return workflowWaitSchema.parse({
-    runId: row.run_id,
-    operationId: row.operation_id,
-    state: row.state,
-    match: parseJson(row.match_json, "workflow_waits.match_json"),
-    matchKey: row.match_key,
-    dueAt: row.due_at,
-    deadlineAt: row.deadline_at,
-    resolverCursor: row.resolver_cursor,
-    result: parseNullableJson(row.result_json, "workflow_waits.result_json"),
-    resolvedBy: row.resolved_by,
-    claimedBy: row.claimed_by,
-    claimedAt: row.claimed_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    resolvedAt: row.resolved_at,
-  });
-}
-
-function parseTrigger(value: unknown): WorkflowTrigger {
-  const row = triggerRowSchema.parse(value);
-  return workflowTriggerSchema.parse({
-    triggerId: row.trigger_id,
-    revisionId: row.revision_id,
-    state: row.state,
-    definition: parseJson(row.definition_json, "workflow_triggers.definition_json"),
-    args: parseJson(row.args_json, "workflow_triggers.args_json"),
-    argsSha256: row.args_sha256,
-    schedulingPolicy: parseJson(
-      row.scheduling_policy_json,
-      "workflow_triggers.scheduling_policy_json",
-    ),
-    origin: parseJson(row.origin_json, "workflow_triggers.origin_json"),
-    completionTarget: parseJson(
-      row.completion_target_json,
-      "workflow_triggers.completion_target_json",
-    ),
-    progressTarget: parseNullableJson(
-      row.progress_target_json,
-      "workflow_triggers.progress_target_json",
-    ),
-    nextFireAt: row.next_fire_at,
-    lastFireAt: row.last_fire_at,
-    lastRunId: row.last_run_id,
-    claimedBy: row.claimed_by,
-    claimedAt: row.claimed_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  });
-}
-
-function parseBinding(value: unknown): WorkflowSurfaceBinding {
-  const row = bindingRowSchema.parse(value);
-  return workflowSurfaceBindingSchema.parse({
-    runId: row.run_id,
-    target: parseJson(row.target_json, "workflow_surface_bindings.target_json"),
-    messageRef: parseNullableJson(
-      row.message_ref_json,
-      "workflow_surface_bindings.message_ref_json",
-    ),
-    lastRenderedSha256: row.last_rendered_sha256,
-    lastError: row.last_error,
-    retryCount: row.retry_count,
-    nextAttemptAt: row.next_attempt_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  });
-}
-
-function parseAction(value: unknown): WorkflowSurfaceAction {
-  const row = actionRowSchema.parse(value);
-  return workflowSurfaceActionSchema.parse({
-    actionId: row.action_id,
-    tokenSha256: row.token_sha256,
-    runId: row.run_id,
-    kind: row.kind,
-    expectedPlatform: row.expected_platform,
-    expectedUserId: row.expected_user_id,
-    expectedMessageRef: parseNullableJson(
-      row.expected_message_ref_json,
-      "workflow_surface_actions.expected_message_ref_json",
-    ),
-    expiresAt: row.expires_at,
-    consumedAt: row.consumed_at,
-    consumedByPlatform: row.consumed_by_platform,
-    consumedByUserId: row.consumed_by_user_id,
-    createdAt: row.created_at,
-  });
-}
-
-function parseRequestTerminalReceipt(value: unknown): WorkflowRequestTerminalReceipt {
-  const row = requestTerminalReceiptRowSchema.parse(value);
-  return {
-    requestId: row.request_id,
-    runId: row.run_id,
-    operationId: row.operation_id,
-    dispatchEpoch: row.dispatch_epoch,
-    state: row.state,
-    detail: row.detail,
-    output:
-      row.output_json === null
-        ? null
-        : jsonValueSchema.parse(
-            parseJson(row.output_json, "workflow_request_terminal_receipts.output_json"),
-          ),
-    resultArtifactId: row.result_artifact_id,
-    usage:
-      row.usage_json === null
-        ? null
-        : workflowUsageSchema.parse(
-            parseJson(row.usage_json, "workflow_request_terminal_receipts.usage_json"),
-          ),
-    createdAt: row.created_at,
-  };
-}
-
-function parseActionOutboxEntry(value: unknown): WorkflowActionOutboxEntry {
-  const row = actionOutboxRowSchema.parse(value);
-  return {
-    outboxId: row.outbox_id,
-    actionId: row.action_id,
-    runId: row.run_id,
-    eventType: row.event_type,
-    payload: parseJson(row.payload_json, "workflow_action_outbox.payload_json"),
-    publishedAt: row.published_at,
-    projectedAt: row.projected_at,
-    attemptCount: row.attempt_count,
-    nextAttemptAt: row.next_attempt_at,
-    lastError: row.last_error,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function tolerantRows<T>(rows: readonly unknown[], parse: (row: unknown) => T): T[] {
-  return rows.flatMap((row) => {
-    try {
-      return [parse(row)];
-    } catch {
-      return [];
-    }
-  });
+function adaptWorkflowMigrationResultToStartupHost(
+  result: ResultType<void, WorkflowMigrationError>,
+): void {
+  if (result.status === "error") throw result.error;
 }
 
 function boundedLimit(limit: number | undefined): number {
@@ -523,6 +239,21 @@ export type CreateWorkflowInvocationResult =
       limit: number;
     };
 
+export class WorkflowInvocationInvalid extends TaggedError("WorkflowInvocationInvalid")<{
+  readonly message: string;
+}> {}
+
+export class WorkflowInvocationConflict extends TaggedError("WorkflowInvocationConflict")<{
+  readonly recordId: string;
+  readonly message: string;
+}> {}
+
+export type CreateWorkflowInvocationError =
+  | PersistedDataError
+  | DurableWorkflowSqliteDriverFailure
+  | WorkflowInvocationInvalid
+  | WorkflowInvocationConflict;
+
 export const DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS = 64;
 
 export type ApplyWorkflowSurfaceActionResult =
@@ -533,18 +264,20 @@ export type ApplyWorkflowSurfaceActionResult =
     }
   | { status: "not_found" | "unauthorized" | "expired" | "consumed" | "stale" };
 
-export type WorkflowRequestTerminalReceipt = {
-  requestId: string;
-  runId: string;
-  operationId: string;
-  dispatchEpoch: string;
-  state: "resolved" | "failed" | "cancelled";
-  detail: string | null;
-  output: WorkflowOperation["output"];
-  resultArtifactId: string | null;
-  usage: WorkflowOperation["usage"];
-  createdAt: number;
-};
+export class WorkflowSurfaceActionAtomicityConflict extends TaggedError(
+  "WorkflowSurfaceActionAtomicityConflict",
+)<{
+  readonly actionId: string;
+  readonly stage: "consume" | "load-updated-run" | "insert-run-event" | "insert-progress-event";
+  readonly message: string;
+}> {}
+
+export type ApplyWorkflowSurfaceActionError =
+  | PersistedDataError
+  | DurableWorkflowSqliteDriverFailure
+  | WorkflowSurfaceActionAtomicityConflict;
+
+export type WorkflowRequestTerminalReceipt = DecodedWorkflowRequestTerminalReceipt;
 
 export type WorkflowRequestDispatchHandoff =
   | { status: "receipt"; receipt: WorkflowRequestTerminalReceipt }
@@ -552,20 +285,7 @@ export type WorkflowRequestDispatchHandoff =
   | { status: "stale"; dispatchEpoch: string; policy: WorkflowRequestPolicy }
   | { status: "fresh" };
 
-export type WorkflowActionOutboxEntry = {
-  outboxId: string;
-  actionId: string;
-  runId: string;
-  eventType: string;
-  payload: unknown;
-  publishedAt: number | null;
-  projectedAt: number | null;
-  attemptCount: number;
-  nextAttemptAt: number | null;
-  lastError: string | null;
-  createdAt: number;
-  updatedAt: number;
-};
+export type WorkflowActionOutboxEntry = DecodedWorkflowActionOutboxEntry;
 
 export type OrphanedLiveParentRun = {
   run: WorkflowRun;
@@ -573,14 +293,25 @@ export type OrphanedLiveParentRun = {
   cancelled: boolean;
 };
 
+export type DurableWorkflowStoreOptions = {
+  readonly onPersistenceDiagnostic?: (diagnostic: WorkflowPersistenceDiagnostic) => void;
+  readonly testHooks?: {
+    readonly afterSurfaceActionStateChange?: () => void;
+  };
+};
+
 export class DurableWorkflowStore {
   private readonly db: Database;
+  private readonly options: DurableWorkflowStoreOptions;
+  private readonly pendingPersistenceDiagnostics: WorkflowPersistenceDiagnostic[] = [];
+  private persistenceDiagnosticFlushQueued = false;
 
-  constructor(dbPath?: string) {
+  constructor(dbPath?: string, options: DurableWorkflowStoreOptions = {}) {
+    this.options = options;
     this.db = new Database(dbPath ?? resolveWorkflowDbPath());
     configureSqliteConnection(this.db);
     this.db.run("PRAGMA foreign_keys = ON");
-    applyWorkflowSchemaMigrations(this.db);
+    adaptWorkflowMigrationResultToStartupHost(applyWorkflowSchemaMigrations(this.db));
     this.quarantineAndPauseLegacyResolvedReceipts(Date.now());
   }
 
@@ -588,8 +319,53 @@ export class DurableWorkflowStore {
     this.db.close();
   }
 
+  private persistedRows(sql: string) {
+    return this.db.query<WorkflowPersistedRow, SQLQueryBindings[]>(sql);
+  }
+
+  private queuePersistenceDiagnostic(error: PersistedDataError): void {
+    this.pendingPersistenceDiagnostics.push({
+      table: error.table,
+      field: error.field,
+      version: error.version,
+      issueCode: error.issueCode,
+      recordId: error.recordId.slice(0, 256),
+    });
+    if (this.persistenceDiagnosticFlushQueued) return;
+    this.persistenceDiagnosticFlushQueued = true;
+    queueMicrotask(() => {
+      this.persistenceDiagnosticFlushQueued = false;
+      for (const diagnostic of this.pendingPersistenceDiagnostics.splice(0)) {
+        this.options.onPersistenceDiagnostic?.(diagnostic);
+      }
+    });
+  }
+
+  private decodeRow<T>(
+    row: WorkflowPersistedRow,
+    decoder: WorkflowRowDecoder<T>,
+  ): ResultType<T, PersistedDataError> {
+    const decoded = decoder({ row, schemaVersion: WORKFLOW_SCHEMA_VERSION });
+    if (decoded.status === "ok") return Result.ok(decoded.value.value);
+    this.queuePersistenceDiagnostic(decoded.error);
+    return Result.err(decoded.error);
+  }
+
+  private decodeRows<T>(
+    rows: readonly WorkflowPersistedRow[],
+    decoder: WorkflowRowDecoder<T>,
+  ): ResultType<T[], PersistedDataError> {
+    const values: T[] = [];
+    for (const row of rows) {
+      const decoded = this.decodeRow(row, decoder);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      values.push(decoded.value);
+    }
+    return Result.ok(values);
+  }
+
   private quarantineAndPauseLegacyResolvedReceipts(now: number): void {
-    const quarantine = this.db.transaction(() => {
+    runWorkflowTransaction(this.db, "quarantine-legacy-receipts", () => {
       this.db.run(
         `INSERT OR IGNORE INTO workflow_request_terminal_receipt_quarantine (
            request_id, run_id, operation_id, dispatch_epoch, state, detail, created_at,
@@ -640,7 +416,6 @@ export class DurableWorkflowStore {
         [WORKFLOW_MANUAL_RECONCILIATION_DETAIL, now],
       );
     });
-    quarantine.immediate();
   }
 
   listMigrations(): WorkflowSchemaMigration[] {
@@ -692,45 +467,51 @@ export class DurableWorkflowStore {
     return result.changes === 1;
   }
 
-  getRevision(revisionId: string): WorkflowRevision | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_revisions WHERE revision_id = ?")
-      .get(revisionId);
-    return row === null ? null : parseRevision(row);
+  getRevision(revisionId: string): ResultType<WorkflowRevision | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-revision", () => {
+      const row = this.persistedRows("SELECT * FROM workflow_revisions WHERE revision_id = ?").get(
+        revisionId,
+      );
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowRevisionRow);
+    });
   }
 
-  findRevisionByIdentity(identityInput: WorkflowRevisionIdentity): WorkflowRevision | null {
-    const row = this.db
-      .query(
+  findRevisionByIdentity(
+    identityInput: WorkflowRevisionIdentity,
+  ): ResultType<WorkflowRevision | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("find-revision-by-identity", () => {
+      const row = this.persistedRows(
         `SELECT * FROM workflow_revisions WHERE
           canonical_project_id = ? AND canonical_workspace_root = ? AND scope = ? AND
           normalized_path = ? AND source_sha256 = ? AND input_schema_sha256 = ? AND
           capability_sha256 = ? AND runtime_version = ?`,
-      )
-      .get(...revisionIdentityValues(identityInput));
-    return row === null ? null : parseRevision(row);
+      ).get(...revisionIdentityValues(identityInput));
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowRevisionRow);
+    });
   }
 
   listRevisions(options?: {
     canonicalProjectId?: string;
     scope?: WorkflowRevision["scope"];
     limit?: number;
-  }): WorkflowRevision[] {
-    const clauses: string[] = [];
-    const bindings: string[] = [];
-    if (options?.canonicalProjectId) {
-      clauses.push("canonical_project_id = ?");
-      bindings.push(options.canonicalProjectId);
-    }
-    if (options?.scope) {
-      clauses.push("scope = ?");
-      bindings.push(options.scope);
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .query(`SELECT * FROM workflow_revisions ${where} ORDER BY created_at DESC LIMIT ?`)
-      .all(...bindings, boundedLimit(options?.limit));
-    return tolerantRows(rows, parseRevision);
+  }): ResultType<WorkflowRevision[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-revisions", () => {
+      const clauses: string[] = [];
+      const bindings: string[] = [];
+      if (options?.canonicalProjectId) {
+        clauses.push("canonical_project_id = ?");
+        bindings.push(options.canonicalProjectId);
+      }
+      if (options?.scope) {
+        clauses.push("scope = ?");
+        bindings.push(options.scope);
+      }
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = this.persistedRows(
+        `SELECT * FROM workflow_revisions ${where} ORDER BY created_at DESC LIMIT ?`,
+      ).all(...bindings, boundedLimit(options?.limit));
+      return this.decodeRows(rows, decodeWorkflowRevisionRow);
+    });
   }
 
   createRun(runInput: WorkflowRun): boolean {
@@ -775,9 +556,11 @@ export class DurableWorkflowStore {
     return result.changes >= 1;
   }
 
-  getRun(runId: string): WorkflowRun | null {
-    const row = this.db.query("SELECT * FROM workflow_runs WHERE run_id = ?").get(runId);
-    return row === null ? null : parseRun(row);
+  getRun(runId: string): ResultType<WorkflowRun | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-run", () => {
+      const row = this.persistedRows("SELECT * FROM workflow_runs WHERE run_id = ?").get(runId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowRunRow);
+    });
   }
 
   listRuns(options?: {
@@ -787,49 +570,49 @@ export class DurableWorkflowStore {
     originClient?: string;
     originUserId?: string;
     limit?: number;
-  }): WorkflowRun[] {
-    const clauses: string[] = [];
-    const bindings: string[] = [];
-    if (options?.revisionId) {
-      clauses.push("workflow_runs.revision_id = ?");
-      bindings.push(options.revisionId);
-    }
-    if (options?.state) {
-      clauses.push("workflow_runs.state = ?");
-      bindings.push(options.state);
-    }
-    if (options?.canonicalProjectId) {
-      clauses.push("workflow_revisions.canonical_project_id = ?");
-      bindings.push(options.canonicalProjectId);
-    }
-    if (options?.originClient) {
-      clauses.push("workflow_runs.origin_client = ?");
-      bindings.push(options.originClient);
-    }
-    if (options?.originUserId) {
-      clauses.push("workflow_runs.origin_user_id = ?");
-      bindings.push(options.originUserId);
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .query(
+  }): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-runs", () => {
+      const clauses: string[] = [];
+      const bindings: string[] = [];
+      if (options?.revisionId) {
+        clauses.push("workflow_runs.revision_id = ?");
+        bindings.push(options.revisionId);
+      }
+      if (options?.state) {
+        clauses.push("workflow_runs.state = ?");
+        bindings.push(options.state);
+      }
+      if (options?.canonicalProjectId) {
+        clauses.push("workflow_revisions.canonical_project_id = ?");
+        bindings.push(options.canonicalProjectId);
+      }
+      if (options?.originClient) {
+        clauses.push("workflow_runs.origin_client = ?");
+        bindings.push(options.originClient);
+      }
+      if (options?.originUserId) {
+        clauses.push("workflow_runs.origin_user_id = ?");
+        bindings.push(options.originUserId);
+      }
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = this.persistedRows(
         `SELECT workflow_runs.* FROM workflow_runs
          JOIN workflow_revisions ON workflow_revisions.revision_id = workflow_runs.revision_id
          ${where} ORDER BY workflow_runs.created_at DESC LIMIT ?`,
-      )
-      .all(...bindings, boundedLimit(options?.limit));
-    return tolerantRows(rows, parseRun);
+      ).all(...bindings, boundedLimit(options?.limit));
+      return this.decodeRows(rows, decodeWorkflowRunRow);
+    });
   }
 
-  listActiveRuns(limit = 1_000): WorkflowRun[] {
-    const rows = this.db
-      .query(
+  listActiveRuns(limit = 1_000): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-active-runs", () => {
+      const rows = this.persistedRows(
         `SELECT * FROM workflow_runs
          WHERE state NOT IN ('succeeded', 'failed', 'rejected', 'cancelled')
          ORDER BY updated_at, run_id LIMIT ?`,
-      )
-      .all(boundedLimit(limit));
-    return tolerantRows(rows, parseRun);
+      ).all(boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowRunRow);
+    });
   }
 
   countActiveRuns(): number {
@@ -842,9 +625,11 @@ export class DurableWorkflowStore {
     return row?.count ?? 0;
   }
 
-  listRunsNeedingProjectionReconciliation(limit = 1_000): WorkflowRun[] {
-    const rows = this.db
-      .query(
+  listRunsNeedingProjectionReconciliation(
+    limit = 1_000,
+  ): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-runs-needing-projection-reconciliation", () => {
+      const rows = this.persistedRows(
         `SELECT workflow_runs.* FROM workflow_runs
          LEFT JOIN workflow_surface_bindings
            ON workflow_surface_bindings.run_id = workflow_runs.run_id
@@ -858,9 +643,9 @@ export class DurableWorkflowStore {
              )
            )
          ORDER BY workflow_runs.updated_at, workflow_runs.run_id LIMIT ?`,
-      )
-      .all(boundedLimit(limit));
-    return tolerantRows(rows, parseRun);
+      ).all(boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowRunRow);
+    });
   }
 
   createInvocation(input: {
@@ -868,76 +653,126 @@ export class DurableWorkflowStore {
     run: WorkflowRun;
     idempotency?: { key: string; fingerprintSha256: string };
     maxActiveRuns?: number;
-  }): CreateWorkflowInvocationResult {
-    const revision = workflowRevisionSchema.parse(input.revision);
-    const requestedRun = workflowRunSchema.parse(input.run);
+  }): ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError> {
+    const revision = input.revision;
+    const requestedRun = input.run;
     if (requestedRun.revisionId !== revision.revisionId) {
-      throw new Error("Run revisionId must match the requested revision");
+      return Result.err(
+        new WorkflowInvocationInvalid({
+          message: "Run revisionId must match the requested revision",
+        }),
+      );
     }
     if (requestedRun.state !== "queued") {
-      throw new Error("Workflow invocations must be queued");
+      return Result.err(
+        new WorkflowInvocationInvalid({ message: "Workflow invocations must be queued" }),
+      );
     }
-    const maxActiveRuns = z
-      .number()
-      .int()
-      .positive()
-      .parse(input.maxActiveRuns ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS);
+    const maxActiveRuns = input.maxActiveRuns ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS;
+    if (!Number.isInteger(maxActiveRuns) || maxActiveRuns <= 0) {
+      return Result.err(
+        new WorkflowInvocationInvalid({ message: "Maximum active workflow runs must be positive" }),
+      );
+    }
 
-    const create = this.db.transaction((): CreateWorkflowInvocationResult => {
-      if (input.idempotency) {
-        const receipt = this.db
-          .query<{ run_id: string; fingerprint_sha256: string }, [string]>(
-            "SELECT run_id, fingerprint_sha256 FROM workflow_invocation_receipts WHERE idempotency_key = ?",
-          )
-          .get(input.idempotency.key);
-        if (receipt) {
-          if (receipt.fingerprint_sha256 !== input.idempotency.fingerprintSha256) {
-            throw new Error("Workflow idempotency key was reused with different invocation input");
+    return runBunSqliteTransaction(
+      this.db,
+      (): ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError> => {
+        if (input.idempotency) {
+          const receipt = this.db
+            .query<{ run_id: string; fingerprint_sha256: string }, [string]>(
+              "SELECT run_id, fingerprint_sha256 FROM workflow_invocation_receipts WHERE idempotency_key = ?",
+            )
+            .get(input.idempotency.key);
+          if (receipt) {
+            if (receipt.fingerprint_sha256 !== input.idempotency.fingerprintSha256) {
+              return Result.err(
+                new WorkflowInvocationConflict({
+                  recordId: input.idempotency.key,
+                  message: "Workflow idempotency key was reused with different invocation input",
+                }),
+              );
+            }
+            const existingRunResult = this.getRun(receipt.run_id);
+            if (existingRunResult.status === "error") return Result.err(existingRunResult.error);
+            const existingRun = existingRunResult.value;
+            const existingRevisionResult = existingRun
+              ? this.getRevision(existingRun.revisionId)
+              : Result.ok(null);
+            if (existingRevisionResult.status === "error") {
+              return Result.err(existingRevisionResult.error);
+            }
+            const existingRevision = existingRevisionResult.value;
+            if (!existingRun || !existingRevision) {
+              return Result.err(
+                new WorkflowInvocationConflict({
+                  recordId: input.idempotency.key,
+                  message: "Workflow invocation receipt references missing durable records",
+                }),
+              );
+            }
+            return Result.ok({
+              status: "accepted",
+              run: existingRun,
+              revision: existingRevision,
+              revisionCreated: false,
+            });
           }
-          const existingRun = this.getRun(receipt.run_id);
-          const existingRevision = existingRun ? this.getRevision(existingRun.revisionId) : null;
-          if (!existingRun || !existingRevision) {
-            throw new Error("Workflow invocation receipt references missing durable records");
-          }
-          return {
-            status: "accepted",
-            run: existingRun,
-            revision: existingRevision,
-            revisionCreated: false,
-          };
         }
-      }
-      const activeRuns = this.countActiveRuns();
-      if (activeRuns >= maxActiveRuns) {
-        return { status: "rejected_capacity", activeRuns, limit: maxActiveRuns };
-      }
-      const revisionCreated = this.createRevision(revision);
-      const storedRevision = this.findRevisionByIdentity(revision);
-      if (!storedRevision) throw new Error("Revision was not persisted");
-      if (storedRevision.revisionId !== revision.revisionId) {
-        throw new Error(
-          `Revision identity already belongs to ${storedRevision.revisionId}, not ${revision.revisionId}`,
-        );
-      }
+        const activeRuns = this.countActiveRuns();
+        if (activeRuns >= maxActiveRuns) {
+          return Result.ok({ status: "rejected_capacity", activeRuns, limit: maxActiveRuns });
+        }
+        const revisionCreated = this.createRevision(revision);
+        const storedRevisionResult = this.findRevisionByIdentity(revision);
+        if (storedRevisionResult.status === "error") return Result.err(storedRevisionResult.error);
+        const storedRevision = storedRevisionResult.value;
+        if (!storedRevision) {
+          return Result.err(
+            new WorkflowInvocationConflict({
+              recordId: revision.revisionId,
+              message: "Workflow revision was not persisted",
+            }),
+          );
+        }
+        if (storedRevision.revisionId !== revision.revisionId) {
+          return Result.err(
+            new WorkflowInvocationConflict({
+              recordId: revision.revisionId,
+              message: "Workflow revision identity already belongs to another revision",
+            }),
+          );
+        }
 
-      const run = requestedRun;
-      if (!this.createRun(run)) throw new Error(`Run ${run.runId} already exists`);
-      if (input.idempotency) {
-        this.db.run(
-          `INSERT INTO workflow_invocation_receipts (
+        const run = requestedRun;
+        if (!this.createRun(run)) {
+          return Result.err(
+            new WorkflowInvocationConflict({
+              recordId: run.runId,
+              message: "Workflow run already exists",
+            }),
+          );
+        }
+        if (input.idempotency) {
+          this.db.run(
+            `INSERT INTO workflow_invocation_receipts (
              idempotency_key, run_id, fingerprint_sha256, created_at
            ) VALUES (?, ?, ?, ?)`,
-          [input.idempotency.key, run.runId, input.idempotency.fingerprintSha256, run.createdAt],
-        );
-      }
-      return { status: "accepted", revision: storedRevision, run, revisionCreated };
-    });
-    return create.immediate();
+            [input.idempotency.key, run.runId, input.idempotency.fingerprintSha256, run.createdAt],
+          );
+        }
+        return Result.ok({ status: "accepted", revision: storedRevision, run, revisionCreated });
+      },
+      (cause) => classifyWorkflowSqliteDriverFailure("create-invocation", cause),
+    );
   }
 
-  listActiveLiveParentRuns(parentRequestId: string, limit = 1_000): WorkflowRun[] {
-    const rows = this.db
-      .query(
+  listActiveLiveParentRuns(
+    parentRequestId: string,
+    limit = 1_000,
+  ): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-active-live-parent-runs", () => {
+      const rows = this.persistedRows(
         `SELECT workflow_runs.* FROM workflow_runs
          JOIN workflow_completion_deliveries
            ON workflow_completion_deliveries.run_id = workflow_runs.run_id
@@ -945,9 +780,9 @@ export class DurableWorkflowStore {
            AND workflow_completion_deliveries.state = 'pending'
             AND workflow_runs.state NOT IN ('succeeded', 'failed', 'cancelled')
          ORDER BY workflow_runs.created_at, workflow_runs.run_id LIMIT ?`,
-      )
-      .all(parentRequestId, boundedLimit(limit));
-    return rows.map(parseRun);
+      ).all(parentRequestId, boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowRunRow);
+    });
   }
 
   getLiveParentDeliverySnapshot(
@@ -984,9 +819,9 @@ export class DurableWorkflowStore {
     parentRequestId: string,
     limit = 1_000,
     includeSynchronous = false,
-  ): WorkflowRun[] {
-    const rows = this.db
-      .query(
+  ): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-pending-live-parent-completions", () => {
+      const rows = this.persistedRows(
         `SELECT workflow_runs.* FROM workflow_runs
          JOIN workflow_completion_deliveries
            ON workflow_completion_deliveries.run_id = workflow_runs.run_id
@@ -997,9 +832,9 @@ export class DurableWorkflowStore {
             ) = 1)
              AND workflow_runs.state IN ('succeeded', 'failed', 'cancelled')
          ORDER BY workflow_runs.terminal_at, workflow_runs.created_at, workflow_runs.run_id LIMIT ?`,
-      )
-      .all(parentRequestId, includeSynchronous ? 1 : 0, boundedLimit(limit));
-    return rows.map(parseRun);
+      ).all(parentRequestId, includeSynchronous ? 1 : 0, boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowRunRow);
+    });
   }
 
   getLiveParentDeliveryState(
@@ -1019,17 +854,18 @@ export class DurableWorkflowStore {
     now: number;
     detail: string;
   }): OrphanedLiveParentRun[] {
-    const reconcile = this.db.transaction(() => {
-      const pendingRows = this.db
-        .query(
-          `SELECT workflow_runs.* FROM workflow_runs
+    return runWorkflowTransaction(this.db, "reconcile-orphaned-live-parent-runs", () => {
+      const pendingRows = this.persistedRows(
+        `SELECT workflow_runs.* FROM workflow_runs
            JOIN workflow_completion_deliveries
              ON workflow_completion_deliveries.run_id = workflow_runs.run_id
            WHERE workflow_completion_deliveries.state = 'pending'
            ORDER BY workflow_runs.created_at, workflow_runs.run_id`,
-        )
-        .all();
-      const pendingRuns = pendingRows.map(parseRun);
+      ).all();
+      const pendingRunsResult = this.decodeRows(pendingRows, decodeWorkflowRunRow);
+      if (pendingRunsResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(pendingRunsResult.error);
+      const pendingRuns = pendingRunsResult.value;
       const resolvableRequestIds = new Set(input.resolvableParentRequestIds);
       const retainedRunIds = new Set<string>();
 
@@ -1122,13 +958,15 @@ export class DurableWorkflowStore {
           )
           .run(input.now, input.now, run.runId);
         if (delivery.changes !== 1) continue;
-        const updated = this.getRun(run.runId);
+        const updatedResult = this.getRun(run.runId);
+        if (updatedResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(updatedResult.error);
+        const updated = updatedResult.value;
         if (!updated) throw new Error(`Orphaned workflow run disappeared: ${run.runId}`);
         orphaned.push({ run: updated, previousState: run.state, cancelled: !terminal });
       }
       return orphaned;
     });
-    return reconcile.immediate();
   }
 
   markLiveParentCompletionDelivered(runId: string, now: number): boolean {
@@ -1148,7 +986,7 @@ export class DurableWorkflowStore {
     error: string;
     now: number;
   }): number | null {
-    const record = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "record-live-parent-materialization-failure", () => {
       const updated = this.db
         .query(
           `UPDATE workflow_completion_deliveries
@@ -1166,7 +1004,6 @@ export class DurableWorkflowStore {
         .get(input.runId);
       return materializationAttemptRowSchema.parse(raw).materialization_attempt_count;
     });
-    return record.immediate();
   }
 
   clearLiveParentCompletionMaterializationFailure(runId: string, now: number): boolean {
@@ -1194,13 +1031,18 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowRun(input.from, input.to)) {
       throw new Error(`Illegal workflow run transition: ${input.from} -> ${input.to}`);
     }
-    const current = this.getRun(input.runId);
+    const currentResult = this.getRun(input.runId);
+    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
+    const current = currentResult.value;
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
     if (input.from === "paused" && input.to === "queued") {
-      const resume = this.db.transaction(() => {
-        const paused = this.getRun(input.runId);
+      return runWorkflowTransaction(this.db, "resume-run", () => {
+        const pausedResult = this.getRun(input.runId);
+        if (pausedResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(pausedResult.error);
+        const paused = pausedResult.value;
         if (!paused || paused.state !== "paused") return false;
         if (!this.preparePausedOperationsForResume(input.runId, input.now)) return false;
         return (
@@ -1212,7 +1054,6 @@ export class DurableWorkflowStore {
             .run(input.detail ?? paused.terminalDetail, input.now, input.runId).changes === 1
         );
       });
-      return resume.immediate();
     }
     const terminal = ["succeeded", "failed", "rejected", "cancelled"].includes(input.to);
     let resultJson: string | null;
@@ -1256,8 +1097,10 @@ export class DurableWorkflowStore {
     result: WorkflowRun["result"];
     resultArtifactId: string | null;
   }): boolean {
-    const terminalize = this.db.transaction(() => {
-      const run = this.getRun(input.runId);
+    return runWorkflowTransaction(this.db, "terminalize-run", () => {
+      const runResult = this.getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run || run.state !== input.from || run.claimedBy !== input.ownerId) return false;
       const activeCount = this.db
         .query<{ count: number }, [string]>(
@@ -1302,12 +1145,12 @@ export class DurableWorkflowStore {
         );
       return result.changes === 1;
     });
-    return terminalize.immediate();
   }
 
   cancelRunAndChildren(input: { runId: string; now: number; detail: string }): WorkflowRun | null {
-    const cancel = this.db.transaction(() => this.cancelRunAndChildrenInTransaction(input));
-    return cancel.immediate();
+    return runWorkflowTransaction(this.db, "cancel-run-and-children", () =>
+      this.cancelRunAndChildrenInTransaction(input),
+    );
   }
 
   cancelLiveParentRunsAndSuppress(input: {
@@ -1315,19 +1158,19 @@ export class DurableWorkflowStore {
     now: number;
     detail: string;
   }): OrphanedLiveParentRun[] {
-    const cancel = this.db.transaction(() => {
-      const rows = this.db
-        .query(
-          `SELECT workflow_runs.* FROM workflow_runs
+    return runWorkflowTransaction(this.db, "cancel-live-parent-runs", () => {
+      const rows = this.persistedRows(
+        `SELECT workflow_runs.* FROM workflow_runs
            JOIN workflow_completion_deliveries
              ON workflow_completion_deliveries.run_id = workflow_runs.run_id
            WHERE workflow_completion_deliveries.parent_request_id = ?
              AND workflow_completion_deliveries.state = 'pending'
              AND workflow_runs.state NOT IN ('succeeded', 'failed', 'cancelled')
            ORDER BY workflow_runs.created_at, workflow_runs.run_id`,
-        )
-        .all(input.parentRequestId);
-      const runs = rows.map(parseRun);
+      ).all(input.parentRequestId);
+      const runsResult = this.decodeRows(rows, decodeWorkflowRunRow);
+      if (runsResult.status === "error") signalDurableWorkflowReadErrorToHost(runsResult.error);
+      const runs = runsResult.value;
       const cancelled: OrphanedLiveParentRun[] = [];
       for (const run of runs) {
         const updated = this.cancelRunAndChildrenInTransaction({
@@ -1347,7 +1190,6 @@ export class DurableWorkflowStore {
       );
       return cancelled;
     });
-    return cancel.immediate();
   }
 
   private cancelRunAndChildrenInTransaction(input: {
@@ -1355,7 +1197,9 @@ export class DurableWorkflowStore {
     now: number;
     detail: string;
   }): WorkflowRun | null {
-    const run = this.getRun(input.runId);
+    const runResult = this.getRun(input.runId);
+    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+    const run = runResult.value;
     if (!run || ["succeeded", "failed", "cancelled"].includes(run.state)) return run;
     this.db.run(
       `UPDATE workflow_operations SET state = 'cancelled', error = ?, terminal_at = ?,
@@ -1381,12 +1225,17 @@ export class DurableWorkflowStore {
          WHERE run_id = ? AND state = ?`,
       )
       .run(input.detail, input.now, input.now, input.runId, run.state);
-    return changed.changes === 1 ? this.getRun(input.runId) : null;
+    if (changed.changes !== 1) return null;
+    const updated = this.getRun(input.runId);
+    if (updated.status === "error") signalDurableWorkflowReadErrorToHost(updated.error);
+    return updated.value;
   }
 
   pauseRunAndChildren(input: { runId: string; now: number; detail: string }): WorkflowRun | null {
-    const pause = this.db.transaction(() => {
-      const run = this.getRun(input.runId);
+    return runWorkflowTransaction(this.db, "pause-run-and-children", () => {
+      const runResult = this.getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run || !["queued", "running", "blocked"].includes(run.state)) return run;
       this.prepareOperationsForPause(input.runId, input.now, input.detail);
       const changed = this.db
@@ -1395,9 +1244,11 @@ export class DurableWorkflowStore {
            claimed_at = NULL, updated_at = ? WHERE run_id = ? AND state = ?`,
         )
         .run(input.detail, input.now, input.runId, run.state);
-      return changed.changes === 1 ? this.getRun(input.runId) : null;
+      if (changed.changes !== 1) return null;
+      const updated = this.getRun(input.runId);
+      if (updated.status === "error") signalDurableWorkflowReadErrorToHost(updated.error);
+      return updated.value;
     });
-    return pause.immediate();
   }
 
   private prepareOperationsForPause(runId: string, now: number, detail: string): void {
@@ -1522,7 +1373,7 @@ export class DurableWorkflowStore {
     runOwnerId: string;
     now: number;
   }): boolean {
-    const block = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "block-ambiguous-paused-operation", () => {
       const changed = this.db
         .query(
           `UPDATE workflow_operations SET state = 'blocked', error = ?,
@@ -1558,7 +1409,6 @@ export class DurableWorkflowStore {
       );
       return true;
     });
-    return block.immediate();
   }
 
   blockAmbiguousTerminalLifecycleOperation(input: {
@@ -1568,7 +1418,7 @@ export class DurableWorkflowStore {
     runOwnerId: string;
     now: number;
   }): boolean {
-    const block = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "block-ambiguous-terminal-operation", () => {
       const changed = this.db
         .query(
           `UPDATE workflow_operations SET state = 'blocked', error = ?,
@@ -1599,7 +1449,6 @@ export class DurableWorkflowStore {
         .run(WORKFLOW_MANUAL_RECONCILIATION_DETAIL, input.now, input.runId, input.runOwnerId);
       return paused.changes === 1;
     });
-    return block.immediate();
   }
 
   getManualReconciliationDetail(runId: string): string | null {
@@ -1636,7 +1485,10 @@ export class DurableWorkflowStore {
          )`,
       )
       .run(input.claimerId, input.now, input.now, input.now, input.runId, staleBefore);
-    return result.changes === 1 ? this.getRun(input.runId) : null;
+    if (result.changes !== 1) return null;
+    const claimed = this.getRun(input.runId);
+    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
+    return claimed.value;
   }
 
   refreshRunClaim(runId: string, claimerId: string, now: number): boolean {
@@ -1695,18 +1547,27 @@ export class DurableWorkflowStore {
     return result.changes === 1;
   }
 
-  getOperation(runId: string, operationId: string): WorkflowOperation | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_operations WHERE run_id = ? AND operation_id = ?")
-      .get(runId, operationId);
-    return row === null ? null : parseOperation(row);
+  getOperation(
+    runId: string,
+    operationId: string,
+  ): ResultType<WorkflowOperation | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-operation", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_operations WHERE run_id = ? AND operation_id = ?",
+      ).get(runId, operationId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowOperationRow);
+    });
   }
 
-  getOperationByRequestId(requestId: string): WorkflowOperation | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_operations WHERE request_id = ?")
-      .get(requestId);
-    return row === null ? null : parseOperation(row);
+  getOperationByRequestId(
+    requestId: string,
+  ): ResultType<WorkflowOperation | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-operation-by-request-id", () => {
+      const row = this.persistedRows("SELECT * FROM workflow_operations WHERE request_id = ?").get(
+        requestId,
+      );
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowOperationRow);
+    });
   }
 
   private matchesWorkflowRequestPolicyIdentity(input: {
@@ -1767,7 +1628,7 @@ export class DurableWorkflowStore {
     ) {
       return null;
     }
-    const authorize = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "authorize-agent-dispatch", () => {
       const quarantined = this.db
         .query(
           `SELECT 1 FROM workflow_request_terminal_receipt_quarantine
@@ -1784,8 +1645,13 @@ export class DurableWorkflowStore {
         )
         .get(input.requestId, input.runId, input.operationId, policy.dispatchEpoch);
       if (terminalReceipt) return null;
-      const run = this.getRun(input.runId);
-      const operation = this.getOperation(input.runId, input.operationId);
+      const runResult = this.getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const operationResult = this.getOperation(input.runId, input.operationId);
+      if (operationResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(operationResult.error);
+      const run = runResult.value;
+      const operation = operationResult.value;
       if (
         !run ||
         !operation ||
@@ -1800,27 +1666,28 @@ export class DurableWorkflowStore {
       ) {
         return null;
       }
-      const existing = this.db
-        .query<z.infer<typeof requestDispatchRowSchema>, [string]>(
-          "SELECT * FROM workflow_request_dispatches WHERE request_id = ?",
-        )
-        .get(input.requestId);
+      const existingRow = this.persistedRows(
+        "SELECT * FROM workflow_request_dispatches WHERE request_id = ?",
+      ).get(input.requestId);
+      const existingResult =
+        existingRow === null
+          ? Result.ok(null)
+          : this.decodeRow(existingRow, decodeWorkflowRequestDispatchRow);
+      if (existingResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(existingResult.error);
+      const existing = existingResult.value;
       if (
         existing &&
-        existing.active === 1 &&
-        existing.owner_heartbeat_at !== null &&
-        existing.owner_heartbeat_at > input.staleOwnerBefore
+        existing.active &&
+        existing.ownerHeartbeatAt !== null &&
+        existing.ownerHeartbeatAt > input.staleOwnerBefore
       ) {
         return null;
       }
       if (existing) {
-        const existingPolicy = workflowRequestPolicySchema.safeParse(
-          parseJson(existing.policy_json, "workflow_request_dispatches.policy_json"),
-        );
         if (
-          !existingPolicy.success ||
           canonicalJson(
-            workflowRequestPolicyIdentityProjection(existingPolicy.data).resolvedModelRequest,
+            workflowRequestPolicyIdentityProjection(existing.policy).resolvedModelRequest,
           ) !== canonicalJson(workflowRequestPolicyIdentityProjection(policy).resolvedModelRequest)
         ) {
           return null;
@@ -1859,9 +1726,11 @@ export class DurableWorkflowStore {
           input.now,
         ],
       );
-      return this.getOperation(input.runId, input.operationId);
+      const updatedOperation = this.getOperation(input.runId, input.operationId);
+      if (updatedOperation.status === "error")
+        signalDurableWorkflowReadErrorToHost(updatedOperation.error);
+      return updatedOperation.value;
     });
-    return authorize.immediate();
   }
 
   authorizeWorkflowRequest(input: {
@@ -1869,9 +1738,11 @@ export class DurableWorkflowStore {
     sessionId: string;
     platform: string;
   }): AuthorizedWorkflowRequest | null {
-    const authorize = this.db.transaction((): AuthorizedWorkflowRequest | null => {
-      const raw = this.db
-        .query<z.infer<typeof requestDispatchRowSchema>, [string, string, string]>(
+    return runWorkflowTransaction(
+      this.db,
+      "authorize-workflow-request",
+      (): AuthorizedWorkflowRequest | null => {
+        const raw = this.persistedRows(
           `SELECT * FROM workflow_request_dispatches
           WHERE request_id = ? AND session_id = ? AND platform = ?
              AND active = 1
@@ -1883,37 +1754,42 @@ export class DurableWorkflowStore {
                 AND receipt.dispatch_epoch = workflow_request_dispatches.dispatch_epoch
               )
             )`,
-        )
-        .get(input.requestId, input.sessionId, input.platform);
-      if (!raw) return null;
-      const row = requestDispatchRowSchema.parse(raw);
-      const run = this.getRun(row.run_id);
-      if (!run) return null;
-      const rawPolicy = parseJson(row.policy_json, "workflow_request_dispatches.policy_json");
-      const policy = workflowRequestPolicySchema.parse(rawPolicy);
-      const operation = this.getOperation(row.run_id, row.operation_id);
-      if (
-        !operation ||
-        run.state !== "running" ||
-        operation.requestId !== input.requestId ||
-        !["dispatched", "running"].includes(operation.state) ||
-        row.dispatch_epoch !== policy.dispatchEpoch ||
-        !this.matchesWorkflowRequestPolicyIdentity({
+        ).get(input.requestId, input.sessionId, input.platform);
+        if (!raw) return null;
+        const rowResult = this.decodeRow(raw, decodeWorkflowRequestDispatchRow);
+        if (rowResult.status === "error") signalDurableWorkflowReadErrorToHost(rowResult.error);
+        const row = rowResult.value;
+        const runResult = this.getRun(row.runId);
+        if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+        const run = runResult.value;
+        if (!run) return null;
+        const policy = row.policy;
+        const operationResult = this.getOperation(row.runId, row.operationId);
+        if (operationResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(operationResult.error);
+        const operation = operationResult.value;
+        if (
+          !operation ||
+          run.state !== "running" ||
+          operation.requestId !== input.requestId ||
+          !["dispatched", "running"].includes(operation.state) ||
+          row.dispatchEpoch !== policy.dispatchEpoch ||
+          !this.matchesWorkflowRequestPolicyIdentity({
+            policy,
+            run,
+            operation,
+          })
+        ) {
+          return null;
+        }
+        return {
+          requestId: row.requestId,
+          sessionId: row.sessionId,
+          platform: row.platform,
           policy,
-          run,
-          operation,
-        })
-      ) {
-        return null;
-      }
-      return {
-        requestId: row.request_id,
-        sessionId: row.session_id,
-        platform: row.platform,
-        policy,
-      };
-    });
-    return authorize.immediate();
+        };
+      },
+    );
   }
 
   recordWorkflowRequestTerminal(input: {
@@ -1932,7 +1808,7 @@ export class DurableWorkflowStore {
     const output = input.output === undefined ? null : jsonValueSchema.parse(input.output);
     const usage = input.usage === undefined ? null : workflowUsageSchema.parse(input.usage);
     if (input.state === "resolved" && output === null && !input.resultArtifactId) return false;
-    const record = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "record-workflow-request-terminal", () => {
       const inserted = this.db
         .query(
           `INSERT INTO workflow_request_terminal_receipts (
@@ -1987,27 +1863,33 @@ export class DurableWorkflowStore {
       }
       return true;
     });
-    return record.immediate();
   }
 
-  getWorkflowRequestTerminalReceipt(requestId: string): WorkflowRequestTerminalReceipt | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_request_terminal_receipts WHERE request_id = ?")
-      .get(requestId);
-    return row === null ? null : parseRequestTerminalReceipt(row);
+  getWorkflowRequestTerminalReceipt(
+    requestId: string,
+  ): ResultType<WorkflowRequestTerminalReceipt | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-workflow-request-terminal-receipt", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_request_terminal_receipts WHERE request_id = ?",
+      ).get(requestId);
+      return row === null
+        ? Result.ok(null)
+        : this.decodeRow(row, decodeWorkflowRequestTerminalReceiptRow);
+    });
   }
 
-  getWorkflowRequestDispatchPolicy(requestId: string): WorkflowRequestPolicy | null {
-    const row = this.db
-      .query<{ policy_json: string }, [string]>(
-        "SELECT policy_json FROM workflow_request_dispatches WHERE request_id = ?",
-      )
-      .get(requestId);
-    if (!row) return null;
-    const parsed = workflowRequestPolicySchema.safeParse(
-      parseJson(row.policy_json, "workflow_request_dispatches.policy_json"),
-    );
-    return parsed.success ? parsed.data : null;
+  getWorkflowRequestDispatchPolicy(
+    requestId: string,
+  ): ResultType<WorkflowRequestPolicy | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-workflow-request-dispatch-policy", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_request_dispatches WHERE request_id = ?",
+      ).get(requestId);
+      if (!row) return Result.ok(null);
+      const decoded = this.decodeRow(row, decodeWorkflowRequestDispatchRow);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      return Result.ok(decoded.value.policy);
+    });
   }
 
   getWorkflowRequestDispatchHandoff(input: {
@@ -2015,62 +1897,65 @@ export class DurableWorkflowStore {
     now: number;
     staleAfterMs?: number;
   }): WorkflowRequestDispatchHandoff {
-    const inspect = this.db.transaction(() => {
-      const receipt = this.db
-        .query("SELECT * FROM workflow_request_terminal_receipts WHERE request_id = ?")
-        .get(input.requestId);
-      if (receipt !== null) {
-        return { status: "receipt" as const, receipt: parseRequestTerminalReceipt(receipt) };
-      }
-      const staleBefore = input.now - (input.staleAfterMs ?? 60_000);
-      const dispatch = this.db
-        .query<
-          {
-            dispatch_epoch: string;
-            policy_json: string;
-            run_id: string;
-            operation_id: string;
-            owner_id: string | null;
-            owner_heartbeat_at: number | null;
-          },
-          [string]
-        >(
-          `SELECT dispatch_epoch, policy_json, run_id, operation_id, owner_id,
-             owner_heartbeat_at FROM workflow_request_dispatches
-           WHERE request_id = ? AND active = 1`,
-        )
-        .get(input.requestId);
-      if (!dispatch) return { status: "fresh" as const };
-      const policy = workflowRequestPolicySchema.parse(
-        parseJson(dispatch.policy_json, "workflow_request_dispatches.policy_json"),
-      );
-      const run = this.getRun(dispatch.run_id);
-      const operation = this.getOperation(dispatch.run_id, dispatch.operation_id);
-      if (
-        dispatch.dispatch_epoch !== policy.dispatchEpoch ||
-        run?.state !== "running" ||
-        !operation ||
-        !["dispatched", "running"].includes(operation.state) ||
-        !this.matchesWorkflowRequestPolicyIdentity({
+    return runWorkflowTransaction<WorkflowRequestDispatchHandoff>(
+      this.db,
+      "get-workflow-request-dispatch-handoff",
+      () => {
+        const receipt = this.persistedRows(
+          "SELECT * FROM workflow_request_terminal_receipts WHERE request_id = ?",
+        ).get(input.requestId);
+        if (receipt !== null) {
+          return {
+            status: "receipt",
+            receipt: (() => {
+              const decoded = this.decodeRow(receipt, decodeWorkflowRequestTerminalReceiptRow);
+              if (decoded.status === "error") signalDurableWorkflowReadErrorToHost(decoded.error);
+              return decoded.value;
+            })(),
+          };
+        }
+        const staleBefore = input.now - (input.staleAfterMs ?? 60_000);
+        const dispatchRow = this.persistedRows(
+          "SELECT * FROM workflow_request_dispatches WHERE request_id = ? AND active = 1",
+        ).get(input.requestId);
+        if (!dispatchRow) return { status: "fresh" };
+        const dispatchResult = this.decodeRow(dispatchRow, decodeWorkflowRequestDispatchRow);
+        if (dispatchResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(dispatchResult.error);
+        const dispatch = dispatchResult.value;
+        const policy = dispatch.policy;
+        const runResult = this.getRun(dispatch.runId);
+        if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+        const operationResult = this.getOperation(dispatch.runId, dispatch.operationId);
+        if (operationResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(operationResult.error);
+        const run = runResult.value;
+        const operation = operationResult.value;
+        if (
+          dispatch.dispatchEpoch !== policy.dispatchEpoch ||
+          run?.state !== "running" ||
+          !operation ||
+          !["dispatched", "running"].includes(operation.state) ||
+          !this.matchesWorkflowRequestPolicyIdentity({
+            policy,
+            run,
+            operation,
+          })
+        ) {
+          throw new Error("Live workflow dispatch has an invalid durable policy identity");
+        }
+        return {
+          status:
+            dispatch.ownerId !== null &&
+            dispatch.ownerHeartbeatAt !== null &&
+            dispatch.ownerHeartbeatAt > staleBefore
+              ? "live"
+              : "stale",
+          dispatchEpoch: dispatch.dispatchEpoch,
           policy,
-          run,
-          operation,
-        })
-      ) {
-        throw new Error("Live workflow dispatch has an invalid durable policy identity");
-      }
-      return {
-        status:
-          dispatch.owner_id !== null &&
-          dispatch.owner_heartbeat_at !== null &&
-          dispatch.owner_heartbeat_at > staleBefore
-            ? ("live" as const)
-            : ("stale" as const),
-        dispatchEpoch: dispatch.dispatch_epoch,
-        policy,
-      };
-    });
-    return inspect.immediate();
+        };
+      },
+    );
   }
 
   claimWorkflowRequestPromptPublication(input: {
@@ -2211,42 +2096,43 @@ export class DurableWorkflowStore {
   listOperations(
     runId: string,
     options?: { state?: WorkflowOperationState; limit?: number },
-  ): WorkflowOperation[] {
-    const rows = options?.state
-      ? this.db
-          .query(
+  ): ResultType<WorkflowOperation[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-operations", () => {
+      const rows = options?.state
+        ? this.persistedRows(
             "SELECT * FROM workflow_operations WHERE run_id = ? AND state = ? ORDER BY created_at LIMIT ?",
-          )
-          .all(runId, options.state, boundedLimit(options.limit))
-      : this.db
-          .query("SELECT * FROM workflow_operations WHERE run_id = ? ORDER BY created_at LIMIT ?")
-          .all(runId, boundedLimit(options?.limit));
-    return tolerantRows(rows, parseOperation);
+          ).all(runId, options.state, boundedLimit(options.limit))
+        : this.persistedRows(
+            "SELECT * FROM workflow_operations WHERE run_id = ? ORDER BY created_at LIMIT ?",
+          ).all(runId, boundedLimit(options?.limit));
+      return this.decodeRows(rows, decodeWorkflowOperationRow);
+    });
   }
 
   summarizeMeaningfulOperations(runId: string): WorkflowOperationProgressSummary[] {
-    const rows = this.db
-      .query(
-        `SELECT phase, kind, state, COUNT(*) AS count,
+    const rows = this.persistedRows(
+      `SELECT phase, kind, state, COUNT(*) AS count,
            SUM(CASE WHEN started_at IS NOT NULL THEN 1 ELSE 0 END) AS startedCount
          FROM workflow_operations
          WHERE run_id = ? AND kind IN ('agent', 'wait')
          GROUP BY phase, kind, state
          ORDER BY MIN(created_at), phase, kind, state`,
-      )
-      .all(runId);
-    return tolerantRows(rows, (row) => workflowOperationProgressSummarySchema.parse(row));
+    ).all(runId);
+    return rows.map((row) => workflowOperationProgressSummarySchema.parse(row));
   }
 
-  listRecentMeaningfulOperations(runId: string, limit = 5): WorkflowOperation[] {
-    const rows = this.db
-      .query(
+  listRecentMeaningfulOperations(
+    runId: string,
+    limit = 5,
+  ): ResultType<WorkflowOperation[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-recent-meaningful-operations", () => {
+      const rows = this.persistedRows(
         `SELECT * FROM workflow_operations
          WHERE run_id = ? AND kind IN ('agent', 'wait')
          ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
-      )
-      .all(runId, boundedLimit(limit));
-    return tolerantRows(rows, parseOperation);
+      ).all(runId, boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowOperationRow);
+    });
   }
 
   countOperations(runId: string, kind?: WorkflowOperation["kind"]): number {
@@ -2280,7 +2166,9 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowOperation(input.from, input.to)) {
       throw new Error(`Illegal workflow operation transition: ${input.from} -> ${input.to}`);
     }
-    const current = this.getOperation(input.runId, input.operationId);
+    const currentResult = this.getOperation(input.runId, input.operationId);
+    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
+    const current = currentResult.value;
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
@@ -2347,8 +2235,11 @@ export class DurableWorkflowStore {
     usage?: WorkflowOperation["usage"];
     runOwnerId: string;
   }): boolean {
-    const terminalize = this.db.transaction(() => {
-      const current = this.getOperation(input.runId, input.operationId);
+    return runWorkflowTransaction(this.db, "terminalize-operation-and-expire-request", () => {
+      const currentResult = this.getOperation(input.runId, input.operationId);
+      if (currentResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(currentResult.error);
+      const current = currentResult.value;
       if (!current || current.state !== input.from) return false;
       const changed = this.transitionOperation(input);
       if (!changed) return false;
@@ -2360,7 +2251,6 @@ export class DurableWorkflowStore {
         .run(input.now, input.requestId, input.runId, input.operationId);
       return true;
     });
-    return terminalize.immediate();
   }
 
   tryClaimOperation(input: {
@@ -2395,7 +2285,10 @@ export class DurableWorkflowStore {
         staleBefore,
         input.runOwnerId,
       );
-    return result.changes === 1 ? this.getOperation(input.runId, input.operationId) : null;
+    if (result.changes !== 1) return null;
+    const claimed = this.getOperation(input.runId, input.operationId);
+    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
+    return claimed.value;
   }
 
   createWait(waitInput: WorkflowWait, runOwnerId: string): boolean {
@@ -2436,11 +2329,16 @@ export class DurableWorkflowStore {
     return result.changes === 1;
   }
 
-  getWait(runId: string, operationId: string): WorkflowWait | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_waits WHERE run_id = ? AND operation_id = ?")
-      .get(runId, operationId);
-    return row === null ? null : parseWait(row);
+  getWait(
+    runId: string,
+    operationId: string,
+  ): ResultType<WorkflowWait | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-wait", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_waits WHERE run_id = ? AND operation_id = ?",
+      ).get(runId, operationId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowWaitRow);
+    });
   }
 
   listWaits(options: {
@@ -2450,56 +2348,58 @@ export class DurableWorkflowStore {
     matchKey?: string;
     dueBefore?: number;
     limit?: number;
-  }): WorkflowWait[] {
-    const clauses: string[] = [];
-    const bindings: Array<string | number> = [];
-    if (options.runId) {
-      clauses.push("run_id = ?");
-      bindings.push(options.runId);
-    }
-    if (options.state) {
-      clauses.push("state = ?");
-      bindings.push(options.state);
-    }
-    if (options.matchKind) {
-      clauses.push("match_kind = ?");
-      bindings.push(options.matchKind);
-    }
-    if (options.matchKey) {
-      clauses.push("match_key = ?");
-      bindings.push(options.matchKey);
-    }
-    if (options.dueBefore !== undefined) {
-      clauses.push("due_at IS NOT NULL AND due_at <= ?");
-      bindings.push(options.dueBefore);
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .query(`SELECT * FROM workflow_waits ${where} ORDER BY updated_at LIMIT ?`)
-      .all(...bindings, boundedLimit(options.limit));
-    return tolerantRows(rows, parseWait);
+  }): ResultType<WorkflowWait[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-waits", () => {
+      const clauses: string[] = [];
+      const bindings: Array<string | number> = [];
+      if (options.runId) {
+        clauses.push("run_id = ?");
+        bindings.push(options.runId);
+      }
+      if (options.state) {
+        clauses.push("state = ?");
+        bindings.push(options.state);
+      }
+      if (options.matchKind) {
+        clauses.push("match_kind = ?");
+        bindings.push(options.matchKind);
+      }
+      if (options.matchKey) {
+        clauses.push("match_key = ?");
+        bindings.push(options.matchKey);
+      }
+      if (options.dueBefore !== undefined) {
+        clauses.push("due_at IS NOT NULL AND due_at <= ?");
+        bindings.push(options.dueBefore);
+      }
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = this.persistedRows(
+        `SELECT * FROM workflow_waits ${where} ORDER BY updated_at LIMIT ?`,
+      ).all(...bindings, boundedLimit(options.limit));
+      return this.decodeRows(rows, decodeWorkflowWaitRow);
+    });
   }
 
   listActiveWaitsByMatchKey(
     matchKind: WorkflowWait["match"]["kind"],
     matchKey: string,
-  ): WorkflowWait[] {
-    const rows = this.db
-      .query(
+  ): ResultType<WorkflowWait[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-active-waits-by-match-key", () => {
+      const rows = this.persistedRows(
         `SELECT workflow_waits.* FROM workflow_waits
          JOIN workflow_runs ON workflow_runs.run_id = workflow_waits.run_id
          WHERE match_kind = ? AND match_key = ? AND workflow_waits.state IN ('pending', 'claimed')
            AND workflow_runs.state = 'running'
          ORDER BY workflow_waits.created_at, workflow_waits.run_id,
            workflow_waits.operation_id LIMIT 1000`,
-      )
-      .all(matchKind, matchKey);
-    return tolerantRows(rows, parseWait);
+      ).all(matchKind, matchKey);
+      return this.decodeRows(rows, decodeWorkflowWaitRow);
+    });
   }
 
-  listDueWaits(now: number): WorkflowWait[] {
-    const rows = this.db
-      .query(
+  listDueWaits(now: number): ResultType<WorkflowWait[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-due-waits", () => {
+      const rows = this.persistedRows(
         `SELECT workflow_waits.* FROM workflow_waits
          JOIN workflow_runs ON workflow_runs.run_id = workflow_waits.run_id
          WHERE workflow_waits.state IN ('pending', 'claimed')
@@ -2508,9 +2408,9 @@ export class DurableWorkflowStore {
            (deadline_at IS NOT NULL AND deadline_at <= ?)
           ) ORDER BY COALESCE(workflow_waits.due_at, workflow_waits.deadline_at),
             workflow_waits.created_at LIMIT 1000`,
-      )
-      .all(now, now);
-    return tolerantRows(rows, parseWait);
+      ).all(now, now);
+      return this.decodeRows(rows, decodeWorkflowWaitRow);
+    });
   }
 
   claimWorkflowWaitResolverLease(input: {
@@ -2549,7 +2449,7 @@ export class DurableWorkflowStore {
     cursor: string;
     now: number;
   }): boolean {
-    const advance = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "advance-wait-resolver-checkpoint", () => {
       const lease = this.db
         .query<{ owner_id: string }, []>(
           "SELECT owner_id FROM workflow_wait_resolver_lease WHERE singleton = 1",
@@ -2566,7 +2466,6 @@ export class DurableWorkflowStore {
       );
       return true;
     });
-    return advance.immediate();
   }
 
   refreshWorkflowWaitResolverLease(ownerId: string, now: number): boolean {
@@ -2604,7 +2503,7 @@ export class DurableWorkflowStore {
     now: number;
     retryBefore: number;
   }): { barrierId: string; processed: boolean; shouldPublish: boolean } | null {
-    const prepare = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "prepare-wait-expiry-barrier", () => {
       const row = this.db
         .query<
           {
@@ -2639,7 +2538,6 @@ export class DurableWorkflowStore {
       }
       return { barrierId, processed: false, shouldPublish };
     });
-    return prepare.immediate();
   }
 
   recordWaitExpiryBarrierCursor(barrierId: string, cursor: string, now: number): void {
@@ -2674,7 +2572,9 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowWait(input.from, input.to)) {
       throw new Error(`Illegal workflow wait transition: ${input.from} -> ${input.to}`);
     }
-    const current = this.getWait(input.runId, input.operationId);
+    const currentResult = this.getWait(input.runId, input.operationId);
+    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
+    const current = currentResult.value;
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
@@ -2725,9 +2625,13 @@ export class DurableWorkflowStore {
     result: WorkflowWait["result"];
     now: number;
   }): WorkflowWait | null {
-    const resolve = this.db.transaction(() => {
-      const wait = this.getWait(input.runId, input.operationId);
-      const run = this.getRun(input.runId);
+    return runWorkflowTransaction(this.db, "resolve-reply-wait", () => {
+      const waitResult = this.getWait(input.runId, input.operationId);
+      if (waitResult.status === "error") signalDurableWorkflowReadErrorToHost(waitResult.error);
+      const runResult = this.getRun(input.runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const wait = waitResult.value;
+      const run = runResult.value;
       if (
         !wait ||
         wait.match.kind !== "reply" ||
@@ -2766,9 +2670,10 @@ export class DurableWorkflowStore {
         operationId: input.operationId,
         now: input.now,
       });
-      return this.getWait(input.runId, input.operationId);
+      const resolved = this.getWait(input.runId, input.operationId);
+      if (resolved.status === "error") signalDurableWorkflowReadErrorToHost(resolved.error);
+      return resolved.value;
     });
-    return resolve.immediate();
   }
 
   tryClaimWait(input: {
@@ -2800,7 +2705,10 @@ export class DurableWorkflowStore {
         staleBefore,
         input.runOwnerId,
       );
-    return result.changes === 1 ? this.getWait(input.runId, input.operationId) : null;
+    if (result.changes !== 1) return null;
+    const claimed = this.getWait(input.runId, input.operationId);
+    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
+    return claimed.value;
   }
 
   recordAdapterEventSuppression(input: {
@@ -2836,7 +2744,7 @@ export class DurableWorkflowStore {
     messageId: string;
     now: number;
   }): { runId: string; operationId: string } | null {
-    const lookup = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "get-adapter-event-suppression", () => {
       this.db.run("DELETE FROM workflow_adapter_event_suppressions WHERE expires_at <= ?", [
         input.now,
       ]);
@@ -2848,7 +2756,6 @@ export class DurableWorkflowStore {
         .get(input.platform, input.channelId, input.messageId, input.now);
       return row ? { runId: row.run_id, operationId: row.operation_id } : null;
     });
-    return lookup.immediate();
   }
 
   createTrigger(triggerInput: WorkflowTrigger): boolean {
@@ -2891,7 +2798,7 @@ export class DurableWorkflowStore {
     idempotency: { key: string; fingerprintSha256: string };
   }): { trigger: WorkflowTrigger; created: boolean } {
     const trigger = workflowTriggerSchema.parse(input.trigger);
-    const create = this.db.transaction(() => {
+    return runWorkflowTransaction(this.db, "create-trigger-invocation", () => {
       const receipt = this.db
         .query<{ trigger_id: string; fingerprint_sha256: string }, [string]>(
           `SELECT trigger_id, fingerprint_sha256 FROM workflow_trigger_invocation_receipts
@@ -2902,7 +2809,10 @@ export class DurableWorkflowStore {
         if (receipt.fingerprint_sha256 !== input.idempotency.fingerprintSha256) {
           throw new Error("Workflow trigger idempotency key was reused with different input");
         }
-        const existing = this.getTrigger(receipt.trigger_id);
+        const existingResult = this.getTrigger(receipt.trigger_id);
+        if (existingResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(existingResult.error);
+        const existing = existingResult.value;
         if (!existing) throw new Error("Workflow trigger receipt references a missing trigger");
         return { trigger: existing, created: false };
       }
@@ -2922,23 +2832,26 @@ export class DurableWorkflowStore {
       );
       return { trigger, created: true };
     });
-    return create.immediate();
   }
 
-  getTrigger(triggerId: string): WorkflowTrigger | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_triggers WHERE trigger_id = ?")
-      .get(triggerId);
-    return row === null ? null : parseTrigger(row);
+  getTrigger(triggerId: string): ResultType<WorkflowTrigger | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-trigger", () => {
+      const row = this.persistedRows("SELECT * FROM workflow_triggers WHERE trigger_id = ?").get(
+        triggerId,
+      );
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowTriggerRow);
+    });
   }
 
-  getTriggerByLastRunId(runId: string): WorkflowTrigger | null {
-    const row = this.db
-      .query(
+  getTriggerByLastRunId(
+    runId: string,
+  ): ResultType<WorkflowTrigger | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-trigger-by-last-run-id", () => {
+      const row = this.persistedRows(
         "SELECT * FROM workflow_triggers WHERE last_run_id = ? ORDER BY updated_at DESC LIMIT 1",
-      )
-      .get(runId);
-    return row === null ? null : parseTrigger(row);
+      ).get(runId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowTriggerRow);
+    });
   }
 
   listTriggers(options?: {
@@ -2949,44 +2862,44 @@ export class DurableWorkflowStore {
     originClient?: string;
     originUserId?: string;
     limit?: number;
-  }): WorkflowTrigger[] {
-    const clauses: string[] = [];
-    const bindings: Array<string | number> = [];
-    if (options?.revisionId) {
-      clauses.push("workflow_triggers.revision_id = ?");
-      bindings.push(options.revisionId);
-    }
-    if (options?.state) {
-      clauses.push("workflow_triggers.state = ?");
-      bindings.push(options.state);
-    }
-    if (options?.dueBefore !== undefined) {
-      clauses.push(
-        "workflow_triggers.next_fire_at IS NOT NULL AND workflow_triggers.next_fire_at <= ?",
-      );
-      bindings.push(options.dueBefore);
-    }
-    if (options?.canonicalProjectId) {
-      clauses.push("workflow_revisions.canonical_project_id = ?");
-      bindings.push(options.canonicalProjectId);
-    }
-    if (options?.originClient) {
-      clauses.push("json_extract(workflow_triggers.origin_json, '$.client') = ?");
-      bindings.push(options.originClient);
-    }
-    if (options?.originUserId) {
-      clauses.push("json_extract(workflow_triggers.origin_json, '$.userId') = ?");
-      bindings.push(options.originUserId);
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .query(
+  }): ResultType<WorkflowTrigger[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-triggers", () => {
+      const clauses: string[] = [];
+      const bindings: Array<string | number> = [];
+      if (options?.revisionId) {
+        clauses.push("workflow_triggers.revision_id = ?");
+        bindings.push(options.revisionId);
+      }
+      if (options?.state) {
+        clauses.push("workflow_triggers.state = ?");
+        bindings.push(options.state);
+      }
+      if (options?.dueBefore !== undefined) {
+        clauses.push(
+          "workflow_triggers.next_fire_at IS NOT NULL AND workflow_triggers.next_fire_at <= ?",
+        );
+        bindings.push(options.dueBefore);
+      }
+      if (options?.canonicalProjectId) {
+        clauses.push("workflow_revisions.canonical_project_id = ?");
+        bindings.push(options.canonicalProjectId);
+      }
+      if (options?.originClient) {
+        clauses.push("json_extract(workflow_triggers.origin_json, '$.client') = ?");
+        bindings.push(options.originClient);
+      }
+      if (options?.originUserId) {
+        clauses.push("json_extract(workflow_triggers.origin_json, '$.userId') = ?");
+        bindings.push(options.originUserId);
+      }
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = this.persistedRows(
         `SELECT workflow_triggers.* FROM workflow_triggers
          JOIN workflow_revisions ON workflow_revisions.revision_id = workflow_triggers.revision_id
          ${where} ORDER BY workflow_triggers.next_fire_at, workflow_triggers.created_at LIMIT ?`,
-      )
-      .all(...bindings, boundedLimit(options?.limit));
-    return tolerantRows(rows, parseTrigger);
+      ).all(...bindings, boundedLimit(options?.limit));
+      return this.decodeRows(rows, decodeWorkflowTriggerRow);
+    });
   }
 
   transitionTrigger(input: {
@@ -3001,7 +2914,9 @@ export class DurableWorkflowStore {
     if (!canTransitionWorkflowTrigger(input.from, input.to)) {
       throw new Error(`Illegal workflow trigger transition: ${input.from} -> ${input.to}`);
     }
-    const current = this.getTrigger(input.triggerId);
+    const currentResult = this.getTrigger(input.triggerId);
+    if (currentResult.status === "error") signalDurableWorkflowReadErrorToHost(currentResult.error);
+    const current = currentResult.value;
     if (!current) return false;
     if (current.state !== input.from) return false;
     const result = this.db
@@ -3036,7 +2951,10 @@ export class DurableWorkflowStore {
            AND (claimed_at IS NULL OR claimed_at <= ?)`,
       )
       .run(input.claimerId, input.now, input.now, input.triggerId, input.now, staleBefore);
-    return result.changes === 1 ? this.getTrigger(input.triggerId) : null;
+    if (result.changes !== 1) return null;
+    const claimed = this.getTrigger(input.triggerId);
+    if (claimed.status === "error") signalDurableWorkflowReadErrorToHost(claimed.error);
+    return claimed.value;
   }
 
   fireClaimedTrigger(input: {
@@ -3053,8 +2971,15 @@ export class DurableWorkflowStore {
     | null {
     const requestedRun = workflowRunSchema.parse(input.run);
     const maxActiveRuns = z.number().int().positive().parse(input.maxActiveRuns);
-    const fire = this.db.transaction(() => {
-      const trigger = this.getTrigger(input.triggerId);
+    return runWorkflowTransaction<
+      | { status: "fired"; trigger: WorkflowTrigger; run: WorkflowRun }
+      | { status: "skipped"; trigger: WorkflowTrigger }
+      | null
+    >(this.db, "fire-claimed-trigger", () => {
+      const triggerResult = this.getTrigger(input.triggerId);
+      if (triggerResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(triggerResult.error);
+      const trigger = triggerResult.value;
       if (
         !trigger ||
         trigger.state !== "active" ||
@@ -3096,9 +3021,12 @@ export class DurableWorkflowStore {
           );
         if (skipped.changes !== 1)
           throw new Error(`Lost workflow trigger claim: ${trigger.triggerId}`);
-        const storedTrigger = this.getTrigger(trigger.triggerId);
+        const storedTriggerResult = this.getTrigger(trigger.triggerId);
+        if (storedTriggerResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(storedTriggerResult.error);
+        const storedTrigger = storedTriggerResult.value;
         if (!storedTrigger) throw new Error(`Workflow trigger disappeared: ${trigger.triggerId}`);
-        return { status: "skipped" as const, trigger: storedTrigger };
+        return { status: "skipped", trigger: storedTrigger };
       }
 
       const run = requestedRun;
@@ -3127,11 +3055,13 @@ export class DurableWorkflowStore {
         );
       if (updated.changes !== 1)
         throw new Error(`Lost workflow trigger claim: ${trigger.triggerId}`);
-      const storedTrigger = this.getTrigger(trigger.triggerId);
+      const storedTriggerResult = this.getTrigger(trigger.triggerId);
+      if (storedTriggerResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(storedTriggerResult.error);
+      const storedTrigger = storedTriggerResult.value;
       if (!storedTrigger) throw new Error(`Workflow trigger disappeared: ${trigger.triggerId}`);
-      return { status: "fired" as const, trigger: storedTrigger, run };
+      return { status: "fired", trigger: storedTrigger, run };
     });
-    return fire.immediate();
   }
 
   deleteTrigger(triggerId: string): boolean {
@@ -3187,37 +3117,42 @@ export class DurableWorkflowStore {
     actionIds: readonly string[];
   }): void {
     const binding = workflowSurfaceBindingSchema.parse(input.binding);
-    const commit = this.db.transaction(() => {
+    runWorkflowTransaction(this.db, "commit-surface-projection", () => {
       this.upsertSurfaceBinding(binding);
       if (binding.messageRef) this.bindSurfaceActions(input.actionIds, binding.messageRef);
     });
-    commit.immediate();
   }
 
-  getSurfaceBinding(runId: string): WorkflowSurfaceBinding | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_surface_bindings WHERE run_id = ?")
-      .get(runId);
-    return row === null ? null : parseBinding(row);
+  getSurfaceBinding(
+    runId: string,
+  ): ResultType<WorkflowSurfaceBinding | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-surface-binding", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_surface_bindings WHERE run_id = ?",
+      ).get(runId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowSurfaceBindingRow);
+    });
   }
 
   listSurfaceBindings(options?: {
     dueBefore?: number;
     missingMessageOnly?: boolean;
     limit?: number;
-  }): WorkflowSurfaceBinding[] {
-    const clauses: string[] = [];
-    const bindings: number[] = [];
-    if (options?.dueBefore !== undefined) {
-      clauses.push("next_attempt_at IS NOT NULL AND next_attempt_at <= ?");
-      bindings.push(options.dueBefore);
-    }
-    if (options?.missingMessageOnly) clauses.push("message_ref_json IS NULL");
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .query(`SELECT * FROM workflow_surface_bindings ${where} ORDER BY updated_at LIMIT ?`)
-      .all(...bindings, boundedLimit(options?.limit));
-    return tolerantRows(rows, parseBinding);
+  }): ResultType<WorkflowSurfaceBinding[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-surface-bindings", () => {
+      const clauses: string[] = [];
+      const bindings: number[] = [];
+      if (options?.dueBefore !== undefined) {
+        clauses.push("next_attempt_at IS NOT NULL AND next_attempt_at <= ?");
+        bindings.push(options.dueBefore);
+      }
+      if (options?.missingMessageOnly) clauses.push("message_ref_json IS NULL");
+      const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+      const rows = this.persistedRows(
+        `SELECT * FROM workflow_surface_bindings ${where} ORDER BY updated_at LIMIT ?`,
+      ).all(...bindings, boundedLimit(options?.limit));
+      return this.decodeRows(rows, decodeWorkflowSurfaceBindingRow);
+    });
   }
 
   deleteSurfaceBinding(runId: string): boolean {
@@ -3255,39 +3190,45 @@ export class DurableWorkflowStore {
     return result.changes === 1;
   }
 
-  getSurfaceAction(actionId: string): WorkflowSurfaceAction | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_surface_actions WHERE action_id = ?")
-      .get(actionId);
-    return row === null ? null : parseAction(row);
+  getSurfaceAction(
+    actionId: string,
+  ): ResultType<WorkflowSurfaceAction | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-surface-action", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_surface_actions WHERE action_id = ?",
+      ).get(actionId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowSurfaceActionRow);
+    });
   }
 
-  getSurfaceActionByTokenSha256(tokenSha256: string): WorkflowSurfaceAction | null {
-    const row = this.db
-      .query("SELECT * FROM workflow_surface_actions WHERE token_sha256 = ?")
-      .get(tokenSha256);
-    return row === null ? null : parseAction(row);
+  getSurfaceActionByTokenSha256(
+    tokenSha256: string,
+  ): ResultType<WorkflowSurfaceAction | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-surface-action-by-token", () => {
+      const row = this.persistedRows(
+        "SELECT * FROM workflow_surface_actions WHERE token_sha256 = ?",
+      ).get(tokenSha256);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowSurfaceActionRow);
+    });
   }
 
   listSurfaceActions(
     runId: string,
     options?: { activeAt?: number; limit?: number },
-  ): WorkflowSurfaceAction[] {
-    const rows =
-      options?.activeAt === undefined
-        ? this.db
-            .query(
+  ): ResultType<WorkflowSurfaceAction[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-surface-actions", () => {
+      const rows =
+        options?.activeAt === undefined
+          ? this.persistedRows(
               "SELECT * FROM workflow_surface_actions WHERE run_id = ? ORDER BY created_at LIMIT ?",
-            )
-            .all(runId, boundedLimit(options?.limit))
-        : this.db
-            .query(
+            ).all(runId, boundedLimit(options?.limit))
+          : this.persistedRows(
               `SELECT * FROM workflow_surface_actions
              WHERE run_id = ? AND consumed_at IS NULL AND expires_at > ?
              ORDER BY created_at LIMIT ?`,
-            )
-            .all(runId, options.activeAt, boundedLimit(options.limit));
-    return tolerantRows(rows, parseAction);
+            ).all(runId, options.activeAt, boundedLimit(options.limit));
+      return this.decodeRows(rows, decodeWorkflowSurfaceActionRow);
+    });
   }
 
   bindSurfaceActions(
@@ -3295,7 +3236,7 @@ export class DurableWorkflowStore {
     messageRef: NonNullable<WorkflowSurfaceAction["expectedMessageRef"]>,
   ): void {
     if (actionIds.length === 0) return;
-    const bind = this.db.transaction(() => {
+    runWorkflowTransaction(this.db, "bind-surface-actions", () => {
       for (const actionId of actionIds) {
         this.db.run(
           `UPDATE workflow_surface_actions SET expected_message_ref_json = ?
@@ -3304,7 +3245,6 @@ export class DurableWorkflowStore {
         );
       }
     });
-    bind.immediate();
   }
 
   expireActiveSurfaceActions(runId: string, now: number): void {
@@ -3322,134 +3262,189 @@ export class DurableWorkflowStore {
     messageRef: NonNullable<WorkflowSurfaceAction["expectedMessageRef"]>;
     sourceMessageId?: string;
     now: number;
-  }): ApplyWorkflowSurfaceActionResult {
-    const apply = this.db.transaction((): ApplyWorkflowSurfaceActionResult => {
-      const action = this.getSurfaceActionByTokenSha256(input.tokenSha256);
-      if (!action) return { status: "not_found" };
-      if (action.consumedAt !== null) return { status: "consumed" };
-      if (action.expiresAt <= input.now) return { status: "expired" };
-      const expected = action.expectedMessageRef;
-      if (
-        action.expectedPlatform !== input.platform ||
-        action.expectedUserId !== input.userId ||
-        !expected ||
-        expected.platform !== input.messageRef.platform ||
-        expected.channelId !== input.messageRef.channelId ||
-        expected.messageId !== input.messageRef.messageId
-      ) {
-        return { status: "unauthorized" };
-      }
+  }): ResultType<ApplyWorkflowSurfaceActionResult, ApplyWorkflowSurfaceActionError> {
+    return runBunSqliteTransaction(
+      this.db,
+      (): ResultType<ApplyWorkflowSurfaceActionResult, ApplyWorkflowSurfaceActionError> => {
+        const actionRow = this.persistedRows(
+          "SELECT * FROM workflow_surface_actions WHERE token_sha256 = ?",
+        ).get(input.tokenSha256);
+        if (actionRow === null) return Result.ok({ status: "not_found" });
+        const decodedAction = decodeWorkflowSurfaceActionRow({
+          row: actionRow,
+          schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        });
+        if (decodedAction.status === "error") return Result.err(decodedAction.error);
+        const action = decodedAction.value.value;
+        if (action.consumedAt !== null) return Result.ok({ status: "consumed" });
+        if (action.expiresAt <= input.now) return Result.ok({ status: "expired" });
+        const expected = action.expectedMessageRef;
+        if (
+          action.expectedPlatform !== input.platform ||
+          action.expectedUserId !== input.userId ||
+          !expected ||
+          expected.platform !== input.messageRef.platform ||
+          expected.channelId !== input.messageRef.channelId ||
+          expected.messageId !== input.messageRef.messageId
+        ) {
+          return Result.ok({ status: "unauthorized" });
+        }
 
-      let runIds: string[] = [];
-      const previousRunStates = new Map<string, WorkflowRunState>();
-      const run = this.getRun(action.runId);
-      if (!run) return { status: "stale" };
-      previousRunStates.set(run.runId, run.state);
-      let nextState: WorkflowRunState;
-      let valid: boolean;
-      switch (action.kind) {
-        case "cancel":
-          nextState = "cancelled";
-          valid = !["succeeded", "failed", "cancelled"].includes(run.state);
-          break;
-        case "pause":
-          nextState = "paused";
-          valid = ["queued", "running", "blocked"].includes(run.state);
-          break;
-        case "resume":
-          nextState = "queued";
-          valid = run.state === "paused";
-          break;
-      }
-      if (!valid) return { status: "stale" };
-      const terminal = nextState === "cancelled";
-      if (
-        action.kind === "resume" &&
-        !this.preparePausedOperationsForResume(run.runId, input.now)
-      ) {
-        return { status: "stale" };
-      }
-      const result = this.db
-        .query(
-          `UPDATE workflow_runs SET state = ?, terminal_detail = ?,
+        const runRow = this.persistedRows("SELECT * FROM workflow_runs WHERE run_id = ?").get(
+          action.runId,
+        );
+        if (runRow === null) return Result.ok({ status: "stale" });
+        const decodedRun = decodeWorkflowRunRow({
+          row: runRow,
+          schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        });
+        if (decodedRun.status === "error") return Result.err(decodedRun.error);
+        const run = decodedRun.value.value;
+        let nextState: WorkflowRunState;
+        let valid: boolean;
+        switch (action.kind) {
+          case "cancel":
+            nextState = "cancelled";
+            valid = !["succeeded", "failed", "cancelled"].includes(run.state);
+            break;
+          case "pause":
+            nextState = "paused";
+            valid = ["queued", "running", "blocked"].includes(run.state);
+            break;
+          case "resume":
+            nextState = "queued";
+            valid = run.state === "paused";
+            break;
+        }
+        if (!valid) return Result.ok({ status: "stale" });
+        const terminal = nextState === "cancelled";
+        if (
+          action.kind === "resume" &&
+          !this.preparePausedOperationsForResume(run.runId, input.now)
+        ) {
+          return Result.ok({ status: "stale" });
+        }
+        const result = this.db
+          .query(
+            `UPDATE workflow_runs SET state = ?, terminal_detail = ?,
            terminal_at = CASE WHEN ? THEN ? ELSE terminal_at END, updated_at = ?
            WHERE run_id = ? AND state = ?`,
-        )
-        .run(
-          nextState,
-          action.kind === "cancel" ? "Cancelled from surface control" : run.terminalDetail,
-          terminal,
-          input.now,
-          input.now,
-          run.runId,
-          run.state,
-        );
-      if (result.changes !== 1) return { status: "stale" };
-      if (action.kind === "pause") {
-        this.prepareOperationsForPause(run.runId, input.now, "Paused from surface control");
-      } else if (action.kind === "cancel") {
-        this.db.run(
-          `UPDATE workflow_operations SET state = 'cancelled', error = 'Cancelled from surface control',
+          )
+          .run(
+            nextState,
+            action.kind === "cancel" ? "Cancelled from surface control" : run.terminalDetail,
+            terminal,
+            input.now,
+            input.now,
+            run.runId,
+            run.state,
+          );
+        if (result.changes !== 1) return Result.ok({ status: "stale" });
+        if (action.kind === "pause") {
+          this.prepareOperationsForPause(run.runId, input.now, "Paused from surface control");
+        } else if (action.kind === "cancel") {
+          this.db.run(
+            `UPDATE workflow_operations SET state = 'cancelled', error = 'Cancelled from surface control',
            terminal_at = ?, updated_at = ?
            WHERE run_id = ? AND state IN ('queued', 'dispatched', 'running', 'blocked')`,
-          [input.now, input.now, run.runId],
-        );
-        this.db.run(
-          `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
+            [input.now, input.now, run.runId],
+          );
+          this.db.run(
+            `UPDATE workflow_waits SET state = 'cancelled', claimed_by = NULL, claimed_at = NULL,
            resolved_at = ?, updated_at = ?
            WHERE run_id = ? AND state IN ('pending', 'claimed')`,
-          [input.now, input.now, run.runId],
-        );
-        this.db.run(
-          `UPDATE workflow_request_dispatches SET active = 0,
+            [input.now, input.now, run.runId],
+          );
+          this.db.run(
+            `UPDATE workflow_request_dispatches SET active = 0,
            updated_at = ?
            WHERE run_id = ? AND active = 1`,
-          [input.now, run.runId],
-        );
-      }
-      runIds = [run.runId];
-
-      const consumed = this.db
-        .query(
-          `UPDATE workflow_surface_actions SET consumed_at = ?, consumed_by_platform = ?,
+            [input.now, run.runId],
+          );
+        }
+        this.options.testHooks?.afterSurfaceActionStateChange?.();
+        const consumed = this.db
+          .query(
+            `UPDATE workflow_surface_actions SET consumed_at = ?, consumed_by_platform = ?,
            consumed_by_user_id = ? WHERE action_id = ? AND consumed_at IS NULL`,
-        )
-        .run(input.now, input.platform, input.userId, action.actionId);
-      if (consumed.changes !== 1) return { status: "consumed" };
-      for (const runId of runIds) {
-        const updatedRun = this.getRun(runId);
-        if (!updatedRun) continue;
-        this.insertActionOutboxEntry({
-          outboxId: `${action.actionId}:run:${runId}`,
+          )
+          .run(input.now, input.platform, input.userId, action.actionId);
+        if (consumed.changes !== 1) {
+          return Result.err(
+            new WorkflowSurfaceActionAtomicityConflict({
+              actionId: action.actionId,
+              stage: "consume",
+              message: "Workflow surface action consumption conflicted after its state change",
+            }),
+          );
+        }
+        const updatedRunRow = this.persistedRows(
+          "SELECT * FROM workflow_runs WHERE run_id = ?",
+        ).get(run.runId);
+        if (updatedRunRow === null) {
+          return Result.err(
+            new WorkflowSurfaceActionAtomicityConflict({
+              actionId: action.actionId,
+              stage: "load-updated-run",
+              message: "Workflow run disappeared after its surface action state change",
+            }),
+          );
+        }
+        const decodedUpdatedRun = decodeWorkflowRunRow({
+          row: updatedRunRow,
+          schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        });
+        if (decodedUpdatedRun.status === "error") return Result.err(decodedUpdatedRun.error);
+        const updatedRun = decodedUpdatedRun.value.value;
+        const runEventInserted = this.insertActionOutboxEntry({
+          outboxId: `${action.actionId}:run:${run.runId}`,
           actionId: action.actionId,
-          runId,
+          runId: run.runId,
           eventType: "evt.workflow.run.changed",
           payload: {
-            runId,
+            runId: run.runId,
             revisionId: updatedRun.revisionId,
             state: updatedRun.state,
-            previousState: previousRunStates.get(runId),
+            previousState: run.state,
             ts: input.now,
           },
           now: input.now,
         });
-        this.insertActionOutboxEntry({
-          outboxId: `${action.actionId}:progress:${runId}`,
+        if (!runEventInserted) {
+          return Result.err(
+            new WorkflowSurfaceActionAtomicityConflict({
+              actionId: action.actionId,
+              stage: "insert-run-event",
+              message: "Workflow run-change outbox identity already exists",
+            }),
+          );
+        }
+        const progressEventInserted = this.insertActionOutboxEntry({
+          outboxId: `${action.actionId}:progress:${run.runId}`,
           actionId: action.actionId,
-          runId,
+          runId: run.runId,
           eventType: "evt.workflow.progress.requested",
           payload: {
-            runId,
+            runId: run.runId,
             revisionId: updatedRun.revisionId,
             reason: "state_changed",
             ts: input.now,
           },
           now: input.now,
         });
-      }
-      return { status: "applied", action, runIds };
-    });
-    return apply.immediate();
+        if (!progressEventInserted) {
+          return Result.err(
+            new WorkflowSurfaceActionAtomicityConflict({
+              actionId: action.actionId,
+              stage: "insert-progress-event",
+              message: "Workflow progress outbox identity already exists",
+            }),
+          );
+        }
+        return Result.ok({ status: "applied", action, runIds: [run.runId] });
+      },
+      (cause) => classifyWorkflowSqliteDriverFailure("apply-surface-action", cause),
+    );
   }
 
   private insertActionOutboxEntry(input: {
@@ -3459,34 +3454,39 @@ export class DurableWorkflowStore {
     eventType: string;
     payload: unknown;
     now: number;
-  }): void {
-    this.db.run(
-      `INSERT INTO workflow_action_outbox (
+  }): boolean {
+    return (
+      this.db.run(
+        `INSERT INTO workflow_action_outbox (
          outbox_id, action_id, run_id, event_type, payload_json, published_at,
          projected_at, attempt_count, next_attempt_at, last_error, created_at, updated_at
        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, NULL, NULL, ?, ?)
        ON CONFLICT(outbox_id) DO NOTHING`,
-      [
-        input.outboxId,
-        input.actionId,
-        input.runId,
-        input.eventType,
-        JSON.stringify(jsonValueSchema.parse(input.payload)),
-        input.now,
-        input.now,
-      ],
+        [
+          input.outboxId,
+          input.actionId,
+          input.runId,
+          input.eventType,
+          JSON.stringify(jsonValueSchema.parse(input.payload)),
+          input.now,
+          input.now,
+        ],
+      ).changes === 1
     );
   }
 
-  listPendingActionOutboxEvents(now: number, limit = 100): WorkflowActionOutboxEntry[] {
-    return this.db
-      .query(
+  listPendingActionOutboxEvents(
+    now: number,
+    limit = 100,
+  ): ResultType<WorkflowActionOutboxEntry[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-pending-action-outbox-events", () => {
+      const rows = this.persistedRows(
         `SELECT * FROM workflow_action_outbox
          WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
          ORDER BY created_at, outbox_id LIMIT ?`,
-      )
-      .all(now, boundedLimit(limit))
-      .map(parseActionOutboxEntry);
+      ).all(now, boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowActionOutboxRow);
+    });
   }
 
   markActionOutboxPublished(input: { outboxId: string; now: number }): boolean {
@@ -3510,15 +3510,17 @@ export class DurableWorkflowStore {
     );
   }
 
-  listPendingActionOutboxProjections(limit = 100): WorkflowActionOutboxEntry[] {
-    return this.db
-      .query(
+  listPendingActionOutboxProjections(
+    limit = 100,
+  ): ResultType<WorkflowActionOutboxEntry[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-pending-action-outbox-projections", () => {
+      const rows = this.persistedRows(
         `SELECT * FROM workflow_action_outbox
          WHERE event_type = 'evt.workflow.progress.requested' AND projected_at IS NULL
          ORDER BY created_at, outbox_id LIMIT ?`,
-      )
-      .all(boundedLimit(limit))
-      .map(parseActionOutboxEntry);
+      ).all(boundedLimit(limit));
+      return this.decodeRows(rows, decodeWorkflowActionOutboxRow);
+    });
   }
 
   markActionOutboxProjected(input: { outboxId: string; now: number }): boolean {
@@ -3554,7 +3556,10 @@ export class DurableWorkflowStore {
         input.platform,
         input.userId,
       );
-    return result.changes === 1 ? this.getSurfaceActionByTokenSha256(input.tokenSha256) : null;
+    if (result.changes !== 1) return null;
+    const consumed = this.getSurfaceActionByTokenSha256(input.tokenSha256);
+    if (consumed.status === "error") signalDurableWorkflowReadErrorToHost(consumed.error);
+    return consumed.value;
   }
 
   deleteSurfaceAction(actionId: string): boolean {

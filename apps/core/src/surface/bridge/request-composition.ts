@@ -184,7 +184,9 @@ function collectStoredBoundaryBreaks(input: {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
       surfaceProjectionKey(input.sessionId, message.messageId),
     );
-    if (stored) return `${stored.requestId}:${stored.segmentIndex}`;
+    if (stored?.status === "ok" && stored.value) {
+      return `${stored.value.requestId}:${stored.value.segmentIndex}`;
+    }
     const admittedIds = storedProjectionSegmentIds(
       input.projections.get(message.messageId) ?? null,
     );
@@ -209,13 +211,19 @@ function appendPersistedSyntheticSuffix(input: {
   const manifest = input.transcriptStore?.getCorePrimaryLineageManifest?.({
     requestId: input.requestId,
   });
-  if (!manifest || !manifest.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")) {
+  if (
+    !manifest ||
+    manifest.status === "error" ||
+    !manifest.value ||
+    !manifest.value.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
+  ) {
     return true;
   }
-  if (input.segmentInputs.length > manifest.segments.length) return false;
+  const manifestValue = manifest.value;
+  if (input.segmentInputs.length > manifestValue.segments.length) return false;
 
   const prefixMatches = input.segmentInputs.every((segment, index) => {
-    const stored = manifest.segments[index];
+    const stored = manifestValue.segments[index];
     return (
       stored !== undefined &&
       isDeepStrictEqual(segment.atoms, stored.atoms) &&
@@ -223,7 +231,7 @@ function appendPersistedSyntheticSuffix(input: {
       isDeepStrictEqual(segment.requestSource, stored.requestSource)
     );
   });
-  const suffix = manifest.segments.slice(input.segmentInputs.length);
+  const suffix = manifestValue.segments.slice(input.segmentInputs.length);
   if (!prefixMatches || suffix.some((segment) => segment.atoms[0]?.kind !== "synthetic")) {
     return false;
   }
@@ -309,12 +317,10 @@ async function composeSelectedDiscordChain(input: {
   try {
     const projections = new Map<string, CoreSurfaceProjection | null>();
     for (const message of input.chain) {
-      projections.set(
-        message.messageId,
-        projectionStore?.getCoreSurfaceProjection(
-          surfaceProjectionKey(input.sessionId, message.messageId),
-        ) ?? null,
+      const stored = projectionStore?.getCoreSurfaceProjection(
+        surfaceProjectionKey(input.sessionId, message.messageId),
       );
+      projections.set(message.messageId, stored?.status === "ok" ? stored.value : null);
     }
     const immutableChain = input.chain.map((message) => {
       const projection = projections.get(message.messageId) ?? null;
@@ -453,7 +459,11 @@ async function composeSelectedDiscordChain(input: {
           },
           ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
         });
-        projectedByMessageId.set(messageId, admitted.canonicalMessages);
+        if (admitted.status === "error") {
+          lineageComplete = false;
+          continue;
+        }
+        projectedByMessageId.set(messageId, admitted.value.canonicalMessages);
       }
     }
 
@@ -513,18 +523,19 @@ async function composeSelectedDiscordChain(input: {
         const metadata = input.transcriptStore?.getCoreRequestAtomMetadata?.({
           requestId: snapshot.requestId,
         });
-        if (!metadata) lineageComplete = false;
+        const metadataValue = metadata?.status === "ok" ? metadata.value : null;
+        if (!metadataValue) lineageComplete = false;
         const requestAtom: CoreLineageAtomV1 = {
           kind: "request",
           requestId: snapshot.requestId,
           transcriptDigest:
-            metadata?.transcriptDigest ??
+            metadataValue?.transcriptDigest ??
             snapshot.transcriptDigest ??
             hashCanonicalMessagesV1(snapshot.messages).hash,
           providerFamily:
-            metadata?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
+            metadataValue?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
           containsCrossFamilyTurns:
-            metadata?.containsCrossFamilyTurns ??
+            metadataValue?.containsCrossFamilyTurns ??
             snapshot.providerState?.containsCrossFamilyTurns ??
             true,
         };
@@ -608,11 +619,12 @@ function resolveTranscriptSnapshot(input: {
     return input.resolvedSnapshotsBySurfaceMessageId.get(input.messageId) ?? null;
   }
 
-  return input.transcriptStore.getTranscriptBySurfaceMessage({
+  const transcript = input.transcriptStore.getTranscriptBySurfaceMessage({
     platform: input.platform,
     channelId: input.channelId,
     messageId: input.messageId,
   });
+  return transcript.status === "ok" ? transcript.value : null;
 }
 
 function getDiscordIsChatFromRaw(raw: unknown): boolean | undefined {

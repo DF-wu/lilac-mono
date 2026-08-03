@@ -5,6 +5,7 @@ import {
   copyFile,
   mkdir,
   mkdtemp as mkdtempFs,
+  readFile,
   readdir,
   rm,
   stat,
@@ -37,6 +38,7 @@ import {
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { getCodexAuthStoragePath, ModelCapability } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 import { z } from "zod";
 
 import type { RuntimeConfig } from "../src/config";
@@ -636,6 +638,11 @@ class ScriptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
         this.captureCall += 1;
         return await this.captureScript(this.captureCall, this.workspaceId);
       },
+      captureResult: async () => {
+        this.captureCall += 1;
+        return Result.ok(await this.captureScript(this.captureCall, this.workspaceId));
+      },
+      invalidateCaptureCacheResult: async () => Result.ok(undefined),
       prepareRestore: async () => ({ status: "skipped", reason: "git-unavailable" }),
     });
   }
@@ -662,6 +669,11 @@ class InterceptedWorkspaceHistoryStore extends WorkspaceHistoryStore {
     return await super.withWorkspaceLock(async (lockedStore) => {
       const resumePreparedRestore = lockedStore.resumePreparedRestore;
       return await callback({
+        captureResult: async () => {
+          this.hooks.onCapture?.();
+          return await lockedStore.captureResult();
+        },
+        invalidateCaptureCacheResult: async () => await lockedStore.invalidateCaptureCacheResult(),
         capture: async () => {
           this.hooks.onCapture?.();
           return await lockedStore.capture();
@@ -1178,6 +1190,55 @@ describe("MiniLilacSqliteStore", () => {
 });
 
 describe("SessionService", () => {
+  it("explicitly invalidates an incompatible cache with a redacted diagnostic before recomputing", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-cache-policy-"));
+    temporaryDirectories.push(directory);
+    const diagnostics: object[] = [];
+    let historyStore: WorkspaceHistoryStore | undefined;
+    const model = new MockLanguageModelV4({
+      doStream: async () => textResult("cache-policy-answer", "done"),
+    });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: () => model,
+      workspaceHistoryStoreFactory: (options) => {
+        historyStore = new WorkspaceHistoryStore(options);
+        return historyStore;
+      },
+      onWorkspaceHistoryPersistenceDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+    await collect(
+      (await service.startPrompt(session.id, userMessage("first"), "cache-policy-first")).stream,
+    );
+    if (historyStore === undefined) throw new Error("workspace history store was not created");
+    const cachePath = path.join(historyStore.storeDirectory, "capture-cache.json");
+    const current = JSON.parse(await readFile(cachePath, "utf8"));
+    const incompatible = JSON.stringify({
+      ...current,
+      implementationVersion: "secret-implementation-version",
+    });
+    await writeFile(cachePath, incompatible);
+
+    await collect(
+      (await service.startPrompt(session.id, userMessage("second"), "cache-policy-second")).stream,
+    );
+
+    expect(diagnostics).toEqual([
+      {
+        operation: "invalidate-capture-cache",
+        recordKind: "capture-cache",
+        issueCode: "unsupported-version",
+        versionCategory: "implementation",
+      },
+    ]);
+    expect(JSON.stringify(diagnostics)).not.toContain("secret-implementation-version");
+    expect(await readFile(cachePath, "utf8")).not.toBe(incompatible);
+    expect(await readFile(cachePath, "utf8")).not.toContain("secret-implementation-version");
+    service.close();
+  });
+
   it("keeps transcript history without workspace snapshots outside Git", async () => {
     const directory = await mkdtempFs(path.join(tmpdir(), "mini-lilac-non-git-history-"));
     temporaryDirectories.push(directory);
@@ -2719,8 +2780,8 @@ describe("SessionService", () => {
     if (uri === undefined) throw new Error("overflow artifact URI was not persisted");
     expect(serializedTranscript).not.toContain("x".repeat(1_000));
     const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) expect(artifact.content).toContain(longLine.trim());
+    expect(artifact.status).toBe("ok");
+    if (artifact.status === "ok") expect(artifact.value.content).toContain(longLine.trim());
     service.close();
   });
 
@@ -2772,8 +2833,8 @@ describe("SessionService", () => {
     const childTranscript = JSON.stringify(service.store.getModelMessages(child.id));
     const uri = /tool-result:\/\/[0-9a-f-]{36}/u.exec(childTranscript)?.[0];
     if (uri === undefined) throw new Error("child overflow artifact URI was not persisted");
-    expect((await artifacts.read(uri, root.id)).ok).toBe(true);
-    expect((await artifacts.read(uri, child.id)).ok).toBe(false);
+    expect((await artifacts.read(uri, root.id)).status).toBe("ok");
+    expect((await artifacts.read(uri, child.id)).status).toBe("error");
     service.close();
   });
 
@@ -6804,7 +6865,7 @@ describe("SessionService", () => {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await expect(
         service.startPrompt(session.id, userMessage("must roll back"), "atomic-prompt"),
-      ).rejects.toThrow("prompt command fault");
+      ).rejects.toThrow("Mini Lilac SQLite operation failed");
       expect(
         service.store.database.query("SELECT COUNT(*) AS count FROM workspace_snapshots").get(),
       ).toEqual({ count: 0 });
@@ -7267,11 +7328,11 @@ describe("SessionService", () => {
     expect(secondPrompt).toContain("middle output omitted");
     expect(secondPrompt).toContain('"completeOutputRetained":true');
     const artifact = await artifacts.read(uri, session.id);
-    expect(artifact.ok).toBe(true);
-    if (artifact.ok) {
-      expect(artifact.content).toContain("start-");
-      expect(artifact.content).toContain("-end");
-      expect(artifact.content).toContain("z".repeat(40_000));
+    expect(artifact.status).toBe("ok");
+    if (artifact.status === "ok") {
+      expect(artifact.value.content).toContain("start-");
+      expect(artifact.value.content).toContain("-end");
+      expect(artifact.value.content).toContain("z".repeat(40_000));
     }
     service.close();
   });

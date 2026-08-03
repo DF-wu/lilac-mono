@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
+import { CorruptPersistedFields } from "@stanley2058/lilac-utils";
 import type { ModelMessage } from "ai";
 import superjson from "superjson";
 import { z } from "zod";
@@ -358,9 +359,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
       .run(serialize({ invalid: true }));
     database.close();
 
-    expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(
-      "Invalid canonical model transcript",
-    );
+    expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(CorruptPersistedFields);
 
     const unchanged = new Database(databasePath, { strict: true });
     expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 2 });

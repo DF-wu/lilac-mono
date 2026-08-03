@@ -173,6 +173,39 @@ import {
   type TestRawSubscriptionHost,
 } from "../../helpers/result-raw-bus";
 
+function transcriptResultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function getRequestTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getRequestTranscript"]>[0],
+) {
+  return transcriptResultValue(store.getRequestTranscript(input));
+}
+
+function getCorePrimaryLineageManifest(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCorePrimaryLineageManifest"]>[0],
+) {
+  return transcriptResultValue(store.getCorePrimaryLineageManifest(input));
+}
+
+function getCoreRequestAtomMetadata(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCoreRequestAtomMetadata"]>[0],
+) {
+  return transcriptResultValue(store.getCoreRequestAtomMetadata(input));
+}
+
+function getTranscriptBySurfaceMessage(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getTranscriptBySurfaceMessage"]>[0],
+) {
+  return transcriptResultValue(store.getTranscriptBySurfaceMessage(input));
+}
+
 function level1TestTool(execute: () => unknown) {
   return tool({
     inputSchema: jsonSchema<Record<string, never>>({
@@ -795,23 +828,25 @@ describe("subagent model selection", () => {
       },
     ]);
     const staleStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getCoreSurfaceProjection() {
-        return null;
+        return Result.ok(null);
       },
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       validateCorePrimaryLineageReferences() {
-        return "stale-surface-lineage";
+        return Result.ok("stale-surface-lineage");
       },
       close() {},
     };
     const validStore = {
       ...staleStore,
       getCoreSurfaceProjection() {
-        return {
+        return Result.ok({
           requestClient: "discord" as const,
           surfaceId: "discord:channel",
           sessionId: "channel",
@@ -824,12 +859,14 @@ describe("subagent model selection", () => {
           },
           ownedBlobs: [],
           createdAt: 1,
-        };
+        });
       },
       validateCorePrimaryLineageReferences(input: { manifest: CoreLineageManifestV1 }) {
-        return input.manifest.segments[0]?.canonicalMessages[0]?.content === "hello"
-          ? null
-          : "transformed-surface-lineage";
+        return Result.ok(
+          input.manifest.segments[0]?.canonicalMessages[0]?.content === "hello"
+            ? null
+            : "transformed-surface-lineage",
+        );
       },
     };
 
@@ -2881,7 +2918,7 @@ describe("startBusAgentRunner production path", () => {
     );
     expect(JSON.stringify(secondTurnAssistantMessages)).not.toContain("NO_REPLY");
     expect(JSON.stringify(secondTurnAssistantMessages)).toContain("call-silent");
-    const transcript = store.getRequestTranscript({ requestId });
+    const transcript = getRequestTranscript(store, { requestId });
     expect(transcript?.finalText).toBe("final answer");
     expect(JSON.stringify(transcript?.messages)).not.toContain("NO_REPLY");
     expect(JSON.stringify(transcript?.messages)).toContain("call-silent");
@@ -2953,8 +2990,8 @@ function extendPrimaryManifest(input: {
   currentMessageId: string;
   currentMessages: readonly ModelMessage[];
 }): CoreLineageManifestV1 {
-  const transcript = input.store.getRequestTranscript({ requestId: input.completedRequestId });
-  const metadata = input.store.getCoreRequestAtomMetadata({ requestId: input.completedRequestId });
+  const transcript = getRequestTranscript(input.store, { requestId: input.completedRequestId });
+  const metadata = getCoreRequestAtomMetadata(input.store, { requestId: input.completedRequestId });
   if (!transcript || !metadata) throw new Error("completed primary request metadata is missing");
   input.store.admitCoreSurfaceProjection({
     requestClient: "discord",
@@ -3256,7 +3293,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       throw new Error("first request did not route with complete Stage 6 lineage");
     }
     const firstInputManifest = firstRouted.data.corePrimaryLineage;
-    const persistedFirstManifest = store.getCorePrimaryLineageManifest({
+    const persistedFirstManifest = getCorePrimaryLineageManifest(store, {
       requestId: firstRequestId,
     });
     if (!persistedFirstManifest) throw new Error("auto-injected manifest was not persisted");
@@ -3289,7 +3326,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     );
     expect(adapter.messages.get(firstOutput.messageId)?.text).toBe("auto-inject response 1");
     expect(
-      store.getTranscriptBySurfaceMessage({
+      getTranscriptBySurfaceMessage(store, {
         platform: "discord",
         channelId: sessionId,
         messageId: firstOutput.messageId,
@@ -3300,7 +3337,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
-    const firstTranscript = store.getRequestTranscript({ requestId: firstRequestId });
+    const firstTranscript = getRequestTranscript(store, { requestId: firstRequestId });
     if (!firstBinding || !firstTranscript?.transcriptDigest || !firstTranscript.providerState) {
       throw new Error("auto-injected first turn did not promote");
     }
@@ -3549,7 +3586,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       lilacSessionId: sessionId,
     });
     if (!firstBinding) throw new Error("first binding was not promoted");
-    const firstTranscript = store.getRequestTranscript({ requestId: firstRequestId });
+    const firstTranscript = getRequestTranscript(store, { requestId: firstRequestId });
     if (!firstTranscript?.transcriptDigest) throw new Error("first transcript digest is missing");
     const firstHead = computeCorePrimaryClaudeTerminalHead({
       manifest: firstManifest,
@@ -3592,7 +3629,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       lilacSessionId: sessionId,
     });
     if (!secondBinding) throw new Error("second binding was not promoted");
-    const secondTranscript = store.getRequestTranscript({ requestId: secondRequestId });
+    const secondTranscript = getRequestTranscript(store, { requestId: secondRequestId });
     if (!secondTranscript?.transcriptDigest) throw new Error("second transcript digest is missing");
     const secondHead = computeCorePrimaryClaudeTerminalHead({
       manifest: secondManifest,
@@ -3613,11 +3650,11 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       "Continue after the completed tool call.",
     );
     expect(
-      JSON.stringify(store.getRequestTranscript({ requestId: secondRequestId })?.messages),
+      JSON.stringify(getRequestTranscript(store, { requestId: secondRequestId })?.messages),
     ).toContain("native-tool");
     expect(secondBinding.canonicalMessageCount).toBe(
       secondManifest.segments.at(-1)!.canonicalEnd +
-        store.getRequestTranscript({ requestId: secondRequestId })!.messages.length,
+        getRequestTranscript(store, { requestId: secondRequestId })!.messages.length,
     );
     expect(secondBinding).toMatchObject(secondHead);
     expect(secondBinding.nativeContextTokens).toBeGreaterThan(firstBinding.nativeContextTokens);
@@ -3731,7 +3768,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       messages: [{ role: "assistant", content: "competitor response" }],
       corePrimaryLineage: raceManifest,
     });
-    const competitorTranscript = store.getRequestTranscript({ requestId: competitorRequestId });
+    const competitorTranscript = getRequestTranscript(store, { requestId: competitorRequestId });
     if (!competitorTranscript?.transcriptDigest)
       throw new Error("competitor transcript is missing");
     const competitorHead = computeCorePrimaryClaudeTerminalHead({

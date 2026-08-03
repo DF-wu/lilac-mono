@@ -24,3 +24,4 @@ export * from "./subagent-idle-timeout";
 export * from "./reasoning-summary";
 export * from "./working-indicators";
 export * from "./server-compaction-request";
+export * from "./persistence";

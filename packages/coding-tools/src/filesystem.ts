@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { FileSystem, type FsBackend } from "@stanley2058/lilac-fs";
 import {
+  adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_URI_PREFIX,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
 } from "@stanley2058/lilac-tool-results";
@@ -175,15 +176,18 @@ export function createFilesystemTools(params: {
       execute: async ({ cwd: operationCwd, ...input }, options) => {
         if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
           const artifact = artifactIntegration
-            ? await artifactIntegration.artifacts.readWindow(
-                input.path,
-                artifactIntegration.scopeId,
-                {
-                  start: input.start ?? { type: "offset", offset: 0 },
-                  maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
-                  maxLines: Math.max(1, input.maxLines ?? 2_000),
-                  maxOutputBytes,
-                },
+            ? await adaptToolResultArtifactReadToUnavailablePolicy(
+                artifactIntegration.artifacts,
+                await artifactIntegration.artifacts.readWindow(
+                  input.path,
+                  artifactIntegration.scopeId,
+                  {
+                    start: input.start ?? { type: "offset", offset: 0 },
+                    maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
+                    maxLines: Math.max(1, input.maxLines ?? 2_000),
+                    maxOutputBytes,
+                  },
+                ),
               )
             : { ok: false as const };
           if (!artifact.ok) {

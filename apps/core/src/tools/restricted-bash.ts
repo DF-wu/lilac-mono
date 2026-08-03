@@ -728,23 +728,28 @@ export async function executeRestrictedBash(
       options.toolCallId
     ) {
       try {
-        artifactUri = (
-          await options.artifacts.createFromStream({
-            sessionId: context.sessionId,
-            requestId: context.requestId,
-            toolCallId: options.toolCallId,
+        const artifact = await options.artifacts.createFromStream({
+          sessionId: context.sessionId,
+          requestId: context.requestId,
+          toolCallId: options.toolCallId,
+          toolName: "bash",
+          source: Readable.from([
+            "--- stdout ---\n",
+            output.stdout,
+            "\n\n--- stderr ---\n",
+            output.stderr,
+            "\n",
+          ]),
+          ttlMs: outputConfig.artifactTtlMs,
+          maxBytesPerSession: outputConfig.artifactMaxBytesPerSession,
+        });
+        if (artifact.status === "ok") artifactUri = artifact.value.uri;
+        else {
+          logger.warn("tool.artifact.write_failed", {
             toolName: "bash",
-            source: Readable.from([
-              "--- stdout ---\n",
-              output.stdout,
-              "\n\n--- stderr ---\n",
-              output.stderr,
-              "\n",
-            ]),
-            ttlMs: outputConfig.artifactTtlMs,
-            maxBytesPerSession: outputConfig.artifactMaxBytesPerSession,
-          })
-        ).uri;
+            errorTag: artifact.error.name,
+          });
+        }
       } catch (error) {
         logger.warn("tool.artifact.write_failed", {
           toolName: "bash",

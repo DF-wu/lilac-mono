@@ -185,11 +185,12 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect(
         store.tryClaimRun({ runId: invocation.runId, claimerId: "worker-1", now: 101 }),
       ).not.toBeNull();
-      const artifactId = await writeWorkflowValueArtifact({
+      const artifact = await writeWorkflowValueArtifact({
         dataDir,
         value: "unrestricted result",
         maxBytes: 1_048_576,
       });
+      if (artifact.status === "error") throw artifact.error;
       expect(
         store.terminalizeRun({
           runId: invocation.runId,
@@ -199,7 +200,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           now: 102,
           detail: "unrestricted detail",
           result: null,
-          resultArtifactId: artifactId,
+          resultArtifactId: artifact.value,
         }),
       ).toBe(true);
 

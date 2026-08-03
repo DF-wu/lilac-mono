@@ -1193,11 +1193,8 @@ export async function bridgeBusToAdapter(params: {
     };
 
     const deleteUnlinkedCheckpointCandidate = async () => {
-      const deleted = await captureBusToAdapterEffect(
-        "delete-transcript-checkpoint",
-        async () =>
-          params.transcriptStore?.deleteUnlinkedCheckpointCandidate?.({ requestId }) ?? false,
-      );
+      const deleted = params.transcriptStore?.deleteUnlinkedCheckpointCandidate?.({ requestId });
+      if (!deleted) return;
       if (deleted.status === "ok") {
         if (!deleted.value) return;
         logger.info("compaction checkpoint deleted", {
@@ -1207,15 +1204,11 @@ export async function bridgeBusToAdapter(params: {
         });
         return;
       }
-      logger.warn(
-        "failed to delete unlinked compaction checkpoint candidate",
-        {
-          requestId,
-          sessionId,
-          errorClass: deleted.error.cause instanceof Error ? deleted.error.cause.name : "unknown",
-        },
-        deleted.error.cause,
-      );
+      logger.warn("failed to delete unlinked transcript checkpoint", {
+        requestId,
+        sessionId,
+        errorTag: deleted.error.name,
+      });
     };
 
     const relayStop = async () => {

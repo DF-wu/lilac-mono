@@ -13,9 +13,12 @@ import { GithubApiError } from "../github/github-api";
 import { SurfaceMessageNotFoundError, type SurfaceAdapter } from "../surface/adapter";
 import { GithubMessageCreatedError } from "../surface/github/github-adapter";
 import type { ContentOpts, MsgRef, SessionRef } from "../surface/types";
-import { DurableWorkflowStore } from "./durable-workflow-store";
+import {
+  DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+} from "./durable-workflow-store";
 import { sha256 } from "./workflow-definition";
-import type { WorkflowSurfaceActionKind } from "./workflow-domain";
+import type { WorkflowSurfaceActionKind, WorkflowSurfaceBinding } from "./workflow-domain";
 import {
   buildWorkflowProgressView,
   renderWorkflowProgressView,
@@ -257,7 +260,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
   }
 
   async reconcile(): Promise<void> {
-    for (const run of this.input.store.listRunsNeedingProjectionReconciliation(1_000)) {
+    const runs = this.input.store.listRunsNeedingProjectionReconciliation(1_000);
+    if (runs.status === "error") signalDurableWorkflowReadErrorToHost(runs.error);
+    for (const run of runs.value) {
       await this.project(run.runId, false, true).catch((error: unknown) => {
         this.logger.warn("Workflow startup projection reconciliation failed", {
           runId: run.runId,
@@ -269,7 +274,15 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
 
   private retryDue(): void {
     const now = this.input.now?.() ?? Date.now();
-    for (const binding of this.input.store.listSurfaceBindings({ dueBefore: now, limit: 1_000 })) {
+    const bindings = this.input.store.listSurfaceBindings({ dueBefore: now, limit: 1_000 });
+    if (bindings.status === "error") {
+      this.logger.warn(
+        "Workflow projection retry read failed",
+        formatTaggedErrorForLog(bindings.error),
+      );
+      return;
+    }
+    for (const binding of bindings.value) {
       this.requestProjection(binding.runId);
     }
   }
@@ -286,7 +299,15 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
   }
 
   private async drainPendingActionOutboxProjections(): Promise<void> {
-    for (const entry of this.input.store.listPendingActionOutboxProjections()) {
+    const entries = this.input.store.listPendingActionOutboxProjections();
+    if (entries.status === "error") {
+      this.logger.warn(
+        "Workflow action outbox projection read failed",
+        formatTaggedErrorForLog(entries.error),
+      );
+      return;
+    }
+    for (const entry of entries.value) {
       try {
         await this.project(entry.runId);
         if (
@@ -380,7 +401,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
   }
 
   private writeFailure(
-    binding: NonNullable<ReturnType<DurableWorkflowStore["getSurfaceBinding"]>>,
+    binding: WorkflowSurfaceBinding,
     error: unknown,
     now: number,
     overrides?: Partial<Pick<typeof binding, "messageRef" | "lastRenderedSha256">>,
@@ -417,7 +438,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     requireMessage: boolean,
     verifyExisting: boolean,
   ): Promise<MsgRef | null> {
-    const run = this.input.store.getRun(runId);
+    const runResult = this.input.store.getRun(runId);
+    if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+    const run = runResult.value;
     if (run?.progressTarget === null) {
       if (requireMessage) {
         throw new Error(`Workflow run ${runId} has no supported durable progress target`);
@@ -438,7 +461,10 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     const adapter = this.input.adapters.get(target.platform);
     if (!adapter) throw new Error(`Workflow progress adapter is unavailable: ${target.platform}`);
 
-    let existing = this.input.store.getSurfaceBinding(runId);
+    const existingResult = this.input.store.getSurfaceBinding(runId);
+    if (existingResult.status === "error")
+      signalDurableWorkflowReadErrorToHost(existingResult.error);
+    let existing: WorkflowSurfaceBinding | null = existingResult.value;
     if (!existing) {
       existing = {
         runId,

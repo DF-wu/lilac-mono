@@ -194,14 +194,16 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const adapter = new FakeAdapter();
     const unlinked: Array<{ platform: string; channelId: string; messageId: string }> = [];
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       unlinkSurfaceMessage(input) {
         unlinked.push(input);
-        return { requestId: "request", checkpointDeleted: true };
+        return Result.ok({ requestId: "request", checkpointDeleted: true });
       },
       close() {},
     };
@@ -224,10 +226,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const adapter = new FakeAdapter();
     const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
       linkSurfaceMessagesToRequest() {},
       getTranscriptBySurfaceMessage() {
-        return null;
+        return Result.ok(null);
       },
       unlinkSurfaceMessage() {
         throw new Error("unlink failed");

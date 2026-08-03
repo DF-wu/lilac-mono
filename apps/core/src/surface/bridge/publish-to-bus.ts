@@ -149,9 +149,16 @@ export async function bridgeAdapterToBus(params: {
             channelId: evt.messageRef.channelId,
             messageId: evt.messageRef.messageId,
           });
-          if (unlinkResult?.checkpointDeleted) {
+          if (unlinkResult?.status === "error") {
+            logger.warn("failed to unlink deleted surface message", {
+              platform: evt.messageRef.platform,
+              channelId: evt.messageRef.channelId,
+              messageId: evt.messageRef.messageId,
+              errorTag: unlinkResult.error.name,
+            });
+          } else if (unlinkResult?.value.checkpointDeleted) {
             logger.info("compaction checkpoint deleted", {
-              requestId: unlinkResult.requestId,
+              requestId: unlinkResult.value.requestId,
               platform: evt.messageRef.platform,
               channelId: evt.messageRef.channelId,
               messageId: evt.messageRef.messageId,

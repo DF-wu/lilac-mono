@@ -9,10 +9,8 @@ import {
   miniLilacMessagesSchema,
   miniLilacReconnectQuerySchema,
   miniLilacRedoRequestSchema,
-  miniLilacRedoResultSchema,
   miniLilacSteerRequestSchema,
   miniLilacUndoRequestSchema,
-  miniLilacUndoResultSchema,
   miniLilacUpdateSessionBindingsRequestSchema,
   type MiniLilacModelSummary,
   type MiniLilacProfileSummary,
@@ -22,12 +20,14 @@ import {
 } from "@stanley2058/mini-lilac-client";
 import {
   HistoryRecoveryAbandonedError,
+  type MiniLilacPersistenceError,
   type ModelCatalogSnapshot,
   type RuntimeConfig,
   type SessionService,
   WorkspaceHistoryStoreError,
 } from "@stanley2058/mini-lilac-runtime";
 import { createUIMessageStreamResponse, safeValidateUIMessages } from "ai";
+import type { Result as ResultType } from "better-result";
 import Elysia from "elysia";
 import { z } from "zod";
 
@@ -78,6 +78,24 @@ class ApiError extends Error {
     message: string,
   ) {
     super(message);
+  }
+}
+
+export function adaptMiniLilacPersistenceResultToHost<T>(
+  result: ResultType<T, MiniLilacPersistenceError>,
+): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "UnsupportedVersion":
+    case "MalformedSerialization":
+    case "CorruptPersistedFields":
+    case "MiniLilacSqliteDriverFailure":
+    case "MiniLilacHistoryRecordMissing":
+      throw new ApiError(
+        500,
+        "persistence_failure",
+        "The persisted Mini Lilac session could not be read",
+      );
   }
 }
 
@@ -262,7 +280,9 @@ function existingSession(
   sessionService: SessionService,
   sessionId: string,
 ): MiniLilacSessionSnapshot | undefined {
-  return sessionService.store.listSessions().find((session) => session.id === sessionId);
+  return adaptMiniLilacPersistenceResultToHost(sessionService.listSessionsResult()).find(
+    (session) => session.id === sessionId,
+  );
 }
 
 async function validateSessionBinding(
@@ -395,14 +415,17 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
             );
           }
           try {
-            snapshot = await sessionService.createSession({
-              id: request.id,
-              cwd: request.cwd,
-              model: request.model,
-              profile: request.profile,
-              reasoning: request.reasoning,
-            });
+            snapshot = adaptMiniLilacPersistenceResultToHost(
+              await sessionService.createSessionResult({
+                id: request.id,
+                cwd: request.cwd,
+                model: request.model,
+                profile: request.profile,
+                reasoning: request.reasoning,
+              }),
+            );
           } catch (error) {
+            if (error instanceof ApiError) throw error;
             const message = error instanceof Error ? error.message : String(error);
             throw new ApiError(400, "invalid_session_configuration", message);
           }
@@ -411,7 +434,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
         }
 
         const commandId = request.clientCommandId ?? crypto.randomUUID();
-        const started = await sessionService.startPrompt(snapshot.id, userMessage, commandId);
+        const started = adaptMiniLilacPersistenceResultToHost(
+          await sessionService.startPromptResult(snapshot.id, userMessage, commandId),
+        );
         return uiMessageStreamResponse(started.stream);
       });
     }),
@@ -425,7 +450,7 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       if (!snapshot) throw new ApiError(404, "not_found", `Session '${sessionId}' was not found`);
       const runId = "runId" in reconnect ? reconnect.runId : snapshot.activeRunId;
       if (runId === null) return new Response(null, { status: 204 });
-      const run = sessionService.store.getRun(runId);
+      const run = adaptMiniLilacPersistenceResultToHost(sessionService.getRunResult(runId));
       if (run.sessionId !== sessionId) {
         throw new ApiError(
           409,
@@ -435,22 +460,29 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       }
       if (run.status !== "active") return new Response(null, { status: 204 });
       const afterSeq = "after" in reconnect ? reconnect.after : 0;
-      return uiMessageStreamResponse(sessionService.replayRun(run.id, { afterSeq }));
+      return uiMessageStreamResponse(
+        adaptMiniLilacPersistenceResultToHost(sessionService.replayRunResult(run.id, { afterSeq })),
+      );
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId`, ({ params }) =>
     safely(() => {
       const { sessionId } = sessionParamsSchema.parse(params);
-      return jsonResponse(sessionService.getSnapshot(sessionId));
+      return jsonResponse(
+        adaptMiniLilacPersistenceResultToHost(sessionService.getSnapshotResult(sessionId)),
+      );
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/resume`, ({ params }) =>
     safely(async () => {
       const { sessionId } = sessionParamsSchema.parse(params);
-      const resume = await sessionService.getSessionResume(sessionId);
-      return jsonResponse({ ...resume, todos: sessionService.getTodos(sessionId) });
+      const resume = adaptMiniLilacPersistenceResultToHost(
+        await sessionService.getSessionResumeResult(sessionId),
+      );
+      const todos = adaptMiniLilacPersistenceResultToHost(sessionService.getTodosResult(sessionId));
+      return jsonResponse({ ...resume, todos });
     }),
   );
 
@@ -463,8 +495,7 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       } catch {
         throw new ApiError(400, "invalid_cwd", `Session cwd '${cwd}' does not exist`);
       }
-      const sessions = sessionService.store
-        .listSessions()
+      const sessions = adaptMiniLilacPersistenceResultToHost(sessionService.listSessionsResult())
         .filter((session) => session.cwd === canonicalCwd && !session.id.startsWith("sub:"))
         .toSorted((left, right) => {
           const timestamp = (right.updatedAt ?? right.createdAt ?? "").localeCompare(
@@ -479,14 +510,18 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/messages`, ({ params }) =>
     safely(() => {
       const { sessionId } = sessionParamsSchema.parse(params);
-      return jsonResponse(sessionService.getMessages(sessionId));
+      return jsonResponse(
+        adaptMiniLilacPersistenceResultToHost(sessionService.getMessagesResult(sessionId)),
+      );
     }),
   );
 
   app.get(`${MINI_LILAC_API_PREFIX}/sessions/:sessionId/todos`, ({ params }) =>
     safely(() => {
       const { sessionId } = sessionParamsSchema.parse(params);
-      const todos: MiniLilacTodoState = sessionService.getTodos(sessionId);
+      const todos: MiniLilacTodoState = adaptMiniLilacPersistenceResultToHost(
+        sessionService.getTodosResult(sessionId),
+      );
       return jsonResponse(todos);
     }),
   );
@@ -515,7 +550,11 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
       return withSessionLock(sessionId, async () =>
-        jsonResponse(await sessionService.updateSessionBindings(request)),
+        jsonResponse(
+          adaptMiniLilacPersistenceResultToHost(
+            await sessionService.updateSessionBindingsResult(request),
+          ),
+        ),
       );
     }),
   );
@@ -528,7 +567,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       if (request.sessionId !== sessionId) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
-      return jsonResponse(await sessionService.steer(request));
+      return jsonResponse(
+        adaptMiniLilacPersistenceResultToHost(await sessionService.steerResult(request)),
+      );
     }),
   );
 
@@ -542,7 +583,11 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
         if (request.sessionId !== sessionId) {
           throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
         }
-        return jsonResponse(await sessionService.interruptQueuedSteering(request));
+        return jsonResponse(
+          adaptMiniLilacPersistenceResultToHost(
+            await sessionService.interruptQueuedSteeringResult(request),
+          ),
+        );
       }),
   );
 
@@ -554,7 +599,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       if (request.sessionId !== sessionId) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
-      return jsonResponse(await sessionService.cancel(request));
+      return jsonResponse(
+        adaptMiniLilacPersistenceResultToHost(await sessionService.cancelResult(request)),
+      );
     }),
   );
 
@@ -567,7 +614,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
       return withSessionLock(sessionId, async () =>
-        jsonResponse(miniLilacUndoResultSchema.parse(await sessionService.undo(request))),
+        jsonResponse(
+          adaptMiniLilacPersistenceResultToHost(await sessionService.undoResult(request)),
+        ),
       );
     }),
   );
@@ -581,7 +630,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
       return withSessionLock(sessionId, async () =>
-        jsonResponse(miniLilacRedoResultSchema.parse(await sessionService.redo(request))),
+        jsonResponse(
+          adaptMiniLilacPersistenceResultToHost(await sessionService.redoResult(request)),
+        ),
       );
     }),
   );
@@ -602,7 +653,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       // a view of the compaction, not its owner. Disconnecting detaches the
       // client and compaction still commits; stopping it is an explicit call to
       // the cancel endpoint below.
-      const started = await withSessionLock(sessionId, () => sessionService.compact(request));
+      const started = adaptMiniLilacPersistenceResultToHost(
+        await withSessionLock(sessionId, () => sessionService.compactResult(request)),
+      );
       return uiMessageStreamResponse(started.stream);
     }),
   );
@@ -614,7 +667,9 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
       if (request.sessionId !== sessionId) {
         throw new ApiError(409, "session_id_mismatch", "Body sessionId does not match the path");
       }
-      return jsonResponse(await sessionService.cancelCompaction(request));
+      return jsonResponse(
+        adaptMiniLilacPersistenceResultToHost(await sessionService.cancelCompactionResult(request)),
+      );
     }),
   );
 

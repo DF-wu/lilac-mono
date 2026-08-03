@@ -10,7 +10,7 @@ import {
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
-import { DurableWorkflowStore } from "./durable-workflow-store";
+import { DurableWorkflowStore, type DurableWorkflowReadError } from "./durable-workflow-store";
 import type { WorkflowWait } from "./workflow-domain";
 import { matchWorkflowReplyWait, workflowReplyMatchKey } from "./workflow-waits";
 
@@ -93,7 +93,8 @@ type WorkflowWaitResolverActivationError =
 
 type WorkflowWaitResolverDeliveryError =
   | WorkflowWaitResolverLeaseLost
-  | WorkflowWaitResolverCheckpointNotAdvanced;
+  | WorkflowWaitResolverCheckpointNotAdvanced
+  | DurableWorkflowReadError;
 
 type WorkflowWaitResolverSubscription = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
@@ -107,6 +108,12 @@ function workflowWaitResolverDeliveryPolicy(
     case "WorkflowWaitResolverLeaseLost":
     case "WorkflowWaitResolverCheckpointNotAdvanced":
       return "stop";
+    case "UnsupportedVersion":
+    case "MalformedSerialization":
+    case "CorruptPersistedFields":
+      return "dead-letter";
+    case "DurableWorkflowSqliteDriverFailure":
+      return "park-pending";
   }
 }
 
@@ -215,7 +222,8 @@ export class WorkflowWaitResolver {
             return Result.err(this.leaseLost(context.cursor));
           }
           if (message.type === lilacEventTypes.EvtAdapterMessageCreated) {
-            await this.resolveAdapterEvent(message.data, context.cursor);
+            const resolved = await this.resolveAdapterEvent(message.data, context.cursor);
+            if (resolved.status === "error") return Result.err(resolved.error);
           } else if (message.type === lilacEventTypes.EvtWorkflowWaitResolverBarrier) {
             if (!this.ensureLeaseOwnership(this.now())) {
               return Result.err(this.leaseLost(context.cursor));
@@ -502,13 +510,18 @@ export class WorkflowWaitResolver {
     return true;
   }
 
-  async resolveAdapterEvent(event: EvtAdapterMessageCreatedData, cursor: string): Promise<void> {
+  async resolveAdapterEvent(
+    event: EvtAdapterMessageCreatedData,
+    cursor: string,
+  ): Promise<ResultType<void, DurableWorkflowReadError>> {
     const key = workflowReplyMatchKey(event.platform, event.channelId);
-    for (const candidate of this.input.store.listActiveWaitsByMatchKey("reply", key)) {
+    const candidates = this.input.store.listActiveWaitsByMatchKey("reply", key);
+    if (candidates.status === "error") return Result.err(candidates.error);
+    for (const candidate of candidates.value) {
       const result = matchWorkflowReplyWait(candidate, event);
       if (result === null) continue;
       const now = this.now();
-      if (!this.ensureLeaseOwnership(now)) return;
+      if (!this.ensureLeaseOwnership(now)) return Result.ok(undefined);
       const resolved = this.input.store.resolveReplyWaitAndSuppress({
         runId: candidate.runId,
         operationId: candidate.operationId,
@@ -522,6 +535,7 @@ export class WorkflowWaitResolver {
       });
       if (resolved) await this.publishWakeupAdvisory(resolved);
     }
+    return Result.ok(undefined);
   }
 
   async reconcileTimers(): Promise<void> {
@@ -557,7 +571,7 @@ export class WorkflowWaitResolver {
   }
 
   private async reconcileTimersResult(): Promise<
-    ResultType<void, WorkflowWaitResolverBarrierPublishFailed>
+    ResultType<void, WorkflowWaitResolverBarrierPublishFailed | DurableWorkflowReadError>
   > {
     if (this.polling) return Result.ok(undefined);
     this.polling = true;
@@ -565,7 +579,8 @@ export class WorkflowWaitResolver {
       const now = this.now();
       if (!this.ensureLeaseOwnership(now)) return Result.ok(undefined);
       const candidates = this.input.store.listDueWaits(now);
-      for (const candidate of candidates) {
+      if (candidates.status === "error") return Result.err(candidates.error);
+      for (const candidate of candidates.value) {
         if (candidate.match.kind === "reply") {
           if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
           const barrier = this.input.store.prepareWaitExpiryBarrier({
@@ -592,7 +607,9 @@ export class WorkflowWaitResolver {
           }
           if (!barrier.processed) continue;
         }
-        const runOwnerId = this.input.store.getRun(candidate.runId)?.claimedBy;
+        const runResult = this.input.store.getRun(candidate.runId);
+        if (runResult.status === "error") return Result.err(runResult.error);
+        const runOwnerId = runResult.value?.claimedBy;
         if (!runOwnerId) continue;
         if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
         const claimed = this.input.store.tryClaimWait({
@@ -640,8 +657,10 @@ export class WorkflowWaitResolver {
 
   private async captureWorkflowWaitResolverWakeupPublication(
     wait: WorkflowWait,
-  ): Promise<ResultType<void, WorkflowWaitResolverWakeupPublishFailed>> {
-    const run = this.input.store.getRun(wait.runId);
+  ): Promise<ResultType<void, WorkflowWaitResolverWakeupPublishFailed | DurableWorkflowReadError>> {
+    const runResult = this.input.store.getRun(wait.runId);
+    if (runResult.status === "error") return Result.err(runResult.error);
+    const run = runResult.value;
     if (!run) return Result.ok(undefined);
     try {
       await this.input.bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {

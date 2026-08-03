@@ -41,9 +41,19 @@ export function selectNewestReachableCheckpoint<T>(input: {
       channelId: input.channelId,
       messageId,
     });
+    if (resolved.status === "error") {
+      logger.warn("compaction checkpoint transcript read failed", {
+        table: "table" in resolved.error ? resolved.error.table : "request_transcripts",
+        field: "field" in resolved.error ? resolved.error.field : "row",
+        issueCode: "issueCode" in resolved.error ? resolved.error.issueCode : "sqlite-driver",
+      });
+      resolvedSnapshotsBySurfaceMessageId.set(messageId, null);
+      return null;
+    }
     const snapshot =
-      resolved?.requestClient === input.platform && resolved.sessionId === input.channelId
-        ? resolved
+      resolved.value?.requestClient === input.platform &&
+      resolved.value.sessionId === input.channelId
+        ? resolved.value
         : null;
     resolvedSnapshotsBySurfaceMessageId.set(messageId, snapshot);
     return snapshot;

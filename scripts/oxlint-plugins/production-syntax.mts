@@ -26,6 +26,10 @@ import {
 export type LocalRecordGuardKind = "local-record-guard";
 export type PresentationDecoderImportKind = "presentation-decoder-import";
 export type ResultCallbackKind = "inline-async-result-callback";
+export type StoreInlineDecodingKind = "store-inline-json-decoding" | "store-inline-schema-decoding";
+export type DirectSqliteTransactionKind =
+  | "direct-sqlite-transaction"
+  | "manual-sqlite-transaction-control";
 
 function sourceFileOf(sourceText: string, filePath: string): ts.SourceFile {
   return ts.createSourceFile(
@@ -66,6 +70,28 @@ function unwrappedExpression(expression: ts.Expression): ts.Expression {
     current = current.expression;
   }
   return current;
+}
+
+function registrationOwnsSourceSymbol(
+  module: string,
+  symbol: string,
+  identity: { readonly module: string; readonly exportName: string },
+): boolean {
+  return (
+    moduleWithoutExtension(identity.module) === module &&
+    (symbol === identity.exportName || symbol.startsWith(`${identity.exportName}.`))
+  );
+}
+
+function findingOwnedByRegistration<Kind extends string>(
+  finding: SyntacticFinding<Kind>,
+  registrations: readonly {
+    readonly identity: { readonly module: string; readonly exportName: string };
+  }[],
+): boolean {
+  return registrations.some((registration) =>
+    registrationOwnsSourceSymbol(finding.module, finding.symbol, registration.identity),
+  );
 }
 
 function isGlobalThis(expression: ts.Expression): boolean {
@@ -1346,6 +1372,242 @@ export function findInlineAsyncResultCallbackViolations(
   return findings;
 }
 
+const STORE_SCHEMA_DECODER_MEMBERS = new Set([
+  "parse",
+  "parseAsync",
+  "safeParse",
+  "safeParseAsync",
+]);
+
+function collectMemberFunctionAliases(
+  sourceFile: ts.SourceFile,
+  members: ReadonlySet<string>,
+): ReadonlyMap<string, string> {
+  const counts = collectBindingNameCounts(sourceFile);
+  const aliases = new Map<string, string>();
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      counts.get(node.name.text) === 1
+    ) {
+      const parts = propertyAccessParts(node.initializer);
+      if (parts && members.has(parts[1])) {
+        const receiver = unwrappedExpression(parts[0]);
+        const member =
+          parts[1] === "parse" && ts.isIdentifier(receiver) && receiver.text === "JSON"
+            ? "JSON.parse"
+            : parts[1];
+        aliases.set(node.name.text, member);
+      }
+      const source = unwrappedExpression(node.initializer);
+      if (ts.isIdentifier(source)) {
+        const member = aliases.get(source.text);
+        if (member) aliases.set(node.name.text, member);
+      }
+    }
+    if (
+      ts.isBindingElement(node) &&
+      ts.isIdentifier(node.name) &&
+      counts.get(node.name.text) === 1
+    ) {
+      const property = node.propertyName ?? node.name;
+      if (
+        (ts.isIdentifier(property) || ts.isStringLiteralLike(property)) &&
+        members.has(property.text)
+      ) {
+        const pattern = node.parent;
+        const declaration = ts.isObjectBindingPattern(pattern) ? pattern.parent : undefined;
+        const initializer =
+          declaration && ts.isVariableDeclaration(declaration) && declaration.initializer
+            ? unwrappedExpression(declaration.initializer)
+            : undefined;
+        const member =
+          property.text === "parse" &&
+          initializer &&
+          ts.isIdentifier(initializer) &&
+          initializer.text === "JSON"
+            ? "JSON.parse"
+            : property.text;
+        aliases.set(node.name.text, member);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return aliases;
+}
+
+export function findStoreInlineDecodingViolations(
+  sourceText: string,
+  filePath = "apps/example/src/store.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<StoreInlineDecodingKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  const sourceFile = sourceFileOf(sourceText, filePath);
+  const identity = sourceIdentity(filePath);
+  const registrations =
+    manifest.workspaces
+      .find((workspace) => workspace.name === identity.workspace)
+      ?.persistedStoreConsumers.filter((registration) => registration.status === "enforced") ?? [];
+  if (registrations.length === 0) return [];
+  const decoderAliases = collectMemberFunctionAliases(
+    sourceFile,
+    new Set(["parse", ...STORE_SCHEMA_DECODER_MEMBERS]),
+  );
+  const findings: SyntacticFinding<StoreInlineDecodingKind>[] = [];
+  const add = (node: ts.Node, kind: StoreInlineDecodingKind, message: string): void => {
+    const finding = createFinding(sourceFile, filePath, node, kind, message);
+    if (findingOwnedByRegistration(finding, registrations)) findings.push(finding);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = unwrappedExpression(node.expression);
+      if (ts.isIdentifier(callee)) {
+        const aliasedMember = decoderAliases.get(callee.text);
+        if (aliasedMember === "JSON.parse") {
+          add(
+            node,
+            "store-inline-json-decoding",
+            "Call the registered persisted codec instead of an aliased JSON parser inside a migrated store scope",
+          );
+        } else if (aliasedMember && STORE_SCHEMA_DECODER_MEMBERS.has(aliasedMember)) {
+          add(
+            node,
+            "store-inline-schema-decoding",
+            "Call the registered persisted codec instead of an aliased schema decoder inside a migrated store scope",
+          );
+        }
+      }
+      const parts = propertyAccessParts(node.expression);
+      if (parts) {
+        const receiver = unwrappedExpression(parts[0]);
+        if (parts[1] === "parse" && ts.isIdentifier(receiver) && receiver.text === "JSON") {
+          add(
+            node,
+            "store-inline-json-decoding",
+            "Call the registered persisted codec instead of JSON.parse inside a migrated store scope",
+          );
+        } else if (STORE_SCHEMA_DECODER_MEMBERS.has(parts[1])) {
+          add(
+            node,
+            "store-inline-schema-decoding",
+            "Call the registered persisted codec instead of invoking a schema decoder inside a migrated store scope",
+          );
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
+function collectStaticStrings(sourceFile: ts.SourceFile): ReadonlyMap<string, string> {
+  const counts = collectBindingNameCounts(sourceFile);
+  const values = new Map<string, string>();
+  const declarations: ts.VariableDeclaration[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      declarations.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const declaration of declarations) {
+      if (counts.get(declaration.name.getText(sourceFile)) !== 1) continue;
+      const name = declaration.name.getText(sourceFile);
+      if (values.has(name)) continue;
+      const initializer = declaration.initializer && unwrappedExpression(declaration.initializer);
+      let value: string | undefined;
+      if (initializer && ts.isStringLiteralLike(initializer)) {
+        value = initializer.text;
+      } else if (initializer && ts.isIdentifier(initializer)) {
+        value = values.get(initializer.text);
+      }
+      if (value !== undefined) {
+        values.set(name, value);
+        changed = true;
+      }
+    }
+  }
+  return values;
+}
+
+function staticSqlText(
+  expression: ts.Expression,
+  staticStrings: ReadonlyMap<string, string>,
+): string | undefined {
+  const unwrapped = unwrappedExpression(expression);
+  if (ts.isStringLiteralLike(unwrapped)) return unwrapped.text;
+  if (ts.isNoSubstitutionTemplateLiteral(unwrapped)) return unwrapped.text;
+  if (ts.isIdentifier(unwrapped)) return staticStrings.get(unwrapped.text);
+  return undefined;
+}
+
+export function findDirectSqliteTransactionViolations(
+  sourceText: string,
+  filePath = "apps/example/src/store.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+  manifest: ArchitectureManifest = architectureManifest,
+): SyntacticFinding<DirectSqliteTransactionKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  const sourceFile = sourceFileOf(sourceText, filePath);
+  const identity = sourceIdentity(filePath);
+  const registrations =
+    manifest.workspaces
+      .find((workspace) => workspace.name === identity.workspace)
+      ?.sqliteTransactionConsumers.filter((registration) => registration.status === "enforced") ??
+    [];
+  if (registrations.length === 0) return [];
+  const transactionAliases = collectMemberFunctionAliases(sourceFile, new Set(["transaction"]));
+  const staticStrings = collectStaticStrings(sourceFile);
+  const findings: SyntacticFinding<DirectSqliteTransactionKind>[] = [];
+  const add = (node: ts.Node, kind: DirectSqliteTransactionKind, message: string): void => {
+    const finding = createFinding(sourceFile, filePath, node, kind, message);
+    if (findingOwnedByRegistration(finding, registrations)) findings.push(finding);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = unwrappedExpression(node.expression);
+      if (ts.isIdentifier(callee) && transactionAliases.get(callee.text) === "transaction") {
+        add(
+          node,
+          "direct-sqlite-transaction",
+          "Call the registered SQLite Result adapter instead of an aliased Database.transaction",
+        );
+      }
+      const parts = propertyAccessParts(node.expression);
+      if (parts?.[1] === "transaction") {
+        add(
+          node,
+          "direct-sqlite-transaction",
+          "Call the registered SQLite Result adapter instead of Database.transaction in a migrated consumer",
+        );
+      }
+      for (const argument of node.arguments) {
+        if (ts.isSpreadElement(argument)) continue;
+        const sql = staticSqlText(argument, staticStrings);
+        if (sql && /(?:^\s*|[;\n]\s*)(?:BEGIN|COMMIT|ROLLBACK)\b/iu.test(sql)) {
+          add(
+            argument,
+            "manual-sqlite-transaction-control",
+            "Use the registered SQLite Result adapter instead of manual BEGIN, COMMIT, or ROLLBACK",
+          );
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
 function ruleFromFinder<Kind extends string>(
   description: string,
   finder: (sourceText: string, filePath: string) => readonly SyntacticFinding<Kind>[],
@@ -1382,4 +1644,12 @@ export const noInlineAsyncResultCallbackRule = ruleFromFinder(
 export const noPresentationDecoderImportRule = ruleFromFinder(
   "Disallow Zod parser imports in activated unknown-free presentation modules",
   findPresentationDecoderImportViolations,
+);
+export const noStoreInlineDecodingRule = ruleFromFinder(
+  "Disallow inline JSON and schema decoding in exact migrated store scopes",
+  findStoreInlineDecodingViolations,
+);
+export const noDirectSqliteTransactionRule = ruleFromFinder(
+  "Disallow raw SQLite transactions and manual transaction control in exact migrated consumers",
+  findDirectSqliteTransactionViolations,
 );

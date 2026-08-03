@@ -6,6 +6,7 @@ import {
   composeSingleMessage,
 } from "../../../src/surface/bridge/request-composition";
 import type { ModelMessage } from "ai";
+import { Result } from "better-result";
 import type {
   AdapterEventHandler,
   AdapterSubscription,
@@ -13,7 +14,7 @@ import type {
   SurfaceAdapter,
   SurfaceOutputStream,
 } from "../../../src/surface/adapter";
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
+import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
 import type {
   AdapterCapabilities,
   ContentOpts,
@@ -25,6 +26,23 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
+
+function transcriptStoreFor(
+  resolve: (
+    input: Parameters<TranscriptStore["getTranscriptBySurfaceMessage"]>[0],
+  ) => TranscriptSnapshot | null,
+): TranscriptStore {
+  return {
+    saveRequestTranscript() {
+      return Result.ok(undefined);
+    },
+    linkSurfaceMessagesToRequest() {},
+    getTranscriptBySurfaceMessage(input) {
+      return Result.ok(resolve(input));
+    },
+    close() {},
+  };
+}
 
 class FakeAdapter implements SurfaceAdapter {
   constructor(
@@ -2491,63 +2509,58 @@ describe("request-composition active channel burst rules", () => {
     ];
 
     const lookupCounts = new Map<string, number>();
-    const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
-      linkSurfaceMessagesToRequest() {},
-      close() {},
-      getTranscriptBySurfaceMessage(input) {
-        lookupCounts.set(input.messageId, (lookupCounts.get(input.messageId) ?? 0) + 1);
-        const expanded = (content: string): ModelMessage[] => [{ role: "assistant", content }];
-        if (input.messageId === "8") {
-          return {
-            requestId: "r8",
-            sessionId,
-            requestClient: "discord",
-            createdTs: 0,
-            updatedTs: 0,
-            messages: [
-              {
-                role: "assistant",
-                content: [
-                  {
-                    type: "tool-call",
-                    toolCallId: "call-old",
-                    toolName: "bash",
-                    input: { command: "pwd" },
-                  },
-                  {
-                    type: "text",
-                    text: '[discord user_id=bot user_name=lilac message_id=old message_time="Jan 01, 00:00"]\nFALLBACK_OLD',
-                  },
-                ],
-              },
-              {
-                role: "tool",
-                content: [
-                  {
-                    type: "tool-result",
-                    toolCallId: "call-old",
-                    toolName: "bash",
-                    output: { type: "text", value: "/tmp" },
-                  },
-                ],
-              },
-            ],
-          };
-        }
-        if (input.messageId === "9") {
-          return {
-            requestId: "r9",
-            sessionId,
-            requestClient: "discord",
-            createdTs: 0,
-            updatedTs: 0,
-            messages: expanded("EXPANDED_RECENT"),
-          };
-        }
-        return null;
-      },
-    };
+    const transcriptStore = transcriptStoreFor((input) => {
+      lookupCounts.set(input.messageId, (lookupCounts.get(input.messageId) ?? 0) + 1);
+      const expanded = (content: string): ModelMessage[] => [{ role: "assistant", content }];
+      if (input.messageId === "8") {
+        return {
+          requestId: "r8",
+          sessionId,
+          requestClient: "discord",
+          createdTs: 0,
+          updatedTs: 0,
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool-call",
+                  toolCallId: "call-old",
+                  toolName: "bash",
+                  input: { command: "pwd" },
+                },
+                {
+                  type: "text",
+                  text: '[discord user_id=bot user_name=lilac message_id=old message_time="Jan 01, 00:00"]\nFALLBACK_OLD',
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-old",
+                  toolName: "bash",
+                  output: { type: "text", value: "/tmp" },
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (input.messageId === "9") {
+        return {
+          requestId: "r9",
+          sessionId,
+          requestClient: "discord",
+          createdTs: 0,
+          updatedTs: 0,
+          messages: expanded("EXPANDED_RECENT"),
+        };
+      }
+      return null;
+    });
 
     const adapter = new ListFakeAdapter(msgs);
 
@@ -2624,23 +2637,18 @@ describe("request-composition active channel burst rules", () => {
         raw: { reference: {} },
       },
     ];
-    const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
-      linkSurfaceMessagesToRequest() {},
-      close() {},
-      getTranscriptBySurfaceMessage(input) {
-        if (input.messageId !== "checkpoint") return null;
-        return {
-          requestId: "checkpoint-request",
-          sessionId,
-          requestClient: "discord",
-          createdTs: 0,
-          updatedTs: 0,
-          messages: [{ role: "user", content: "PERSISTED_CHECKPOINT" }],
-          contextMeta: { type: "compaction", formatVersion: 1 },
-        };
-      },
-    };
+    const transcriptStore = transcriptStoreFor((input) => {
+      if (input.messageId !== "checkpoint") return null;
+      return {
+        requestId: "checkpoint-request",
+        sessionId,
+        requestClient: "discord",
+        createdTs: 0,
+        updatedTs: 0,
+        messages: [{ role: "user", content: "PERSISTED_CHECKPOINT" }],
+        contextMeta: { type: "compaction", formatVersion: 1 },
+      };
+    });
 
     const out = await composeRecentChannelMessages(new ListFakeAdapter(messages), {
       platform: "discord",
@@ -2690,62 +2698,57 @@ describe("request-composition active channel burst rules", () => {
       mkUser("10", anchorTs, "<@bot> trigger"),
     ];
 
-    const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
-      linkSurfaceMessagesToRequest() {},
-      close() {},
-      getTranscriptBySurfaceMessage(input) {
-        const expanded = (content: string): ModelMessage[] => [{ role: "assistant", content }];
-        if (input.messageId === "8") {
-          return {
-            requestId: "r8",
-            sessionId,
-            requestClient: "discord",
-            createdTs: 0,
-            updatedTs: 0,
-            messages: [
-              {
-                role: "assistant",
-                content: [
-                  {
-                    type: "tool-call",
-                    toolCallId: "call-old",
-                    toolName: "bash",
-                    input: { command: "pwd" },
-                  },
-                  {
-                    type: "text",
-                    text: '[discord user_id=bot user_name=lilac message_id=old message_time="Jan 01, 00:00"]\nFALLBACK_OLD',
-                  },
-                ],
-              },
-              {
-                role: "tool",
-                content: [
-                  {
-                    type: "tool-result",
-                    toolCallId: "call-old",
-                    toolName: "bash",
-                    output: { type: "text", value: "/tmp" },
-                  },
-                ],
-              },
-            ],
-          };
-        }
-        if (input.messageId === "9") {
-          return {
-            requestId: "r9",
-            sessionId,
-            requestClient: "discord",
-            createdTs: 0,
-            updatedTs: 0,
-            messages: expanded("EXPANDED_RECENT"),
-          };
-        }
-        return null;
-      },
-    };
+    const transcriptStore = transcriptStoreFor((input) => {
+      const expanded = (content: string): ModelMessage[] => [{ role: "assistant", content }];
+      if (input.messageId === "8") {
+        return {
+          requestId: "r8",
+          sessionId,
+          requestClient: "discord",
+          createdTs: 0,
+          updatedTs: 0,
+          messages: [
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "tool-call",
+                  toolCallId: "call-old",
+                  toolName: "bash",
+                  input: { command: "pwd" },
+                },
+                {
+                  type: "text",
+                  text: '[discord user_id=bot user_name=lilac message_id=old message_time="Jan 01, 00:00"]\nFALLBACK_OLD',
+                },
+              ],
+            },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call-old",
+                  toolName: "bash",
+                  output: { type: "text", value: "/tmp" },
+                },
+              ],
+            },
+          ],
+        };
+      }
+      if (input.messageId === "9") {
+        return {
+          requestId: "r9",
+          sessionId,
+          requestClient: "discord",
+          createdTs: 0,
+          updatedTs: 0,
+          messages: expanded("EXPANDED_RECENT"),
+        };
+      }
+      return null;
+    });
 
     const adapter = new ListFakeAdapter(msgs);
 
@@ -2881,23 +2884,18 @@ describe("request-composition active channel burst rules", () => {
       }
     }
 
-    const transcriptStore: TranscriptStore = {
-      saveRequestTranscript() {},
-      linkSurfaceMessagesToRequest() {},
-      close() {},
-      getTranscriptBySurfaceMessage(input) {
-        if (input.messageId !== "root") return null;
-        return {
-          requestId: "rroot",
-          sessionId,
-          requestClient: "discord",
-          createdTs: 0,
-          updatedTs: 0,
-          messages: [{ role: "assistant", content: "EXPANDED_ROOT" }],
-          contextMeta: { type: "compaction", formatVersion: 1 },
-        };
-      },
-    };
+    const transcriptStore = transcriptStoreFor((input) => {
+      if (input.messageId !== "root") return null;
+      return {
+        requestId: "rroot",
+        sessionId,
+        requestClient: "discord",
+        createdTs: 0,
+        updatedTs: 0,
+        messages: [{ role: "assistant", content: "EXPANDED_ROOT" }],
+        contextMeta: { type: "compaction", formatVersion: 1 },
+      };
+    });
 
     const adapter = new ReplyChainAdapter({
       [`${sessionId}:root`]: root,

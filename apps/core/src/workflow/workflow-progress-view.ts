@@ -1,4 +1,5 @@
 import type { SurfaceAction, SurfacePlatform } from "../surface/types";
+import { signalDurableWorkflowReadErrorToHost } from "./durable-workflow-store";
 import type {
   DurableWorkflowStore,
   WorkflowOperationProgressSummary,
@@ -175,25 +176,43 @@ export async function buildWorkflowProgressView(input: {
   runId: string;
   now?: number;
 }): Promise<WorkflowProgressView> {
-  const run = input.store.getRun(input.runId);
+  const runResult = input.store.getRun(input.runId);
+  if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+  const run = runResult.value;
   if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
-  const revision = input.store.getRevision(run.revisionId);
+  const revisionResult = input.store.getRevision(run.revisionId);
+  if (revisionResult.status === "error") signalDurableWorkflowReadErrorToHost(revisionResult.error);
+  const revision = revisionResult.value;
   if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
   const operationSummaries = input.store.summarizeMeaningfulOperations(run.runId);
-  const recentOperations = input.store.listRecentMeaningfulOperations(run.runId, 5);
-  const trigger = input.store.getTriggerByLastRunId(run.runId);
+  const recentOperationsResult = input.store.listRecentMeaningfulOperations(run.runId, 5);
+  if (recentOperationsResult.status === "error")
+    signalDurableWorkflowReadErrorToHost(recentOperationsResult.error);
+  const recentOperations = recentOperationsResult.value;
+  const triggerResult = input.store.getTriggerByLastRunId(run.runId);
+  if (triggerResult.status === "error") signalDurableWorkflowReadErrorToHost(triggerResult.error);
+  const trigger = triggerResult.value;
   const sensitive = schemaContainsSensitive(run.inputSchemaSnapshot);
   const progress = emptyCounts();
   for (const summary of operationSummaries) addOperationSummary(progress, summary);
-  const waits = [
-    ...input.store.listWaits({ runId: run.runId, state: "pending", matchKind: "reply", limit: 5 }),
-    ...input.store.listWaits({ runId: run.runId, state: "claimed", matchKind: "reply", limit: 5 }),
-    ...input.store.listWaits({ runId: run.runId, state: "pending", matchKind: "sleep", limit: 5 }),
-    ...input.store.listWaits({ runId: run.runId, state: "claimed", matchKind: "sleep", limit: 5 }),
-  ]
+  const waits = [];
+  for (const options of [
+    { runId: run.runId, state: "pending", matchKind: "reply", limit: 5 },
+    { runId: run.runId, state: "claimed", matchKind: "reply", limit: 5 },
+    { runId: run.runId, state: "pending", matchKind: "sleep", limit: 5 },
+    { runId: run.runId, state: "claimed", matchKind: "sleep", limit: 5 },
+  ] satisfies Parameters<DurableWorkflowStore["listWaits"]>[0][]) {
+    const listed = input.store.listWaits(options);
+    if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+    waits.push(...listed.value);
+  }
+  const renderedWaits = waits
     .sort((left, right) => left.createdAt - right.createdAt)
     .map((wait): WorkflowProgressWait => {
-      const operation = input.store.getOperation(run.runId, wait.operationId);
+      const operationResult = input.store.getOperation(run.runId, wait.operationId);
+      if (operationResult.status === "error")
+        signalDurableWorkflowReadErrorToHost(operationResult.error);
+      const operation = operationResult.value;
       let prompt: string;
       switch (wait.match.kind) {
         case "reply":
@@ -232,7 +251,7 @@ export async function buildWorkflowProgressView(input: {
     progress,
     phases: summarizePhases(operationSummaries, sensitive),
     recentOperations: visibleOperations,
-    waits,
+    waits: renderedWaits,
     agents: {
       used: agentSummaries.reduce((total, summary) => total + agentUsageCount(summary), 0),
       active: agentSummaries

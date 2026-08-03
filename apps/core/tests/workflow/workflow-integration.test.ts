@@ -1,3 +1,4 @@
+import { workflowStoreValue } from "./workflow-store-test-helpers";
 import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -12,7 +13,6 @@ import {
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
-
 import {
   okResultForTest,
   startResultForTest,
@@ -38,7 +38,6 @@ import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store"
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
-
 class LiveRawBus implements RawBus {
   subscribe = subscribeForTest;
   private sequence = 0;
@@ -46,7 +45,6 @@ class LiveRawBus implements RawBus {
     topic: string;
     handler: TestRawMessageHandler;
   }>();
-
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
     const id = `${++this.sequence}-0`;
     const stored: Message<TData> = { ...message, id, ts: Date.now(), topic: options.topic };
@@ -57,7 +55,6 @@ class LiveRawBus implements RawBus {
     }
     return { id, cursor: id };
   }
-
   async openTestSubscription(
     topic: string,
     _options: SubscriptionOptions,
@@ -67,22 +64,18 @@ class LiveRawBus implements RawBus {
     this.subscriptions.add(subscription);
     return { stop: async () => void this.subscriptions.delete(subscription) };
   }
-
   async fetch(_topic: string, _options: FetchOptions) {
     return { messages: [] };
   }
-
   async close() {
     this.subscriptions.clear();
   }
 }
-
 class WorkflowCardAdapter implements SurfaceAdapter {
   readonly contents: ContentOpts[] = [];
   readonly messages = new Map<string, SurfaceMessage>();
   sends = 0;
   edits = 0;
-
   async connect() {}
   async disconnect() {}
   async getSelf() {
@@ -153,7 +146,6 @@ class WorkflowCardAdapter implements SurfaceAdapter {
   }
   async markRead() {}
 }
-
 function source(): string {
   return `import { defineWorkflow } from "@lilac/workflow";
 export default defineWorkflow({
@@ -177,23 +169,19 @@ export default defineWorkflow({
 });
 `;
 }
-
 async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 10000;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for workflow integration");
     // test-wait-justification: polls integration state produced by independently scheduled workflow and bus workers
     await Bun.sleep(10);
   }
 }
-
 describe("unified workflow integration", () => {
   const roots: string[] = [];
-
   afterEach(async () => {
     await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
   });
-
   it("authors, validates, dispatches through the request bus, persists, and projects the terminal result", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-integration-"));
     roots.push(root);
@@ -316,7 +304,6 @@ describe("unified workflow integration", () => {
       authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
       toolCallId: "integration-tool-1",
     };
-
     try {
       await projector.start();
       await tool.init();
@@ -345,23 +332,24 @@ describe("unified workflow integration", () => {
         { context },
       );
       const { runId } = z.object({ runId: z.string() }).parse(triggered);
-      expect(store.getRun(runId)?.state).toBe("queued");
+      expect(workflowStoreValue(store.getRun(runId))?.state).toBe("queued");
       expect(adapter.contents[0]?.actions?.map((action) => action.label)).toEqual([
         "Pause",
         "Cancel",
       ]);
       expect(JSON.stringify(adapter.contents)).not.toContain("super-secret-value");
       await engine.start();
-      expect(["queued", "running", "succeeded"].includes(store.getRun(runId)?.state ?? "")).toBe(
-        true,
-      );
-
-      await waitFor(() => store.getRun(runId)?.state === "succeeded");
+      expect(
+        ["queued", "running", "succeeded"].includes(
+          workflowStoreValue(store.getRun(runId))?.state ?? "",
+        ),
+      ).toBe(true);
+      await waitFor(() => workflowStoreValue(store.getRun(runId))?.state === "succeeded");
       await waitFor(() =>
         adapter.contents.some((content) => content.text?.includes("**Succeeded**")),
       );
-      const run = store.getRun(runId);
-      const operations = store.listOperations(runId);
+      const run = workflowStoreValue(store.getRun(runId));
+      const operations = workflowStoreValue(store.listOperations(runId));
       const agentOperation = operations.find((operation) => operation.kind === "agent");
       expect(run).toMatchObject({
         result: "integration result",
@@ -388,8 +376,7 @@ describe("unified workflow integration", () => {
       await bus.close();
       store.close();
     }
-  }, 20_000);
-
+  }, 20000);
   it("hard-restarts an active execution and recovers its journal plus existing surface binding", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-hard-restart-"));
     roots.push(root);
@@ -442,7 +429,7 @@ describe("unified workflow integration", () => {
       { context },
     );
     const { runId } = z.object({ runId: z.string() }).parse(triggered);
-    const firstBinding = store.getSurfaceBinding(runId)?.messageRef;
+    const firstBinding = workflowStoreValue(store.getSurfaceBinding(runId))?.messageRef;
     const firstEngine = new WorkflowEngine({
       bus,
       store,
@@ -462,19 +449,19 @@ describe("unified workflow integration", () => {
     });
     let restartedEngine: WorkflowEngine | null = null;
     let restartedProjector: WorkflowProgressProjector | null = null;
-
     try {
       await firstEngine.start();
-      await waitFor(() => store.listOperations(runId, { state: "dispatched" }).length === 1);
-      const persistedRequestId = store
-        .listOperations(runId)
-        .find((operation) => operation.kind === "agent")?.requestId;
+      await waitFor(
+        () => workflowStoreValue(store.listOperations(runId, { state: "dispatched" })).length === 1,
+      );
+      const persistedRequestId = workflowStoreValue(store.listOperations(runId)).find(
+        (operation) => operation.kind === "agent",
+      )?.requestId;
       if (!persistedRequestId) throw new Error("active operation did not persist its request ID");
       await firstEngine.stop();
       await firstProjector.stop();
       await tool.destroy();
       store.close();
-
       store = new DurableWorkflowStore(dbPath);
       restartedProjector = new WorkflowProgressProjector({
         bus,
@@ -485,9 +472,8 @@ describe("unified workflow integration", () => {
         minEditIntervalMs: 0,
       });
       await restartedProjector.start();
-      expect(store.getSurfaceBinding(runId)?.messageRef).toEqual(firstBinding);
+      expect(workflowStoreValue(store.getSurfaceBinding(runId))?.messageRef).toEqual(firstBinding);
       expect(adapter.sends).toBe(1);
-
       let reconciled = false;
       restartedEngine = new WorkflowEngine({
         bus,
@@ -495,7 +481,7 @@ describe("unified workflow integration", () => {
         dataDir,
         subscriptionId: "restart-engine-second",
         pollMs: 5,
-        now: () => 60_101,
+        now: () => 60101,
         dispatchAgentRequest: async ({ requestId, reconcile }) => {
           expect(requestId).toBe(persistedRequestId);
           reconciled = reconcile;
@@ -503,18 +489,17 @@ describe("unified workflow integration", () => {
         },
       });
       await restartedEngine.start();
-      await waitFor(() => store.getRun(runId)?.state === "succeeded");
+      await waitFor(() => workflowStoreValue(store.getRun(runId))?.state === "succeeded");
       await waitFor(() =>
         adapter.contents.some((content) => content.text?.includes("**Succeeded**")),
       );
       expect(reconciled).toBe(true);
       expect(
-        store
-          .listOperations(runId)
+        workflowStoreValue(store.listOperations(runId))
           .map((operation) => operation.kind)
           .sort(),
       ).toEqual(["agent", "phase"]);
-      expect(store.getRun(runId)?.result).toBe("recovered result");
+      expect(workflowStoreValue(store.getRun(runId))?.result).toBe("recovered result");
       expect(JSON.stringify(adapter.contents)).not.toContain("restart-secret");
       await restartedEngine.stop();
       await restartedProjector.stop();
@@ -527,5 +512,5 @@ describe("unified workflow integration", () => {
       await bus.close();
       store.close();
     }
-  }, 15_000);
+  }, 15000);
 });

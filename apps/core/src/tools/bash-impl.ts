@@ -499,7 +499,14 @@ async function persistTruncatedOutput(params: {
       ttlMs: params.outputConfig.artifactTtlMs,
       maxBytesPerSession: params.outputConfig.artifactMaxBytesPerSession,
     });
-    return { uri: artifact.uri };
+    if (artifact.status === "error") {
+      logger.warn("tool.artifact.write_failed", {
+        toolName: "bash",
+        errorTag: artifact.error.name,
+      });
+      return {};
+    }
+    return { uri: artifact.value.uri };
   } catch (error) {
     logger.warn("tool.artifact.write_failed", {
       toolName: "bash",

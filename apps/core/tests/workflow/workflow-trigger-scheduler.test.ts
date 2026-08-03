@@ -1,3 +1,4 @@
+import { workflowStoreValue } from "./workflow-store-test-helpers";
 import { describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
@@ -12,7 +13,6 @@ import {
   type RawDeliveryHandler,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
-
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import {
   canonicalJsonSha256,
@@ -23,7 +23,6 @@ import {
   type WorkflowTrigger,
 } from "../../src/workflow/workflow-domain";
 import { WorkflowTriggerScheduler } from "../../src/workflow/workflow-trigger-scheduler";
-
 class CapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
@@ -41,19 +40,18 @@ class CapturingRawBus implements RawBus {
   }
   async close() {}
 }
-
 function createRevision(store: DurableWorkflowStore): void {
   const resources = normalizeWorkflowResourcePolicy({
     agents: { maxConcurrent: 1, maxTotal: 1 },
     maxNestingDepth: 2,
-    operationIdleTimeoutMs: 10_000,
+    operationIdleTimeoutMs: 10000,
     waits: [],
   });
   const limits = {
-    maxSourceBytes: 10_000,
-    maxInputBytes: 10_000,
-    maxOperationOutputBytes: 10_000,
-    maxResultBytes: 10_000,
+    maxSourceBytes: 10000,
+    maxInputBytes: 10000,
+    maxOperationOutputBytes: 10000,
+    maxResultBytes: 10000,
   };
   store.createRevision({
     revisionId: "revision-1",
@@ -74,7 +72,6 @@ function createRevision(store: DurableWorkflowStore): void {
     createdAt: 1,
   });
 }
-
 function trigger(): WorkflowTrigger {
   return {
     triggerId: "trigger-1",
@@ -102,7 +99,6 @@ function trigger(): WorkflowTrigger {
     updatedAt: 1,
   };
 }
-
 describe("workflow trigger scheduler", () => {
   it("fires the immutable trusted owner snapshot directly into the queue", async () => {
     const file = join(tmpdir(), `workflow-scheduler-${crypto.randomUUID()}.sqlite`);
@@ -114,8 +110,10 @@ describe("workflow trigger scheduler", () => {
       store.createTrigger(trigger());
       const scheduler = new WorkflowTriggerScheduler({ bus, store, now: () => 100 });
       await scheduler.tick();
-      const storedTrigger = store.getTrigger("trigger-1");
-      const fired = storedTrigger?.lastRunId ? store.getRun(storedTrigger.lastRunId) : null;
+      const storedTrigger = workflowStoreValue(store.getTrigger("trigger-1"));
+      const fired = storedTrigger?.lastRunId
+        ? workflowStoreValue(store.getRun(storedTrigger.lastRunId))
+        : null;
       expect(fired).toMatchObject({
         state: "queued",
         revisionId: "revision-1",
@@ -130,7 +128,6 @@ describe("workflow trigger scheduler", () => {
       rmSync(file, { force: true });
     }
   });
-
   it("defers a timestamp trigger at global capacity and fires after capacity is released", async () => {
     const file = join(tmpdir(), `workflow-scheduler-cap-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(file);
@@ -165,16 +162,14 @@ describe("workflow trigger scheduler", () => {
         now: () => 100,
         getMaxActiveRuns: () => 1,
       });
-
       await scheduler.tick();
-      expect(store.getTrigger("trigger-1")).toMatchObject({
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
         state: "active",
         nextFireAt: 100,
         lastFireAt: null,
         lastRunId: null,
       });
-      expect(store.listRuns()).toHaveLength(1);
-
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(1);
       expect(
         store.transitionRun({
           runId: "ordinary-active-run",
@@ -184,7 +179,7 @@ describe("workflow trigger scheduler", () => {
         }),
       ).toBe(true);
       await scheduler.tick();
-      const storedTrigger = store.getTrigger("trigger-1");
+      const storedTrigger = workflowStoreValue(store.getTrigger("trigger-1"));
       expect(storedTrigger).toMatchObject({ state: "active", nextFireAt: null });
       expect(storedTrigger?.lastRunId).toBeTruthy();
       expect(store.countActiveRuns()).toBe(1);

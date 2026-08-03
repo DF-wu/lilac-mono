@@ -3,14 +3,19 @@ import path from "node:path";
 import ts from "typescript-codegen";
 
 import { createFingerprint, createFingerprintIdentity, relativeModulePath } from "./fingerprint.ts";
+import { PERSISTED_CODEC_FIXTURE_CASES } from "./manifest.ts";
 import type {
   CompatibilitySink,
   EventCodecRegistryRegistration,
   EventDeliveryApiRegistration,
   EventDeliveryConsumerRegistration,
   PackageSymbolIdentity,
+  PersistedCodecRegistration,
+  PersistedStoreConsumerRegistration,
   RawEventMessageBoundaryRegistration,
   ResultDecoderRegistration,
+  SqliteTransactionAdapterRegistration,
+  SqliteTransactionConsumerRegistration,
   SymbolIdentity,
   ToolCodecRegistryRegistration,
   UnknownFreeModuleRegistration,
@@ -28,11 +33,24 @@ export interface WorkspacePackageRoot {
   readonly root: string;
 }
 
+export interface ActivePersistenceInfrastructure {
+  readonly persistedCodecs: readonly {
+    readonly packageName: string;
+    readonly identity: SymbolIdentity;
+  }[];
+  readonly sqliteTransactionAdapters: readonly {
+    readonly packageName: string;
+    readonly identity: SymbolIdentity;
+  }[];
+  readonly scanAllProductionModules?: boolean;
+}
+
 const ZOD_PARSE_MEMBERS = new Set(["parse", "parseAsync", "safeParse", "safeParseAsync"]);
 const UNSAFE_RESULT_MEMBERS = new Set(["deserializeUnsafe", "serializeUnsafe", "unwrap"]);
 const RESULT_CAPTURE_MEMBERS = new Set(["try", "tryPromise"]);
 const MAX_TYPE_DEPTH = 6;
 const MAX_VISITED_PROPERTIES = 256;
+const MAX_PERSISTED_CODEC_PROPERTIES = 1024;
 
 function normalizedPath(value: string): string {
   return value.split(path.sep).join("/");
@@ -107,6 +125,9 @@ function callCandidateNames(
     names.add("stringify");
     names.add("toJSON");
     for (const logger of workspace.structuredLoggers) names.add(logger.sink.exportName);
+  }
+  if (activeRules.has("architecture/no-result-err-in-sqlite-callback")) {
+    names.add("transaction");
   }
 
   const aliases: Array<readonly [source: string, target: string]> = [];
@@ -298,6 +319,35 @@ interface UnknownTraversalState {
   remainingProperties: number;
 }
 
+const CLOSED_PLATFORM_TYPE_NAMES = new Set(["ArrayBuffer", "SharedArrayBuffer", "Uint8Array"]);
+
+function isClosedPlatformType(type: ts.Type): boolean {
+  const symbol = type.aliasSymbol ?? type.symbol;
+  if (!symbol) return false;
+  const declarations = symbol.declarations ?? [];
+  if (declarations.length === 0) return false;
+  if (CLOSED_PLATFORM_TYPE_NAMES.has(symbol.name)) {
+    return declarations.every(isDefaultLibraryDeclaration);
+  }
+  if (symbol.name === "URL") {
+    return declarations.every(
+      (declaration) =>
+        isDefaultLibraryDeclaration(declaration) ||
+        /(?:^|\/)@types\/node\/url\.d\.ts$/u.test(
+          normalizedPath(declaration.getSourceFile().fileName),
+        ),
+    );
+  }
+  return (
+    symbol.name === "Buffer" &&
+    declarations.every((declaration) =>
+      /(?:^|\/)@types\/node\/buffer(?:\.buffer)?\.d\.ts$/u.test(
+        normalizedPath(declaration.getSourceFile().fileName),
+      ),
+    )
+  );
+}
+
 function typeContainsFlags(
   type: ts.Type,
   forbiddenFlags: ts.TypeFlags,
@@ -310,6 +360,7 @@ function typeContainsFlags(
   },
 ): boolean {
   if ((type.flags & forbiddenFlags) !== 0) return true;
+  if (isClosedPlatformType(type)) return false;
   if (state.seen.has(type)) return false;
   state.seen.add(type);
 
@@ -742,6 +793,90 @@ function callReceiver(node: ts.CallExpression): ts.Expression | undefined {
   return undefined;
 }
 
+function callableExpressionDeclaration(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): ts.FunctionLikeDeclaration | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) return unwrapped;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  for (const declaration of symbol?.declarations ?? []) {
+    if (ts.isFunctionDeclaration(declaration) || ts.isMethodDeclaration(declaration)) {
+      if (declaration.body) return declaration;
+      continue;
+    }
+    if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+      const initializer = unwrapExpression(declaration.initializer);
+      if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))
+        return initializer;
+    }
+  }
+  return undefined;
+}
+
+function analyzeSqliteTransactionCallback(
+  node: ts.CallExpression,
+  signature: ts.Signature | undefined,
+  sourcePackage: string | undefined,
+  member: string | undefined,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  if (sourcePackage !== "bun:sqlite" || member !== "transaction") return;
+  const callbackExpression = node.arguments[0];
+  if (!callbackExpression || ts.isSpreadElement(callbackExpression)) return;
+  const callback = callableExpressionDeclaration(callbackExpression, checker);
+  const callbackSignature = checker.getSignaturesOfType(
+    checker.getTypeAtLocation(callbackExpression),
+    ts.SignatureKind.Call,
+  )[0];
+  const returned = callbackSignature?.getReturnType();
+  const callbackReturnsErr = Boolean(
+    returned &&
+    typeContainsPackageType(
+      returned,
+      checker,
+      packageRoots,
+      "better-result",
+      new Set(["Err"]),
+      callbackExpression,
+    ),
+  );
+  let resultErrCall: ts.CallExpression | undefined;
+  if (callback) {
+    const visit = (child: ts.Node): void => {
+      if (resultErrCall || (child !== callback && ts.isFunctionLike(child))) return;
+      if (ts.isCallExpression(child)) {
+        const childSignature = checker.getResolvedSignature(child);
+        if (
+          packageForSignature(childSignature, packageRoots) === "better-result" &&
+          declarationName(childSignature?.declaration) === "err"
+        ) {
+          resultErrCall = child;
+          return;
+        }
+      }
+      ts.forEachChild(child, visit);
+    };
+    visit(callback);
+  }
+  if (!callbackReturnsErr && !resultErrCall) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/no-result-err-in-sqlite-callback",
+      resultErrCall ?? callbackExpression,
+      "Raw bun:sqlite transaction callback can produce a better-result Err without forcing rollback.",
+      "Return a plain value from the raw driver callback and throw only the registered private rollback sentinel inside the SQLite Result adapter.",
+    ),
+  );
+  void signature;
+}
+
 function isDefaultLibraryDeclaration(node: ts.Node | undefined): boolean {
   if (!node) return false;
   return /(?:^|\/)lib\.[^/]+\.d\.ts$/u.test(normalizedPath(node.getSourceFile().fileName));
@@ -984,6 +1119,20 @@ function analyzeCall(
   const signature = checker.getResolvedSignature(node);
   const sourcePackage = packageForSignature(signature, packageRoots);
   const member = declarationName(signature?.declaration);
+
+  if (activeRules.has("architecture/no-result-err-in-sqlite-callback")) {
+    analyzeSqliteTransactionCallback(
+      node,
+      signature,
+      sourcePackage,
+      member,
+      checker,
+      workspace,
+      workspaceRoot,
+      packageRoots,
+      diagnostics,
+    );
+  }
 
   if (
     activeRules.has("architecture/no-unregistered-decoder") &&
@@ -2899,6 +3048,10 @@ function setDifference(left: ReadonlySet<string>, right: ReadonlySet<string>): r
   return [...left].filter((value) => !right.has(value)).sort();
 }
 
+function registeredIdentityKey(identity: SymbolIdentity): string {
+  return `${identity.module}#${identity.exportName}`;
+}
+
 function analyzeEventCodecRegistry(
   registration: EventCodecRegistryRegistration,
   checker: ts.TypeChecker,
@@ -3219,6 +3372,656 @@ function analyzeUnknownFreeModule(
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
+}
+
+function literalStringValues(type: ts.Type): readonly string[] | undefined {
+  if ((type.flags & ts.TypeFlags.StringLiteral) !== 0) {
+    return [(type as ts.StringLiteralType).value];
+  }
+  if (!type.isUnion()) return undefined;
+  const values = type.types.flatMap((member) => literalStringValues(member) ?? []);
+  return values.length === type.types.length ? values : undefined;
+}
+
+function propertyType(
+  type: ts.Type,
+  property: string,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+): ts.Type | undefined {
+  const symbol = checker.getPropertyOfType(type, property);
+  return symbol && checker.getTypeOfSymbolAtLocation(symbol, symbol.valueDeclaration ?? location);
+}
+
+function fixtureCaseExpectation(
+  value: ts.Expression,
+  checker: ts.TypeChecker,
+): { readonly outcome?: string; readonly provenance?: string } {
+  const object = unwrapExpression(value);
+  if (!ts.isObjectLiteralExpression(object)) return {};
+  const literalProperty = (name: string): string | undefined => {
+    const property = object.properties.find(
+      (candidate): candidate is ts.PropertyAssignment =>
+        ts.isPropertyAssignment(candidate) && propertyStringValue(candidate, checker) === name,
+    );
+    const initializer = property && unwrapExpression(property.initializer);
+    return initializer && ts.isStringLiteralLike(initializer) ? initializer.text : undefined;
+  };
+  return { outcome: literalProperty("outcome"), provenance: literalProperty("provenance") };
+}
+
+function analyzePersistedCodec(
+  registration: PersistedCodecRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const declaration = requireOneRegisteredNode(
+    "Persisted codec",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isCallableImplementation,
+  );
+  const signature = checker.getSignatureFromDeclaration(declaration);
+  const input = declaration.parameters[registration.inputParameter];
+  const returnType = signature?.getReturnType();
+  const resultArguments =
+    returnType && isDirectResultType(returnType, packageRoots)
+      ? resultTypeArguments(returnType, checker)
+      : undefined;
+  const success = resultArguments?.[0];
+  const error = resultArguments?.[1];
+  const value = success && propertyType(success, "value", checker, declaration);
+  const provenance = success && propertyType(success, "provenance", checker, declaration);
+  const actualProvenance = new Set(provenance ? literalStringValues(provenance) : undefined);
+  const expectedProvenance = new Set(registration.provenance);
+  const invalidFlags = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never;
+  const failures = [
+    input ? undefined : "registered input parameter does not exist",
+    input && (checker.getTypeAtLocation(input).flags & ts.TypeFlags.Any) === 0
+      ? undefined
+      : "registered input is any or missing",
+    resultArguments ? undefined : "return type is not a direct better-result Result<T, E>",
+    value &&
+    !typeContainsFlags(value, invalidFlags, checker, declaration, {
+      inspectMethodProperties: true,
+      seen: new Set(),
+      remainingProperties: MAX_PERSISTED_CODEC_PROPERTIES,
+    })
+      ? undefined
+      : "Result success value is not fully decoded",
+    provenance ? undefined : "Result success lacks provenance",
+    setDifference(expectedProvenance, actualProvenance).length === 0 &&
+    setDifference(actualProvenance, expectedProvenance).length === 0
+      ? undefined
+      : `provenance must be exactly ${[...expectedProvenance].join(" | ")}`,
+    error &&
+    !typeContainsFlags(error, invalidFlags, checker, declaration, {
+      inspectMethodProperties: false,
+      seen: new Set(),
+      remainingProperties: MAX_VISITED_PROPERTIES,
+    })
+      ? undefined
+      : "Result error type is not specific",
+  ].filter((failure): failure is string => failure !== undefined);
+  if (failures.length > 0) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/persisted-codec-contract",
+        input ?? declaration,
+        `Persisted codec ${registration.identity.exportName} is invalid: ${failures.join("; ")}.`,
+        "Return Result<{ value: Decoded; provenance: the exact declared provenance union }, SpecificStorageError> from the exact persisted boundary.",
+      ),
+    );
+  }
+
+  const catalog = requireOneRegisteredNode(
+    "Persisted codec fixture catalog",
+    registration.fixtureCatalog,
+    workspace,
+    workspaceRoot,
+    program,
+    isObjectRegistryDeclaration,
+  );
+  const object = objectLiteralInitializer(catalog);
+  const cases = new Map<string, { readonly outcome?: string; readonly provenance?: string }>();
+  if (object) {
+    for (const property of object.properties) {
+      if (!ts.isPropertyAssignment(property)) continue;
+      const name = propertyStringValue(property, checker);
+      if (name) cases.set(name, fixtureCaseExpectation(property.initializer, checker));
+    }
+  }
+  const expectedCases = new Set<string>(PERSISTED_CODEC_FIXTURE_CASES);
+  const actualCases = new Set(cases.keys());
+  const expectedOutcomes = new Map<string, readonly [string, string | undefined]>([
+    ["current", ["ok", "current"]],
+    ["legacy", ["ok", "migrated"]],
+    [
+      "missing-defaulted",
+      registration.provenance.includes("missing-defaulted")
+        ? ["ok", "missing-defaulted"]
+        : ["error", undefined],
+    ],
+    ["unsupported-version", ["error", undefined]],
+    ["malformed-serialization", ["error", undefined]],
+    ["corrupt-fields", ["error", undefined]],
+  ]);
+  const invalidCases = [...expectedOutcomes].flatMap(([name, [outcome, caseProvenance]]) => {
+    const actual = cases.get(name);
+    return actual?.outcome === outcome && actual.provenance === caseProvenance ? [] : [name];
+  });
+  const fixtureFailures = [
+    object ? undefined : "catalog is not an explicit object literal",
+    setDifference(expectedCases, actualCases).length
+      ? `missing ${setDifference(expectedCases, actualCases).join(", ")}`
+      : undefined,
+    setDifference(actualCases, expectedCases).length
+      ? `contains extra ${setDifference(actualCases, expectedCases).join(", ")}`
+      : undefined,
+    invalidCases.length ? `invalid outcome/provenance for ${invalidCases.join(", ")}` : undefined,
+  ].filter((failure): failure is string => failure !== undefined);
+  if (fixtureFailures.length > 0) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/persisted-codec-fixture-catalog",
+        catalog,
+        `Persisted codec fixture catalog ${registration.fixtureCatalog.exportName} is invalid: ${fixtureFailures.join("; ")}.`,
+        "Declare all six explicit compatibility cases; missing-defaulted must be an error unless that provenance is declared.",
+      ),
+    );
+  }
+}
+
+function resolvedCallMatchesIdentity(
+  call: ts.CallExpression,
+  identity: PackageSymbolIdentity,
+  checker: ts.TypeChecker,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const declaration = checker.getResolvedSignature(call)?.declaration;
+  if (!declaration) return false;
+  const identityRoot =
+    identity.package === undefined
+      ? workspaceRoot
+      : packageRoots.find((candidate) => candidate.packageName === identity.package)?.root;
+  return Boolean(
+    identityRoot && identityMatches(identity, nodeIdentity(declaration, identityRoot)),
+  );
+}
+
+function registeredOwnerCalls(
+  owner: ts.Node,
+  identity: PackageSymbolIdentity,
+  checker: ts.TypeChecker,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (
+      ts.isCallExpression(node) &&
+      resolvedCallMatchesIdentity(node, identity, checker, workspaceRoot, packageRoots)
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(owner);
+  return found;
+}
+
+function sameRegisteredTarget(
+  target: PackageSymbolIdentity,
+  active: { readonly packageName: string; readonly identity: SymbolIdentity },
+  workspacePackageName: string,
+): boolean {
+  return (
+    (target.package ?? workspacePackageName) === active.packageName &&
+    identityMatches(active.identity, {
+      ...active.identity,
+      symbolPath: target.exportName,
+      module: target.module,
+    })
+  );
+}
+
+function assertPersistenceInfrastructureCallsResolve(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  active: ActivePersistenceInfrastructure,
+): void {
+  const registeredConsumers = workspace.persistedStoreConsumers;
+  const registeredTransactions = workspace.sqliteTransactionConsumers;
+  const registeredCatalogs = new Set(
+    workspace.persistedCodecs.map(({ fixtureCatalog }) => registeredIdentityKey(fixtureCatalog)),
+  );
+
+  for (const sourceFile of program.getSourceFiles()) {
+    if (!isProductionSource(sourceFile, workspaceRoot)) continue;
+    const module = relativeModulePath(workspaceRoot, sourceFile);
+    if (ruleApplies(workspace, "architecture/persisted-codec-fixture-catalog", module)) {
+      for (const statement of sourceFile.statements) {
+        if (!ts.isVariableStatement(statement) || !hasExportModifier(statement)) continue;
+        for (const declaration of statement.declarationList.declarations) {
+          if (!ts.isIdentifier(declaration.name) || !declaration.name.text.endsWith("CodecCases")) {
+            continue;
+          }
+          const key = registeredIdentityKey({ module, exportName: declaration.name.text });
+          if (!registeredCatalogs.has(key)) {
+            throw new Error(
+              `Unregistered persisted codec fixture catalog in ${workspace.name}: ${key}.`,
+            );
+          }
+        }
+      }
+    }
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const callIdentity = nodeIdentity(node, workspaceRoot);
+        for (const codec of active.persistedCodecs) {
+          if (
+            active.scanAllProductionModules !== true &&
+            !registeredConsumers.some(({ identity }) => identity.module === module) &&
+            !workspace.boundaryDecoders.some(({ identity }) => identity.module === module) &&
+            !workspace.persistedCodecs.some(({ identity }) => identity.module === module)
+          ) {
+            continue;
+          }
+          const target = { ...codec.identity, package: codec.packageName };
+          if (!resolvedCallMatchesIdentity(node, target, checker, workspaceRoot, packageRoots)) {
+            continue;
+          }
+          if (
+            active.persistedCodecs.some(
+              (owner) =>
+                owner.packageName === workspace.packageName &&
+                identityOwns(owner.identity, callIdentity),
+            ) ||
+            workspace.boundaryDecoders.some(
+              (decoder) =>
+                decoder.category === "persistence" && identityOwns(decoder.identity, callIdentity),
+            )
+          ) {
+            continue;
+          }
+          const registered = registeredConsumers.some(
+            (consumer) =>
+              identityOwns(consumer.identity, callIdentity) &&
+              consumer.codecs.some((candidate) =>
+                sameRegisteredTarget(candidate, codec, workspace.packageName),
+              ),
+          );
+          if (!registered) {
+            throw new Error(
+              `Unregistered persisted store consumer in ${workspace.name}: ${module}#${callIdentity.symbolPath} calls ${codec.packageName}#${registeredIdentityKey(codec.identity)}.`,
+            );
+          }
+        }
+        for (const adapter of active.sqliteTransactionAdapters) {
+          if (
+            active.scanAllProductionModules !== true &&
+            !registeredTransactions.some(({ identity }) => identity.module === module)
+          ) {
+            continue;
+          }
+          const target = { ...adapter.identity, package: adapter.packageName };
+          if (!resolvedCallMatchesIdentity(node, target, checker, workspaceRoot, packageRoots)) {
+            continue;
+          }
+          if (
+            adapter.packageName === workspace.packageName &&
+            identityOwns(adapter.identity, callIdentity)
+          ) {
+            continue;
+          }
+          const registered = registeredTransactions.some(
+            (consumer) =>
+              identityOwns(consumer.identity, callIdentity) &&
+              sameRegisteredTarget(consumer.adapter, adapter, workspace.packageName),
+          );
+          if (!registered) {
+            throw new Error(
+              `Unregistered SQLite transaction consumer in ${workspace.name}: ${module}#${callIdentity.symbolPath} calls ${adapter.packageName}#${registeredIdentityKey(adapter.identity)}.`,
+            );
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+}
+
+function analyzePersistedStoreConsumer(
+  registration: PersistedStoreConsumerRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const owner = requireOneRegisteredNode(
+    "Persisted store consumer",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isCallableImplementation,
+  );
+  const missing = registration.codecs.filter(
+    (codec) => !registeredOwnerCalls(owner, codec, checker, workspaceRoot, packageRoots),
+  );
+  if (missing.length === 0) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/persisted-codec-contract",
+      owner,
+      `Persisted store consumer ${registration.identity.exportName} does not call registered codecs ${missing.map(registeredIdentityKey).join(", ")}.`,
+      "Decode persisted values through every registered codec before passing typed values into store policy.",
+    ),
+  );
+}
+
+function hasExportModifier(
+  node: ts.Node & { readonly modifiers?: ts.NodeArray<ts.ModifierLike> },
+): boolean {
+  return node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) === true;
+}
+
+function externalCallMatches(
+  call: ts.CallExpression,
+  identity: { readonly package: string; readonly exportName: string },
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const signature = checker.getResolvedSignature(call);
+  return (
+    packageForSignature(signature, packageRoots) === identity.package &&
+    declarationName(signature?.declaration) === identity.exportName.split(".").at(-1)
+  );
+}
+
+function typeContainsExactSymbol(
+  type: ts.Type,
+  symbol: ts.Symbol,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Type> = new Set(),
+): boolean {
+  if (seen.has(type)) return false;
+  seen.add(type);
+  const typeSymbol = type.aliasSymbol ?? type.getSymbol();
+  if (typeSymbol && canonicalSymbol(typeSymbol, checker) === canonicalSymbol(symbol, checker)) {
+    return true;
+  }
+  return (
+    type.isUnionOrIntersection() &&
+    type.types.some((member) => typeContainsExactSymbol(member, symbol, checker, seen))
+  );
+}
+
+function nodeIsWithin(node: ts.Node, owner: ts.Node): boolean {
+  for (let current: ts.Node | undefined = node; current; current = current.parent) {
+    if (current === owner) return true;
+  }
+  return false;
+}
+
+function analyzeSqliteTransactionAdapter(
+  registration: SqliteTransactionAdapterRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const adapter = requireOneRegisteredNode(
+    "SQLite transaction adapter",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isCallableImplementation,
+  );
+  const sentinel = requireOneRegisteredNode(
+    "SQLite rollback sentinel",
+    registration.rollbackSentinel,
+    workspace,
+    workspaceRoot,
+    program,
+    (node): node is ts.ClassDeclaration => ts.isClassDeclaration(node) && node.name !== undefined,
+  );
+  const classifier = requireOneRegisteredNode(
+    "SQLite driver error classifier",
+    registration.driverErrorClassifier,
+    workspace,
+    workspaceRoot,
+    program,
+    isCallableImplementation,
+  );
+  const adapterSignature = checker.getSignatureFromDeclaration(adapter);
+  const database = adapter.parameters[registration.databaseParameter];
+  const operation = adapter.parameters[registration.operationParameter];
+  const operationSignature = operation
+    ? checker.getSignaturesOfType(checker.getTypeAtLocation(operation), ts.SignatureKind.Call)[0]
+    : undefined;
+  const classifierSignature = checker.getSignatureFromDeclaration(classifier);
+  const classifierInput = classifier.parameters[0];
+  const classifierReturn = classifierSignature?.getReturnType();
+  let transactionCall: ts.CallExpression | undefined;
+  let transactionCallback: ts.FunctionLikeDeclaration | undefined;
+  let sentinelThrow = false;
+  let sentinelCheck = false;
+  let panicCheck = false;
+  let classifierCall = false;
+  let unknownRethrow = false;
+  const sentinelSymbol = sentinel.name && checker.getSymbolAtLocation(sentinel.name);
+  const catchSymbols = new Set<ts.Symbol>();
+  const expressionIsCatchValue = (expression: ts.Expression): boolean => {
+    const value = unwrapExpression(expression);
+    const symbol = ts.isIdentifier(value) ? checker.getSymbolAtLocation(value) : undefined;
+    return Boolean(symbol && catchSymbols.has(symbol));
+  };
+  const expressionIsSentinel = (expression: ts.Expression): boolean => {
+    if (!sentinelSymbol) return false;
+    const value = unwrapExpression(expression);
+    if (ts.isNewExpression(value)) {
+      const symbol = checker.getSymbolAtLocation(value.expression);
+      return Boolean(
+        symbol && canonicalSymbol(symbol, checker) === canonicalSymbol(sentinelSymbol, checker),
+      );
+    }
+    return typeContainsExactSymbol(checker.getTypeAtLocation(value), sentinelSymbol, checker);
+  };
+  const visit = (node: ts.Node): void => {
+    const catchName = ts.isCatchClause(node) ? node.variableDeclaration?.name : undefined;
+    if (catchName && ts.isIdentifier(catchName)) {
+      const symbol = checker.getSymbolAtLocation(catchName);
+      if (symbol) catchSymbols.add(symbol);
+    }
+    if (ts.isCallExpression(node)) {
+      const signature = checker.getResolvedSignature(node);
+      if (
+        packageForSignature(signature, packageRoots) === "bun:sqlite" &&
+        declarationName(signature?.declaration) === "transaction"
+      ) {
+        transactionCall ??= node;
+        const callback = node.arguments[0];
+        if (callback && !ts.isSpreadElement(callback)) {
+          transactionCallback ??= callableExpressionDeclaration(callback, checker);
+        }
+      }
+      if (
+        externalCallMatches(node, registration.panicClassifier, checker, packageRoots) &&
+        node.arguments.some(
+          (argument) => !ts.isSpreadElement(argument) && expressionIsCatchValue(argument),
+        )
+      ) {
+        panicCheck = true;
+      }
+      if (
+        resolvedCallMatchesIdentity(
+          node,
+          registration.driverErrorClassifier,
+          checker,
+          workspaceRoot,
+          packageRoots,
+        ) &&
+        node.arguments.some(
+          (argument) => !ts.isSpreadElement(argument) && expressionIsCatchValue(argument),
+        )
+      ) {
+        classifierCall = true;
+      }
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword
+    ) {
+      const symbol = checker.getSymbolAtLocation(unwrapExpression(node.right));
+      if (
+        sentinelSymbol &&
+        expressionIsCatchValue(node.left) &&
+        symbol &&
+        canonicalSymbol(symbol, checker) === canonicalSymbol(sentinelSymbol!, checker)
+      ) {
+        sentinelCheck = true;
+      }
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      (node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
+        node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsToken) &&
+      ((expressionIsCatchValue(node.left) && expressionIsSentinel(node.right)) ||
+        (expressionIsCatchValue(node.right) && expressionIsSentinel(node.left)))
+    ) {
+      sentinelCheck = true;
+    }
+    if (ts.isThrowStatement(node)) {
+      const expression = unwrapExpression(node.expression);
+      if (
+        transactionCallback &&
+        nodeIsWithin(node, transactionCallback) &&
+        expressionIsSentinel(expression)
+      ) {
+        sentinelThrow = true;
+      }
+      if (ts.isIdentifier(expression)) {
+        const symbol = checker.getSymbolAtLocation(expression);
+        if (symbol && catchSymbols.has(symbol)) unknownRethrow = true;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(adapter);
+  const transactionCallbackReturn = transactionCallback
+    ? checker.getSignatureFromDeclaration(transactionCallback)?.getReturnType()
+    : undefined;
+  const invalidFlags = ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never;
+  const failures = [
+    database &&
+    typeIsPackageType(
+      checker.getTypeAtLocation(database),
+      "bun:sqlite",
+      new Set(["Database"]),
+      packageRoots,
+    )
+      ? undefined
+      : "registered database parameter is not bun:sqlite Database",
+    operationSignature && isDirectResultType(operationSignature.getReturnType(), packageRoots)
+      ? undefined
+      : "registered operation callback does not return Result",
+    adapterSignature && isDirectResultType(adapterSignature.getReturnType(), packageRoots)
+      ? undefined
+      : "adapter does not return a direct Result",
+    transactionCall ? undefined : "adapter does not call bun:sqlite Database.transaction",
+    transactionCallbackReturn &&
+    !typeContainsResult(transactionCallbackReturn, checker, packageRoots, transactionCallback!)
+      ? undefined
+      : "raw driver callback returns Result",
+    sentinelThrow ? undefined : "raw driver callback does not throw the rollback sentinel",
+    sentinelCheck ? undefined : "adapter does not recognize the exact rollback sentinel",
+    panicCheck ? undefined : "adapter does not invoke the exact Panic classifier",
+    classifierCall ? undefined : "adapter does not invoke the exact SQLite driver classifier",
+    unknownRethrow ? undefined : "adapter does not rethrow unknown defects",
+    !hasExportModifier(sentinel) ? undefined : "rollback sentinel is exported instead of private",
+    classifierInput &&
+    (checker.getTypeAtLocation(classifierInput).flags &
+      (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) ===
+      0
+      ? undefined
+      : "driver classifier input is missing or untyped",
+    classifierReturn &&
+    !typeContainsFlags(classifierReturn, invalidFlags, checker, classifier, {
+      inspectMethodProperties: false,
+      seen: new Set(),
+      remainingProperties: MAX_VISITED_PROPERTIES,
+    })
+      ? undefined
+      : "driver classifier return is not a closed specific type",
+  ].filter((failure): failure is string => failure !== undefined);
+  if (failures.length === 0) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/sqlite-transaction-adapter-contract",
+      adapter,
+      `SQLite transaction adapter ${registration.identity.exportName} is invalid: ${failures.join("; ")}.`,
+      "Use one private rollback sentinel inside the raw callback, preserve Panic exactly, map only classified driver failures, and rethrow unknown defects.",
+    ),
+  );
+}
+
+function analyzeSqliteTransactionConsumer(
+  registration: SqliteTransactionConsumerRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const owner = requireOneRegisteredNode(
+    "SQLite transaction consumer",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isCallableImplementation,
+  );
+  if (registeredOwnerCalls(owner, registration.adapter, checker, workspaceRoot, packageRoots))
+    return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/sqlite-transaction-consumer",
+      owner,
+      `SQLite transaction consumer ${registration.identity.exportName} does not call registered adapter ${registeredIdentityKey(registration.adapter)}.`,
+      "Route the transaction through the registered Result adapter; do not call the raw driver transaction API directly.",
+    ),
+  );
 }
 
 function messageTypeIsUnknown(
@@ -3729,6 +4532,87 @@ function analyzeRegisteredEventInfrastructure(
       );
     }
   }
+  for (const registration of workspace.persistedCodecs) {
+    if (
+      registration.status === "enforced" &&
+      (ruleApplies(
+        workspace,
+        "architecture/persisted-codec-contract",
+        registration.identity.module,
+      ) ||
+        ruleApplies(
+          workspace,
+          "architecture/persisted-codec-fixture-catalog",
+          registration.identity.module,
+        ))
+    ) {
+      analyzePersistedCodec(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.persistedStoreConsumers) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(workspace, "architecture/persisted-codec-contract", registration.identity.module)
+    ) {
+      analyzePersistedStoreConsumer(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.sqliteTransactionAdapters) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(
+        workspace,
+        "architecture/sqlite-transaction-adapter-contract",
+        registration.identity.module,
+      )
+    ) {
+      analyzeSqliteTransactionAdapter(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.sqliteTransactionConsumers) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(
+        workspace,
+        "architecture/sqlite-transaction-consumer",
+        registration.identity.module,
+      )
+    ) {
+      analyzeSqliteTransactionConsumer(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
   for (const registration of workspace.rawEventMessageBoundaries) {
     if (
       registration.status === "enforced" &&
@@ -3943,10 +4827,30 @@ export function analyzeWorkspace(
   activeEventDeliveryApiPackages: ReadonlySet<string> = new Set(
     workspace.eventDeliveryConsumers.map((registration) => registration.apiPackage),
   ),
+  activePersistenceInfrastructure: ActivePersistenceInfrastructure = {
+    persistedCodecs: workspace.persistedCodecs
+      .filter(({ status }) => status === "enforced")
+      .map(({ identity }) => ({ packageName: workspace.packageName, identity })),
+    sqliteTransactionAdapters: workspace.sqliteTransactionConsumers
+      .filter(({ status }) => status === "enforced")
+      .map(({ adapter }) => ({
+        packageName: adapter.package ?? workspace.packageName,
+        identity: adapter,
+      })),
+    scanAllProductionModules: false,
+  },
 ): readonly ArchitectureDiagnostic[] {
   assertOpenProtocolAdaptersResolve(workspace, workspaceRoot, program);
   const checker = program.getTypeChecker();
   const diagnostics: ArchitectureDiagnostic[] = [];
+  assertPersistenceInfrastructureCallsResolve(
+    workspace,
+    workspaceRoot,
+    program,
+    checker,
+    packageRoots,
+    activePersistenceInfrastructure,
+  );
   assertEventDeliveryConsumersResolve(
     workspace,
     workspaceRoot,

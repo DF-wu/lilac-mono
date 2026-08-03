@@ -162,9 +162,10 @@ export function shouldReplayCorePrimaryHistory(input: {
       continue;
     }
     if (atom?.kind === "checkpoint") {
-      const state = input.store.getRequestTranscript?.({
+      const transcript = input.store.getRequestTranscript?.({
         requestId: atom.requestId,
-      })?.providerState;
+      });
+      const state = transcript?.status === "ok" ? transcript.value?.providerState : undefined;
       if (!state || state.lastFamily !== input.targetFamily || state.containsCrossFamilyTurns) {
         return true;
       }
@@ -567,7 +568,8 @@ export function createCorePrimaryClaudeRuntime(input: {
       if (
         !attempt ||
         !candidate?.run.nativeSession ||
-        !manifest ||
+        manifest.status === "error" ||
+        !manifest.value ||
         cursor === null ||
         cursor.canonicalMessageCount !== canonicalMessages.length ||
         cursor.canonicalPrefixHash !== canonicalHash ||
@@ -578,7 +580,7 @@ export function createCorePrimaryClaudeRuntime(input: {
         return false;
       }
       const expectedCanonicalMessages = [
-        ...manifest.segments.flatMap((segment) => segment.canonicalMessages),
+        ...manifest.value.segments.flatMap((segment) => segment.canonicalMessages),
         ...terminalTranscript.messages,
       ];
       if (!isDeepStrictEqual(expectedCanonicalMessages, canonicalMessages)) {
@@ -586,7 +588,7 @@ export function createCorePrimaryClaudeRuntime(input: {
         return false;
       }
       const terminalHead = computeCorePrimaryClaudeTerminalHead({
-        manifest,
+        manifest: manifest.value,
         requestId: terminalTranscript.requestId,
         transcriptDigest: terminalTranscript.transcriptDigest,
         responseMessageCount: terminalTranscript.messages.length,
@@ -636,7 +638,7 @@ export function createCorePrimaryClaudeRuntime(input: {
       }
       let publicationRecovered = false;
       try {
-        input.store.publishCorePrimaryClaudeSuccess({
+        const publication = input.store.publishCorePrimaryClaudeSuccess({
           providerId: input.providerId,
           requestClient: "discord",
           lilacSessionId: input.sessionId,
@@ -655,6 +657,14 @@ export function createCorePrimaryClaudeRuntime(input: {
           lastModelSpecifier: input.modelSpecifier,
           lastReasoning: input.reasoning,
         });
+        if (publication.status === "error") {
+          recordAttemptOutcome("failed");
+          diagnostic("canonical-publication-failed", {
+            reason: "transcript-publication-error",
+            errorTag: publication.error.name,
+          });
+          return false;
+        }
       } catch (error) {
         let persistedState: CorePrimaryClaudeSessionAttempt["state"] | null = null;
         try {

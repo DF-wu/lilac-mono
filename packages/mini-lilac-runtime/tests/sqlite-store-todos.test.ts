@@ -260,7 +260,7 @@ describe("MiniLilacSqliteStore todos", () => {
         runId: "run-1",
         todos: [SECOND_TODO],
       }),
-    ).toThrow("rejected session update");
+    ).toThrow("Mini Lilac SQLite operation failed");
     expect(store.getTodos("session-1")).toEqual(beforeState);
     expect(store.getSession("session-1").updatedAt).toBe(beforeUpdatedAt);
 

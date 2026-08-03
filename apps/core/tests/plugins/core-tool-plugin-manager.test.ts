@@ -10,7 +10,7 @@ import { Panic, Result } from "better-result";
 import { createCoreToolPluginManager } from "../../src/plugins";
 import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
-import type { ConversationThreadService } from "../../src/conversation/thread-service";
+import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
 import {
@@ -193,7 +193,7 @@ describe("core tool plugin manager", () => {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -306,7 +306,7 @@ describe("core tool plugin manager", () => {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,
@@ -561,7 +561,7 @@ describe("core tool plugin manager", () => {
         bus: {} as LilacBus,
         adapter: {} as SurfaceAdapter,
         discovery: {} as DiscoveryService,
-        conversationThreads: {} as ConversationThreadService,
+        conversationThreads: {} as ConversationThreadToolService,
         config: cfg,
       },
       dataDir,

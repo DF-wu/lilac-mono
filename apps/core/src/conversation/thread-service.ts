@@ -17,7 +17,9 @@ import {
   resolveModelSlot,
   resolvePromptDir,
   type CoreConfig,
+  type PersistedDataError,
 } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   type ConversationThreadMessage,
@@ -186,10 +188,23 @@ export type ConversationThreadRunSummarizationResult = {
   status?: "queued" | "completed";
 };
 
-export type ConversationThreadToolService = Pick<
-  ConversationThreadService,
-  "search" | "metadata" | "read" | "runSummarization" | "planAutoInjectSearch"
->;
+export type ConversationThreadToolService = {
+  search(
+    input: Parameters<ConversationThreadService["search"]>[0],
+  ): Promise<ConversationThreadSearchResult>;
+  metadata(
+    input: Parameters<ConversationThreadService["metadata"]>[0],
+  ): Promise<ConversationThreadMetadataOutput>;
+  read(
+    input: Parameters<ConversationThreadService["read"]>[0],
+  ): Promise<ConversationThreadReadOutput>;
+  runSummarization(
+    input?: ConversationThreadRunSummarizationInput,
+  ): Promise<ConversationThreadRunSummarizationResult>;
+  planAutoInjectSearch(
+    input: Parameters<ConversationThreadService["planAutoInjectSearch"]>[0],
+  ): Promise<ConversationThreadAutoInjectQueryPlan>;
+};
 
 export type ConversationThreadSearchResult = {
   meta: {
@@ -332,6 +347,23 @@ export type ConversationThreadMetadataOutput = {
   threads: ConversationThreadReadOutput["thread"][];
   missing: string[];
 };
+
+export class ConversationThreadNotFound extends TaggedError("ConversationThreadNotFound")<{
+  readonly threadId: string;
+  readonly message: string;
+}> {}
+
+export class ConversationThreadAccessDenied extends TaggedError("ConversationThreadAccessDenied")<{
+  readonly threadId: string;
+  readonly message: string;
+}> {}
+
+export type ConversationThreadReadError =
+  | PersistedDataError
+  | ConversationThreadNotFound
+  | ConversationThreadAccessDenied;
+
+export type ConversationThreadMetadataError = PersistedDataError | ConversationThreadAccessDenied;
 
 export type ConversationThreadSummarizer = (input: {
   cfg: CoreConfig;
@@ -1338,7 +1370,7 @@ export class ConversationThreadService {
     minScore?: number;
     verbose?: boolean;
     queryAboutness?: ConversationThreadQueryAboutness;
-  }): Promise<ConversationThreadSearchResult> {
+  }): Promise<ResultType<ConversationThreadSearchResult, PersistedDataError>> {
     const cfg = await this.params.getConfig();
     const limit = Math.min(50, Math.max(1, Math.floor(input.limit ?? 5)));
     const minScore = Math.max(0, input.minScore ?? DEFAULT_SEARCH_MIN_SCORE);
@@ -1362,15 +1394,19 @@ export class ConversationThreadService {
         allowlist: buildSearchAllowlist(cfg),
         onEmbeddingUsage: usage.record,
       });
+      if (recallHits.status === "error") {
+        usage.log({ status: "failed", mode, queryCount: queries.length });
+        return Result.err(recallHits.error);
+      }
       const { aboutness: queryAboutness, error: queryAboutnessError } = input.queryAboutness
         ? { aboutness: normalizeQueryAboutness(input.queryAboutness), error: undefined }
         : await this.captureQueryAboutness({
             queries,
             cfg,
             mode,
-            candidateCount: recallHits.length,
+            candidateCount: recallHits.value.length,
           });
-      const hits = this.applyAboutnessCoverage(recallHits, queryAboutness)
+      const hits = this.applyAboutnessCoverage(recallHits.value, queryAboutness)
         .filter((hit) => hit.score >= minScore)
         .slice(0, limit);
       const result = {
@@ -1389,7 +1425,7 @@ export class ConversationThreadService {
         results: hits.map((hit) => this.formatSearchHit(hit, input.verbose ?? false)),
       } satisfies ConversationThreadSearchResult;
       usage.log({ status: "completed", mode, queryCount: queries.length });
-      return result;
+      return Result.ok(result);
     } catch (e) {
       usage.log({
         status: "failed",
@@ -1415,39 +1451,52 @@ export class ConversationThreadService {
     threadId: string;
     offset?: number;
     limit?: number;
-  }): Promise<ConversationThreadReadOutput> {
+  }): Promise<ResultType<ConversationThreadReadOutput, ConversationThreadReadError>> {
     const cfg = await this.params.getConfig();
     const offset = Math.max(0, Math.floor(input.offset ?? 0));
     const limit = Math.min(200, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
     const result = this.params.store.readThread(input.threadId, offset, limit);
-    if (!result) throw new Error(`conversation thread not found: ${input.threadId}`);
+    if (result.status === "error") return Result.err(result.error);
+    if (!result.value) {
+      return Result.err(
+        new ConversationThreadNotFound({
+          threadId: input.threadId,
+          message: `conversation thread not found: ${input.threadId}`,
+        }),
+      );
+    }
     if (
       !shouldAllowDiscordThread(cfg, {
-        channelId: result.thread.channel_id,
-        parentChannelId: result.thread.parent_channel_id,
-        guildId: result.thread.guild_id,
+        channelId: result.value.thread.channel_id,
+        parentChannelId: result.value.thread.parent_channel_id,
+        guildId: result.value.thread.guild_id,
       })
     ) {
-      throw new Error(`Not allowed: conversation thread '${input.threadId}'`);
+      return Result.err(
+        new ConversationThreadAccessDenied({
+          threadId: input.threadId,
+          message: `Not allowed: conversation thread '${input.threadId}'`,
+        }),
+      );
     }
 
-    const nextOffset = offset + result.messages.length;
-    const hasMore = nextOffset < result.totalMessages;
+    const nextOffset = offset + result.value.messages.length;
+    const hasMore = nextOffset < result.value.totalMessages;
     const botMentionNames = resolveThreadBotMentionNames(cfg);
-    return {
+    return Result.ok({
       thread: this.formatMetadataThread({
-        thread: result.thread,
-        summary: result.summary,
-        messageCount: result.totalMessages,
+        thread: result.value.thread,
+        summary: result.value.summary,
+        messageCount: result.value.totalMessages,
       }),
       page: {
         offset,
         limit,
-        total: result.totalMessages,
+        total: result.value.totalMessages,
         nextOffset: hasMore ? nextOffset : undefined,
         hasMore,
       },
-      messages: result.messages.map((message) => ({
+      messages: result.value.messages.map((message) => ({
         ordinal: message.ordinal,
         messageId: message.messageId,
         userId: message.userId,
@@ -1459,12 +1508,12 @@ export class ConversationThreadService {
           botMentionNames,
         }),
       })),
-    };
+    });
   }
 
   async metadata(input: {
     threadIds: readonly string[];
-  }): Promise<ConversationThreadMetadataOutput> {
+  }): Promise<ResultType<ConversationThreadMetadataOutput, ConversationThreadMetadataError>> {
     const cfg = await this.params.getConfig();
     const threadIds = normalizeMetadataThreadIds(input);
     const threads: ConversationThreadMetadataOutput["threads"] = [];
@@ -1484,19 +1533,26 @@ export class ConversationThreadService {
           guildId: thread.guild_id,
         })
       ) {
-        throw new Error(`Not allowed: conversation thread '${threadId}'`);
+        return Result.err(
+          new ConversationThreadAccessDenied({
+            threadId,
+            message: `Not allowed: conversation thread '${threadId}'`,
+          }),
+        );
       }
 
+      const summary = this.params.store.getSummary(threadId);
+      if (summary.status === "error") return Result.err(summary.error);
       threads.push(
         this.formatMetadataThread({
           thread,
-          summary: this.params.store.getSummary(threadId),
+          summary: summary.value,
           messageCount: this.params.store.countThreadMessages(threadId),
         }),
       );
     }
 
-    return { threads, missing };
+    return Result.ok({ threads, missing });
   }
 
   async runSummarization(
@@ -1676,6 +1732,14 @@ export class ConversationThreadService {
         const summaryMessages = this.normalizeMessagesForSummarization(summaryRead.messages, cfg);
         const summaryIsStale = item.summaryIsStale;
         const previousSummary = this.params.store.getSummary(thread.thread_id);
+        if (previousSummary.status === "error") {
+          result.failed += 1;
+          result.failures.push({
+            threadId: thread.thread_id,
+            error: previousSummary.error.message,
+          });
+          return;
+        }
         if (summaryRead.omittedMessages > 0) {
           this.logger.debug("thread summarization transcript truncated", {
             jobId,
@@ -1699,7 +1763,7 @@ export class ConversationThreadService {
                 summarize,
                 cfg,
                 promptContext,
-                previousSummary,
+                previousSummary: previousSummary.value,
                 messages: summaryMessages,
                 omittedMessages: summaryRead.omittedMessages,
               });
@@ -1711,12 +1775,18 @@ export class ConversationThreadService {
                 { ifCurrent: true },
               );
             })()
-          : {
+          : Result.ok({
               facets: this.params.store.listFacets(thread.thread_id),
               embeddingInputHash:
                 this.params.store.computeEmbeddingInputHash(thread.thread_id) ?? "",
-            };
-        if (!summaryWrite) {
+            });
+        if (summaryWrite.status === "error") {
+          result.failed += 1;
+          result.failures.push({ threadId: thread.thread_id, error: summaryWrite.error.message });
+          return;
+        }
+        const writtenSummary = summaryWrite.value;
+        if (!writtenSummary) {
           this.logger.debug("thread summary generation discarded after concurrent update", {
             jobId,
             threadId: thread.thread_id,
@@ -1727,7 +1797,7 @@ export class ConversationThreadService {
           this.logger.debug("thread summary generation completed", {
             jobId,
             threadId: thread.thread_id,
-            facets: summaryWrite.facets.length,
+            facets: writtenSummary.facets.length,
           });
         }
 
@@ -1735,8 +1805,8 @@ export class ConversationThreadService {
           jobId,
           threadId: thread.thread_id,
           embeddingAdapter,
-          embeddingInputHash: summaryWrite.embeddingInputHash,
-          facets: summaryWrite.facets,
+          embeddingInputHash: writtenSummary.embeddingInputHash,
+          facets: writtenSummary.facets,
         });
         this.params.store.clearMaintenanceFailure({
           threadId: thread.thread_id,
@@ -2050,7 +2120,7 @@ export class ConversationThreadService {
     filters: ConversationThreadSearchFilters;
     allowlist: ConversationThreadSearchAllowlist;
     onEmbeddingUsage?: (event: ConversationThreadEmbeddingUsageEvent) => void;
-  }): Promise<ConversationThreadSearchHit[]> {
+  }): Promise<ResultType<ConversationThreadSearchHit[], PersistedDataError>> {
     const candidates = new Map<string, ConversationThreadSearchHit>();
     const add = (hit: ConversationThreadSearchHit) => {
       if (
@@ -2076,12 +2146,14 @@ export class ConversationThreadService {
     };
 
     if (input.mode !== "semantic") {
-      for (const hit of this.params.store.search({
+      const lexical = this.params.store.search({
         query: input.query,
         limit: input.limit * 5,
         filters: input.filters,
         allowlist: input.allowlist,
-      })) {
+      });
+      if (lexical.status === "error") return Result.err(lexical.error);
+      for (const hit of lexical.value) {
         hit.score = applyImportanceNudge(
           hit,
           hit.lexicalScore * (input.mode === "lexical" ? 1 : HYBRID_LEXICAL_WEIGHT),
@@ -2098,14 +2170,16 @@ export class ConversationThreadService {
           facet: "query",
           onUsage: input.onEmbeddingUsage,
         });
-        for (const hit of this.params.store.searchSemantic({
+        const semantic = this.params.store.searchSemantic({
           embedding: queryEmbedding,
           modelId: adapter.modelId,
           dimensions: queryEmbedding.length,
           limit: input.limit * 5,
           filters: input.filters,
           allowlist: input.allowlist,
-        })) {
+        });
+        if (semantic.status === "error") return Result.err(semantic.error);
+        for (const hit of semantic.value) {
           hit.score = applyImportanceNudge(
             hit,
             hit.semanticScore + hit.lexicalScore * HYBRID_LEXICAL_WEIGHT,
@@ -2120,12 +2194,14 @@ export class ConversationThreadService {
       }
     }
 
-    return [...candidates.values()]
-      .sort((left, right) => {
-        if (left.score !== right.score) return right.score - left.score;
-        return right.endTs - left.endTs;
-      })
-      .slice(0, input.limit);
+    return Result.ok(
+      [...candidates.values()]
+        .sort((left, right) => {
+          if (left.score !== right.score) return right.score - left.score;
+          return right.endTs - left.endTs;
+        })
+        .slice(0, input.limit),
+    );
   }
 
   private async searchHitsForQueries(input: {
@@ -2137,7 +2213,7 @@ export class ConversationThreadService {
     filters: ConversationThreadSearchFilters;
     allowlist: ConversationThreadSearchAllowlist;
     onEmbeddingUsage?: (event: ConversationThreadEmbeddingUsageEvent) => void;
-  }): Promise<ConversationThreadSearchHitWithAttribution[]> {
+  }): Promise<ResultType<ConversationThreadSearchHitWithAttribution[], PersistedDataError>> {
     if (input.queries.length === 1) {
       return await this.searchHits({
         query: input.queries[0]!,
@@ -2168,6 +2244,10 @@ export class ConversationThreadService {
       })),
     );
 
+    for (const result of queryResults) {
+      if (result.hits.status === "error") return Result.err(result.hits.error);
+    }
+
     const queryCount = input.queries.length;
     const candidates = new Map<
       string,
@@ -2175,7 +2255,8 @@ export class ConversationThreadService {
     >();
 
     for (const { query, hits } of queryResults) {
-      hits.forEach((hit, index) => {
+      if (hits.status === "error") continue;
+      hits.value.forEach((hit, index) => {
         const selfScore = hit.score;
         const contribution = selfScore / queryCount;
         const attribution: ConversationThreadQueryAttribution = {
@@ -2219,12 +2300,14 @@ export class ConversationThreadService {
       });
     }
 
-    return [...candidates.values()]
-      .sort((left, right) => {
-        if (left.score !== right.score) return right.score - left.score;
-        return right.endTs - left.endTs;
-      })
-      .slice(0, input.limit);
+    return Result.ok(
+      [...candidates.values()]
+        .sort((left, right) => {
+          if (left.score !== right.score) return right.score - left.score;
+          return right.endTs - left.endTs;
+        })
+        .slice(0, input.limit),
+    );
   }
 
   private formatSearchHit(hit: ConversationThreadSearchHitWithAttribution, verbose: boolean) {
@@ -2303,6 +2386,25 @@ export class ConversationThreadService {
       messageCount: input.messageCount,
     };
   }
+}
+
+export function createConversationThreadToolService(
+  service: ConversationThreadService,
+): ConversationThreadToolService {
+  const resolvePersistenceOperation = async <T>(
+    operation: Promise<ResultType<T, { readonly message: string }>>,
+  ): Promise<T> => {
+    const result = await operation;
+    if (result.status === "error") throw new Error(result.error.message);
+    return result.value;
+  };
+  return {
+    search: (input) => resolvePersistenceOperation(service.search(input)),
+    metadata: (input) => resolvePersistenceOperation(service.metadata(input)),
+    read: (input) => resolvePersistenceOperation(service.read(input)),
+    runSummarization: (input) => service.runSummarization(input),
+    planAutoInjectSearch: (input) => service.planAutoInjectSearch(input),
+  };
 }
 
 function normalizeMetadataThreadIds(input: { threadIds: readonly string[] }): string[] {

@@ -102,6 +102,13 @@ async function captured(store: WorkspaceHistoryStore) {
   return result;
 }
 
+async function invalidateCaptureCache(store: WorkspaceHistoryStore): Promise<void> {
+  const result = await store.withWorkspaceLock(
+    async (lockedStore) => await lockedStore.invalidateCaptureCacheResult(),
+  );
+  expect(result).toMatchObject({ status: "ok" });
+}
+
 async function restoreFromCurrent(store: WorkspaceHistoryStore, targetRootTreeOid: string) {
   const current = await captured(store);
   return await store.restore(targetRootTreeOid, {
@@ -1487,8 +1494,10 @@ describe("WorkspaceHistoryStore", () => {
     });
     await rm(path.join(workspace, "nested"), { recursive: true });
     await writeFile(path.join(workspace, "secret", "token.txt"), "target replacement\n");
+    await invalidateCaptureCache(sensitiveStore);
     const protectedAliasTarget = await captured(sensitiveStore);
     await writeFile(path.join(workspace, "secret", "token.txt"), "protected\n");
+    await invalidateCaptureCache(store);
     const current = await captured(store);
     await store.withWorkspaceLock(async (locked) => {
       await expect(
@@ -3151,5 +3160,124 @@ describe("WorkspaceHistoryStore", () => {
     const capture = mismatched.capture();
     await expect(capture).rejects.toBeInstanceOf(WorkspaceHistoryStoreError);
     await expect(capture).rejects.toMatchObject({ code: "ownership-mismatch" });
+  });
+
+  it("returns invalid caches as typed Errs without rewriting persisted bytes", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    await writeFile(path.join(workspace, "file.txt"), "first\n");
+    await captured(store);
+    const cachePath = path.join(store.storeDirectory, "capture-cache.json");
+    const current = JSON.parse(await readFile(cachePath, "utf8"));
+    const cases = [
+      {
+        serialized: '{"token":"must-not-appear"',
+        tag: "WorkspaceHistoryPersistenceMalformed",
+        issueCode: "malformed-serialization",
+      },
+      {
+        serialized: JSON.stringify({
+          ...current,
+          implementationVersion: "must-not-appear-implementation",
+        }),
+        tag: "WorkspaceHistoryPersistenceUnsupportedVersion",
+        issueCode: "unsupported-version",
+      },
+      {
+        serialized: JSON.stringify({ ...current, entries: [] }),
+        tag: "WorkspaceHistoryPersistenceCorrupt",
+        issueCode: "corrupt-fields",
+      },
+      {
+        serialized: JSON.stringify({ ...current, workspaceId: "different-workspace" }),
+        tag: "WorkspaceHistoryPersistenceCorrupt",
+        issueCode: "identity-mismatch",
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      await writeFile(cachePath, fixture.serialized);
+      const result = await store.captureResult();
+      expect(result).toMatchObject({
+        status: "error",
+        error: {
+          _tag: fixture.tag,
+          recordKind: "capture-cache",
+          issueCode: fixture.issueCode,
+        },
+      });
+      expect(await readFile(cachePath, "utf8")).toBe(fixture.serialized);
+      expect(JSON.stringify(result)).not.toContain("must-not-appear");
+    }
+  });
+
+  it("does not rewrite a corrupt strict ownership record while reading it", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    await writeFile(path.join(workspace, "file.txt"), "first\n");
+    await captured(store);
+    const markerPath = path.join(store.storeDirectory, "ownership.json");
+    const corruptMarker = '{"formatVersion":1,"databasePathHash":"secret-but-corrupt"}\n';
+    await writeFile(markerPath, corruptMarker);
+
+    await expect(store.capture()).rejects.toMatchObject({ code: "ownership-mismatch" });
+    expect(await readFile(markerPath, "utf8")).toBe(corruptMarker);
+  });
+
+  it("does not rewrite newline-less current ownership or snapshot metadata while reading", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    await writeFile(path.join(workspace, "file.txt"), "first\n");
+    const snapshot = await captured(store);
+
+    const markerPath = path.join(store.storeDirectory, "ownership.json");
+    const markerWithoutNewline = (await readFile(markerPath, "utf8")).replace(/\n$/u, "");
+    await writeFile(markerPath, markerWithoutNewline);
+    await captured(store);
+    expect(await readFile(markerPath, "utf8")).toBe(markerWithoutNewline);
+
+    const manifestWithNewline = await git(store.storeDirectory, [
+      "cat-file",
+      "blob",
+      snapshot.manifestBlobOid,
+    ]);
+    expect(manifestWithNewline.endsWith("\n")).toBe(true);
+    const manifestWithoutNewline = manifestWithNewline.replace(/\n$/u, "");
+    const manifestBlobOid = (
+      await git(store.storeDirectory, ["hash-object", "-w", "--stdin"], manifestWithoutNewline)
+    ).trim();
+    const rootTreeOid = (
+      await git(
+        store.storeDirectory,
+        ["mktree"],
+        `100644 blob ${manifestBlobOid}\tmanifest.json\n` +
+          `040000 tree ${snapshot.workspaceTreeOid}\tworkspace\n`,
+      )
+    ).trim();
+
+    expect(await store.verifySnapshot(rootTreeOid)).toMatchObject({ status: "verified" });
+    expect(await git(store.storeDirectory, ["cat-file", "blob", manifestBlobOid])).toBe(
+      manifestWithoutNewline,
+    );
+  });
+
+  it("returns owned failures from Result entry points", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, history, store } = await createStore(root);
+    await writeFile(path.join(workspace, "file.txt"), "first\n");
+    await captured(store);
+    const mismatched = new WorkspaceHistoryStore({
+      cwd: workspace,
+      historyRoot: history,
+      workspaceId: "workspace-01",
+      namespaceId: "different-namespace",
+      databasePathHash: "database-hash-01",
+    });
+
+    const result = await mismatched.captureResult();
+    expect(result).toMatchObject({
+      status: "error",
+      error: { code: "ownership-mismatch", operation: "verify store ownership" },
+    });
   });
 });

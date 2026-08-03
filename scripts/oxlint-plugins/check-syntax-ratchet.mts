@@ -11,8 +11,10 @@ import {
 import { validateWorkspaceInventory } from "../architecture/workspace-inventory.ts";
 import {
   findExceptionFlowViolations,
+  findDirectSqliteTransactionViolations,
   findInlineAsyncResultCallbackViolations,
   findPresentationDecoderImportViolations,
+  findStoreInlineDecodingViolations,
 } from "./production-syntax.mts";
 import { syntaxBaseline } from "./syntax-baseline.mts";
 import type { SyntacticFinding } from "./syntax-rule-utils.mts";
@@ -21,6 +23,8 @@ export const ACTIVE_SYNTAX_RULES = [
   "lilac/no-exception-flow",
   "lilac/no-inline-async-result-callback",
   "lilac/no-presentation-decoder-import",
+  "lilac/no-store-inline-decoding",
+  "lilac/no-direct-sqlite-transaction",
 ] as const;
 export type ActiveSyntaxRule = (typeof ACTIVE_SYNTAX_RULES)[number];
 
@@ -216,6 +220,16 @@ export async function scanSyntaxFindings(
           "lilac/no-presentation-decoder-import",
           findPresentationDecoderImportViolations(source, path, undefined, manifest),
           "Stage 5 unknown-free presentation modules cannot own Zod parsing",
+        ),
+        ...toSyntaxFindings(
+          "lilac/no-store-inline-decoding",
+          findStoreInlineDecodingViolations(source, path, undefined, manifest),
+          "Stage 6 migrated store scopes decode only through registered persisted codecs",
+        ),
+        ...toSyntaxFindings(
+          "lilac/no-direct-sqlite-transaction",
+          findDirectSqliteTransactionViolations(source, path, undefined, manifest),
+          "Stage 6 migrated transaction consumers use only the registered SQLite Result adapter",
         ),
       );
     }

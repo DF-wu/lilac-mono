@@ -117,6 +117,7 @@ import {
 } from "../../transcript/heartbeat-handoff";
 import {
   COMPACTION_CHECKPOINT_FORMAT_VERSION,
+  type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../transcript/transcript-store";
 import type {
@@ -1385,7 +1386,7 @@ function persistHeartbeatSurfaceHandoffs(params: {
     const handoff = extracted[i] ?? fallback;
     const handoffRequestId = buildHeartbeatHandoffRequestId(params.requestId, i);
 
-    params.transcriptStore.saveRequestTranscript({
+    const saved = params.transcriptStore.saveRequestTranscript({
       requestId: handoffRequestId,
       sessionId: HEARTBEAT_HANDOFF_SESSION_ID,
       requestClient: params.requestClient,
@@ -1393,6 +1394,13 @@ function persistHeartbeatSurfaceHandoffs(params: {
       finalText: handoff.finalText,
       modelLabel: params.modelLabel,
     });
+    if (saved.status === "error") {
+      params.logger.warn("heartbeat handoff transcript persistence failed", {
+        requestId: handoffRequestId,
+        errorTag: saved.error.name,
+      });
+      continue;
+    }
     params.transcriptStore.linkSurfaceMessagesToRequest({
       requestId: handoffRequestId,
       created: [ref],
@@ -1479,8 +1487,17 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
       sessionId: input.sessionId,
       surfaceId: `discord:${input.sessionId}`,
     });
-    if (invalidReason) {
-      return createCorePrimaryLineageFreshOnlyV1(invalidReason, lineage.currentCanonicalStart);
+    if (invalidReason.status === "error") {
+      return createCorePrimaryLineageFreshOnlyV1(
+        "lineage-store-unavailable",
+        lineage.currentCanonicalStart,
+      );
+    }
+    if (invalidReason.value) {
+      return createCorePrimaryLineageFreshOnlyV1(
+        invalidReason.value,
+        lineage.currentCanonicalStart,
+      );
     }
     return lineage;
   } catch {
@@ -1596,9 +1613,10 @@ export function resolveCorePrimaryTranscriptProviderState(input: {
         continue;
       }
       if (atom.kind === "request") {
-        const state = input.transcriptStore?.getRequestTranscript?.({
+        const transcript = input.transcriptStore?.getRequestTranscript?.({
           requestId: atom.requestId,
-        })?.providerState;
+        });
+        const state = transcript?.status === "ok" ? transcript.value?.providerState : undefined;
         if (
           !state ||
           state.lastFamily !== atom.providerFamily ||
@@ -1611,9 +1629,10 @@ export function resolveCorePrimaryTranscriptProviderState(input: {
         continue;
       }
       if (atom.kind === "checkpoint") {
-        const state = input.transcriptStore?.getRequestTranscript?.({
+        const transcript = input.transcriptStore?.getRequestTranscript?.({
           requestId: atom.requestId,
-        })?.providerState;
+        });
+        const state = transcript?.status === "ok" ? transcript.value?.providerState : undefined;
         if (!state || state.lastFamily !== input.targetFamily || state.containsCrossFamilyTurns) {
           containsCrossFamilyTurns = true;
         }
@@ -3547,26 +3566,22 @@ export async function startBusAgentRunner(params: {
               resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
 
               if (params.transcriptStore) {
-                const persisted = await captureBusAgentRunnerOperation(
-                  "custom command failure transcript persistence",
-                  () =>
-                    params.transcriptStore?.saveRequestTranscript({
-                      requestId: headers.request_id,
-                      sessionId: headers.session_id,
-                      requestClient: headers.request_client,
-                      messages: [
-                        ...customCommandMessages,
-                        { role: "assistant", content: finalText } satisfies ModelMessage,
-                      ],
-                      finalText,
-                      modelLabel: resolvedModelLabel,
-                    }),
-                );
+                const persisted = params.transcriptStore.saveRequestTranscript({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  requestClient: headers.request_client,
+                  messages: [
+                    ...customCommandMessages,
+                    { role: "assistant", content: finalText } satisfies ModelMessage,
+                  ],
+                  finalText,
+                  modelLabel: resolvedModelLabel,
+                });
                 if (persisted.status === "error") {
                   logger.error("failed to persist transcript after custom command error", {
                     requestId: headers.request_id,
                     sessionId: headers.session_id,
-                    error: persisted.error.message,
+                    errorTag: persisted.error.name,
                   });
                 }
               }
@@ -3761,9 +3776,7 @@ export async function startBusAgentRunner(params: {
           };
 
           let seededSessionMessages: ModelMessage[] = [];
-          let seededSessionTranscript: ReturnType<
-            NonNullable<TranscriptStore["getLatestCompleteNamedTranscript"]>
-          > = null;
+          let seededSessionTranscript: TranscriptSnapshot | null = null;
           if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
             const loadedTranscript = await captureBusAgentRunnerOperation(
               "subagent continuation transcript load",
@@ -3777,8 +3790,8 @@ export async function startBusAgentRunner(params: {
                       sessionId: next.sessionId,
                     }),
             );
-            if (loadedTranscript.status === "ok") {
-              const latest = loadedTranscript.value;
+            if (loadedTranscript.status === "ok" && loadedTranscript.value?.status === "ok") {
+              const latest = loadedTranscript.value.value;
               if (latest && latest.messages.length > 0) {
                 seededSessionMessages = latest.messages;
                 seededSessionTranscript = latest;
@@ -3789,11 +3802,17 @@ export async function startBusAgentRunner(params: {
                   messagesSeeded: latest.messages.length,
                 });
               }
-            } else {
+            } else if (loadedTranscript.status === "error") {
               logger.warn("failed to load subagent continuation transcript", {
                 requestId: next.requestId,
                 sessionId: next.sessionId,
                 error: loadedTranscript.error.message,
+              });
+            } else if (loadedTranscript.value?.status === "error") {
+              logger.warn("failed to decode subagent continuation transcript", {
+                requestId: next.requestId,
+                sessionId: next.sessionId,
+                errorTag: loadedTranscript.value.error.name,
               });
             }
           }
@@ -5780,7 +5799,7 @@ export async function startBusAgentRunner(params: {
                   terminalPrimaryLineage?.state === "complete" &&
                   !isCompactionCheckpoint;
 
-                transcriptStore.saveRequestTranscript({
+                const savedTranscript = transcriptStore.saveRequestTranscript({
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                   requestClient: headers.request_client,
@@ -5800,6 +5819,16 @@ export async function startBusAgentRunner(params: {
                     ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
                     : {}),
                 });
+                if (savedTranscript.status === "error") {
+                  coreNamedClaudeRuntime?.markTerminalFailure(false);
+                  corePrimaryClaudeRuntime?.markTerminalFailure(false);
+                  logger.error("failed to persist transcript", {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    errorTag: savedTranscript.error.name,
+                  });
+                  return;
+                }
                 if (coreNamedClaudeRuntime && !isCancelled) {
                   if (!providerState) {
                     return signalBusAgentRunnerHostFailure(
@@ -5809,18 +5838,19 @@ export async function startBusAgentRunner(params: {
                   const verified = transcriptStore.getRequestTranscript?.({
                     requestId: headers.request_id,
                   });
+                  const verifiedTranscript = verified?.status === "ok" ? verified.value : null;
                   const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
                   if (
-                    !verified ||
-                    verified.messages.length !== persistedMessages.length ||
-                    hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
+                    !verifiedTranscript ||
+                    verifiedTranscript.messages.length !== persistedMessages.length ||
+                    hashCanonicalMessagesV1(verifiedTranscript.messages).hash !== expectedHash
                   ) {
                     return signalBusAgentRunnerHostFailure(
                       new Error("persisted Core named transcript failed canonical re-read"),
                     );
                   }
                   const promoted = await coreNamedClaudeRuntime.finalize({
-                    terminalTranscript: verified,
+                    terminalTranscript: verifiedTranscript,
                     canonicalMessages: persistedMessages,
                     providerState,
                     isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
@@ -5845,21 +5875,24 @@ export async function startBusAgentRunner(params: {
                   const verifiedManifest = transcriptStore.getCorePrimaryLineageManifest?.({
                     requestId: headers.request_id,
                   });
+                  const verifiedTranscript = verified?.status === "ok" ? verified.value : null;
+                  const manifest =
+                    verifiedManifest?.status === "ok" ? verifiedManifest.value : null;
                   const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
                   const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
                   if (
-                    !verified ||
-                    !verifiedManifest ||
-                    verified.providerState != null ||
-                    verified.messages.length !== persistedMessages.length ||
-                    hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
+                    !verifiedTranscript ||
+                    !manifest ||
+                    verifiedTranscript.providerState != null ||
+                    verifiedTranscript.messages.length !== persistedMessages.length ||
+                    hashCanonicalMessagesV1(verifiedTranscript.messages).hash !== expectedHash
                   ) {
                     return signalBusAgentRunnerHostFailure(
                       new Error("persisted Core primary transcript failed canonical re-read"),
                     );
                   }
                   const promoted = await corePrimaryClaudeRuntime.finalize({
-                    terminalTranscript: verified,
+                    terminalTranscript: verifiedTranscript,
                     canonicalMessages: terminalCanonicalMessages,
                     providerState,
                     isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
@@ -6154,7 +6187,7 @@ export async function startBusAgentRunner(params: {
                 return runProfile === "primary" ? responseMessages : safeFinalMessages;
               })();
 
-              failureTranscriptStore.saveRequestTranscript({
+              return failureTranscriptStore.saveRequestTranscript({
                 requestId: headers.request_id,
                 sessionId: headers.session_id,
                 requestClient: headers.request_client,
@@ -6183,6 +6216,12 @@ export async function startBusAgentRunner(params: {
               requestId: headers.request_id,
               sessionId: headers.session_id,
               error: persistedFailure.error.message,
+            });
+          } else if (persistedFailure.value.status === "error") {
+            logger.error("failed to persist transcript after error", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              errorTag: persistedFailure.value.error.name,
             });
           }
         }

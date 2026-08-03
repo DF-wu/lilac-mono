@@ -1,7 +1,11 @@
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
 
-import { DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS, DurableWorkflowStore } from "./durable-workflow-store";
+import {
+  DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
+  DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+} from "./durable-workflow-store";
 import { computeNextCronAtMs } from "./cron";
 import { sha256 } from "./workflow-definition";
 import type { WorkflowRun, WorkflowTrigger } from "./workflow-domain";
@@ -43,7 +47,9 @@ export class WorkflowTriggerScheduler {
     try {
       const now = this.input.now?.() ?? Date.now();
       this.reconcileTimestampCompletion(now);
-      for (const trigger of this.input.store.listTriggers({ state: "active", dueBefore: now })) {
+      const dueTriggers = this.input.store.listTriggers({ state: "active", dueBefore: now });
+      if (dueTriggers.status === "error") signalDurableWorkflowReadErrorToHost(dueTriggers.error);
+      for (const trigger of dueTriggers.value) {
         const claimed = this.input.store.tryClaimDueTrigger({
           triggerId: trigger.triggerId,
           claimerId: this.workerId,
@@ -59,7 +65,10 @@ export class WorkflowTriggerScheduler {
   }
 
   private reconcileTimestampCompletion(now: number): void {
-    for (const trigger of this.input.store.listTriggers({ state: "active", limit: 1_000 })) {
+    const activeTriggers = this.input.store.listTriggers({ state: "active", limit: 1_000 });
+    if (activeTriggers.status === "error")
+      signalDurableWorkflowReadErrorToHost(activeTriggers.error);
+    for (const trigger of activeTriggers.value) {
       if (
         trigger.definition.kind !== "timestamp" ||
         trigger.nextFireAt !== null ||
@@ -67,7 +76,9 @@ export class WorkflowTriggerScheduler {
       ) {
         continue;
       }
-      const run = this.input.store.getRun(trigger.lastRunId);
+      const runResult = this.input.store.getRun(trigger.lastRunId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run || !TERMINAL_RUN_STATES.has(run.state)) continue;
       this.input.store.transitionTrigger({
         triggerId: trigger.triggerId,
@@ -79,7 +90,10 @@ export class WorkflowTriggerScheduler {
   }
 
   private async fire(trigger: WorkflowTrigger, now: number): Promise<void> {
-    const revision = this.input.store.getRevision(trigger.revisionId);
+    const revisionResult = this.input.store.getRevision(trigger.revisionId);
+    if (revisionResult.status === "error")
+      signalDurableWorkflowReadErrorToHost(revisionResult.error);
+    const revision = revisionResult.value;
     const fireAt = trigger.nextFireAt;
     if (!revision || fireAt === null) return;
     const nextFireAt =

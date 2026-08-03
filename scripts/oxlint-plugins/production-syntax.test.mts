@@ -9,9 +9,11 @@ import {
 } from "../architecture/manifest.ts";
 import {
   findExceptionFlowViolations,
+  findDirectSqliteTransactionViolations,
   findInlineAsyncResultCallbackViolations,
   findLocalRecordGuardViolations,
   findPresentationDecoderImportViolations,
+  findStoreInlineDecodingViolations,
 } from "./production-syntax.mts";
 import { type SyntacticPolicy, SYNTACTIC_POLICY } from "./syntax-policy.mts";
 
@@ -111,11 +113,66 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): Architectu
         toolCodecRegistries: [],
         resultDecoders: [],
         unknownFreeModules: [],
+        persistedCodecs: [],
+        persistedStoreConsumers: [],
+        sqliteTransactionAdapters: [],
+        sqliteTransactionConsumers: [],
         rawEventMessageBoundaries: [],
         eventDeliveryApis: [],
         eventDeliveryConsumers: [],
         eventFamilyMigrations: [],
         baselines: { boundaryValidation: "unused", failureFlow: "unused" },
+      },
+    ],
+  };
+}
+
+function manifestWithStage6(status: "advisory" | "enforced"): ArchitectureManifest {
+  const manifest = manifestWithAdapters([]);
+  const workspace = manifest.workspaces[0];
+  if (!workspace) throw new Error("fixture workspace missing");
+  return {
+    ...manifest,
+    workspaces: [
+      {
+        ...workspace,
+        persistedCodecs: [
+          {
+            status,
+            identity: { module: "src/codecs.ts", exportName: "decodeStoredValue" },
+            inputParameter: 0,
+            fixtureCatalog: { module: "tests/codecs.test.ts", exportName: "storedValueCases" },
+            provenance: ["current", "migrated", "missing-defaulted"],
+          },
+        ],
+        persistedStoreConsumers: [
+          {
+            status,
+            identity: { module: "src/store.ts", exportName: "Store.load" },
+            codecs: [{ module: "src/codecs.ts", exportName: "decodeStoredValue" }],
+          },
+        ],
+        sqliteTransactionAdapters: [
+          {
+            status,
+            identity: { module: "src/sqlite-adapter.ts", exportName: "runTransaction" },
+            databaseParameter: 0,
+            operationParameter: 1,
+            rollbackSentinel: { module: "src/sqlite-adapter.ts", exportName: "Rollback" },
+            panicClassifier: { package: "better-result", exportName: "Panic.is" },
+            driverErrorClassifier: {
+              module: "src/sqlite-adapter.ts",
+              exportName: "classifyDriverError",
+            },
+          },
+        ],
+        sqliteTransactionConsumers: [
+          {
+            status,
+            identity: { module: "src/store.ts", exportName: "Store.save" },
+            adapter: { module: "src/sqlite-adapter.ts", exportName: "runTransaction" },
+          },
+        ],
       },
     ],
   };
@@ -585,6 +642,88 @@ describe("Result callback syntax", () => {
     );
 
     expect(violations).toEqual([]);
+  });
+});
+
+describe("Stage 6 persistence and SQLite syntax", () => {
+  it("blocks inline JSON and schema decoding only in exact enforced store scopes", () => {
+    const source = `
+      class Store {
+        load(raw: string) {
+          const nested = () => JSON.parse(raw);
+          const parseJson = JSON.parse;
+          const decode = rowSchema.safeParse;
+          parseJson(raw);
+          decode(raw);
+          return rowSchema.safeParse(nested());
+        }
+        sibling(raw: string) {
+          return rowSchema.parse(JSON.parse(raw));
+        }
+      }
+    `;
+    const enforced = findStoreInlineDecodingViolations(
+      source,
+      "apps/example/src/store.ts",
+      policyWith(),
+      manifestWithStage6("enforced"),
+    );
+    expect(enforced.map(({ kind, symbol }) => [kind, symbol])).toEqual([
+      ["store-inline-json-decoding", "Store.load.nested"],
+      ["store-inline-json-decoding", "Store.load"],
+      ["store-inline-schema-decoding", "Store.load"],
+      ["store-inline-schema-decoding", "Store.load"],
+    ]);
+    expect(
+      findStoreInlineDecodingViolations(
+        source,
+        "apps/example/src/store.ts",
+        policyWith(),
+        manifestWithStage6("advisory"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("blocks direct transaction APIs and manual control in consumers and descendants", () => {
+    const findings = findDirectSqliteTransactionViolations(
+      `
+        class Store {
+          save() {
+            const begin = "BEGIN IMMEDIATE";
+            this.db.run(begin);
+            const child = () => this.db.transaction(() => write()).immediate();
+            const rawTransaction = this.db.transaction;
+            rawTransaction(() => write());
+            child();
+            this.db.exec("COMMIT");
+          }
+          sibling() {
+            this.db.transaction(() => write()).immediate();
+            this.db.run("ROLLBACK");
+          }
+        }
+      `,
+      "apps/example/src/store.ts",
+      policyWith(),
+      manifestWithStage6("enforced"),
+    );
+    expect(findings.map(({ kind, symbol }) => [kind, symbol])).toEqual([
+      ["manual-sqlite-transaction-control", "Store.save"],
+      ["direct-sqlite-transaction", "Store.save.child"],
+      ["direct-sqlite-transaction", "Store.save"],
+      ["manual-sqlite-transaction-control", "Store.save"],
+    ]);
+  });
+
+  it("does not activate transaction syntax policy for advisory registrations", () => {
+    expect(
+      findDirectSqliteTransactionViolations(
+        `class Store { save() { return this.db.transaction(() => write()).immediate(); } }`,
+        "apps/example/src/store.ts",
+        policyWith(),
+        manifestWithStage6("advisory"),
+      ),
+    ).toEqual([]);
   });
 });
 

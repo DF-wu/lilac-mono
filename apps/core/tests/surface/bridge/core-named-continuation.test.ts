@@ -5,6 +5,7 @@ import path from "node:path";
 
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
+import type { Result as ResultType } from "better-result";
 import type {
   ClaudeNativeAttemptObservation,
   ClaudeNativeSessionStart,
@@ -19,6 +20,25 @@ import {
 import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
 
 const directories: string[] = [];
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function getRequestTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getRequestTranscript"]>[0],
+) {
+  return resultValue(store.getRequestTranscript(input));
+}
+
+function getLatestCompleteNamedTranscript(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getLatestCompleteNamedTranscript"]>[0],
+) {
+  return resultValue(store.getLatestCompleteNamedTranscript(input));
+}
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => {};
@@ -121,7 +141,7 @@ async function commitRuntime(input: {
     requestClient: "unknown",
     messages: input.messages,
   });
-  const terminal = input.store.getRequestTranscript({ requestId: input.requestId });
+  const terminal = getRequestTranscript(input.store, { requestId: input.requestId });
   if (!terminal) throw new Error("terminal transcript missing");
   return await input.runtime.finalize({
     terminalTranscript: terminal,
@@ -173,7 +193,7 @@ describe("Core named Claude continuation", () => {
     ).toBe(true);
     await firstRuntime.retireAtRunEnd();
 
-    const source = store.getLatestCompleteNamedTranscript({
+    const source = getLatestCompleteNamedTranscript(store, {
       requestClient: "discord",
       sessionId,
     });
@@ -282,7 +302,7 @@ describe("Core named Claude continuation", () => {
     ).toBe(true);
 
     for (const mismatch of ["scope", "head"] as const) {
-      const source = store.getLatestCompleteNamedTranscript({
+      const source = getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       });
@@ -377,7 +397,7 @@ describe("Core named Claude continuation", () => {
       reasoning: "high",
       executionScopeHash: "scope",
       executionCwd: "/workspace",
-      sourceTranscript: store.getLatestCompleteNamedTranscript({
+      sourceTranscript: getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       }),
@@ -456,7 +476,7 @@ describe("Core named Claude continuation", () => {
       reasoning: "high",
       executionScopeHash: "scope",
       executionCwd: "/workspace",
-      sourceTranscript: store.getLatestCompleteNamedTranscript({
+      sourceTranscript: getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       }),
@@ -495,7 +515,7 @@ describe("Core named Claude continuation", () => {
       requestClient: "unknown",
       messages: terminalMessages,
     });
-    const terminal = store.getRequestTranscript({ requestId: "cancel-during-finalize" });
+    const terminal = getRequestTranscript(store, { requestId: "cancel-during-finalize" });
     if (!terminal) throw new Error("terminal transcript missing");
     const promotion = runtime.finalize({
       terminalTranscript: terminal,
@@ -558,7 +578,7 @@ describe("Core named Claude continuation", () => {
       requestClient: "unknown",
       messages: terminalMessages,
     });
-    const terminal = store.getRequestTranscript({ requestId: "promotion-error" });
+    const terminal = getRequestTranscript(store, { requestId: "promotion-error" });
     if (!terminal) throw new Error("terminal transcript missing");
     store.promoteCoreNamedClaudeSessionBinding = () => {
       throw new Error("simulated promotion database failure");
@@ -693,7 +713,7 @@ describe("Core named Claude continuation", () => {
       reasoning: "medium",
       executionScopeHash: "scope",
       executionCwd: "/workspace",
-      sourceTranscript: store.getLatestCompleteNamedTranscript({
+      sourceTranscript: getLatestCompleteNamedTranscript(store, {
         requestClient: "discord",
         sessionId,
       }),

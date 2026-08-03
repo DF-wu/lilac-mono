@@ -1,6 +1,9 @@
 import type { EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
 
-import { DurableWorkflowStore } from "./durable-workflow-store";
+import {
+  DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+} from "./durable-workflow-store";
 import { matchWorkflowReplyWait, workflowReplyMatchKey } from "./workflow-waits";
 
 export function shouldSuppressRouterForWorkflowReply(input: {
@@ -21,9 +24,11 @@ export function shouldSuppressRouterForWorkflowReply(input: {
     };
   }
   const matchKey = workflowReplyMatchKey(input.event.platform, input.event.channelId);
-  const wait = input.store
-    .listActiveWaitsByMatchKey("reply", matchKey)
-    .find((candidate) => matchWorkflowReplyWait(candidate, input.event) !== null);
+  const waits = input.store.listActiveWaitsByMatchKey("reply", matchKey);
+  if (waits.status === "error") signalDurableWorkflowReadErrorToHost(waits.error);
+  const wait = waits.value.find(
+    (candidate) => matchWorkflowReplyWait(candidate, input.event) !== null,
+  );
   return wait
     ? { suppress: true, reason: `workflow:${wait.runId}:${wait.operationId}:pending` }
     : { suppress: false };

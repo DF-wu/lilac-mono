@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { Result as ResultType } from "better-result";
 
 import type {
   SubagentDelegationHandle,
@@ -8,7 +9,13 @@ import type {
   TrustedSubagentDelegationRegistration,
 } from "../tools/subagent";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
-import { DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS, DurableWorkflowStore } from "./durable-workflow-store";
+import {
+  DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
+  DurableWorkflowStore,
+  signalDurableWorkflowReadErrorToHost,
+  type CreateWorkflowInvocationError,
+  type CreateWorkflowInvocationResult,
+} from "./durable-workflow-store";
 import {
   canonicalJsonSha256,
   sha256,
@@ -18,8 +25,18 @@ import {
 } from "./workflow-definition";
 import { WorkflowDefinitionStore } from "./workflow-definition-store";
 import type { WorkflowCompletionTarget, WorkflowRevision, WorkflowRun } from "./workflow-domain";
-import { readWorkflowValueArtifact } from "./workflow-artifact-store";
+import {
+  adaptWorkflowArtifactResultToException,
+  readWorkflowValueArtifact,
+} from "./workflow-artifact-store";
 import { resolveWorkflowSubagentToolResult } from "./workflow-subagent-output";
+
+function adaptWorkflowInvocationResultToSubagentHost(
+  result: ResultType<CreateWorkflowInvocationResult, CreateWorkflowInvocationError>,
+): CreateWorkflowInvocationResult {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const GENERATED_WORKFLOW_NAME = "subagent-delegate";
 
@@ -81,15 +98,20 @@ async function completionStatus(
   toolResultArtifacts?: ToolResultArtifactStore,
 ): Promise<SubagentDelegationOutcome> {
   if (run.state === "succeeded") {
-    const revision = store.getRevision(run.revisionId);
+    const revisionResult = store.getRevision(run.revisionId);
+    if (revisionResult.status === "error")
+      signalDurableWorkflowReadErrorToHost(revisionResult.error);
+    const revision = revisionResult.value;
     if (!revision) throw new Error(`Subagent workflow revision disappeared: ${run.revisionId}`);
-    const result = run.resultArtifactId
-      ? await readWorkflowValueArtifact({
-          dataDir,
-          artifactId: run.resultArtifactId,
-          maxBytes: revision.limits.maxResultBytes,
-        })
-      : run.result;
+    let result = run.result;
+    if (run.resultArtifactId) {
+      const loaded = await readWorkflowValueArtifact({
+        dataDir,
+        artifactId: run.resultArtifactId,
+        maxBytes: revision.limits.maxResultBytes,
+      });
+      result = adaptWorkflowArtifactResultToException(loaded);
+    }
     const rawFinalText = typeof result === "string" ? result : JSON.stringify(result);
     const finalText =
       run.completionTarget.kind === "live_parent"
@@ -108,9 +130,9 @@ async function completionStatus(
       detail: run.terminalDetail ?? "subagent cancelled",
     };
   }
-  const timedOut = store
-    .listOperations(run.runId, { limit: 1_000 })
-    .some((operation) => operation.state === "timed_out");
+  const operations = store.listOperations(run.runId, { limit: 1_000 });
+  if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
+  const timedOut = operations.value.some((operation) => operation.state === "timed_out");
   return {
     status: timedOut ? "timeout" : "failed",
     finalText: "",
@@ -258,11 +280,13 @@ export class WorkflowSubagentDispatcher {
       updatedAt: now,
       terminalAt: null,
     };
-    const invocation = this.input.store.createInvocation({
-      revision,
-      run: requestedRun,
-      maxActiveRuns: (await this.input.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
-    });
+    const invocation = adaptWorkflowInvocationResultToSubagentHost(
+      this.input.store.createInvocation({
+        revision,
+        run: requestedRun,
+        maxActiveRuns: (await this.input.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
+      }),
+    );
     if (invocation.status === "rejected_capacity") {
       throw new Error(
         `Subagent delegation was not created because global workflow capacity is full (${invocation.activeRuns}/${invocation.limit} active runs); wait for a workflow to finish or cancel one, then retry`,
@@ -278,7 +302,10 @@ export class WorkflowSubagentDispatcher {
         return waitForCompletion();
       },
       cancel: async (detail) => {
-        const current = this.input.store.getRun(runId);
+        const currentResult = this.input.store.getRun(runId);
+        if (currentResult.status === "error")
+          signalDurableWorkflowReadErrorToHost(currentResult.error);
+        const current = currentResult.value;
         if (!current || ["succeeded", "failed", "cancelled"].includes(current.state)) {
           return;
         }
@@ -298,15 +325,23 @@ export class WorkflowSubagentDispatcher {
     runId: string,
     acknowledgeSynchronousDelivery: boolean,
   ): Promise<SubagentDelegationOutcome> {
-    const initialRun = this.input.store.getRun(runId);
+    const initialRunResult = this.input.store.getRun(runId);
+    if (initialRunResult.status === "error")
+      signalDurableWorkflowReadErrorToHost(initialRunResult.error);
+    const initialRun = initialRunResult.value;
     if (!initialRun) throw new Error(`Subagent workflow run disappeared: ${runId}`);
-    const revision = this.input.store.getRevision(initialRun.revisionId);
+    const revisionResult = this.input.store.getRevision(initialRun.revisionId);
+    if (revisionResult.status === "error")
+      signalDurableWorkflowReadErrorToHost(revisionResult.error);
+    const revision = revisionResult.value;
     if (!revision)
       throw new Error(`Subagent workflow revision disappeared: ${initialRun.revisionId}`);
     const preDispatchDeadline = initialRun.createdAt + revision.resources.operationIdleTimeoutMs;
 
     while (true) {
-      const run = this.input.store.getRun(runId);
+      const runResult = this.input.store.getRun(runId);
+      if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+      const run = runResult.value;
       if (!run) throw new Error(`Subagent workflow run disappeared: ${runId}`);
       if (["succeeded", "failed", "cancelled"].includes(run.state)) {
         const completion = await completionStatus(
@@ -324,9 +359,11 @@ export class WorkflowSubagentDispatcher {
         return completion;
       }
 
-      const hasDispatchedAgentOperation = this.input.store
-        .listOperations(runId, { limit: 1_000 })
-        .some((operation) => operation.kind === "agent" && operation.state !== "queued");
+      const operations = this.input.store.listOperations(runId, { limit: 1_000 });
+      if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
+      const hasDispatchedAgentOperation = operations.value.some(
+        (operation) => operation.kind === "agent" && operation.state !== "queued",
+      );
       if (
         !hasDispatchedAgentOperation &&
         (this.input.now?.() ?? Date.now()) >= preDispatchDeadline

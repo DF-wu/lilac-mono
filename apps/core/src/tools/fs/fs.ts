@@ -33,6 +33,7 @@ import { fileTypeFromBuffer } from "file-type";
 import path from "node:path";
 
 import {
+  adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
   TOOL_RESULT_URI_PREFIX,
   type ToolResultArtifactStore,
@@ -852,12 +853,15 @@ export function fsTool(
           const sessionId = opts?.requestContext?.sessionId;
           const artifact =
             opts?.toolResultArtifacts && sessionId
-              ? await opts.toolResultArtifacts.readWindow(input.path, sessionId, {
-                  start: input.start ?? { type: "offset", offset: 0 },
-                  maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
-                  maxLines: Math.max(1, input.maxLines ?? 2_000),
-                  maxOutputBytes,
-                })
+              ? await adaptToolResultArtifactReadToUnavailablePolicy(
+                  opts.toolResultArtifacts,
+                  await opts.toolResultArtifacts.readWindow(input.path, sessionId, {
+                    start: input.start ?? { type: "offset", offset: 0 },
+                    maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
+                    maxLines: Math.max(1, input.maxLines ?? 2_000),
+                    maxOutputBytes,
+                  }),
+                )
               : { ok: false as const };
           if (!artifact.ok) {
             return {

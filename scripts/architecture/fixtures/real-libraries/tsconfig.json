@@ -4,6 +4,8 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "types": ["bun"],
     "ignoreDeprecations": "6.0",
     "baseUrl": ".",
     "paths": {
@@ -11,8 +13,8 @@
         "../../../../apps/core/node_modules/@stanley2058/simple-module-logger/dist/index.d.mts"
       ],
       "@stanley2058/lilac-utils": ["../../../../packages/utils/tagged-error-log.ts"],
-      "better-result": ["../../../../apps/core/node_modules/better-result/dist/index.d.mts"],
-      "zod": ["../../../../apps/core/node_modules/zod/index.d.ts"]
+      "better-result": ["../../../../apps/core/node_modules/better-result"],
+      "zod": ["../../../../apps/core/node_modules/zod"]
     },
     "noEmit": true
   },

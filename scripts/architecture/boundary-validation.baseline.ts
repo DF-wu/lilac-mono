@@ -475,66 +475,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.saveRequestTranscript.%3Ccallback%3E%5BAsExpression%5D%401|sha256=ab9ebba60b6b50c06ebef26773e67d248b097d39b338c1111fbd2b5742ed50d5",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.saveRequestTranscript.<callback>[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1347,
-          column: 24,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BAsExpression%5D%401|sha256=2b1f515a63b3fc417b5c9b6a8fad71985fe8adb408dc131def3ba41e6d364fe1",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1541,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getLatestCoreSurfaceSegment%5BAsExpression%5D%401|sha256=50b189ff5fd73fec67a30ca92ac781a675591a16c2627bf338327d242ea63ec9",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getLatestCoreSurfaceSegment[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1613,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCorePrimaryLineageManifest%5BAsExpression%5D%401|sha256=e3897c5ce804438da0d9d250d15f989370c15fd8afd0f12d5477583e2e46113b",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCorePrimaryLineageManifest[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1663,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.saveCorePrimaryLineageManifestInTransaction%5BAsExpression%5D%401|sha256=2c9a3c7cc2fac79ad964dde55162dc0e149ab64bfaa94849696006d75b863ba7",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.saveCorePrimaryLineageManifestInTransaction[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1691,
-          column: 22,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.validateCorePrimaryLineageReferences%5BAsExpression%5D%401|sha256=cc17f2c240d8927ce9be103dcbcdd8174a9b5964af4c79a6137f3de440422ff8",
         identity:
           "src/transcript/transcript-store.ts#SqliteTranscriptStore.validateCorePrimaryLineageReferences[AsExpression]@1",
@@ -542,114 +482,6 @@ export const boundaryValidationBaseline = {
           file: "src/transcript/transcript-store.ts",
           line: 1848,
           column: 29,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreOwnedBlobOrNull%5BAsExpression%5D%401|sha256=db88e5acb176589752b501405d4da4939b049b636d918a6ae89b02d708bf7810",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreOwnedBlobOrNull[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1910,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.unlinkSurfaceMessage.%3Ccallback%3E%5BAsExpression%5D%401|sha256=4c6eb64beeab8f8c886fb7cbe60f8750923e57045091ca7d0a31a785230174c8",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.unlinkSurfaceMessage.<callback>[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1922,
-          column: 23,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.unlinkSurfaceMessage.%3Ccallback%3E%5BAsExpression%5D%401|sha256=93b36a7eb2734c563131dc62d7e8ce9f3143b5622d9f971cfeeecdd6ae2e41d9",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.unlinkSurfaceMessage.<callback>[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1939,
-          column: 26,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.deleteUnlinkedCheckpointCandidate.%3Ccallback%3E%5BAsExpression%5D%401|sha256=2f942675c0a20856e4e4279568c25355b2b2f5f67f45deedf0a36f196e8da9a4",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.deleteUnlinkedCheckpointCandidate.<callback>[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1963,
-          column: 26,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getTranscriptBySurfaceMessage%5BAsExpression%5D%401|sha256=06eb949b854df82e3cdefb290b7a9f37b116ca00d131f9d7c96b77c53d689363",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getTranscriptBySurfaceMessage[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2013,
-          column: 20,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getTranscriptBySurfaceMessage%5BAsExpression%5D%401|sha256=1eb2d9c5ed1a74ef60e4c7542d4252ac8f4dd94d9e8c9add88dd3402a5335971",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getTranscriptBySurfaceMessage[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2023,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getLatestTranscriptBySession%5BAsExpression%5D%401|sha256=7b65b91a7490f3219304c6b2c4ac7fabd5fd396f731f0f746e3691e1dc124551",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getLatestTranscriptBySession[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2039,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getRequestTranscript%5BAsExpression%5D%401|sha256=dd3d92bfa6629b405c943b0fef737927508858a409888521cab49a60f28a35e6",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getRequestTranscript[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2057,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getLatestCompleteNamedTranscript%5BAsExpression%5D%401|sha256=3bb7fdf58f81b275c538bdb1507c91169aa51ad3b89c1fc56834b3eac2730a2b",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getLatestCompleteNamedTranscript[AsExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2073,
-          column: 20,
         },
         reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
       },
@@ -810,18 +642,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Fconversation%2Fthread-store.ts%23ConversationThreadStore.getSummary%5BAsExpression%5D%401|sha256=3831d741d415abdba72fb001c0fa4ca0124e7421146597bb86aab35c25a5495f",
-        identity:
-          "src/conversation/thread-store.ts#ConversationThreadStore.getSummary[AsExpression]@1",
-        location: {
-          file: "src/conversation/thread-store.ts",
-          line: 1249,
-          column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Fconversation%2Fthread-store.ts%23ConversationThreadStore.countThreadMessages%5BAsExpression%5D%401|sha256=b5db33fcf56137dcc5441a2db76ccdfad12668ff6f3aeaed5ce7d9c3a774dd42",
         identity:
           "src/conversation/thread-store.ts#ConversationThreadStore.countThreadMessages[AsExpression]@1",
@@ -829,18 +649,6 @@ export const boundaryValidationBaseline = {
           file: "src/conversation/thread-store.ts",
           line: 1310,
           column: 17,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Fconversation%2Fthread-store.ts%23ConversationThreadStore.upsertSummary.%3Ccallback%3E%5BAsExpression%5D%401|sha256=907de65706b043377bc9a30bba8ac60bbf883703c2ab815594027631a2972c45",
-        identity:
-          "src/conversation/thread-store.ts#ConversationThreadStore.upsertSummary.<callback>[AsExpression]@1",
-        location: {
-          file: "src/conversation/thread-store.ts",
-          line: 1666,
-          column: 25,
         },
         reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
       },
@@ -942,18 +750,6 @@ export const boundaryValidationBaseline = {
           file: "src/tool-server/tools/surface.ts",
           line: 410,
           column: 7,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unknown-assertion|identity=src%2Fruntime%2Fgraceful-restart-store.ts%23SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshotDetailed%5BAsExpression%5D%401|sha256=a7a14e9fb0c48ee4b6c3c75632a800f1338f9d765cdff4e44c465dc4a48ad76a",
-        identity:
-          "src/runtime/graceful-restart-store.ts#SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshotDetailed[AsExpression]@1",
-        location: {
-          file: "src/runtime/graceful-restart-store.ts",
-          line: 76,
-          column: 19,
         },
         reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
       },
@@ -1363,18 +1159,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fconversation%2Fthread-store.ts%23safeImportance%5BParameter%5D%401|sha256=1d5fb6da7bdbc1c40e687c9621d29f0382546d25bd72f1dc4b5512bf9537e1a7",
-        identity: "src/conversation/thread-store.ts#safeImportance[Parameter]@1",
-        location: {
-          file: "src/conversation/thread-store.ts",
-          line: 267,
-          column: 25,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fconversation%2Fthread-service.ts%23isSummaryStreamDecodeError%5BParameter%5D%401|sha256=a513efda11bcf38b67f9ed5b33389eb03f31ce7c24d03ae17ae7132b173fe32e",
         identity: "src/conversation/thread-service.ts#isSummaryStreamDecodeError[Parameter]@1",
         location: {
@@ -1399,138 +1183,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRevision%5BParameter%5D%401|sha256=acc12f61d732cd8b0cc48ae2a3296c7d48f6abc797189777f3e1fbfc7c4bd936",
-        identity: "src/workflow/durable-workflow-store.ts#parseRevision[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 255,
-          column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRun%5BParameter%5D%401|sha256=09e67dd2548602f0388beff0b43805516912c253533c9d346d7b5b529ea554be",
-        identity: "src/workflow/durable-workflow-store.ts#parseRun[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 277,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseOperation%5BParameter%5D%401|sha256=6bfbec4a908af808002544ec22c0e1de29881947a4aaf74f4c18505e590fcbe5",
-        identity: "src/workflow/durable-workflow-store.ts#parseOperation[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 310,
-          column: 25,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseWait%5BParameter%5D%401|sha256=8cf5eba6a75ecc3254f99b19bb50efb9deb16448580b5216738b5023246d9b65",
-        identity: "src/workflow/durable-workflow-store.ts#parseWait[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 338,
-          column: 20,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseTrigger%5BParameter%5D%401|sha256=63f77586879101cfc7aeb88e8d954f9a30b8bbf1d8f8203b95e4a8ec27a278df",
-        identity: "src/workflow/durable-workflow-store.ts#parseTrigger[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 359,
-          column: 23,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseBinding%5BParameter%5D%401|sha256=d26a40364ead75580fdf24aa69c08b985cb868b081c01a0bea868396ed5e2d04",
-        identity: "src/workflow/durable-workflow-store.ts#parseBinding[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 391,
-          column: 23,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseAction%5BParameter%5D%401|sha256=1c49d77c74007dcd18a2115c7b74b150024d16b535eca09a428758f77d6d5e04",
-        identity: "src/workflow/durable-workflow-store.ts#parseAction[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 409,
-          column: 22,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRequestTerminalReceipt%5BParameter%5D%401|sha256=bbc02db2d6f343bcfbb199467bbfb0a66e66014b6537f5fe9286db3484c33074",
-        identity: "src/workflow/durable-workflow-store.ts#parseRequestTerminalReceipt[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 430,
-          column: 38,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseActionOutboxEntry%5BParameter%5D%401|sha256=6df01fe2def17b1b0d43bd214c5317edb6e68bb58b007d063fa59e12838d9f58",
-        identity: "src/workflow/durable-workflow-store.ts#parseActionOutboxEntry[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 456,
-          column: 33,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23tolerantRows%5BParameter%5D%401|sha256=07f0e635c1e5ac322131d5e66eae55278db584cff0728f592e0a95bbe92c7d8e",
-        identity: "src/workflow/durable-workflow-store.ts#tolerantRows[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 474,
-          column: 60,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23tolerantRows.%3Ccallback%3E%5BParameter%5D%401|sha256=c056d6b96334d90e98d1fca1f3f8be939e0e0d8637b4c718fe542dadaefb3d33",
-        identity: "src/workflow/durable-workflow-store.ts#tolerantRows.<callback>[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 475,
-          column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.listMigrations.%3Ccallback%3E%5BParameter%5D%401|sha256=168760ecb03cff42dfee965f5030678a1b3b193dc3ba6267e29265f3ba9d92af",
         identity:
           "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.listMigrations.<callback>[Parameter]@1",
@@ -1538,19 +1190,6 @@ export const boundaryValidationBaseline = {
           file: "src/workflow/durable-workflow-store.ts",
           line: 650,
           column: 13,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.summarizeMeaningfulOperations.%3Ccallback%3E%5BParameter%5D%401|sha256=65e5383e632e2949858b17a7741ab51f05138182c600b143a633b287c74777f2",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.summarizeMeaningfulOperations.<callback>[Parameter]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 2236,
-          column: 32,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -3869,32 +3508,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.saveRequestTranscript%5BCallExpression%5D%401|sha256=4676cdf8da5887f595fbcf0545d12e63fbd00ab04bd96dd516c204106f696c6d",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.saveRequestTranscript[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1331,
-          column: 9,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.saveRequestTranscript%5BCallExpression%5D%401|sha256=ced886ee6afcd8df8bf4f72b1c6e4592f8465d7c088c2fe89900abdda37fd481",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.saveRequestTranscript[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1334,
-          column: 9,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.putCoreOwnedBlob%5BCallExpression%5D%401|sha256=d534ec1a77aff012cf8e8c64f6e1015b90c6256479a5d69197b0a1b64b11b42e",
         identity:
           "src/transcript/transcript-store.ts#SqliteTranscriptStore.putCoreOwnedBlob[CallExpression]@1",
@@ -3934,19 +3547,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.admitCoreSurfaceProjection%5BCallExpression%5D%401|sha256=b5fd0f5f07b572b01994417b4d9930865bc68303eff495ae1751668d212119ed",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.admitCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1474,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=3525f350f2b8576009dc0eb3e0911e8f92f062042c7c6accedd2f03fc944f151",
         identity:
           "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
@@ -3954,84 +3554,6 @@ export const boundaryValidationBaseline = {
           file: "src/transcript/transcript-store.ts",
           line: 1540,
           column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=4a916b964fa98027aad63efd24c99462a6ad42aea5944db5c45899fd961aa886",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1571,
-          column: 36,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=79e238df9c09ee02e26d914a4bf71fb206a3ddb1ed4710a2ae3ce84eff646273",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1593,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=291f35641818a184012d21b7e1e13cd86b1d9a16ccf2cfbcc0a6f396eea62c07",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1597,
-          column: 32,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=533d589c1e7d1ae6da7542729ebbb3eba0fbf1c03e87cf82f38ea33146bfbb80",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1598,
-          column: 26,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=3e46c9f8edf07302c08ad4a3f4d550b900ea847839f48731123e028b5b0b022b",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1601,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCoreSurfaceProjection%5BCallExpression%5D%401|sha256=a1e66031fae93f00bd166907cb358c7cfb856b040ccc2a59df87f2b40955426a",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreSurfaceProjection[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1605,
-          column: 18,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -4051,19 +3573,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.saveCorePrimaryLineageManifest%5BCallExpression%5D%401|sha256=67e0e088a05b3280ad8310f3b873d239377dd982f2019b9e91e173bd1c45d953",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.saveCorePrimaryLineageManifest[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1651,
-          column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.getCorePrimaryLineageManifest%5BCallExpression%5D%401|sha256=d0365d120f4fd31b0f42282c7fff609ba82850d4927f1a196ef7aaeef154d544",
         identity:
           "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCorePrimaryLineageManifest[CallExpression]@1",
@@ -4077,19 +3586,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.saveCorePrimaryLineageManifestInTransaction%5BCallExpression%5D%401|sha256=27decd7995800f39127c3a936d4f1a5248e3c7789648a265e9683c546d83e727",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.saveCorePrimaryLineageManifestInTransaction[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1695,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.validateCorePrimaryLineageReferences%5BCallExpression%5D%401|sha256=36ee389e85bed7335e16f3736b85047765308989513d00ab1bcb402ba65fa765",
         identity:
           "src/transcript/transcript-store.ts#SqliteTranscriptStore.validateCorePrimaryLineageReferences[CallExpression]@1",
@@ -4097,19 +3593,6 @@ export const boundaryValidationBaseline = {
           file: "src/transcript/transcript-store.ts",
           line: 1792,
           column: 28,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.validateCorePrimaryLineageReferences%5BCallExpression%5D%401|sha256=c8bc7c12bdb5fa15592faeba1568902b6caa4d371aca1775bad334a7441f532f",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.validateCorePrimaryLineageReferences[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 1824,
-          column: 34,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -4233,19 +3716,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.publishCoreNamedClaudeSuccess%5BCallExpression%5D%401|sha256=1700641d9f179e4f4ff285306992ffd64c74c20b7f05405f2496d6564a654abe",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.publishCoreNamedClaudeSuccess[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2250,
-          column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.promoteCoreNamedClaudeSessionBinding%5BCallExpression%5D%401|sha256=941cee4806e64eebd75a236ac6d6e53bb1594a80869c0d6e6fa2c7377001f7bf",
         identity:
           "src/transcript/transcript-store.ts#SqliteTranscriptStore.promoteCoreNamedClaudeSessionBinding[CallExpression]@1",
@@ -4343,19 +3813,6 @@ export const boundaryValidationBaseline = {
         location: {
           file: "src/transcript/transcript-store.ts",
           line: 2606,
-          column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.publishCorePrimaryClaudeSuccess%5BCallExpression%5D%401|sha256=decb9228ec675dc9cb03f687e0954f6bda468903e7f604ee4937a991ba41951d",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.publishCorePrimaryClaudeSuccess[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 2649,
           column: 19,
         },
         reason:
@@ -4467,45 +3924,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.rowToSnapshot%5BCallExpression%5D%401|sha256=dcdc02f20919df40ebc7fd70210769c4ae062df900e85ab517c1d8495ebe62cc",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.rowToSnapshot[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3668,
-          column: 30,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.rowToSnapshot%5BCallExpression%5D%401|sha256=bb0c94a1874471ac0d0f4bd65570de05e2f762d1123c9f7a5630cd9f1020e8f5",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.rowToSnapshot[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3675,
-          column: 27,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23SqliteTranscriptStore.rowToSnapshot%5BCallExpression%5D%401|sha256=669d1a046d79aa99c5ab33a9e92df91a655b56620739e7c70cee9d288cd341bb",
-        identity:
-          "src/transcript/transcript-store.ts#SqliteTranscriptStore.rowToSnapshot[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3677,
-          column: 38,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23parseNormalizedCanonicalMessages%5BCallExpression%5D%401|sha256=c3fd392c6e5d327486f56b418b9326401d93542d3f7196fdf150fad65548120d",
         identity:
           "src/transcript/transcript-store.ts#parseNormalizedCanonicalMessages[CallExpression]@1",
@@ -4526,66 +3944,6 @@ export const boundaryValidationBaseline = {
           file: "src/transcript/transcript-store.ts",
           line: 3804,
           column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23validateCoreOwnedBlobRow%5BCallExpression%5D%401|sha256=5ced5f00d3bb4672160eb38b7b05cdb9cb8e82dd81893a886e970251c9fcda0b",
-        identity: "src/transcript/transcript-store.ts#validateCoreOwnedBlobRow[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3808,
-          column: 21,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23validateCoreOwnedBlobRow%5BCallExpression%5D%401|sha256=46be8ad81e41e805d7931590db839045fe7db850e7ba44a3fafa646600e1f4fa",
-        identity: "src/transcript/transcript-store.ts#validateCoreOwnedBlobRow[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3814,
-          column: 17,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23validateCoreOwnedBlobRow%5BCallExpression%5D%401|sha256=f45aa90d732967f9f44c478f13fecb0c338b46428e76b0e9b0f7c970d813b150",
-        identity: "src/transcript/transcript-store.ts#validateCoreOwnedBlobRow[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3829,
-          column: 16,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23parseCompactionContextMeta%5BCallExpression%5D%401|sha256=c3920b226476010f953c5a74a49621c15ae5e73de327dba757a92f675141c56d",
-        identity: "src/transcript/transcript-store.ts#parseCompactionContextMeta[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3847,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftranscript%2Ftranscript-store.ts%23parseHistoryProviderState%5BCallExpression%5D%401|sha256=d2efc1791554436af5a3c58f7505be02076f757801f9b4090eb6c060f08d572c",
-        identity: "src/transcript/transcript-store.ts#parseHistoryProviderState[CallExpression]@1",
-        location: {
-          file: "src/transcript/transcript-store.ts",
-          line: 3857,
-          column: 20,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -5781,225 +5139,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRevision%5BCallExpression%5D%401|sha256=6b83296301078c9b889a453fbef9cdaaa4d61ac89a8f403159e18cccd5e3deef",
-        identity: "src/workflow/durable-workflow-store.ts#parseRevision[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 256,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRevision%5BCallExpression%5D%401|sha256=928e0cc92a75000e8f072947346a61b75e9ed7e861d3a7948e3f904f87e12f25",
-        identity: "src/workflow/durable-workflow-store.ts#parseRevision[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 257,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRun%5BCallExpression%5D%401|sha256=5c775978b182214b04344dad73a3f1f0b66fd711b5f3958bc1bc658027c71329",
-        identity: "src/workflow/durable-workflow-store.ts#parseRun[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 278,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRun%5BCallExpression%5D%401|sha256=50ccf1e6a18da33870f7519f2e52ed4ef10657cebec796e2617931ed1fff276f",
-        identity: "src/workflow/durable-workflow-store.ts#parseRun[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 279,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseOperation%5BCallExpression%5D%401|sha256=fbe9d4e9e740c731fa4bf007292af566ed39932a8deb0086069f09ed3758bf28",
-        identity: "src/workflow/durable-workflow-store.ts#parseOperation[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 311,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseOperation%5BCallExpression%5D%401|sha256=9ff12d7252462456474c5dfa85e49cd250639084ff5c4cee2dc3f31a821f5308",
-        identity: "src/workflow/durable-workflow-store.ts#parseOperation[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 312,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseWait%5BCallExpression%5D%401|sha256=698e6d73aa00f260650f7e77583768c159fd926cbffc7e710f756b348c145450",
-        identity: "src/workflow/durable-workflow-store.ts#parseWait[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 339,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseWait%5BCallExpression%5D%401|sha256=2c1e18360c2ab5057a45a8a700235e252cf13623c094cf4cdc42115a211699be",
-        identity: "src/workflow/durable-workflow-store.ts#parseWait[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 340,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseTrigger%5BCallExpression%5D%401|sha256=b4658de8dbe7837e74b49afb941fb12df1f88ae14e7a0aad3e8c6ce359741377",
-        identity: "src/workflow/durable-workflow-store.ts#parseTrigger[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 360,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseTrigger%5BCallExpression%5D%401|sha256=bbd0a5f27847881aa2334bb92500bd284f11d440086b2177df3ef54cac774e5a",
-        identity: "src/workflow/durable-workflow-store.ts#parseTrigger[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 361,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseBinding%5BCallExpression%5D%401|sha256=19423898325fdf39d16906b0237695f4727445a87643f1db603a9cf4ba7cbd11",
-        identity: "src/workflow/durable-workflow-store.ts#parseBinding[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 392,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseBinding%5BCallExpression%5D%401|sha256=e636ab4d75bfd351aa7d5dacffb45d1328553d91c5f77a0d5b62086a4bb1a793",
-        identity: "src/workflow/durable-workflow-store.ts#parseBinding[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 393,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseAction%5BCallExpression%5D%401|sha256=d57c9a011d0b9ebab3a89e835ec754c838f10495230b8372b6d6a205895fff91",
-        identity: "src/workflow/durable-workflow-store.ts#parseAction[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 410,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseAction%5BCallExpression%5D%401|sha256=1372b4ece36c58ae53ef1427d451fcab41b42cf6a9726e4ec9bec85cebefc7b4",
-        identity: "src/workflow/durable-workflow-store.ts#parseAction[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 411,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRequestTerminalReceipt%5BCallExpression%5D%401|sha256=890d3013aa116c2b93837f20368ef3d7094eac57382da33d81f0912e6bf4f453",
-        identity:
-          "src/workflow/durable-workflow-store.ts#parseRequestTerminalReceipt[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 431,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRequestTerminalReceipt%5BCallExpression%5D%401|sha256=df4b2dfadd37eadcff9eb3a0706e7a082dfb3d4061403c552d5f924b73376ca6",
-        identity:
-          "src/workflow/durable-workflow-store.ts#parseRequestTerminalReceipt[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 442,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseRequestTerminalReceipt%5BCallExpression%5D%401|sha256=736b037b9e4238e4a295a97a795e3d4e95c2027ab789e34cda4cd6216c9b4060",
-        identity:
-          "src/workflow/durable-workflow-store.ts#parseRequestTerminalReceipt[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 449,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23parseActionOutboxEntry%5BCallExpression%5D%401|sha256=82f94d2034f00b14266a83e6d11003637659fa5d8c417e22477a52cd4a2a387a",
-        identity: "src/workflow/durable-workflow-store.ts#parseActionOutboxEntry[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 457,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.listMigrations.%3Ccallback%3E%5BCallExpression%5D%401|sha256=a651b208e92a1e248a6ece72c04e0280392d5b12e93dad55fd190ad1265bf016",
         identity:
           "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.listMigrations.<callback>[CallExpression]@1",
@@ -6046,45 +5185,6 @@ export const boundaryValidationBaseline = {
           file: "src/workflow/durable-workflow-store.ts",
           line: 737,
           column: 17,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.createInvocation%5BCallExpression%5D%401|sha256=0e10d387397ddff3b52cde83dae428638207f72455002fd703adbf953b6be015",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.createInvocation[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 872,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.createInvocation%5BCallExpression%5D%401|sha256=81166ba7b06baf91b0fcf50482b38ed5c3fbee3d64134ca5ac6bde6cab49903e",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.createInvocation[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 873,
-          column: 26,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.createInvocation%5BCallExpression%5D%401|sha256=dead5e554d4328fbf1cbf6b00fe5ba834210b700b431a358728b436d862f83d6",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.createInvocation[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 880,
-          column: 27,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -6195,45 +5295,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.authorizeAgentDispatch.%3Ccallback%3E%5BCallExpression%5D%401|sha256=007e8fb7bfca9cc0e0f45ff7b8a4e6b8d74e412b481d49f03385838b04d39ac8",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.authorizeAgentDispatch.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 1815,
-          column: 32,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.authorizeWorkflowRequest.%3Ccallback%3E%5BCallExpression%5D%401|sha256=133cacf71fb78d46841865bece43ec4853663c7525a1029e2b0c604f7861bdf5",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.authorizeWorkflowRequest.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 1887,
-          column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.authorizeWorkflowRequest.%3Ccallback%3E%5BCallExpression%5D%401|sha256=8c06e04a13283679c0d741c36eb2f34dfb97ad7a7626f0acd2bdc8a7ad16ce57",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.authorizeWorkflowRequest.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 1891,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.recordWorkflowRequestTerminal%5BCallExpression%5D%401|sha256=86703180e814e10f4c54e92b0da5d4756eaafecb60b2bd4cfed17fd464bec396",
         identity:
           "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.recordWorkflowRequestTerminal[CallExpression]@1",
@@ -6254,32 +5315,6 @@ export const boundaryValidationBaseline = {
           file: "src/workflow/durable-workflow-store.ts",
           line: 1931,
           column: 54,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.getWorkflowRequestDispatchPolicy%5BCallExpression%5D%401|sha256=fc423dfda613d29586e7068bf3784e1862eff2abb7094acf4c06f508578d5519",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.getWorkflowRequestDispatchPolicy[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 2005,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fdurable-workflow-store.ts%23DurableWorkflowStore.getWorkflowRequestDispatchHandoff.%3Ccallback%3E%5BCallExpression%5D%401|sha256=aad761b591f08b2278e5c3ae66317b7c94820e8f846170fdf0da6e750d9c421b",
-        identity:
-          "src/workflow/durable-workflow-store.ts#DurableWorkflowStore.getWorkflowRequestDispatchHandoff.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workflow/durable-workflow-store.ts",
-          line: 2042,
-          column: 22,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -6792,32 +5827,6 @@ export const boundaryValidationBaseline = {
           file: "src/workflow/workflow-definition-store.ts",
           line: 317,
           column: 14,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fworkflow-artifact-store.ts%23writeWorkflowValueArtifact%5BCallExpression%5D%401|sha256=af0de0bc68722b57232f7e95ab287dd8a6c132a7942b47883bede3267f2f762d",
-        identity:
-          "src/workflow/workflow-artifact-store.ts#writeWorkflowValueArtifact[CallExpression]@1",
-        location: {
-          file: "src/workflow/workflow-artifact-store.ts",
-          line: 35,
-          column: 17,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fworkflow-artifact-store.ts%23readWorkflowValueArtifact%5BCallExpression%5D%401|sha256=87b496c1bc3218687ba7c896ddf5823791077b35691f5817cb6cef2cd52280e3",
-        identity:
-          "src/workflow/workflow-artifact-store.ts#readWorkflowValueArtifact[CallExpression]@1",
-        location: {
-          file: "src/workflow/workflow-artifact-store.ts",
-          line: 91,
-          column: 10,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -8174,19 +7183,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fserver.ts%23createMiniLilacServer.%3Ccallback%3E.%3Ccallback%3E.%3Ccallback%3E%5BCallExpression%5D%401|sha256=7aeee0f230750377040bba02fbe83ee83f4a840b8b21698c40c7ade561bbb67d",
-        identity:
-          "src/server.ts#createMiniLilacServer.<callback>.<callback>.<callback>[CallExpression]@1",
-        location: {
-          file: "src/server.ts",
-          line: 570,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fserver.ts%23createMiniLilacServer.%3Ccallback%3E.%3Ccallback%3E%5BCallExpression%5D%4011|sha256=a41dd717d0947229002de82b414442df678f0225b0da522d0c4c5072bcb6cea8",
         identity: "src/server.ts#createMiniLilacServer.<callback>.<callback>[CallExpression]@11",
         location: {
@@ -8205,19 +7201,6 @@ export const boundaryValidationBaseline = {
           file: "src/server.ts",
           line: 578,
           column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fmini-lilac-server|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fserver.ts%23createMiniLilacServer.%3Ccallback%3E.%3Ccallback%3E.%3Ccallback%3E%5BCallExpression%5D%401|sha256=0d834e8c0a822638ce77f735b2b176359022593bdfa08502c4caaec27f0a8cf0",
-        identity:
-          "src/server.ts#createMiniLilacServer.<callback>.<callback>.<callback>[CallExpression]@1",
-        location: {
-          file: "src/server.ts",
-          line: 584,
-          column: 22,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -10541,78 +9524,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseMigratedUiMessage%5BCallExpression%5D%401|sha256=3506929c67bb677b66226dd876a7dd70ca12a1f02a997ce20c8b72994a4a7321",
-        identity: "src/sqlite-store.ts#parseMigratedUiMessage[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 536,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseMigratedUiMessage%5BCallExpression%5D%401|sha256=d2bf3ee6757426a378cb6579912320d3f15cdd5fddc240a3a07347c84c341fb6",
-        identity: "src/sqlite-store.ts#parseMigratedUiMessage[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 540,
-          column: 9,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseMigratedUiMessage%5BCallExpression%5D%401|sha256=b81a05e8903f8a7569a95ee68f072dd5526155f9e7a16f843ec2d84e871d2010",
-        identity: "src/sqlite-store.ts#parseMigratedUiMessage[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 544,
-          column: 30,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseMigratedUiMessage%5BCallExpression%5D%401|sha256=7880ad43805493606dc1c7ead198409e8cf69b4b2c9b89623b3d2f3f4085e9cd",
-        identity: "src/sqlite-store.ts#parseMigratedUiMessage[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 562,
-          column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseMigratedUiMessage%5BCallExpression%5D%401|sha256=0fe6cca18abc1b478db1f837fb371a128e16321824d8c12c2e68ea2d747b2165",
-        identity: "src/sqlite-store.ts#parseMigratedUiMessage[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 571,
-          column: 14,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseMigratedUserUiMessage%5BCallExpression%5D%401|sha256=56c69dfea86c9bb43ff927b2bc30c9dca239931aebad6c0c7a4a129ec62449db",
-        identity: "src/sqlite-store.ts#parseMigratedUserUiMessage[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 592,
-          column: 10,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23parseStoredUIMessageChunk%5BCallExpression%5D%401|sha256=f7284b91e20045094a32090716651dcd2c734e0ce3dc16aacc9209df01e5b0f4",
         identity: "src/sqlite-store.ts#parseStoredUIMessageChunk[CallExpression]@1",
         location: {
@@ -10685,54 +9596,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toWorkspace%5BCallExpression%5D%401|sha256=e790b6db959d671e079436d7eba36e780123755ac445195df0d5b2515861784c",
-        identity: "src/sqlite-store.ts#toWorkspace[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1431,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toWorkspaceSnapshot%5BCallExpression%5D%401|sha256=eb4896057dfeece7a1e50333bd1197b260e6c536adde36f1e5a35ef84e58bc91",
-        identity: "src/sqlite-store.ts#toWorkspaceSnapshot[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1442,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toHistoryState%5BCallExpression%5D%401|sha256=feb845e3520526754caef46385bb64e3ebbc2f0b9291744bf05210864451abc7",
-        identity: "src/sqlite-store.ts#toHistoryState[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1456,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toHistoryState%5BCallExpression%5D%401|sha256=0e7164e435d87311c0e63545bf2b8d831f9352e0f215c0b0ee00c710bf98171e",
-        identity: "src/sqlite-store.ts#toHistoryState[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1473,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toMiniMainClaudeBinding%5BCallExpression%5D%401|sha256=526ad13a6084e1dc576e0b88d9da2f9bfafc889a6b733fe1bf12061318b04c4d",
         identity: "src/sqlite-store.ts#toMiniMainClaudeBinding[CallExpression]@1",
         location: {
@@ -10781,162 +9644,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toHistoryTransition%5BCallExpression%5D%401|sha256=01436d807e76f0979246870b64ed4e148568a3835103ddd86fcc39d7bf281ad6",
-        identity: "src/sqlite-store.ts#toHistoryTransition[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1536,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toHistoryTransition%5BCallExpression%5D%401|sha256=a856a40c82dca5b25e64cc8f466ac4441f3bb584336489c07c3476d442c6f4d3",
-        identity: "src/sqlite-store.ts#toHistoryTransition[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1548,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toSessionHistory%5BCallExpression%5D%401|sha256=7d5c1b24089f7cb2bcb14d20b2d0a7721838fd86bc9543063308d5eee89ebe09",
-        identity: "src/sqlite-store.ts#toSessionHistory[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1557,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toHistoryRedoEntry%5BCallExpression%5D%401|sha256=766869dd003b571d42472f1b09a09c892e8e51ed1799c4e80f62f006e4343775",
-        identity: "src/sqlite-store.ts#toHistoryRedoEntry[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1568,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toHistoryOperation%5BCallExpression%5D%401|sha256=555e45a6a77dcf972dfbef92078173dea700fe7b5dbbc1afb36aabfa05351241",
-        identity: "src/sqlite-store.ts#toHistoryOperation[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1579,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toPendingRunFinalization%5BCallExpression%5D%401|sha256=9ef0bdb496d61469064fa56e688b0d3beb441f9f576dc79e48a0e8e9d51d9b8b",
-        identity: "src/sqlite-store.ts#toPendingRunFinalization[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1600,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toPendingRunFinalization%5BCallExpression%5D%401|sha256=38b2c1635d4a528eb76365b31f74d3e32bc5c051793be4955c34be21a130bc91",
-        identity: "src/sqlite-store.ts#toPendingRunFinalization[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1617,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toPendingRunFinalization%5BCallExpression%5D%401|sha256=84cf80e574fb6f8a936c73196bfb87c17e191d05e6feea7b7c1960a399d0cd9d",
-        identity: "src/sqlite-store.ts#toPendingRunFinalization[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1624,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23toPendingRunFinalization%5BCallExpression%5D%401|sha256=ac14d030e5cf68bc8670afd3f93419337cad8c02e2f1f6f0f8ef5369da648732",
-        identity: "src/sqlite-store.ts#toPendingRunFinalization[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1630,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23readMiniLilacHistoryRecoveryStatus%5BCallExpression%5D%401|sha256=90ce5792abee43d1286cb47276149daad56f575e56eb8f117c1b8df9dc859c3a",
-        identity: "src/sqlite-store.ts#readMiniLilacHistoryRecoveryStatus[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1669,
-          column: 21,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23readMiniLilacHistoryRecoveryStatus%5BCallExpression%5D%401|sha256=b3f85936df370e8b5e4cdef5ac46e5a6213b9746a5635f498ae2491cf706616c",
-        identity: "src/sqlite-store.ts#readMiniLilacHistoryRecoveryStatus[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1675,
-          column: 24,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23readMiniLilacHistoryRecoveryStatus%5BCallExpression%5D%401|sha256=8906f8407c810d296ef1e86a6ed872cf1b9328ee44024a6d4ed959f2d074b97e",
-        identity: "src/sqlite-store.ts#readMiniLilacHistoryRecoveryStatus[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1691,
-          column: 34,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.initializeSchema%5BCallExpression%5D%401|sha256=c30ca54b0606dce32f2445d078187719f36cdc87a963ed758c718dbc03c29d8b",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.initializeSchema[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1750,
-          column: 21,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSchemaV4ToV5%5BCallExpression%5D%401|sha256=9882de595e51130db532845fbeb9ebb50c7606669e0aaeaff55564bf5443da8d",
         identity: "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSchemaV4ToV5[CallExpression]@1",
         location: {
@@ -10974,19 +9681,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSessionHistoryV4%5BCallExpression%5D%401|sha256=20e5d800f7496181dbd03a5c81ede3505b97937f8e76d57a4ba8cbb65e29b7fe",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSessionHistoryV4[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2487,
-          column: 5,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSessionHistoryV4%5BCallExpression%5D%401|sha256=e4aae5cf887ecb7adc0c82fcc88c2f42812fbe61e8fea9827a38e8fd667fdefc",
         identity:
           "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSessionHistoryV4[CallExpression]@1",
@@ -11007,32 +9701,6 @@ export const boundaryValidationBaseline = {
           file: "src/sqlite-store.ts",
           line: 2508,
           column: 28,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSessionHistoryV4.%3Ccallback%3E%5BCallExpression%5D%401|sha256=f399d0abb65ab24e482bca272f5b7b373a63ef468595022d825578bee1bffd90",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSessionHistoryV4.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2529,
-          column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSessionHistoryV4.%3Ccallback%3E%5BCallExpression%5D%401|sha256=88db6390852a54ee4df4348535c35d4b47a2da4963b5fc331af282fd106747fc",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSessionHistoryV4.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2539,
-          column: 7,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -11077,18 +9745,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSchemaV2ToV3%5BCallExpression%5D%401|sha256=4c2e054d4612de90b54d049d576a1fcbbce45934104ff2f439270d19cbc0c5b8",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSchemaV2ToV3[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2824,
-          column: 7,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSchemaV2ToV3.%3Ccallback%3E%5BCallExpression%5D%401|sha256=446195c01a03092251f8a95ef1688f688ebb2113e5bfa6888b4d2cff04935a9d",
         identity:
           "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSchemaV2ToV3.<callback>[CallExpression]@1",
@@ -11096,43 +9752,6 @@ export const boundaryValidationBaseline = {
           file: "src/sqlite-store.ts",
           line: 2840,
           column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSchemaV2ToV3%5BCallExpression%5D%401|sha256=210697ea44e32b0f360b78b1aa1484ab5a190496843bcebe64cab011737ea730",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSchemaV2ToV3[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2848,
-          column: 27,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.migrateSchemaV2ToV3%5BCallExpression%5D%401|sha256=3729969795df7089f1eeeffd10e08f62873b15962565a053c3780a0e876df2ed",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.migrateSchemaV2ToV3[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2850,
-          column: 9,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.createSession.%3Ccallback%3E%5BCallExpression%5D%401|sha256=dfa42e9281a4f78ad662c56e947855e63a368440e1e15bd94ab2580f3ab9e008",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.createSession.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 2906,
-          column: 25,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -11178,100 +9797,12 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getTodos%5BCallExpression%5D%401|sha256=4a549ba5c79dc83e9cd8d069d40ff88ef63e9df533d139a39254f422ff906301",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getTodos[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3185,
-          column: 24,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getTodos%5BCallExpression%5D%401|sha256=18fcba393b512821f7a9cb2544c30bdfce8b4a1ffc872e443aecbd20d02556d3",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getTodos[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3186,
-          column: 17,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getTodos%5BCallExpression%5D%401|sha256=61ea08b50d2cd97dc944a881ee0f3896f220026bf0c6d9f17f9c1462570bad01",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getTodos[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3187,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.replaceTodosForRun%5BCallExpression%5D%401|sha256=219f81a7e6a20521b131e5d7511c4881de8b903b37d0972b5e2c97294ac3f7a6",
         identity: "src/sqlite-store.ts#MiniLilacSqliteStore.replaceTodosForRun[CallExpression]@1",
         location: {
           file: "src/sqlite-store.ts",
           line: 3194,
           column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.replaceTodosForRun.%3Ccallback%3E%5BCallExpression%5D%401|sha256=f6215b298fa679b9855809524920591d5bd1da3bf816ea82bd7f6cdeadccb5c8",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.replaceTodosForRun.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3233,
-          column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.replaceTodosForRun.%3Ccallback%3E%5BCallExpression%5D%401|sha256=bf5130c43b4330293f220189b952ff1d83ee1d1bae13fd1fb809ac8a3bf8d68b",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.replaceTodosForRun.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3234,
-          column: 21,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getHistoryStoreMetadata%5BCallExpression%5D%401|sha256=bdc94821a8ce3bee1cae713897d0b0584a31730026b0c29e9ba873ef4f4b736e",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.getHistoryStoreMetadata[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3250,
-          column: 17,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.listWorkspaceSnapshots%5BCallExpression%5D%401|sha256=13cad92462364eb5c4f4b2418b0c68e46c19cf9d59289727f169d304c11efc45",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.listWorkspaceSnapshots[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3278,
-          column: 5,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -11402,44 +9933,6 @@ export const boundaryValidationBaseline = {
           file: "src/sqlite-store.ts",
           line: 3382,
           column: 5,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getWorkspaceSnapshot%5BCallExpression%5D%401|sha256=2953629a3162febcc416295fcb3aa1d956ea4ec7d99cd5d221aa389bb4049e4f",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getWorkspaceSnapshot[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3418,
-          column: 5,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getHistoryStateModelMessages%5BCallExpression%5D%401|sha256=2ff6f43ce3d9ea549ff119e19fdc0ca17efd9b02cb67243c91f45e6f3716b338",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.getHistoryStateModelMessages[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3433,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getHistoryStateUiMessages%5BCallExpression%5D%401|sha256=efe0ad3620569011f12c95633d45a9fe7920982ee1ca11ab7d9e95ba7da2e790",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.getHistoryStateUiMessages[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3440,
-          column: 12,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -11583,30 +10076,6 @@ export const boundaryValidationBaseline = {
           file: "src/sqlite-store.ts",
           line: 3778,
           column: 19,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getHistoryAccounting%5BCallExpression%5D%401|sha256=f695f38d093ac8e9fb496bdae9f690f8a79932f4266929311994baa9bd4bf67a",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getHistoryAccounting[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3891,
-          column: 55,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getHistoryAccounting%5BCallExpression%5D%401|sha256=31e39c4c06d5eadaead3bfad468ec9a29b8c77bd03d2212365a6fbe0bc39c971",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getHistoryAccounting[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 3898,
-          column: 17,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -11762,45 +10231,6 @@ export const boundaryValidationBaseline = {
         location: {
           file: "src/sqlite-store.ts",
           line: 4164,
-          column: 11,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.commitSteeringHistoryBoundary.%3Ccallback%3E%5BCallExpression%5D%401|sha256=41e218dd115c5dee1aa910c1cb2b7a229a79bff2fa9cfb3ca855885357fc390e",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.commitSteeringHistoryBoundary.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 4167,
-          column: 30,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.commitSteeringHistoryBoundary.%3Ccallback%3E%5BCallExpression%5D%401|sha256=6c2548f51370d916437b183c09fefd2879b58b8fca7dd0ab8311ddbde79662bf",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.commitSteeringHistoryBoundary.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 4201,
-          column: 32,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.commitSteeringHistoryBoundary.%3Ccallback%3E%5BCallExpression%5D%401|sha256=a2cf12a3b39a6ba790cfc1a8322c8a0a799bc5cd084830b056d94c9dc0633c95",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.commitSteeringHistoryBoundary.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 4202,
           column: 11,
         },
         reason:
@@ -12133,32 +10563,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.reservePendingRunFinalization.%3Ccallback%3E%5BCallExpression%5D%401|sha256=d38728ff401351e5550ecc366afcd29afe7f995e053dcf04dc932953e7c7196d",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.reservePendingRunFinalization.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 5100,
-          column: 30,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.listRecoverableOpenRootRuns%5BCallExpression%5D%401|sha256=ca0aef8b7406ae700a5ac2cfa75d47ea6d53f0c9562ea453819f4e8e45a5fa88",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.listRecoverableOpenRootRuns[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 5163,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.recoverInterruptedRuntimeState.%3Ccallback%3E%5BCallExpression%5D%401|sha256=b0760adf9576d86254153d565d6679ffbc2855a37b08d4fe1074ebd37baa1695",
         identity:
           "src/sqlite-store.ts#MiniLilacSqliteStore.recoverInterruptedRuntimeState.<callback>[CallExpression]@1",
@@ -12283,19 +10687,6 @@ export const boundaryValidationBaseline = {
           file: "src/sqlite-store.ts",
           line: 5769,
           column: 28,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.assertWorkspaceHistoryAvailableForOwner%5BCallExpression%5D%401|sha256=93dae3a11d564db0081150036b529bacf6a21c61c4ef6c3e1fd4240b11d323a7",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.assertWorkspaceHistoryAvailableForOwner[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 5815,
-          column: 23,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -12535,30 +10926,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getModelMessages%5BCallExpression%5D%401|sha256=d3503ee6e27fec8fad5b43e5447e23ecbd55cf063360708731345d8ccd3d8a21",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getModelMessages[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 6234,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getUiMessages%5BCallExpression%5D%401|sha256=a24776c803ecd7872cdcf6df61742338a45ef5b82bbb078bef5fbcaa46c7fc24",
-        identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getUiMessages[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 6243,
-          column: 12,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.internSerializedChain.%3Ccallback%3E%5BCallExpression%5D%401|sha256=ba32781f13c21df89e37d63c075b1a2fe921b2b9f695429aecc73f50f09d68fe",
         identity:
           "src/sqlite-store.ts#MiniLilacSqliteStore.internSerializedChain.<callback>[CallExpression]@1",
@@ -12610,309 +10977,12 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.readSerializedChain.%3Ccallback%3E%5BCallExpression%5D%401|sha256=3335f95ed25e9744fad31f1088ad96764ffd39c051cea107bf3d7fb951413346",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.readSerializedChain.<callback>[CallExpression]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 6371,
-          column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.getCommandResult%5BCallExpression%5D%401|sha256=2b38be5f66e8267eb675a4d2005cde333af6677dbb37d63614df4bc274ab553b",
         identity: "src/sqlite-store.ts#MiniLilacSqliteStore.getCommandResult[CallExpression]@1",
         location: {
           file: "src/sqlite-store.ts",
           line: 6387,
           column: 17,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23isMissingExecutable%5BCallExpression%5D%401|sha256=ff6f5fdbc667af25a8982e734354fe5a527e67a1d09aef4050bff5e13038854c",
-        identity: "src/workspace-history-store.ts#isMissingExecutable[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 582,
-          column: 18,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23lstatIfExists%5BCallExpression%5D%401|sha256=292c3c2a27768bc428958ad91d88db2889bb38f444a9ff5a22de353b3639a9ca",
-        identity: "src/workspace-history-store.ts#lstatIfExists[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 810,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.removeOwnedStore.%3Ccallback%3E%5BCallExpression%5D%401|sha256=c0b7ddbfc07f988bd356e991118fcba07612f3ebd123a42dd1f778f83c1a84be",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.removeOwnedStore.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2079,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.writeRestorePlanManifest%5BCallExpression%5D%401|sha256=72fbfa7197f2f6cceac6ac32b59b0531a0cd1e6baec1a8a095abd38d87d6c446",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.writeRestorePlanManifest[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2228,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.readRestorePlanManifest%5BCallExpression%5D%401|sha256=ab35eebe4df6bfc7f3f8c90f30ba95c536d2e6640789e4defe13ceda994bb812",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.readRestorePlanManifest[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2293,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.ensureStore%5BCallExpression%5D%401|sha256=73d26d2121a678887200831bf8a411c8c22e4919ddde571b3c2502964ef8d9ca",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.ensureStore[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2472,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.verifyOwnershipMarker%5BCallExpression%5D%401|sha256=c557faa67c93a40a1433e2099529bc37133b1872fbe4c95d02c20a0fcabdfd7b",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.verifyOwnershipMarker[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2582,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.readCaptureCache.%3Ccallback%3E%5BCallExpression%5D%401|sha256=54c6c1674aa6493ddd27d9405c1b035d8ddb76fc3dde1f1b74e4efc6a73999c4",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.readCaptureCache.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2828,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.readCaptureCache%5BCallExpression%5D%401|sha256=dbf3f189a99810d111e71886b967298283ae91699aa097917ed49e7d1c2beaf1",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.readCaptureCache[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2839,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.writeCaptureCache%5BCallExpression%5D%401|sha256=4ecb2b3ac41a85fca7cc9e889eb6907cfc028ad72d2bf31a28b42eb91364d5a7",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.writeCaptureCache[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2874,
-          column: 24,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.readSnapshot%5BCallExpression%5D%401|sha256=782a8e1eaf6a5412676d74369a117a9c7621024b7c874ffca71fded4804f49bb",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.readSnapshot[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 3112,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.createExclusiveTemporaryDirectory%5BCallExpression%5D%401|sha256=4721efb7a62a9e09d56b96c46c6ae5f8fb3ace650f1f814f8d07b5a234cd27da",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.createExclusiveTemporaryDirectory[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 3755,
-          column: 24,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.createDestinationSibling%5BCallExpression%5D%401|sha256=29dd954410ee17c382c76b3789216884075425dc2102d2039b7aad9b3cccc0dc",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.createDestinationSibling[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 3840,
-          column: 24,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.applyPreparedRestore.%3Ccallback%3E%5BCallExpression%5D%401|sha256=17b791286583a807a3cdbaa5f9d5fbcb945c28215e0ecd7b49520d905795c4b2",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.applyPreparedRestore.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 4148,
-          column: 26,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.publishDestinationSibling%5BCallExpression%5D%401|sha256=f2382cbb1b9d9b3fe8e7749ce64e641150c8d87b2984df54441791984e5b699c",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.publishDestinationSibling[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 4336,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.cleanupDestinationArtifacts.%3Ccallback%3E%5BCallExpression%5D%401|sha256=a582b2f79e157946a804c7494fa45a9d0675b6df7b66d74d643330274b4b743d",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.cleanupDestinationArtifacts.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 4412,
-          column: 24,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.cleanupStaleRestoreArtifactsLocked%5BCallExpression%5D%401|sha256=6bfddc9db0866b58742f851495f647283e2f3d57756125ef97f9df353571c5b1",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.cleanupStaleRestoreArtifactsLocked[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 4460,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.cleanupStaleRestoreArtifactsLocked%5BCallExpression%5D%401|sha256=ab624399dc36d422681e9b7080c84ea57df881118e4d14b3689566674e5c32d5",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.cleanupStaleRestoreArtifactsLocked[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 4542,
-          column: 29,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.validatedOwnedRestoreArtifactPaths%5BCallExpression%5D%401|sha256=948f2b64466e457248ee24ea78acb57d0f8097ebb914f8cc024171e87c220452",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.validatedOwnedRestoreArtifactPaths[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 4595,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.ensureSnapshotRefCreationMetadata%5BCallExpression%5D%401|sha256=704d1e0fdce65fc910e870efea7647c5cc238953b8695fc0a5e0b7961fa14fd3",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.ensureSnapshotRefCreationMetadata[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 5107,
-          column: 22,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.readSnapshotRefCreationMetadata%5BCallExpression%5D%401|sha256=f410b78fcf047a7124706bd50afecb8f17ef6cfe190436480ad778873e21f632",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.readSnapshotRefCreationMetadata[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 5152,
-          column: 20,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.objectTypesUnlocked%5BCallExpression%5D%401|sha256=3c4de5671599cfd842cde7dcd4c9aeab24c9203dd26c53e45a7dc004e712da90",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.objectTypesUnlocked[CallExpression]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 5351,
-          column: 22,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -13380,30 +11450,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23parseMigratedUiMessage%5BParameter%5D%401|sha256=22e6c130a01a06b5a1d2ec8ea9f59ab9f53bf5db424d5eb253e7bdf91868b8be",
-        identity: "src/sqlite-store.ts#parseMigratedUiMessage[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 532,
-          column: 33,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23parseMigratedUserUiMessage%5BParameter%5D%401|sha256=8fb0d92a10877b30fb16649a9f284fce236e87a3c7f5f340139aaab4167f3fe2",
-        identity: "src/sqlite-store.ts#parseMigratedUserUiMessage[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 587,
-          column: 37,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23%3Ccallback%3E%5BParameter%5D%402|sha256=13633916acb6f93ae9052397916d031dbd1e414d41bc43a0966eec445f889f90",
         identity: "src/sqlite-store.ts#<callback>[Parameter]@2",
         location: {
@@ -13536,42 +11582,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toWorkspace%5BParameter%5D%401|sha256=871debc0dcf3bfb65817c405fdd79dc059349ec661c4fd11a4af2b72ec79a325",
-        identity: "src/sqlite-store.ts#toWorkspace[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1430,
-          column: 22,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toWorkspaceSnapshot%5BParameter%5D%401|sha256=e4c8d1901e8dec95073a081c3a499aeec1d7e3b058268e912acdaca29876ac47",
-        identity: "src/sqlite-store.ts#toWorkspaceSnapshot[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1441,
-          column: 30,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toHistoryState%5BParameter%5D%401|sha256=2baaa2716c15db6a1adfd9f7bb0e343b85be005c8dc4398ba9a7f004326c9bcd",
-        identity: "src/sqlite-store.ts#toHistoryState[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1455,
-          column: 25,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toMiniMainClaudeBinding%5BParameter%5D%401|sha256=d1308b2f3d62728c3b30963234e7c803f0021f1df8a92890833d3ab1a192837d",
         identity: "src/sqlite-store.ts#toMiniMainClaudeBinding[Parameter]@1",
         location: {
@@ -13613,66 +11623,6 @@ export const boundaryValidationBaseline = {
         location: {
           file: "src/sqlite-store.ts",
           line: 1531,
-          column: 35,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toHistoryTransition%5BParameter%5D%401|sha256=ee951b32760c43e4696c0d8a4e74697c43530ebb2f9f2e4ba8defec169f856bc",
-        identity: "src/sqlite-store.ts#toHistoryTransition[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1535,
-          column: 30,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toSessionHistory%5BParameter%5D%401|sha256=9de5b514a6537ad9b0fa37cd107d89df47c2b67dab01d75800c329158e9104c3",
-        identity: "src/sqlite-store.ts#toSessionHistory[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1556,
-          column: 27,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toHistoryRedoEntry%5BParameter%5D%401|sha256=d43385ce55336155aa6c88f1c2ae9ba7e72cfcd47c963d7c4ca5444a0bdb9bf0",
-        identity: "src/sqlite-store.ts#toHistoryRedoEntry[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1567,
-          column: 29,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toHistoryOperation%5BParameter%5D%401|sha256=267fdec9e8fd761c8b268905a53d18ee34d783669dc238d30c892c3c5ec22bac",
-        identity: "src/sqlite-store.ts#toHistoryOperation[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1578,
-          column: 29,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23toPendingRunFinalization%5BParameter%5D%401|sha256=001291eff04340601aa0f6c3cc0ff05a672e4ec39074ef79407d3e4171f584cb",
-        identity: "src/sqlite-store.ts#toPendingRunFinalization[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 1599,
           column: 35,
         },
         reason:
@@ -13757,19 +11707,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.readSerializedChain.%3Ccallback%3E%5BParameter%5D%401|sha256=11242c708e426f25b8e8c5974e49305533d13a01bcfcd374284a941d702b65af",
-        identity:
-          "src/sqlite-store.ts#MiniLilacSqliteStore.readSerializedChain.<callback>[Parameter]@1",
-        location: {
-          file: "src/sqlite-store.ts",
-          line: 6371,
-          column: 13,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fsqlite-store.ts%23MiniLilacSqliteStore.saveCommandResult%5BParameter%5D%401|sha256=f545ec6bafd72e4d4404867a741d03a11b9b629370ac88b23257b8e43784d861",
         identity: "src/sqlite-store.ts#MiniLilacSqliteStore.saveCommandResult[Parameter]@1",
         location: {
@@ -13826,19 +11763,6 @@ export const boundaryValidationBaseline = {
           file: "src/workspace-history-store.ts",
           line: 2407,
           column: 57,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fmini-lilac-runtime|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkspace-history-store.ts%23WorkspaceHistoryStore.readCaptureCache.%3Ccallback%3E%5BParameter%5D%401|sha256=b2b92f31d3d08e96aa80a58d55536aa22963e4207b1cce0063aaa422fd839c33",
-        identity:
-          "src/workspace-history-store.ts#WorkspaceHistoryStore.readCaptureCache.<callback>[Parameter]@1",
-        location: {
-          file: "src/workspace-history-store.ts",
-          line: 2827,
-          column: 70,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -14049,41 +11973,6 @@ export const boundaryValidationBaseline = {
           file: "src/session-service.ts",
           line: 4904,
           column: 33,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-    ],
-  },
-  "packages/plugin-runtime": {
-    "architecture/no-unknown-assertion": [],
-    "architecture/no-domain-unknown": [],
-    "architecture/no-rich-unknown-predicate": [],
-  },
-  "packages/tool-results": {
-    "architecture/no-rich-unknown-predicate": [
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Ftool-results|rule=architecture%2Fno-rich-unknown-predicate|identity=src%2Ftool-result-artifact-store.ts%23isArtifactMetadata%5BFunctionDeclaration%5D%401|sha256=936663cf15bc4c996b04decf0e5ca98478533ef06d1114322b1e55f45c35eec7",
-        identity: "src/tool-result-artifact-store.ts#isArtifactMetadata[FunctionDeclaration]@1",
-        location: {
-          file: "src/tool-result-artifact-store.ts",
-          line: 126,
-          column: 1,
-        },
-        reason:
-          "Existing rich unknown predicate awaiting schema decoding or exact capability registration.",
-      },
-    ],
-    "architecture/no-domain-unknown": [
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Ftool-results|rule=architecture%2Fno-domain-unknown|identity=src%2Ftool-result-artifact-store.ts%23isArtifactMetadata%5BParameter%5D%401|sha256=17f6f0524bf45bd4ae3fa21d6ce86af3c105b1c750bca04e67cb566607e836f6",
-        identity: "src/tool-result-artifact-store.ts#isArtifactMetadata[Parameter]@1",
-        location: {
-          file: "src/tool-result-artifact-store.ts",
-          line: 126,
-          column: 29,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { readFileSync } from "node:fs";
 
 import { describe, expect, test } from "bun:test";
 import ts from "typescript-codegen";
@@ -11,7 +12,9 @@ import { createFingerprint } from "./fingerprint.ts";
 import type {
   ArchitectureManifest,
   OpenProtocolAdapter,
+  PersistedCodecRegistration,
   ResultDecoderRegistration,
+  SqliteTransactionAdapterRegistration,
   ToolCodecRegistryRegistration,
   WorkspaceArchitecture,
   ZeroBaselineScope,
@@ -66,6 +69,10 @@ const BASE_WORKSPACE = {
   toolCodecRegistries: [],
   resultDecoders: [],
   unknownFreeModules: [],
+  persistedCodecs: [],
+  persistedStoreConsumers: [],
+  sqliteTransactionAdapters: [],
+  sqliteTransactionConsumers: [],
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
@@ -2289,6 +2296,488 @@ describe("Stage 5 presentation architecture rules", () => {
     );
     expect(findings).toHaveLength(1);
     expect(findings[0]?.message).toContain('"malformed-known-tool"');
+  });
+});
+
+describe("Stage 6 persistence and SQLite architecture", () => {
+  const realRoot = path.join(import.meta.dir, "fixtures/real-libraries");
+  const realWorkspaceBase = {
+    ...BASE_WORKSPACE,
+    name: "real-stage6",
+    packageName: "architecture-real-libraries",
+    root: "scripts/architecture/fixtures/real-libraries",
+    tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+  } as const satisfies WorkspaceArchitecture;
+
+  function persistedCodec(
+    exportName: string,
+    fixtureExportName: string,
+    provenance: PersistedCodecRegistration["provenance"] = [
+      "current",
+      "migrated",
+      "missing-defaulted",
+    ],
+  ): PersistedCodecRegistration {
+    return {
+      status: "enforced",
+      identity: { module: "stage6-persistence.ts", exportName },
+      inputParameter: 0,
+      fixtureCatalog: { module: "stage6-persistence.ts", exportName: fixtureExportName },
+      provenance,
+    };
+  }
+
+  const transactionAdapter: SqliteTransactionAdapterRegistration = {
+    status: "enforced",
+    identity: { module: "stage6-transactions.ts", exportName: "runFixtureSqliteTransaction" },
+    databaseParameter: 0,
+    operationParameter: 1,
+    rollbackSentinel: { module: "stage6-transactions.ts", exportName: "FixtureRollback" },
+    panicClassifier: { package: "better-result", exportName: "Panic.is" },
+    driverErrorClassifier: {
+      module: "stage6-transactions.ts",
+      exportName: "classifyFixtureSqliteDriverError",
+    },
+  };
+
+  test("validates real persisted codec contracts, provenance, fixtures, and consumer linkage", () => {
+    const codecs = [
+      persistedCodec("decodeFixtureStringArray", "fixtureStringArrayCases"),
+      persistedCodec("decodeFixtureImportance", "fixtureImportanceCases"),
+      persistedCodec("decodeFixtureAboutness", "fixtureAboutnessCases"),
+      persistedCodec("decodeFixtureBytes", "fixtureBytesCases"),
+      persistedCodec("decodeRequiredFixture", "requiredFixtureCases", ["current", "migrated"]),
+    ];
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/persisted-codec-contract": [{ include: "stage6-persistence.ts" }],
+        "architecture/persisted-codec-fixture-catalog": [{ include: "stage6-persistence.ts" }],
+      },
+      persistedCodecs: codecs,
+      persistedStoreConsumers: [
+        {
+          status: "enforced",
+          identity: {
+            module: "stage6-persistence.ts",
+            exportName: "consumeFixturePersistence",
+          },
+          codecs: [codecs[0]!.identity],
+        },
+      ],
+      operationalResultApis: [
+        ...codecs.map(({ identity }) => identity),
+        { module: "stage6-persistence.ts", exportName: "consumeFixturePersistence" },
+      ],
+      zeroBaselineScopes: [
+        { module: "stage6-persistence.ts", symbol: "consumeFixturePersistence" },
+      ],
+    } satisfies WorkspaceArchitecture;
+    assertArchitectureManifestIntegrity({ version: 1, workspaces: [workspace] });
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+    expect(analyzeWorkspace(workspace, realRoot, program)).toEqual([]);
+  });
+
+  test("rejects drifted provenance and incomplete or mislabeled fixture catalogs", () => {
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/persisted-codec-contract": [{ include: "stage6-persistence.ts" }],
+        "architecture/persisted-codec-fixture-catalog": [{ include: "stage6-persistence.ts" }],
+      },
+      persistedCodecs: [
+        persistedCodec("decodeFixtureWithWrongProvenance", "incompleteFixtureCases"),
+      ],
+      operationalResultApis: [
+        { module: "stage6-persistence.ts", exportName: "decodeFixtureWithWrongProvenance" },
+      ],
+    } satisfies WorkspaceArchitecture;
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+    const findings = analyzeWorkspace(workspace, realRoot, program);
+    expect(findings.map(({ rule }) => rule).sort()).toEqual([
+      "architecture/persisted-codec-contract",
+      "architecture/persisted-codec-fixture-catalog",
+    ]);
+    expect(
+      findings.some(({ message }) => message.includes("provenance must be exactly")),
+    ).toBeTrue();
+    expect(findings.some(({ message }) => message.includes("missing-defaulted"))).toBeTrue();
+  });
+
+  test("fails closed for unregistered persisted consumers and fixture catalogs", () => {
+    const codec = persistedCodec("decodeFixtureStringArray", "fixtureStringArrayCases");
+    const unregisteredConsumerWorkspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/persisted-codec-contract": [{ include: "stage6-persistence.ts" }],
+        "architecture/persisted-codec-fixture-catalog": [{ include: "stage6-persistence.ts" }],
+      },
+      persistedCodecs: [codec],
+      operationalResultApis: [codec.identity],
+    } satisfies WorkspaceArchitecture;
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, unregisteredConsumerWorkspace).program;
+    expect(() => analyzeWorkspace(unregisteredConsumerWorkspace, realRoot, program)).toThrow(
+      "Unregistered persisted store consumer",
+    );
+
+    const unregisteredCatalogWorkspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/persisted-codec-fixture-catalog": [
+          { include: "stage6-unregistered-catalog.ts" },
+        ],
+      },
+    } satisfies WorkspaceArchitecture;
+    expect(() => analyzeWorkspace(unregisteredCatalogWorkspace, realRoot, program)).toThrow(
+      "Unregistered persisted codec fixture catalog",
+    );
+  });
+
+  test("registers the single workflow row codec catalog without treating family fixtures as a second contract", () => {
+    const core = architectureManifest.workspaces.find(({ root }) => root === "apps/core");
+    if (!core) throw new Error("Core architecture workspace missing");
+    const workflowModule = "src/workflow/workflow-persistence-codec.ts";
+    const workflowCodecs = core.persistedCodecs.filter(
+      ({ identity }) => identity.module === workflowModule,
+    );
+    expect(workflowCodecs).toEqual([
+      expect.objectContaining({
+        status: "enforced",
+        identity: {
+          module: workflowModule,
+          exportName: "decodeWorkflowPersistenceRow",
+        },
+        fixtureCatalog: {
+          module: workflowModule,
+          exportName: "workflowPersistenceRowCodecCases",
+        },
+        missingOutcomes: {
+          revision: "missing-rejected",
+          run: "missing-rejected",
+          operation: "missing-rejected",
+          wait: "missing-rejected",
+          trigger: "missing-rejected",
+          binding: "missing-rejected",
+          action: "missing-defaulted",
+          dispatch: "missing-rejected",
+          receipt: "missing-rejected",
+          outbox: "missing-rejected",
+          "legacy-audit": "missing-rejected",
+        },
+      }),
+    ]);
+
+    const sourceText = readFileSync(
+      path.join(REPOSITORY_ROOT, "apps/core", workflowModule),
+      "utf8",
+    );
+    const source = ts.createSourceFile(workflowModule, sourceText, ts.ScriptTarget.Latest, true);
+    const exportedVariables = source.statements.flatMap((statement) => {
+      if (!ts.isVariableStatement(statement)) return [];
+      const exported = statement.modifiers?.some(
+        ({ kind }) => kind === ts.SyntaxKind.ExportKeyword,
+      );
+      if (!exported) return [];
+      return statement.declarationList.declarations.flatMap(({ name }) =>
+        ts.isIdentifier(name) ? [name.text] : [],
+      );
+    });
+    expect(exportedVariables.filter((name) => name.endsWith("CodecCases"))).toEqual([
+      "workflowPersistenceRowCodecCases",
+    ]);
+    expect(exportedVariables).toContain("workflowPersistenceRowFamilyFixtures");
+  });
+
+  test("validates the real bun:sqlite adapter and detects Err returned by a raw callback", () => {
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/sqlite-transaction-adapter-contract": [{ include: "stage6-transactions.ts" }],
+        "architecture/no-result-err-in-sqlite-callback": [{ include: "stage6-transactions.ts" }],
+      },
+      sqliteTransactionAdapters: [transactionAdapter],
+      operationalResultApis: [transactionAdapter.identity],
+    } satisfies WorkspaceArchitecture;
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+    const findings = analyzeWorkspace(workspace, realRoot, program);
+    expect(
+      findings.filter(
+        ({ rule, identity }) =>
+          rule === "architecture/no-result-err-in-sqlite-callback" &&
+          identity.includes("rawDriverCallbackReturningErr"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      findings.filter(({ rule }) => rule === "architecture/sqlite-transaction-adapter-contract"),
+    ).toEqual([]);
+  });
+
+  test("rejects non-private sentinels and inexact Panic or driver classifiers", () => {
+    const inexactAdapter = {
+      ...transactionAdapter,
+      rollbackSentinel: {
+        module: "stage6-transactions.ts",
+        exportName: "ExportedFixtureRollback",
+      },
+      panicClassifier: { package: "better-result", exportName: "Panic" },
+      driverErrorClassifier: {
+        module: "stage6-transactions.ts",
+        exportName: "fixtureRowCount",
+      },
+    } satisfies SqliteTransactionAdapterRegistration;
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/sqlite-transaction-adapter-contract": [{ include: "stage6-transactions.ts" }],
+      },
+      sqliteTransactionAdapters: [inexactAdapter],
+      operationalResultApis: [inexactAdapter.identity],
+    } satisfies WorkspaceArchitecture;
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+    const findings = analyzeWorkspace(workspace, realRoot, program);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("rollback sentinel is exported instead of private");
+    expect(findings[0]?.message).toContain("exact Panic classifier");
+    expect(findings[0]?.message).toContain("exact SQLite driver classifier");
+  });
+
+  test("manifest integrity requires exact Panic identity, operational linkage, and descendant zero debt", () => {
+    const base = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/sqlite-transaction-adapter-contract": [{ include: "stage6-transactions.ts" }],
+        "architecture/sqlite-transaction-consumer": [{ include: "stage6-transactions.ts" }],
+      },
+      sqliteTransactionAdapters: [transactionAdapter],
+      sqliteTransactionConsumers: [
+        {
+          status: "enforced",
+          identity: {
+            module: "stage6-transactions.ts",
+            exportName: "goodFixtureTransactionConsumer",
+          },
+          adapter: transactionAdapter.identity,
+        },
+      ],
+      operationalResultApis: [
+        transactionAdapter.identity,
+        { module: "stage6-transactions.ts", exportName: "goodFixtureTransactionConsumer" },
+      ],
+      zeroBaselineScopes: [
+        { module: "stage6-transactions.ts", symbol: "goodFixtureTransactionConsumer" },
+      ],
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [base] }),
+    ).not.toThrow();
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...base,
+            sqliteTransactionAdapters: [
+              {
+                ...transactionAdapter,
+                panicClassifier: { package: "better-result", exportName: "Panic" },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("exact better-result#Panic.is");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [{ ...base, operationalResultApis: [transactionAdapter.identity] }],
+      }),
+    ).toThrow("operational Result API");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [{ ...base, zeroBaselineScopes: [] }],
+      }),
+    ).toThrow("descendant-aware zero-baseline scope");
+  });
+
+  test("requires transaction consumers to call the exact registered adapter", () => {
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/sqlite-transaction-consumer": [{ include: "stage6-transactions.ts" }],
+      },
+      sqliteTransactionAdapters: [transactionAdapter],
+      sqliteTransactionConsumers: [
+        {
+          status: "enforced",
+          identity: {
+            module: "stage6-transactions.ts",
+            exportName: "goodFixtureTransactionConsumer",
+          },
+          adapter: transactionAdapter.identity,
+        },
+        {
+          status: "enforced",
+          identity: {
+            module: "stage6-transactions.ts",
+            exportName: "badFixtureTransactionConsumer",
+          },
+          adapter: transactionAdapter.identity,
+        },
+      ],
+      operationalResultApis: [
+        transactionAdapter.identity,
+        { module: "stage6-transactions.ts", exportName: "goodFixtureTransactionConsumer" },
+        { module: "stage6-transactions.ts", exportName: "badFixtureTransactionConsumer" },
+      ],
+      zeroBaselineScopes: [
+        { module: "stage6-transactions.ts", symbol: "goodFixtureTransactionConsumer" },
+        { module: "stage6-transactions.ts", symbol: "badFixtureTransactionConsumer" },
+      ],
+    } satisfies WorkspaceArchitecture;
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+    const findings = analyzeWorkspace(workspace, realRoot, program);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.rule).toBe("architecture/sqlite-transaction-consumer");
+    expect(findings[0]?.identity).toContain("badFixtureTransactionConsumer");
+  });
+
+  test("fails closed for an unregistered SQLite transaction consumer", () => {
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        "architecture/sqlite-transaction-consumer": [{ include: "stage6-transactions.ts" }],
+      },
+      sqliteTransactionAdapters: [transactionAdapter],
+      sqliteTransactionConsumers: [
+        {
+          status: "enforced",
+          identity: {
+            module: "stage6-transactions.ts",
+            exportName: "badFixtureTransactionConsumer",
+          },
+          adapter: transactionAdapter.identity,
+        },
+      ],
+      operationalResultApis: [
+        transactionAdapter.identity,
+        { module: "stage6-transactions.ts", exportName: "badFixtureTransactionConsumer" },
+      ],
+      zeroBaselineScopes: [
+        { module: "stage6-transactions.ts", symbol: "badFixtureTransactionConsumer" },
+      ],
+    } satisfies WorkspaceArchitecture;
+    const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+    expect(() => analyzeWorkspace(workspace, realRoot, program)).toThrow(
+      "Unregistered SQLite transaction consumer",
+    );
+  });
+
+  test("executes real better-result codecs and bun:sqlite commit, rollback, driver, and Panic fixtures", async () => {
+    const process = Bun.spawn(
+      ["bun", "scripts/architecture/fixtures/real-libraries/stage6-runtime.ts"],
+      { cwd: REPOSITORY_ROOT, stdout: "pipe", stderr: "pipe" },
+    );
+    const [exitCode, stderr] = await Promise.all([
+      process.exited,
+      new Response(process.stderr).text(),
+    ]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+  });
+
+  test("activates only the landed production Stage 6 scopes", () => {
+    const core = architectureManifest.workspaces.find(({ name }) => name === "apps/core");
+    const mini = architectureManifest.workspaces.find(
+      ({ name }) => name === "packages/mini-lilac-runtime",
+    );
+    const utils = architectureManifest.workspaces.find(({ name }) => name === "packages/utils");
+    if (!core || !mini || !utils) throw new Error("Stage 6 production workspaces missing");
+    expect(
+      core.persistedCodecs.filter(
+        ({ identity }) =>
+          identity.module === "src/conversation/thread-summary-persistence-codec.ts",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        status: "enforced",
+        identity: {
+          module: "src/conversation/thread-summary-persistence-codec.ts",
+          exportName: "decodeConversationThreadSummaryRow",
+        },
+        fixtureCatalog: {
+          module: "src/conversation/thread-summary-persistence-codec.ts",
+          exportName: "conversationThreadSummaryRowCodecCases",
+        },
+      }),
+    ]);
+    expect(
+      architectureManifest.workspaces.reduce(
+        (count, workspace) => count + workspace.persistedCodecs.length,
+        0,
+      ),
+    ).toBe(21);
+    expect(core.persistedCodecs.every(({ status }) => status === "enforced")).toBeTrue();
+    expect(mini.persistedCodecs.every(({ status }) => status === "enforced")).toBeTrue();
+    expect(mini.persistedStoreConsumers.every(({ status }) => status === "enforced")).toBeTrue();
+    expect(core.persistedStoreConsumers.every(({ status }) => status === "enforced")).toBeTrue();
+    expect(
+      core.sqliteTransactionConsumers.find(
+        ({ identity }) => identity.exportName === "ConversationThreadStore.upsertSummary",
+      )?.status,
+    ).toBe("enforced");
+    expect(
+      core.sqliteTransactionConsumers
+        .filter(({ identity }) => identity.module === "src/transcript/transcript-store.ts")
+        .every(({ status }) => status === "enforced"),
+    ).toBeTrue();
+    expect(
+      core.sqliteTransactionConsumers
+        .filter(({ identity }) => identity.module !== "src/transcript/transcript-store.ts")
+        .every(({ status }) => status === "enforced"),
+    ).toBeTrue();
+    expect(utils.sqliteTransactionAdapters).toContainEqual(
+      expect.objectContaining({
+        status: "enforced",
+        identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
+      }),
+    );
+    for (const registration of [
+      ...core.persistedCodecs,
+      ...core.persistedStoreConsumers,
+      ...core.sqliteTransactionConsumers,
+    ]) {
+      expect(core.operationalResultApis).toContainEqual(registration.identity);
+    }
+    expect(utils.operationalResultApis).toContainEqual({
+      module: "persistence.ts",
+      exportName: "runBunSqliteTransaction",
+    });
+  });
+
+  test("the shared SQLite adapter remains contract-ready after production enforcement", () => {
+    const utils = architectureManifest.workspaces.find(({ name }) => name === "packages/utils");
+    const registration = utils?.sqliteTransactionAdapters[0];
+    if (!utils || !registration) throw new Error("shared SQLite adapter registration missing");
+    const workspace = {
+      ...utils,
+      ruleZones: {
+        ...utils.ruleZones,
+        "architecture/sqlite-transaction-adapter-contract": [{ include: "persistence.ts" }],
+        "architecture/no-result-err-in-sqlite-callback": [{ include: "persistence.ts" }],
+      },
+      sqliteTransactionAdapters: [{ ...registration, status: "enforced" }],
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
+    expect(
+      findings.filter(({ rule }) =>
+        [
+          "architecture/sqlite-transaction-adapter-contract",
+          "architecture/no-result-err-in-sqlite-callback",
+        ].includes(rule),
+      ),
+    ).toEqual([]);
   });
 });
 

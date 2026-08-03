@@ -11,7 +11,7 @@
 
 ## Current Stage
 
-Stages 0 through 5 complete. Next: Stage 6, Versioned Persistence Codecs And Transaction Results.
+Stages 0 through 6 complete. Next: Stage 7, Package-By-Package Internal API Migration.
 
 ## Stage 0
 
@@ -109,6 +109,28 @@ Stages 0 through 5 complete. Next: Stage 6, Versioned Persistence Codecs And Tra
 - [x] Run independent Stage 5 review and resolve all blocking findings.
 - [x] Run focused and full repository validation, then commit Stage 5 separately.
 
+## Stage 6
+
+- [x] Add versioned codecs for conversation-thread string arrays, importance, and aboutness with explicit
+  current, legacy, missing-defaulted, unsupported, malformed, and corrupt outcomes.
+- [x] Preserve every supported persisted record without read-time rewrites and emit bounded,
+  content-redacted corruption diagnostics.
+- [x] Migrate transcript stores, Mini Lilac SQLite records, workspace history/cache, and artifact metadata
+  to owned codecs and typed persistence Results.
+- [x] Consolidate repeated JSON/schema scaffolding only after at least three concrete codecs establish a
+  stable common shape.
+- [x] Add a SQLite transaction Result adapter with one private rollback sentinel, exact Panic
+  propagation, specific driver failure mapping, and no ordinary Err after partial writes.
+- [x] Move non-database fallible work outside transaction callbacks and prove Err rollback, Ok single
+  commit, driver failure, Panic, cleanup, and concurrency behavior.
+- [x] Migrate Mini Lilac SQLite, workspace history, and durable workflow transactions in dependency order.
+- [x] Preserve durable workflow state/outbox consistency, stable identity, publication recovery, restart
+  replay, and no duplicate projection across commit/rollback/crash paths.
+- [x] Add persistence and transaction guidance plus compatibility fixtures before activating Stage 6
+  architecture enforcement and removing repaired baseline debt.
+- [x] Run independent Stage 6 review and resolve all blocking findings.
+- [x] Run focused and full repository validation, then commit Stage 6 separately.
+
 ## Later Stages
 
 - [x] Stage 1: `better-result` foundation and pilot migrations.
@@ -116,7 +138,7 @@ Stages 0 through 5 complete. Next: Stage 6, Versioned Persistence Codecs And Tra
 - [x] Stage 3: high-risk process and extension boundaries.
 - [x] Stage 4: typed event-bus codec and delivery registry.
 - [x] Stage 5: TUI tool-observation projection.
-- [ ] Stage 6: versioned persistence codecs and transaction Results.
+- [x] Stage 6: versioned persistence codecs and transaction Results.
 - [ ] Stage 7: package-by-package internal API migration.
 - [ ] Stage 8: close ratchets and simplify governance.
 
@@ -197,4 +219,14 @@ Stages 0 through 5 complete. Next: Stage 6, Versioned Persistence Codecs And Tra
   validation. Final validation passed `bun run test:all`, including 300 TUI, 372 Mini runtime, 64
   architecture, and 37 lint-rule tests, plus `bun run typecheck`, `bun run lint:fix`, `bun run fmt`,
   `bun run lint`, `bun run fmt:check`, and `git diff --check`. The syntax ratchet contains 2,553 reviewed
+  findings with zero errors.
+- 2026-08-03: Stage 6 added explicit provenance codecs across conversation summaries, Core transcripts,
+  graceful restart, tool/workflow artifacts, Mini SQLite/history, workspace cache, and durable workflow
+  rows. It introduced the shared private-sentinel SQLite Result adapter, migrated targeted transactions,
+  and preserved workflow state/action/outbox atomicity and restart replay. Reviews drove genuine workflow
+  Result APIs, exact SQLiteError classification, no read-time mutation, rich SuperJSON compatibility,
+  complete historical migrations, exact Panic/cleanup precedence, and removal of external work from
+  transactions. Final validation passed `bun run test:all`, including 1,767 Core, 407 Mini runtime, 76
+  architecture, and 40 lint-rule tests, plus `bun run typecheck`, `bun run lint:fix`, `bun run fmt`,
+  `bun run lint`, `bun run fmt:check`, and `git diff --check`. The syntax ratchet contains 2,280 reviewed
   findings with zero errors.
