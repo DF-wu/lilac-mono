@@ -1,25 +1,43 @@
 import type Redis from "ioredis";
 import SuperJSON from "superjson";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import { z } from "zod";
 import { createLogger, errorMessage } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 
 import type { RawBus } from "./raw-bus";
+import {
+  EventDeliveryStartFailed,
+  EventDeliveryStopFailed,
+  EventDeliveryStopped,
+  EventDeliveryTransportFailed,
+  type EventDeliveryDoneError,
+  type RawDeliveryAction,
+  type RawDeliveryDependencies,
+  type RawDeliveryHandler,
+} from "./event-delivery";
+import {
+  checkedDeadLetterAcceptance,
+  EventDeadLetterAcceptFailed,
+  type EventDeadLetterAcceptance,
+  type EventTransportEvidence,
+} from "./event-dead-letter";
 import {
   RedisConnectionPool,
   type RedisConnectionPoolOptions,
   type RedisConnectionPoolAutoscaleOptions,
 } from "./redis-connection-pool";
 import type {
-  BusSubscription,
   Cursor,
   FetchOptions,
-  HandleContext,
-  Message,
   Offset,
   PublishOptions,
+  PublishMessage,
+  RawMessageDecodeOutcome,
+  RedisMessageDecodeIssue,
+  RedisWireValueEvidence,
   SubscriptionOptions,
   Topic,
-  WorkOrFanoutSubscriptionOptions,
 } from "./types";
 
 const DEFAULT_MAX_MESSAGES = 50;
@@ -28,6 +46,9 @@ const OUTPUT_STREAM_TTL_SECONDS = 24 * 60 * 60;
 const TRIM_DEBOUNCE_MS = 100;
 const EPHEMERAL_GROUP_PREFIX = "__lilac_ephemeral__:";
 const TAIL_REPLAY_TOPICS = new Set<Topic>(["evt.request", "evt.adapter"]);
+const MAX_EVIDENCE_VALUES = 32;
+const MAX_EVIDENCE_VALUE_CHARS = 1024;
+const STRING_HEADERS_SCHEMA = z.record(z.string(), z.string());
 
 const XADD_WITH_EXPIRY_SCRIPT = `
 local id = redis.call("XADD", KEYS[1], unpack(ARGV, 2))
@@ -163,91 +184,259 @@ function redisIdForOptionalOffset(offset: Offset | undefined): string {
   return redisIdForOffset(offset);
 }
 
-function toRecord(fields: unknown): Record<string, string> {
-  if (!Array.isArray(fields)) return {};
+type RedisFieldsDecodeResult =
+  | { status: "ok"; value: Record<string, string> }
+  | { status: "error"; issues: readonly RedisMessageDecodeIssue[] };
 
-  const out: Record<string, string> = {};
-  for (let i = 0; i + 1 < fields.length; i += 2) {
-    const k = fields[i];
-    const v = fields[i + 1];
-    if (typeof k === "string" && typeof v === "string") {
-      out[k] = v;
+type SuperJsonDecodeResult = { status: "ok"; value: unknown } | { status: "error" };
+
+function boundWireValue(value: unknown): RedisWireValueEvidence {
+  if (value === null) return { kind: "non-string", valueType: "null" };
+  if (Array.isArray(value)) return { kind: "non-string", valueType: "array" };
+  switch (typeof value) {
+    case "bigint":
+      return { kind: "non-string", valueType: "bigint" };
+    case "boolean":
+      return { kind: "non-string", valueType: "boolean" };
+    case "function":
+      return { kind: "non-string", valueType: "function" };
+    case "number":
+      return { kind: "non-string", valueType: "number" };
+    case "object":
+      return { kind: "non-string", valueType: "object" };
+    case "symbol":
+      return { kind: "non-string", valueType: "symbol" };
+    case "undefined":
+      return { kind: "non-string", valueType: "undefined" };
+    case "string":
+      if (value.length <= MAX_EVIDENCE_VALUE_CHARS) {
+        return { kind: "string", value, truncated: false };
+      }
+      return {
+        kind: "string",
+        value: value.slice(0, MAX_EVIDENCE_VALUE_CHARS),
+        truncated: true,
+      };
+  }
+  return { kind: "non-string", valueType: "undefined" };
+}
+
+function boundWireEvidence(fields: unknown): {
+  fields: readonly RedisWireValueEvidence[];
+  omittedValueCount: number;
+} {
+  const values = Array.isArray(fields) ? fields : [fields];
+  return {
+    fields: values.slice(0, MAX_EVIDENCE_VALUES).map(boundWireValue),
+    omittedValueCount: Math.max(0, values.length - MAX_EVIDENCE_VALUES),
+  };
+}
+
+function redisTransportEvidence(
+  topic: Topic,
+  streamKey: string,
+  id: string,
+  fields: unknown,
+): EventTransportEvidence {
+  const source = { transport: "redis-streams" as const, streamKey, topic, messageId: id };
+  if (
+    Array.isArray(fields) &&
+    fields.length <= MAX_EVIDENCE_VALUES &&
+    fields.every((value) => typeof value === "string" && value.length <= MAX_EVIDENCE_VALUE_CHARS)
+  ) {
+    return { source, wire: { kind: "bounded-complete", fields } };
+  }
+
+  return {
+    source,
+    wire: {
+      kind: "controlled-reference",
+      locator: { kind: "redis-stream-entry", streamKey, messageId: id },
+      preview: boundWireEvidence(fields),
+    },
+  };
+}
+
+function deliveryAction(value: RawDeliveryAction): RawDeliveryAction {
+  if (typeof value !== "object" || value === null) {
+    throw new Panic({ message: "Event delivery handler returned a non-object action" });
+  }
+  const disposition = Reflect.get(value, "disposition");
+  switch (disposition) {
+    case "commit":
+    case "park-pending":
+    case "stop":
+      return value;
+    case "dead-letter": {
+      const record = Reflect.get(value, "record");
+      if (typeof record !== "object" || record === null) {
+        throw new Panic({ message: "Dead-letter disposition omitted its record" });
+      }
+      return value;
+    }
+    default:
+      throw new Panic({ message: "Event delivery handler returned an unknown disposition" });
+  }
+}
+
+function decodeRedisFields(fields: unknown): RedisFieldsDecodeResult {
+  if (!Array.isArray(fields)) {
+    return {
+      status: "error",
+      issues: [{ field: "entry", reason: "fields_not_array" }],
+    };
+  }
+
+  const issues: RedisMessageDecodeIssue[] = [];
+  if (fields.length % 2 !== 0) {
+    issues.push({ field: "entry", reason: "odd_field_count" });
+  }
+  for (let index = 0; index < fields.length; index += 1) {
+    if (typeof fields[index] !== "string") {
+      issues.push({ field: "entry", reason: "non_string_field", index });
     }
   }
-  return out;
+  if (issues.length > 0) return { status: "error", issues };
+
+  const record: Record<string, string> = {};
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const key = fields[index];
+    const value = fields[index + 1];
+    if (typeof key === "string" && typeof value === "string") record[key] = value;
+  }
+  return { status: "ok", value: record };
 }
 
-function superJsonParse(value: string | undefined): unknown {
-  if (!value) return undefined;
+function decodeSuperJson(value: string): SuperJsonDecodeResult {
   try {
-    return SuperJSON.parse(value);
+    return { status: "ok", value: SuperJSON.parse(value) };
   } catch {
-    return undefined;
+    return { status: "error" };
   }
 }
 
-function decodeMessage(topic: Topic, id: string, fields: unknown, logger?: Logger): Message {
-  const record = toRecord(fields);
+function decodeMessage(
+  topic: Topic,
+  streamKey: string,
+  id: string,
+  fields: unknown,
+  logger?: Logger,
+): RawMessageDecodeOutcome {
+  const failure = (issues: readonly RedisMessageDecodeIssue[]): RawMessageDecodeOutcome => {
+    const evidence = boundWireEvidence(fields);
+    logger?.warn("event_bus.transport_decode_failed", {
+      topic,
+      messageId: id,
+      issues: issues.map((issue) => ({ field: issue.field, reason: issue.reason })),
+      evidenceValueCount: evidence.fields.length,
+      evidenceOmittedValueCount: evidence.omittedValueCount,
+      evidenceTruncated: evidence.fields.some(
+        (value) => value.kind === "string" && value.truncated,
+      ),
+    });
+    return {
+      _tag: "RedisMessageDecodeFailure",
+      topic,
+      id,
+      error: {
+        source: { transport: "redis-streams", streamKey, topic, messageId: id },
+        issues,
+        evidence,
+      },
+    };
+  };
 
-  const type = record["type"] ?? "";
+  const fieldsResult = decodeRedisFields(fields);
+  if (fieldsResult.status === "error") return failure(fieldsResult.issues);
+  const record = fieldsResult.value;
+
+  let typeResult:
+    | { status: "ok"; value: string }
+    | { status: "error"; issue: RedisMessageDecodeIssue };
+  const typeRaw = record["type"];
+  if (typeRaw === undefined) {
+    typeResult = { status: "error", issue: { field: "type", reason: "missing" } };
+  } else if (typeRaw.length === 0) {
+    typeResult = { status: "error", issue: { field: "type", reason: "empty" } };
+  } else {
+    typeResult = { status: "ok", value: typeRaw };
+  }
+
   const tsRaw = record["ts"];
-  const ts = typeof tsRaw === "string" ? Number(tsRaw) : NaN;
-
-  if (!type) {
-    logger?.warn("event_bus.decode_anomaly", {
-      topic,
-      messageId: id,
-      decodeField: "type",
-      reason: "missing_or_empty",
-    });
+  const tsNumber = tsRaw === undefined || tsRaw.trim().length === 0 ? NaN : Number(tsRaw);
+  let tsResult:
+    | { status: "ok"; value: number }
+    | { status: "error"; issue: RedisMessageDecodeIssue };
+  if (tsRaw === undefined) {
+    tsResult = { status: "error", issue: { field: "ts", reason: "missing" } };
+  } else if (!Number.isFinite(tsNumber)) {
+    tsResult = { status: "error", issue: { field: "ts", reason: "invalid_number" } };
+  } else {
+    tsResult = { status: "ok", value: tsNumber };
   }
 
-  if (!Number.isFinite(ts)) {
-    logger?.warn("event_bus.decode_anomaly", {
-      topic,
-      messageId: id,
-      decodeField: "ts",
-      reason: "invalid_number",
-      value: tsRaw,
-    });
+  const dataRaw = record["data"];
+  let dataResult:
+    | { status: "ok"; value: unknown }
+    | { status: "error"; issue: RedisMessageDecodeIssue };
+  if (dataRaw === undefined) {
+    dataResult = { status: "error", issue: { field: "data", reason: "missing" } };
+  } else {
+    const decoded = decodeSuperJson(dataRaw);
+    dataResult =
+      decoded.status === "ok"
+        ? decoded
+        : { status: "error", issue: { field: "data", reason: "invalid_superjson" } };
   }
 
-  const rawHeaders = record["headers"];
-  const headersParsed = superJsonParse(record["headers"]);
-  const headers =
-    headersParsed && typeof headersParsed === "object"
-      ? (headersParsed as Record<string, string>)
-      : undefined;
-
-  if (rawHeaders && !headers) {
-    logger?.warn("event_bus.decode_anomaly", {
-      topic,
-      messageId: id,
-      decodeField: "headers",
-      reason: "parse_failed",
-    });
+  const headersRaw = record["headers"];
+  let headersResult:
+    | { status: "ok"; value: Record<string, string> | undefined }
+    | { status: "error"; issue: RedisMessageDecodeIssue };
+  if (headersRaw === undefined) {
+    headersResult = { status: "ok", value: undefined };
+  } else {
+    const decoded = decodeSuperJson(headersRaw);
+    if (decoded.status === "error") {
+      headersResult = {
+        status: "error",
+        issue: { field: "headers", reason: "invalid_superjson" },
+      };
+    } else {
+      const parsed = STRING_HEADERS_SCHEMA.safeParse(decoded.value);
+      if (parsed.success) {
+        headersResult = { status: "ok", value: parsed.data };
+      } else {
+        headersResult = {
+          status: "error",
+          issue: { field: "headers", reason: "not_string_record" },
+        };
+      }
+    }
   }
 
-  const rawData = record["data"];
-  const parsedData = superJsonParse(record["data"]);
-
-  if (rawData && typeof parsedData === "undefined") {
-    logger?.warn("event_bus.decode_anomaly", {
-      topic,
-      messageId: id,
-      decodeField: "data",
-      reason: "parse_failed",
-    });
+  if (
+    typeResult.status === "error" ||
+    tsResult.status === "error" ||
+    dataResult.status === "error" ||
+    headersResult.status === "error"
+  ) {
+    const issues: RedisMessageDecodeIssue[] = [];
+    if (typeResult.status === "error") issues.push(typeResult.issue);
+    if (tsResult.status === "error") issues.push(tsResult.issue);
+    if (dataResult.status === "error") issues.push(dataResult.issue);
+    if (headersResult.status === "error") issues.push(headersResult.issue);
+    return failure(issues);
   }
 
   return {
     topic,
     id,
-    type,
-    ts: Number.isFinite(ts) ? ts : Date.now(),
+    type: typeResult.value,
+    ts: tsResult.value,
     key: record["key"],
-    headers,
-    data: parsedData,
+    headers: headersResult.value,
+    data: dataResult.value,
   };
 }
 
@@ -451,7 +640,7 @@ export class RedisStreamsBus implements RawBus {
 
   /** Publish a message via `XADD`. */
   async publish<TData>(
-    msg: Omit<Message<TData>, "id" | "ts">,
+    msg: PublishMessage<TData>,
     opts: PublishOptions,
   ): Promise<{ id: string; cursor: Cursor }> {
     const streamKey = this.streamKey(opts.topic);
@@ -506,7 +695,7 @@ export class RedisStreamsBus implements RawBus {
   }
 
   /** Fetch messages via `XREAD` (non-durable, no consumer group). */
-  async fetch<TData>(topic: Topic, opts: FetchOptions) {
+  async fetch(topic: Topic, opts: FetchOptions) {
     const streamKey = this.streamKey(topic);
     const limit = opts.limit ?? DEFAULT_MAX_MESSAGES;
 
@@ -520,7 +709,11 @@ export class RedisStreamsBus implements RawBus {
       startId,
     )) as unknown;
 
-    const messages: Array<{ msg: Message<TData>; cursor: Cursor }> = [];
+    const messages: Array<{
+      msg: RawMessageDecodeOutcome;
+      cursor: Cursor;
+      evidence: EventTransportEvidence;
+    }> = [];
 
     // Shape: [[streamKey, [[id, [k,v...]], ...]]]
     const streams = Array.isArray(res) ? res : [];
@@ -533,8 +726,12 @@ export class RedisStreamsBus implements RawBus {
         const fields = Array.isArray(entry) ? entry[1] : undefined;
         if (typeof id !== "string") continue;
 
-        const decoded = decodeMessage(topic, id, fields, this.logger) as Message<TData>;
-        messages.push({ msg: decoded, cursor: id });
+        const decoded = decodeMessage(topic, streamKey, id, fields, this.logger);
+        messages.push({
+          msg: decoded,
+          cursor: id,
+          evidence: redisTransportEvidence(topic, streamKey, id, fields),
+        });
       }
     }
 
@@ -555,47 +752,57 @@ export class RedisStreamsBus implements RawBus {
     return Array.isArray(latest) && typeof latest[0] === "string" ? latest[0] : null;
   }
 
-  /**
-   * Subscribe to a topic.
-   *
-   * - `work`/`fanout`: `XREADGROUP` + `XACK` on `ctx.commit()`.
-   * - `tail`: `XREAD` starting from the requested offset.
-   */
-  async subscribe<TData>(
+  /** Subscribe with transport-owned delivery actions and typed operational Results. */
+  async subscribe(
     topic: Topic,
     opts: SubscriptionOptions,
-    handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-  ): Promise<BusSubscription> {
+    handler: RawDeliveryHandler,
+    dependencies: RawDeliveryDependencies = {},
+  ): Promise<
+    ResultType<
+      {
+        readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+        stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+      },
+      EventDeliveryStartFailed
+    >
+  > {
     const streamKey = this.streamKey(topic);
     const abortController = new AbortController();
+    let lease: Awaited<ReturnType<RedisConnectionPool["acquire"]>>;
+    try {
+      lease = await this.subPool.acquire();
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        new EventDeliveryStartFailed({
+          cause,
+          topic,
+          message: "Failed to acquire a Redis delivery connection",
+        }),
+      );
+    }
 
-    const lease = await this.subPool.acquire();
     const subRedis = lease.redis;
-
     let disconnectOnStop = false;
     let releaseUnhealthy = false;
-
-    // Avoid a race where callers publish immediately after subscribe() resolves.
-    // For work/fanout (consumer group) modes, the group must exist before we return.
     let group: string | null = null;
     let consumerId: string | null = null;
     let createdGroup = false;
-
+    const ephemeral = opts.mode !== "tail" && Boolean(opts.ephemeral);
     const maxMessages = opts.batch?.maxMessages ?? DEFAULT_MAX_MESSAGES;
     const blockMs = Math.min(Math.max(1, opts.batch?.maxWaitMs ?? DEFAULT_BLOCK_MS), 30_000);
 
     try {
       if (opts.mode === "work" || opts.mode === "fanout") {
-        const workOpts = opts as WorkOrFanoutSubscriptionOptions;
-        if (!workOpts.ephemeral && workOpts.subscriptionId.startsWith(EPHEMERAL_GROUP_PREFIX)) {
+        if (!opts.ephemeral && opts.subscriptionId.startsWith(EPHEMERAL_GROUP_PREFIX)) {
           throw new Error(`Consumer group uses reserved prefix: ${EPHEMERAL_GROUP_PREFIX}`);
         }
-        group = workOpts.ephemeral
-          ? `${EPHEMERAL_GROUP_PREFIX}${workOpts.subscriptionId}`
-          : workOpts.subscriptionId;
-        consumerId = workOpts.consumerId ?? randomConsumerId();
-
-        const startId = workOpts.offset?.type === "begin" ? "0-0" : "$";
+        group = opts.ephemeral
+          ? `${EPHEMERAL_GROUP_PREFIX}${opts.subscriptionId}`
+          : opts.subscriptionId;
+        consumerId = opts.consumerId ?? randomConsumerId();
+        const startId = opts.offset?.type === "begin" ? "0-0" : "$";
         createdGroup = await ensureGroup({
           redis: subRedis,
           streamKey,
@@ -603,202 +810,307 @@ export class RedisStreamsBus implements RawBus {
           startId,
           logger: this.logger,
         });
-        if (workOpts.ephemeral && !createdGroup) {
+        if (opts.ephemeral && !createdGroup) {
           throw new Error(`Ephemeral consumer group already exists: ${group}`);
         }
       }
-    } catch (e) {
-      releaseUnhealthy = true;
-      if (!lease.shared) {
-        await lease.release({ unhealthy: true });
-      }
-      throw e;
+    } catch (cause) {
+      if (!lease.shared) await lease.release({ unhealthy: true }).catch(() => undefined);
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        new EventDeliveryStartFailed({
+          cause,
+          topic,
+          message: "Failed to initialize Redis delivery",
+        }),
+      );
     }
 
-    this.logger.info("subscribe", {
-      topic,
-      mode: opts.mode,
-      subscriptionId:
-        opts.mode === "work" || opts.mode === "fanout"
-          ? (opts as WorkOrFanoutSubscriptionOptions).subscriptionId
-          : undefined,
-      consumerId:
-        opts.mode === "work" || opts.mode === "fanout"
-          ? (opts as WorkOrFanoutSubscriptionOptions).consumerId
-          : undefined,
-      offset: opts.offset,
-      maxMessages,
-      blockMs,
-    });
+    const reportFatal = async (
+      cause: unknown,
+      cursor: Cursor,
+      phase: "handler" | "dead-letter" | "delivery-action",
+    ): Promise<void> => {
+      try {
+        await dependencies.reportFatal?.report(cause, { topic, cursor, phase });
+      } catch (reportCause) {
+        dependencies.logger?.error("event_bus.fatal_report_failed", { topic, cursor, phase });
+        this.logger.error("event_bus.fatal_report_failed", { topic, cursor, phase }, reportCause);
+      }
+    };
 
-    const running = (async () => {
+    const acknowledge = async (
+      id: Cursor,
+    ): Promise<ResultType<void, EventDeliveryTransportFailed>> => {
+      if (!group) return Result.ok(undefined);
+      try {
+        const acknowledged = await subRedis.xack(streamKey, group, id);
+        if (acknowledged !== 1) {
+          return Result.err(
+            new EventDeliveryTransportFailed({
+              cause: new Error(`Redis XACK acknowledged ${String(acknowledged)} entries`),
+              operation: "ack",
+              topic,
+              cursor: id,
+              message: "Redis delivery acknowledgement failed",
+            }),
+          );
+        }
+        this.scheduleAcknowledgedTrim(topic, streamKey);
+        return Result.ok(undefined);
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventDeliveryTransportFailed({
+            cause,
+            operation: "ack",
+            topic,
+            cursor: id,
+            message: "Redis delivery acknowledgement failed",
+          }),
+        );
+      }
+    };
+
+    const handleEntry = async (
+      id: Cursor,
+      fields: unknown,
+    ): Promise<
+      | { readonly status: "advance" }
+      | { readonly status: "park" }
+      | { readonly status: "stop"; readonly error: EventDeliveryStopped }
+      | { readonly status: "transport-error"; readonly error: EventDeliveryTransportFailed }
+    > => {
+      const evidence = redisTransportEvidence(topic, streamKey, id, fields);
+      const message = decodeMessage(topic, streamKey, id, fields, this.logger);
+      let action: RawDeliveryAction;
+      try {
+        action = deliveryAction(await handler(message, { cursor: id, mode: opts.mode, evidence }));
+      } catch (cause) {
+        const phase = Panic.is(cause) ? "delivery-action" : "handler";
+        await reportFatal(cause, id, phase);
+        throw cause;
+      }
+
+      switch (action.disposition) {
+        case "commit": {
+          const acknowledged = await acknowledge(id);
+          if (acknowledged.status === "error") {
+            return { status: "transport-error", error: acknowledged.error };
+          }
+          return { status: "advance" };
+        }
+        case "park-pending":
+          if (opts.mode !== "tail") return { status: "park" };
+          return {
+            status: "stop",
+            error: new EventDeliveryStopped({
+              reason: "tail-cannot-park",
+              topic,
+              cursor: id,
+              message: "Tail delivery stopped because park-pending is not durable in tail mode",
+            }),
+          };
+        case "stop":
+          return {
+            status: "stop",
+            error: new EventDeliveryStopped({
+              reason: "requested",
+              topic,
+              cursor: id,
+              message: "Event delivery policy requested stop",
+            }),
+          };
+        case "dead-letter": {
+          let accepted: ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>;
+          if (!dependencies.deadLetter) {
+            accepted = Result.err(
+              new EventDeadLetterAcceptFailed({
+                cause: undefined,
+                message: "No event dead-letter adapter is configured",
+              }),
+            );
+          } else {
+            try {
+              accepted = checkedDeadLetterAcceptance(
+                await dependencies.deadLetter.accept(action.record),
+              );
+            } catch (cause) {
+              await reportFatal(cause, id, "dead-letter");
+              throw cause;
+            }
+          }
+
+          if (accepted.status === "error") {
+            dependencies.logger?.error("event_bus.dead_letter_failed", {
+              topic,
+              cursor: id,
+              mode: opts.mode,
+            });
+            if (opts.mode !== "tail") return { status: "park" };
+            return {
+              status: "stop",
+              error: new EventDeliveryStopped({
+                reason: "dead-letter-failed",
+                topic,
+                cursor: id,
+                message: "Tail delivery stopped after dead-letter acceptance failed",
+              }),
+            };
+          }
+
+          const acknowledged = await acknowledge(id);
+          if (acknowledged.status === "error") {
+            return { status: "transport-error", error: acknowledged.error };
+          }
+          return { status: "advance" };
+        }
+      }
+    };
+
+    const readFailure = (cause: unknown, cursor?: Cursor): EventDeliveryTransportFailed =>
+      new EventDeliveryTransportFailed({
+        cause,
+        operation: "read",
+        topic,
+        cursor,
+        message: "Redis delivery read failed",
+      });
+
+    const running: Promise<ResultType<void, EventDeliveryDoneError>> = (async () => {
       try {
         if (opts.mode === "tail") {
           let cursor = redisIdForOptionalOffset(opts.offset);
-
           while (!abortController.signal.aborted) {
-            const res = (await subRedis.xread(
+            let response: unknown;
+            try {
+              response = await subRedis.xread(
+                "COUNT",
+                String(maxMessages),
+                "BLOCK",
+                String(blockMs),
+                "STREAMS",
+                streamKey,
+                cursor,
+              );
+            } catch (cause) {
+              if (abortController.signal.aborted) return Result.ok(undefined);
+              if (Panic.is(cause)) throw cause;
+              releaseUnhealthy = true;
+              return Result.err(readFailure(cause, cursor));
+            }
+
+            const streams = Array.isArray(response) ? response : [];
+            for (const stream of streams) {
+              const entries = Array.isArray(stream) ? stream[1] : undefined;
+              if (!Array.isArray(entries)) continue;
+              for (const entry of entries) {
+                const id = Array.isArray(entry) ? entry[0] : undefined;
+                const fields = Array.isArray(entry) ? entry[1] : undefined;
+                if (typeof id !== "string") continue;
+                const handled = await handleEntry(id, fields);
+                if (handled.status === "stop") return Result.err(handled.error);
+                if (handled.status === "transport-error") return Result.err(handled.error);
+                if (handled.status === "park") {
+                  throw new Panic({ message: "Tail delivery produced an impossible park action" });
+                }
+                cursor = id;
+              }
+            }
+          }
+          return Result.ok(undefined);
+        }
+
+        if (!group || !consumerId) {
+          throw new Panic({ message: "Redis delivery started without a group and consumer" });
+        }
+        while (!abortController.signal.aborted) {
+          let response: unknown;
+          try {
+            response = await subRedis.xreadgroup(
+              "GROUP",
+              group,
+              consumerId,
               "COUNT",
               String(maxMessages),
               "BLOCK",
               String(blockMs),
               "STREAMS",
               streamKey,
-              cursor,
-            )) as unknown;
-
-            const streams = Array.isArray(res) ? res : [];
-            for (const s of streams) {
-              const entries = Array.isArray(s) ? s[1] : undefined;
-              if (!Array.isArray(entries)) continue;
-
-              for (const entry of entries) {
-                const id = Array.isArray(entry) ? entry[0] : undefined;
-                const fields = Array.isArray(entry) ? entry[1] : undefined;
-                if (typeof id !== "string") continue;
-
-                cursor = id;
-                const msg = decodeMessage(topic, id, fields, this.logger) as Message<TData>;
-                const ctx: HandleContext = {
-                  cursor: id,
-                  commit: async () => {},
-                };
-
-                await handler(msg, ctx);
-              }
-            }
+              ">",
+            );
+          } catch (cause) {
+            if (abortController.signal.aborted) return Result.ok(undefined);
+            if (Panic.is(cause)) throw cause;
+            releaseUnhealthy = true;
+            return Result.err(readFailure(cause));
           }
 
-          return;
-        }
-
-        if (!group || !consumerId) {
-          throw new Error("event-bus internal error: missing group/consumerId");
-        }
-
-        while (!abortController.signal.aborted) {
-          const res = (await subRedis.xreadgroup(
-            "GROUP",
-            group,
-            consumerId,
-            "COUNT",
-            String(maxMessages),
-            "BLOCK",
-            String(blockMs),
-            "STREAMS",
-            streamKey,
-            ">",
-          )) as unknown;
-
-          const streams = Array.isArray(res) ? res : [];
-          for (const s of streams) {
-            const entries = Array.isArray(s) ? s[1] : undefined;
+          const streams = Array.isArray(response) ? response : [];
+          for (const stream of streams) {
+            const entries = Array.isArray(stream) ? stream[1] : undefined;
             if (!Array.isArray(entries)) continue;
-
             for (const entry of entries) {
               const id = Array.isArray(entry) ? entry[0] : undefined;
               const fields = Array.isArray(entry) ? entry[1] : undefined;
               if (typeof id !== "string") continue;
-
-              const msg = decodeMessage(topic, id, fields, this.logger) as Message<TData>;
-              const ctx: HandleContext = {
-                cursor: id,
-                commit: async () => {
-                  try {
-                    await subRedis.xack(streamKey, group, id);
-                    this.scheduleAcknowledgedTrim(topic, streamKey);
-                  } catch (e) {
-                    this.logger.error(
-                      "event_bus.ack_failed",
-                      {
-                        topic,
-                        group,
-                        consumerId,
-                        messageId: id,
-                        type: msg.type,
-                      },
-                      e,
-                    );
-                    throw e;
-                  }
-                },
-              };
-
-              try {
-                await handler(msg, ctx);
-              } catch (e) {
-                // Leave message pending for later analysis / recovery.
-                // TODO: consider adding a configurable dead-letter flow.
-                this.logger.error(
-                  "event-bus handler error",
-                  {
-                    topic,
-                    group,
-                    consumerId,
-                    messageId: id,
-                    messageType: msg.type,
-                  },
-                  e,
-                );
-              }
+              const handled = await handleEntry(id, fields);
+              if (handled.status === "stop") return Result.err(handled.error);
+              if (handled.status === "transport-error") return Result.err(handled.error);
             }
           }
         }
-      } catch (e) {
-        if (abortController.signal.aborted) {
-          return;
-        }
-        releaseUnhealthy = true;
-        this.logger.error("event-bus subscription loop crashed", { topic, mode: opts.mode }, e);
-        throw e;
+        return Result.ok(undefined);
       } finally {
         if (!lease.shared) {
           await lease.release({ unhealthy: disconnectOnStop || releaseUnhealthy });
         }
       }
     })();
-    // Callers may opt into `done`; transports must not create an unhandled rejection for older callers.
     void running.catch(() => undefined);
 
-    return {
+    return Result.ok({
       done: running,
       stop: async () => {
         abortController.abort();
-
-        // If this subscription owns a dedicated connection, disconnect it so any
-        // blocking XREAD unblocks promptly.
-        if (!lease.shared) {
-          // We avoid disconnecting for short BLOCK intervals so the connection can be reused.
-          // For long blocks, force-disconnect to avoid waiting on the server-side timeout.
-          if (blockMs > 500) {
-            disconnectOnStop = true;
-            subRedis.disconnect();
-          }
+        if (!lease.shared && blockMs > 500) {
+          disconnectOnStop = true;
+          subRedis.disconnect();
         }
-
         await running;
 
-        if (group && consumerId) {
-          const workOpts = opts as WorkOrFanoutSubscriptionOptions;
-          if (workOpts.ephemeral && createdGroup) {
-            await this.redis.xgroup("DESTROY", streamKey, group);
-            this.scheduleAcknowledgedTrim(topic, streamKey);
-          } else {
-            const pending = (await this.redis.xpending(
-              streamKey,
-              group,
-              "-",
-              "+",
-              1,
-              consumerId,
-            )) as unknown;
-            if (Array.isArray(pending) && pending.length === 0) {
-              await this.redis.xgroup("DELCONSUMER", streamKey, group, consumerId);
+        try {
+          if (group && consumerId) {
+            if (ephemeral && createdGroup) {
+              await this.redis.xgroup("DESTROY", streamKey, group);
+              this.scheduleAcknowledgedTrim(topic, streamKey);
+            } else {
+              const pending = (await this.redis.xpending(
+                streamKey,
+                group,
+                "-",
+                "+",
+                1,
+                consumerId,
+              )) as unknown;
+              if (Array.isArray(pending) && pending.length === 0) {
+                await this.redis.xgroup("DELCONSUMER", streamKey, group, consumerId);
+              }
             }
           }
+          return Result.ok(undefined);
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
+          return Result.err(
+            new EventDeliveryStopFailed({
+              cause,
+              topic,
+              message: "Redis delivery cleanup failed",
+            }),
+          );
         }
       },
-    };
+    });
   }
 
   /** Close the bus (no-op unless `ownsRedis` was set). */

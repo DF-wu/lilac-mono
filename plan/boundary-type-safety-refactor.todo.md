@@ -11,7 +11,7 @@
 
 ## Current Stage
 
-Stages 0 through 3 complete. Next: Stage 4, Typed Event-Bus Codec And Delivery Registry.
+Stages 0 through 4 complete. Next: Stage 5, TUI Tool Observation Projection.
 
 ## Stage 0
 
@@ -32,7 +32,7 @@ Stages 0 through 3 complete. Next: Stage 4, Typed Event-Bus Codec And Delivery R
 - [x] Migrate MCP value-source and config-file expected failures to domain-owned `better-result` values.
 - [x] Preserve MCP YAML, registry status, OAuth SDK, tool output, and atomic-file compatibility.
 - [x] Prove direct branching, generator composition, exact-signal cancellation, retry abort behavior,
-  cleanup precedence, and Panic supervision under Bun and TypeScript 7.
+      cleanup precedence, and Panic supervision under Bun and TypeScript 7.
 - [x] Add the canonical redacting TaggedError log projection and focused leak tests.
 - [x] Add Stage 1 Result-contract, serialization, redaction, and syntax enforcement with real-library fixtures.
 - [x] Remove repaired pilot baseline debt while retaining reviewed unrelated migration debt.
@@ -54,27 +54,50 @@ Stages 0 through 3 complete. Next: Stage 4, Typed Event-Bus Codec And Delivery R
 
 - [x] Migrate summarization worker messages to a shared, fully decoded protocol and typed Result flow.
 - [x] Migrate remote filesystem runner requests, responses, socket handling, cancellation, cleanup, and
-  deployment/version boundaries to complete codecs and typed Results.
+      deployment/version boundaries to complete codecs and typed Results.
 - [x] Migrate plugin discovery, capability snapshots, hooks, lifecycle, reload cleanup, and late-Panic
-  supervision while preserving plugin identity and external contracts.
+      supervision while preserving plugin identity and external contracts.
 - [x] Decode every custom-command result variant and migrate discovery, import, initialization, argument
-  parsing, and execution to typed Results.
+      parsing, and execution to typed Results.
 - [x] Replace attachment and tool-output assertions with complete schemas or owned typed narrowing.
 - [x] Migrate all declared Stage 3 debt in SSH execution, tool-server routing, and conversation-thread
-  dispatch rather than retaining module-local semantic or syntax baseline entries.
+      dispatch rather than retaining module-local semantic or syntax baseline entries.
 - [x] Preserve original-Panic precedence and independently supervise terminal worker, bus, remote-runner,
-  plugin, startup-lock, and synchronous cleanup failures.
+      plugin, startup-lock, and synchronous cleanup failures.
 - [x] Enforce zero semantic and syntax baseline debt across every declared Stage 3 module.
 - [x] Run final independent Stage 3 acceptance and defect reviews and resolve all blocking findings.
 - [x] Run focused builds/tests plus root typecheck, full tests, lint, architecture ratchets, and formatting.
 - [x] Commit the validated Stage 3 changes separately with a conventional commit.
+
+## Stage 4
+
+- [x] Expose raw Redis/SuperJSON messages as `Message<unknown>` and remove false generic payload
+      assertions from the typed bus path.
+- [x] Add a canonical event-type codec registry with colocated complete envelope/header/payload decoders.
+- [x] Preserve deliberately opaque adapter `raw` fields as `unknown` inside otherwise decoded envelopes.
+- [x] Route invalid contracts through a payload-redacted `event_bus.contract_invalid` disposition that
+      durably dead-letters before source commit and parks or stops when dead-lettering fails.
+- [x] Migrate handler delivery to typed Results and an exhaustive commit, park-pending, dead-letter, or
+      stop policy without handler-owned acknowledgement.
+- [x] Preserve current pending-entry behavior and document that `park-pending` does not automatically
+  reclaim or retry Redis consumer-group entries.
+- [x] Capture transport rejections at the immediate subscription supervisor without converting Panic or
+      broken handler contracts into ordinary delivery errors.
+- [x] Migrate command/request and workflow-control event families with producer/consumer compatibility
+  fixtures.
+- [x] Migrate lifecycle, adapter, surface, and agent-output event families with compatibility fixtures.
+- [x] Add a separate follow-up plan for reclamation, leases, retry timing/exhaustion,
+      idempotency/deduplication, and transactional inbox behavior.
+- [x] Activate Stage 4 architecture rules and remove repaired semantic/syntax baseline debt.
+- [x] Run independent Stage 4 review and resolve all blocking findings.
+- [x] Run focused and full repository validation, then commit Stage 4 separately.
 
 ## Later Stages
 
 - [x] Stage 1: `better-result` foundation and pilot migrations.
 - [x] Stage 2: mechanical union, predicate, and failure guardrails.
 - [x] Stage 3: high-risk process and extension boundaries.
-- [ ] Stage 4: typed event-bus codec and delivery registry.
+- [x] Stage 4: typed event-bus codec and delivery registry.
 - [ ] Stage 5: TUI tool-observation projection.
 - [ ] Stage 6: versioned persistence codecs and transaction Results.
 - [ ] Stage 7: package-by-package internal API migration.
@@ -134,3 +157,18 @@ Stages 0 through 3 complete. Next: Stage 4, Typed Event-Bus Codec And Delivery R
   Core tests, `bun run typecheck`, `bun run lint:fix`, `bun run fmt`, `bun run lint`,
   `bun run fmt:check`, and `git diff --check`. The syntax ratchet contains 2,686 reviewed findings with
   zero errors, and every declared Stage 3 module has zero semantic and syntax baseline debt.
+- 2026-08-03: Added `plan/redis-event-delivery-reliability.md` as the separate Stage 4 follow-up for
+  pending reclamation, fenced leases, retry timing and exhaustion, attempt accounting,
+  idempotency/deduplication, dead-letter/`XACK` crash recovery, transactional inbox/outbox processing,
+  and audited operations. The plan keeps Stage 4 `park-pending` manual and explicitly records that the
+  current `XREADGROUP ... ">"` loop does not retry pending entries.
+- 2026-08-03: Stage 4 moved raw Redis delivery to `Message<unknown>`, added complete schema-derived
+  codecs and compatibility fixtures for all 25 event types, and migrated all 21 production consumers to
+  typed Results with transport-owned commit, park-pending, dead-letter, and stop dispositions. Invalid
+  contracts are logged without payloads and durably dead-lettered before source acknowledgement.
+- 2026-08-03: Independent reviews drove fixes for malformed Result fail-open acknowledgements, zero-count
+  `XACK`, descendant zero-debt enforcement, router termination supervision, legal publisher overrides,
+  opaque adapter projections, and encrypted TTL-bound dead-letter recovery with identity-bound AES-GCM.
+  Final validation passed `bun run test:all` including 1,687 Core and 93 event-bus tests,
+  `bun run typecheck`, `bun run lint:fix`, `bun run fmt`, `bun run lint`, `bun run fmt:check`, and
+  `git diff --check`. The syntax ratchet contains 2,554 reviewed findings with zero errors.

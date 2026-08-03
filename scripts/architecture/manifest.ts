@@ -80,6 +80,74 @@ export interface RuleZone {
   readonly include: string;
 }
 
+export interface ZeroBaselineScope {
+  readonly module: string;
+  readonly symbol?: string;
+}
+
+const SOURCE_MODULE_EXTENSION = /\.(?:[cm]?[jt]sx?)$/u;
+
+export function zeroBaselineScopeOwns(
+  scope: ZeroBaselineScope,
+  module: string,
+  symbol: string,
+): boolean {
+  if (
+    scope.module.replace(SOURCE_MODULE_EXTENSION, "") !==
+    module.replace(SOURCE_MODULE_EXTENSION, "")
+  ) {
+    return false;
+  }
+  return (
+    scope.symbol === undefined || symbol === scope.symbol || symbol.startsWith(`${scope.symbol}.`)
+  );
+}
+
+export type ArchitectureRegistrationStatus = "advisory" | "enforced";
+
+export interface EventCodecRegistryRegistration {
+  readonly status: ArchitectureRegistrationStatus;
+  readonly identity: SymbolIdentity;
+  readonly canonicalEvents: SymbolIdentity;
+  readonly canonicalMembers: readonly string[];
+  readonly codecMembers: readonly string[];
+}
+
+export interface RawEventMessageBoundaryRegistration {
+  readonly status: ArchitectureRegistrationStatus;
+  readonly identity: SymbolIdentity;
+  readonly messageType: ExternalSymbolIdentity;
+  readonly handlerParameter: number;
+  readonly messageParameter: number;
+  readonly contextParameter: number;
+}
+
+export interface EventDeliveryApiRegistration {
+  readonly status: ArchitectureRegistrationStatus;
+  readonly identity: SymbolIdentity;
+  readonly handlerParameter: number;
+  readonly handlerMessageParameter: number;
+  readonly handlerContextParameter: number;
+  readonly deliveryPolicy: SymbolIdentity;
+  readonly deliveryErrorParameter: number;
+}
+
+export type EventDeliveryOperation = "subscribeTopic" | "fetchTopic";
+
+export interface EventDeliveryConsumerRegistration {
+  readonly identity: SymbolIdentity;
+  readonly apiPackage: string;
+  readonly operations: readonly EventDeliveryOperation[];
+}
+
+export interface EventFamilyMigration {
+  readonly family: string;
+  readonly status: "advisory" | "migrating" | "migrated";
+  readonly codecRegistry: SymbolIdentity;
+  readonly members: readonly string[];
+  readonly zeroBaselineScopes: readonly (ZeroBaselineScope & { readonly workspace: string })[];
+}
+
 export interface WorkspaceArchitecture {
   readonly name: string;
   readonly packageName: string;
@@ -97,6 +165,12 @@ export interface WorkspaceArchitecture {
   readonly structuredLoggers: readonly StructuredLogger[];
   readonly taggedErrorFormatters: readonly CompatibilitySink[];
   readonly operationalResultApis: readonly SymbolIdentity[];
+  readonly zeroBaselineScopes: readonly ZeroBaselineScope[];
+  readonly eventCodecRegistries: readonly EventCodecRegistryRegistration[];
+  readonly rawEventMessageBoundaries: readonly RawEventMessageBoundaryRegistration[];
+  readonly eventDeliveryApis: readonly EventDeliveryApiRegistration[];
+  readonly eventDeliveryConsumers: readonly EventDeliveryConsumerRegistration[];
+  readonly eventFamilyMigrations: readonly EventFamilyMigration[];
   readonly baselines: {
     readonly boundaryValidation: string;
     readonly failureFlow: string;
@@ -114,14 +188,18 @@ const STAGE_1_PILOT_RULES = new Set<ArchitectureRule>([
   "architecture/fallible-api-result",
 ]);
 
-const SCOPED_STAGE_2_RULES = new Set<ArchitectureRule>([
+const SCOPED_ARCHITECTURE_RULES = new Set<ArchitectureRule>([
   "architecture/open-protocol-normalization",
+  "architecture/raw-event-message-boundary",
+  "architecture/complete-event-codec-registry",
+  "architecture/event-handler-result",
+  "architecture/event-delivery-policy-exhaustiveness",
 ]);
 
 const DEFAULT_RULE_ZONES = Object.fromEntries(
   ARCHITECTURE_RULES.map((rule) => [
     rule,
-    STAGE_1_PILOT_RULES.has(rule) || SCOPED_STAGE_2_RULES.has(rule) ? [] : [{ include: "**" }],
+    STAGE_1_PILOT_RULES.has(rule) || SCOPED_ARCHITECTURE_RULES.has(rule) ? [] : [{ include: "**" }],
   ]),
 );
 
@@ -138,6 +216,12 @@ const EMPTY_POLICY = {
   structuredLoggers: [],
   taggedErrorFormatters: [],
   operationalResultApis: [],
+  zeroBaselineScopes: [],
+  eventCodecRegistries: [],
+  rawEventMessageBoundaries: [],
+  eventDeliveryApis: [],
+  eventDeliveryConsumers: [],
+  eventFamilyMigrations: [],
   baselines: {
     boundaryValidation: "scripts/architecture/boundary-validation.baseline.ts",
     failureFlow: "scripts/architecture/failure-flow.baseline.ts",
@@ -174,7 +258,7 @@ const MIGRATING_WORKSPACES = new Set<string>([
   "packages/utils",
 ]);
 
-export const STAGE_3_MODULES = new Map<string, readonly string[]>([
+const STAGE_3_ZERO_BASELINE_MODULES = new Map<string, readonly string[]>([
   [
     "apps/core",
     [
@@ -230,6 +314,22 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         (exportName) => ({ module: "src/custom-commands/manager.ts", exportName }),
       ),
       { module: "src/custom-commands/manager.ts", exportName: "CustomCommandManager.execute" },
+      {
+        module: "src/heartbeat/heartbeat-service.ts",
+        exportName: "startHeartbeatService.startHeartbeatLifecycleResult",
+      },
+      {
+        module: "src/heartbeat/heartbeat-service.ts",
+        exportName: "startHeartbeatService.stopHeartbeatLifecycleResult",
+      },
+      {
+        module: "src/tool-server/request-message-cache.ts",
+        exportName: "createRequestMessageCache.startRequestMessageCacheResult",
+      },
+      {
+        module: "src/tool-server/request-message-cache.ts",
+        exportName: "createRequestMessageCache.stopRequestMessageCacheResult",
+      },
       ...[
         "decodeRemoteFsRunnerPackageSpec",
         "buildRemoteFsRunnerCommand",
@@ -254,6 +354,10 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         module: "src/tool-server/create-tool-server.ts",
         exportName,
       })),
+      {
+        module: "src/runtime/core-dead-letter-key.ts",
+        exportName: "loadOrCreateCoreDeadLetterKey",
+      },
       ...[
         "readStreamChunk",
         "readResponseBody",
@@ -408,6 +512,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: {
           module: "src/tool-server/create-tool-server.ts",
           exportName: "projectFatalToolCallDefect",
+        },
+        category: "projection",
+      },
+      {
+        identity: {
+          module: "src/tool-server/request-message-cache.ts",
+          exportName: "resolveAuthenticatedOrigin",
         },
         category: "projection",
       },
@@ -786,6 +897,100 @@ const INTEGRATED_EXCEPTION_ADAPTERS = new Map<string, readonly ExceptionAdapter[
         reason:
           "Signals custom-command initialization failure through the established host startup exception contract.",
       },
+      ...[
+        [
+          "src/heartbeat/heartbeat-service.ts",
+          "adaptHeartbeatLifecycleStartResultToHost",
+          "startHeartbeatService",
+        ],
+        [
+          "src/heartbeat/heartbeat-service.ts",
+          "adaptHeartbeatLifecycleStopResultToHost",
+          "HeartbeatService.stop",
+        ],
+        [
+          "src/tool-server/request-message-cache.ts",
+          "adaptRequestMessageCacheStartResultToHost",
+          "createRequestMessageCache",
+        ],
+        [
+          "src/tool-server/request-message-cache.ts",
+          "adaptRequestMessageCacheStopResultToHost",
+          "RequestMessageCache.stop",
+        ],
+      ].map(([module, exportName, externalExportName]) => ({
+        identity: { module, exportName },
+        category: "result-to-framework" as const,
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: externalExportName,
+        },
+        direction: "signal-host" as const,
+        reason:
+          "Adapts one typed event-delivery lifecycle Result to the existing public rejecting host contract.",
+      })),
+      {
+        identity: {
+          module: "src/runtime/create-core-runtime.ts",
+          exportName: "createCoreEventBusFatalReporter.report",
+        },
+        category: "defect-supervisor",
+        externalApi: {
+          package: "@stanley2058/lilac-event-bus",
+          exportName: "EventDeliveryFatalReporter.report",
+        },
+        direction: "observe-panic",
+        reason:
+          "Normalizes an opaque event-delivery defect at the exact external fatal-reporter boundary without treating it as domain data.",
+      },
+      ...[
+        ["captureCoreRedisConstruction", "Redis constructor"],
+        ["captureCoreWorkspacePreparation", "workspace mkdir/realpath"],
+        ["captureCoreRedisConnection", "Redis.ping"],
+        ["captureCoreRawBusConstruction", "createRedisStreamsBus"],
+        ["captureCoreLilacBusConstruction", "RedisEventDeadLetter/createLilacBus"],
+        ["captureCoreEventBusCleanup", "owned event-bus close"],
+      ].flatMap(([exportName, externalExportName]) => [
+        {
+          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
+          category: "external-to-result" as const,
+          externalApi: {
+            package: "@stanley2058/lilac-core",
+            exportName: externalExportName,
+          },
+          direction: "capture-external" as const,
+          reason: "Captures one owned core event-bus setup or cleanup effect as a typed Result.",
+        },
+        {
+          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
+          category: "defect-supervisor" as const,
+          externalApi: { package: "better-result", exportName: "Panic.is" },
+          direction: "observe-panic" as const,
+          reason: "Preserves Panic identity at the same owned external-effect boundary.",
+        },
+      ]),
+      {
+        identity: {
+          module: "src/runtime/create-core-runtime.ts",
+          exportName: "setupCoreEventBusResources",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason:
+          "Preserves the original event-bus setup Panic while supervising owned Redis cleanup to completion.",
+      },
+      ...[
+        ["adaptCoreEventBusSetupResultToStartup", "runtime host startup"],
+        ["adaptCoreEventBusCleanupResultToHost", "runtime host cleanup"],
+      ].map(([exportName, externalExportName]) => ({
+        identity: { module: "src/runtime/create-core-runtime.ts", exportName },
+        category: "result-to-framework" as const,
+        externalApi: { package: "@stanley2058/lilac-core", exportName: externalExportName },
+        direction: "signal-host" as const,
+        reason:
+          "Adapts an owned event-bus Result to the exact core runtime startup or cleanup exception contract.",
+      })),
       ...["createCoreRuntime.start", "createCoreRuntimeCleanupSupervisor.run"].map(
         (exportName) => ({
           identity: { module: "src/runtime/create-core-runtime.ts", exportName },
@@ -1089,6 +1294,252 @@ const INTEGRATED_EXCEPTION_ADAPTERS = new Map<string, readonly ExceptionAdapter[
       {
         identity: {
           module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "captureBusAgentRunnerOperation",
+        },
+        category: "external-to-result",
+        externalApi: { package: "global", exportName: "Promise" },
+        direction: "capture-external",
+        reason:
+          "Captures one named runner dependency operation into an owned Result at its immediate rejection boundary.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "captureBusAgentRunnerOperation",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason: "Preserves exact Panic identity while capturing ordinary runner operation failure.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "signalBusAgentRunnerHostFailure",
+        },
+        category: "result-to-framework",
+        externalApi: { package: "@stanley2058/lilac-agent", exportName: "agent callback" },
+        direction: "signal-host",
+        reason:
+          "Signals a typed runner failure through an exact agent or provider callback rejection contract.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "projectBusAgentRunnerError",
+        },
+        category: "compatibility",
+        externalApi: { package: "global", exportName: "opaque exception" },
+        direction: "capture-external",
+        reason: "Projects an opaque dependency exception into bounded safe runner logging fields.",
+      },
+      ...[
+        [
+          "startBusAgentRunner.drainSessionQueue.reportOutputPublisherError",
+          "createAgentOutputPublisher.onError",
+        ],
+        [
+          "startBusAgentRunner.drainSessionQueue.reportAgentActivityError",
+          "createAgentOutputActivityPublisher.onError",
+        ],
+        [
+          "startBusAgentRunner.drainSessionQueue.decideIdleRecovery",
+          "AiSdkPiAgent.requestIdleRecovery",
+        ],
+        [
+          "startBusAgentRunner.drainSessionQueue.<callback>.turnErrorHandler",
+          "AiSdkPiAgent.turnErrorHandler",
+        ],
+        [
+          "startBusAgentRunner.drainSessionQueue.<callback>.reportServerCompactionError",
+          "attachAutoCompaction.onServerCompactionError",
+        ],
+        [
+          "startBusAgentRunner.drainSessionQueue.<callback>.reportAutoInjectedThreadSearchError",
+          "ConversationThreadToolService error callback",
+        ],
+      ].map(([exportName, externalExportName]) => ({
+        identity: { module: "src/surface/bridge/bus-agent-runner.ts", exportName: exportName! },
+        category: "compatibility" as const,
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: externalExportName!,
+        },
+        direction: "capture-external" as const,
+        reason:
+          "Normalizes one exact opaque runner callback failure immediately into a safe logging projection.",
+      })),
+      ...[
+        "captureRouterRouting",
+        "startBusRequestRouter.reloadCoreConfigIfNeeded",
+        "startBusRequestRouter.evaluateAdapterSuppression",
+        "startBusRequestRouter.evaluateDirectReplyRouterGate",
+      ].flatMap((exportName) => [
+        {
+          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          category: (exportName.startsWith("captureRouter")
+            ? "external-to-result"
+            : "compatibility") as "external-to-result" | "compatibility",
+          externalApi: {
+            package: "@stanley2058/lilac-core",
+            exportName: "request router dependency",
+          },
+          direction: "capture-external" as const,
+          reason:
+            "Captures an immediate router dependency rejection using its established typed Result or fail-open policy.",
+        },
+        {
+          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          category: "defect-supervisor" as const,
+          externalApi: { package: "better-result", exportName: "Panic.is" },
+          direction: "observe-panic" as const,
+          reason: "Preserves Panic while handling an immediate request-router dependency boundary.",
+        },
+      ]),
+      ...[
+        {
+          category: "compatibility" as const,
+          externalApi: { package: "global", exportName: "Object.getOwnPropertyDescriptor" },
+          direction: "capture-external" as const,
+          reason:
+            "Contains ordinary reflection failures while projecting untrusted Discord routing flags.",
+        },
+        {
+          category: "defect-supervisor" as const,
+          externalApi: { package: "better-result", exportName: "Panic.is" },
+          direction: "observe-panic" as const,
+          reason: "Preserves Panic identity at the Discord raw projection boundary.",
+        },
+      ].map(({ category, externalApi, direction, reason }) => ({
+        identity: {
+          module: "src/surface/bridge/bus-request-router/common.ts",
+          exportName: "getDiscordFlags",
+        },
+        category,
+        externalApi,
+        direction,
+        reason,
+      })),
+      ...[
+        {
+          exportName: "captureRouterActiveBatchGate",
+          externalApi: {
+            package: "@stanley2058/lilac-core",
+            exportName: "RouterGate",
+          },
+          reason: "Maps active-batch gate rejection to the router's typed fail-closed policy.",
+        },
+        {
+          exportName: "captureRouterDebounceFlush",
+          externalApi: {
+            package: "global",
+            exportName: "setTimeout callback Promise",
+          },
+          reason:
+            "Supervises the detached debounce callback, mapping ordinary rejection to a typed Result while reporting Panic through router.done.",
+        },
+      ].flatMap(({ exportName, externalApi, reason }) => [
+        {
+          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          category: "external-to-result" as const,
+          externalApi,
+          direction: "capture-external" as const,
+          reason,
+        },
+        {
+          identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+          category: "defect-supervisor" as const,
+          externalApi: { package: "better-result", exportName: "Panic.is" },
+          direction: "observe-panic" as const,
+          reason: "Preserves Panic identity at the exact gate or detached timer boundary.",
+        },
+      ]),
+      ...[
+        "adaptRouterSubscriptionStart",
+        "superviseRouterSubscriptionsDone",
+        "adaptRouterSubscriptionsStop",
+      ].map((exportName) => ({
+        identity: { module: "src/surface/bridge/bus-request-router.ts", exportName },
+        category: "result-to-framework" as const,
+        externalApi: { package: "@stanley2058/lilac-core", exportName: "request router lifecycle" },
+        direction: "signal-host" as const,
+        reason:
+          "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
+      })),
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "captureBusToAdapterEffect",
+        },
+        category: "external-to-result",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "surface adapter and relay effect",
+        },
+        direction: "capture-external",
+        reason:
+          "Captures an immediate surface, relay, transcript, or event-publication rejection as the bridge-owned effect Result.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "rethrowBusToAdapterPanic",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason:
+          "Preserves exact Panic identity while the bus-to-adapter effect boundary captures ordinary failures.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/subscribe-from-bus.ts",
+          exportName: "superviseBusToAdapterCleanup",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason:
+          "Runs every required relay cleanup and rethrows the original Panic ahead of ordinary cleanup defects.",
+      },
+      ...["adaptBusToAdapterSubscriptionStart", "adaptBusToAdapterSubscriptionStop"].map(
+        (exportName) => ({
+          identity: { module: "src/surface/bridge/subscribe-from-bus.ts", exportName },
+          category: "result-to-framework" as const,
+          externalApi: {
+            package: "@stanley2058/lilac-event-bus",
+            exportName: "subscription lifecycle",
+          },
+          direction: "signal-host" as const,
+          reason:
+            "Adapts the typed event-delivery lifecycle Result to the bridge's existing startup or shutdown host rejection contract.",
+        }),
+      ),
+      {
+        identity: {
+          module: "src/runtime/create-core-runtime.ts",
+          exportName: "superviseCoreRouterDone",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "global", exportName: "Promise.then" },
+        direction: "observe-panic",
+        reason:
+          "Observes typed router termination and forwards unexpected Results or rejections to fatal runtime supervision.",
+      },
+      {
+        identity: {
+          module: "src/runtime/create-core-runtime.ts",
+          exportName: "normalizeRouterDoneDefect",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason:
+          "Preserves exact Panic identity while normalizing a non-Error router done rejection for fatal reporting.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
           exportName: "startBusAgentRunner.startSessionQueueDrain.superviseDetachedDrain",
         },
         category: "defect-supervisor",
@@ -1107,6 +1558,78 @@ const INTEGRATED_EXCEPTION_ADAPTERS = new Map<string, readonly ExceptionAdapter[
         direction: "observe-panic",
         reason:
           "Syntax-visible identity for attaching the exact named detached-drain supervisor callback.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "startBusAgentRunner.superviseSubscriptionDone",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "global", exportName: "Promise.catch" },
+        direction: "observe-panic",
+        reason:
+          "Observes the typed command-request subscription completion at its runtime host boundary and reports rejected Panic without converting it to delivery error data.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "startBusAgentRunner.handleCmdRequestMessage",
+        },
+        category: "external-to-result",
+        externalApi: { package: "@stanley2058/lilac-event-bus", exportName: "event handler" },
+        direction: "capture-external",
+        reason:
+          "Captures ordinary request intake and lifecycle failures as the runner-owned delivery error union.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "startBusAgentRunner.handleCmdRequestMessage",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+        direction: "observe-panic",
+        reason:
+          "Preserves exact Panic identity while ordinary request intake failure becomes an Err.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "startBusAgentRunner",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-event-bus",
+          exportName: "subscription start/done",
+        },
+        direction: "signal-host",
+        reason:
+          "Maps typed subscription start and completion failures to the existing runner startup/background host contract.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "startBusAgentRunner",
+        },
+        category: "defect-supervisor",
+        externalApi: { package: "global", exportName: "Promise.catch" },
+        direction: "observe-panic",
+        reason:
+          "Attaches the named command-request subscription completion supervisor and observes its rethrow.",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/bus-agent-runner.ts",
+          exportName: "startBusAgentRunner.stopSubscription",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-event-bus",
+          exportName: "subscription stop/done",
+        },
+        direction: "signal-host",
+        reason:
+          "Maps typed subscription stop and completion failures to the runner shutdown host while preserving rejected Panic.",
       },
       {
         identity: {
@@ -1615,10 +2138,283 @@ const INTEGRATED_EXCEPTION_ADAPTERS = new Map<string, readonly ExceptionAdapter[
   ],
 ]);
 
+const CANONICAL_LILAC_EVENT_MEMBERS = [
+  "cmd.request.message",
+  "cmd.surface.output.reanchor",
+  "evt.adapter.message.created",
+  "evt.adapter.message.updated",
+  "evt.adapter.message.deleted",
+  "evt.adapter.reaction.added",
+  "evt.adapter.reaction.removed",
+  "evt.adapter.action.invoked",
+  "evt.adapter.workflow-wait-resolver.barrier",
+  "evt.request.lifecycle.changed",
+  "evt.request.reply",
+  "evt.surface.output.message.created",
+  "evt.workflow.run.changed",
+  "evt.workflow.operation.changed",
+  "evt.workflow.progress.requested",
+  "evt.workflow.usage.changed",
+  "evt.workflow.result.ready",
+  "cmd.agent.create",
+  "evt.agent.output.delta.reasoning",
+  "evt.agent.output.delta.text",
+  "evt.agent.output.text.reset",
+  "evt.agent.output.response.text",
+  "evt.agent.output.response.binary",
+  "evt.agent.output.toolcall",
+  "evt.agent.output.activity",
+] as const;
+
+const EVENT_BUS_CODEC_REGISTRY: EventCodecRegistryRegistration = {
+  status: "enforced",
+  identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
+  canonicalEvents: { module: "lilac-spec.ts", exportName: "lilacEventTypes" },
+  canonicalMembers: CANONICAL_LILAC_EVENT_MEMBERS,
+  codecMembers: CANONICAL_LILAC_EVENT_MEMBERS,
+};
+
+function coreEventScope(module: string, symbol: string) {
+  return { workspace: "apps/core", module, symbol } as const;
+}
+
+const EVENT_BUS_FAMILY_MIGRATIONS = [
+  {
+    family: "command-request",
+    members: ["cmd.request.message", "cmd.surface.output.reanchor", "cmd.agent.create"],
+    scopes: [
+      coreEventScope(
+        "src/tool-server/request-message-cache.ts",
+        "createRequestMessageCache.startRequestMessageCacheResult",
+      ),
+      coreEventScope("src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner"),
+      coreEventScope("src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter"),
+    ],
+  },
+  {
+    family: "workflow-control",
+    members: [
+      "evt.adapter.workflow-wait-resolver.barrier",
+      "evt.workflow.run.changed",
+      "evt.workflow.operation.changed",
+      "evt.workflow.progress.requested",
+      "evt.workflow.usage.changed",
+      "evt.workflow.result.ready",
+    ],
+    scopes: [
+      coreEventScope("src/workflow/workflow-engine.ts", "WorkflowEngine.startWakeSubscription"),
+      coreEventScope(
+        "src/workflow/workflow-live-parent-bridge.ts",
+        "WorkflowLiveParentBridge.start",
+      ),
+      coreEventScope(
+        "src/workflow/workflow-progress-projector.ts",
+        "WorkflowProgressProjector.startWorkflowProgressSubscriptionResult",
+      ),
+    ],
+  },
+  {
+    family: "lifecycle",
+    members: ["evt.request.lifecycle.changed", "evt.request.reply"],
+    scopes: [
+      coreEventScope(
+        "src/heartbeat/heartbeat-service.ts",
+        "startHeartbeatService.startHeartbeatLifecycleResult",
+      ),
+      coreEventScope("src/surface/bridge/bus-request-router.ts", "startBusRequestRouter"),
+      coreEventScope("src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter"),
+      coreEventScope("src/workflow/workflow-engine.ts", "WorkflowEngine.waitForAgentRequest"),
+    ],
+  },
+  {
+    family: "adapter",
+    members: [
+      "evt.adapter.message.created",
+      "evt.adapter.message.updated",
+      "evt.adapter.message.deleted",
+      "evt.adapter.reaction.added",
+      "evt.adapter.reaction.removed",
+      "evt.adapter.action.invoked",
+    ],
+    scopes: [
+      coreEventScope("src/surface/bridge/bus-request-router.ts", "startBusRequestRouter"),
+      coreEventScope(
+        "src/workflow/workflow-action-resolver.ts",
+        "startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
+      ),
+      coreEventScope(
+        "src/workflow/workflow-wait-resolver.ts",
+        "WorkflowWaitResolver.startWorkflowWaitSubscriptionResult",
+      ),
+    ],
+  },
+  {
+    family: "surface",
+    members: ["evt.surface.output.message.created"],
+    scopes: [coreEventScope("src/surface/bridge/bus-request-router.ts", "startBusRequestRouter")],
+  },
+  {
+    family: "agent-output",
+    members: [
+      "evt.agent.output.delta.reasoning",
+      "evt.agent.output.delta.text",
+      "evt.agent.output.text.reset",
+      "evt.agent.output.response.text",
+      "evt.agent.output.response.binary",
+      "evt.agent.output.toolcall",
+      "evt.agent.output.activity",
+    ],
+    scopes: [
+      coreEventScope("src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter"),
+      coreEventScope("src/workflow/workflow-engine.ts", "WorkflowEngine.waitForAgentRequest"),
+      coreEventScope(
+        "src/workflow/workflow-live-parent-bridge.ts",
+        "WorkflowLiveParentBridge.ensureChildOutputSubscription",
+      ),
+      coreEventScope(
+        "src/workflow/workflow-live-parent-bridge.ts",
+        "WorkflowLiveParentBridge.reconcileTerminalChildActivity",
+      ),
+    ],
+  },
+].map(
+  ({ family, members, scopes }): EventFamilyMigration => ({
+    family,
+    status: "migrated",
+    codecRegistry: EVENT_BUS_CODEC_REGISTRY.identity,
+    members,
+    zeroBaselineScopes: scopes,
+  }),
+);
+
+const CORE_EVENT_DELIVERY_CONSUMERS = [
+  {
+    identity: {
+      module: "src/heartbeat/heartbeat-service.ts",
+      exportName: "startHeartbeatService.startHeartbeatLifecycleResult",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/tool-server/request-message-cache.ts",
+      exportName: "createRequestMessageCache.startRequestMessageCacheResult",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/bus-agent-runner.ts",
+      exportName: "startBusAgentRunner",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/bus-request-router.ts",
+      exportName: "startBusRequestRouter",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/subscribe-from-bus.ts",
+      exportName: "bridgeBusToAdapter",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-action-resolver.ts",
+      exportName: "startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-engine.ts",
+      exportName: "WorkflowEngine.startWakeSubscription",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-engine.ts",
+      exportName: "WorkflowEngine.waitForAgentRequest",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic", "fetchTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-live-parent-bridge.ts",
+      exportName: "WorkflowLiveParentBridge.start",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-live-parent-bridge.ts",
+      exportName: "WorkflowLiveParentBridge.ensureChildOutputSubscription",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-live-parent-bridge.ts",
+      exportName: "WorkflowLiveParentBridge.reconcileTerminalChildActivity",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["fetchTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-progress-projector.ts",
+      exportName: "WorkflowProgressProjector.startWorkflowProgressSubscriptionResult",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
+      module: "src/workflow/workflow-wait-resolver.ts",
+      exportName: "WorkflowWaitResolver.startWorkflowWaitSubscriptionResult",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+] as const satisfies readonly EventDeliveryConsumerRegistration[];
+
 export const architectureManifest = {
   version: 1,
   workspaces: ACTIVE_WORKSPACES.map(([root, packageName]) => {
-    const stage3Zones = (STAGE_3_MODULES.get(root) ?? []).map((include) => ({ include }));
+    const zeroBaselineScopes = [
+      ...(STAGE_3_ZERO_BASELINE_MODULES.get(root) ?? []).map((module) => ({ module })),
+      ...(root === "apps/core"
+        ? [
+            {
+              module: "src/surface/bridge/bus-request-router/common.ts",
+              symbol: "getDiscordFlags",
+            },
+            ...CORE_EVENT_DELIVERY_CONSUMERS.map(({ identity }) => ({
+              module: identity.module,
+              symbol: identity.exportName,
+            })),
+          ]
+        : []),
+    ];
+    const stage3Zones = (STAGE_3_ZERO_BASELINE_MODULES.get(root) ?? []).map((include) => ({
+      include,
+    }));
     const ruleZones: WorkspaceArchitecture["ruleZones"] = {
       ...EMPTY_POLICY.ruleZones,
       ...Object.fromEntries(
@@ -1634,11 +2430,112 @@ export const architectureManifest = {
         ]),
       ),
       "architecture/open-protocol-normalization": OPEN_PROTOCOL_RULE_ZONES.get(root) ?? [],
+      "architecture/complete-event-codec-registry":
+        root === "packages/event-bus" ? [{ include: "lilac-codecs.ts" }] : [],
+      "architecture/raw-event-message-boundary":
+        root === "packages/event-bus"
+          ? [{ include: "raw-bus.ts" }, { include: "redis-streams-bus.ts" }]
+          : [],
+      "architecture/event-handler-result":
+        root === "packages/event-bus" ? [{ include: "lilac-bus.ts" }] : [],
+      "architecture/event-delivery-policy-exhaustiveness":
+        root === "packages/event-bus" ? [{ include: "event-delivery.ts" }] : [],
     };
     return {
       ...EMPTY_POLICY,
       ruleZones,
+      zeroBaselineScopes,
+      eventCodecRegistries: root === "packages/event-bus" ? [EVENT_BUS_CODEC_REGISTRY] : [],
+      rawEventMessageBoundaries:
+        root === "packages/event-bus"
+          ? [
+              {
+                status: "enforced",
+                identity: { module: "raw-bus.ts", exportName: "RawBus.subscribe" },
+                messageType: {
+                  package: "@stanley2058/lilac-event-bus",
+                  exportName: "Message",
+                },
+                handlerParameter: 2,
+                messageParameter: 0,
+                contextParameter: 1,
+              },
+              {
+                status: "enforced",
+                identity: {
+                  module: "redis-streams-bus.ts",
+                  exportName: "RedisStreamsBus.subscribe",
+                },
+                messageType: {
+                  package: "@stanley2058/lilac-event-bus",
+                  exportName: "Message",
+                },
+                handlerParameter: 2,
+                messageParameter: 0,
+                contextParameter: 1,
+              },
+            ]
+          : [],
+      eventDeliveryApis:
+        root === "packages/event-bus"
+          ? [
+              {
+                status: "enforced",
+                identity: { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
+                handlerParameter: 2,
+                handlerMessageParameter: 0,
+                handlerContextParameter: 1,
+                deliveryPolicy: {
+                  module: "event-delivery.ts",
+                  exportName: "applyEventDeliveryPolicy",
+                },
+                deliveryErrorParameter: 0,
+              },
+            ]
+          : [],
+      eventDeliveryConsumers: root === "apps/core" ? CORE_EVENT_DELIVERY_CONSUMERS : [],
+      eventFamilyMigrations: root === "packages/event-bus" ? EVENT_BUS_FAMILY_MIGRATIONS : [],
       boundaryDecoders: [
+        ...(root === "packages/event-bus"
+          ? ([
+              ...[
+                "boundWireValue",
+                "boundWireEvidence",
+                "redisTransportEvidence",
+                "decodeRedisFields",
+                "decodeMessage",
+                "RedisStreamsBus.subscribe.handleEntry",
+              ].map((exportName) => ({
+                identity: { module: "redis-streams-bus.ts", exportName },
+                category: "wire" as const,
+              })),
+              ...["decodeSchema", "decodeKnownMessage"].map((exportName) => ({
+                identity: { module: "lilac-codecs.ts", exportName },
+                category: "wire" as const,
+              })),
+              ...[
+                "decodeRedisEventDeadLetterCiphertextEnvelope",
+                "decryptRedisEventDeadLetterRecord",
+              ].map((exportName) => ({
+                identity: { module: "redis-event-dead-letter.ts", exportName },
+                category: "persistence" as const,
+              })),
+              {
+                identity: {
+                  module: "lilac-spec.ts",
+                  exportName: "parseCmdRequestMessageData",
+                },
+                category: "wire" as const,
+              },
+              {
+                identity: {
+                  module: "core-primary-lineage.ts",
+                  exportName: "decodeCorePrimaryLineageV1",
+                },
+                category: "projection" as const,
+              },
+            ] satisfies readonly BoundaryDecoder[])
+          : []),
         ...(root === "apps/core"
           ? ([
               {
@@ -1663,12 +2560,73 @@ export const architectureManifest = {
                 },
                 category: "projection",
               },
+              {
+                identity: {
+                  module: "src/workflow/workflow-action-resolver.ts",
+                  exportName: "decodeWorkflowActionOutboxEvent",
+                },
+                category: "persistence",
+              },
+              {
+                identity: {
+                  module: "src/workflow/workflow-action-resolver.ts",
+                  exportName: "decodeWorkflowSurfaceAction",
+                },
+                category: "projection",
+              },
+              {
+                identity: {
+                  module: "src/surface/bridge/bus-agent-runner/raw.ts",
+                  exportName: "parseRequestControlFromRaw",
+                },
+                category: "projection",
+              },
+              {
+                identity: {
+                  module: "src/surface/bridge/bus-request-router/common.ts",
+                  exportName: "getDiscordFlags",
+                },
+                category: "projection",
+              },
             ] satisfies readonly BoundaryDecoder[])
           : []),
         ...(INTEGRATED_BOUNDARY_DECODERS.get(root) ?? []),
       ],
       openProtocolAdapters: INTEGRATED_OPEN_PROTOCOL_ADAPTERS.get(root) ?? [],
       opaqueUnknown: [
+        ...(root === "packages/event-bus"
+          ? ([
+              {
+                identity: {
+                  module: "event-dead-letter.ts",
+                  exportName: "captureDeadLetterAcceptance.catch",
+                },
+                reason: "Preserves an opaque Redis adapter exception as dead-letter failure cause.",
+              },
+              {
+                identity: {
+                  module: "event-delivery.ts",
+                  exportName: "EventDeliveryFatalReporter.report",
+                },
+                reason:
+                  "The fatal reporter contract carries an opaque rejected value to the registered defect supervisor.",
+              },
+              {
+                identity: {
+                  module: "redis-streams-bus.ts",
+                  exportName: "RedisStreamsBus.subscribe.reportFatal",
+                },
+                reason: "Reports an opaque handler or dependency defect without domain inspection.",
+              },
+              {
+                identity: {
+                  module: "redis-streams-bus.ts",
+                  exportName: "RedisStreamsBus.subscribe.readFailure",
+                },
+                reason: "Preserves an opaque Redis read exception as a transport failure cause.",
+              },
+            ] satisfies readonly ReasonedSymbolException[])
+          : []),
         ...(root === "apps/core"
           ? [
               {
@@ -1694,8 +2652,165 @@ export const architectureManifest = {
       ],
       capabilityPredicates: INTEGRATED_CAPABILITY_PREDICATES.get(root) ?? [],
       exceptionAdapters: [
+        ...(root === "packages/event-bus"
+          ? ([
+              {
+                identity: {
+                  module: "event-dead-letter.ts",
+                  exportName: "checkedDeadLetterAcceptance",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic" },
+                direction: "observe-panic",
+                reason:
+                  "Signals a Panic only when a dead-letter adapter violates its nominal Result or receipt contract.",
+              },
+              {
+                identity: {
+                  module: "core-primary-lineage.ts",
+                  exportName: "decodeCorePrimaryLineageV1",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic",
+                reason:
+                  "Maps ordinary lineage projection failures to an owned Result while preserving Panic at the exact boundary.",
+              },
+              {
+                identity: {
+                  module: "redis-event-dead-letter.ts",
+                  exportName: "RedisEventDeadLetter.constructor",
+                },
+                category: "compatibility",
+                externalApi: { package: "global", exportName: "constructor" },
+                direction: "signal-host",
+                reason:
+                  "Converts typed Redis dead-letter configuration validation failure to the constructor host contract.",
+              },
+              ...[
+                ["event-dead-letter.ts", "captureDeadLetterAcceptance.catch"],
+                ["lilac-bus.ts", "checkedDisposition"],
+                ["lilac-bus.ts", "checkedHandlerResult"],
+                ["lilac-bus.ts", "createLilacBus.bus.fetchTopic"],
+                ["lilac-codecs.ts", "validateRequestPrimaryLineage"],
+                ["lilac-codecs.ts", "decodeSchema"],
+                ["redis-streams-bus.ts", "deliveryAction"],
+                ["redis-streams-bus.ts", "RedisStreamsBus.subscribe"],
+                ["redis-streams-bus.ts", "RedisStreamsBus.subscribe.acknowledge"],
+                ["redis-streams-bus.ts", "RedisStreamsBus.subscribe.handleEntry"],
+                ["redis-streams-bus.ts", "RedisStreamsBus.subscribe.stop"],
+              ].map(([module, exportName]) => ({
+                identity: { module, exportName },
+                category: "defect-supervisor" as const,
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic" as const,
+                reason: "Preserves Panic while supervising an immediate event delivery boundary.",
+              })),
+              ...[
+                ["redis-streams-bus.ts", "decodeSuperJson", "superjson", "SuperJSON.parse"],
+                [
+                  "redis-streams-bus.ts",
+                  "RedisStreamsBus.subscribe.reportFatal",
+                  "@stanley2058/lilac-event-bus",
+                  "EventDeliveryFatalReporter.report",
+                ],
+              ].map(([module, exportName, packageName, externalName]) => ({
+                identity: { module, exportName },
+                category: "external-to-result" as const,
+                externalApi: { package: packageName, exportName: externalName },
+                direction: "capture-external" as const,
+                reason:
+                  "Captures the immediate external event transport or compatibility exception.",
+              })),
+              ...[
+                "encryptRedisEventDeadLetterRecoveryValue",
+                "decryptRedisEventDeadLetterRecoveryValue",
+              ].flatMap((exportName) => [
+                {
+                  identity: { module: "redis-event-dead-letter.ts", exportName },
+                  category: "external-to-result" as const,
+                  externalApi: { package: "node:crypto", exportName: "AES-256-GCM" },
+                  direction: "capture-external" as const,
+                  reason:
+                    "Maps an immediate authenticated-encryption operation failure to an owned recovery Result error.",
+                },
+                {
+                  identity: { module: "redis-event-dead-letter.ts", exportName },
+                  category: "defect-supervisor" as const,
+                  externalApi: { package: "better-result", exportName: "Panic.is" },
+                  direction: "observe-panic" as const,
+                  reason:
+                    "Preserves Panic while capturing an immediate authenticated-encryption failure.",
+                },
+              ]),
+              ...[
+                ["decodeRedisEventDeadLetterCiphertextEnvelope", "JSON.parse"],
+                ["decryptRedisEventDeadLetterRecord", "SuperJSON.parse"],
+              ].map(([exportName, externalName]) => ({
+                identity: { module: "redis-event-dead-letter.ts", exportName },
+                category: "external-to-result" as const,
+                externalApi: { package: "serialization", exportName: externalName },
+                direction: "capture-external" as const,
+                reason:
+                  "Maps malformed persisted dead-letter serialization to an owned recovery Result error.",
+              })),
+              ...[["redis-event-dead-letter.ts", "RedisEventDeadLetter.accept"]].map(
+                ([module, exportName]) => ({
+                  identity: { module, exportName },
+                  category: "compatibility" as const,
+                  externalApi: { package: "global", exportName: "Promise" },
+                  direction: "signal-host" as const,
+                  reason: "Signals through a temporary legacy or Result-capture host contract.",
+                }),
+              ),
+            ] satisfies readonly ExceptionAdapter[])
+          : []),
         ...(root === "apps/core"
           ? ([
+              {
+                identity: {
+                  module: "src/runtime/core-dead-letter-key.ts",
+                  exportName: "loadOrCreateCoreDeadLetterKey",
+                },
+                category: "external-to-result",
+                externalApi: { package: "node:fs", exportName: "dead-letter key lifecycle" },
+                direction: "capture-external",
+                reason:
+                  "Maps atomic persistent dead-letter key filesystem failures to owned typed Results.",
+              },
+              {
+                identity: {
+                  module: "src/runtime/core-dead-letter-key.ts",
+                  exportName: "loadOrCreateCoreDeadLetterKey",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic",
+                reason:
+                  "Preserves the original key lifecycle Panic while completing temporary-file cleanup.",
+              },
+              {
+                identity: {
+                  module: "src/runtime/core-dead-letter-key.ts",
+                  exportName: "readCoreDeadLetterKey",
+                },
+                category: "external-to-result",
+                externalApi: { package: "node:fs", exportName: "key file handle" },
+                direction: "capture-external",
+                reason:
+                  "Contains file-handle read and close failures for the outer typed key lifecycle adapter.",
+              },
+              {
+                identity: {
+                  module: "src/runtime/core-dead-letter-key.ts",
+                  exportName: "readCoreDeadLetterKey",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic",
+                reason:
+                  "Preserves the original key read Panic when file-handle cleanup also fails.",
+              },
               ...["captureFileOperation", "readMcpConfigFile", "serializeConfig"].map(
                 (exportName) => ({
                   identity: { module: "src/mcp/config-file.ts", exportName: `${exportName}.catch` },
@@ -1713,6 +2828,220 @@ export const architectureManifest = {
                 direction: "observe-panic" as const,
                 reason: "Preserves Panic while mapping the immediate filesystem or JSON exception.",
               })),
+              ...["captureRunEvent", "captureChildActivity"].map((exportName) => ({
+                identity: {
+                  module: "src/workflow/workflow-live-parent-bridge.ts",
+                  exportName,
+                },
+                category: "defect-supervisor" as const,
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic" as const,
+                reason:
+                  "Preserves Panic while mapping an immediate live-parent delivery failure to an owned Result error.",
+              })),
+              {
+                identity: {
+                  module: "src/workflow/workflow-action-resolver.ts",
+                  exportName: "captureWorkflowActionOutboxPublication",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic",
+                reason: "Preserves Panic identity while capturing action outbox publication.",
+              },
+              {
+                identity: {
+                  module: "src/workflow/workflow-action-resolver.ts",
+                  exportName: "captureWorkflowActionOutboxPublication",
+                },
+                category: "external-to-result",
+                externalApi: {
+                  package: "@stanley2058/lilac-event-bus",
+                  exportName: "LilacBus.publish",
+                },
+                direction: "capture-external",
+                reason: "Maps action outbox publication rejection to an owned Result error.",
+              },
+              ...[
+                [
+                  "WorkflowWaitResolver.captureWorkflowWaitResolverTrim",
+                  "LilacBus.trimTopicBeforeCheckpoint",
+                ],
+                [
+                  "WorkflowWaitResolver.captureWorkflowWaitResolverConsumerGroupRetirement",
+                  "LilacBus.retireTopicConsumerGroup",
+                ],
+                [
+                  "WorkflowWaitResolver.captureWorkflowWaitResolverBarrierPublication",
+                  "LilacBus.publish",
+                ],
+                [
+                  "WorkflowWaitResolver.captureWorkflowWaitResolverWakeupPublication",
+                  "LilacBus.publish",
+                ],
+              ].flatMap(([exportName, externalExportName]) => [
+                {
+                  identity: {
+                    module: "src/workflow/workflow-wait-resolver.ts",
+                    exportName,
+                  },
+                  category: "defect-supervisor" as const,
+                  externalApi: { package: "better-result", exportName: "Panic.is" },
+                  direction: "observe-panic" as const,
+                  reason: "Preserves Panic identity at a workflow wait resolver bus boundary.",
+                },
+                {
+                  identity: {
+                    module: "src/workflow/workflow-wait-resolver.ts",
+                    exportName,
+                  },
+                  category: "external-to-result" as const,
+                  externalApi: {
+                    package: "@stanley2058/lilac-event-bus",
+                    exportName: externalExportName,
+                  },
+                  direction: "capture-external" as const,
+                  reason: "Maps an event-bus rejection to an owned wait resolver Result error.",
+                },
+              ]),
+              {
+                identity: {
+                  module: "src/workflow/workflow-wait-resolver.ts",
+                  exportName: "WorkflowWaitResolver.startWorkflowWaitSubscriptionResult",
+                },
+                category: "defect-supervisor",
+                externalApi: {
+                  package: "@stanley2058/lilac-event-bus",
+                  exportName: "LilacBus.subscribeTopic",
+                },
+                direction: "observe-panic",
+                reason:
+                  "Releases the resolver lease while preserving a rejected subscription defect exactly.",
+              },
+              ...[
+                [
+                  "src/workflow/workflow-action-resolver.ts",
+                  "adaptWorkflowActionSubscriptionStartResultToHost",
+                  "startWorkflowActionResolver",
+                ],
+                [
+                  "src/workflow/workflow-action-resolver.ts",
+                  "adaptWorkflowActionSubscriptionStopResultToHost",
+                  "WorkflowActionResolver.stop",
+                ],
+                [
+                  "src/workflow/workflow-progress-projector.ts",
+                  "adaptWorkflowProgressSubscriptionStartResultToHost",
+                  "WorkflowProgressProjector.start",
+                ],
+                [
+                  "src/workflow/workflow-progress-projector.ts",
+                  "adaptWorkflowProgressSubscriptionStopResultToHost",
+                  "WorkflowProgressProjector.stop",
+                ],
+                [
+                  "src/workflow/workflow-wait-resolver.ts",
+                  "adaptWorkflowWaitResolverStartResultToHost",
+                  "WorkflowWaitResolver.start",
+                ],
+                [
+                  "src/workflow/workflow-wait-resolver.ts",
+                  "adaptWorkflowWaitResolverStopResultToHost",
+                  "WorkflowWaitResolver.stop",
+                ],
+              ].map(([module, exportName, externalExportName]) => ({
+                identity: { module, exportName },
+                category: "result-to-framework" as const,
+                externalApi: {
+                  package: "@stanley2058/lilac-core",
+                  exportName: externalExportName,
+                },
+                direction: "signal-host" as const,
+                reason:
+                  "Adapts a typed event-bus subscription Result to the owner's existing lifecycle rejection contract.",
+              })),
+              {
+                identity: {
+                  module: "src/workflow/workflow-engine.ts",
+                  exportName: "runWorkflowTimerTick",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic",
+                reason:
+                  "Preserves Panic while mapping a supervised workflow timer rejection to an owned Result error.",
+              },
+              ...[
+                [
+                  "captureWorkflowTerminalReceiptAdoption",
+                  "@stanley2058/lilac-core",
+                  "WorkflowEngine.adoptTerminalReceipt",
+                  "terminal receipt adoption",
+                ],
+                [
+                  "captureWorkflowIdleCancellationPublication",
+                  "@stanley2058/lilac-event-bus",
+                  "LilacBus.publish",
+                  "idle cancellation publication",
+                ],
+              ].flatMap(([exportName, packageName, externalExportName, operation]) => [
+                {
+                  identity: { module: "src/workflow/workflow-engine.ts", exportName },
+                  category: "defect-supervisor" as const,
+                  externalApi: { package: "better-result", exportName: "Panic.is" },
+                  direction: "observe-panic" as const,
+                  reason: `Preserves Panic while capturing workflow ${operation}.`,
+                },
+                {
+                  identity: { module: "src/workflow/workflow-engine.ts", exportName },
+                  category: "external-to-result" as const,
+                  externalApi: { package: packageName, exportName: externalExportName },
+                  direction: "capture-external" as const,
+                  reason: `Maps workflow ${operation} rejection to an owned Result error.`,
+                },
+              ]),
+              {
+                identity: {
+                  module: "src/workflow/workflow-live-parent-bridge.ts",
+                  exportName: "WorkflowLiveParentBridge.publishParentDisplay",
+                },
+                category: "defect-supervisor",
+                externalApi: { package: "better-result", exportName: "Panic.is" },
+                direction: "observe-panic",
+                reason: "Preserves Panic while supervising queued live-parent status publication.",
+              },
+              ...[
+                ["requireSubscriptionStart", "LilacBus.subscribeTopic"],
+                ["requireSubscriptionStop", "LilacBus.subscribeTopic"],
+                ["requireChildOutputBatch", "LilacBus.fetchTopic"],
+              ].map(([exportName, externalExportName]) => ({
+                identity: {
+                  module: "src/workflow/workflow-live-parent-bridge.ts",
+                  exportName,
+                },
+                category: "result-to-framework" as const,
+                externalApi: {
+                  package: "@stanley2058/lilac-event-bus",
+                  exportName: externalExportName,
+                },
+                direction: "signal-host" as const,
+                reason:
+                  "Adapts a typed event-bus Result to the bridge's existing startup, cleanup, or reconciliation rejection contract.",
+              })),
+              {
+                identity: {
+                  module: "src/workflow/workflow-engine.ts",
+                  exportName: "requireWorkflowEngineSubscriptionStart",
+                },
+                category: "result-to-framework",
+                externalApi: {
+                  package: "@stanley2058/lilac-event-bus",
+                  exportName: "LilacBus.subscribeTopic",
+                },
+                direction: "signal-host",
+                reason:
+                  "Adapts workflow-engine subscription startup failure to its existing host rejection contract.",
+              },
               {
                 identity: { module: "src/mcp/error-format.ts", exportName: "redactUrl" },
                 category: "external-to-result",
@@ -1814,6 +3143,61 @@ export const architectureManifest = {
               { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSource" },
               { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSourceMap" },
               { module: "src/mcp/value-source.ts", exportName: "validateHttpHeaders" },
+              {
+                module: "src/workflow/workflow-action-resolver.ts",
+                exportName: "startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
+              },
+              {
+                module: "src/workflow/workflow-action-resolver.ts",
+                exportName: "startWorkflowActionResolver.stopWorkflowActionSubscriptionResult",
+              },
+              {
+                module: "src/workflow/workflow-action-resolver.ts",
+                exportName: "captureWorkflowActionOutboxPublication",
+              },
+              {
+                module: "src/workflow/workflow-progress-projector.ts",
+                exportName: "WorkflowProgressProjector.startWorkflowProgressSubscriptionResult",
+              },
+              {
+                module: "src/workflow/workflow-progress-projector.ts",
+                exportName: "WorkflowProgressProjector.stopWorkflowProgressSubscriptionResult",
+              },
+              ...[
+                "startWorkflowWaitResolverResult",
+                "acquireLeaseResult",
+                "startWorkflowWaitSubscriptionResult",
+                "captureWorkflowWaitResolverTrim",
+                "captureWorkflowWaitResolverConsumerGroupRetirement",
+                "failWorkflowWaitResolverActivation",
+                "activateSubscriptionResult",
+                "recoverSubscriptionResult",
+                "stopWorkflowWaitSubscriptionResult",
+                "stopWorkflowWaitResolverResult",
+                "captureWorkflowWaitResolverBarrierPublication",
+                "reconcileTimersResult",
+                "captureWorkflowWaitResolverWakeupPublication",
+              ].map((exportName) => ({
+                module: "src/workflow/workflow-wait-resolver.ts",
+                exportName: `WorkflowWaitResolver.${exportName}`,
+              })),
+              {
+                module: "src/workflow/workflow-engine.ts",
+                exportName: "WorkflowEngine.startWakeSubscription",
+              },
+              { module: "src/workflow/workflow-engine.ts", exportName: "runWorkflowTimerTick" },
+              {
+                module: "src/workflow/workflow-engine.ts",
+                exportName: "captureWorkflowTerminalReceiptAdoption",
+              },
+              {
+                module: "src/workflow/workflow-engine.ts",
+                exportName: "captureWorkflowIdleCancellationPublication",
+              },
+              {
+                module: "src/workflow/workflow-engine.ts",
+                exportName: "fetchWorkflowTerminalReceipt",
+              },
             ]
           : []),
         ...(STAGE_3_OPERATIONAL_RESULT_APIS.get(root) ?? []),
@@ -1863,8 +3247,67 @@ function requireExactIdentity(identity: SymbolIdentity, description: string): vo
   }
 }
 
+function identityKey(identity: SymbolIdentity): string {
+  return `${identity.module}#${identity.exportName}`;
+}
+
+function requireParameterIndex(value: number, description: string): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`Architecture manifest ${description} must be a nonnegative integer.`);
+  }
+}
+
+function requireUniqueValues(values: readonly string[], description: string): Set<string> {
+  const unique = new Set<string>();
+  for (const value of values) {
+    requireNonempty(value, description);
+    if (unique.has(value)) {
+      throw new Error(`Architecture manifest ${description} contains duplicate '${value}'.`);
+    }
+    unique.add(value);
+  }
+  return unique;
+}
+
+function scopeKey(scope: ZeroBaselineScope): string {
+  return `${scope.module}#${scope.symbol ?? "**"}`;
+}
+
+export function zeroBaselineScopesByWorkspace(
+  manifest: ArchitectureManifest,
+): ReadonlyMap<string, readonly ZeroBaselineScope[]> {
+  return new Map(
+    manifest.workspaces.map((workspace) => [workspace.name, workspace.zeroBaselineScopes]),
+  );
+}
+
 export function assertArchitectureManifestIntegrity(manifest: ArchitectureManifest): void {
+  const workspacesByName = new Map(
+    manifest.workspaces.map((workspace) => [workspace.name, workspace] as const),
+  );
   for (const workspace of manifest.workspaces) {
+    const zeroScopeKeys = new Set<string>();
+    for (const scope of workspace.zeroBaselineScopes) {
+      requireNonempty(scope.module, "zero-baseline scope module");
+      if (scope.module.includes("*")) {
+        throw new Error(
+          `Architecture manifest zero-baseline scope must name an exact module: ${scope.module}.`,
+        );
+      }
+      if (scope.symbol !== undefined) {
+        requireNonempty(scope.symbol, "zero-baseline scope symbol");
+        if (scope.symbol.includes("*") || scope.symbol === "<module>") {
+          throw new Error(
+            `Architecture manifest zero-baseline scope must name an exact symbol: ${scope.module}#${scope.symbol}.`,
+          );
+        }
+      }
+      const key = scopeKey(scope);
+      if (zeroScopeKeys.has(key)) {
+        throw new Error(`Duplicate zero-baseline scope in ${workspace.name}: ${key}.`);
+      }
+      zeroScopeKeys.add(key);
+    }
     for (const decoder of workspace.boundaryDecoders) {
       requireExactIdentity(decoder.identity, "boundary decoder");
     }
@@ -1880,6 +3323,197 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
     }
     for (const api of workspace.operationalResultApis) {
       requireExactIdentity(api, "operational Result API");
+    }
+    const codecRegistries = new Map<string, EventCodecRegistryRegistration>();
+    for (const registry of workspace.eventCodecRegistries) {
+      requireExactIdentity(registry.identity, "event codec registry");
+      requireExactIdentity(registry.canonicalEvents, "canonical event catalog");
+      const key = identityKey(registry.identity);
+      if (codecRegistries.has(key)) {
+        throw new Error(
+          `Duplicate event codec registry registration in ${workspace.name}: ${key}.`,
+        );
+      }
+      codecRegistries.set(key, registry);
+      const canonical = requireUniqueValues(
+        registry.canonicalMembers,
+        `event codec registry ${key} canonicalMembers`,
+      );
+      if (canonical.size === 0) {
+        throw new Error(`Architecture manifest event codec registry ${key} must declare members.`);
+      }
+      const codecs = requireUniqueValues(
+        registry.codecMembers,
+        `event codec registry ${key} codecMembers`,
+      );
+      for (const member of codecs) {
+        if (!canonical.has(member)) {
+          throw new Error(
+            `Architecture manifest event codec registry ${key} covers noncanonical member '${member}'.`,
+          );
+        }
+      }
+      if (registry.status === "enforced" && codecs.size !== canonical.size) {
+        throw new Error(
+          `Enforced event codec registry ${key} must declare codec coverage for every canonical member.`,
+        );
+      }
+    }
+    const rawBoundaryIdentities = new Set<string>();
+    for (const boundary of workspace.rawEventMessageBoundaries) {
+      requireExactIdentity(boundary.identity, "raw event message boundary");
+      requireNonempty(boundary.messageType.package, "raw event message type package");
+      requireNonempty(boundary.messageType.exportName, "raw event message type exportName");
+      requireParameterIndex(boundary.handlerParameter, "raw event handlerParameter");
+      requireParameterIndex(boundary.messageParameter, "raw event messageParameter");
+      requireParameterIndex(boundary.contextParameter, "raw event contextParameter");
+      if (boundary.messageParameter === boundary.contextParameter) {
+        throw new Error(
+          `Architecture manifest raw event boundary ${identityKey(boundary.identity)} must use distinct message and context parameters.`,
+        );
+      }
+      const key = identityKey(boundary.identity);
+      if (rawBoundaryIdentities.has(key)) {
+        throw new Error(`Duplicate raw event message boundary in ${workspace.name}: ${key}.`);
+      }
+      rawBoundaryIdentities.add(key);
+    }
+    const deliveryApiIdentities = new Set<string>();
+    for (const api of workspace.eventDeliveryApis) {
+      requireExactIdentity(api.identity, "event delivery API");
+      requireExactIdentity(api.deliveryPolicy, "event delivery policy");
+      requireParameterIndex(api.handlerParameter, "event delivery handlerParameter");
+      requireParameterIndex(api.handlerMessageParameter, "event delivery handlerMessageParameter");
+      requireParameterIndex(api.handlerContextParameter, "event delivery handlerContextParameter");
+      requireParameterIndex(api.deliveryErrorParameter, "event delivery deliveryErrorParameter");
+      if (api.handlerMessageParameter === api.handlerContextParameter) {
+        throw new Error(
+          `Architecture manifest event delivery API ${identityKey(api.identity)} must use distinct handler message and context parameters.`,
+        );
+      }
+      const key = identityKey(api.identity);
+      if (deliveryApiIdentities.has(key)) {
+        throw new Error(`Duplicate event delivery API registration in ${workspace.name}: ${key}.`);
+      }
+      deliveryApiIdentities.add(key);
+    }
+    const deliveryConsumerIdentities = new Set<string>();
+    for (const consumer of workspace.eventDeliveryConsumers) {
+      requireExactIdentity(consumer.identity, "event delivery consumer");
+      requireNonempty(consumer.apiPackage, "event delivery consumer apiPackage");
+      const key = identityKey(consumer.identity);
+      if (deliveryConsumerIdentities.has(key)) {
+        throw new Error(
+          `Duplicate event delivery consumer registration in ${workspace.name}: ${key}.`,
+        );
+      }
+      deliveryConsumerIdentities.add(key);
+      const operations = requireUniqueValues(
+        consumer.operations,
+        `event delivery consumer ${key} operations`,
+      );
+      if (operations.size === 0) {
+        throw new Error(
+          `Architecture manifest event delivery consumer ${key} must declare operations.`,
+        );
+      }
+      if (
+        !zeroScopeKeys.has(
+          scopeKey({ module: consumer.identity.module, symbol: consumer.identity.exportName }),
+        )
+      ) {
+        throw new Error(
+          `Event delivery consumer ${key} must own an exact workspace zero-baseline symbol scope.`,
+        );
+      }
+    }
+    const familyNames = new Set<string>();
+    const claimedMembers = new Map<string, string>();
+    for (const family of workspace.eventFamilyMigrations) {
+      requireNonempty(family.family, "event family name");
+      if (familyNames.has(family.family)) {
+        throw new Error(`Duplicate event family migration in ${workspace.name}: ${family.family}.`);
+      }
+      familyNames.add(family.family);
+      const registryKey = identityKey(family.codecRegistry);
+      requireExactIdentity(family.codecRegistry, "event family codec registry");
+      const registry = codecRegistries.get(registryKey);
+      if (!registry) {
+        throw new Error(
+          `Event family ${family.family} in ${workspace.name} references unregistered codec registry ${registryKey}.`,
+        );
+      }
+      const members = requireUniqueValues(family.members, `event family ${family.family} members`);
+      if (members.size === 0) {
+        throw new Error(
+          `Architecture manifest event family ${family.family} must declare members.`,
+        );
+      }
+      for (const member of members) {
+        const previous = claimedMembers.get(`${registryKey}\0${member}`);
+        if (previous) {
+          throw new Error(
+            `Event family members must not overlap in ${workspace.name}: '${member}' is claimed by ${previous} and ${family.family}.`,
+          );
+        }
+        claimedMembers.set(`${registryKey}\0${member}`, family.family);
+        if (!registry.canonicalMembers.includes(member)) {
+          throw new Error(
+            `Event family ${family.family} in ${workspace.name} contains noncanonical member '${member}'.`,
+          );
+        }
+        if (family.status === "migrated" && !registry.codecMembers.includes(member)) {
+          throw new Error(
+            `Migrated event family ${family.family} lacks codec coverage for '${member}'.`,
+          );
+        }
+      }
+      if (family.status === "migrated") {
+        if (family.zeroBaselineScopes.length === 0) {
+          throw new Error(
+            `Migrated event family ${family.family} must declare at least one zero-baseline scope.`,
+          );
+        }
+        for (const scope of family.zeroBaselineScopes) {
+          requireNonempty(scope.workspace, "event family zero-baseline workspace");
+          requireNonempty(scope.module, "event family zero-baseline module");
+          requireNonempty(scope.symbol ?? "", "event family zero-baseline symbol");
+          const targetWorkspace = workspacesByName.get(scope.workspace);
+          const owned = targetWorkspace?.zeroBaselineScopes.some(
+            (candidate) => scopeKey(candidate) === scopeKey(scope),
+          );
+          if (!targetWorkspace || !owned) {
+            throw new Error(
+              `Migrated event family ${family.family} zero-baseline scope ${scope.workspace}/${scopeKey(scope)} is not owned by that workspace.`,
+            );
+          }
+          const registeredOwner =
+            targetWorkspace.eventDeliveryConsumers.some(
+              (consumer) =>
+                consumer.identity.module === scope.module &&
+                consumer.identity.exportName === scope.symbol,
+            ) ||
+            targetWorkspace.eventDeliveryApis.some(
+              (api) =>
+                api.identity.module === scope.module && api.identity.exportName === scope.symbol,
+            );
+          if (!registeredOwner) {
+            throw new Error(
+              `Migrated event family ${family.family} zero-baseline scope ${scope.workspace}/${scopeKey(scope)} is not an exact event delivery registration.`,
+            );
+          }
+        }
+      }
+    }
+    for (const [registryKey, registry] of codecRegistries) {
+      const unclaimed = registry.canonicalMembers.filter(
+        (member) => !claimedMembers.has(`${registryKey}\0${member}`),
+      );
+      if (unclaimed.length > 0) {
+        throw new Error(
+          `Event family declarations for ${registryKey} are not exhaustive; missing ${unclaimed.join(", ")}.`,
+        );
+      }
     }
     const openProtocolZones = workspace.ruleZones["architecture/open-protocol-normalization"] ?? [];
     for (const zone of openProtocolZones) {

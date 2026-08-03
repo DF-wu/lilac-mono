@@ -218,6 +218,51 @@ logger.warn("Configuration load failed", {
 - If `Result.tryPromise` stops an aborted retry delay, return its latest Err rather than synthesizing cancellation. When cancellation must remain distinct, use a cancellation-aware adapter that checks the owned signal around every attempt and delay, or do not use built-in retry.
 - Expected cleanup returns Result explicitly: cleanup Err wins after a successful main operation; if both fail, return a domain-owned combined failure preserving both. A rollback failure that leaves atomicity unknown is a Panic. Do not put expected throwing cleanup in a Result generator's `finally` block.
 
+### Event bus delivery
+
+- `LilacBus.publish` provides compile-time producer typing only; it does not establish trust at a receiver in another process or reading persisted data.
+- The external Redis/SuperJSON boundary yields `Message<unknown>`. `createLilacBus` must decode the complete message with `decodeLilacMessageForTopic`, which dispatches through `lilacEventCodecRegistry`, before a typed handler runs. Do not replace this receiver validation with an assertion.
+- A `subscribeTopic` handler returns `Promise<Result<void, OwnedErrorUnion>>`. It does not commit, acknowledge, or choose transport behavior; `Ok` commits and the exhaustive delivery policy handles every owned error.
+- `park-pending` leaves a durable work-mode entry in the Redis PEL for manual recovery. It is not retry and does not schedule reclamation or redelivery.
+- `dead-letter` durably accepts the dead-letter record before acknowledging the source entry. Failed acceptance leaves work-mode delivery pending or stops tail delivery.
+- `Panic`, thrown/rejected defects, invalid handler Results, and invalid policy outputs bypass ordinary delivery policy and go to defect supervision.
+
+```ts
+// Producer typing does not validate data later read from Redis.
+await producerBus.publish(lilacEventTypes.CmdRequestMessage, requestData, publishOptions);
+
+// createLilacBus decodes raw Message<unknown> before typed delivery.
+const consumerBus = createLilacBus(rawBus, deliveryOptions);
+
+type RequestDeliveryError =
+  | RequestAlreadyHandled
+  | RequestDependencyUnavailable
+  | RequestInvalid
+  | RequestConsumerStopping;
+
+async function handleRequest(
+  message: DecodedLilacMessageForTopic<"cmd.request">,
+): Promise<ResultType<void, RequestDeliveryError>> {
+  // Expected failures return an owned Err; subscribeTopic owns acknowledgement.
+  return Result.ok(undefined);
+}
+
+function requestDeliveryPolicy(error: RequestDeliveryError): DeliveryDisposition {
+  switch (error._tag) {
+    case "RequestAlreadyHandled":
+      return "commit";
+    case "RequestDependencyUnavailable":
+      return "park-pending";
+    case "RequestInvalid":
+      return "dead-letter";
+    case "RequestConsumerStopping":
+      return "stop";
+  }
+}
+
+await consumerBus.subscribeTopic("cmd.request", options, handleRequest, requestDeliveryPolicy);
+```
+
 ## Core Config
 
 - `core-config.yaml` is parsed by versioned parsers in `packages/utils/core-config/*` into `UniversalCoreConfig`.

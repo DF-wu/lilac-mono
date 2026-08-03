@@ -405,7 +405,9 @@ Expected contents over time:
 - `graceful-restart.db` (in-flight relay/agent recovery snapshots)
 - `skills/` (skill bundles installed/seeded for discovery)
 - `plugins/` (external Level 1 / Level 2 tool plugins)
-- `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home, and `mcp-oauth/<server-id>.json`)
+- `secret/` (persisted secrets, e.g. GitHub App credentials, GPG home,
+  `mcp-oauth/<server-id>.json`, and the mode-`0600` `event-dead-letter.key` required to recover encrypted
+  Redis dead-letter records)
 - `workspace/` (default working directory for bash/fs tools in the core runtime)
 
 Native Claude continuation is separate from `DATA_DIR`. Claude stores its own conversation

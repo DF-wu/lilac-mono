@@ -6,6 +6,8 @@ import type {
   RuleGroup,
 } from "./model.ts";
 import { ARCHITECTURE_RULES, RULE_GROUPS } from "./model.ts";
+import type { ZeroBaselineScope } from "./manifest.ts";
+import { zeroBaselineScopeOwns } from "./manifest.ts";
 
 export interface BaselineEvaluation {
   readonly diagnostics: readonly ArchitectureDiagnostic[];
@@ -17,7 +19,7 @@ export function applyBaselines(
   boundaryValidation: ArchitectureBaseline,
   failureFlow: ArchitectureBaseline,
   migratedWorkspaces: ReadonlySet<string> = new Set(),
-  zeroBaselineModules: ReadonlyMap<string, readonly string[]> = new Map(),
+  zeroBaselineScopes: ReadonlyMap<string, readonly ZeroBaselineScope[]> = new Map(),
 ): BaselineEvaluation {
   const byFingerprint = new Map(findings.map((finding) => [finding.fingerprint, finding]));
   const baselineFingerprints = new Set<string>();
@@ -31,16 +33,24 @@ export function applyBaselines(
       for (const rule of ARCHITECTURE_RULES) {
         if (RULE_GROUPS[rule] !== group) continue;
         for (const entry of rules[rule] ?? []) {
-          if (zeroBaselineModules.get(workspace)?.includes(entry.location.file)) {
+          const symbol = entry.identity.slice(
+            entry.identity.indexOf("#") + 1,
+            entry.identity.indexOf("[") < 0 ? undefined : entry.identity.indexOf("["),
+          );
+          if (
+            zeroBaselineScopes
+              .get(workspace)
+              ?.some((scope) => zeroBaselineScopeOwns(scope, entry.location.file, symbol))
+          ) {
             stale.push({
               rule,
               severity: "error",
               workspace,
-              message: `Migrated module retains a ${group} baseline entry: ${entry.reason}`,
+              message: `Zero-baseline scope retains a ${group} baseline entry: ${entry.reason}`,
               suggestion:
-                "Fix the production violation and remove the baseline entry; migrated modules must keep hard-rule baselines at zero.",
+                "Fix the production violation and remove the baseline entry; declared module and symbol scopes must keep hard-rule baselines at zero.",
               identity: entry.identity,
-              fingerprint: `migrated-module-baseline:${entry.fingerprint}`,
+              fingerprint: `zero-scope-baseline:${entry.fingerprint}`,
               location: entry.location,
             });
             continue;
@@ -127,6 +137,14 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing closed-union map awaiting a compiler-checked exhaustive shape.";
     case "architecture/open-protocol-normalization":
       return "Existing open protocol adapter awaiting a closed local union and explicit fallback variant.";
+    case "architecture/raw-event-message-boundary":
+      return "Existing raw event receiver awaiting an honest Message<unknown> contract.";
+    case "architecture/complete-event-codec-registry":
+      return "Existing canonical event awaiting complete receiver-side codec registration.";
+    case "architecture/event-handler-result":
+      return "Existing event handler awaiting a typed Promise<Result<void, E>> delivery contract.";
+    case "architecture/event-delivery-policy-exhaustiveness":
+      return "Existing event delivery errors awaiting an exhaustive disposition policy.";
     case "architecture/no-production-unwrap":
       return "Existing unsafe Result extraction awaiting explicit success/error policy handling.";
     case "architecture/no-unmapped-result-capture":

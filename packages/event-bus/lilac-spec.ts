@@ -1,18 +1,14 @@
 /**
  * Canonical event contracts for the Lilac monorepo.
  *
- * Most event data remains compile-time only. Runtime parsers are exported for
- * contracts, such as Core primary lineage, that cross trust boundaries.
+ * Payload types are derived from the colocated runtime schemas used at the
+ * event-bus trust boundary.
  */
 
-import { modelMessageSchema, type ModelMessage } from "ai";
+import { modelMessageSchema } from "ai";
 import { z } from "zod";
 
-import {
-  corePrimaryLineageV1Schema,
-  parseCorePrimaryLineageV1,
-  type CorePrimaryLineageV1,
-} from "./core-primary-lineage";
+import { corePrimaryLineageV1Schema, decodeCorePrimaryLineageV1 } from "./core-primary-lineage";
 
 /**
  * Event type string constants (use for autocomplete).
@@ -58,304 +54,349 @@ export type LilacEventType = (typeof lilacEventTypes)[keyof typeof lilacEventTyp
 /** Output stream topic for a single request (agent output deltas/responses). */
 export type OutReqTopic = `out.req.${string}`;
 
+/** Runtime contract for an output stream topic with a non-empty request suffix. */
+export const outReqTopicSchema = z.templateLiteral(["out.req.", z.string().min(1)]);
+
 /** Build the output stream topic for a requestId. */
 export function outReqTopic(requestId: string): OutReqTopic {
   return `out.req.${requestId}`;
 }
 
-export type RequestLifecycleState = "queued" | "running" | "resolved" | "failed" | "cancelled";
+const nonemptyStringSchema = z.string().min(1);
+const finiteNumberSchema = z.number().finite();
 
-export type AdapterPlatform =
-  | "discord"
-  | "github"
-  | "whatsapp"
-  | "slack"
-  | "telegram"
-  | "web"
-  | "unknown";
+export const requestLifecycleStateSchema = z.enum([
+  "queued",
+  "running",
+  "resolved",
+  "failed",
+  "cancelled",
+]);
+export type RequestLifecycleState = z.output<typeof requestLifecycleStateSchema>;
+
+export const adapterPlatformSchema = z.enum([
+  "discord",
+  "github",
+  "whatsapp",
+  "slack",
+  "telegram",
+  "web",
+  "unknown",
+]);
+export type AdapterPlatform = z.output<typeof adapterPlatformSchema>;
 
 /** Reference to a surface message (platform+channel+message). */
-export type SurfaceMsgRef = {
-  platform: AdapterPlatform;
-  channelId: string;
-  messageId: string;
-};
+export const surfaceMsgRefSchema = z.strictObject({
+  platform: adapterPlatformSchema,
+  channelId: nonemptyStringSchema,
+  messageId: nonemptyStringSchema,
+});
+export type SurfaceMsgRef = z.output<typeof surfaceMsgRefSchema>;
 
-export type RequestQueueMode = "prompt" | "steer" | "followUp" | "interrupt";
+export const requestQueueModeSchema = z.enum(["prompt", "steer", "followUp", "interrupt"]);
+export type RequestQueueMode = z.output<typeof requestQueueModeSchema>;
 
-export type RequestRunPolicy = "normal" | "idle_only_session" | "idle_only_global";
+export const requestRunPolicySchema = z.enum(["normal", "idle_only_session", "idle_only_global"]);
+export type RequestRunPolicy = z.output<typeof requestRunPolicySchema>;
 
-export type RequestOrigin = {
-  kind: "heartbeat";
-  reason: "interval" | "retry";
-};
-
-export type CmdRequestMessageData = {
-  queue: RequestQueueMode;
-  messages: ModelMessage[];
-  /** Core-owned canonical primary lineage; other producers may omit it. */
-  corePrimaryLineage?: CorePrimaryLineageV1;
-  runPolicy?: RequestRunPolicy;
-  origin?: RequestOrigin;
-  /** Optional direct model ref (provider/model or alias from models.def). */
-  modelOverride?: string;
-  /** Raw adapter payload (platform event) if you need it later. */
-  raw?: unknown;
-};
+export const requestOriginSchema = z.strictObject({
+  kind: z.literal("heartbeat"),
+  reason: z.enum(["interval", "retry"]),
+});
+export type RequestOrigin = z.output<typeof requestOriginSchema>;
 
 const cmdRequestMessageDataShapeSchema = z.strictObject({
-  queue: z.enum(["prompt", "steer", "followUp", "interrupt"]),
+  queue: requestQueueModeSchema,
   messages: z.array(modelMessageSchema),
   corePrimaryLineage: corePrimaryLineageV1Schema.optional(),
-  runPolicy: z.enum(["normal", "idle_only_session", "idle_only_global"]).optional(),
-  origin: z
-    .strictObject({
-      kind: z.literal("heartbeat"),
-      reason: z.enum(["interval", "retry"]),
-    })
-    .optional(),
+  runPolicy: requestRunPolicySchema.optional(),
+  origin: requestOriginSchema.optional(),
   modelOverride: z.string().optional(),
   raw: z.unknown().optional(),
 });
 
+/** Command payload, including cross-field validation of Core primary lineage. */
+export const cmdRequestMessageDataSchema = cmdRequestMessageDataShapeSchema.superRefine(
+  (data, context) => {
+    if (!data.corePrimaryLineage) return;
+    const decoded = decodeCorePrimaryLineageV1(data.corePrimaryLineage, data.messages);
+    if (decoded.status === "error") {
+      for (const issue of decoded.error.issues) {
+        context.addIssue({
+          code: "custom",
+          path: ["corePrimaryLineage", ...issue.path],
+          message: issue.message,
+        });
+      }
+    }
+  },
+);
+export type CmdRequestMessageData = z.output<typeof cmdRequestMessageDataSchema>;
+
 /** Parse request data and validate any supplied lineage against `messages`. */
 export function parseCmdRequestMessageData(value: unknown): CmdRequestMessageData {
-  const data = cmdRequestMessageDataShapeSchema.parse(value);
-  if (data.corePrimaryLineage) {
-    parseCorePrimaryLineageV1(data.corePrimaryLineage, data.messages);
-  }
-  return data;
+  return cmdRequestMessageDataSchema.parse(value);
 }
 
 /** Command: switch an active output relay to a new reply anchor. */
-export type CmdSurfaceOutputReanchorData = {
+export const cmdSurfaceOutputReanchorDataSchema = z.strictObject({
   /** When true, keep the relay's current reply mode (reply vs top-level). */
-  inheritReplyTo: boolean;
+  inheritReplyTo: z.boolean(),
   /** Optional reanchor mode for UI placeholders. */
-  mode?: "steer" | "interrupt";
+  mode: z.enum(["steer", "interrupt"]).optional(),
   /** Override reply target when inheritReplyTo=false; omit for top-level. */
-  replyTo?: SurfaceMsgRef;
-};
+  replyTo: surfaceMsgRefSchema.optional(),
+});
+export type CmdSurfaceOutputReanchorData = z.output<typeof cmdSurfaceOutputReanchorDataSchema>;
 
-export type EvtAdapterMessageCreatedData = {
-  platform: AdapterPlatform;
-  channelId: string;
-  channelName?: string;
-  messageId: string;
-  userId: string;
-  userName?: string;
-  text: string;
-  ts: number;
-  raw?: unknown;
+const adapterMessageDataShape = {
+  platform: adapterPlatformSchema,
+  channelId: nonemptyStringSchema,
+  channelName: z.string().optional(),
+  messageId: nonemptyStringSchema,
+  userId: nonemptyStringSchema,
+  userName: z.string().optional(),
+  text: z.string(),
+  ts: finiteNumberSchema,
+  raw: z.unknown().optional(),
 };
+export const evtAdapterMessageCreatedDataSchema = z.strictObject(adapterMessageDataShape);
+export type EvtAdapterMessageCreatedData = z.output<typeof evtAdapterMessageCreatedDataSchema>;
+export const evtAdapterMessageUpdatedDataSchema = z.strictObject(adapterMessageDataShape);
+export type EvtAdapterMessageUpdatedData = z.output<typeof evtAdapterMessageUpdatedDataSchema>;
 
-export type EvtAdapterMessageUpdatedData = {
-  platform: AdapterPlatform;
-  channelId: string;
-  channelName?: string;
-  messageId: string;
-  userId: string;
-  userName?: string;
-  text: string;
-  ts: number;
-  raw?: unknown;
+export const evtAdapterMessageDeletedDataSchema = z.strictObject({
+  platform: adapterPlatformSchema,
+  channelId: nonemptyStringSchema,
+  channelName: z.string().optional(),
+  messageId: nonemptyStringSchema,
+  ts: finiteNumberSchema,
+  raw: z.unknown().optional(),
+});
+export type EvtAdapterMessageDeletedData = z.output<typeof evtAdapterMessageDeletedDataSchema>;
+
+const adapterReactionDataShape = {
+  platform: adapterPlatformSchema,
+  channelId: nonemptyStringSchema,
+  channelName: z.string().optional(),
+  messageId: nonemptyStringSchema,
+  userId: nonemptyStringSchema.optional(),
+  userName: z.string().optional(),
+  reaction: z.string(),
+  ts: finiteNumberSchema,
+  raw: z.unknown().optional(),
 };
+export const evtAdapterReactionAddedDataSchema = z.strictObject(adapterReactionDataShape);
+export type EvtAdapterReactionAddedData = z.output<typeof evtAdapterReactionAddedDataSchema>;
+export const evtAdapterReactionRemovedDataSchema = z.strictObject(adapterReactionDataShape);
+export type EvtAdapterReactionRemovedData = z.output<typeof evtAdapterReactionRemovedDataSchema>;
 
-export type EvtAdapterMessageDeletedData = {
-  platform: AdapterPlatform;
-  channelId: string;
-  channelName?: string;
-  messageId: string;
-  ts: number;
-  raw?: unknown;
-};
+export const evtAdapterActionInvokedDataSchema = z.strictObject({
+  actionId: nonemptyStringSchema,
+  platform: adapterPlatformSchema,
+  userId: nonemptyStringSchema,
+  messageRef: surfaceMsgRefSchema,
+  sourceMessageId: nonemptyStringSchema.optional(),
+  ts: finiteNumberSchema,
+});
+export type EvtAdapterActionInvokedData = z.output<typeof evtAdapterActionInvokedDataSchema>;
 
-export type EvtAdapterReactionAddedData = {
-  platform: AdapterPlatform;
-  channelId: string;
-  channelName?: string;
-  messageId: string;
-  userId?: string;
-  userName?: string;
-  reaction: string;
-  ts: number;
-  raw?: unknown;
-};
+export const evtWorkflowWaitResolverBarrierDataSchema = z.strictObject({
+  barrierId: nonemptyStringSchema,
+  ts: finiteNumberSchema,
+});
+export type EvtWorkflowWaitResolverBarrierData = z.output<
+  typeof evtWorkflowWaitResolverBarrierDataSchema
+>;
 
-export type EvtAdapterReactionRemovedData = {
-  platform: AdapterPlatform;
-  channelId: string;
-  channelName?: string;
-  messageId: string;
-  userId?: string;
-  userName?: string;
-  reaction: string;
-  ts: number;
-  raw?: unknown;
-};
+export const evtRequestLifecycleChangedDataSchema = z.strictObject({
+  state: requestLifecycleStateSchema,
+  detail: z.string().optional(),
+  ts: finiteNumberSchema.optional(),
+});
+export type EvtRequestLifecycleChangedData = z.output<typeof evtRequestLifecycleChangedDataSchema>;
 
-export type EvtAdapterActionInvokedData = {
-  actionId: string;
-  platform: AdapterPlatform;
-  userId: string;
-  messageRef: SurfaceMsgRef;
-  sourceMessageId?: string;
-  ts: number;
-};
-
-export type EvtWorkflowWaitResolverBarrierData = {
-  barrierId: string;
-  ts: number;
-};
-
-export type EvtRequestLifecycleChangedData = {
-  state: RequestLifecycleState;
-  detail?: string;
-  ts?: number;
-};
-
-export type EvtRequestReplyData = {};
+export const evtRequestReplyDataSchema = z.strictObject({});
+export type EvtRequestReplyData = z.output<typeof evtRequestReplyDataSchema>;
 
 /** Event: a surface output message was created for a request. */
-export type EvtSurfaceOutputMessageCreatedData = {
-  msgRef: SurfaceMsgRef;
-};
+export const evtSurfaceOutputMessageCreatedDataSchema = z.strictObject({
+  msgRef: surfaceMsgRefSchema,
+});
+export type EvtSurfaceOutputMessageCreatedData = z.output<
+  typeof evtSurfaceOutputMessageCreatedDataSchema
+>;
 
-export type WorkflowRunEventState =
-  | "queued"
-  | "running"
-  | "blocked"
-  | "paused"
-  | "succeeded"
-  | "failed"
-  | "cancelled";
+export const workflowRunEventStateSchema = z.enum([
+  "queued",
+  "running",
+  "blocked",
+  "paused",
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+export type WorkflowRunEventState = z.output<typeof workflowRunEventStateSchema>;
 
-export type WorkflowOperationEventState =
-  | "queued"
-  | "dispatched"
-  | "running"
-  | "blocked"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "timed_out";
+export const workflowOperationEventStateSchema = z.enum([
+  "queued",
+  "dispatched",
+  "running",
+  "blocked",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+]);
+export type WorkflowOperationEventState = z.output<typeof workflowOperationEventStateSchema>;
 
-export type EvtWorkflowRunChangedData = {
-  runId: string;
-  revisionId: string;
-  state: WorkflowRunEventState;
-  previousState?: WorkflowRunEventState;
-  detail?: string;
-  ts: number;
-};
+export const evtWorkflowRunChangedDataSchema = z.strictObject({
+  runId: nonemptyStringSchema,
+  revisionId: nonemptyStringSchema,
+  state: workflowRunEventStateSchema,
+  previousState: workflowRunEventStateSchema.optional(),
+  detail: z.string().optional(),
+  ts: finiteNumberSchema,
+});
+export type EvtWorkflowRunChangedData = z.output<typeof evtWorkflowRunChangedDataSchema>;
 
-export type EvtWorkflowOperationChangedData = {
-  runId: string;
-  revisionId: string;
-  operationId: string;
-  kind: "agent" | "parallel" | "pipeline" | "phase" | "wait";
-  state: WorkflowOperationEventState;
-  previousState?: WorkflowOperationEventState;
-  phase?: string;
-  label?: string;
-  ts: number;
-};
+export const evtWorkflowOperationChangedDataSchema = z.strictObject({
+  runId: nonemptyStringSchema,
+  revisionId: nonemptyStringSchema,
+  operationId: nonemptyStringSchema,
+  kind: z.enum(["agent", "parallel", "pipeline", "phase", "wait"]),
+  state: workflowOperationEventStateSchema,
+  previousState: workflowOperationEventStateSchema.optional(),
+  phase: z.string().optional(),
+  label: z.string().optional(),
+  ts: finiteNumberSchema,
+});
+export type EvtWorkflowOperationChangedData = z.output<
+  typeof evtWorkflowOperationChangedDataSchema
+>;
 
-export type EvtWorkflowProgressRequestedData = {
-  runId: string;
-  revisionId: string;
-  reason: "created" | "state_changed" | "operation_changed" | "usage_changed" | "reconcile";
-  ts: number;
-};
+export const evtWorkflowProgressRequestedDataSchema = z.strictObject({
+  runId: nonemptyStringSchema,
+  revisionId: nonemptyStringSchema,
+  reason: z.enum(["created", "state_changed", "operation_changed", "usage_changed", "reconcile"]),
+  ts: finiteNumberSchema,
+});
+export type EvtWorkflowProgressRequestedData = z.output<
+  typeof evtWorkflowProgressRequestedDataSchema
+>;
 
-export type EvtWorkflowUsageChangedData = {
-  runId: string;
-  revisionId: string;
-  operationId?: string;
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-    agentCount: number;
-    activeAgents: number;
-  };
-  ts: number;
-};
+export const evtWorkflowUsageChangedDataSchema = z.strictObject({
+  runId: nonemptyStringSchema,
+  revisionId: nonemptyStringSchema,
+  operationId: nonemptyStringSchema.optional(),
+  usage: z.strictObject({
+    inputTokens: finiteNumberSchema,
+    outputTokens: finiteNumberSchema,
+    totalTokens: finiteNumberSchema,
+    agentCount: finiteNumberSchema,
+    activeAgents: finiteNumberSchema,
+  }),
+  ts: finiteNumberSchema,
+});
+export type EvtWorkflowUsageChangedData = z.output<typeof evtWorkflowUsageChangedDataSchema>;
 
-export type EvtWorkflowResultReadyData = {
-  runId: string;
-  revisionId: string;
-  state: "succeeded" | "failed" | "rejected" | "cancelled";
-  summary?: string;
-  resultArtifactId?: string;
-  ts: number;
-};
+export const evtWorkflowResultReadyDataSchema = z.strictObject({
+  runId: nonemptyStringSchema,
+  revisionId: nonemptyStringSchema,
+  state: z.enum(["succeeded", "failed", "rejected", "cancelled"]),
+  summary: z.string().optional(),
+  resultArtifactId: nonemptyStringSchema.optional(),
+  ts: finiteNumberSchema,
+});
+export type EvtWorkflowResultReadyData = z.output<typeof evtWorkflowResultReadyDataSchema>;
 
-export type CmdAgentCreateData = {
-  agentId: string;
-  context: unknown;
-};
+export const cmdAgentCreateDataSchema = z
+  .strictObject({
+    agentId: nonemptyStringSchema,
+    context: z.unknown(),
+  })
+  .superRefine((data, context) => {
+    if (!Object.hasOwn(data, "context")) {
+      context.addIssue({ code: "custom", path: ["context"], message: "Required" });
+    }
+  });
+export type CmdAgentCreateData = z.output<typeof cmdAgentCreateDataSchema>;
 
-export type EvtAgentOutputDeltaReasoningData = {
-  delta: string;
-  seq?: number;
-};
+export const evtAgentOutputDeltaReasoningDataSchema = z.strictObject({
+  delta: z.string(),
+  seq: finiteNumberSchema.optional(),
+});
+export type EvtAgentOutputDeltaReasoningData = z.output<
+  typeof evtAgentOutputDeltaReasoningDataSchema
+>;
 
-export type EvtAgentOutputDeltaTextData = {
-  delta: string;
+const agentOutputPhaseSchema = z.enum(["commentary", "final_answer"]);
+export const evtAgentOutputDeltaTextDataSchema = z.strictObject({
+  delta: z.string(),
   /** Native OpenAI Responses message phase when available. */
-  phase?: "commentary" | "final_answer";
+  phase: agentOutputPhaseSchema.optional(),
   /** Synthetic leading separator inserted between assistant text parts. */
-  phaseBoundaryPrefixChars?: number;
-  seq?: number;
-};
+  phaseBoundaryPrefixChars: finiteNumberSchema.optional(),
+  seq: finiteNumberSchema.optional(),
+});
+export type EvtAgentOutputDeltaTextData = z.output<typeof evtAgentOutputDeltaTextDataSchema>;
 
-export type EvtAgentOutputTextResetData = {
+export const evtAgentOutputTextResetDataSchema = z.strictObject({
   /** Full retained response text after rolling back transient streamed output. */
-  text: string;
+  text: z.string(),
   /** Phase of the last retained OpenAI text item, when known. */
-  phase?: "commentary" | "final_answer";
-};
+  phase: agentOutputPhaseSchema.optional(),
+});
+export type EvtAgentOutputTextResetData = z.output<typeof evtAgentOutputTextResetDataSchema>;
 
-export type EvtAgentOutputResponseTextData = {
+export const evtAgentOutputResponseTextDataSchema = z.strictObject({
   /** The full response text accumulated across all deltas. */
-  finalText: string;
+  finalText: z.string(),
   /** Delivery directive for surfaces. Defaults to "reply" when omitted. */
-  delivery?: "reply" | "skip";
+  delivery: z.enum(["reply", "skip"]).optional(),
   /** Optional one-line token/model stats for surface rendering. */
-  statsForNerdsLine?: string;
+  statsForNerdsLine: z.string().optional(),
   /** Structured aggregate usage for durable workflow consumers. */
-  usage?: {
-    inputTokens: number;
-    outputTokens: number;
-    totalTokens: number;
-  };
-};
+  usage: z
+    .strictObject({
+      inputTokens: finiteNumberSchema,
+      outputTokens: finiteNumberSchema,
+      totalTokens: finiteNumberSchema,
+    })
+    .optional(),
+});
+export type EvtAgentOutputResponseTextData = z.output<typeof evtAgentOutputResponseTextDataSchema>;
 
-export type EvtAgentOutputResponseBinaryData = {
-  mimeType: string;
-  dataBase64: string;
-  filename?: string;
-};
+export const evtAgentOutputResponseBinaryDataSchema = z.strictObject({
+  mimeType: nonemptyStringSchema,
+  dataBase64: z.string(),
+  filename: z.string().optional(),
+});
+export type EvtAgentOutputResponseBinaryData = z.output<
+  typeof evtAgentOutputResponseBinaryDataSchema
+>;
 
-export type ToolCallStatus = "start" | "update" | "end";
+export const toolCallStatusSchema = z.enum(["start", "update", "end"]);
+export type ToolCallStatus = z.output<typeof toolCallStatusSchema>;
 
-export type EvtAgentOutputToolCallData = {
+export const evtAgentOutputToolCallDataSchema = z.strictObject({
   /** Correlates tool events within a request. */
-  toolCallId: string;
+  toolCallId: nonemptyStringSchema,
   /** Start/update/end boundaries for a tool call. */
-  status: ToolCallStatus;
+  status: toolCallStatusSchema,
   /** Preformatted label for UI (e.g. `[bash] ls -al`). */
-  display: string;
+  display: z.string(),
   /** Present when `status === "end"`. */
-  ok?: boolean;
+  ok: z.boolean().optional(),
   /** Present when `status === "end" && ok === false`. */
-  error?: string;
-};
+  error: z.string().optional(),
+});
+export type EvtAgentOutputToolCallData = z.output<typeof evtAgentOutputToolCallDataSchema>;
 
-export type EvtAgentOutputActivityData = {
-  source: "model" | "tool" | "subagent";
-};
+export const evtAgentOutputActivityDataSchema = z.strictObject({
+  source: z.enum(["model", "tool", "subagent"]),
+});
+export type EvtAgentOutputActivityData = z.output<typeof evtAgentOutputActivityDataSchema>;
 
 /**
  * Type-level map: event type -> topic + payload.

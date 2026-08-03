@@ -2,13 +2,14 @@ import { describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { Result } from "better-result";
 import {
   createLilacBus,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
+  type RawDeliveryHandler,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 
@@ -29,15 +30,14 @@ class CapturingRawBus implements RawBus {
     this.messages.push(message);
     return { id: `${this.messages.length}-0`, cursor: `${this.messages.length}-0` };
   }
-  async subscribe<TData>(
-    _topic: string,
-    _options: SubscriptionOptions,
-    _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
-  ) {
-    return { stop: async () => {} };
+  async subscribe(_topic: string, _options: SubscriptionOptions, _handler: RawDeliveryHandler) {
+    return Result.ok({
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => Result.ok(undefined),
+    });
   }
-  async fetch<TData>(_topic: string, _options: FetchOptions) {
-    return { messages: [] as Array<{ msg: Message<TData>; cursor: string }> };
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
   }
   async close() {}
 }

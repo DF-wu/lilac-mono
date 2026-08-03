@@ -1,6 +1,19 @@
-import { lilacEventTypes, outReqTopic, type LilacBus } from "@stanley2058/lilac-event-bus";
-import { createLogger } from "@stanley2058/lilac-utils";
-import { env } from "@stanley2058/lilac-utils";
+import {
+  lilacEventTypes,
+  outReqTopic,
+  type Cursor,
+  type DecodedLilacMessageForTopic,
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
+  type EventFetchContractInvalid,
+  type EventFetchTransportFailed,
+  type LilacBus,
+  type OutReqTopic,
+} from "@stanley2058/lilac-event-bus";
+import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { type ChildToolState, renderSubagentDisplay } from "../tools/subagent";
@@ -35,7 +48,106 @@ type ParentSignal = {
 };
 
 type LiveParentTarget = Extract<WorkflowRun["completionTarget"], { kind: "live_parent" }>;
-type ChildOutputMessage = Awaited<ReturnType<LilacBus["fetchTopic"]>>["messages"][number]["msg"];
+type ChildOutputMessage = DecodedLilacMessageForTopic<OutReqTopic>;
+
+type ResultSubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
+type ChildOutputBatch = {
+  messages: Array<{ msg: ChildOutputMessage; cursor: Cursor }>;
+  next?: Cursor;
+};
+
+export class WorkflowLiveParentRunEventFailed extends TaggedError(
+  "WorkflowLiveParentRunEventFailed",
+)<{
+  readonly cause: unknown;
+  readonly runId: string;
+  readonly message: string;
+}> {}
+
+export class WorkflowLiveParentChildActivityFailed extends TaggedError(
+  "WorkflowLiveParentChildActivityFailed",
+)<{
+  readonly cause: unknown;
+  readonly runId: string;
+  readonly childRequestId: string;
+  readonly message: string;
+}> {}
+
+export type WorkflowLiveParentDeliveryError =
+  | WorkflowLiveParentRunEventFailed
+  | WorkflowLiveParentChildActivityFailed;
+
+export function applyWorkflowLiveParentDeliveryPolicy(
+  error: WorkflowLiveParentDeliveryError,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "WorkflowLiveParentRunEventFailed":
+    case "WorkflowLiveParentChildActivityFailed":
+      return "park-pending";
+  }
+}
+
+async function captureRunEvent(
+  runId: string,
+  handle: () => Promise<void>,
+): Promise<ResultType<void, WorkflowLiveParentRunEventFailed>> {
+  try {
+    await handle();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new WorkflowLiveParentRunEventFailed({
+        cause,
+        runId,
+        message: "Live-parent workflow event handling failed",
+      }),
+    );
+  }
+}
+
+async function captureChildActivity(
+  runId: string,
+  childRequestId: string,
+  handle: () => Promise<void>,
+): Promise<ResultType<void, WorkflowLiveParentChildActivityFailed>> {
+  try {
+    await handle();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new WorkflowLiveParentChildActivityFailed({
+        cause,
+        runId,
+        childRequestId,
+        message: "Live-parent child activity handling failed",
+      }),
+    );
+  }
+}
+
+function requireSubscriptionStart(
+  started: ResultType<ResultSubscription, EventDeliveryStartFailed>,
+): ResultSubscription {
+  if (started.status === "error") throw started.error;
+  return started.value;
+}
+
+function requireSubscriptionStop(stopped: ResultType<void, EventDeliveryStopFailed>): void {
+  if (stopped.status === "error") throw stopped.error;
+}
+
+function requireChildOutputBatch(
+  fetched: ResultType<ChildOutputBatch, EventFetchContractInvalid | EventFetchTransportFailed>,
+): ChildOutputBatch {
+  if (fetched.status === "error") throw fetched.error;
+  return fetched.value;
+}
 
 type ChildActivityForwarding = {
   runId: string;
@@ -43,7 +155,7 @@ type ChildActivityForwarding = {
   children: Map<string, ChildToolState>;
   updateSeq: number;
   acceptingLive: boolean;
-  subscriptions: Map<string, { stop(): Promise<void> }>;
+  subscriptions: Map<string, ResultSubscription>;
   subscriptionStarts: Map<string, Promise<void>>;
   publicationTail: Promise<void>;
   publishToolStatus: ParentSignal["publishToolStatus"];
@@ -136,7 +248,7 @@ export class WorkflowLiveParentBridge {
   private readonly parents = new Map<string, ParentSignal>();
   private readonly protectedParents = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly childActivitySubscriptions = new Map<string, ChildActivityForwarding>();
-  private subscription: { stop(): Promise<void> } | null = null;
+  private subscription: ResultSubscription | null = null;
   private orphanHandlingEnabled = false;
 
   constructor(
@@ -151,7 +263,7 @@ export class WorkflowLiveParentBridge {
   ) {}
 
   async start(): Promise<void> {
-    this.subscription = await this.input.bus.subscribeTopic(
+    const started = await this.input.bus.subscribeTopic(
       "evt.workflow",
       {
         mode: "fanout",
@@ -160,21 +272,28 @@ export class WorkflowLiveParentBridge {
         offset: { type: "now" },
         batch: { maxWaitMs: 250 },
       },
-      async (message, context) => {
+      async (message) => {
         if (
           message.type === lilacEventTypes.EvtWorkflowResultReady ||
           message.type === lilacEventTypes.EvtWorkflowOperationChanged ||
           message.type === lilacEventTypes.EvtWorkflowRunChanged
         ) {
-          await this.handleRunEvent(message.data.runId);
+          return await captureRunEvent(message.data.runId, async () => {
+            await this.handleRunEvent(message.data.runId);
+          });
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      applyWorkflowLiveParentDeliveryPolicy,
     );
+    this.subscription = requireSubscriptionStart(started);
+    this.observeSubscriptionDone(this.subscription, { scope: "workflow" });
   }
 
   async stop(): Promise<void> {
-    await this.subscription?.stop();
+    if (this.subscription) {
+      requireSubscriptionStop(await this.subscription.stop());
+    }
     this.subscription = null;
     for (const signal of this.parents.values()) this.notify(signal);
     this.parents.clear();
@@ -492,18 +611,22 @@ export class WorkflowLiveParentBridge {
     if (existingStart) return await existingStart;
 
     const start = (async () => {
-      const subscription = await this.input.bus.subscribeTopic(
+      const started = await this.input.bus.subscribeTopic(
         outReqTopic(childRequestId),
         { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
-        async (message, context) => {
-          try {
+        async (message) =>
+          await captureChildActivity(forwarding.runId, childRequestId, async () => {
             await this.handleChildActivity(forwarding, target, signal, childRequestId, message);
-          } finally {
-            await context.commit();
-          }
-        },
+          }),
+        applyWorkflowLiveParentDeliveryPolicy,
       );
+      const subscription = requireSubscriptionStart(started);
       forwarding.subscriptions.set(childRequestId, subscription);
+      this.observeSubscriptionDone(subscription, {
+        scope: "child",
+        runId: forwarding.runId,
+        childRequestId,
+      });
     })();
     forwarding.subscriptionStarts.set(childRequestId, start);
     try {
@@ -678,6 +801,7 @@ export class WorkflowLiveParentBridge {
       });
     });
     forwarding.publicationTail = publish.catch((error: unknown) => {
+      if (Panic.is(error)) throw error;
       this.logger.warn(
         "live-parent subagent progress publish failed",
         { runId: forwarding.runId },
@@ -750,10 +874,12 @@ export class WorkflowLiveParentBridge {
         let cursor: string | undefined;
         let reachedWatermark = false;
         while (!reachedWatermark) {
-          const batch = await this.input.bus.fetchTopic(topic, {
-            offset: cursor ? { type: "cursor", cursor } : { type: "begin" },
-            limit: 1_000,
-          });
+          const batch = requireChildOutputBatch(
+            await this.input.bus.fetchTopic(topic, {
+              offset: cursor ? { type: "cursor", cursor } : { type: "begin" },
+              limit: 1_000,
+            }),
+          );
           for (const entry of batch.messages) {
             if (
               entry.msg.headers?.request_id === childRequestId &&
@@ -791,18 +917,16 @@ export class WorkflowLiveParentBridge {
     if (forwarding.stopPromise) return await forwarding.stopPromise;
     forwarding.acceptingLive = false;
     forwarding.stopPromise = (async () => {
-      await Promise.all(
-        [...forwarding.subscriptionStarts.values()].map(async (start) => start.catch(() => {})),
-      );
+      await Promise.all(forwarding.subscriptionStarts.values());
       await Promise.all(
         [...forwarding.subscriptions.values()].map(async (subscription) => {
-          await subscription.stop().catch((error: unknown) => {
-            this.logger.warn(
-              "live-parent child activity subscription stop failed",
-              { runId: forwarding.runId },
-              error,
-            );
-          });
+          const stopped = await subscription.stop();
+          if (stopped.status === "error") {
+            this.logger.warn("live-parent child activity subscription stop failed", {
+              runId: forwarding.runId,
+              ...formatTaggedErrorForLog(stopped.error),
+            });
+          }
         }),
       );
       await forwarding.publicationTail;
@@ -815,6 +939,25 @@ export class WorkflowLiveParentBridge {
     if (!forwarding) return;
     this.childActivitySubscriptions.delete(runId);
     await this.stopChildActivity(forwarding);
+  }
+
+  private observeSubscriptionDone(
+    subscription: ResultSubscription,
+    context:
+      | { readonly scope: "workflow" }
+      | { readonly scope: "child"; readonly runId: string; readonly childRequestId: string },
+  ): void {
+    void subscription.done.then((done) => {
+      if (done.status === "ok") return;
+      switch (done.error._tag) {
+        case "EventDeliveryTransportFailed":
+        case "EventDeliveryStopped":
+          this.logger.warn("live-parent event subscription ended", {
+            ...context,
+            ...formatTaggedErrorForLog(done.error),
+          });
+      }
+    });
   }
 
   private async stopChildActivityForParent(parentRequestId: string): Promise<void> {

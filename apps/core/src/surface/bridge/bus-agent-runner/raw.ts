@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { MODEL_REASONING_EFFORTS, type ModelReasoningEffort } from "@stanley2058/lilac-utils";
+import {
+  isRecord,
+  MODEL_REASONING_EFFORTS,
+  type ModelReasoningEffort,
+} from "@stanley2058/lilac-utils";
 
 const SUBAGENT_PROFILES = ["explore", "general", "self"] as const;
 const SESSION_MODES = ["mention", "active"] as const;
@@ -65,14 +69,12 @@ const routerRawSchema = z
   })
   .passthrough();
 
-const requestControlRawSchema = z
-  .object({
-    requiresActive: booleanTrueSchema,
-    cancel: booleanTrueSchema,
-    cancelQueued: booleanTrueSchema,
-    messageId: optionalStringSchema,
-  })
-  .passthrough();
+const requestControlRawSchema = z.strictObject({
+  requiresActive: booleanTrueSchema,
+  cancel: booleanTrueSchema,
+  cancelQueued: booleanTrueSchema,
+  messageId: optionalStringSchema,
+});
 
 const subagentRawSchema = z
   .object({
@@ -149,7 +151,25 @@ export type RequestControl = {
 };
 
 export function parseRequestControlFromRaw(raw: unknown): RequestControl {
-  const parsed = requestControlRawSchema.safeParse(raw);
+  if (!isRecord(raw)) {
+    return {
+      requiresActive: false,
+      cancel: false,
+      cancelQueued: false,
+      targetMessageId: null,
+    };
+  }
+
+  const ownDataProperty = (key: "requiresActive" | "cancel" | "cancelQueued" | "messageId") => {
+    const descriptor = Object.getOwnPropertyDescriptor(raw, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  };
+  const parsed = requestControlRawSchema.safeParse({
+    requiresActive: ownDataProperty("requiresActive"),
+    cancel: ownDataProperty("cancel"),
+    cancelQueued: ownDataProperty("cancelQueued"),
+    messageId: ownDataProperty("messageId"),
+  });
   if (!parsed.success) {
     return {
       requiresActive: false,

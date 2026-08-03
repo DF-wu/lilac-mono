@@ -1,25 +1,44 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
   createLilacBus,
+  EventDeliveryStartFailed,
+  EventDeliveryStopped,
+  EventDeliveryStopFailed,
   lilacEventTypes,
   type CmdRequestMessageData,
-  type HandleContext,
+  type EventDeliveryDoneError,
   type Message,
   type PublishOptions,
+  type RawDeliveryAction,
+  type RawDeliveryHandler,
   type RawBus,
-  type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 
-import { startHeartbeatService } from "../../src/heartbeat/heartbeat-service";
+import {
+  applyHeartbeatLifecycleDeliveryPolicy,
+  HeartbeatLifecycleRequestIdMissing,
+  HeartbeatLifecycleSessionIdMissing,
+  startHeartbeatService,
+} from "../../src/heartbeat/heartbeat-service";
 import { getHeartbeatQuietState } from "../../src/heartbeat/common";
+import { startResultForTest, stopResultForTest } from "../helpers/result-raw-bus";
 
-function createInMemoryRawBus(): RawBus {
+function createInMemoryRawBus(options?: {
+  onDeliveryAction?: (message: Message<unknown>, action: RawDeliveryAction) => void;
+  startPanic?: Panic;
+  startFailure?: EventDeliveryStartFailed;
+  stopFailure?: EventDeliveryStopFailed;
+  doneFailure?: EventDeliveryDoneError;
+  stopPanic?: Panic;
+}): RawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
-  const subs = new Set<{
+  const deliverySubs = new Set<{
     topic: string;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+    mode: "work" | "fanout" | "tail";
+    handler: RawDeliveryHandler;
   }>();
 
   return {
@@ -32,40 +51,56 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
       list.push(stored);
       topics.set(opts.topic, list);
 
-      for (const sub of subs) {
+      for (const sub of deliverySubs) {
         if (sub.topic !== opts.topic) continue;
-        await sub.handler(stored, { cursor: id, commit: async () => {} });
+        const action = await sub.handler(stored, {
+          cursor: id,
+          mode: sub.mode,
+          evidence: {
+            source: {
+              transport: "redis-streams",
+              streamKey: opts.topic,
+              topic: opts.topic,
+              messageId: id,
+            },
+            wire: { kind: "bounded-complete", fields: [] },
+          },
+        });
+        options?.onDeliveryAction?.(stored, action);
       }
 
       return { id, cursor: id };
     },
-    subscribe: async <TData>(
-      topic: string,
-      _opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
-    ) => {
-      const entry = {
-        topic,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
-      subs.add(entry);
-      return {
+    subscribe: async (topic, subscriptionOptions, handler) => {
+      if (options?.startPanic) throw options.startPanic;
+      if (options?.startFailure) return Result.err(options.startFailure);
+
+      const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+      if (options?.doneFailure) done.resolve(Result.err(options.doneFailure));
+      const entry = { topic, mode: subscriptionOptions.mode, handler };
+      deliverySubs.add(entry);
+      return Result.ok({
+        done: done.promise,
         stop: async () => {
-          subs.delete(entry);
+          deliverySubs.delete(entry);
+          if (!options?.doneFailure) done.resolve(Result.ok(undefined));
+          if (options?.stopPanic) throw options.stopPanic;
+          if (options?.stopFailure) return Result.err(options.stopFailure);
+          return Result.ok(undefined);
         },
-      };
+      });
     },
-    fetch: async <TData>(topic: string) => {
+    fetch: async (topic: string) => {
       const existing = topics.get(topic) ?? [];
       return {
-        messages: existing.map((msg) => ({ msg: msg as Message<TData>, cursor: msg.id })),
+        messages: existing.map((msg) => ({ msg, cursor: msg.id })),
         next: existing.at(-1)?.id,
       };
     },
@@ -151,6 +186,178 @@ describe("heartbeat service", () => {
     expect(quietState.label).toBe("outside");
   });
 
+  it("parks every owned lifecycle identifier error", () => {
+    expect(
+      applyHeartbeatLifecycleDeliveryPolicy(
+        new HeartbeatLifecycleRequestIdMissing({ message: "request ID missing" }),
+      ),
+    ).toBe("park-pending");
+    expect(
+      applyHeartbeatLifecycleDeliveryPolicy(
+        new HeartbeatLifecycleSessionIdMissing({ message: "session ID missing" }),
+      ),
+    ).toBe("park-pending");
+  });
+
+  it("commits unrelated and valid events while parking a lifecycle event without a session ID", async () => {
+    const actions: RawDeliveryAction[] = [];
+    const bus = createLilacBus(
+      createInMemoryRawBus({
+        onDeliveryAction: (_message, action) => actions.push(action),
+      }),
+    );
+    const service = await startHeartbeatService({
+      bus,
+      subscriptionId: "hb-delivery-policy",
+      config: createHeartbeatConfig(),
+      now: () => Date.UTC(2026, 2, 11, 10, 0, 0),
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: { request_id: "unrelated-request" },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running" },
+      { headers: { request_id: "valid-request", session_id: "discord-session" } },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running" },
+      { headers: { request_id: "missing-session" } },
+    );
+
+    expect(actions.map((action) => action.disposition)).toEqual([
+      "commit",
+      "commit",
+      "park-pending",
+    ]);
+
+    await service.stop();
+  });
+
+  it("adapts a typed lifecycle subscription start failure", async () => {
+    const failure = new EventDeliveryStartFailed({
+      cause: undefined,
+      topic: "evt.request",
+      message: "start unavailable",
+    });
+    const bus = createLilacBus(createInMemoryRawBus({ startFailure: failure }));
+
+    await expect(
+      startHeartbeatService({
+        bus,
+        subscriptionId: "hb-start-failure",
+        config: createHeartbeatConfig(),
+      }),
+    ).rejects.toThrow("Heartbeat lifecycle subscription start failed: start unavailable");
+  });
+
+  it("adapts typed lifecycle subscription stop and done failures", async () => {
+    const stopFailure = new EventDeliveryStopFailed({
+      cause: undefined,
+      topic: "evt.request",
+      message: "cleanup unavailable",
+    });
+    const stopService = await startHeartbeatService({
+      bus: createLilacBus(createInMemoryRawBus({ stopFailure })),
+      subscriptionId: "hb-stop-failure",
+      config: createHeartbeatConfig(),
+    });
+    await expect(stopService.stop()).rejects.toThrow(
+      "Heartbeat lifecycle subscription stop failed: cleanup unavailable",
+    );
+
+    const doneFailure = new EventDeliveryStopped({
+      reason: "requested",
+      topic: "evt.request",
+      cursor: "1-0",
+      message: "delivery stopped",
+    });
+    const doneService = await startHeartbeatService({
+      bus: createLilacBus(createInMemoryRawBus({ doneFailure })),
+      subscriptionId: "hb-done-failure",
+      config: createHeartbeatConfig(),
+    });
+    await expect(doneService.stop()).rejects.toThrow(
+      "Heartbeat lifecycle subscription done failed: delivery stopped",
+    );
+  });
+
+  it("preserves lifecycle cleanup precedence and Panic identity", async () => {
+    const startPanic = new Panic({ message: "heartbeat startup invariant failed" });
+    await expect(
+      startHeartbeatService({
+        bus: createLilacBus(createInMemoryRawBus({ startPanic })),
+        subscriptionId: "hb-start-panic",
+        config: createHeartbeatConfig(),
+      }),
+    ).rejects.toBe(startPanic);
+
+    const stopFailure = new EventDeliveryStopFailed({
+      cause: undefined,
+      topic: "evt.request",
+      message: "stop wins",
+    });
+    const doneFailure = new EventDeliveryStopped({
+      reason: "requested",
+      topic: "evt.request",
+      cursor: "1-0",
+      message: "done loses",
+    });
+    const precedenceService = await startHeartbeatService({
+      bus: createLilacBus(createInMemoryRawBus({ stopFailure, doneFailure })),
+      subscriptionId: "hb-cleanup-precedence",
+      config: createHeartbeatConfig(),
+    });
+    await expect(precedenceService.stop()).rejects.toThrow(
+      "Heartbeat lifecycle subscription stop failed: stop wins",
+    );
+
+    const panic = new Panic({ message: "heartbeat cleanup invariant failed" });
+    const panicService = await startHeartbeatService({
+      bus: createLilacBus(createInMemoryRawBus({ stopPanic: panic })),
+      subscriptionId: "hb-cleanup-panic",
+      config: createHeartbeatConfig(),
+    });
+    await expect(panicService.stop()).rejects.toBe(panic);
+  });
+
+  it("propagates Panic from lifecycle event handling", async () => {
+    const panic = new Panic({ message: "lifecycle invariant failed" });
+    const bus = createLilacBus(createInMemoryRawBus());
+    const service = await startHeartbeatService({
+      bus,
+      subscriptionId: "hb-handler-panic",
+      config: createHeartbeatConfig(),
+    });
+    const originalAdd = Set.prototype.add;
+    const addSpy = spyOn(Set.prototype, "add").mockImplementation(function <T>(
+      this: Set<T>,
+      value: T,
+    ): Set<T> {
+      if (value === "panic-request") throw panic;
+      return originalAdd.call(this, value);
+    });
+
+    try {
+      await expect(
+        bus.publish(
+          lilacEventTypes.EvtRequestLifecycleChanged,
+          { state: "running" },
+          { headers: { request_id: "panic-request", session_id: "discord-session" } },
+        ),
+      ).rejects.toBe(panic);
+    } finally {
+      addSpy.mockRestore();
+      await service.stop();
+    }
+  });
+
   it("schedules the next heartbeat wake from the cron expression", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const fakeTimers = createFakeTimers();
@@ -171,20 +378,23 @@ describe("heartbeat service", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requests: Array<Message<CmdRequestMessageData>> = [];
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const cfg = {
@@ -226,27 +436,30 @@ describe("heartbeat service", () => {
     );
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("includes configured default output session in the heartbeat prompt", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requests: Array<Message<CmdRequestMessageData>> = [];
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const cfg = {
@@ -276,27 +489,30 @@ describe("heartbeat service", () => {
     );
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("uses the canonical heartbeat session model override when configured", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requests: Array<Message<CmdRequestMessageData>> = [];
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const service = await startHeartbeatService({
@@ -318,27 +534,30 @@ describe("heartbeat service", () => {
     expect(requests[0]?.data.modelOverride).toBe("sonnet");
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("uses the heartbeat alias model override when canonical key is absent", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requests: Array<Message<CmdRequestMessageData>> = [];
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const service = await startHeartbeatService({
@@ -360,27 +579,30 @@ describe("heartbeat service", () => {
     expect(requests[0]?.data.modelOverride).toBe("haiku");
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("prefers the canonical heartbeat key over the alias", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requests: Array<Message<CmdRequestMessageData>> = [];
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const service = await startHeartbeatService({
@@ -405,7 +627,7 @@ describe("heartbeat service", () => {
     expect(requests[0]?.data.modelOverride).toBe("sonnet");
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("suppresses while busy and retries later", async () => {
@@ -414,20 +636,23 @@ describe("heartbeat service", () => {
     const fakeTimers = createFakeTimers();
     let nowMs = Date.UTC(2026, 2, 11, 10, 0, 0);
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const cfg = {
@@ -490,7 +715,7 @@ describe("heartbeat service", () => {
     );
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("treats restored active external requests as busy until lifecycle settles", async () => {
@@ -499,20 +724,23 @@ describe("heartbeat service", () => {
     const fakeTimers = createFakeTimers();
     let nowMs = Date.UTC(2026, 2, 11, 10, 0, 0);
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const cfg = {
@@ -563,7 +791,7 @@ describe("heartbeat service", () => {
     expect(requests[0]?.data.origin).toEqual({ kind: "heartbeat", reason: "retry" });
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 
   it("coalesces concurrent ticks into a single heartbeat request", async () => {
@@ -571,20 +799,23 @@ describe("heartbeat service", () => {
     const requests: Array<Message<CmdRequestMessageData>> = [];
     const fakeTimers = createFakeTimers();
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "hb-test-requests",
-        consumerId: "hb-test-requests",
-        offset: { type: "begin" },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push(msg);
-        }
-        await ctx.commit();
-      },
+    const sub = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "fanout",
+          subscriptionId: "hb-test-requests",
+          consumerId: "hb-test-requests",
+          offset: { type: "begin" },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            requests.push(msg);
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     const cfg = {
@@ -613,6 +844,6 @@ describe("heartbeat service", () => {
     expect(requests).toHaveLength(1);
 
     await service.stop();
-    await sub.stop();
+    await stopResultForTest(sub.stop());
   });
 });

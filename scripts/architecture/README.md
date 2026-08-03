@@ -36,3 +36,22 @@ performs its registered Zod subtype classification in `projectMiniLilacStreamChu
 `projectUIMessageChunk` remains the exact open AI SDK adapter with its local unsupported fallback.
 Malformed stream frames signal through the exact registered stream-host adapters, including the
 `ChatTransport` rejection contract in `MiniLilacTransport.responseStream`.
+
+Stage 3 zero-debt enforcement is declared by each workspace's `zeroBaselineScopes`. A scope owns either
+an exact module or one exact symbol; both the semantic and syntax ratchets reject baseline entries in
+that scope. Migrated workspaces still retain package-wide zero-debt enforcement.
+
+Stage 4 adds manifest infrastructure for exact event codec registries, raw receive boundaries, delivery
+APIs, delivery policies, and event-family migrations. Registrations use exact module/symbol identities
+and zero-based parameter indexes. Family declarations must partition every registered canonical event
+exactly once. A migrated family must have declared codec coverage and workspace-owned zero-baseline
+scopes.
+
+The event-bus codec, raw receive, handler Result, and delivery-policy foundations are enforced. Exact
+`eventDeliveryConsumers` cover every production `subscribeTopic` and `fetchTopic` owner;
+each consumer must own a matching symbol zero-baseline scope, and unregistered calls fail analysis.
+All six event families are `migrated`: the manifest partitions all 25 canonical events, links each
+family to exact cross-workspace delivery registrations and zero-baseline scopes, and requires complete
+codec coverage. Enforced raw and typed APIs reject generic receive contracts, handler-owned `commit`
+contexts, legacy API aliases, generic message specialization assertions, and unregistered production
+consumers.

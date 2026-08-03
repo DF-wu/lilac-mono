@@ -4,7 +4,9 @@ import { join } from "node:path";
 import {
   architectureManifest,
   type ArchitectureManifest,
-  STAGE_3_MODULES,
+  type ZeroBaselineScope,
+  zeroBaselineScopeOwns,
+  zeroBaselineScopesByWorkspace,
 } from "../architecture/manifest.ts";
 import { validateWorkspaceInventory } from "../architecture/workspace-inventory.ts";
 import {
@@ -77,7 +79,7 @@ export function evaluateSyntaxRatchet(
   findings: readonly SyntaxFinding[],
   baseline: SyntaxBaseline,
   migratedWorkspaces: ReadonlySet<string>,
-  zeroBaselineModules: ReadonlyMap<string, readonly string[]> = new Map(),
+  zeroBaselineScopes: ReadonlyMap<string, readonly ZeroBaselineScope[]> = new Map(),
 ): SyntaxRatchetEvaluation {
   const available = new Map<string, SyntaxBaselineEntry[]>();
   const diagnostics: SyntaxRatchetDiagnostic[] = [];
@@ -102,13 +104,17 @@ export function evaluateSyntaxRatchet(
       });
       continue;
     }
-    if (zeroBaselineModules.get(partitionWorkspace)?.includes(entry.module)) {
+    if (
+      zeroBaselineScopes
+        .get(partitionWorkspace)
+        ?.some((scope) => zeroBaselineScopeOwns(scope, entry.module, entry.symbol))
+    ) {
       diagnostics.push({
         severity: "error",
         rule,
         workspace: partitionWorkspace,
         entry,
-        message: "Migrated modules must keep active syntax-rule baselines at zero",
+        message: "Declared module and symbol scopes must keep active syntax-rule baselines at zero",
       });
       continue;
     }
@@ -259,13 +265,12 @@ async function main(): Promise<void> {
       .filter((workspace) => workspace.status === "migrated")
       .map((workspace) => workspace.root),
   );
-  const stage3SyntaxModules = new Map(
-    [...STAGE_3_MODULES].map(([workspace, modules]) => [
-      workspace,
-      modules.map((module) => module.replace(/\.(?:[cm]?[jt]sx?)$/u, "")),
-    ]),
+  const evaluation = evaluateSyntaxRatchet(
+    findings,
+    syntaxBaseline,
+    migrated,
+    zeroBaselineScopesByWorkspace(manifest),
   );
-  const evaluation = evaluateSyntaxRatchet(findings, syntaxBaseline, migrated, stage3SyntaxModules);
   for (const diagnostic of evaluation.diagnostics) {
     const output = diagnostic.severity === "error" ? console.error : console.warn;
     output(formatDiagnostic(diagnostic));

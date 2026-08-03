@@ -1,14 +1,48 @@
+import {
+  Err,
+  Ok,
+  Panic,
+  Result,
+  TaggedError,
+  type AnyTaggedError,
+  type Result as ResultType,
+} from "better-result";
+import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
+
 import type { RawBus } from "./raw-bus";
-import type { BusSubscription, Cursor, FetchOptions, Message, SubscriptionOptions } from "./types";
+import type { Cursor, FetchOptions, RedisMessageDecodeFailure, SubscriptionOptions } from "./types";
+import {
+  createContractInvalidDeadLetterRecord,
+  createHandlerErrorDeadLetterRecord,
+  redisDecodeIssuesForDeadLetter,
+  type EventDeadLetter,
+} from "./event-dead-letter";
+import {
+  applyEventDeliveryPolicy,
+  EventContractInvalid,
+  type EventDeliveryDoneError,
+  EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
+  EventFetchContractInvalid,
+  EventFetchTransportFailed,
+  type DeliveryDisposition,
+  type EventDeliveryContext,
+  type EventDeliveryFatalReporter,
+  type EventDeliveryLogger,
+  type RawDeliveryAction,
+} from "./event-delivery";
+import {
+  decodeLilacMessageForTopic,
+  lilacEventCodecRegistry,
+  type DecodedLilacMessage,
+  type LilacEventDecodeError,
+} from "./lilac-codecs";
 import {
   lilacEventTypes,
-  outReqTopic,
   type AdapterPlatform,
   type LilacDataForType,
-  type LilacEventSpec,
   type LilacEventType,
   type LilacEventTypesForTopic,
-  type LilacKeyForType,
   type LilacTopic,
   type LilacTopicForType,
 } from "./lilac-spec";
@@ -26,78 +60,22 @@ export type LilacEnvelopeHeaders = {
   request_client?: AdapterPlatform;
 };
 
-/**
- * Strongly-typed event message envelope.
- *
- * `type` controls the `data` payload shape.
- */
-export type LilacMessage<TType extends LilacEventType> = TType extends LilacEventType
-  ? Omit<Message<LilacDataForType<TType>>, "headers"> & {
-      type: TType;
-      topic: LilacTopicForType<TType>;
-      key?: LilacKeyForType<TType>;
-      headers?: Record<string, string> & Partial<LilacEnvelopeHeaders>;
-    }
-  : never;
-
 /** Discriminated union of all events that may appear on `TTopic`. */
-export type LilacMessageForTopic<TTopic extends LilacTopic> = LilacMessage<
+export type LilacMessageForTopic<TTopic extends LilacTopic> = DecodedLilacMessage<
   LilacEventTypesForTopic<TTopic>
 >;
 
-type OutputEventType =
-  | typeof lilacEventTypes.EvtAgentOutputDeltaReasoning
-  | typeof lilacEventTypes.EvtAgentOutputDeltaText
-  | typeof lilacEventTypes.EvtAgentOutputTextReset
-  | typeof lilacEventTypes.EvtAgentOutputResponseText
-  | typeof lilacEventTypes.EvtAgentOutputResponseBinary
-  | typeof lilacEventTypes.EvtAgentOutputToolCall
-  | typeof lilacEventTypes.EvtAgentOutputActivity;
+export type DecodedLilacMessageForTopic<TTopic extends LilacTopic> = DecodedLilacMessage<
+  LilacEventTypesForTopic<TTopic>
+>;
 
-function isOutputEventType(type: LilacEventType): type is OutputEventType {
-  return (
-    type === lilacEventTypes.EvtAgentOutputDeltaReasoning ||
-    type === lilacEventTypes.EvtAgentOutputDeltaText ||
-    type === lilacEventTypes.EvtAgentOutputTextReset ||
-    type === lilacEventTypes.EvtAgentOutputResponseText ||
-    type === lilacEventTypes.EvtAgentOutputResponseBinary ||
-    type === lilacEventTypes.EvtAgentOutputToolCall ||
-    type === lilacEventTypes.EvtAgentOutputActivity
-  );
-}
+export type CreateLilacBusOptions = {
+  readonly deadLetter?: EventDeadLetter;
+  readonly logger?: EventDeliveryLogger;
+  readonly reportFatal?: EventDeliveryFatalReporter;
+};
 
-function getStaticTopicForType<TType extends Exclude<LilacEventType, OutputEventType>>(
-  type: TType,
-): LilacTopicForType<TType> {
-  return (
-    {
-      [lilacEventTypes.CmdRequestMessage]: "cmd.request",
-
-      [lilacEventTypes.CmdSurfaceOutputReanchor]: "cmd.surface",
-
-      [lilacEventTypes.EvtAdapterMessageCreated]: "evt.adapter",
-      [lilacEventTypes.EvtAdapterMessageUpdated]: "evt.adapter",
-      [lilacEventTypes.EvtAdapterMessageDeleted]: "evt.adapter",
-      [lilacEventTypes.EvtAdapterReactionAdded]: "evt.adapter",
-      [lilacEventTypes.EvtAdapterReactionRemoved]: "evt.adapter",
-      [lilacEventTypes.EvtAdapterActionInvoked]: "evt.adapter",
-      [lilacEventTypes.EvtWorkflowWaitResolverBarrier]: "evt.adapter",
-
-      [lilacEventTypes.EvtRequestLifecycleChanged]: "evt.request",
-      [lilacEventTypes.EvtRequestReply]: "evt.request",
-
-      [lilacEventTypes.EvtSurfaceOutputMessageCreated]: "evt.surface",
-
-      [lilacEventTypes.EvtWorkflowRunChanged]: "evt.workflow",
-      [lilacEventTypes.EvtWorkflowOperationChanged]: "evt.workflow",
-      [lilacEventTypes.EvtWorkflowProgressRequested]: "evt.workflow",
-      [lilacEventTypes.EvtWorkflowUsageChanged]: "evt.workflow",
-      [lilacEventTypes.EvtWorkflowResultReady]: "evt.workflow",
-
-      [lilacEventTypes.CmdAgentCreate]: "cmd.agent",
-    } as const satisfies Record<string, string>
-  )[type] as LilacTopicForType<TType>;
-}
+const KNOWN_EVENT_TYPES = new Set<string>(Object.values(lilacEventTypes));
 
 function assertRequestId(headers: LilacEnvelopeHeaders | undefined, label: string): string {
   const requestId = headers?.request_id;
@@ -110,78 +88,141 @@ function assertRequestId(headers: LilacEnvelopeHeaders | undefined, label: strin
 function getTopicForType<TType extends LilacEventType>(
   type: TType,
   headers: LilacEnvelopeHeaders | undefined,
-): LilacEventSpec[TType]["topic"] {
-  switch (type) {
-    case lilacEventTypes.EvtAgentOutputDeltaReasoning:
-    case lilacEventTypes.EvtAgentOutputDeltaText:
-    case lilacEventTypes.EvtAgentOutputTextReset:
-    case lilacEventTypes.EvtAgentOutputResponseText:
-    case lilacEventTypes.EvtAgentOutputResponseBinary:
-    case lilacEventTypes.EvtAgentOutputToolCall:
-    case lilacEventTypes.EvtAgentOutputActivity: {
-      const requestId = assertRequestId(headers, `publish(${type})`);
-      return outReqTopic(requestId) as LilacEventSpec[TType]["topic"];
-    }
-
-    default:
-      return getStaticTopicForType(
-        type as unknown as Exclude<LilacEventType, OutputEventType>,
-      ) as LilacEventSpec[TType]["topic"];
-  }
+): LilacTopicForType<TType>;
+function getTopicForType(
+  type: LilacEventType,
+  headers: LilacEnvelopeHeaders | undefined,
+): LilacTopic {
+  const codec = lilacEventCodecRegistry[type];
+  const requestId = codec.requiresRequestId
+    ? assertRequestId(headers, `publish(${type})`)
+    : (headers?.request_id ?? "");
+  return codec.resolveTopic(requestId);
 }
 
 function getKeyForType<TType extends LilacEventType>(
   type: TType,
   headers: LilacEnvelopeHeaders | undefined,
-  data: LilacEventSpec[TType]["data"],
+  data: LilacDataForType<TType>,
+): string | undefined;
+function getKeyForType(
+  type: LilacEventType,
+  headers: LilacEnvelopeHeaders | undefined,
+  data: LilacDataForType<LilacEventType>,
 ): string | undefined {
-  switch (type) {
-    case lilacEventTypes.CmdRequestMessage:
-    case lilacEventTypes.CmdSurfaceOutputReanchor:
-    case lilacEventTypes.EvtRequestLifecycleChanged:
-    case lilacEventTypes.EvtRequestReply:
-    case lilacEventTypes.EvtSurfaceOutputMessageCreated:
-    case lilacEventTypes.EvtAgentOutputDeltaReasoning:
-    case lilacEventTypes.EvtAgentOutputDeltaText:
-    case lilacEventTypes.EvtAgentOutputTextReset:
-    case lilacEventTypes.EvtAgentOutputResponseText:
-    case lilacEventTypes.EvtAgentOutputResponseBinary:
-    case lilacEventTypes.EvtAgentOutputToolCall:
-    case lilacEventTypes.EvtAgentOutputActivity: {
+  switch (lilacEventCodecRegistry[type].keySource) {
+    case "request_id":
       return assertRequestId(headers, `publish(${type})`);
-    }
-
-    case lilacEventTypes.EvtAdapterMessageCreated:
-    case lilacEventTypes.EvtAdapterMessageUpdated:
-    case lilacEventTypes.EvtAdapterMessageDeleted:
-    case lilacEventTypes.EvtAdapterReactionAdded:
-    case lilacEventTypes.EvtAdapterReactionRemoved: {
-      return (data as { channelId: string; messageId: string }).messageId;
-    }
-
-    case lilacEventTypes.EvtAdapterActionInvoked: {
-      return (data as { actionId: string }).actionId;
-    }
-
-    case lilacEventTypes.EvtWorkflowWaitResolverBarrier: {
-      return (data as { barrierId: string }).barrierId;
-    }
-
-    case lilacEventTypes.EvtWorkflowRunChanged:
-    case lilacEventTypes.EvtWorkflowOperationChanged:
-    case lilacEventTypes.EvtWorkflowProgressRequested:
-    case lilacEventTypes.EvtWorkflowUsageChanged:
-    case lilacEventTypes.EvtWorkflowResultReady: {
-      return (data as { runId: string }).runId;
-    }
-
-    case lilacEventTypes.CmdAgentCreate: {
-      return (data as { agentId: string }).agentId;
-    }
-
-    default:
-      return undefined;
+    case "messageId":
+      return "messageId" in data && typeof data.messageId === "string" ? data.messageId : undefined;
+    case "actionId":
+      return "actionId" in data && typeof data.actionId === "string" ? data.actionId : undefined;
+    case "barrierId":
+      return "barrierId" in data && typeof data.barrierId === "string" ? data.barrierId : undefined;
+    case "runId":
+      return "runId" in data && typeof data.runId === "string" ? data.runId : undefined;
+    case "agentId":
+      return "agentId" in data && typeof data.agentId === "string" ? data.agentId : undefined;
   }
+}
+
+function normalizeTransportInvalid(failure: RedisMessageDecodeFailure): EventContractInvalid {
+  return new EventContractInvalid({
+    source: "transport",
+    stage: "transport",
+    issues: redisDecodeIssuesForDeadLetter(failure.error.issues),
+    message: "Invalid event transport envelope",
+  });
+}
+
+function normalizeContractInvalid(error: LilacEventDecodeError): EventContractInvalid {
+  return new EventContractInvalid({
+    source: "contract",
+    stage: error.stage,
+    eventType: error.eventType,
+    issues: error.issues,
+    message: "Invalid Lilac event contract",
+  });
+}
+
+function logContractInvalid(
+  logger: EventDeliveryLogger | undefined,
+  topic: LilacTopic,
+  cursor: Cursor,
+  error: EventContractInvalid,
+): void {
+  let eventType: string | undefined;
+  if (error.eventType !== undefined) {
+    eventType = KNOWN_EVENT_TYPES.has(error.eventType) ? error.eventType : "<unknown>";
+  }
+  logger?.warn("event_bus.contract_invalid", {
+    topic,
+    cursor,
+    source: error.source,
+    stage: error.stage,
+    eventType,
+  });
+}
+
+function checkedDisposition(value: DeliveryDisposition): DeliveryDisposition {
+  switch (value) {
+    case "commit":
+    case "park-pending":
+    case "dead-letter":
+    case "stop":
+      return value;
+    default: {
+      const unhandled: never = value;
+      throw new Panic({
+        message: `Event delivery policy returned an unknown disposition: ${String(unhandled)}`,
+      });
+    }
+  }
+}
+
+function checkedHandlerResult<TError extends AnyTaggedError>(
+  value: ResultType<void, TError>,
+): ResultType<void, TError> {
+  if (value instanceof Ok && Object.getPrototypeOf(value) === Ok.prototype) {
+    const status = Object.getOwnPropertyDescriptor(value, "status");
+    const payload = Object.getOwnPropertyDescriptor(value, "value");
+    if (
+      status === undefined ||
+      !("value" in status) ||
+      status.value !== "ok" ||
+      payload === undefined ||
+      !("value" in payload) ||
+      payload.value !== undefined
+    ) {
+      throw new Panic({ message: "Event handler returned an incomplete Ok<void> Result" });
+    }
+    return value;
+  }
+
+  if (value instanceof Err && Object.getPrototypeOf(value) === Err.prototype) {
+    const status = Object.getOwnPropertyDescriptor(value, "status");
+    const error = Object.getOwnPropertyDescriptor(value, "error");
+    if (
+      status === undefined ||
+      !("value" in status) ||
+      status.value !== "error" ||
+      error === undefined ||
+      !("value" in error) ||
+      Panic.is(error.value) ||
+      !TaggedError.is(error.value) ||
+      !Object.hasOwn(error.value, "_tag") ||
+      !Object.hasOwn(error.value, "name") ||
+      !Object.hasOwn(error.value, "message") ||
+      typeof error.value._tag !== "string" ||
+      typeof error.value.name !== "string" ||
+      typeof error.value.message !== "string"
+    ) {
+      throw new Panic({ message: "Event handler returned an incomplete Err Result" });
+    }
+    return value;
+  }
+
+  throw new Panic({ message: "Event handler returned a forged or malformed Result" });
 }
 
 /**
@@ -206,39 +247,37 @@ export interface LilacBus {
     },
   ): Promise<{ id: string; cursor: Cursor; topic: LilacTopicForType<TType> }>;
 
-  /** Subscribe to a topic and receive a discriminated union of events. */
-  subscribeTopic<TTopic extends LilacTopic>(
+  subscribeTopic<TTopic extends LilacTopic, TError extends AnyTaggedError>(
     topic: TTopic,
     opts: SubscriptionOptions,
     handler: (
-      msg: LilacMessageForTopic<TTopic>,
-      ctx: { cursor: Cursor; commit(): Promise<void> },
-    ) => Promise<void>,
-  ): Promise<BusSubscription>;
+      msg: DecodedLilacMessageForTopic<TTopic>,
+      ctx: EventDeliveryContext,
+    ) => Promise<ResultType<void, TError>>,
+    deliveryPolicy: (error: TError) => DeliveryDisposition,
+  ): Promise<
+    ResultType<
+      {
+        readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+        stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+      },
+      EventDeliveryStartFailed
+    >
+  >;
 
-  /**
-   * Subscribe to a single event type.
-   *
-   * For output-stream event types you must provide `opts.topic` (e.g. `outReqTopic(request_id)`).
-   */
-  subscribeType<TType extends LilacEventType>(
-    type: TType,
-    opts: SubscriptionOptions &
-      (TType extends OutputEventType ? { topic: LilacTopicForType<TType> } : { topic?: never }),
-    handler: (
-      msg: LilacMessage<TType>,
-      ctx: { cursor: Cursor; commit(): Promise<void> },
-    ) => Promise<void>,
-  ): Promise<BusSubscription>;
-
-  /** Fetch typed messages from a topic (manual pull API). */
+  /** Fetch and decode a complete batch without exposing invalid entries as typed messages. */
   fetchTopic<TTopic extends LilacTopic>(
     topic: TTopic,
     opts: FetchOptions,
-  ): Promise<{
-    messages: Array<{ msg: LilacMessageForTopic<TTopic>; cursor: Cursor }>;
-    next?: Cursor;
-  }>;
+  ): Promise<
+    ResultType<
+      {
+        messages: Array<{ msg: DecodedLilacMessageForTopic<TTopic>; cursor: Cursor }>;
+        next?: Cursor;
+      },
+      EventFetchContractInvalid | EventFetchTransportFailed
+    >
+  >;
 
   /** Return the latest durable cursor currently present on a topic. */
   getTopicWatermark(topic: LilacTopic): Promise<Cursor | null>;
@@ -262,7 +301,7 @@ export interface LilacBus {
 }
 
 /** Wrap a `RawBus` with the Lilac typed event spec. */
-export function createLilacBus(raw: RawBus): LilacBus {
+export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {}): LilacBus {
   const bus: LilacBus = {
     publish: async <TType extends LilacEventType>(
       type: TType,
@@ -297,53 +336,125 @@ export function createLilacBus(raw: RawBus): LilacBus {
       return { ...res, topic };
     },
 
-    subscribeTopic: async <TTopic extends LilacTopic>(
+    subscribeTopic: async <TTopic extends LilacTopic, TError extends AnyTaggedError>(
       topic: TTopic,
       opts: SubscriptionOptions,
       handler: (
-        msg: LilacMessageForTopic<TTopic>,
-        ctx: { cursor: Cursor; commit(): Promise<void> },
-      ) => Promise<void>,
+        msg: DecodedLilacMessageForTopic<TTopic>,
+        ctx: EventDeliveryContext,
+      ) => Promise<ResultType<void, TError>>,
+      deliveryPolicy: (error: TError) => DeliveryDisposition,
     ) => {
-      return await raw.subscribe(topic, opts, async (msg, ctx) => {
-        await handler(msg as unknown as LilacMessageForTopic<TTopic>, ctx);
-      });
-    },
-
-    subscribeType: async <TType extends LilacEventType>(
-      type: TType,
-      opts: SubscriptionOptions &
-        (TType extends OutputEventType ? { topic: LilacTopicForType<TType> } : { topic?: never }),
-      handler: (
-        msg: LilacMessage<TType>,
-        ctx: { cursor: Cursor; commit(): Promise<void> },
-      ) => Promise<void>,
-    ) => {
-      const topic = isOutputEventType(type)
-        ? (opts as unknown as { topic: LilacTopicForType<TType> }).topic
-        : getStaticTopicForType(type as unknown as Exclude<LilacEventType, OutputEventType>);
-
-      if (!topic) {
-        throw new Error(
-          `subscribeType(${type}) requires an explicit topic (e.g. outReqTopic(request_id))`,
+      if (typeof raw.subscribe !== "function") {
+        return Result.err(
+          new EventDeliveryStartFailed({
+            cause: undefined,
+            topic,
+            message: "The configured raw bus does not implement subscribe",
+          }),
         );
       }
+      return await raw.subscribe(
+        topic,
+        opts,
+        async (message, context): Promise<RawDeliveryAction> => {
+          let contractError: EventContractInvalid | undefined;
+          let eventType: string | undefined;
+          if ("_tag" in message) {
+            contractError = normalizeTransportInvalid(message);
+          } else {
+            eventType = message.type;
+            const decoded = decodeLilacMessageForTopic(message, topic);
+            if (decoded.status === "error") {
+              contractError = normalizeContractInvalid(decoded.error);
+            } else {
+              const handled = checkedHandlerResult(await handler(decoded.value, context));
+              if (handled.status === "ok") return { disposition: "commit" };
 
-      return await raw.subscribe(topic, opts, async (msg, ctx) => {
-        if (msg.type !== type) return;
-        await handler(msg as unknown as LilacMessage<TType>, ctx);
-      });
+              const disposition = checkedDisposition(deliveryPolicy(handled.error));
+              if (disposition !== "dead-letter") return { disposition };
+              const formatted = formatTaggedErrorForLog(handled.error);
+              return {
+                disposition,
+                record: createHandlerErrorDeadLetterRecord({
+                  topic,
+                  cursor: context.cursor,
+                  mode: context.mode,
+                  evidence: context.evidence,
+                  errorTag: formatted.errorTag,
+                  errorMessage: formatted.errorMessage,
+                }),
+              };
+            }
+          }
+
+          logContractInvalid(options.logger, topic, context.cursor, contractError);
+          const disposition = applyEventDeliveryPolicy(contractError);
+          if (disposition !== "dead-letter") return { disposition };
+          return {
+            disposition,
+            record: createContractInvalidDeadLetterRecord({
+              topic,
+              cursor: context.cursor,
+              mode: context.mode,
+              evidence: context.evidence,
+              stage: contractError.stage,
+              eventType: contractError.eventType ?? eventType,
+              issues: contractError.issues,
+            }),
+          };
+        },
+        {
+          deadLetter: options.deadLetter,
+          logger: options.logger,
+          reportFatal: options.reportFatal,
+        },
+      );
     },
 
     fetchTopic: async <TTopic extends LilacTopic>(topic: TTopic, opts: FetchOptions) => {
-      const res = await raw.fetch(topic, opts);
-      return {
-        messages: res.messages as unknown as Array<{
-          msg: LilacMessageForTopic<TTopic>;
-          cursor: Cursor;
-        }>,
-        next: res.next,
-      };
+      let fetched: Awaited<ReturnType<RawBus["fetch"]>>;
+      try {
+        fetched = await raw.fetch(topic, opts);
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventFetchTransportFailed({
+            cause,
+            topic,
+            message: "Event topic fetch failed",
+          }),
+        );
+      }
+
+      const messages: Array<{
+        msg: DecodedLilacMessageForTopic<TTopic>;
+        cursor: Cursor;
+      }> = [];
+      for (const entry of fetched.messages) {
+        let contractError: EventContractInvalid;
+        if ("_tag" in entry.msg) {
+          contractError = normalizeTransportInvalid(entry.msg);
+        } else {
+          const decoded = decodeLilacMessageForTopic(entry.msg, topic);
+          if (decoded.status === "ok") {
+            messages.push({ msg: decoded.value, cursor: entry.cursor });
+            continue;
+          }
+          contractError = normalizeContractInvalid(decoded.error);
+        }
+        logContractInvalid(options.logger, topic, entry.cursor, contractError);
+        return Result.err(
+          new EventFetchContractInvalid({
+            topic,
+            cursor: entry.cursor,
+            contractError,
+            evidence: entry.evidence,
+            message: "Fetched event failed its contract",
+          }),
+        );
+      }
+      return Result.ok({ messages, next: fetched.next });
     },
 
     getTopicWatermark: async (topic) => {

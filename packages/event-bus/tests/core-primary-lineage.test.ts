@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Panic } from "better-result";
 
 import {
   CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1,
@@ -6,6 +7,7 @@ import {
   computeCoreLineagePrefixDigestV1,
   coreLineageManifestV1Schema,
   createCorePrimaryLineageFreshOnlyV1,
+  decodeCorePrimaryLineageV1,
   extendCoreLineagePrefixDigestV1,
   parseCmdRequestMessageData,
   parseCorePrimaryLineageV1,
@@ -209,5 +211,56 @@ describe("Core primary lineage v1", () => {
       currentCanonicalStart: 0,
       reason: "malformed-manifest",
     });
+  });
+
+  it("projects lineage mismatch into Result and command-schema issues", () => {
+    const editedMessages = [{ role: "user" as const, content: "edited" }, ...MESSAGES.slice(1)];
+    const decoded = decodeCorePrimaryLineageV1(manifestFixture(), editedMessages);
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") {
+      expect(decoded.error.issues).toContainEqual({
+        path: [],
+        message: "Core primary lineage does not exactly align with canonical messages",
+      });
+    }
+    expect(() =>
+      parseCmdRequestMessageData({
+        queue: "prompt",
+        messages: editedMessages,
+        corePrimaryLineage: manifestFixture(),
+      }),
+    ).toThrow("does not exactly align");
+  });
+
+  it("maps ordinary decoder exceptions and preserves Panic at the exact boundary", () => {
+    const ordinaryFailure = Object.defineProperty({}, "state", {
+      get() {
+        throw new Error("ordinary getter failure");
+      },
+    });
+    const decoded = decodeCorePrimaryLineageV1(ordinaryFailure, MESSAGES);
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") {
+      expect(decoded.error.issues).toEqual([
+        { path: [], message: "Core primary lineage validation failed" },
+      ]);
+    }
+
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const revokedFailure = Object.defineProperty({}, "state", {
+      get() {
+        throw proxy;
+      },
+    });
+    expect(decodeCorePrimaryLineageV1(revokedFailure, MESSAGES).status).toBe("error");
+
+    const panic = new Panic({ message: "lineage invariant" });
+    const panicFailure = Object.defineProperty({}, "state", {
+      get() {
+        throw panic;
+      },
+    });
+    expect(() => decodeCorePrimaryLineageV1(panicFailure, MESSAGES)).toThrow(panic);
   });
 });

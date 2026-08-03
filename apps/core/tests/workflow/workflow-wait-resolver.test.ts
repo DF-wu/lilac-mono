@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -6,13 +6,19 @@ import {
   createLilacBus,
   lilacEventTypes,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
+import { Panic } from "better-result";
 
+import {
+  subscribeForTest,
+  testDeliveriesRemainOpenOnPolicyStop,
+  testDeliveryActions,
+  type TestRawMessageHandler,
+} from "../helpers/result-raw-bus";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { canonicalJsonSha256, sha256 } from "../../src/workflow/workflow-definition";
 import {
@@ -23,13 +29,14 @@ import { shouldSuppressRouterForWorkflowReply } from "../../src/workflow/workflo
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
 
 class IdleRawBus implements RawBus {
+  readonly subscribe = subscribeForTest;
   readonly retiredGroups: Array<{ topic: string; group: string; activated: boolean }> = [];
   private sequence = 0;
   private readonly watermarks = new Map<string, string>();
   private readonly history: Message<unknown>[];
   private readonly subscriptions: Array<{
     topic: string;
-    handler: (message: Message<unknown>, context: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }> = [];
 
   constructor(history: readonly Message<unknown>[] = []) {
@@ -39,25 +46,21 @@ class IdleRawBus implements RawBus {
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
     const id = `${++this.sequence}-0`;
     this.watermarks.set(message.topic, id);
-    const stored = { ...message, id, ts: Date.now() } as Message<unknown>;
+    const stored: Message<unknown> = { ...message, id, ts: Date.now() };
     this.history.push(stored);
     for (const subscription of this.subscriptions) {
       if (subscription.topic !== message.topic) continue;
-      await subscription.handler(stored, { cursor: id, commit: async () => {} });
+      await subscription.handler(stored, id);
     }
     return { id, cursor: id };
   }
 
-  async subscribe<TData>(
+  async openTestSubscription(
     topic: string,
     options: SubscriptionOptions,
-    handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    handler: TestRawMessageHandler,
   ) {
-    const subscription = {
-      topic,
-      handler: (message: Message<unknown>, context: HandleContext) =>
-        handler(message as Message<TData>, context),
-    };
+    const subscription = { topic, handler };
     this.subscriptions.push(subscription);
     if (options.offset?.type === "begin" || options.offset?.type === "cursor") {
       const topicHistory = this.history.filter((message) => message.topic === topic);
@@ -67,7 +70,7 @@ class IdleRawBus implements RawBus {
           ? topicHistory.findIndex((message) => message.id === requestedCursor) + 1
           : 0;
       for (const message of topicHistory.slice(Math.max(0, start))) {
-        await subscription.handler(message, { cursor: message.id, commit: async () => {} });
+        await subscription.handler(message, message.id);
       }
     }
     return {
@@ -78,11 +81,11 @@ class IdleRawBus implements RawBus {
     };
   }
 
-  async fetch<TData>(topic: string, _options: FetchOptions) {
+  async fetch(topic: string, _options: FetchOptions) {
     return {
       messages: this.history
         .filter((message) => message.topic === topic)
-        .map((message) => ({ msg: message as Message<TData>, cursor: message.id })),
+        .map((message) => ({ msg: message, cursor: message.id })),
     };
   }
   async watermark(topic: string) {
@@ -126,6 +129,50 @@ class FailingFirstWakeupRawBus extends IdleRawBus {
   }
 }
 
+class ConfigurablePublicationFailureRawBus extends IdleRawBus {
+  barrierFailure: Error | null = null;
+  wakeupFailure: Error | null = null;
+
+  override async publish<TData>(
+    message: Omit<Message<TData>, "id" | "ts">,
+    options: PublishOptions,
+  ) {
+    if (message.type === lilacEventTypes.EvtWorkflowWaitResolverBarrier && this.barrierFailure) {
+      throw this.barrierFailure;
+    }
+    if (message.type === lilacEventTypes.EvtWorkflowProgressRequested && this.wakeupFailure) {
+      throw this.wakeupFailure;
+    }
+    return await super.publish(message, options);
+  }
+}
+
+class RetirementFailingRawBus extends IdleRawBus {
+  subscriptionStops = 0;
+  retirementFailure: Error | null = null;
+  subscriptionStopFailure: Error | null = null;
+
+  override async openTestSubscription(
+    topic: string,
+    options: SubscriptionOptions,
+    handler: TestRawMessageHandler,
+  ) {
+    const subscription = await super.openTestSubscription(topic, options, handler);
+    return {
+      stop: async () => {
+        this.subscriptionStops += 1;
+        if (this.subscriptionStopFailure) throw this.subscriptionStopFailure;
+        await subscription.stop();
+      },
+    };
+  }
+
+  override async retireConsumerGroup(topic: string, group: string) {
+    if (this.retirementFailure) throw this.retirementFailure;
+    return await super.retireConsumerGroup(topic, group);
+  }
+}
+
 class HeartbeatTrackingWaitStore extends DurableWorkflowStore {
   readonly resolverLeaseRefreshes: number[] = [];
 
@@ -161,6 +208,15 @@ class LeaseTrackingWaitStore extends DurableWorkflowStore {
   }
 }
 
+class CheckpointRejectingWaitStore extends DurableWorkflowStore {
+  checkpointAttempts = 0;
+
+  override advanceWorkflowWaitResolverCheckpoint(): boolean {
+    this.checkpointAttempts += 1;
+    return false;
+  }
+}
+
 class CompletingRawBus extends IdleRawBus {
   subscriptionCount = 0;
   subscriptionAttempts = 0;
@@ -189,17 +245,17 @@ class CompletingRawBus extends IdleRawBus {
     else completion.reject(error);
   }
 
-  override async subscribe<TData>(
+  override async openTestSubscription(
     topic: string,
     options: SubscriptionOptions,
-    handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    handler: TestRawMessageHandler,
   ) {
     this.subscriptionAttempts += 1;
     if (this.failingSubscriptions > 0) {
       this.failingSubscriptions -= 1;
       throw new Error("simulated subscription startup failure");
     }
-    const subscription = await super.subscribe(topic, options, handler);
+    const subscription = await super.openTestSubscription(topic, options, handler);
     const completion = Promise.withResolvers<void>();
     this.completions.push(completion);
     this.subscriptionCount += 1;
@@ -495,6 +551,86 @@ describe("WorkflowWaitResolver", () => {
     }
   });
 
+  it("keeps the startup failure primary when subscription cleanup returns an error", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-startup-cleanup-${crypto.randomUUID()}.sqlite`);
+    const store = new LeaseTrackingWaitStore(dbPath);
+    const raw = new RetirementFailingRawBus();
+    raw.retirementFailure = new Error("retirement unavailable");
+    raw.subscriptionStopFailure = new Error("cleanup unavailable");
+    const bus = createLilacBus(raw);
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-startup-cleanup-precedence",
+    });
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(resolver.start()).rejects.toMatchObject({
+        _tag: "WorkflowWaitResolverConsumerGroupRetirementFailed",
+      });
+      expect(raw.subscriptionStops).toBe(1);
+      expect(store.resolverLeaseReleases).toBe(1);
+    } finally {
+      logged.mockRestore();
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("cleans up startup and preserves consumer-group retirement Panic identity", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-startup-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new LeaseTrackingWaitStore(dbPath);
+    const raw = new RetirementFailingRawBus();
+    const panic = new Panic({ message: "retirement defect" });
+    raw.retirementFailure = panic;
+    raw.subscriptionStopFailure = new Error("cleanup unavailable");
+    const bus = createLilacBus(raw);
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-startup-panic",
+    });
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(resolver.start()).rejects.toBe(panic);
+      expect(raw.subscriptionStops).toBe(1);
+      expect(store.resolverLeaseReleases).toBe(1);
+    } finally {
+      logged.mockRestore();
+      raw.subscriptionStopFailure = null;
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("releases its lease when the public stop adapter rejects a cleanup Result", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-stop-result-${crypto.randomUUID()}.sqlite`);
+    const store = new LeaseTrackingWaitStore(dbPath);
+    const raw = new RetirementFailingRawBus();
+    const bus = createLilacBus(raw);
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "resolver-stop-result",
+    });
+    try {
+      await resolver.start();
+      raw.subscriptionStopFailure = new Error("cleanup unavailable");
+      await expect(resolver.stop()).rejects.toMatchObject({ _tag: "EventDeliveryStopFailed" });
+      expect(store.resolverLeaseReleases).toBe(1);
+    } finally {
+      raw.subscriptionStopFailure = null;
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("does not recover a subscription completed by intentional stop", async () => {
     const dbPath = join(tmpdir(), `workflow-wait-subscription-stop-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);
@@ -585,6 +721,131 @@ describe("WorkflowWaitResolver", () => {
       expect(store.getWorkflowWaitResolverCheckpoint("evt.adapter")).toBe(second.cursor);
       expect(first.cursor).not.toBe(second.cursor);
     } finally {
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("preserves wakeup publication Panic identity after durable reply resolution", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-wakeup-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new ConfigurablePublicationFailureRawBus();
+    const bus = createLilacBus(raw);
+    const panic = new Panic({ message: "wakeup publication defect" });
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "wakeup-panic",
+      now: () => 10,
+      pollMs: 1_000_000,
+    });
+    try {
+      createRunAndWait(store, {
+        runId: "wakeup-panic-run",
+        operationId: "wakeup-panic-wait",
+        wait: {
+          state: "pending",
+          match: {
+            kind: "reply",
+            platform: "discord",
+            channelId: "channel-1",
+            messageId: "anchor-1",
+            fromUserId: "user-1",
+          },
+          matchKey: "discord:channel-1",
+          dueAt: null,
+          deadlineAt: 1_000,
+          resolverCursor: null,
+          result: null,
+          resolvedBy: null,
+          claimedBy: null,
+          claimedAt: null,
+          createdAt: 3,
+          updatedAt: 3,
+          resolvedAt: null,
+        },
+      });
+      await resolver.start();
+      raw.wakeupFailure = panic;
+      await expect(
+        resolver.resolveAdapterEvent(
+          {
+            platform: "discord",
+            channelId: "channel-1",
+            messageId: "reply-1",
+            userId: "user-1",
+            text: "continue",
+            ts: 10,
+            raw: { discord: { replyToMessageId: "anchor-1" } },
+          },
+          "wakeup-panic-cursor",
+        ),
+      ).rejects.toBe(panic);
+      expect(store.getWait("wakeup-panic-run", "wakeup-panic-wait")?.state).toBe("resolved");
+    } finally {
+      raw.wakeupFailure = null;
+      await resolver.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("clears reconciliation state and preserves barrier publication Panic identity", async () => {
+    const dbPath = join(tmpdir(), `workflow-wait-barrier-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new ConfigurablePublicationFailureRawBus();
+    const bus = createLilacBus(raw);
+    const panic = new Panic({ message: "barrier publication defect" });
+    let now = 50;
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "barrier-panic",
+      now: () => now,
+      pollMs: 1_000_000,
+    });
+    try {
+      createRunAndWait(store, {
+        runId: "barrier-panic-run",
+        operationId: "barrier-panic-wait",
+        wait: {
+          state: "pending",
+          match: {
+            kind: "reply",
+            platform: "discord",
+            channelId: "channel-1",
+            messageId: null,
+            fromUserId: "user-1",
+          },
+          matchKey: "discord:channel-1",
+          dueAt: null,
+          deadlineAt: 100,
+          resolverCursor: null,
+          result: null,
+          resolvedBy: null,
+          claimedBy: null,
+          claimedAt: null,
+          createdAt: 3,
+          updatedAt: 3,
+          resolvedAt: null,
+        },
+      });
+      await resolver.start();
+      now = 100;
+      raw.barrierFailure = panic;
+      await expect(resolver.reconcileTimers()).rejects.toBe(panic);
+      expect(store.getWait("barrier-panic-run", "barrier-panic-wait")?.state).toBe("pending");
+
+      raw.barrierFailure = null;
+      now = 5_101;
+      await resolver.reconcileTimers();
+      await resolver.reconcileTimers();
+      expect(store.getWait("barrier-panic-run", "barrier-panic-wait")?.state).toBe("expired");
+    } finally {
+      raw.barrierFailure = null;
       await resolver.stop();
       await bus.close();
       store.close();
@@ -685,6 +946,7 @@ describe("WorkflowWaitResolver", () => {
       id: "9-0",
       ts: 90,
       type: lilacEventTypes.EvtAdapterMessageCreated,
+      key: "reply-before-deadline",
       data: event,
     });
     const bus = createLilacBus(raw);
@@ -744,6 +1006,7 @@ describe("WorkflowWaitResolver", () => {
         id: "checkpoint-1",
         ts: 10,
         type: lilacEventTypes.EvtAdapterMessageCreated,
+        key: "irrelevant",
         data: {
           platform: "discord",
           channelId: "other-channel",
@@ -814,6 +1077,52 @@ describe("WorkflowWaitResolver", () => {
     } finally {
       await restarted.stop();
       await first.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("does not advance the tail when the SQLite checkpoint cannot advance", async () => {
+    const dbPath = join(
+      tmpdir(),
+      `workflow-reply-checkpoint-failure-${crypto.randomUUID()}.sqlite`,
+    );
+    const store = new CheckpointRejectingWaitStore(dbPath);
+    const raw = new IdleRawBus([
+      {
+        topic: "evt.adapter",
+        id: "checkpoint-rejected",
+        ts: 10,
+        type: lilacEventTypes.EvtAdapterMessageCreated,
+        key: "irrelevant",
+        data: {
+          platform: "discord",
+          channelId: "other-channel",
+          messageId: "irrelevant",
+          userId: "user-1",
+          text: "ignore",
+          ts: 10,
+        },
+      },
+    ]);
+    const actions: string[] = [];
+    testDeliveryActions.set(raw, actions);
+    testDeliveriesRemainOpenOnPolicyStop.add(raw);
+    const bus = createLilacBus(raw);
+    const resolver = new WorkflowWaitResolver({
+      bus,
+      store,
+      subscriptionId: "checkpoint-rejected",
+      now: () => 20,
+    });
+    try {
+      await resolver.start();
+      expect(store.checkpointAttempts).toBe(1);
+      expect(store.getWorkflowWaitResolverCheckpoint("evt.adapter")).toBeNull();
+      expect(actions).toEqual(["stop"]);
+    } finally {
+      await resolver.stop();
       await bus.close();
       store.close();
       rmSync(dbPath, { force: true });

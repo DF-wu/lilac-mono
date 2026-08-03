@@ -1,13 +1,19 @@
 import { describe, expect, it } from "bun:test";
+import { Result, type Result as ResultType } from "better-result";
 import Redis from "ioredis";
+import SuperJSON from "superjson";
 import {
   computeCoreLineagePrefixDigestV1,
   createLilacBus,
   createRedisStreamsBus,
+  EventHandlerFailed,
   lilacEventTypes,
   outReqTopic,
   type CoreLineageAtomV1,
   type CoreLineageManifestV1,
+  type DecodedMessage,
+  type RawMessageDecodeOutcome,
+  type RedisMessageDecodeFailure,
 } from "../index";
 import { env } from "@stanley2058/lilac-utils";
 import type { ModelMessage } from "ai";
@@ -18,7 +24,225 @@ function randomId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
+function requireOk<TValue, TError>(result: ResultType<TValue, TError>): TValue {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+async function eventually<T>(
+  operation: () => Promise<T>,
+  predicate: (value: T) => boolean,
+): Promise<T> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const value = await operation();
+    if (predicate(value)) return value;
+  }
+  throw new Error("Observable Redis state did not converge before the test deadline");
+}
+
+async function pendingCount(redis: Redis, streamKey: string, group: string): Promise<number> {
+  const summary = (await redis.xpending(streamKey, group)) as unknown;
+  if (!Array.isArray(summary) || typeof summary[0] !== "number") {
+    throw new Error("Redis returned an invalid pending summary");
+  }
+  return summary[0];
+}
+
+function requireDecodedMessage(message: RawMessageDecodeOutcome): DecodedMessage<unknown> {
+  if (!("_tag" in message)) return message;
+  throw new Error(`Expected a decoded message, received ${message._tag}`);
+}
+
+function requireDecodeFailure(message: RawMessageDecodeOutcome): RedisMessageDecodeFailure {
+  if ("_tag" in message) return message;
+  throw new Error("Expected a Redis message decode failure");
+}
+
 describe("RedisStreamsBus", () => {
+  it("returns bounded evidence for malformed SuperJSON data", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("malformed-superjson")}`;
+    const topic = "topic";
+    const streamKey = `${keyPrefix}:${topic}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    try {
+      const id = await redis.xadd(
+        streamKey,
+        "*",
+        "type",
+        "test.malformed",
+        "ts",
+        "123",
+        "data",
+        "{not-superjson",
+      );
+      if (typeof id !== "string") throw new Error("Redis did not return an entry id");
+
+      const fetched = await raw.fetch(topic, { offset: { type: "begin" } });
+      const failure = requireDecodeFailure(fetched.messages[0]!.msg);
+      expect(failure.id).toBe(id);
+      expect(failure.error.source).toEqual({
+        transport: "redis-streams",
+        streamKey,
+        topic,
+        messageId: id,
+      });
+      expect(failure.error.issues).toEqual([{ field: "data", reason: "invalid_superjson" }]);
+      expect(failure.error.evidence.fields).toContainEqual({
+        kind: "string",
+        value: "{not-superjson",
+        truncated: false,
+      });
+    } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
+  });
+
+  it("reports missing and invalid envelope fields without fabricating values", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("invalid-fields")}`;
+    const topic = "topic";
+    const streamKey = `${keyPrefix}:${topic}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    try {
+      await redis.xadd(streamKey, "*", "unexpected", "field");
+      await redis.xadd(
+        streamKey,
+        "*",
+        "type",
+        "",
+        "ts",
+        "not-a-number",
+        "data",
+        SuperJSON.stringify({ ok: true }),
+      );
+
+      const fetched = await raw.fetch(topic, { offset: { type: "begin" }, limit: 10 });
+      const missing = requireDecodeFailure(fetched.messages[0]!.msg);
+      expect(missing.error.issues).toEqual([
+        { field: "type", reason: "missing" },
+        { field: "ts", reason: "missing" },
+        { field: "data", reason: "missing" },
+      ]);
+      expect("type" in missing).toBe(false);
+      expect("ts" in missing).toBe(false);
+
+      const invalid = requireDecodeFailure(fetched.messages[1]!.msg);
+      expect(invalid.error.issues).toEqual([
+        { field: "type", reason: "empty" },
+        { field: "ts", reason: "invalid_number" },
+      ]);
+      expect("type" in invalid).toBe(false);
+      expect("ts" in invalid).toBe(false);
+    } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
+  });
+
+  it("rejects decoded headers containing non-string values", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("invalid-headers")}`;
+    const topic = "topic";
+    const streamKey = `${keyPrefix}:${topic}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    try {
+      await redis.xadd(
+        streamKey,
+        "*",
+        "type",
+        "test.headers",
+        "ts",
+        "123",
+        "data",
+        SuperJSON.stringify(null),
+        "headers",
+        SuperJSON.stringify({ request_id: 42 }),
+      );
+
+      const fetched = await raw.fetch(topic, { offset: { type: "begin" } });
+      const failure = requireDecodeFailure(fetched.messages[0]!.msg);
+      expect(failure.error.issues).toEqual([{ field: "headers", reason: "not_string_record" }]);
+    } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
+  });
+
+  it("preserves the existing SuperJSON URL, Date, and header wire encoding", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("wire-compatibility")}`;
+    const topic = "topic";
+    const streamKey = `${keyPrefix}:${topic}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const data = {
+      url: new URL("https://example.com/path?query=value"),
+      date: new Date("2026-08-03T12:34:56.789Z"),
+    };
+    const headers = { request_id: "request-1" };
+    try {
+      const published = await raw.publish(
+        { topic, type: "test.compatibility", headers, data },
+        { topic, type: "test.compatibility", headers },
+      );
+      const entries = await redis.xrange(streamKey, published.id, published.id);
+      const fields = entries[0]?.[1];
+      if (!fields) throw new Error("Published Redis entry was not found");
+      expect(fields[fields.indexOf("data") + 1]).toBe(SuperJSON.stringify(data));
+      expect(fields[fields.indexOf("headers") + 1]).toBe(SuperJSON.stringify(headers));
+
+      const fetched = await raw.fetch(topic, { offset: { type: "begin" } });
+      const decoded = requireDecodedMessage(fetched.messages[0]!.msg);
+      expect(decoded.data).toEqual(data);
+      expect(decoded.headers).toEqual(headers);
+    } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
+  });
+
+  it("caps retained wire evidence by value count and string length", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("bounded-evidence")}`;
+    const topic = "topic";
+    const streamKey = `${keyPrefix}:${topic}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const oversizedData = "x".repeat(5000);
+    const fields = ["type", "test.large", "ts", "123", "data", oversizedData];
+    for (let index = 0; index < 20; index += 1) {
+      fields.push(`extra-${index}`, `value-${index}`);
+    }
+    try {
+      const id = await redis.xadd(streamKey, "*", ...fields);
+      if (typeof id !== "string") throw new Error("Redis did not return an entry id");
+
+      const fetched = await raw.fetch(topic, { offset: { type: "begin" } });
+      const failure = requireDecodeFailure(fetched.messages[0]!.msg);
+      expect(failure.error.source.messageId).toBe(id);
+      expect(failure.error.evidence.fields).toHaveLength(32);
+      expect(failure.error.evidence.omittedValueCount).toBe(fields.length - 32);
+      const dataEvidence = failure.error.evidence.fields[5];
+      expect(dataEvidence).toEqual({
+        kind: "string",
+        value: oversizedData.slice(0, 1024),
+        truncated: true,
+      });
+      for (const value of failure.error.evidence.fields) {
+        if (value.kind === "string") expect(value.value.length).toBeLessThanOrEqual(1024);
+      }
+    } finally {
+      await redis.del(streamKey);
+      await raw.close();
+      await redis.quit();
+    }
+  });
+
   it("returns the latest durable topic watermark", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const raw = createRedisStreamsBus({
@@ -56,10 +280,12 @@ describe("RedisStreamsBus", () => {
     const topicA = "topic-a";
     const topicB = "topic-b";
 
-    const sub = await raw.subscribe(
-      topicA,
-      { mode: "tail", offset: { type: "now" }, batch: { maxWaitMs: 2000 } },
-      async () => {},
+    const sub = requireOk(
+      await raw.subscribe(
+        topicA,
+        { mode: "tail", offset: { type: "now" }, batch: { maxWaitMs: 2000 } },
+        async () => ({ disposition: "commit" }),
+      ),
     );
 
     // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK.
@@ -75,7 +301,7 @@ describe("RedisStreamsBus", () => {
     // On the old single-connection implementation, this would be ~BLOCK ms.
     expect(publishMs).toBeLessThan(600);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await raw.close();
   });
 
@@ -91,20 +317,20 @@ describe("RedisStreamsBus", () => {
 
     const topic = "topic";
 
-    const sub = await raw.subscribe(
-      topic,
-      { mode: "tail", offset: { type: "now" }, batch: { maxWaitMs: 5000 } },
-      async () => {},
+    const sub = requireOk(
+      await raw.subscribe(
+        topic,
+        { mode: "tail", offset: { type: "now" }, batch: { maxWaitMs: 5000 } },
+        async () => ({ disposition: "commit" }),
+      ),
     );
-    const done = sub.done;
-    if (!done) throw new Error("Redis subscription did not expose completion");
 
     // test-wait-justification: the pooled subscriber exposes no client ID or readiness hook, so Redis cannot safely identify when this test's XREAD has entered BLOCK before stop() is timed.
     await new Promise((r) => setTimeout(r, 50));
 
     const startedAt = Date.now();
-    await sub.stop();
-    await done;
+    requireOk(await sub.stop());
+    requireOk(await sub.done);
     const stopMs = Date.now() - startedAt;
 
     expect(stopMs).toBeLessThan(600);
@@ -118,21 +344,21 @@ describe("RedisStreamsBus", () => {
       keyPrefix: `test:lilac-event-bus:${randomId("done-failure")}`,
       ownsRedis: true,
     });
-    const sub = await raw.subscribe(
-      "topic",
-      { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
-      async () => {
-        throw new Error("tail handler failed");
-      },
+    const sub = requireOk(
+      await raw.subscribe(
+        "topic",
+        { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
+        async () => {
+          throw new Error("tail handler failed");
+        },
+      ),
     );
-    const done = sub.done;
-    if (!done) throw new Error("Redis subscription did not expose completion");
     try {
       await raw.publish(
         { topic: "topic", type: "test.failure", data: {} },
         { topic: "topic", type: "test.failure" },
       );
-      await expect(done).rejects.toThrow("tail handler failed");
+      await expect(sub.done).rejects.toThrow("tail handler failed");
     } finally {
       await sub.stop().catch(() => undefined);
       await raw.close();
@@ -151,15 +377,19 @@ describe("RedisStreamsBus", () => {
     const received: string[] = [];
     const delivered = Promise.withResolvers<void>();
 
-    const sub = await bus.subscribeTopic(
-      topic,
-      { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
-      async (msg) => {
-        if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
-          received.push(msg.data.delta);
-          delivered.resolve();
-        }
-      },
+    const sub = requireOk(
+      await bus.subscribeTopic(
+        topic,
+        { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
+            received.push(msg.data.delta);
+            delivered.resolve();
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await bus.publish(
@@ -174,7 +404,7 @@ describe("RedisStreamsBus", () => {
     await delivered.promise;
 
     expect(received).toEqual(["hello"]);
-    await sub.stop();
+    requireOk(await sub.stop());
     await bus.close();
   });
 
@@ -207,56 +437,66 @@ describe("RedisStreamsBus", () => {
     const keyPrefix = `test:lilac-event-bus:${randomId("acked-trim")}`;
     const streamKey = `${keyPrefix}:topic`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
-    const commitsA: Array<() => Promise<void>> = [];
-    const commitsB: Array<() => Promise<void>> = [];
+    let deliveriesA = 0;
+    let deliveriesB = 0;
+    const firstBAction = Promise.withResolvers<{ disposition: "commit" }>();
     const commitsAReady = Promise.withResolvers<void>();
-    const commitsBReady = Promise.withResolvers<void>();
+    const firstBReady = Promise.withResolvers<void>();
+    const secondBReady = Promise.withResolvers<void>();
 
-    const subA = await raw.subscribe(
-      "topic",
-      {
-        mode: "fanout",
-        subscriptionId: "group-a",
-        consumerId: "consumer-a",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 50 },
-      },
-      async (_msg, ctx) => {
-        commitsA.push(ctx.commit);
-        if (commitsA.length === 2) commitsAReady.resolve();
-      },
+    const subA = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "fanout",
+          subscriptionId: "group-a",
+          consumerId: "consumer-a",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 50 },
+        },
+        async () => {
+          deliveriesA += 1;
+          if (deliveriesA === 2) commitsAReady.resolve();
+          return { disposition: "commit" };
+        },
+      ),
     );
-    const subB = await raw.subscribe(
-      "topic",
-      {
-        mode: "fanout",
-        subscriptionId: "group-b",
-        consumerId: "consumer-b",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 50 },
-      },
-      async (_msg, ctx) => {
-        commitsB.push(ctx.commit);
-        if (commitsB.length === 2) commitsBReady.resolve();
-      },
+    const subB = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "fanout",
+          subscriptionId: "group-b",
+          consumerId: "consumer-b",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 50 },
+        },
+        async () => {
+          deliveriesB += 1;
+          if (deliveriesB === 1) {
+            firstBReady.resolve();
+            return await firstBAction.promise;
+          }
+          secondBReady.resolve();
+          return { disposition: "commit" };
+        },
+      ),
     );
 
     await raw.publish({ topic: "topic", type: "test", data: 1 }, { topic: "topic", type: "test" });
     await raw.publish({ topic: "topic", type: "test", data: 2 }, { topic: "topic", type: "test" });
-    await Promise.all([commitsAReady.promise, commitsBReady.promise]);
+    await Promise.all([commitsAReady.promise, firstBReady.promise]);
 
-    await commitsA[0]!();
-    await commitsA[1]!();
-    await commitsB[1]!();
     await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(2);
 
-    await commitsB[0]!();
+    firstBAction.resolve({ disposition: "commit" });
+    await secondBReady.promise;
     await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(1);
 
-    await subA.stop();
-    await subB.stop();
+    requireOk(await subA.stop());
+    requireOk(await subB.stop());
     await redis.del(streamKey);
     await raw.close();
     await redis.quit();
@@ -267,21 +507,24 @@ describe("RedisStreamsBus", () => {
     const keyPrefix = `test:lilac-event-bus:${randomId("tail-recovery")}`;
     const streamKey = `${keyPrefix}:evt.request`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
-    const commits: Array<() => Promise<void>> = [];
+    let deliveries = 0;
     const commitsReady = Promise.withResolvers<void>();
-    const sub = await raw.subscribe(
-      "evt.request",
-      {
-        mode: "fanout",
-        subscriptionId: "durable-group",
-        consumerId: "consumer",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 50 },
-      },
-      async (_msg, ctx) => {
-        commits.push(ctx.commit);
-        if (commits.length === 2) commitsReady.resolve();
-      },
+    const sub = requireOk(
+      await raw.subscribe(
+        "evt.request",
+        {
+          mode: "fanout",
+          subscriptionId: "durable-group",
+          consumerId: "consumer",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 50 },
+        },
+        async () => {
+          deliveries += 1;
+          if (deliveries === 2) commitsReady.resolve();
+          return { disposition: "commit" };
+        },
+      ),
     );
 
     await raw.publish(
@@ -293,12 +536,10 @@ describe("RedisStreamsBus", () => {
       { topic: "evt.request", type: "test" },
     );
     await commitsReady.promise;
-    await commits[0]!();
-    await commits[1]!();
     await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(2);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await redis.del(streamKey);
     await raw.close();
     await redis.quit();
@@ -429,21 +670,24 @@ describe("RedisStreamsBus", () => {
     const keyPrefix = `test:lilac-event-bus:${randomId("adapter-recovery")}`;
     const streamKey = `${keyPrefix}:evt.adapter`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
-    const commits: Array<() => Promise<void>> = [];
+    let deliveries = 0;
     const commitsReady = Promise.withResolvers<void>();
-    const sub = await raw.subscribe(
-      "evt.adapter",
-      {
-        mode: "fanout",
-        subscriptionId: "other-adapter-group",
-        consumerId: "other-consumer",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 50 },
-      },
-      async (_msg, ctx) => {
-        commits.push(ctx.commit);
-        if (commits.length === 2) commitsReady.resolve();
-      },
+    const sub = requireOk(
+      await raw.subscribe(
+        "evt.adapter",
+        {
+          mode: "fanout",
+          subscriptionId: "other-adapter-group",
+          consumerId: "other-consumer",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 50 },
+        },
+        async () => {
+          deliveries += 1;
+          if (deliveries === 2) commitsReady.resolve();
+          return { disposition: "commit" };
+        },
+      ),
     );
 
     await raw.publish(
@@ -455,12 +699,10 @@ describe("RedisStreamsBus", () => {
       { topic: "evt.adapter", type: "test.barrier", retention: { maxLenApprox: 1 } },
     );
     await commitsReady.promise;
-    await commits[1]!();
-    await commits[0]!();
     await raw.flushPendingTrims();
     expect(await redis.xlen(streamKey)).toBe(2);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await redis.del(streamKey);
     await raw.close();
     await redis.quit();
@@ -471,20 +713,22 @@ describe("RedisStreamsBus", () => {
     const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral")}`;
     const streamKey = `${keyPrefix}:topic`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
-    const sub = await raw.subscribe(
-      "topic",
-      {
-        mode: "fanout",
-        subscriptionId: "temporary-group",
-        consumerId: "temporary-consumer",
-        ephemeral: true,
-        offset: { type: "now" },
-        batch: { maxWaitMs: 50 },
-      },
-      async () => {},
+    const sub = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "fanout",
+          subscriptionId: "temporary-group",
+          consumerId: "temporary-consumer",
+          ephemeral: true,
+          offset: { type: "now" },
+          batch: { maxWaitMs: 50 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
     );
 
-    await sub.stop();
+    requireOk(await sub.stop());
     expect(await redis.xinfo("GROUPS", streamKey)).toEqual([]);
 
     await redis.del(streamKey);
@@ -504,29 +748,42 @@ describe("RedisStreamsBus", () => {
       offset: { type: "now" as const },
       batch: { maxWaitMs: 50 },
     };
-    const owner = await raw.subscribe("topic", { ...options, consumerId: "owner" }, async () => {});
-    await expect(
-      raw.subscribe("topic", { ...options, consumerId: "participant" }, async () => {}),
-    ).rejects.toThrow("Ephemeral consumer group already exists");
-
-    const durable = await raw.subscribe(
+    const owner = requireOk(
+      await raw.subscribe("topic", { ...options, consumerId: "owner" }, async () => ({
+        disposition: "commit",
+      })),
+    );
+    const participant = await raw.subscribe(
       "topic",
-      {
-        mode: "fanout",
-        subscriptionId: "shared-temporary-group",
-        consumerId: "durable",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 50 },
-      },
-      async () => {},
+      { ...options, consumerId: "participant" },
+      async () => ({ disposition: "commit" }),
+    );
+    expect(participant.status).toBe("error");
+    if (participant.status === "error") {
+      expect(participant.error.message).toContain("Failed to initialize Redis delivery");
+      expect(String(participant.error.cause)).toContain("Ephemeral consumer group already exists");
+    }
+
+    const durable = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "fanout",
+          subscriptionId: "shared-temporary-group",
+          consumerId: "durable",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 50 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
     );
 
     const groups = await redis.xinfo("GROUPS", streamKey);
     expect(groups).toHaveLength(2);
 
-    await owner.stop();
+    requireOk(await owner.stop());
     expect(await redis.xinfo("GROUPS", streamKey)).toHaveLength(1);
-    await durable.stop();
+    requireOk(await durable.stop());
 
     await redis.del(streamKey);
     await raw.close();
@@ -548,18 +805,22 @@ describe("RedisStreamsBus", () => {
     }> = [];
     const delivered = Promise.withResolvers<void>();
 
-    const sub = await bus.subscribeTopic(
-      topic,
-      { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
-      async (msg) => {
-        if (msg.type === lilacEventTypes.EvtAgentOutputToolCall) {
-          received.push({
-            status: msg.data.status,
-            display: msg.data.display,
-          });
-          if (received.length >= 2) delivered.resolve();
-        }
-      },
+    const sub = requireOk(
+      await bus.subscribeTopic(
+        topic,
+        { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 250 } },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.EvtAgentOutputToolCall) {
+            received.push({
+              status: msg.data.status,
+              display: msg.data.display,
+            });
+            if (received.length >= 2) delivered.resolve();
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await bus.publish(
@@ -590,7 +851,7 @@ describe("RedisStreamsBus", () => {
       { status: "end", display: "[bash] ls -al" },
     ]);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await bus.close();
   });
 
@@ -607,40 +868,46 @@ describe("RedisStreamsBus", () => {
     const aDelivered = Promise.withResolvers<void>();
     const bDelivered = Promise.withResolvers<void>();
 
-    const subA = await bus.subscribeTopic(
-      "evt.request",
-      {
-        mode: "fanout",
-        subscriptionId: "adapter-a",
-        consumerId: "a",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 250 },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.EvtRequestReply) {
-          aCount++;
-        }
-        await ctx.commit();
-        aDelivered.resolve();
-      },
+    const subA = requireOk(
+      await bus.subscribeTopic(
+        "evt.request",
+        {
+          mode: "fanout",
+          subscriptionId: "adapter-a",
+          consumerId: "a",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 250 },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.EvtRequestReply) {
+            aCount++;
+          }
+          aDelivered.resolve();
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
-    const subB = await bus.subscribeTopic(
-      "evt.request",
-      {
-        mode: "fanout",
-        subscriptionId: "adapter-b",
-        consumerId: "b",
-        offset: { type: "now" },
-        batch: { maxWaitMs: 250 },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.EvtRequestReply) {
-          bCount++;
-        }
-        await ctx.commit();
-        bDelivered.resolve();
-      },
+    const subB = requireOk(
+      await bus.subscribeTopic(
+        "evt.request",
+        {
+          mode: "fanout",
+          subscriptionId: "adapter-b",
+          consumerId: "b",
+          offset: { type: "now" },
+          batch: { maxWaitMs: 250 },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.EvtRequestReply) {
+            bCount++;
+          }
+          bDelivered.resolve();
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await bus.publish(
@@ -655,9 +922,22 @@ describe("RedisStreamsBus", () => {
 
     expect(aCount).toBe(1);
     expect(bCount).toBe(1);
+    const streamKey = `${keyPrefix}:evt.request`;
+    expect(
+      await eventually(
+        () => pendingCount(redis, streamKey, "adapter-a"),
+        (count) => count === 0,
+      ),
+    ).toBe(0);
+    expect(
+      await eventually(
+        () => pendingCount(redis, streamKey, "adapter-b"),
+        (count) => count === 0,
+      ),
+    ).toBe(0);
 
-    await subA.stop();
-    await subB.stop();
+    requireOk(await subA.stop());
+    requireOk(await subB.stop());
     await bus.close();
   });
 
@@ -687,10 +967,12 @@ describe("RedisStreamsBus", () => {
       { headers: { request_id: requestId } },
     );
 
-    const first = await bus.fetchTopic(topic, {
-      offset: { type: "begin" },
-      limit: 1,
-    });
+    const first = requireOk(
+      await bus.fetchTopic(topic, {
+        offset: { type: "begin" },
+        limit: 1,
+      }),
+    );
 
     expect(first.messages.length).toBe(1);
     const cursor = first.messages[0]!.cursor;
@@ -698,25 +980,29 @@ describe("RedisStreamsBus", () => {
     const received: string[] = [];
     const delivered = Promise.withResolvers<void>();
 
-    const sub = await bus.subscribeTopic(
-      topic,
-      {
-        mode: "tail",
-        offset: { type: "cursor", cursor },
-        batch: { maxWaitMs: 250 },
-      },
-      async (msg) => {
-        if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
-          received.push(msg.data.delta);
-          delivered.resolve();
-        }
-      },
+    const sub = requireOk(
+      await bus.subscribeTopic(
+        topic,
+        {
+          mode: "tail",
+          offset: { type: "cursor", cursor },
+          batch: { maxWaitMs: 250 },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.EvtAgentOutputDeltaText) {
+            received.push(msg.data.delta);
+            delivered.resolve();
+          }
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await delivered.promise;
     expect(received).toEqual(["b"]);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await bus.close();
   });
 
@@ -731,22 +1017,25 @@ describe("RedisStreamsBus", () => {
     let received = 0;
     const delivered = Promise.withResolvers<void>();
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "work",
-        subscriptionId: "agent-service",
-        consumerId: "instance-1",
-        offset: { type: "begin" },
-        batch: { maxWaitMs: 250 },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          received++;
-        }
-        await ctx.commit();
-        delivered.resolve();
-      },
+    const sub = requireOk(
+      await bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "work",
+          subscriptionId: "agent-service",
+          consumerId: "instance-1",
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 250 },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            received++;
+          }
+          delivered.resolve();
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await bus.publish(
@@ -766,8 +1055,14 @@ describe("RedisStreamsBus", () => {
 
     await delivered.promise;
     expect(received).toBe(1);
+    expect(
+      await eventually(
+        () => pendingCount(redis, `${keyPrefix}:cmd.request`, "agent-service"),
+        (count) => count === 0,
+      ),
+    ).toBe(0);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await bus.close();
   });
 
@@ -810,22 +1105,25 @@ describe("RedisStreamsBus", () => {
     let received: unknown;
     const delivered = Promise.withResolvers<void>();
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "work",
-        subscriptionId: "test-agent",
-        consumerId: "instance-1",
-        offset: { type: "begin" },
-        batch: { maxWaitMs: 250 },
-      },
-      async (msg, ctx) => {
-        if (msg.type === lilacEventTypes.CmdRequestMessage) {
-          received = msg.data;
-        }
-        await ctx.commit();
-        delivered.resolve();
-      },
+    const sub = requireOk(
+      await bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "work",
+          subscriptionId: "test-agent",
+          consumerId: "instance-1",
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 250 },
+        },
+        async (msg) => {
+          if (msg.type === lilacEventTypes.CmdRequestMessage) {
+            received = msg.data;
+          }
+          delivered.resolve();
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await bus.publish(lilacEventTypes.CmdRequestMessage, complexData, {
@@ -835,7 +1133,7 @@ describe("RedisStreamsBus", () => {
     await delivered.promise;
 
     expect(received).toEqual(complexData);
-    await sub.stop();
+    requireOk(await sub.stop());
     await bus.close();
   });
 
@@ -873,10 +1171,12 @@ describe("RedisStreamsBus", () => {
       { queue: "prompt", messages, corePrimaryLineage },
       { headers: { request_id: randomId("req") } },
     );
-    const fetched = await bus.fetchTopic("cmd.request", {
-      offset: { type: "begin" },
-      limit: 1,
-    });
+    const fetched = requireOk(
+      await bus.fetchTopic("cmd.request", {
+        offset: { type: "begin" },
+        limit: 1,
+      }),
+    );
 
     expect(fetched.messages[0]?.msg.data).toEqual({
       queue: "prompt",
@@ -886,7 +1186,7 @@ describe("RedisStreamsBus", () => {
     await bus.close();
   });
 
-  it("keeps work subscription loop alive after handler error", async () => {
+  it("keeps work subscription loop alive after a handler error is committed by policy", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("work-loop")}`;
     const raw = createRedisStreamsBus({ redis, keyPrefix, ownsRedis: true });
@@ -896,27 +1196,30 @@ describe("RedisStreamsBus", () => {
     let deliveredAfterError = false;
     const delivered = Promise.withResolvers<void>();
 
-    const sub = await bus.subscribeTopic(
-      "cmd.request",
-      {
-        mode: "work",
-        subscriptionId: "agent-service-loop",
-        consumerId: "instance-1",
-        offset: { type: "begin" },
-        batch: { maxWaitMs: 250 },
-      },
-      async (msg, ctx) => {
-        if (msg.type !== lilacEventTypes.CmdRequestMessage) return;
+    const sub = requireOk(
+      await bus.subscribeTopic(
+        "cmd.request",
+        {
+          mode: "work",
+          subscriptionId: "agent-service-loop",
+          consumerId: "instance-1",
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 250 },
+        },
+        async (msg) => {
+          if (msg.type !== lilacEventTypes.CmdRequestMessage) return Result.ok(undefined);
 
-        calls += 1;
-        if (calls === 1) {
-          throw new Error("boom");
-        }
+          calls += 1;
+          if (calls === 1) {
+            return Result.err(new EventHandlerFailed({ message: "expected handler failure" }));
+          }
 
-        deliveredAfterError = true;
-        await ctx.commit();
-        delivered.resolve();
-      },
+          deliveredAfterError = true;
+          delivered.resolve();
+          return Result.ok(undefined);
+        },
+        () => "commit",
+      ),
     );
 
     await bus.publish(
@@ -953,8 +1256,14 @@ describe("RedisStreamsBus", () => {
 
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(deliveredAfterError).toBe(true);
+    expect(
+      await eventually(
+        () => pendingCount(redis, `${keyPrefix}:cmd.request`, "agent-service-loop"),
+        (count) => count === 0,
+      ),
+    ).toBe(0);
 
-    await sub.stop();
+    requireOk(await sub.stop());
     await bus.close();
   });
 });

@@ -1,13 +1,17 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 
 import {
   createLilacBus,
   lilacEventTypes,
   type FetchOptions,
-  type HandleContext,
   type Message,
+  type PublishMessage,
   type PublishOptions,
   type RawBus,
+  type RawDeliveryDependencies,
+  type RawDeliveryHandler,
+  type RawMessageDecodeOutcome,
   type SubscriptionOptions,
 } from "../index";
 
@@ -15,25 +19,29 @@ class CapturingRawBus implements RawBus {
   lastMessage: Omit<Message<unknown>, "id" | "ts"> | null = null;
 
   async publish<TData>(
-    message: Omit<Message<TData>, "id" | "ts">,
+    message: PublishMessage<TData>,
     _options: PublishOptions,
   ): Promise<{ id: string; cursor: string }> {
     this.lastMessage = message;
     return { id: "1-0", cursor: "1-0" };
   }
 
-  async subscribe<TData>(
+  async subscribe(
     _topic: string,
     _options: SubscriptionOptions,
-    _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
-  ): Promise<{ stop(): Promise<void> }> {
-    return { stop: async () => {} };
+    _handler: RawDeliveryHandler,
+    _dependencies?: RawDeliveryDependencies,
+  ) {
+    return Result.ok({
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => Result.ok(undefined),
+    });
   }
 
-  async fetch<TData>(
+  async fetch(
     _topic: string,
     _options: FetchOptions,
-  ): Promise<{ messages: Array<{ msg: Message<TData>; cursor: string }>; next?: string }> {
+  ): Promise<{ messages: Array<{ msg: RawMessageDecodeOutcome; cursor: string }>; next?: string }> {
     return { messages: [] };
   }
 

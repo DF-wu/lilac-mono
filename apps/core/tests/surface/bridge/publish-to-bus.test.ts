@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 
 import {
   createLilacBus,
   lilacEventTypes,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
@@ -33,15 +33,21 @@ import type {
 } from "../../../src/surface/types";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
 import type { TranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscriptionHost,
+} from "../../helpers/result-raw-bus";
 
-function createInMemoryRawBus(): RawBus {
+function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
     topic: string;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
 
   return {
+    subscribe: subscribeForTest,
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
       const id = `${Date.now()}-${Math.random()}`;
       const stored: Message<unknown> = {
@@ -51,7 +57,7 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
@@ -60,21 +66,18 @@ function createInMemoryRawBus(): RawBus {
 
       for (const sub of subs) {
         if (sub.topic !== opts.topic) continue;
-        await sub.handler(stored, { cursor: id, commit: async () => {} });
+        await sub.handler(stored, id);
       }
 
       return { id, cursor: id };
     },
 
-    subscribe: async <TData>(
+    openTestSubscription: async (
       topic: string,
       _opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
+      handler: TestRawMessageHandler,
     ) => {
-      const entry = {
-        topic,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
+      const entry = { topic, handler };
       subs.add(entry);
 
       return {
@@ -84,11 +87,11 @@ function createInMemoryRawBus(): RawBus {
       };
     },
 
-    fetch: async <TData>(topic: string, _opts: FetchOptions) => {
+    fetch: async (topic: string, _opts: FetchOptions) => {
       const existing = topics.get(topic) ?? [];
       return {
         messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
+          msg: m,
           cursor: m.id,
         })),
         next: existing.length > 0 ? existing[existing.length - 1]!.id : undefined,
@@ -232,7 +235,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       close() {},
     };
     const publishedTypes: string[] = [];
-    const evtSub = await bus.subscribeTopic(
+    const evtSubResult = await bus.subscribeTopic(
       "evt.adapter",
       {
         mode: "fanout",
@@ -242,8 +245,12 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
       async (msg) => {
         publishedTypes.push(msg.type);
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (evtSubResult.status === "error") throw evtSubResult.error;
+    const evtSub = evtSubResult.value;
     await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test", transcriptStore });
 
     adapter.emit({
@@ -257,7 +264,8 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(publishedTypes).toContain(lilacEventTypes.EvtAdapterMessageDeleted);
-    await evtSub.stop();
+    const stopped = await evtSub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 
   it("maps adapter message and reaction events to Lilac bus events", async () => {
@@ -267,7 +275,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
-    const evtSub = await bus.subscribeTopic(
+    const evtSubResult = await bus.subscribeTopic(
       "evt.adapter",
       {
         mode: "fanout",
@@ -275,11 +283,14 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (msg, ctx) => {
+      async (msg) => {
         published.push(msg as Message<unknown>);
-        await ctx.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (evtSubResult.status === "error") throw evtSubResult.error;
+    const evtSub = evtSubResult.value;
 
     const session = { platform: "discord" as const, channelId: "chan" };
     const message = {
@@ -369,7 +380,8 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userId: "u2",
     });
 
-    await evtSub.stop();
+    const stopped = await evtSub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 
   it("keeps active-only behavior for cancel button events", async () => {
@@ -379,7 +391,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
-    const sub = await bus.subscribeTopic(
+    const subResult = await bus.subscribeTopic(
       "cmd.request",
       {
         mode: "fanout",
@@ -387,11 +399,14 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (msg, ctx) => {
+      async (msg) => {
         published.push(msg as Message<unknown>);
-        await ctx.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (subResult.status === "error") throw subResult.error;
+    const sub = subResult.value;
 
     adapter.emit({
       type: "adapter.request.cancel",
@@ -420,7 +435,8 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
     });
 
-    await sub.stop();
+    const stopped = await sub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 
   it("marks context-menu cancels as queue-capable", async () => {
@@ -430,7 +446,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
-    const sub = await bus.subscribeTopic(
+    const subResult = await bus.subscribeTopic(
       "cmd.request",
       {
         mode: "fanout",
@@ -438,11 +454,14 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (msg, ctx) => {
+      async (msg) => {
         published.push(msg as Message<unknown>);
-        await ctx.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (subResult.status === "error") throw subResult.error;
+    const sub = subResult.value;
 
     adapter.emit({
       type: "adapter.request.cancel",
@@ -475,7 +494,8 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
     });
 
-    await sub.stop();
+    const stopped = await sub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 
   it("adds surface metadata when publishing slash-command prompts", async () => {
@@ -485,7 +505,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     await bridgeAdapterToBus({ adapter, bus, subscriptionId: "test" });
 
     const published: Array<Message<unknown>> = [];
-    const sub = await bus.subscribeTopic(
+    const subResult = await bus.subscribeTopic(
       "cmd.request",
       {
         mode: "fanout",
@@ -493,11 +513,14 @@ describe("bridgeAdapterToBus cancel mapping", () => {
         consumerId: "c1",
         offset: { type: "begin" },
       },
-      async (msg, ctx) => {
+      async (msg) => {
         published.push(msg as Message<unknown>);
-        await ctx.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (subResult.status === "error") throw subResult.error;
+    const sub = subResult.value;
 
     adapter.emit({
       type: "adapter.command.invoked",
@@ -551,6 +574,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
     });
 
-    await sub.stop();
+    const stopped = await sub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 });

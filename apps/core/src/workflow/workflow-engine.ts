@@ -1,8 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import {
+  type DecodedLilacMessageForTopic,
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
+  type EventFetchContractInvalid,
+  type EventFetchTransportFailed,
   lilacEventTypes,
   outReqTopic,
   type LilacBus,
@@ -93,6 +101,211 @@ type ActiveRun = {
   nextHeartbeatAt: number;
 };
 
+type WorkflowEventSubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
+export class WorkflowWakeDeliveryFailed extends TaggedError("WorkflowWakeDeliveryFailed")<{
+  readonly message: string;
+}> {}
+
+export class WorkflowOutputDeliveryFailed extends TaggedError("WorkflowOutputDeliveryFailed")<{
+  readonly message: string;
+}> {}
+
+export class WorkflowLifecycleDeliveryFailed extends TaggedError(
+  "WorkflowLifecycleDeliveryFailed",
+)<{
+  readonly message: string;
+}> {}
+
+export type WorkflowEventDeliveryError =
+  | WorkflowWakeDeliveryFailed
+  | WorkflowOutputDeliveryFailed
+  | WorkflowLifecycleDeliveryFailed;
+
+export function applyWorkflowEventDeliveryPolicy(
+  error: WorkflowEventDeliveryError,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "WorkflowWakeDeliveryFailed":
+    case "WorkflowOutputDeliveryFailed":
+      return "park-pending";
+    case "WorkflowLifecycleDeliveryFailed":
+      return "stop";
+  }
+}
+
+class WorkflowReconciliationFetchFailed extends TaggedError("WorkflowReconciliationFetchFailed")<{
+  readonly kind: "transport" | "contract";
+  readonly topic: string;
+  readonly cursor?: string;
+  readonly message: string;
+}> {}
+
+export class WorkflowTimerTickFailed extends TaggedError("WorkflowTimerTickFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class WorkflowTerminalReceiptMissing extends TaggedError("WorkflowTerminalReceiptMissing")<{
+  readonly requestId: string;
+  readonly message: string;
+}> {}
+
+export class WorkflowTerminalReceiptAdoptionFailed extends TaggedError(
+  "WorkflowTerminalReceiptAdoptionFailed",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class WorkflowTerminalReceiptReconciliationFailed extends TaggedError(
+  "WorkflowTerminalReceiptReconciliationFailed",
+)<{
+  readonly message: string;
+}> {}
+
+class WorkflowIdleCancellationPublishFailed extends TaggedError(
+  "WorkflowIdleCancellationPublishFailed",
+)<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+function toWorkflowReconciliationFetchFailed(
+  error: EventFetchContractInvalid | EventFetchTransportFailed,
+): WorkflowReconciliationFetchFailed {
+  switch (error._tag) {
+    case "EventFetchTransportFailed":
+      return new WorkflowReconciliationFetchFailed({
+        kind: "transport",
+        topic: error.topic,
+        message: `Workflow reconciliation could not fetch ${error.topic}`,
+      });
+    case "EventFetchContractInvalid":
+      return new WorkflowReconciliationFetchFailed({
+        kind: "contract",
+        topic: error.topic,
+        cursor: error.cursor,
+        message: `Workflow reconciliation rejected an invalid ${error.topic} event at ${error.cursor}`,
+      });
+  }
+}
+
+function eventDeliveryDoneDetail(label: string, error: EventDeliveryDoneError): string {
+  switch (error._tag) {
+    case "EventDeliveryTransportFailed":
+      return `${label} delivery failed during ${error.operation}`;
+    case "EventDeliveryStopped":
+      return `${label} delivery stopped: ${error.reason}`;
+  }
+}
+
+function requireWorkflowEngineSubscriptionStart(
+  started: ResultType<WorkflowEventSubscription, EventDeliveryStartFailed>,
+): WorkflowEventSubscription {
+  if (started.status === "error") throw started.error;
+  return started.value;
+}
+
+export async function runWorkflowTimerTick(
+  operation: () => Promise<void>,
+): Promise<ResultType<void, WorkflowTimerTickFailed>> {
+  try {
+    await operation();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new WorkflowTimerTickFailed({
+        cause,
+        message: `Workflow timer tick failed: ${boundedError(cause)}`,
+      }),
+    );
+  }
+}
+
+function fetchWorkflowTerminalReceipt(
+  store: DurableWorkflowStore,
+  requestId: string,
+): ResultType<WorkflowRequestTerminalReceipt, WorkflowTerminalReceiptMissing> {
+  const receipt = store.getWorkflowRequestTerminalReceipt(requestId);
+  if (receipt) return Result.ok(receipt);
+  return Result.err(
+    new WorkflowTerminalReceiptMissing({
+      requestId,
+      message: "Workflow prompt publication was rejected without a terminal receipt",
+    }),
+  );
+}
+
+export async function captureWorkflowTerminalReceiptAdoption<T>(
+  adopt: () => Promise<T>,
+): Promise<ResultType<T, WorkflowTerminalReceiptAdoptionFailed>> {
+  try {
+    return Result.ok(await adopt());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new WorkflowTerminalReceiptAdoptionFailed({
+        cause,
+        message: `Workflow terminal receipt could not be adopted: ${boundedError(cause)}`,
+      }),
+    );
+  }
+}
+
+export async function captureWorkflowIdleCancellationPublication(
+  bus: LilacBus,
+  input: {
+    readonly requestId: string;
+    readonly sessionId: string;
+    readonly dispatchEpoch: string;
+  },
+): Promise<ResultType<void, WorkflowIdleCancellationPublishFailed>> {
+  try {
+    await bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+      {
+        headers: {
+          request_id: input.requestId,
+          session_id: input.sessionId,
+          request_client: "unknown",
+          workflow_dispatch_epoch: input.dispatchEpoch,
+        },
+      },
+    );
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new WorkflowIdleCancellationPublishFailed({
+        cause,
+        message: "Workflow idle cancellation publication failed",
+      }),
+    );
+  }
+}
+
+async function stopWorkflowEventSubscription(
+  label: string,
+  subscription: WorkflowEventSubscription,
+): Promise<readonly string[]> {
+  const failures: string[] = [];
+  const stopped = await subscription.stop();
+  if (stopped.status === "error") failures.push(`${label} stop failed: ${stopped.error.message}`);
+  const done = await subscription.done;
+  if (done.status === "error") failures.push(eventDeliveryDoneDetail(label, done.error));
+  return failures;
+}
+
+function failedAgentRequest(detail: string): AgentRequestResult {
+  return { state: "failed", output: "", detail, usage: null };
+}
+
 class Semaphore {
   private active = 0;
   private readonly waiters: Array<() => void> = [];
@@ -137,7 +350,7 @@ export class WorkflowEngine {
   private readonly active = new Map<string, ActiveRun>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopping = false;
-  private wakeSubscription: { stop(): Promise<void> } | null = null;
+  private wakeSubscription: WorkflowEventSubscription | null = null;
   private tickPromise: Promise<void> | null = null;
 
   constructor(
@@ -192,19 +405,8 @@ export class WorkflowEngine {
 
   async start(): Promise<void> {
     this.stopping = false;
-    this.wakeSubscription = await this.input.bus.subscribeTopic(
-      "evt.workflow",
-      {
-        mode: "fanout",
-        subscriptionId: this.input.subscriptionId,
-        consumerId: `${this.input.subscriptionId}:${process.pid}`,
-        offset: { type: "now" },
-        batch: { maxWaitMs: 500 },
-      },
-      async (_message, context) => {
-        await this.requestTick();
-        await context.commit();
-      },
+    this.wakeSubscription = requireWorkflowEngineSubscriptionStart(
+      await this.startWakeSubscription(),
     );
     for (const run of this.input.store.listRuns({ state: "running", limit: 1_000 })) {
       await this.claimAndLaunch(run, WORKFLOW_LEASE_STALE_MS);
@@ -221,11 +423,40 @@ export class WorkflowEngine {
     }
     await this.requestTick();
     this.timer = setInterval(() => {
-      void this.requestTick().catch((error: unknown) => {
-        this.logger.error("Workflow timer tick failed", error);
+      void runWorkflowTimerTick(() => this.requestTick()).then((tick) => {
+        if (tick.status === "error") {
+          this.logger.error("Workflow timer tick failed", tick.error.cause);
+        }
       });
     }, this.input.pollMs ?? 250);
     this.timer.unref?.();
+  }
+
+  private startWakeSubscription(): Promise<
+    ResultType<WorkflowEventSubscription, EventDeliveryStartFailed>
+  > {
+    return this.input.bus.subscribeTopic(
+      "evt.workflow",
+      {
+        mode: "fanout",
+        subscriptionId: this.input.subscriptionId,
+        consumerId: `${this.input.subscriptionId}:${process.pid}`,
+        offset: { type: "now" },
+        batch: { maxWaitMs: 500 },
+      },
+      async (): Promise<ResultType<void, WorkflowWakeDeliveryFailed>> => {
+        if (this.stopping) {
+          return Result.err(
+            new WorkflowWakeDeliveryFailed({
+              message: "Workflow engine is stopping before the durable wake can be handled",
+            }),
+          );
+        }
+        await this.requestTick();
+        return Result.ok(undefined);
+      },
+      applyWorkflowEventDeliveryPolicy,
+    );
   }
 
   async stop(): Promise<void> {
@@ -236,8 +467,11 @@ export class WorkflowEngine {
     const subscription = this.wakeSubscription;
     this.wakeSubscription = null;
     if (subscription) {
-      const settled = await Promise.allSettled([Promise.resolve().then(() => subscription.stop())]);
+      const settled = await Promise.allSettled([
+        Promise.resolve().then(() => stopWorkflowEventSubscription("workflow wake", subscription)),
+      ]);
       if (settled[0]?.status === "rejected") failures.push(settled[0].reason);
+      if (settled[0]?.status === "fulfilled") failures.push(...settled[0].value);
     }
     if (this.tickPromise) {
       const settled = await Promise.allSettled([this.tickPromise]);
@@ -1226,30 +1460,57 @@ export class WorkflowEngine {
       if (state === "resolved" && lifecycle === "resolved" && !output) return;
       finishResult({ state, output, detail, usage });
     };
-    const readExactReceipt = (): WorkflowRequestTerminalReceipt | null => {
+    const readExactReceipt = (): ResultType<
+      WorkflowRequestTerminalReceipt | null,
+      WorkflowTerminalReceiptReconciliationFailed
+    > => {
       const receipt = this.input.store.getWorkflowRequestTerminalReceipt(input.requestId);
-      if (!receipt) return null;
+      if (!receipt) return Result.ok(null);
       if (
         receipt.requestId !== input.requestId ||
         receipt.runId !== input.run.runId ||
         receipt.operationId !== input.operation.operationId ||
         receipt.dispatchEpoch !== input.dispatchEpoch
       ) {
-        throw new Error("Terminal lifecycle receipt does not match its exact workflow dispatch");
+        return Result.err(
+          new WorkflowTerminalReceiptReconciliationFailed({
+            message: "Terminal lifecycle receipt does not match its exact workflow dispatch",
+          }),
+        );
       }
-      return receipt;
+      return Result.ok(receipt);
     };
     const adoptReceipt = async (
       receipt: WorkflowRequestTerminalReceipt,
       source: "receipt" | "terminal_receipt",
-    ): Promise<void> => {
-      const adopted = await this.adoptTerminalReceipt(receipt, input.revision);
+    ): Promise<ResultType<void, WorkflowTerminalReceiptReconciliationFailed>> => {
+      const adopted = await captureWorkflowTerminalReceiptAdoption(() =>
+        this.adoptTerminalReceipt(receipt, input.revision),
+      );
+      if (adopted.status === "error") {
+        return Result.err(
+          new WorkflowTerminalReceiptReconciliationFailed({ message: adopted.error.message }),
+        );
+      }
       finishResult({
-        ...adopted,
+        ...adopted.value,
         ...(idleTimedOut
           ? { state: "timed_out" as const, detail: "Agent operation idle timeout" }
           : {}),
         source,
+      });
+      return Result.ok(undefined);
+    };
+    const finishReceiptFailure = (
+      state: AgentRequestResult["state"],
+      receiptFailure: WorkflowTerminalReceiptReconciliationFailed,
+    ): void => {
+      finishResult({
+        state,
+        output: "",
+        detail: receiptFailure.message,
+        usage: state === "failed" ? null : usage,
+        source: "terminal_without_receipt",
       });
     };
     const pollReceipt = async (): Promise<void> => {
@@ -1257,49 +1518,44 @@ export class WorkflowEngine {
       readingReceipt = true;
       try {
         const receipt = readExactReceipt();
-        if (!receipt) return;
-        await adoptReceipt(receipt, "receipt");
-      } catch (error) {
-        finishResult({
-          state: "failed",
-          output: "",
-          detail: boundedError(error),
-          usage: null,
-          source: "terminal_without_receipt",
-        });
+        if (receipt.status === "error") {
+          finishReceiptFailure("failed", receipt.error);
+          return;
+        }
+        if (!receipt.value) return;
+        const adopted = await adoptReceipt(receipt.value, "receipt");
+        if (adopted.status === "error") finishReceiptFailure("failed", adopted.error);
       } finally {
         readingReceipt = false;
       }
     };
-    const scheduleReceiptPoll = (): void => {
-      if (settled || this.stopping) return;
-      receiptTimer = setTimeout(async () => {
+    const waitForReceiptPoll = (): Promise<void> =>
+      new Promise((resolve) => {
+        receiptTimer = setTimeout(resolve, this.input.receiptPollMs ?? 25);
+        receiptTimer.unref?.();
+      });
+    const pollReceipts = async (): Promise<AgentRequestResult> => {
+      while (!settled && !this.stopping) {
+        await waitForReceiptPoll();
         await pollReceipt();
-        scheduleReceiptPoll();
-      }, this.input.receiptPollMs ?? 25);
-      receiptTimer.unref?.();
+      }
+      return await new Promise<AgentRequestResult>(() => {});
     };
     const publishIdleCancellation = async (): Promise<void> => {
       while (!settled && idleTimedOut && !this.stopping && !input.signal.aborted) {
-        try {
-          await this.input.bus.publish(
-            lilacEventTypes.CmdRequestMessage,
-            { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
-            {
-              headers: {
-                request_id: input.requestId,
-                session_id: input.sessionId,
-                request_client: "unknown",
-                workflow_dispatch_epoch: input.dispatchEpoch,
-              },
-            },
-          );
-          return;
-        } catch {
-          await Bun.sleep(100);
-        }
+        const published = await captureWorkflowIdleCancellationPublication(this.input.bus, {
+          requestId: input.requestId,
+          sessionId: input.sessionId,
+          dispatchEpoch: input.dispatchEpoch,
+        });
+        if (published.status === "ok") return;
+        await Bun.sleep(100);
       }
     };
+    const idleCancellationStart = Promise.withResolvers<void>();
+    const idleCancellationDefect = idleCancellationStart.promise
+      .then(() => publishIdleCancellation())
+      .then(() => new Promise<AgentRequestResult>(() => {}));
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
@@ -1316,7 +1572,7 @@ export class WorkflowEngine {
           });
         }, IDLE_CANCEL_QUIESCENCE_WAIT_MS);
         idleCancellationTimer.unref?.();
-        void publishIdleCancellation();
+        idleCancellationStart.resolve();
       }, input.revision.resources.operationIdleTimeoutMs);
       idleTimer.unref?.();
     };
@@ -1325,7 +1581,7 @@ export class WorkflowEngine {
     };
     const suffix = `${input.requestId}:${crypto.randomUUID()}`;
     const handleOutputMessage = async (
-      message: Awaited<ReturnType<LilacBus["fetchTopic"]>>["messages"][number]["msg"],
+      message: DecodedLilacMessageForTopic<ReturnType<typeof outReqTopic>>,
     ): Promise<void> => {
       if (
         message.headers?.request_id !== input.requestId ||
@@ -1342,14 +1598,14 @@ export class WorkflowEngine {
       }
     };
     const handleLifecycleMessage = async (
-      message: Awaited<ReturnType<LilacBus["fetchTopic"]>>["messages"][number]["msg"],
-    ): Promise<void> => {
+      message: DecodedLilacMessageForTopic<"evt.request">,
+    ): Promise<ResultType<void, WorkflowTerminalReceiptReconciliationFailed>> => {
       if (
         message.type !== lilacEventTypes.EvtRequestLifecycleChanged ||
         message.headers?.request_id !== input.requestId ||
         message.headers?.workflow_dispatch_epoch !== input.dispatchEpoch
       ) {
-        return;
+        return Result.ok(undefined);
       }
       resetIdle();
       lifecycle = message.data.state;
@@ -1372,7 +1628,7 @@ export class WorkflowEngine {
         terminalState !== "failed" &&
         terminalState !== "cancelled"
       ) {
-        return;
+        return Result.ok(undefined);
       }
 
       readingReceipt = true;
@@ -1380,14 +1636,24 @@ export class WorkflowEngine {
         const deadline = Date.now() + TERMINAL_RECEIPT_WAIT_MS;
         while (!settled && !this.stopping) {
           const receipt = readExactReceipt();
-          if (receipt) {
-            if (receipt.state !== terminalState) {
-              throw new Error(
-                `Terminal lifecycle state ${terminalState} does not match durable receipt state ${receipt.state}`,
-              );
+          if (receipt.status === "error") {
+            finishReceiptFailure(terminalState, receipt.error);
+            return Result.err(receipt.error);
+          }
+          if (receipt.value) {
+            if (receipt.value.state !== terminalState) {
+              const mismatch = new WorkflowTerminalReceiptReconciliationFailed({
+                message: `Terminal lifecycle state ${terminalState} does not match durable receipt state ${receipt.value.state}`,
+              });
+              finishReceiptFailure(terminalState, mismatch);
+              return Result.err(mismatch);
             }
-            await adoptReceipt(receipt, "terminal_receipt");
-            return;
+            const adopted = await adoptReceipt(receipt.value, "terminal_receipt");
+            if (adopted.status === "error") {
+              finishReceiptFailure(terminalState, adopted.error);
+              return Result.err(adopted.error);
+            }
+            return Result.ok(undefined);
           }
           if (Date.now() >= deadline) break;
           await Bun.sleep(10);
@@ -1399,27 +1665,34 @@ export class WorkflowEngine {
           usage,
           source: "terminal_without_receipt",
         });
-      } catch (error) {
-        finishResult({
-          state: terminalState,
-          output: "",
-          detail: boundedError(error),
-          usage,
-          source: "terminal_without_receipt",
-        });
       } finally {
         readingReceipt = false;
       }
+      return Result.ok(undefined);
     };
-    const outSub = await this.input.bus.subscribeTopic(
+    const outSubscription = await this.input.bus.subscribeTopic(
       outReqTopic(input.requestId),
       { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 100 } },
-      async (message, context) => {
+      async (message): Promise<ResultType<void, WorkflowOutputDeliveryFailed>> => {
+        if (this.stopping) {
+          return Result.err(
+            new WorkflowOutputDeliveryFailed({
+              message: "Workflow engine is stopping before request output can be handled",
+            }),
+          );
+        }
         await handleOutputMessage(message);
-        await context.commit();
+        return Result.ok(undefined);
       },
+      applyWorkflowEventDeliveryPolicy,
     );
-    const evtSub = await this.input.bus.subscribeTopic(
+    if (outSubscription.status === "error") {
+      return failedAgentRequest(
+        `Workflow output subscription failed: ${outSubscription.error.message}`,
+      );
+    }
+    const outSub = outSubscription.value;
+    const evtSubscription = await this.input.bus.subscribeTopic(
       "evt.request",
       {
         mode: "fanout",
@@ -1429,11 +1702,28 @@ export class WorkflowEngine {
         offset: { type: "begin" },
         batch: { maxWaitMs: 100 },
       },
-      async (message, context) => {
+      async (message): Promise<ResultType<void, WorkflowLifecycleDeliveryFailed>> => {
+        if (this.stopping) {
+          return Result.err(
+            new WorkflowLifecycleDeliveryFailed({
+              message: "Workflow engine is stopping before request lifecycle can be handled",
+            }),
+          );
+        }
         await handleLifecycleMessage(message);
-        await context.commit();
+        return Result.ok(undefined);
       },
+      applyWorkflowEventDeliveryPolicy,
     );
+    if (evtSubscription.status === "error") {
+      const cleanupFailures = await stopWorkflowEventSubscription("workflow output", outSub);
+      const detail = [
+        `Workflow lifecycle subscription failed: ${evtSubscription.error.message}`,
+        ...cleanupFailures,
+      ].join("; ");
+      return failedAgentRequest(detail);
+    }
+    const evtSub = evtSubscription.value;
     const abort = (): void => {
       if (input.signal.reason !== "workflow lease lost" && input.signal.reason !== "shutdown") {
         void this.input.bus.publish(
@@ -1451,104 +1741,163 @@ export class WorkflowEngine {
       finish("cancelled");
     };
     input.signal.addEventListener("abort", abort, { once: true });
-    armIdle();
-    await pollReceipt();
-    scheduleReceiptPoll();
-    if (input.reconcile || input.publishRequest) {
-      let outputCursor: string | undefined;
-      do {
-        const batch = await this.input.bus.fetchTopic(outReqTopic(input.requestId), {
-          offset: outputCursor ? { type: "cursor", cursor: outputCursor } : { type: "begin" },
-          limit: 1_000,
-        });
-        for (const entry of batch.messages) await handleOutputMessage(entry.msg);
-        const previous = outputCursor;
-        outputCursor = batch.next;
-        if (batch.messages.length < 1_000 || !outputCursor || outputCursor === previous) break;
-      } while (!settled);
-
-      let lifecycleCursor: string | undefined;
-      do {
-        const batch = await this.input.bus.fetchTopic("evt.request", {
-          offset: lifecycleCursor ? { type: "cursor", cursor: lifecycleCursor } : { type: "begin" },
-          limit: 1_000,
-        });
-        for (const entry of batch.messages) await handleLifecycleMessage(entry.msg);
-        const previous = lifecycleCursor;
-        lifecycleCursor = batch.next;
-        if (batch.messages.length < 1_000 || !lifecycleCursor || lifecycleCursor === previous)
-          break;
-      } while (!settled);
-    }
-    if (input.publishRequest && !settled) {
-      await this.input.beforePromptPublication?.({
-        requestId: input.requestId,
-        runId: input.run.runId,
-        operationId: input.operation.operationId,
-        dispatchEpoch: input.dispatchEpoch,
-        runOwnerId: this.workerId,
-      });
-      const publicationClaimed = this.input.store.claimWorkflowRequestPromptPublication({
-        requestId: input.requestId,
-        runId: input.run.runId,
-        operationId: input.operation.operationId,
-        runOwnerId: this.workerId,
-        now: this.now(),
-      });
-      if (!publicationClaimed) {
-        try {
-          const receipt = this.input.store.getWorkflowRequestTerminalReceipt(input.requestId);
-          if (!receipt) {
-            throw new Error("Workflow prompt publication was rejected without a terminal receipt");
+    let terminal: AgentRequestResult | null = null;
+    let cleanupFailures: readonly string[] = [];
+    try {
+      armIdle();
+      await pollReceipt();
+      const receiptPollingDefect = pollReceipts();
+      if (input.reconcile || input.publishRequest) {
+        let outputCursor: string | undefined;
+        do {
+          const fetched = await this.input.bus.fetchTopic(outReqTopic(input.requestId), {
+            offset: outputCursor ? { type: "cursor", cursor: outputCursor } : { type: "begin" },
+            limit: 1_000,
+          });
+          if (fetched.status === "error") {
+            const fetchFailure = toWorkflowReconciliationFetchFailed(fetched.error);
+            terminal = failedAgentRequest(fetchFailure.message);
+            finishResult(terminal);
+            break;
           }
-          return await this.adoptTerminalReceipt(receipt, input.revision);
-        } finally {
-          input.signal.removeEventListener("abort", abort);
-          await Promise.all([outSub.stop(), evtSub.stop()]);
+          for (const entry of fetched.value.messages) await handleOutputMessage(entry.msg);
+          const previous = outputCursor;
+          outputCursor = fetched.value.next;
+          if (fetched.value.messages.length < 1_000 || !outputCursor || outputCursor === previous) {
+            break;
+          }
+        } while (!settled);
+
+        if (terminal === null) {
+          let lifecycleCursor: string | undefined;
+          do {
+            const fetched = await this.input.bus.fetchTopic("evt.request", {
+              offset: lifecycleCursor
+                ? { type: "cursor", cursor: lifecycleCursor }
+                : { type: "begin" },
+              limit: 1_000,
+            });
+            if (fetched.status === "error") {
+              const fetchFailure = toWorkflowReconciliationFetchFailed(fetched.error);
+              terminal = failedAgentRequest(fetchFailure.message);
+              finishResult(terminal);
+              break;
+            }
+            for (const entry of fetched.value.messages) {
+              const handled = await handleLifecycleMessage(entry.msg);
+              if (handled.status === "error") break;
+            }
+            const previous = lifecycleCursor;
+            lifecycleCursor = fetched.value.next;
+            if (
+              fetched.value.messages.length < 1_000 ||
+              !lifecycleCursor ||
+              lifecycleCursor === previous
+            ) {
+              break;
+            }
+          } while (!settled);
         }
       }
-      const liveParent =
-        input.run.completionTarget.kind === "live_parent" ? input.run.completionTarget : null;
-      await this.input.bus.publish(
-        lilacEventTypes.CmdRequestMessage,
-        {
-          queue: "prompt",
-          messages: [{ role: "user", content: input.prompt }],
-          ...(input.model ? { modelOverride: input.model } : {}),
-          raw: {
-            workflow: {
-              runId: input.run.runId,
-              operationId: input.operation.operationId,
-              dispatchEpoch: input.dispatchEpoch,
+      if (input.publishRequest && !settled) {
+        await this.input.beforePromptPublication?.({
+          requestId: input.requestId,
+          runId: input.run.runId,
+          operationId: input.operation.operationId,
+          dispatchEpoch: input.dispatchEpoch,
+          runOwnerId: this.workerId,
+        });
+        const publicationClaimed = this.input.store.claimWorkflowRequestPromptPublication({
+          requestId: input.requestId,
+          runId: input.run.runId,
+          operationId: input.operation.operationId,
+          runOwnerId: this.workerId,
+          now: this.now(),
+        });
+        if (!publicationClaimed) {
+          const fetchedReceipt = fetchWorkflowTerminalReceipt(this.input.store, input.requestId);
+          if (fetchedReceipt.status === "error") {
+            terminal = failedAgentRequest(fetchedReceipt.error.message);
+            finishResult(terminal);
+          } else {
+            terminal = await this.adoptTerminalReceipt(fetchedReceipt.value, input.revision);
+          }
+        } else {
+          const liveParent =
+            input.run.completionTarget.kind === "live_parent" ? input.run.completionTarget : null;
+          await this.input.bus.publish(
+            lilacEventTypes.CmdRequestMessage,
+            {
+              queue: "prompt",
+              messages: [{ role: "user", content: input.prompt }],
+              ...(input.model ? { modelOverride: input.model } : {}),
+              raw: {
+                workflow: {
+                  runId: input.run.runId,
+                  operationId: input.operation.operationId,
+                  dispatchEpoch: input.dispatchEpoch,
+                },
+                subagent: {
+                  profile: input.profile,
+                  depth: liveParent?.depth ?? 1,
+                  ...(input.reasoning ? { reasoning: input.reasoning } : {}),
+                  ...(liveParent
+                    ? {
+                        parentRequestId: liveParent.parentRequestId,
+                        parentToolCallId: liveParent.parentToolCallId,
+                      }
+                    : {}),
+                },
+              },
             },
-            subagent: {
-              profile: input.profile,
-              depth: liveParent?.depth ?? 1,
-              ...(input.reasoning ? { reasoning: input.reasoning } : {}),
-              ...(liveParent
-                ? {
-                    parentRequestId: liveParent.parentRequestId,
-                    parentToolCallId: liveParent.parentToolCallId,
-                  }
-                : {}),
+            {
+              headers: {
+                request_id: input.requestId,
+                session_id: input.sessionId,
+                request_client: "unknown",
+                workflow_run_id: input.run.runId,
+                workflow_operation_id: input.operation.operationId,
+                workflow_dispatch_epoch: input.dispatchEpoch,
+              },
             },
-          },
-        },
-        {
-          headers: {
-            request_id: input.requestId,
-            session_id: input.sessionId,
-            request_client: "unknown",
-            workflow_run_id: input.run.runId,
-            workflow_operation_id: input.operation.operationId,
-            workflow_dispatch_epoch: input.dispatchEpoch,
-          },
-        },
-      );
+          );
+        }
+      }
+      terminal ??= await Promise.race([
+        result,
+        receiptPollingDefect,
+        idleCancellationDefect,
+        outSub.done.then((done) => {
+          if (done.status === "error") {
+            return failedAgentRequest(eventDeliveryDoneDetail("Workflow output", done.error));
+          }
+          return failedAgentRequest("Workflow output delivery ended before request completion");
+        }),
+        evtSub.done.then((done) => {
+          if (done.status === "error") {
+            return failedAgentRequest(eventDeliveryDoneDetail("Workflow lifecycle", done.error));
+          }
+          return failedAgentRequest("Workflow lifecycle delivery ended before request completion");
+        }),
+      ]);
+    } finally {
+      input.signal.removeEventListener("abort", abort);
+      cleanupFailures = (
+        await Promise.all([
+          stopWorkflowEventSubscription("workflow output", outSub),
+          stopWorkflowEventSubscription("workflow lifecycle", evtSub),
+        ])
+      ).flat();
     }
-    const terminal = await result;
-    input.signal.removeEventListener("abort", abort);
-    await Promise.all([outSub.stop(), evtSub.stop()]);
+    if (cleanupFailures.length > 0) {
+      if (terminal.state === "resolved") return failedAgentRequest(cleanupFailures.join("; "));
+      return {
+        ...terminal,
+        detail: [terminal.detail, ...cleanupFailures]
+          .filter((detail) => detail !== null)
+          .join("; "),
+      };
+    }
     return terminal;
   }
 

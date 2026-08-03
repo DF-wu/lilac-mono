@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { modelMessageSchema, type ModelMessage } from "ai";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 export const CORE_PRIMARY_LINEAGE_DOMAIN_V1 = "lilac:core-primary-lineage:v1";
@@ -331,6 +332,86 @@ export const corePrimaryLineageV1Schema = z.discriminatedUnion("state", [
 ]);
 
 export type CorePrimaryLineageV1 = z.infer<typeof corePrimaryLineageV1Schema>;
+
+export class CorePrimaryLineageInvalid extends TaggedError("CorePrimaryLineageInvalid")<{
+  readonly cause: unknown;
+  readonly issues: readonly {
+    readonly path: readonly PropertyKey[];
+    readonly message: string;
+  }[];
+  readonly message: string;
+}> {}
+
+function invalidLineage(
+  issues: readonly { readonly path: readonly PropertyKey[]; readonly message: string }[],
+): ResultType<never, CorePrimaryLineageInvalid> {
+  return Result.err(
+    new CorePrimaryLineageInvalid({
+      cause: undefined,
+      issues,
+      message: "Core primary lineage is invalid",
+    }),
+  );
+}
+
+/** Decode lineage and project cross-field failures without ordinary exception flow. */
+export function decodeCorePrimaryLineageV1(
+  value: unknown,
+  canonicalMessages: unknown,
+): ResultType<CorePrimaryLineageV1, CorePrimaryLineageInvalid> {
+  try {
+    const decodedLineage = corePrimaryLineageV1Schema.safeParse(value);
+    if (!decodedLineage.success) {
+      return invalidLineage(
+        decodedLineage.error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+      );
+    }
+    const decodedMessages = modelMessagesSchema.safeParse(canonicalMessages);
+    if (!decodedMessages.success) {
+      return invalidLineage(
+        decodedMessages.error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+      );
+    }
+
+    const lineage = decodedLineage.data;
+    const messages = decodedMessages.data;
+    if (lineage.currentCanonicalStart > messages.length) {
+      return invalidLineage([
+        {
+          path: ["currentCanonicalStart"],
+          message: "Core primary current canonical start exceeds canonical messages",
+        },
+      ]);
+    }
+    if (lineage.state === "fresh-only") return Result.ok(lineage);
+
+    const manifestMessages = lineage.segments.flatMap((segment) => segment.canonicalMessages);
+    if (!isDeepStrictEqual(manifestMessages, messages)) {
+      return invalidLineage([
+        {
+          path: [],
+          message: "Core primary lineage does not exactly align with canonical messages",
+        },
+      ]);
+    }
+    return Result.ok(lineage);
+  } catch (cause) {
+    let isPanic = false;
+    try {
+      isPanic = Panic.is(cause);
+    } catch {
+      // A revoked thrown value is an ordinary opaque validation failure, not a Panic.
+    }
+    if (isPanic) throw cause;
+    return Result.err(
+      new CorePrimaryLineageInvalid({
+        cause: undefined,
+        issues: [{ path: [], message: "Core primary lineage validation failed" }],
+        message: "Core primary lineage is invalid",
+      }),
+    );
+  }
+}
 
 /**
  * Parse lineage and require a complete manifest to cover exactly the supplied

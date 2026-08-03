@@ -7,16 +7,27 @@ import {
   createLilacBus,
   lilacEventTypes,
   outReqTopic,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 
+import {
+  okResultForTest,
+  startResultForTest,
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscriptionHost,
+} from "../helpers/result-raw-bus";
 import type { TrustedSubagentDelegationRegistration } from "../../src/tools/subagent";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
-import { WorkflowLiveParentBridge } from "../../src/workflow/workflow-live-parent-bridge";
+import {
+  applyWorkflowLiveParentDeliveryPolicy,
+  WorkflowLiveParentBridge,
+  WorkflowLiveParentChildActivityFailed,
+  WorkflowLiveParentRunEventFailed,
+} from "../../src/workflow/workflow-live-parent-bridge";
 import { WorkflowSubagentDispatcher } from "../../src/workflow/workflow-subagent-dispatcher";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { createToolResultArtifactStore } from "../../src/artifacts/tool-result-artifact-store";
@@ -26,11 +37,11 @@ const AUTHENTICATED_PARENT = { platform: "discord", userId: "user-1" } as const;
 
 function createInMemoryRawBus(control?: {
   beforePublish?: (input: { type: string; headers: PublishOptions["headers"] }) => Promise<void>;
-}): RawBus & { activeSubscriptions(): number } {
+}): RawBus & TestRawSubscriptionHost & { activeSubscriptions(): number } {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subscriptions = new Set<{
     topic: string;
-    handler: (message: Message<unknown>, context: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
   return {
     publish: async <TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) => {
@@ -50,21 +61,18 @@ function createInMemoryRawBus(control?: {
       topics.set(options.topic, existing);
       for (const subscription of subscriptions) {
         if (subscription.topic === options.topic) {
-          await subscription.handler(stored, { cursor: id, commit: async () => {} });
+          await subscription.handler(stored, id);
         }
       }
       return { id, cursor: id };
     },
-    subscribe: async <TData>(
+    subscribe: subscribeForTest,
+    openTestSubscription: async (
       topic: string,
       _options: SubscriptionOptions,
-      handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+      handler: TestRawMessageHandler,
     ) => {
-      const entry = {
-        topic,
-        handler: (message: Message<unknown>, context: HandleContext) =>
-          handler(message as Message<TData>, context),
-      };
+      const entry = { topic, handler };
       subscriptions.add(entry);
       return {
         stop: async () => {
@@ -72,9 +80,9 @@ function createInMemoryRawBus(control?: {
         },
       };
     },
-    fetch: async <TData>(topic: string) => ({
+    fetch: async (topic: string) => ({
       messages: (topics.get(topic) ?? []).map((message) => ({
-        msg: message as Message<TData>,
+        msg: message,
         cursor: message.id,
       })),
       next: topics.get(topic)?.at(-1)?.id,
@@ -201,6 +209,28 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("workflow subagent convergence", () => {
+  it("parks every owned live-parent delivery failure", () => {
+    expect(
+      applyWorkflowLiveParentDeliveryPolicy(
+        new WorkflowLiveParentRunEventFailed({
+          cause: undefined,
+          runId: "run:1",
+          message: "run event failed",
+        }),
+      ),
+    ).toBe("park-pending");
+    expect(
+      applyWorkflowLiveParentDeliveryPolicy(
+        new WorkflowLiveParentChildActivityFailed({
+          cause: undefined,
+          runId: "run:1",
+          childRequestId: "child:1",
+          message: "child activity failed",
+        }),
+      ),
+    ).toBe("park-pending");
+  });
+
   it("rejects delegation at global capacity without creating partial durable state", async () => {
     const { projectRoot, store, dispatcher } = await setup(1);
     const first = await dispatcher.delegate(registration(projectRoot, "parent:first"));
@@ -446,15 +476,18 @@ describe("workflow subagent convergence", () => {
     const { store } = await createRun("parent:tool-tree");
     const bus = createLilacBus(createInMemoryRawBus());
     const updates: Array<{ toolCallId: string; display: string }> = [];
-    await bus.subscribeTopic(
-      outReqTopic("parent:tool-tree"),
-      { mode: "tail", offset: { type: "begin" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
-          updates.push({ toolCallId: message.data.toolCallId, display: message.data.display });
-        }
-        await context.commit();
-      },
+    await startResultForTest(
+      bus.subscribeTopic(
+        outReqTopic("parent:tool-tree"),
+        { mode: "tail", offset: { type: "begin" } },
+        async (message) => {
+          if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+            updates.push({ toolCallId: message.data.toolCallId, display: message.data.display });
+          }
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
@@ -554,15 +587,18 @@ describe("workflow subagent convergence", () => {
       }),
     );
     const updates: string[] = [];
-    await bus.subscribeTopic(
-      outReqTopic("parent:activity-coalescing"),
-      { mode: "tail", offset: { type: "begin" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
-          updates.push(message.data.display);
-        }
-        await context.commit();
-      },
+    await startResultForTest(
+      bus.subscribeTopic(
+        outReqTopic("parent:activity-coalescing"),
+        { mode: "tail", offset: { type: "begin" } },
+        async (message) => {
+          if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+            updates.push(message.data.display);
+          }
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
@@ -641,15 +677,18 @@ describe("workflow subagent convergence", () => {
     );
 
     const updates: Array<{ toolCallId: string; display: string }> = [];
-    await bus.subscribeTopic(
-      outReqTopic("parent:terminal-tree"),
-      { mode: "tail", offset: { type: "begin" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
-          updates.push({ toolCallId: message.data.toolCallId, display: message.data.display });
-        }
-        await context.commit();
-      },
+    await startResultForTest(
+      bus.subscribeTopic(
+        outReqTopic("parent:terminal-tree"),
+        { mode: "tail", offset: { type: "begin" } },
+        async (message) => {
+          if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+            updates.push({ toolCallId: message.data.toolCallId, display: message.data.display });
+          }
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
@@ -680,15 +719,18 @@ describe("workflow subagent convergence", () => {
     let childRequestId: string | undefined;
     let hasWorkflowIdentity = false;
     const progress: string[] = [];
-    await bus.subscribeTopic(
-      outReqTopic("parent:1"),
-      { mode: "tail", offset: { type: "begin" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
-          progress.push(message.data.display);
-        }
-        await context.commit();
-      },
+    await startResultForTest(
+      bus.subscribeTopic(
+        outReqTopic("parent:1"),
+        { mode: "tail", offset: { type: "begin" } },
+        async (message) => {
+          if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+            progress.push(message.data.display);
+          }
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
@@ -698,75 +740,81 @@ describe("workflow subagent convergence", () => {
     await bridge.start();
     const parent = bridge.registerParent({ parentRequestId: "parent:1" });
     await parent.ready;
-    await bus.subscribeTopic(
-      "cmd.request",
-      { mode: "fanout", subscriptionId: "generated-agent", offset: { type: "now" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.CmdRequestMessage && message.data.queue === "prompt") {
-          childSessionId = message.headers?.session_id;
-          childRequestId = message.headers?.request_id;
-          const workflow = z
-            .object({
-              workflow: z.strictObject({
-                runId: z.string(),
-                operationId: z.string(),
-                dispatchEpoch: z.string(),
+    await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        { mode: "fanout", subscriptionId: "generated-agent", offset: { type: "now" } },
+        async (message) => {
+          if (
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            message.data.queue === "prompt"
+          ) {
+            childSessionId = message.headers?.session_id;
+            childRequestId = message.headers?.request_id;
+            const workflow = z
+              .object({
+                workflow: z.strictObject({
+                  runId: z.string(),
+                  operationId: z.string(),
+                  dispatchEpoch: z.string(),
+                }),
+              })
+              .parse(message.data.raw).workflow;
+            hasWorkflowIdentity = true;
+            if (!childRequestId || !childSessionId) {
+              throw new Error("generated workflow request authority is incomplete");
+            }
+            const authorized = store.authorizeWorkflowRequest({
+              requestId: childRequestId,
+              sessionId: childSessionId,
+              platform: "unknown",
+            });
+            if (!authorized) throw new Error("generated workflow request was not authorized");
+            expect(authorized.policy).toMatchObject({
+              profile: "explore",
+              model: null,
+              reasoning: null,
+            });
+            expect(
+              store.claimWorkflowRequest({
+                requestId: childRequestId,
+                dispatchEpoch: workflow.dispatchEpoch,
+                ownerId: "generated-runner",
+                now: Date.now(),
               }),
-            })
-            .parse(message.data.raw).workflow;
-          hasWorkflowIdentity = true;
-          if (!childRequestId || !childSessionId) {
-            throw new Error("generated workflow request authority is incomplete");
+            ).toBe(true);
+            expect(
+              store.recordWorkflowRequestTerminal({
+                requestId: childRequestId,
+                runId: authorized.policy.runId,
+                operationId: authorized.policy.operationId,
+                dispatchEpoch: workflow.dispatchEpoch,
+                ownerId: "generated-runner",
+                state: "resolved",
+                output: "engine result",
+                now: Date.now(),
+              }),
+            ).toBe(true);
+            await bus.publish(
+              lilacEventTypes.EvtAgentOutputDeltaText,
+              { delta: "checking authentication middleware" },
+              { headers: message.headers },
+            );
+            await bus.publish(
+              lilacEventTypes.EvtAgentOutputResponseText,
+              { finalText: "engine result" },
+              { headers: message.headers },
+            );
+            await bus.publish(
+              lilacEventTypes.EvtRequestLifecycleChanged,
+              { state: "resolved" },
+              { headers: message.headers },
+            );
           }
-          const authorized = store.authorizeWorkflowRequest({
-            requestId: childRequestId,
-            sessionId: childSessionId,
-            platform: "unknown",
-          });
-          if (!authorized) throw new Error("generated workflow request was not authorized");
-          expect(authorized.policy).toMatchObject({
-            profile: "explore",
-            model: null,
-            reasoning: null,
-          });
-          expect(
-            store.claimWorkflowRequest({
-              requestId: childRequestId,
-              dispatchEpoch: workflow.dispatchEpoch,
-              ownerId: "generated-runner",
-              now: Date.now(),
-            }),
-          ).toBe(true);
-          expect(
-            store.recordWorkflowRequestTerminal({
-              requestId: childRequestId,
-              runId: authorized.policy.runId,
-              operationId: authorized.policy.operationId,
-              dispatchEpoch: workflow.dispatchEpoch,
-              ownerId: "generated-runner",
-              state: "resolved",
-              output: "engine result",
-              now: Date.now(),
-            }),
-          ).toBe(true);
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputDeltaText,
-            { delta: "checking authentication middleware" },
-            { headers: message.headers },
-          );
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            { finalText: "engine result" },
-            { headers: message.headers },
-          );
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            { state: "resolved" },
-            { headers: message.headers },
-          );
-        }
-        await context.commit();
-      },
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const engine = new WorkflowEngine({
       bus,
@@ -822,6 +870,7 @@ describe("workflow subagent convergence", () => {
       subscriptionId: "test-live-parent",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:1" });
+    await parent.ready;
 
     expect(parent.snapshot()).toMatchObject({
       hasPendingCompletions: true,
@@ -869,6 +918,7 @@ describe("workflow subagent convergence", () => {
       subscriptionId: "missing-artifact-delivery",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:1" });
+    await parent.ready;
     await expect(parent.listPendingAsync()).rejects.toThrow();
     expect(parent.snapshot().hasPendingCompletions).toBe(true);
     await parent.close();
@@ -929,6 +979,7 @@ describe("workflow subagent convergence", () => {
       subscriptionId: "partial-materialization",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:partial-materialization" });
+    await parent.ready;
 
     const settled = await parent.listPendingSettledAsync();
     expect(settled).toHaveLength(2);
@@ -992,6 +1043,7 @@ describe("workflow subagent convergence", () => {
       subscriptionId: "test-live-parent-order",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:ordered" });
+    await parent.ready;
 
     expect(parent.listPending().map((completion) => completion.runId)).toEqual([
       second.runId,
@@ -1013,6 +1065,7 @@ describe("workflow subagent convergence", () => {
       subscriptionId: "test-live-parent-cancel",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:1" });
+    await parent.ready;
     await parent.cancelAll("parent request cancelled");
 
     expect(store.getRun(run.runId)?.state).toBe("cancelled");
@@ -1204,15 +1257,18 @@ describe("workflow subagent convergence", () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const userVisibleEvents: string[] = [];
-    await bus.subscribeTopic(
-      "evt.workflow",
-      { mode: "tail", offset: { type: "begin" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.EvtWorkflowProgressRequested) {
-          userVisibleEvents.push(message.data.runId);
-        }
-        await context.commit();
-      },
+    await startResultForTest(
+      bus.subscribeTopic(
+        "evt.workflow",
+        { mode: "tail", offset: { type: "begin" } },
+        async (message) => {
+          if (message.type === lilacEventTypes.EvtWorkflowProgressRequested) {
+            userVisibleEvents.push(message.data.runId);
+          }
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,

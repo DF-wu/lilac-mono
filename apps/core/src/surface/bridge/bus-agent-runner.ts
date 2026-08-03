@@ -9,7 +9,7 @@ import {
   type ToolSet,
   type UserContent,
 } from "ai";
-import type { Panic } from "better-result";
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type {
   ConfiguredModelChainEntry,
@@ -32,6 +32,7 @@ import {
   getCoreConfig,
   isPanic,
   isRecord,
+  opaqueErrorMessage,
   ModelCapability,
   openAIMessagePhase,
   resolveCoreConfigPath,
@@ -53,6 +54,8 @@ import {
   type AdapterPlatform,
   type CoreLineageManifestV1,
   type CorePrimaryLineageV1,
+  type DecodedLilacMessageForTopic,
+  type DeliveryDisposition,
   type LilacBus,
   type RequestLifecycleState,
   type RequestOrigin,
@@ -280,6 +283,82 @@ export function rethrowBusAgentRunnerPanic(
   if (!isPanic(cause)) return;
   beforeRethrow?.(cause);
   throw cause;
+}
+
+export class BusAgentRunnerRequestHeadersInvalid extends TaggedError(
+  "BusAgentRunnerRequestHeadersInvalid",
+)<{
+  readonly missing: readonly ("request_id" | "session_id")[];
+  readonly message: string;
+}> {}
+
+export class BusAgentRunnerIntakeFailed extends TaggedError("BusAgentRunnerIntakeFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BusAgentRunnerOperationFailed extends TaggedError("BusAgentRunnerOperationFailed")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export async function captureBusAgentRunnerOperation<T>(
+  operation: string,
+  run: () => T | Promise<T>,
+  beforePanicRethrow?: (panic: Panic) => void,
+): Promise<ResultType<Awaited<T>, BusAgentRunnerOperationFailed>> {
+  try {
+    return Result.ok(await run());
+  } catch (cause) {
+    rethrowBusAgentRunnerPanic(cause, beforePanicRethrow);
+    return Result.err(
+      new BusAgentRunnerOperationFailed({
+        operation,
+        cause,
+        message: opaqueErrorMessage(cause, `${operation} failed`),
+      }),
+    );
+  }
+}
+
+export function signalBusAgentRunnerHostFailure(
+  failure: Error | BusAgentRunnerOperationFailed,
+): never {
+  throw failure instanceof BusAgentRunnerOperationFailed ? failure.cause : failure;
+}
+
+type BusAgentRunnerErrorProjection = {
+  readonly message: string;
+  readonly details?: ReturnType<typeof extractAiErrorLogDetails>;
+};
+
+export function projectBusAgentRunnerError(
+  cause: unknown,
+  fallback = "Agent runner operation failed",
+): BusAgentRunnerErrorProjection {
+  const message = opaqueErrorMessage(cause, fallback);
+  try {
+    const details = extractAiErrorLogDetails(cause);
+    return details ? { message, details } : { message };
+  } catch {
+    return { message };
+  }
+}
+
+export type BusAgentRunnerDeliveryError =
+  | BusAgentRunnerRequestHeadersInvalid
+  | BusAgentRunnerIntakeFailed;
+
+export function busAgentRunnerDeliveryDisposition(
+  error: BusAgentRunnerDeliveryError,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "BusAgentRunnerRequestHeadersInvalid":
+      return "dead-letter";
+    case "BusAgentRunnerIntakeFailed":
+      return "park-pending";
+  }
 }
 
 export async function rethrowBusAgentRunnerCleanupDefect(
@@ -1576,10 +1655,7 @@ const SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS = 3;
 export const WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS = 10_000;
 
 function isCancelControlEntry(entry: Enqueued): boolean {
-  const raw = entry.raw;
-  if (!raw || typeof raw !== "object") return false;
-  const v = (raw as Record<string, unknown>)["cancel"];
-  return v === true;
+  return parseRequestControlFromRaw(entry.raw).cancel;
 }
 
 function collectBufferedPromptEntriesForActiveRequest(input: {
@@ -2098,29 +2174,28 @@ export async function startBusAgentRunner(params: {
   async function reloadCoreConfigIfNeeded(): Promise<void> {
     if (params.config) return;
 
-    try {
-      cfg = await getCoreConfig();
-
-      if (coreConfigReloadHadError) {
-        logger.info("core-config reload recovered", {
-          path: "core-config.yaml",
-        });
-      }
-
-      coreConfigReloadHadError = false;
-      lastCoreConfigReloadError = null;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
+    const loaded = await captureBusAgentRunnerOperation("core config reload", getCoreConfig);
+    if (loaded.status === "error") {
+      const message = loaded.error.message;
+      if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
         logger.warn("core-config reload failed; using last known config", {
           path: "core-config.yaml",
-          error: msg,
+          error: message,
         });
       }
-
       coreConfigReloadHadError = true;
-      lastCoreConfigReloadError = msg;
+      lastCoreConfigReloadError = message;
+      return;
     }
+
+    cfg = loaded.value;
+    if (coreConfigReloadHadError) {
+      logger.info("core-config reload recovered", {
+        path: "core-config.yaml",
+      });
+    }
+    coreConfigReloadHadError = false;
+    lastCoreConfigReloadError = null;
   }
   const cwd = params.cwd ?? process.env.LILAC_WORKSPACE_DIR ?? process.cwd();
   const workflowRunnerOwnerId = `agent-runner:${process.pid}:${crypto.randomUUID()}`;
@@ -2150,7 +2225,520 @@ export async function startBusAgentRunner(params: {
     void operation.catch(observeSupervisedDrainRejection);
   }
 
-  const sub = await bus.subscribeTopic(
+  type CmdRequestMessage = Extract<
+    DecodedLilacMessageForTopic<"cmd.request">,
+    { type: typeof lilacEventTypes.CmdRequestMessage }
+  >;
+
+  async function handleCmdRequestMessage(
+    msg: CmdRequestMessage,
+  ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> {
+    const requestId = msg.headers?.request_id;
+    const sessionId = msg.headers?.session_id;
+    const requestClient = msg.headers?.request_client ?? "unknown";
+    if (!requestId || !sessionId) {
+      const missing: ("request_id" | "session_id")[] = [];
+      if (!requestId) missing.push("request_id");
+      if (!sessionId) missing.push("session_id");
+      return Result.err(
+        new BusAgentRunnerRequestHeadersInvalid({
+          missing,
+          message: "cmd.request.message missing required request/session headers",
+        }),
+      );
+    }
+
+    try {
+      await (async () => {
+        rethrowBusAgentRunnerPanic(terminalPanic);
+
+        if (env.perf.log) {
+          const lagMs = Date.now() - msg.ts;
+          const shouldWarn = lagMs >= env.perf.lagWarnMs;
+          const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
+          if (shouldWarn || shouldSample) {
+            if (shouldWarn) {
+              logger.warn("perf.bus_lag", {
+                stage: "cmd.request->agent_runner",
+                lagMs,
+                requestId,
+                sessionId,
+                requestClient,
+                queue: msg.data.queue,
+              });
+            } else {
+              logger.info("perf.bus_lag", {
+                stage: "cmd.request->agent_runner",
+                lagMs,
+                requestId,
+                sessionId,
+                requestClient,
+                queue: msg.data.queue,
+              });
+            }
+          }
+        }
+
+        logger.debug("cmd.request.message received", {
+          requestId,
+          sessionId,
+          requestClient,
+          queue: msg.data.queue,
+          runPolicy: msg.data.runPolicy ?? "normal",
+          originKind: msg.data.origin?.kind,
+          modelOverride: msg.data.modelOverride,
+          messageCount: msg.data.messages.length,
+        });
+
+        // reload config opportunistically (mtime cached in getCoreConfig).
+        // If reload fails, keep using the last known good config.
+        await reloadCoreConfigIfNeeded();
+
+        const intakeRunProfile = parseSubagentMetaFromRaw(msg.data.raw).profile;
+        const entry: Enqueued = {
+          requestId,
+          sessionId,
+          requestClient,
+          queue: msg.data.queue,
+          runPolicy: msg.data.runPolicy ?? "normal",
+          origin: msg.data.origin,
+          messages: msg.data.messages,
+          corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
+            requestClient,
+            sessionId,
+            runProfile: intakeRunProfile,
+            messages: msg.data.messages,
+            corePrimaryLineage: msg.data.corePrimaryLineage,
+            transcriptStore: params.transcriptStore,
+          }),
+          modelOverride: msg.data.modelOverride,
+          raw: msg.data.raw,
+        };
+
+        const requestControl = parseRequestControlFromRaw(entry.raw);
+
+        const state =
+          bySession.get(sessionId) ??
+          ({
+            running: false,
+            agent: null,
+            queue: [] as Enqueued[],
+            activeRequestId: null,
+            activeRun: null,
+            compactedToolCallIds: new Set<string>(),
+          } satisfies SessionQueue);
+        bySession.set(sessionId, state);
+
+        const logQueueTransition = (input: {
+          action: string;
+          queueDepthBefore: number;
+          queueDepthAfter: number;
+          reason?: string;
+          activeRequestId?: string | null;
+        }) => {
+          logger.info("agent.queue.transition", {
+            requestId,
+            sessionId,
+            requestClient,
+            queueMode: entry.queue,
+            running: state.running,
+            queueDepthBefore: input.queueDepthBefore,
+            queueDepthAfter: input.queueDepthAfter,
+            action: input.action,
+            reason: input.reason,
+            activeRequestId: input.activeRequestId ?? state.activeRequestId,
+            draining,
+          });
+        };
+
+        if (
+          !requestControl.cancel &&
+          shouldCancelRunPolicyRequest({ runPolicy: entry.runPolicy, sessionId, states: bySession })
+        ) {
+          await publishLifecycle({
+            bus,
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: requestClient,
+            },
+            state: "cancelled",
+            detail:
+              entry.runPolicy === "idle_only_session"
+                ? "idle_only_session_busy"
+                : "idle_only_global_busy",
+          });
+          logQueueTransition({
+            action: "drop",
+            queueDepthBefore: state.queue.length,
+            queueDepthAfter: state.queue.length,
+            reason:
+              entry.runPolicy === "idle_only_session"
+                ? "idle_only_session_busy"
+                : "idle_only_global_busy",
+          });
+          return;
+        }
+
+        if (draining) {
+          logger.info("dropping request message while draining", {
+            requestId,
+            sessionId,
+            queue: msg.data.queue,
+          });
+          logQueueTransition({
+            action: "drop",
+            queueDepthBefore: state.queue.length,
+            queueDepthAfter: state.queue.length,
+            reason: "draining",
+          });
+          return;
+        }
+
+        const dropCancelNoTarget = async (reason: string) => {
+          logger.info("dropping cancel request with no target", {
+            requestId,
+            sessionId,
+            queue: entry.queue,
+            activeRequestId: state.activeRequestId,
+            reason,
+          });
+          logQueueTransition({
+            action: "drop",
+            queueDepthBefore: state.queue.length,
+            queueDepthAfter: state.queue.length,
+            reason,
+          });
+        };
+
+        if (requestControl.cancel && requestControl.cancelQueued) {
+          const removed = new Map<string, AdapterPlatform>();
+
+          const removedByRequestId = removeQueuedEntries(
+            state.queue,
+            (queued) => queued.requestId === requestId,
+          );
+          for (const queued of removedByRequestId) {
+            removed.set(queued.requestId, queued.requestClient);
+          }
+
+          const targetMessageId = requestControl.targetMessageId;
+          if (targetMessageId) {
+            const removedByMessage = removeQueuedEntries(state.queue, (queued) =>
+              requestRawReferencesMessage(queued.raw, targetMessageId),
+            );
+            for (const queued of removedByMessage) {
+              removed.set(queued.requestId, queued.requestClient);
+            }
+          }
+
+          if (removed.size > 0) {
+            for (const [cancelledRequestId, cancelledRequestClient] of removed) {
+              await publishLifecycle({
+                bus,
+                headers: {
+                  request_id: cancelledRequestId,
+                  session_id: sessionId,
+                  request_client: cancelledRequestClient,
+                },
+                state: "cancelled",
+                detail: "cancelled while queued",
+              });
+            }
+
+            logger.info("queued request cancelled", {
+              requestId,
+              sessionId,
+              cancelledRequestIds: [...removed.keys()],
+              queueDepth: state.queue.length,
+            });
+            logQueueTransition({
+              action: "cancel_queued",
+              queueDepthBefore: state.queue.length + removed.size,
+              queueDepthAfter: state.queue.length,
+              reason: "cancel_queued",
+            });
+
+            if (!state.running) {
+              startSessionQueueDrain(sessionId, state, requestId);
+            }
+
+            return;
+          }
+
+          const targetMessageIdForActive = requestControl.targetMessageId;
+          const targetMatchesActive =
+            typeof targetMessageIdForActive === "string" &&
+            requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
+
+          if (
+            !state.running ||
+            !state.activeRequestId ||
+            (!state.agent && !state.activeRun?.cancel)
+          ) {
+            await dropCancelNoTarget("request not queued or active");
+            return;
+          }
+
+          if (state.activeRequestId === requestId || targetMatchesActive) {
+            const activeCancelEntry: Enqueued = {
+              ...entry,
+              requestId: state.activeRequestId,
+              requestClient: state.activeRun?.requestClient ?? entry.requestClient,
+            };
+            if (state.activeRun?.started === false) {
+              state.activeRun.cancel();
+            } else if (state.agent) {
+              await applyToRunningAgent(
+                state.agent,
+                activeCancelEntry,
+                cancelledByRequestId,
+                state.activeRun,
+              );
+            }
+            logQueueTransition({
+              action: "apply_to_active",
+              queueDepthBefore: state.queue.length,
+              queueDepthAfter: state.queue.length,
+              reason: targetMatchesActive
+                ? "cancel_active_by_message_id"
+                : "cancel_active_by_request_id",
+            });
+            return;
+          }
+
+          await dropCancelNoTarget("request not queued or active");
+          return;
+        }
+
+        if (!state.running) {
+          if (requestControl.cancel) {
+            await dropCancelNoTarget("request not active");
+            return;
+          }
+
+          // Some messages only make sense when a run is already active.
+          if (requestControl.requiresActive && entry.queue !== "prompt") {
+            logger.info("dropping request message (requires active run)", {
+              requestId,
+              sessionId,
+              queue: entry.queue,
+            });
+            logQueueTransition({
+              action: "drop",
+              queueDepthBefore: state.queue.length,
+              queueDepthAfter: state.queue.length,
+              reason: "requires_active_without_run",
+            });
+            return;
+          }
+
+          const queueDepthBefore = state.queue.length;
+          state.queue.push(entry);
+          logQueueTransition({
+            action: "enqueue",
+            queueDepthBefore,
+            queueDepthAfter: state.queue.length,
+            reason: "start_when_idle",
+          });
+          startSessionQueueDrain(sessionId, state, requestId);
+        } else {
+          if (
+            state.activeRequestId === requestId &&
+            requestControl.cancel &&
+            state.activeRun?.started === false &&
+            state.activeRun?.cancel
+          ) {
+            state.activeRun.cancel();
+            logQueueTransition({
+              action: "apply_to_active",
+              queueDepthBefore: state.queue.length,
+              queueDepthAfter: state.queue.length,
+              reason: "cancel_active_before_agent_start",
+            });
+            return;
+          }
+
+          if (
+            state.activeRequestId === requestId &&
+            !requestControl.cancel &&
+            state.activeRun?.runProfile === "primary"
+          ) {
+            const activeRun = state.activeRun;
+            const incomingOverride =
+              entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
+            let incompatible =
+              activeRun.resolvedModelSpec === null &&
+              incomingOverride !== undefined &&
+              incomingOverride !== activeRun.modelOverride;
+            if (
+              incomingOverride !== undefined &&
+              activeRun.resolvedModelSpec !== null &&
+              activeRun.resolvedProviderFamily !== null
+            ) {
+              try {
+                const requested = resolveAgentRunModel({
+                  cfg,
+                  runProfile: "primary",
+                  requestModelOverride: incomingOverride,
+                }).head;
+                incompatible = shouldQueueIncompatibleActiveRuntimeModel({
+                  activeSpec: activeRun.resolvedModelSpec,
+                  activeReasoning: activeRun.resolvedReasoning,
+                  activeFamily: activeRun.resolvedProviderFamily,
+                  requested,
+                });
+              } catch {
+                incompatible = true;
+              }
+            }
+            if (incompatible) {
+              const queuedEntry: Enqueued = {
+                ...entry,
+                requestId: modelChangingRequestId(entry),
+                queue: "prompt",
+              };
+              const queueDepthBefore = state.queue.length;
+              state.queue.push(queuedEntry);
+              await publishLifecycle({
+                bus,
+                headers: {
+                  request_id: queuedEntry.requestId,
+                  session_id: sessionId,
+                  request_client: requestClient,
+                },
+                state: "queued",
+                detail: "queued for incompatible model or reasoning selection",
+              });
+              logQueueTransition({
+                action: "enqueue",
+                queueDepthBefore,
+                queueDepthAfter: state.queue.length,
+                reason: "incompatible_active_model",
+              });
+              return;
+            }
+          }
+
+          // If the message is intended for the currently active request, apply immediately.
+          if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
+            const queueDepthBefore = state.queue.length;
+            const shouldAbsorbBufferedPrompts =
+              (entry.queue === "steer" || entry.queue === "interrupt") &&
+              !isCancelControlEntry(entry);
+
+            const bufferedPrompts = shouldAbsorbBufferedPrompts
+              ? collectBufferedPromptEntriesForActiveRequest({
+                  queue: state.queue,
+                  activeRequestId: requestId,
+                })
+              : [];
+
+            const mergedEntry =
+              bufferedPrompts.length > 0
+                ? ({
+                    ...entry,
+                    messages: [
+                      ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
+                      ...entry.messages,
+                    ],
+                    corePrimaryLineage: degradeCorePrimaryLineageForMutation(
+                      "queued-buffer-absorbed-into-steering",
+                      state.agent.state.messages.length,
+                    ),
+                  } satisfies Enqueued)
+                : entry;
+
+            await applyToRunningAgent(
+              state.agent,
+              mergedEntry,
+              cancelledByRequestId,
+              state.activeRun,
+            );
+
+            if (bufferedPrompts.length > 0) {
+              const absorbMode: "steer" | "interrupt" =
+                entry.queue === "interrupt" ? "interrupt" : "steer";
+              removeQueuedEntriesByReference(state.queue, bufferedPrompts);
+              await publishAbsorbedQueuedPromptCancelled({
+                bus,
+                sessionId,
+                entries: bufferedPrompts,
+                mode: absorbMode,
+              });
+            }
+
+            logQueueTransition({
+              action: "apply_to_active",
+              queueDepthBefore,
+              queueDepthAfter: state.queue.length,
+              reason:
+                bufferedPrompts.length > 0
+                  ? `same_request_id_absorbed_${bufferedPrompts.length}`
+                  : "same_request_id",
+            });
+          } else {
+            // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
+            // an unrelated active request.
+            if (requestControl.requiresActive || requestControl.cancel) {
+              logger.info("dropping request message (requires active request id)", {
+                requestId,
+                sessionId,
+                activeRequestId: state.activeRequestId,
+                queue: entry.queue,
+              });
+              logQueueTransition({
+                action: "drop",
+                queueDepthBefore: state.queue.length,
+                queueDepthAfter: state.queue.length,
+                reason: "requires_active_different_request_id",
+              });
+              return;
+            }
+
+            // No parallel runs: queue prompt messages for later.
+            const queueDepthBefore = state.queue.length;
+            state.queue.push(entry);
+
+            await publishLifecycle({
+              bus,
+              headers: {
+                request_id: requestId,
+                session_id: sessionId,
+                request_client: requestClient,
+              },
+              state: "queued",
+              detail: "queued behind active request",
+            });
+
+            logger.info("request queued behind active run", {
+              requestId,
+              sessionId,
+              activeRequestId: state.activeRequestId,
+              queueDepth: state.queue.length,
+            });
+            logQueueTransition({
+              action: "enqueue",
+              queueDepthBefore,
+              queueDepthAfter: state.queue.length,
+              reason: "queued_behind_active",
+            });
+          }
+        }
+      })();
+      return Result.ok(undefined);
+    } catch (cause) {
+      rethrowBusAgentRunnerPanic(cause);
+      return Result.err(
+        new BusAgentRunnerIntakeFailed({
+          cause,
+          message: "cmd.request.message intake failed",
+        }),
+      );
+    }
+  }
+
+  const startedSubscription = await bus.subscribeTopic(
     "cmd.request",
     {
       mode: "work",
@@ -2159,512 +2747,41 @@ export async function startBusAgentRunner(params: {
       offset: { type: "begin" },
       batch: { maxWaitMs: 1000 },
     },
-    async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.CmdRequestMessage) {
-        await ctx.commit();
-        return;
+    async (msg) => {
+      switch (msg.type) {
+        case lilacEventTypes.CmdRequestMessage:
+          return await handleCmdRequestMessage(msg);
       }
-
-      const requestId = msg.headers?.request_id;
-      const sessionId = msg.headers?.session_id;
-      const requestClient = msg.headers?.request_client ?? "unknown";
-      if (!requestId || !sessionId) {
-        throw new Error("cmd.request.message missing required headers.request_id/session_id");
-      }
-      rethrowBusAgentRunnerPanic(terminalPanic);
-
-      if (env.perf.log) {
-        const lagMs = Date.now() - msg.ts;
-        const shouldWarn = lagMs >= env.perf.lagWarnMs;
-        const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
-        if (shouldWarn || shouldSample) {
-          if (shouldWarn) {
-            logger.warn("perf.bus_lag", {
-              stage: "cmd.request->agent_runner",
-              lagMs,
-              requestId,
-              sessionId,
-              requestClient,
-              queue: msg.data.queue,
-            });
-          } else {
-            logger.info("perf.bus_lag", {
-              stage: "cmd.request->agent_runner",
-              lagMs,
-              requestId,
-              sessionId,
-              requestClient,
-              queue: msg.data.queue,
-            });
-          }
-        }
-      }
-
-      logger.debug("cmd.request.message received", {
-        requestId,
-        sessionId,
-        requestClient,
-        queue: msg.data.queue,
-        runPolicy: msg.data.runPolicy ?? "normal",
-        originKind: msg.data.origin?.kind,
-        modelOverride: msg.data.modelOverride,
-        messageCount: msg.data.messages.length,
-      });
-
-      // reload config opportunistically (mtime cached in getCoreConfig).
-      // If reload fails, keep using the last known good config.
-      await reloadCoreConfigIfNeeded();
-
-      const intakeRunProfile = parseSubagentMetaFromRaw(msg.data.raw).profile;
-      const entry: Enqueued = {
-        requestId,
-        sessionId,
-        requestClient,
-        queue: msg.data.queue,
-        runPolicy: msg.data.runPolicy ?? "normal",
-        origin: msg.data.origin,
-        messages: msg.data.messages,
-        corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
-          requestClient,
-          sessionId,
-          runProfile: intakeRunProfile,
-          messages: msg.data.messages,
-          corePrimaryLineage: msg.data.corePrimaryLineage,
-          transcriptStore: params.transcriptStore,
-        }),
-        modelOverride: msg.data.modelOverride,
-        raw: msg.data.raw,
-      };
-
-      const requestControl = parseRequestControlFromRaw(entry.raw);
-
-      const state =
-        bySession.get(sessionId) ??
-        ({
-          running: false,
-          agent: null,
-          queue: [] as Enqueued[],
-          activeRequestId: null,
-          activeRun: null,
-          compactedToolCallIds: new Set<string>(),
-        } satisfies SessionQueue);
-      bySession.set(sessionId, state);
-
-      const logQueueTransition = (input: {
-        action: string;
-        queueDepthBefore: number;
-        queueDepthAfter: number;
-        reason?: string;
-        activeRequestId?: string | null;
-      }) => {
-        logger.info("agent.queue.transition", {
-          requestId,
-          sessionId,
-          requestClient,
-          queueMode: entry.queue,
-          running: state.running,
-          queueDepthBefore: input.queueDepthBefore,
-          queueDepthAfter: input.queueDepthAfter,
-          action: input.action,
-          reason: input.reason,
-          activeRequestId: input.activeRequestId ?? state.activeRequestId,
-          draining,
-        });
-      };
-
-      if (
-        !requestControl.cancel &&
-        shouldCancelRunPolicyRequest({ runPolicy: entry.runPolicy, sessionId, states: bySession })
-      ) {
-        await publishLifecycle({
-          bus,
-          headers: {
-            request_id: requestId,
-            session_id: sessionId,
-            request_client: requestClient,
-          },
-          state: "cancelled",
-          detail:
-            entry.runPolicy === "idle_only_session"
-              ? "idle_only_session_busy"
-              : "idle_only_global_busy",
-        });
-        logQueueTransition({
-          action: "drop",
-          queueDepthBefore: state.queue.length,
-          queueDepthAfter: state.queue.length,
-          reason:
-            entry.runPolicy === "idle_only_session"
-              ? "idle_only_session_busy"
-              : "idle_only_global_busy",
-        });
-        await ctx.commit();
-        return;
-      }
-
-      if (draining) {
-        logger.info("dropping request message while draining", {
-          requestId,
-          sessionId,
-          queue: msg.data.queue,
-        });
-        logQueueTransition({
-          action: "drop",
-          queueDepthBefore: state.queue.length,
-          queueDepthAfter: state.queue.length,
-          reason: "draining",
-        });
-        await ctx.commit();
-        return;
-      }
-
-      const dropCancelNoTarget = async (reason: string) => {
-        logger.info("dropping cancel request with no target", {
-          requestId,
-          sessionId,
-          queue: entry.queue,
-          activeRequestId: state.activeRequestId,
-          reason,
-        });
-        logQueueTransition({
-          action: "drop",
-          queueDepthBefore: state.queue.length,
-          queueDepthAfter: state.queue.length,
-          reason,
-        });
-        await ctx.commit();
-      };
-
-      if (requestControl.cancel && requestControl.cancelQueued) {
-        const removed = new Map<string, AdapterPlatform>();
-
-        const removedByRequestId = removeQueuedEntries(
-          state.queue,
-          (queued) => queued.requestId === requestId,
-        );
-        for (const queued of removedByRequestId) {
-          removed.set(queued.requestId, queued.requestClient);
-        }
-
-        const targetMessageId = requestControl.targetMessageId;
-        if (targetMessageId) {
-          const removedByMessage = removeQueuedEntries(state.queue, (queued) =>
-            requestRawReferencesMessage(queued.raw, targetMessageId),
-          );
-          for (const queued of removedByMessage) {
-            removed.set(queued.requestId, queued.requestClient);
-          }
-        }
-
-        if (removed.size > 0) {
-          for (const [cancelledRequestId, cancelledRequestClient] of removed) {
-            await publishLifecycle({
-              bus,
-              headers: {
-                request_id: cancelledRequestId,
-                session_id: sessionId,
-                request_client: cancelledRequestClient,
-              },
-              state: "cancelled",
-              detail: "cancelled while queued",
-            });
-          }
-
-          logger.info("queued request cancelled", {
-            requestId,
-            sessionId,
-            cancelledRequestIds: [...removed.keys()],
-            queueDepth: state.queue.length,
-          });
-          logQueueTransition({
-            action: "cancel_queued",
-            queueDepthBefore: state.queue.length + removed.size,
-            queueDepthAfter: state.queue.length,
-            reason: "cancel_queued",
-          });
-
-          if (!state.running) {
-            startSessionQueueDrain(sessionId, state, requestId);
-          }
-
-          await ctx.commit();
-          return;
-        }
-
-        const targetMessageIdForActive = requestControl.targetMessageId;
-        const targetMatchesActive =
-          typeof targetMessageIdForActive === "string" &&
-          requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
-
-        if (
-          !state.running ||
-          !state.activeRequestId ||
-          (!state.agent && !state.activeRun?.cancel)
-        ) {
-          await dropCancelNoTarget("request not queued or active");
-          return;
-        }
-
-        if (state.activeRequestId === requestId || targetMatchesActive) {
-          const activeCancelEntry: Enqueued = {
-            ...entry,
-            requestId: state.activeRequestId,
-            requestClient: state.activeRun?.requestClient ?? entry.requestClient,
-          };
-          if (state.activeRun?.started === false) {
-            state.activeRun.cancel();
-          } else if (state.agent) {
-            await applyToRunningAgent(
-              state.agent,
-              activeCancelEntry,
-              cancelledByRequestId,
-              state.activeRun,
-            );
-          }
-          logQueueTransition({
-            action: "apply_to_active",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason: targetMatchesActive
-              ? "cancel_active_by_message_id"
-              : "cancel_active_by_request_id",
-          });
-          await ctx.commit();
-          return;
-        }
-
-        await dropCancelNoTarget("request not queued or active");
-        return;
-      }
-
-      if (!state.running) {
-        if (requestControl.cancel) {
-          await dropCancelNoTarget("request not active");
-          return;
-        }
-
-        // Some messages only make sense when a run is already active.
-        if (requestControl.requiresActive && entry.queue !== "prompt") {
-          logger.info("dropping request message (requires active run)", {
-            requestId,
-            sessionId,
-            queue: entry.queue,
-          });
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason: "requires_active_without_run",
-          });
-          await ctx.commit();
-          return;
-        }
-
-        const queueDepthBefore = state.queue.length;
-        state.queue.push(entry);
-        logQueueTransition({
-          action: "enqueue",
-          queueDepthBefore,
-          queueDepthAfter: state.queue.length,
-          reason: "start_when_idle",
-        });
-        startSessionQueueDrain(sessionId, state, requestId);
-      } else {
-        if (
-          state.activeRequestId === requestId &&
-          requestControl.cancel &&
-          state.activeRun?.started === false &&
-          state.activeRun?.cancel
-        ) {
-          state.activeRun.cancel();
-          logQueueTransition({
-            action: "apply_to_active",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason: "cancel_active_before_agent_start",
-          });
-          await ctx.commit();
-          return;
-        }
-
-        if (
-          state.activeRequestId === requestId &&
-          !requestControl.cancel &&
-          state.activeRun?.runProfile === "primary"
-        ) {
-          const activeRun = state.activeRun;
-          const incomingOverride =
-            entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
-          let incompatible =
-            activeRun.resolvedModelSpec === null &&
-            incomingOverride !== undefined &&
-            incomingOverride !== activeRun.modelOverride;
-          if (
-            incomingOverride !== undefined &&
-            activeRun.resolvedModelSpec !== null &&
-            activeRun.resolvedProviderFamily !== null
-          ) {
-            try {
-              const requested = resolveAgentRunModel({
-                cfg,
-                runProfile: "primary",
-                requestModelOverride: incomingOverride,
-              }).head;
-              incompatible = shouldQueueIncompatibleActiveRuntimeModel({
-                activeSpec: activeRun.resolvedModelSpec,
-                activeReasoning: activeRun.resolvedReasoning,
-                activeFamily: activeRun.resolvedProviderFamily,
-                requested,
-              });
-            } catch {
-              incompatible = true;
-            }
-          }
-          if (incompatible) {
-            const queuedEntry: Enqueued = {
-              ...entry,
-              requestId: modelChangingRequestId(entry),
-              queue: "prompt",
-            };
-            const queueDepthBefore = state.queue.length;
-            state.queue.push(queuedEntry);
-            await publishLifecycle({
-              bus,
-              headers: {
-                request_id: queuedEntry.requestId,
-                session_id: sessionId,
-                request_client: requestClient,
-              },
-              state: "queued",
-              detail: "queued for incompatible model or reasoning selection",
-            });
-            logQueueTransition({
-              action: "enqueue",
-              queueDepthBefore,
-              queueDepthAfter: state.queue.length,
-              reason: "incompatible_active_model",
-            });
-            await ctx.commit();
-            return;
-          }
-        }
-
-        // If the message is intended for the currently active request, apply immediately.
-        if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
-          const queueDepthBefore = state.queue.length;
-          const shouldAbsorbBufferedPrompts =
-            (entry.queue === "steer" || entry.queue === "interrupt") &&
-            !isCancelControlEntry(entry);
-
-          const bufferedPrompts = shouldAbsorbBufferedPrompts
-            ? collectBufferedPromptEntriesForActiveRequest({
-                queue: state.queue,
-                activeRequestId: requestId,
-              })
-            : [];
-
-          const mergedEntry =
-            bufferedPrompts.length > 0
-              ? ({
-                  ...entry,
-                  messages: [
-                    ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
-                    ...entry.messages,
-                  ],
-                  corePrimaryLineage: degradeCorePrimaryLineageForMutation(
-                    "queued-buffer-absorbed-into-steering",
-                    state.agent.state.messages.length,
-                  ),
-                } satisfies Enqueued)
-              : entry;
-
-          await applyToRunningAgent(
-            state.agent,
-            mergedEntry,
-            cancelledByRequestId,
-            state.activeRun,
-          );
-
-          if (bufferedPrompts.length > 0) {
-            const absorbMode: "steer" | "interrupt" =
-              entry.queue === "interrupt" ? "interrupt" : "steer";
-            removeQueuedEntriesByReference(state.queue, bufferedPrompts);
-            await publishAbsorbedQueuedPromptCancelled({
-              bus,
-              sessionId,
-              entries: bufferedPrompts,
-              mode: absorbMode,
-            });
-          }
-
-          logQueueTransition({
-            action: "apply_to_active",
-            queueDepthBefore,
-            queueDepthAfter: state.queue.length,
-            reason:
-              bufferedPrompts.length > 0
-                ? `same_request_id_absorbed_${bufferedPrompts.length}`
-                : "same_request_id",
-          });
-        } else {
-          // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
-          // an unrelated active request.
-          if (requestControl.requiresActive || requestControl.cancel) {
-            logger.info("dropping request message (requires active request id)", {
-              requestId,
-              sessionId,
-              activeRequestId: state.activeRequestId,
-              queue: entry.queue,
-            });
-            logQueueTransition({
-              action: "drop",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: "requires_active_different_request_id",
-            });
-            await ctx.commit();
-            return;
-          }
-
-          // No parallel runs: queue prompt messages for later.
-          const queueDepthBefore = state.queue.length;
-          state.queue.push(entry);
-
-          await publishLifecycle({
-            bus,
-            headers: {
-              request_id: requestId,
-              session_id: sessionId,
-              request_client: requestClient,
-            },
-            state: "queued",
-            detail: "queued behind active request",
-          });
-
-          logger.info("request queued behind active run", {
-            requestId,
-            sessionId,
-            activeRequestId: state.activeRequestId,
-            queueDepth: state.queue.length,
-          });
-          logQueueTransition({
-            action: "enqueue",
-            queueDepthBefore,
-            queueDepthAfter: state.queue.length,
-            reason: "queued_behind_active",
-          });
-        }
-      }
-
-      await ctx.commit();
     },
+    busAgentRunnerDeliveryDisposition,
   );
+  if (startedSubscription.status === "error") throw startedSubscription.error;
+  const sub = startedSubscription.value;
+
+  const subscriptionDone = sub.done.then((done) => {
+    if (done.status === "error") throw done.error;
+  });
+  const superviseSubscriptionDone = (cause: unknown): void => {
+    rethrowBusAgentRunnerPanic(cause, (panic) => {
+      terminalPanic ??= panic;
+      params.reportFatalPanic(panic);
+    });
+    logger.error("cmd.request subscription stopped", {
+      error: cause instanceof Error ? cause.message : String(cause),
+    });
+  };
+  const observeSupervisedSubscriptionDoneRejection = (): void => undefined;
+  const supervisedSubscriptionDone = subscriptionDone.catch(superviseSubscriptionDone);
+  void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
 
   let subscriptionStopped = false;
   const stopSubscription = async () => {
     if (subscriptionStopped) return;
     subscriptionStopped = true;
-    await sub.stop();
+    const stopped = await sub.stop();
+    if (stopped.status === "error") throw stopped.error;
+    const done = await sub.done;
+    if (done.status === "error") throw done.error;
   };
 
   function buildActiveRecoveryEntry(state: SessionQueue): AgentRunnerRecoveryEntry | null {
@@ -2887,6 +3004,10 @@ export async function startBusAgentRunner(params: {
     let claudeCodeRun: MaterializedClaudeCodeRun | null = null;
     let coreNamedClaudeRuntime: CoreNamedClaudeRuntime | null = null;
     let corePrimaryClaudeRuntime: CorePrimaryClaudeRuntime | null = null;
+    const getClaudeCodeRun = (): MaterializedClaudeCodeRun | null => claudeCodeRun;
+    const getCoreNamedClaudeRuntime = (): CoreNamedClaudeRuntime | null => coreNamedClaudeRuntime;
+    const getCorePrimaryClaudeRuntime = (): CorePrimaryClaudeRuntime | null =>
+      corePrimaryClaudeRuntime;
     let activeRunOperation: Promise<unknown> | null = null;
     let customCommandAbortController: AbortController | null = null;
     let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
@@ -2894,7 +3015,10 @@ export async function startBusAgentRunner(params: {
     const preAgentCancellationPromise = new Promise<never>((_, reject) => {
       rejectPreAgentCancellation = reject;
     });
-    void preAgentCancellationPromise.catch(() => undefined);
+    void captureBusAgentRunnerOperation(
+      "pre-agent cancellation observation",
+      () => preAgentCancellationPromise,
+    );
     let unsubscribe = () => {};
     let unsubscribeCompaction = () => {};
 
@@ -2911,17 +3035,28 @@ export async function startBusAgentRunner(params: {
       ...(workflowDispatchEpoch ? { workflow_dispatch_epoch: workflowDispatchEpoch } : {}),
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
     };
+    const reportOutputPublisherError = (label: string, cause: unknown): void => {
+      const error = projectBusAgentRunnerError(cause, `Failed to publish ${label}`);
+      logger.error(`failed to publish ${label}`, {
+        requestId: headers.request_id,
+        sessionId: headers.session_id,
+        error: error.message,
+      });
+    };
     const outputPublisher = createAgentOutputPublisher({
       bus,
       headers,
-      onError: (label, error) => {
-        logger.error(
-          `failed to publish ${label}`,
-          { requestId: headers.request_id, sessionId: headers.session_id },
-          error,
-        );
-      },
+      onError: reportOutputPublisherError,
     });
+    const publishAuxiliaryOutput = async (
+      operation: string,
+      fields: Readonly<Record<string, unknown>>,
+      publish: () => Promise<void>,
+    ): Promise<void> => {
+      const published = await captureBusAgentRunnerOperation(operation, publish);
+      if (published.status === "ok") return;
+      logger.error(operation, { ...fields, error: published.error.message });
+    };
     let auxiliaryOutputTail = Promise.resolve();
     const publishCurrentLifecycle = async (input: {
       state: RequestLifecycleState;
@@ -2952,25 +3087,51 @@ export async function startBusAgentRunner(params: {
           now: Date.now(),
         });
         if (recorded !== true) {
-          throw new Error("Workflow terminal receipt persistence lost its fenced dispatch claim");
+          return signalBusAgentRunnerHostFailure(
+            new Error("Workflow terminal receipt persistence lost its fenced dispatch claim"),
+          );
         }
       }
       await publishLifecycle({ bus, headers, ...input });
+    };
+    const reportAgentActivityError = (cause: unknown): void => {
+      const error = projectBusAgentRunnerError(cause, "Agent activity publish failed");
+      logger.debug("agent activity publish failed", {
+        requestId: next.requestId,
+        sessionId: next.sessionId,
+        error: error.message,
+      });
     };
     const publishAgentActivity = createAgentOutputActivityPublisher({
       publish: async (source) => {
         await outputPublisher.publishActivity({ source });
       },
-      onError: (error) => {
-        logger.debug("agent activity publish failed", {
-          requestId: next.requestId,
-          sessionId: next.sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      },
+      onError: reportAgentActivityError,
     });
     const idleRetryBudget = createRetryBackoffBudget(cfg.agent.retry);
     let idleRecoveryPromise: ReturnType<AiSdkPiAgent<ToolSet>["requestIdleRecovery"]> | null = null;
+    const decideIdleRecovery = async (
+      _idleError: unknown,
+      { abortSignal }: { readonly abortSignal: AbortSignal },
+    ) => {
+      await liveParentSession?.cancelAll("parent idle timeout recovery");
+
+      await coreNamedClaudeRuntime?.retireForRetry();
+      await corePrimaryClaudeRuntime?.retireForRetry();
+      const retryResult = await captureBusAgentRunnerOperation("idle retry backoff", () =>
+        idleRetryBudget.next(abortSignal),
+      );
+      if (retryResult.status === "error" || !retryResult.value) return "fail" as const;
+      const retry = retryResult.value;
+      logger.warn("agent idle timeout; retrying", {
+        requestId: headers.request_id,
+        sessionId: headers.session_id,
+        attempt: retry.attempt,
+        maxRetries: cfg.agent.retry.maxRetries,
+        delayMs: retry.delayMs,
+      });
+      return "retry" as const;
+    };
     const runIdleWatchdog =
       runProfile === "primary"
         ? createAgentRunIdleWatchdog({
@@ -2984,25 +3145,7 @@ export async function startBusAgentRunner(params: {
               customCommandAbortController?.abort();
               const agent = activeAgent;
               if (!agent) return;
-              idleRecoveryPromise = agent.requestIdleRecovery(
-                error,
-                async (_idleError, { abortSignal }) => {
-                  await liveParentSession?.cancelAll("parent idle timeout recovery");
-
-                  await coreNamedClaudeRuntime?.retireForRetry();
-                  await corePrimaryClaudeRuntime?.retireForRetry();
-                  const retry = await idleRetryBudget.next(abortSignal).catch(() => null);
-                  if (!retry) return "fail";
-                  logger.warn("agent idle timeout; retrying", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    attempt: retry.attempt,
-                    maxRetries: cfg.agent.retry.maxRetries,
-                    delayMs: retry.delayMs,
-                  });
-                  return "retry";
-                },
-              );
+              idleRecoveryPromise = agent.requestIdleRecovery(error, decideIdleRecovery);
             },
           })
         : null;
@@ -3015,24 +3158,27 @@ export async function startBusAgentRunner(params: {
       if (!runIdleWatchdog) return await tracked;
 
       while (true) {
-        try {
-          return await runIdleWatchdog.waitFor(tracked);
-        } catch (error) {
-          const recovery = idleRecoveryPromise;
-          if (!(error instanceof AgentIdleTimeoutError) || !recovery) throw error;
-          const result = await recovery;
-          if (idleRecoveryPromise === recovery) idleRecoveryPromise = null;
-          if (
-            result.status !== "retried" &&
-            !(
-              result.status === "superseded" &&
-              (result.reason === "cancel" || result.reason === "interrupt")
-            )
-          ) {
-            throw error;
-          }
-          runIdleWatchdog.restart();
+        const waited = await captureBusAgentRunnerOperation("agent idle watchdog wait", () =>
+          runIdleWatchdog.waitFor(tracked),
+        );
+        if (waited.status === "ok") return waited.value;
+        const cause = waited.error.cause;
+        const recovery = idleRecoveryPromise;
+        if (!(cause instanceof AgentIdleTimeoutError) || !recovery) {
+          return signalBusAgentRunnerHostFailure(waited.error);
         }
+        const result = await recovery;
+        if (idleRecoveryPromise === recovery) idleRecoveryPromise = null;
+        if (
+          result.status !== "retried" &&
+          !(
+            result.status === "superseded" &&
+            (result.reason === "cancel" || result.reason === "interrupt")
+          )
+        ) {
+          return signalBusAgentRunnerHostFailure(waited.error);
+        }
+        runIdleWatchdog.restart();
       }
     };
     const getActiveRunOperation = (): Promise<unknown> | null => activeRunOperation;
@@ -3162,184 +3308,2817 @@ export async function startBusAgentRunner(params: {
     let resolvedModelLabel = "unknown";
     let resolvedProviderFamily: HistoryProviderState["lastFamily"] = "ai-sdk";
     try {
-      const looksLikeWorkflowRequest =
-        next.requestId.startsWith("wfr:") || next.sessionId.startsWith("workflow:");
-      if (workflowHint || looksLikeWorkflowRequest) {
-        if (!workflowHint || !params.durableWorkflowStore) {
-          throw new Error("Workflow request is missing server-issued dispatch authority");
-        }
-        const authorized = params.durableWorkflowStore.authorizeWorkflowRequest({
-          requestId: next.requestId,
-          sessionId: next.sessionId,
-          platform: next.requestClient,
-        });
-        if (
-          !authorized ||
-          authorized.policy.runId !== workflowHint.runId ||
-          authorized.policy.operationId !== workflowHint.operationId ||
-          authorized.policy.dispatchEpoch !== workflowHint.dispatchEpoch
-        ) {
-          throw new Error("Workflow request dispatch authority is invalid or inactive");
-        }
-        workflowDispatchEpoch = authorized.policy.dispatchEpoch;
-        headers.workflow_dispatch_epoch = workflowDispatchEpoch;
-        if (
-          !params.durableWorkflowStore.claimWorkflowRequest({
-            requestId: next.requestId,
-            dispatchEpoch: authorized.policy.dispatchEpoch,
-            ownerId: workflowRunnerOwnerId,
-            now: Date.now(),
-          })
-        ) {
-          throw new Error("Workflow request dispatch is owned by another live runner");
-        }
-        workflowRequestClaimed = true;
-        workflowPolicy = authorized.policy;
-        trustedFallbackSurface =
-          authorized.policy.originSession.sessionId &&
-          (authorized.policy.originSession.client === "discord" ||
-            authorized.policy.originSession.client === "github") &&
-          authorized.policy.originSession.userId
-            ? {
-                platform: authorized.policy.originSession.client,
-                sessionId: authorized.policy.originSession.sessionId,
-                userId: authorized.policy.originSession.userId,
+      const runResult = await captureBusAgentRunnerOperation(
+        "agent queue run",
+        async () => {
+          const looksLikeWorkflowRequest =
+            next.requestId.startsWith("wfr:") || next.sessionId.startsWith("workflow:");
+          if (workflowHint || looksLikeWorkflowRequest) {
+            if (!workflowHint || !params.durableWorkflowStore) {
+              return signalBusAgentRunnerHostFailure(
+                new Error("Workflow request is missing server-issued dispatch authority"),
+              );
+            }
+            const authorized = params.durableWorkflowStore.authorizeWorkflowRequest({
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              platform: next.requestClient,
+            });
+            if (
+              !authorized ||
+              authorized.policy.runId !== workflowHint.runId ||
+              authorized.policy.operationId !== workflowHint.operationId ||
+              authorized.policy.dispatchEpoch !== workflowHint.dispatchEpoch
+            ) {
+              return signalBusAgentRunnerHostFailure(
+                new Error("Workflow request dispatch authority is invalid or inactive"),
+              );
+            }
+            workflowDispatchEpoch = authorized.policy.dispatchEpoch;
+            headers.workflow_dispatch_epoch = workflowDispatchEpoch;
+            if (
+              !params.durableWorkflowStore.claimWorkflowRequest({
+                requestId: next.requestId,
+                dispatchEpoch: authorized.policy.dispatchEpoch,
+                ownerId: workflowRunnerOwnerId,
+                now: Date.now(),
+              })
+            ) {
+              return signalBusAgentRunnerHostFailure(
+                new Error("Workflow request dispatch is owned by another live runner"),
+              );
+            }
+            workflowRequestClaimed = true;
+            workflowPolicy = authorized.policy;
+            trustedFallbackSurface =
+              authorized.policy.originSession.sessionId &&
+              (authorized.policy.originSession.client === "discord" ||
+                authorized.policy.originSession.client === "github") &&
+              authorized.policy.originSession.userId
+                ? {
+                    platform: authorized.policy.originSession.client,
+                    sessionId: authorized.policy.originSession.sessionId,
+                    userId: authorized.policy.originSession.userId,
+                  }
+                : null;
+            workflowClaimTimer = setInterval(() => {
+              const refreshed = params.durableWorkflowStore?.refreshWorkflowRequestClaim(
+                next.requestId,
+                workflowRunnerOwnerId,
+                Date.now(),
+              );
+              if (refreshed === false) {
+                activeAgent?.abort();
+                rejectPreAgentCancellation?.(new PreAgentRunCancelledError());
               }
-            : null;
-        workflowClaimTimer = setInterval(() => {
-          const refreshed = params.durableWorkflowStore?.refreshWorkflowRequestClaim(
-            next.requestId,
-            workflowRunnerOwnerId,
-            Date.now(),
-          );
-          if (refreshed === false) {
-            activeAgent?.abort();
-            rejectPreAgentCancellation?.(new PreAgentRunCancelledError());
+            }, WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS);
+            workflowClaimTimer.unref?.();
           }
-        }, WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS);
-        workflowClaimTimer.unref?.();
-      }
-      if (workflowPolicy) assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
-      const stableNamedContinuation = resolveCoreStableNamedContinuation({
-        runProfile,
-        sessionId: next.sessionId,
-        workflowPolicy,
-      });
-      const maxSubagentDepth = subagents.maxDepth;
-      if (subagentMeta.depth > maxSubagentDepth) {
-        const detail = `subagent depth ${subagentMeta.depth} exceeds maxDepth=${maxSubagentDepth}`;
-        await publishCurrentLifecycle({
-          state: "failed",
-          detail,
-          output: `Error: ${detail}`,
-        });
-        await outputPublisher.publishResponseText({ finalText: `Error: ${detail}` });
-        return;
-      }
-
-      let lifecycleDetail: string | undefined;
-      if (next.recovery) {
-        lifecycleDetail = "resumed after server restart";
-      } else {
-        switch (next.queue) {
-          case "prompt":
-            lifecycleDetail = undefined;
-            break;
-          case "steer":
-          case "followUp":
-          case "interrupt":
-            lifecycleDetail = `coerced queue=${next.queue} to prompt (no active run)`;
-            break;
-          default: {
-            const _exhaustive: never = next.queue;
-            lifecycleDetail = _exhaustive;
-            break;
+          if (workflowPolicy) assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
+          const stableNamedContinuation = resolveCoreStableNamedContinuation({
+            runProfile,
+            sessionId: next.sessionId,
+            workflowPolicy,
+          });
+          const maxSubagentDepth = subagents.maxDepth;
+          if (subagentMeta.depth > maxSubagentDepth) {
+            const detail = `subagent depth ${subagentMeta.depth} exceeds maxDepth=${maxSubagentDepth}`;
+            await publishCurrentLifecycle({
+              state: "failed",
+              detail,
+              output: `Error: ${detail}`,
+            });
+            await outputPublisher.publishResponseText({ finalText: `Error: ${detail}` });
+            return;
           }
-        }
-      }
-      await publishCurrentLifecycle({
-        state: "running",
-        detail: lifecycleDetail,
-      });
-      await bus.publish(lilacEventTypes.EvtRequestReply, {}, { headers });
 
-      if (parsedCustomCommand) {
-        if (runProfile === "primary" && next.requestClient === "discord") {
-          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
-            "custom-command-tool-insertion",
-            next.corePrimaryLineage?.currentCanonicalStart,
-          );
-          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        }
-        const toolCallId = buildCustomCommandToolCallId(next.requestId, parsedCustomCommand.name);
-        const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
-        activeCustomCommandTool = { toolCallId, display };
-
-        await outputPublisher.publishToolCall({
-          toolCallId,
-          status: "start",
-          display,
-        });
-
-        let output: CustomCommandResult = { type: "json", value: null };
-        let customError = parsedCustomCommand.error ?? null;
-        const command = params.customCommands?.get(parsedCustomCommand.name) ?? null;
-
-        if (!customError && !params.customCommands) {
-          customError = "Custom command manager is unavailable.";
-        }
-        if (!customError && !command) {
-          customError = `Unknown custom command '${parsedCustomCommand.name}'.`;
-        }
-
-        if (!customError && command && params.customCommands) {
-          if (cancelledByRequestId.has(headers.request_id)) {
-            throw new PreAgentRunCancelledError();
+          let lifecycleDetail: string | undefined;
+          if (next.recovery) {
+            lifecycleDetail = "resumed after server restart";
+          } else {
+            switch (next.queue) {
+              case "prompt":
+                lifecycleDetail = undefined;
+                break;
+              case "steer":
+              case "followUp":
+              case "interrupt":
+                lifecycleDetail = `coerced queue=${next.queue} to prompt (no active run)`;
+                break;
+              default: {
+                const _exhaustive: never = next.queue;
+                lifecycleDetail = _exhaustive;
+                break;
+              }
+            }
           }
-          customCommandAbortController = new AbortController();
-          runIdleWatchdog?.start();
-          try {
-            const executed = await waitForPreAgent(
-              waitForRun(
-                params.customCommands.execute({
-                  command,
-                  args: parsedCustomCommand.args,
-                  context: {
-                    cwd,
-                    dataDir: env.dataDir,
-                    commandDir: command.dir,
-                    commandName: command.def.name,
-                    requestId: next.requestId,
-                    sessionId: next.sessionId,
-                    abortSignal: customCommandAbortController.signal,
-                    reportActivity: () => markRunActivity("tool"),
-                  },
+          await publishCurrentLifecycle({
+            state: "running",
+            detail: lifecycleDetail,
+          });
+          await bus.publish(lilacEventTypes.EvtRequestReply, {}, { headers });
+
+          if (parsedCustomCommand) {
+            if (runProfile === "primary" && next.requestClient === "discord") {
+              next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+                "custom-command-tool-insertion",
+                next.corePrimaryLineage?.currentCanonicalStart,
+              );
+              if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+            }
+            const toolCallId = buildCustomCommandToolCallId(
+              next.requestId,
+              parsedCustomCommand.name,
+            );
+            const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
+            activeCustomCommandTool = { toolCallId, display };
+
+            await outputPublisher.publishToolCall({
+              toolCallId,
+              status: "start",
+              display,
+            });
+
+            let output: CustomCommandResult = { type: "json", value: null };
+            let customError = parsedCustomCommand.error ?? null;
+            const command = params.customCommands?.get(parsedCustomCommand.name) ?? null;
+
+            if (!customError && !params.customCommands) {
+              customError = "Custom command manager is unavailable.";
+            }
+            if (!customError && !command) {
+              customError = `Unknown custom command '${parsedCustomCommand.name}'.`;
+            }
+
+            if (!customError && command && params.customCommands) {
+              if (cancelledByRequestId.has(headers.request_id)) {
+                return signalBusAgentRunnerHostFailure(new PreAgentRunCancelledError());
+              }
+              customCommandAbortController = new AbortController();
+              runIdleWatchdog?.start();
+              try {
+                const executed = await waitForPreAgent(
+                  waitForRun(
+                    params.customCommands.execute({
+                      command,
+                      args: parsedCustomCommand.args,
+                      context: {
+                        cwd,
+                        dataDir: env.dataDir,
+                        commandDir: command.dir,
+                        commandName: command.def.name,
+                        requestId: next.requestId,
+                        sessionId: next.sessionId,
+                        abortSignal: customCommandAbortController.signal,
+                        reportActivity: () => markRunActivity("tool"),
+                      },
+                    }),
+                  ),
+                );
+                if (executed.status === "error") {
+                  customError = customCommandExecutionErrorText(executed.error);
+                } else {
+                  output = executed.value;
+                }
+              } finally {
+                runIdleWatchdog?.pause();
+                customCommandAbortController = null;
+              }
+            }
+
+            const customCancelled = cancelledByRequestId.has(headers.request_id);
+
+            if (customCancelled) {
+              const finalText = "Cancelled.";
+              await outputPublisher.publishToolCall({
+                toolCallId,
+                status: "end",
+                display,
+                ok: false,
+                error: "cancelled by interrupt",
+              });
+              activeCustomCommandTool = null;
+              await publishCurrentLifecycle({
+                state: "cancelled",
+                detail: "cancelled by interrupt",
+                output: finalText,
+              });
+              await outputPublisher.publishResponseText({ finalText });
+              return;
+            }
+
+            if (customError) {
+              output = { type: "error-text", value: customError };
+            }
+
+            output = await waitForPreAgent(
+              Promise.resolve(
+                normalizeToolResultOutput(output, {
+                  toolCallId,
+                  toolName: CUSTOM_COMMAND_TOOL_NAME,
                 }),
               ),
             );
-            if (executed.status === "error") {
-              customError = customCommandExecutionErrorText(executed.error);
-            } else {
-              output = executed.value;
+
+            customCommandMessages = buildCustomCommandMessages({
+              toolCallId,
+              name: parsedCustomCommand.name,
+              args: parsedCustomCommand.args,
+              prompt: parsedCustomCommand.prompt,
+              text: parsedCustomCommand.text,
+              source: parsedCustomCommand.source,
+              output,
+            });
+
+            await outputPublisher.publishToolCall({
+              toolCallId,
+              status: "end",
+              display,
+              ok: !customError,
+              error: customError ?? undefined,
+            });
+            activeCustomCommandTool = null;
+
+            if (customError) {
+              const finalText = buildCustomCommandFailureFinalText({
+                commandText: parsedCustomCommand.text,
+                normalizedOutput: output,
+              });
+              resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
+
+              if (params.transcriptStore) {
+                const persisted = await captureBusAgentRunnerOperation(
+                  "custom command failure transcript persistence",
+                  () =>
+                    params.transcriptStore?.saveRequestTranscript({
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      requestClient: headers.request_client,
+                      messages: [
+                        ...customCommandMessages,
+                        { role: "assistant", content: finalText } satisfies ModelMessage,
+                      ],
+                      finalText,
+                      modelLabel: resolvedModelLabel,
+                    }),
+                );
+                if (persisted.status === "error") {
+                  logger.error("failed to persist transcript after custom command error", {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    error: persisted.error.message,
+                  });
+                }
+              }
+
+              await publishCurrentLifecycle({
+                state: "failed",
+                detail: customError,
+                output: finalText,
+              });
+              await outputPublisher.publishResponseText({ finalText });
+
+              logger.warn("custom command failed", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                commandName: parsedCustomCommand.name,
+                error: customError,
+              });
+              return;
             }
-          } finally {
-            runIdleWatchdog?.pause();
-            customCommandAbortController = null;
+          }
+
+          const requestModelOverride =
+            runProfile === "primary"
+              ? (next.modelOverride ?? parseRequestModelOverrideFromRaw(next.raw) ?? undefined)
+              : next.modelOverride;
+          if (
+            workflowPolicy &&
+            requestModelOverride !== undefined &&
+            requestModelOverride !== workflowPolicy.resolvedModelRequest.alias &&
+            requestModelOverride !== workflowPolicy.resolvedModelRequest.spec
+          ) {
+            return signalBusAgentRunnerHostFailure(
+              new Error("Workflow request model does not match the approved operation policy"),
+            );
+          }
+          const modelPlan = resolveAgentRunModel({
+            cfg,
+            runProfile,
+            requestModelOverride,
+            reasoningOverride: subagentMeta.reasoning,
+            resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
+          });
+          const initialResolvedModel = modelPlan.head;
+          resolvedModelLabel = initialResolvedModel.modelId;
+          resolvedProviderFamily = classifyHistoryProviderFamily({
+            type: initialResolvedModel.provider,
+          });
+          if (state.activeRun) {
+            state.activeRun.resolvedModelSpec = initialResolvedModel.spec;
+            state.activeRun.resolvedReasoning = initialResolvedModel.reasoning;
+            state.activeRun.resolvedProviderFamily = resolvedProviderFamily;
+          }
+
+          const skillsSection =
+            runProfile === "explore"
+              ? null
+              : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
+
+          const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
+          const parentChannelResolution =
+            next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
+          const parentChannelId = parentChannelResolution ?? undefined;
+          const safetyMode: SessionSafetyMode =
+            next.requestClient === "discord" && parentChannelResolution === undefined
+              ? "restricted"
+              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId);
+          if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
+            controlCapability =
+              (await params.issueHeartbeatCapability?.({
+                requestId: next.requestId,
+                sessionId: next.sessionId,
+                requestClient: next.requestClient,
+                canonicalCwd: cwd,
+                expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
+              })) ?? null;
+            if (!controlCapability) {
+              return signalBusAgentRunnerHostFailure(
+                new Error("Heartbeat request is missing server-issued Level-2 authority"),
+              );
+            }
+          } else if (
+            workflowPolicy ||
+            next.requestClient === "discord" ||
+            next.requestClient === "github"
+          ) {
+            const capabilityPrincipal = trustedFallbackSurface
+              ? {
+                  platform: trustedFallbackSurface.platform,
+                  userId: trustedFallbackSurface.userId,
+                }
+              : undefined;
+            const issuedControl = await params.issueControlCapability?.({
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              requestClient: next.requestClient,
+              profile: runProfile,
+              canonicalCwd: workflowPolicy?.cwd ?? cwd,
+              safetyMode,
+              expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
+              ...(capabilityPrincipal ? { principal: capabilityPrincipal } : {}),
+            });
+            if (!issuedControl) {
+              return signalBusAgentRunnerHostFailure(
+                new Error(
+                  "Native profile request is missing server-issued Level-2 control authority",
+                ),
+              );
+            }
+            controlCapability = issuedControl.capability;
+            if (issuedControl.principal) {
+              trustedFallbackSurface = {
+                platform: issuedControl.principal.platform,
+                sessionId: next.sessionId,
+                userId: issuedControl.principal.userId,
+              };
+            }
+          }
+
+          const additionalSessionPrompts = await waitForPreAgent(
+            resolveSessionAdditionalPrompts({
+              entries: cfg.surface.router.sessionModes[sessionConfigId]?.additionalPrompts,
+              onWarn: (warning) => {
+                logger.warn("skipping invalid session additionalPrompts entry", {
+                  requestId: next.requestId,
+                  sessionId,
+                  sessionConfigId,
+                  reason: warning.reason,
+                  value: warning.value,
+                  filePath: warning.filePath,
+                  error: warning.error,
+                });
+              },
+            }),
+          );
+
+          const heartbeatOverlay = buildHeartbeatOverlayForRequest({
+            cfg,
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+            runProfile,
+            nowMs: Date.now(),
+          });
+
+          const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
+            cfg,
+            runProfile,
+          });
+
+          const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
+
+          const restrictedSessionOverlay =
+            safetyMode === "restricted"
+              ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
+              : null;
+
+          const buildSystemPrompt = (
+            resolved: ResolvedModelRef,
+            editingToolMode: ReturnType<typeof resolveEditingToolMode>,
+          ): string => {
+            const baseSystemPrompt = buildSystemPromptForProfile({
+              baseSystemPrompt: cfg.agent.systemPrompt,
+              profile: runProfile,
+              profileConfig:
+                runProfile === "primary"
+                  ? undefined
+                  : resolveNativeSubagentProfile(cfg, runProfile),
+              activeEditingTool: runProfile === "explore" ? null : editingToolMode,
+              exploreOverlay: subagents.profiles.explore.promptOverlay,
+              generalOverlay: subagents.profiles.general.promptOverlay,
+              selfOverlay: subagents.profiles.self.promptOverlay,
+              skillsSection,
+            });
+            let prompt = appendConfiguredAliasPromptBlock({
+              baseSystemPrompt,
+              cfg,
+              coreConfigPath: resolveCoreConfigPath(),
+            });
+            prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
+            for (const overlay of [
+              heartbeatOverlay,
+              autoInjectedThreadSearchOverlay,
+              surfaceMetadataOverlay,
+              restrictedSessionOverlay,
+            ]) {
+              if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
+            }
+            return maybeAppendResponseCommentaryPrompt({
+              baseSystemPrompt: prompt,
+              provider: resolved.provider,
+              responseCommentary: resolved.responseCommentary,
+            });
+          };
+
+          let seededSessionMessages: ModelMessage[] = [];
+          let seededSessionTranscript: ReturnType<
+            NonNullable<TranscriptStore["getLatestCompleteNamedTranscript"]>
+          > = null;
+          if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
+            const loadedTranscript = await captureBusAgentRunnerOperation(
+              "subagent continuation transcript load",
+              () =>
+                stableNamedContinuation
+                  ? params.transcriptStore?.getLatestCompleteNamedTranscript?.({
+                      requestClient: stableNamedContinuation.requestClient,
+                      sessionId: next.sessionId,
+                    })
+                  : params.transcriptStore?.getLatestTranscriptBySession?.({
+                      sessionId: next.sessionId,
+                    }),
+            );
+            if (loadedTranscript.status === "ok") {
+              const latest = loadedTranscript.value;
+              if (latest && latest.messages.length > 0) {
+                seededSessionMessages = latest.messages;
+                seededSessionTranscript = latest;
+                logger.info("subagent continuation seeded from transcript", {
+                  requestId: next.requestId,
+                  sessionId: next.sessionId,
+                  fromRequestId: latest.requestId,
+                  messagesSeeded: latest.messages.length,
+                });
+              }
+            } else {
+              logger.warn("failed to load subagent continuation transcript", {
+                requestId: next.requestId,
+                sessionId: next.sessionId,
+                error: loadedTranscript.error.message,
+              });
+            }
+          }
+
+          const fallbackSurfaceForDelegation = trustedFallbackSurface;
+          const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
+          const listSelectedCatalogIds = () =>
+            params.transcriptStore?.listSessionToolIds?.({
+              requestClient: next.requestClient,
+              sessionId: next.sessionId,
+            }) ?? [];
+          const buildModelBinding = async (resolved: ResolvedModelRef) => {
+            let capabilityInfo: ModelCapabilityInfo | null = null;
+            let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
+            let bindingCostEstimateReason: string | undefined;
+            const capability = await captureBusAgentRunnerOperation(
+              "model capability resolution",
+              () => waitForPreAgent(modelCapability.resolve(resolved.spec)),
+            );
+            if (capability.status === "ok") {
+              capabilityInfo = capability.value;
+              if (capabilityInfo.cost) {
+                bindingCostEstimateStatus = "estimated";
+              } else {
+                bindingCostEstimateReason = "model_cost_missing";
+              }
+            } else {
+              if (capability.error.cause instanceof PreAgentRunCancelledError) {
+                return signalBusAgentRunnerHostFailure(capability.error.cause);
+              }
+              bindingCostEstimateReason = `capability_resolve_failed:${capability.error.message}`;
+            }
+
+            const editingToolMode = resolveEditingToolMode({
+              provider: resolved.provider,
+              modelId: resolved.modelId,
+            });
+            const anthropicModel = isAnthropicModelSpec(resolved.spec);
+            const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
+              spec: resolved.spec,
+              anthropicPromptCache: resolved.anthropicPromptCache,
+            });
+            const reasoningDisplay =
+              resolved.reasoningDisplay ??
+              workflowPolicy?.resolvedModelRequest.reasoningDisplay ??
+              cfg.agent.reasoningDisplay;
+            const providerOptionsWithOpenAIReasoningSummary =
+              withReasoningSummaryDefaultForOpenAIModels({
+                reasoningDisplay,
+                provider: resolved.provider,
+                modelId: resolved.modelId,
+                providerOptions: resolved.providerOptions,
+              });
+            const providerOptionsWithReasoningDisplay =
+              withReasoningDisplayDefaultForAnthropicModels({
+                reasoningDisplay,
+                provider: resolved.provider,
+                modelId: resolved.modelId,
+                providerOptions: providerOptionsWithOpenAIReasoningSummary,
+              });
+            const providerOptionsWithPromptCacheKey = (() => {
+              if (resolved.provider !== "openai" && resolved.provider !== "codex") {
+                return providerOptionsWithReasoningDisplay;
+              }
+              const base = providerOptionsWithReasoningDisplay ?? {};
+              const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
+              return {
+                ...base,
+                openai: {
+                  ...existingOpenAI,
+                  promptCacheKey: toOpenAIPromptCacheKey(sessionId),
+                },
+              };
+            })();
+            const providerOptionsWithServerCompaction = (() => {
+              if (!resolved.openaiServerCompaction) return providerOptionsWithPromptCacheKey;
+              const base = providerOptionsWithPromptCacheKey ?? {};
+              const existingOpenAI = base.openai ?? {};
+              const include = Array.isArray(existingOpenAI.include)
+                ? existingOpenAI.include.filter(
+                    (value): value is string => typeof value === "string",
+                  )
+                : [];
+              return {
+                ...base,
+                openai: {
+                  ...existingOpenAI,
+                  store: false,
+                  include: [...new Set([...include, "reasoning.encrypted_content"])],
+                },
+              };
+            })();
+            const providerOptionsForAgent = anthropicModel
+              ? withStableAnthropicUpstreamOrder(
+                  resolved.provider,
+                  providerOptionsWithServerCompaction,
+                )
+              : providerOptionsWithServerCompaction;
+            const systemPrompt = buildSystemPrompt(resolved, editingToolMode);
+            const agentSystem = anthropicPromptCachingEnabled
+              ? {
+                  role: "system" as const,
+                  content: systemPrompt,
+                  providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+                }
+              : systemPrompt;
+            const experimentalDownload = buildExperimentalDownloadForAnthropicFallback({
+              spec: resolved.spec,
+              provider: resolved.provider,
+              providerOptions: providerOptionsForAgent,
+            });
+            const toolset = await waitForPreAgent(
+              params.pluginManager.buildLevel1Toolset({
+                cwd: executionCwd,
+                runProfile,
+                editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
+                subagentDepth: subagentMeta.depth,
+                subagentConfig: {
+                  enabled: subagents.enabled,
+                  idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
+                  maxDepth: subagents.maxDepth,
+                },
+                requestContext: {
+                  requestId: next.requestId,
+                  sessionId: next.sessionId,
+                  requestClient: next.requestClient,
+                  subagentDepth: subagentMeta.depth,
+                  subagentProfile: runProfile,
+                  safetyMode,
+                  metadata: {
+                    controlCapability: controlCapability ?? undefined,
+                    readFileDirectAttachmentSupported:
+                      supportsReadFileDirectAttachments(capabilityInfo),
+                    onActivity: (source: "tool" | "subagent") => markRunActivity(source),
+                    onSubagentDelegate:
+                      workflowSubagentDispatcher &&
+                      liveParentSession &&
+                      fallbackSurfaceForDelegation
+                        ? async (registration: SubagentDelegationRegistration) =>
+                            await workflowSubagentDispatcher.delegate({
+                              ...registration,
+                              projectRoot: executionCwd,
+                              fallbackSurface: fallbackSurfaceForDelegation,
+                            })
+                        : undefined,
+                  },
+                },
+                reportToolStatus: (update) => {
+                  void publishAuxiliaryOutput(
+                    "failed to publish batch tool status",
+                    {
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      toolCallId: update.toolCallId,
+                    },
+                    () => outputPublisher.publishToolCall(update),
+                  );
+                },
+              }),
+            );
+            return {
+              resolved,
+              capabilityInfo,
+              costEstimateStatus: bindingCostEstimateStatus,
+              costEstimateReason: bindingCostEstimateReason,
+              editingToolMode,
+              anthropicPromptCachingEnabled,
+              providerOptionsForAgent,
+              agentSystem,
+              experimentalDownload,
+              toolset,
+              activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
+            };
+          };
+
+          let activeBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
+          modelCapabilityInfo = activeBinding.capabilityInfo;
+          costEstimateStatus = activeBinding.costEstimateStatus;
+          costEstimateReason = activeBinding.costEstimateReason;
+
+          logger.info("agent run starting", {
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+            requestClient: next.requestClient,
+            runProfile,
+            subagentDepth: subagentMeta.depth,
+            sessionConfigId,
+            safetyMode,
+            requestModelOverride,
+            model: activeBinding.resolved.spec,
+            responseCommentary: activeBinding.resolved.responseCommentary === true,
+            editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
+            fallbackCount: modelPlan.fallbacks.length,
+            isRecoveryResume: Boolean(next.recovery),
+            messageCount: next.messages.length,
+            recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
+            queuedForSession: state.queue.length,
+          });
+
+          let agent: AiSdkPiAgent<ToolSet> | null = null;
+          let activeModelIndex = 0;
+          let didSwitchModel = false;
+          const advanceModel = async () => {
+            if (!agent) {
+              return signalBusAgentRunnerHostFailure(
+                new Error("Model fallback started before the agent was ready"),
+              );
+            }
+            const nextFallback = selectNextNativeModelFallback({
+              plan: modelPlan,
+              activeIndex: activeModelIndex,
+              onSkipClaudeCode: (candidate, index) => {
+                logger.warn("skipping claude-code model fallback for native agent run", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  modelSpec: candidate.spec,
+                  fallbackIndex: index,
+                });
+              },
+            });
+            if (!nextFallback) return { ok: false as const, reason: "model fallback exhausted" };
+
+            const nextBinding = await buildModelBinding(nextFallback.candidate);
+            nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
+            agent.setModel(
+              nextBinding.resolved.model,
+              nextBinding.providerOptionsForAgent,
+              nextBinding.resolved.spec,
+              nextBinding.resolved.reasoning,
+            );
+            agent.setSystem(nextBinding.agentSystem);
+            agent.setTools(nextBinding.toolset.tools);
+            agent.setActiveTools(nextBinding.activeToolNames);
+            agent.setExperimentalDownload(nextBinding.experimentalDownload);
+            agent.setGenericOutputNormalizerBypassTools(
+              nextBinding.toolset.genericOutputNormalizerBypassTools,
+            );
+            agent.setAggregateOutputBudgetExemptTools(
+              nextBinding.toolset.aggregateOutputBudgetExemptTools,
+            );
+
+            activeBinding = nextBinding;
+            activeModelIndex = nextFallback.index;
+            didSwitchModel = true;
+            modelCapabilityInfo = nextBinding.capabilityInfo;
+            costEstimateStatus = nextBinding.costEstimateStatus;
+            costEstimateReason = nextBinding.costEstimateReason;
+            resolvedModelLabel = nextBinding.resolved.modelId;
+            resolvedProviderFamily = classifyHistoryProviderFamily({
+              type: nextBinding.resolved.provider,
+            });
+            if (state.activeRun) {
+              state.activeRun.resolvedModelSpec = nextBinding.resolved.spec;
+              state.activeRun.resolvedReasoning = nextBinding.resolved.reasoning;
+              state.activeRun.resolvedProviderFamily = resolvedProviderFamily;
+            }
+            return { ok: true as const, modelSpec: nextBinding.resolved.spec };
+          };
+          const hasNativeModelFallback =
+            activeBinding.resolved.provider !== "claude-code" && modelPlan.fallbacks.length > 0;
+          const transientRetryController = createTransientModelRetryController({
+            retry: cfg.agent.retry,
+            logger,
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            modelSpec: activeBinding.resolved.spec,
+            ...(hasNativeModelFallback ? { advanceModel } : {}),
+          });
+          const disabledServerCompactionReplayKeys = new Set<string>();
+          let activeNativeServerCompactionReplayKey: string | null = null;
+          const turnErrorHandler = async (
+            error: unknown,
+            errorContext: Parameters<
+              NonNullable<Parameters<typeof attachAutoCompaction>[1]["baseTurnErrorHandler"]>
+            >[1],
+          ) => {
+            const projectedError = projectBusAgentRunnerError(error, "Model turn failed");
+            const transientDecision = await transientRetryController.handler(error, errorContext);
+            if (transientDecision === "retry") {
+              await coreNamedClaudeRuntime?.retireForRetry();
+              await corePrimaryClaudeRuntime?.retireForRetry();
+              return "retry" as const;
+            }
+            if (
+              activeNativeServerCompactionReplayKey &&
+              errorContext.phase === "model-call" &&
+              errorContext.retrySafety.canRetry &&
+              errorContext.abortSignal?.aborted !== true
+            ) {
+              disabledServerCompactionReplayKeys.add(activeNativeServerCompactionReplayKey);
+              logger.warn("OpenAI server compaction replay failed; retrying portable summary", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                modelSpec: activeBinding.resolved.spec,
+                ...projectedError.details,
+                error: projectedError.message,
+              });
+              activeNativeServerCompactionReplayKey = null;
+              return "retry" as const;
+            }
+            return "fail" as const;
+          };
+          if (activeBinding.resolved.provider === "claude-code") {
+            const claudeCodeToolMapping = completeLevel1ToolMapping(activeBinding.toolset);
+            const continuationStore = params.transcriptStore;
+            const materializeClaude = async (
+              nativeSession?: Parameters<typeof materializeClaudeCodeRun>[0]["nativeSession"],
+            ) => {
+              const run = await (params.materializeClaudeCodeRun ?? materializeClaudeCodeRun)({
+                modelId: activeBinding.resolved.modelId,
+                cwd: executionCwd,
+                tools: claudeCodeToolMapping.tools,
+                catalogMetadata: claudeCodeToolMapping.catalogMetadata,
+                // Core admits no Claude built-ins; Lilac remains the only tool source.
+                builtInTools: [],
+                reasoning: activeBinding.resolved.reasoning,
+                ...(nativeSession ? { nativeSession } : {}),
+                execute: async (request) => {
+                  if (!activeAgent) {
+                    return signalBusAgentRunnerHostFailure(
+                      new Error("Claude Code tool execution started before the agent was ready"),
+                    );
+                  }
+                  return await activeAgent.executeExternalToolCall(request);
+                },
+              });
+              if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
+              return run;
+            };
+            const shouldPersistClaude = shouldUsePersistentCoreClaudeRuntime({
+              runProfile,
+              requestClient: next.requestClient,
+              stableNamedContinuation,
+              corePrimaryLineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+            });
+            if (shouldPersistClaude && continuationStore !== undefined) {
+              const canonicalCwdResult = await captureBusAgentRunnerOperation(
+                "Claude execution cwd canonicalization",
+                () => fs.realpath(executionCwd),
+              );
+              const canonicalExecutionCwd =
+                canonicalCwdResult.status === "ok"
+                  ? canonicalCwdResult.value
+                  : path.resolve(executionCwd);
+              const nativeStorageNamespace = path.resolve(
+                process.env["CLAUDE_CONFIG_DIR"] ?? path.join(homedir(), ".claude"),
+              );
+              const profileConfig =
+                runProfile === "primary" ? null : resolveNativeSubagentProfile(cfg, runProfile);
+              const executionScope = hashCoreNamedExecutionScope({
+                canonicalCwd: canonicalExecutionCwd,
+                providerIdentity: "core:claude-code",
+                nativeStorageNamespaceIdentity: nativeStorageNamespace,
+                nativeExecutableConfig: claudeCodeExecutableSettings(),
+                profile: runProfile,
+                safetyMode,
+                profileAuthority: {
+                  level1: profileConfig?.level1 ?? null,
+                  level2: profileConfig?.level2 ?? null,
+                  network: profileConfig?.network ?? null,
+                  workspaceWrites: profileConfig?.workspaceWrites ?? null,
+                  execution: profileConfig?.execution ?? null,
+                  delegation: profileConfig?.delegation ?? null,
+                },
+                pluginAuthority: cfg.plugins ?? null,
+                workflowAuthority: workflowPolicy
+                  ? {
+                      profile: workflowPolicy.profile,
+                      cwd: workflowPolicy.cwd,
+                      originClient: workflowPolicy.originSession.client,
+                    }
+                  : null,
+                systemPolicy: {
+                  base: cfg.agent.systemPrompt,
+                  profileOverlay: profileConfig?.promptOverlay ?? null,
+                  additionalSessionPrompts,
+                  skillsSection,
+                },
+                directToolNames: [...activeBinding.toolset.directToolNames],
+                externalToolAuthority: activeBinding.toolset.catalog
+                  .map((entry) => ({
+                    source: entry.source,
+                    sourceId: entry.sourceId,
+                    stableId: entry.stableId,
+                    modelName: entry.modelName,
+                  }))
+                  .sort((left, right) => left.stableId.localeCompare(right.stableId)),
+                subagentAuthority: {
+                  enabled: subagents.enabled,
+                  maxDepth: subagents.maxDepth,
+                  currentDepth: subagentMeta.depth,
+                },
+              });
+              if (
+                runProfile === "primary" &&
+                next.requestClient === "discord" &&
+                supportsCorePrimaryContinuationStore(continuationStore)
+              ) {
+                corePrimaryClaudeRuntime = createCorePrimaryClaudeRuntime({
+                  store: continuationStore,
+                  sessionId: next.sessionId,
+                  requestId: next.requestId,
+                  providerId: activeBinding.resolved.provider,
+                  modelSpecifier: activeBinding.resolved.spec,
+                  reasoning: activeBinding.resolved.reasoning ?? "provider-default",
+                  executionScopeHash: executionScope.hash,
+                  executionCwd,
+                  getLineage: () => state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                  materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
+                  onDiagnostic: (event, detail) => {
+                    const fields = { lifecycle: event, ...detail };
+                    if (
+                      event === "native-source-invalid" ||
+                      event === "candidate-observability-lost" ||
+                      event === "candidate-unpromotable" ||
+                      event === "candidate-finalization-failed" ||
+                      event === "canonical-publication-failed" ||
+                      event === "promotion-failed" ||
+                      event === "promotion-rejected"
+                    ) {
+                      logger.warn("core_primary_claude.lifecycle", fields);
+                    } else if (event === "canonical-published" || event === "promotion") {
+                      logger.info("core_primary_claude.lifecycle", fields);
+                    } else {
+                      logger.debug("core_primary_claude.lifecycle", fields);
+                    }
+                  },
+                });
+              } else if (
+                stableNamedContinuation !== null &&
+                supportsCoreNamedContinuationStore(continuationStore)
+              ) {
+                coreNamedClaudeRuntime = createCoreNamedClaudeRuntime({
+                  store: continuationStore,
+                  requestClient: stableNamedContinuation.requestClient,
+                  sessionId: next.sessionId,
+                  requestId: next.requestId,
+                  providerId: activeBinding.resolved.provider,
+                  modelSpecifier: activeBinding.resolved.spec,
+                  reasoning: activeBinding.resolved.reasoning ?? "provider-default",
+                  executionScopeHash: executionScope.hash,
+                  executionCwd,
+                  sourceTranscript: seededSessionTranscript,
+                  getCurrentTurnMessages: () => initialMessages,
+                  materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
+                  onDiagnostic: (event, detail) => {
+                    const fields = { lifecycle: event, ...detail };
+                    if (
+                      event === "native-source-invalid" ||
+                      event === "candidate-observability-lost" ||
+                      event === "candidate-unpromotable" ||
+                      event === "candidate-finalization-failed" ||
+                      event === "canonical-publication-failed" ||
+                      event === "promotion-failed" ||
+                      event === "promotion-rejected"
+                    ) {
+                      logger.warn("core_named_claude.lifecycle", fields);
+                    } else if (event === "canonical-published" || event === "promotion") {
+                      logger.info("core_named_claude.lifecycle", fields);
+                    } else {
+                      logger.debug("core_named_claude.lifecycle", fields);
+                    }
+                  },
+                });
+              } else {
+                claudeCodeRun = await waitForPreAgent(materializeClaude());
+              }
+            } else {
+              claudeCodeRun = await waitForPreAgent(materializeClaude());
+            }
+          }
+
+          const agentOptions: AiSdkPiAgentOptions<ToolSet> = {
+            system: activeBinding.agentSystem,
+            model: claudeCodeRun?.agentModel ?? activeBinding.resolved.model,
+            modelSpecifier: activeBinding.resolved.spec,
+            messages: next.recovery?.checkpointMessages ?? seededSessionMessages,
+            tools: activeBinding.toolset.tools,
+            providerOptions: activeBinding.providerOptionsForAgent,
+            reasoning: activeBinding.resolved.reasoning,
+            ...(hasNativeModelFallback ||
+            coreNamedClaudeRuntime !== null ||
+            corePrimaryClaudeRuntime !== null
+              ? { streamTextMaxRetries: 0 }
+              : {}),
+            turnErrorHandler,
+            beforeStep:
+              activeBinding.resolved.provider !== "claude-code"
+                ? async () => {
+                    if (!agent) {
+                      return signalBusAgentRunnerHostFailure(
+                        new Error("Tool refresh started before the agent was ready"),
+                      );
+                    }
+                    await refreshSelectedLevel1Tools({
+                      target: agent,
+                      toolset: activeBinding.toolset,
+                      listSelectedCatalogIds,
+                    });
+                  }
+                : undefined,
+            normalizeToolResultOutput,
+            normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
+            genericOutputNormalizerBypassTools:
+              activeBinding.toolset.genericOutputNormalizerBypassTools,
+            aggregateOutputBudgetExemptTools:
+              activeBinding.toolset.aggregateOutputBudgetExemptTools,
+            experimentalDownload: activeBinding.experimentalDownload,
+            sendToolsToModel: activeBinding.resolved.provider !== "claude-code",
+            debug: {
+              captureModelViewMessages: env.debug.contextDump.enabled,
+            },
+          };
+          agent = params.createAgent
+            ? params.createAgent(agentOptions)
+            : new AiSdkPiAgent<ToolSet>(agentOptions);
+          if (activeBinding.resolved.provider === "claude-code") {
+            applyCompleteLevel1Tools(agent, activeBinding.toolset);
+          }
+          agent.setPrepareModelCall(
+            coreNamedClaudeRuntime?.prepareModelCall ?? corePrimaryClaudeRuntime?.prepareModelCall,
+          );
+          activeAgent = agent;
+
+          agent.setContext({
+            sessionId: next.sessionId,
+            requestId: next.requestId,
+            requestClient: next.requestClient,
+            subagentDepth: subagentMeta.depth,
+            subagentProfile: runProfile,
+            safetyMode,
+          });
+
+          // Drain all buffered messages at boundaries (better UX in chat surfaces).
+          agent.setFollowUpMode("all");
+          agent.setSteeringMode("all");
+
+          const prepareModelView = async (
+            messages: readonly ModelMessage[],
+            transformContext: TransformMessagesContext,
+            fullBudget: boolean,
+          ): Promise<ModelMessage[]> => {
+            const configuredServerCompactionReplayKey = activeBinding.resolved
+              .openaiServerCompaction
+              ? `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`
+              : undefined;
+            const serverCompactionReplayKey =
+              configuredServerCompactionReplayKey &&
+              !disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey)
+                ? configuredServerCompactionReplayKey
+                : undefined;
+            activeNativeServerCompactionReplayKey = null;
+            if (
+              configuredServerCompactionReplayKey &&
+              hasMatchingOpenAIServerCompaction(messages, serverCompactionReplayKey)
+            ) {
+              activeNativeServerCompactionReplayKey = serverCompactionReplayKey ?? null;
+            }
+            const materialized =
+              configuredServerCompactionReplayKey || hasOpenAIServerCompaction(messages)
+                ? materializeOpenAIServerCompaction(messages, serverCompactionReplayKey)
+                : messages;
+            const targetFamily = classifyHistoryProviderFamily({
+              type: activeBinding.resolved.provider,
+            });
+            let historyPrepared: readonly ModelMessage[];
+            if (coreNamedClaudeRuntime) {
+              historyPrepared = coreNamedClaudeRuntime.prepareHistoryView(materialized);
+            } else if (corePrimaryClaudeRuntime) {
+              historyPrepared = fullBudget
+                ? corePrimaryClaudeRuntime.prepareFullBudgetView(
+                    materialized,
+                    transformContext.canonicalStartIndex,
+                  )
+                : corePrimaryClaudeRuntime.prepareHistoryView(materialized);
+            } else {
+              switch (runProfile) {
+                case "primary": {
+                  const lineage = state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+                  const historicalEnd = lineage?.currentCanonicalStart ?? 0;
+                  historyPrepared = prepareCorePrimaryHistoryView({
+                    canonicalMessages: materialized,
+                    lineage,
+                    replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
+                      lineage,
+                      historicalEnd,
+                      store: params.transcriptStore ?? {},
+                      targetFamily,
+                    }),
+                    targetFamily,
+                    modelSpecifier: activeBinding.resolved.spec,
+                    canonicalStartIndex: transformContext.canonicalStartIndex,
+                  });
+                  break;
+                }
+                case "explore":
+                case "general":
+                case "self":
+                  historyPrepared = stableNamedContinuation
+                    ? prepareCoreNamedHistoryView({
+                        canonicalMessages: materialized,
+                        sourceMessages: seededSessionMessages,
+                        currentTurnMessages: initialMessages,
+                        replayHistoricalPrefix: shouldReplayCoreNamedHistory({
+                          sourceTranscript: seededSessionTranscript,
+                          targetFamily,
+                        }),
+                        targetFamily,
+                        modelSpecifier: activeBinding.resolved.spec,
+                      })
+                    : materialized;
+                  break;
+                default: {
+                  const _exhaustive: never = runProfile;
+                  historyPrepared = _exhaustive;
+                  break;
+                }
+              }
+            }
+            if (
+              configuredServerCompactionReplayKey &&
+              disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey) &&
+              hasMatchingOpenAIServerCompaction(messages, configuredServerCompactionReplayKey)
+            ) {
+              agent.replaceMessages(materializeOpenAIServerCompaction(messages, undefined), {
+                reason: "compaction",
+                preserveRecoveryCheckpoint: true,
+              });
+              disabledServerCompactionReplayKeys.delete(configuredServerCompactionReplayKey);
+            }
+            // First, remove pathological binary blobs from the *model-facing* view.
+            const scrubbed = scrubLargeBinaryForModelView(historyPrepared, {
+              maxBytesPerPart: cfg.tools.media.maxInlineBytesPerPart,
+              maxBytesTotal: cfg.tools.media.maxInlineBytesTotal,
+            });
+
+            // Then, compact older tool outputs (placeholder) with session-stable state.
+            if (cfg.tools.historicalResultPruning.enabled) {
+              const estimatedPrunedTokens = maybeMarkOldToolOutputsCompacted({
+                messages: scrubbed,
+                compactedToolCallIds: state.compactedToolCallIds,
+                protectTokens: cfg.tools.historicalResultPruning.protectTokens,
+                minimumTokens: cfg.tools.historicalResultPruning.minimumTokens,
+              });
+              if (estimatedPrunedTokens > 0) {
+                logger.info("agent.historical_result_pruned", {
+                  requestId: next.requestId,
+                  sessionId: next.sessionId,
+                  compactedToolCallCount: state.compactedToolCallIds.size,
+                  estimatedPrunedTokens,
+                });
+              }
+            }
+
+            const compacted = cfg.tools.historicalResultPruning.enabled
+              ? applyToolOutputCompactionView({
+                  messages: scrubbed,
+                  compactedToolCallIds: state.compactedToolCallIds,
+                })
+              : scrubbed;
+
+            return compacted;
+          };
+          const toolPruneTransform: PrepareFullModelView = (messages, transformContext) =>
+            prepareModelView(messages, transformContext, false);
+          const fullBudgetTransform: PrepareFullModelView = (messages, transformContext) =>
+            prepareModelView(messages, transformContext, true);
+          // History protocol safety is required even when automatic compaction is disabled.
+          agent.setPrepareFullModelView(toolPruneTransform);
+          agent.setPrepareFullBudgetView(fullBudgetTransform);
+
+          let autoCompactionSeq = 0;
+          let activeAutoCompactionToolCallId: string | null = null;
+          const publishAutoCompactionToolStatus = (update: {
+            toolCallId: string;
+            status: "start" | "end";
+            display: string;
+            ok?: boolean;
+            error?: string;
+          }) => {
+            const publishOne = async () => {
+              await publishAuxiliaryOutput(
+                "failed to publish auto-compaction tool status",
+                {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  toolCallId: update.toolCallId,
+                  status: update.status,
+                },
+                () => outputPublisher.publishToolCall(update),
+              );
+            };
+
+            auxiliaryOutputTail = auxiliaryOutputTail.then(publishOne);
+          };
+          const reportServerCompactionError = (cause: unknown): void => {
+            const error = projectBusAgentRunnerError(cause, "OpenAI server compaction failed");
+            logger.warn("OpenAI server compaction failed; using portable summary", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              modelSpec: activeBinding.resolved.spec,
+              ...error.details,
+              error: error.message,
+            });
+          };
+
+          unsubscribeCompaction = await waitForPreAgent(
+            attachAutoCompaction(agent, {
+              model: activeBinding.resolved.spec,
+              summaryModel:
+                claudeCodeRun?.createUtilityModel ??
+                coreNamedClaudeRuntime?.currentRun()?.createUtilityModel ??
+                corePrimaryClaudeRuntime?.currentRun()?.createUtilityModel ??
+                (activeBinding.resolved.provider === "claude-code"
+                  ? () => activeBinding.resolved.model
+                  : "current"),
+              modelCapability,
+              thresholdInputSource:
+                activeBinding.resolved.provider === "claude-code" ? "transcript-estimate" : "usage",
+              resolveCurrentModelSpecifier: () =>
+                agent.state.modelSpecifier ?? activeBinding.resolved.spec,
+              prepareFullModelView: toolPruneTransform,
+              prepareFullBudgetView: fullBudgetTransform,
+              inputEstimateFloor:
+                coreNamedClaudeRuntime === null && corePrimaryClaudeRuntime === null
+                  ? undefined
+                  : ({ canonicalMessages, overlay, estimateMessagesTokens }) =>
+                      (coreNamedClaudeRuntime ?? corePrimaryClaudeRuntime)?.inputEstimateFloor({
+                        canonicalMessages,
+                        overlay,
+                        estimateMessagesTokens,
+                      }) ?? null,
+              resolveCurrentInputCanonicalStart: () =>
+                (state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage)
+                  ?.currentCanonicalStart ?? null,
+              decorateRequestPayload: (payload) => {
+                const requestPayload =
+                  payload.length === 0 && (coreNamedClaudeRuntime || corePrimaryClaudeRuntime)
+                    ? ([
+                        {
+                          role: "user",
+                          content: "Continue after the completed tool call.",
+                        },
+                      ] satisfies ModelMessage[])
+                    : [...payload];
+                return activeBinding.anthropicPromptCachingEnabled
+                  ? withProviderOptionsOnLastUserMessage(
+                      requestPayload,
+                      ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
+                    )
+                  : requestPayload;
+              },
+              baseTurnErrorHandler: turnErrorHandler,
+              serverCompaction: async ({
+                messages: prefix,
+                portableSummary,
+                context: modelContext,
+                abortSignal,
+              }) => {
+                if (!activeBinding.resolved.openaiServerCompaction) {
+                  return signalBusAgentRunnerHostFailure(
+                    new Error("OpenAI server compaction is disabled for the active model"),
+                  );
+                }
+                return await compactWithOpenAIResponses({
+                  model: agent.state.model,
+                  replayKey: `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`,
+                  portableSummary,
+                  messages: prefix,
+                  system: modelContext?.system ?? agent.state.system,
+                  tools: modelContext?.tools,
+                  providerOptions: agent.state.providerOptions,
+                  reasoning: agent.state.reasoning,
+                  abortSignal,
+                });
+              },
+              serverCompactionEnabled: () => {
+                if (!activeBinding.resolved.openaiServerCompaction) return false;
+                const replayKey = `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`;
+                return !disabledServerCompactionReplayKeys.has(replayKey);
+              },
+              onServerCompactionError: reportServerCompactionError,
+              onUnknownCapability: ({ spec, reason, error }) => {
+                logger.warn(
+                  "auto-compaction capability unknown; disabling threshold compaction",
+                  {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    modelSpec: spec,
+                    reason,
+                  },
+                  error,
+                );
+              },
+              onOverflowRecoveryAttempt: ({ spec, attempt, maxAttempts }) => {
+                logger.info("auto-compaction overflow recovery retry", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  modelSpec: spec,
+                  attempt,
+                  maxAttempts,
+                });
+              },
+              onOverflowRecoveryExhausted: ({ spec, attempts, maxAttempts }) => {
+                logger.warn("auto-compaction overflow recovery exhausted", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  modelSpec: spec,
+                  attempts,
+                  maxAttempts,
+                });
+              },
+              onCompactionStart: ({
+                spec,
+                reason,
+                messageCountBefore,
+                observedInputTokens,
+                inputTokenSource,
+                estimatedInputTokens,
+                budget,
+              }) => {
+                autoCompactionSeq += 1;
+                activeAutoCompactionToolCallId = buildSyntheticToolCallId({
+                  prefix: "auto_compaction",
+                  seed: `${headers.request_id}:${autoCompactionSeq}`,
+                });
+
+                publishAutoCompactionToolStatus({
+                  toolCallId: activeAutoCompactionToolCallId,
+                  status: "start",
+                  display: formatAutoCompactionToolDisplay({
+                    phase: "start",
+                    messageCountBefore,
+                  }),
+                });
+
+                logger.info("auto-compaction start", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  subagentDepth: subagentMeta.depth,
+                  modelSpec: spec,
+                  reason,
+                  messageCountBefore,
+                  observedInputTokens,
+                  inputTokenSource,
+                  estimatedInputTokens,
+                  inputBudget: budget.inputBudget,
+                  safeInputBudget: budget.safeInputBudget,
+                  reservedOutputTokens: budget.reservedOutputTokens,
+                });
+              },
+              onCompactionEnd: ({
+                spec,
+                reason,
+                messageCountBefore,
+                messageCountAfter,
+                estimatedInputTokens,
+                estimatedInputTokensAfter,
+                durationMs,
+                status,
+                error,
+                canonicalReplacement,
+              }) => {
+                const toolCallId =
+                  activeAutoCompactionToolCallId ??
+                  buildSyntheticToolCallId({
+                    prefix: "auto_compaction",
+                    seed: `${headers.request_id}:orphan-end`,
+                  });
+                activeAutoCompactionToolCallId = null;
+
+                publishAutoCompactionToolStatus({
+                  toolCallId,
+                  status: "end",
+                  display: formatAutoCompactionToolDisplay({
+                    phase: "end",
+                    ok: status === "completed",
+                    messageCountBefore,
+                    messageCountAfter,
+                  }),
+                  ok: status === "completed",
+                  error: status === "completed" ? undefined : "auto compaction failed",
+                });
+
+                const payload = {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  subagentDepth: subagentMeta.depth,
+                  modelSpec: spec,
+                  reason,
+                  status,
+                  durationMs,
+                  messageCountBefore,
+                  messageCountAfter,
+                  estimatedInputTokens,
+                  estimatedInputTokensAfter,
+                };
+                if (status === "completed") {
+                  completedCompactionCount += 1;
+                  if (runProfile === "primary" && next.requestClient === "discord") {
+                    const previousLineage =
+                      state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+                    const mappedCurrentStart = (() => {
+                      if (!canonicalReplacement || !previousLineage) return 0;
+                      return mapCorePrimaryCompactionCurrentCanonicalStart({
+                        previousCurrentCanonicalStart: previousLineage.currentCanonicalStart,
+                        replacement: canonicalReplacement,
+                      });
+                    })();
+                    next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+                      "compaction-checkpoint-transform",
+                      mappedCurrentStart,
+                    );
+                    if (state.activeRun)
+                      state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+                  }
+                  logger.info("auto-compaction end", payload);
+                  return;
+                }
+                logger.warn(
+                  "auto-compaction end",
+                  { ...payload, ...extractAiErrorLogDetails(error) },
+                  error,
+                );
+              },
+            }),
+          );
+
+          const publishedDeferredCompletionRunIds = new Set<string>();
+          let lastBoundaryModelInputMessages: readonly ModelMessage[] = [];
+          const drainDeferredCompletions = async (input: {
+            modelInputMessages: readonly ModelMessage[];
+            abortSignal?: AbortSignal;
+          }): Promise<{ append: ModelMessage[]; forceNextTurn: boolean }> => {
+            if (!liveParentSession) {
+              return { append: [], forceNextTurn: false };
+            }
+
+            const pendingIdentities = liveParentSession.listPendingIdentities();
+            const consumedBeforeMaterialization = pendingIdentities
+              .filter((identity) =>
+                hasConsumedDeferredSubagentResult(input.modelInputMessages, identity),
+              )
+              .map((identity) => identity.runId);
+            if (consumedBeforeMaterialization.length > 0) {
+              await liveParentSession.acknowledge(consumedBeforeMaterialization);
+            }
+            if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
+
+            const queried = await captureBusAgentRunnerOperation(
+              "workflow subagent completion query",
+              () => liveParentSession.listPendingSettledAsync(),
+            );
+            if (queried.status === "error") {
+              logger.warn("workflow subagent completion query failed; delivery remains pending", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                error: queried.error.message,
+              });
+              return { append: [], forceNextTurn: false };
+            }
+            const settled = queried.value;
+
+            if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
+
+            const completions: WorkflowLiveParentCompletion[] = [];
+            for (const result of settled) {
+              let completion: WorkflowLiveParentCompletion | null = null;
+              let materializationError: BusAgentRunnerOperationFailed | undefined;
+              if (result.loaded) {
+                const normalized = await captureBusAgentRunnerOperation(
+                  "workflow subagent completion materialization",
+                  () =>
+                    normalizeSubagentFinalText({
+                      normalize: normalizeToolResultOutput,
+                      finalText: result.completion.finalText,
+                      toolCallId: buildSubagentResultToolCallId(result.completion.runId),
+                    }),
+                );
+                if (normalized.status === "ok") {
+                  completion = {
+                    ...result.completion,
+                    finalText: normalized.value,
+                  };
+                } else {
+                  materializationError = normalized.error;
+                }
+              } else {
+                const projected = projectBusAgentRunnerError(
+                  result.error,
+                  "Workflow subagent completion load failed",
+                );
+                materializationError = new BusAgentRunnerOperationFailed({
+                  operation: "workflow subagent completion load",
+                  cause: result.error,
+                  message: projected.message,
+                });
+              }
+
+              if (completion) {
+                if (!liveParentSession.isPending(completion.runId)) continue;
+                liveParentSession.clearMaterializationFailure(completion.runId);
+                completions.push(completion);
+                continue;
+              }
+
+              const identity = result.loaded ? result.completion : result.identity;
+              const errorMessage =
+                materializationError?.message ??
+                "Workflow subagent completion materialization failed";
+              const attempts = liveParentSession.recordMaterializationFailure(
+                identity.runId,
+                errorMessage,
+              );
+              logger.warn("workflow subagent completion materialization failed", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                runId: identity.runId,
+                attempts,
+                maxAttempts: SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS,
+                error: errorMessage,
+              });
+              if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS)
+                continue;
+              if (!liveParentSession.isPending(identity.runId)) continue;
+
+              completions.push({
+                ...identity,
+                status: "failed",
+                ok: false,
+                finalText: "",
+                detail: `subagent result delivery failed after ${attempts} attempts: ${errorMessage}`,
+              });
+            }
+
+            const deliverableCompletions = completions.filter((completion) =>
+              liveParentSession.isPending(completion.runId),
+            );
+
+            const provisionalPlan = planDeferredSubagentBoundary({
+              canonicalMessages: agent.state.messages,
+              modelInputMessages: input.modelInputMessages,
+              completions: deliverableCompletions,
+            });
+
+            for (const completion of deliverableCompletions) {
+              if (!liveParentSession.isPending(completion.runId)) continue;
+              if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
+              const published = await captureBusAgentRunnerOperation(
+                "workflow subagent completion publish",
+                () =>
+                  outputPublisher.publishToolCall({
+                    toolCallId: completion.parentToolCallId,
+                    status: "end",
+                    display: buildDeferredSubagentDisplay(completion),
+                    ok: completion.ok,
+                    error: completion.ok
+                      ? undefined
+                      : (completion.detail ?? `subagent ${completion.status}`),
+                  }),
+              );
+              if (published.status === "ok") {
+                publishedDeferredCompletionRunIds.add(completion.runId);
+              } else {
+                logger.warn("workflow subagent completion publish failed", {
+                  runId: completion.runId,
+                  error: published.error.message,
+                });
+              }
+            }
+
+            if (provisionalPlan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
+              await liveParentSession.acknowledge(provisionalPlan.consumedRunIds);
+            }
+
+            const finalPlan = planDeferredSubagentBoundary({
+              canonicalMessages: agent.state.messages,
+              modelInputMessages: input.modelInputMessages,
+              completions: deliverableCompletions.filter((completion) =>
+                liveParentSession.isPending(completion.runId),
+              ),
+            });
+            if (
+              finalPlan.append.length > 0 &&
+              runProfile === "primary" &&
+              next.requestClient === "discord"
+            ) {
+              next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+                "deferred-result-insertion",
+                agent.state.messages.length,
+              );
+              if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+            }
+
+            return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
+          };
+          let pendingSilentTurnStartIndex: number | null = null;
+          const removePendingSilentTurn = () => {
+            if (pendingSilentTurnStartIndex === null) return;
+            const startIndex = pendingSilentTurnStartIndex;
+            pendingSilentTurnStartIndex = null;
+            const hasAssistantMessage = agent.state.messages
+              .slice(startIndex)
+              .some((message) => message.role === "assistant");
+            if (!hasAssistantMessage) return;
+
+            const messages = removeSilentAssistantTurnMessages({
+              messages: agent.state.messages,
+              startIndex,
+              messageCount: agent.state.messages.length - startIndex,
+            });
+            if (runProfile === "primary" && next.requestClient === "discord") {
+              const currentCanonicalStart =
+                state.activeRun?.corePrimaryLineage?.currentCanonicalStart ??
+                next.corePrimaryLineage?.currentCanonicalStart ??
+                startIndex;
+              next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+                "silent-turn-removal",
+                currentCanonicalStart,
+              );
+              if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+            }
+            agent.replaceMessages(messages);
+          };
+
+          agent.setTurnBoundaryHandler(async (context) => {
+            await coreNamedClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
+            await corePrimaryClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
+            removePendingSilentTurn();
+
+            lastBoundaryModelInputMessages = context.modelInputMessages;
+            return await drainDeferredCompletions({
+              modelInputMessages: context.modelInputMessages,
+              abortSignal: context.abortSignal,
+            });
+          });
+
+          state.agent = agent;
+
+          let finalText = "";
+          let stableFinalText = "";
+          let stablePartialText = state.activeRun?.partialText ?? "";
+          let attemptStartFinalText = stableFinalText;
+          let attemptStartPartialText = stablePartialText;
+          const currentTurnToolCallIds = new Set<string>();
+          let turnTextStartIndex = 0;
+          let turnPartialTextStartIndex = stablePartialText.length;
+          let pendingNoReplyTurnText = "";
+          let pendingNoReplyTurnOutputs: Array<{
+            delta: string;
+            phase?: ReturnType<typeof openAIMessagePhase>;
+            phaseBoundaryPrefixChars: number;
+          }> = [];
+          let bufferNoReplyTurnText = true;
+          let lastCompletedTurnWasSilent = false;
+          let turnFinalAnswerText = "";
+          let turnHasFinalAnswerPhase = false;
+          let lastCompletedTurnFinalAnswerText: string | undefined;
+          let currentTextPhase: ReturnType<typeof openAIMessagePhase>;
+          let retainedTextPhase: ReturnType<typeof openAIMessagePhase>;
+          const assistantTextPhaseByPartId = new Map<
+            string,
+            NonNullable<ReturnType<typeof openAIMessagePhase>>
+          >();
+          const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
+            next.recovery?.partialText,
+          );
+          const appendPendingNoReplyOutput = (
+            delta: string,
+            phase: ReturnType<typeof openAIMessagePhase>,
+            phaseBoundaryPrefixChars: number,
+          ): void => {
+            const previous = pendingNoReplyTurnOutputs.at(-1);
+            if (
+              previous !== undefined &&
+              previous.phase === phase &&
+              phaseBoundaryPrefixChars === 0
+            ) {
+              previous.delta += delta;
+              return;
+            }
+            pendingNoReplyTurnOutputs.push({ delta, phase, phaseBoundaryPrefixChars });
+          };
+          const publishPendingNoReplyOutputs = (): void => {
+            for (const output of pendingNoReplyTurnOutputs) {
+              outputPublisher.publishText(
+                output.delta,
+                output.phase,
+                output.phaseBoundaryPrefixChars,
+              );
+            }
+            pendingNoReplyTurnOutputs = [];
+          };
+          const reasoningChunkState: ReasoningChunkState = {
+            chunks: new Map<string, string>(),
+            seq: 0,
+          };
+          let retryAttemptHadReasoning = false;
+
+          const toolStartMs = new Map<string, number>();
+
+          const contextDumpEnabled = env.debug.contextDump.enabled;
+          const contextDumpDir = env.debug.contextDump.dir;
+          let turnEndCount = 0;
+
+          const dumpContextAfterTurn = async (
+            event: Extract<AiSdkPiAgentEvent<ToolSet>, { type: "turn_end" }>,
+          ) => {
+            if (!contextDumpEnabled) return;
+
+            const tsMs = Date.now();
+            const safeSessionId = sanitizeFilenameToken(headers.session_id);
+            const safeRequestId = sanitizeFilenameToken(headers.request_id);
+            const fileName = `${safeSessionId}-${safeRequestId}-${tsMs}.json`;
+            const filePath = path.join(contextDumpDir, fileName);
+
+            const modelView = agent.state.debug?.lastModelViewMessages;
+            const modelViewTurn = agent.state.debug?.lastModelViewTurn;
+
+            const payload = {
+              meta: {
+                tsMs,
+                ts: new Date(tsMs).toISOString(),
+                sessionId: headers.session_id,
+                requestId: headers.request_id,
+                requestClient: headers.request_client,
+                runProfile,
+                subagentDepth: subagentMeta.depth,
+                modelSpec: activeBinding.resolved.spec,
+                modelId: activeBinding.resolved.modelId,
+                turnEndIndex: turnEndCount,
+                modelViewTurn,
+              },
+              system: agent.state.system,
+              providerOptions: agent.state.providerOptions,
+              reasoning: agent.state.reasoning,
+              tools: {
+                names: Object.keys(agent.state.tools ?? {}),
+              },
+              usage: {
+                lastTurn: event.usage,
+                lastTurnTotal: event.totalUsage,
+              },
+              transcript: {
+                messages: agent.state.messages,
+              },
+              modelViewMessagesForTurn: modelView,
+            };
+
+            const dumped = await captureBusAgentRunnerOperation("context dump write", async () => {
+              await fs.mkdir(contextDumpDir, { recursive: true });
+              await fs.writeFile(filePath, debugJsonStringify(payload), "utf8");
+            });
+            if (dumped.status === "ok") {
+              logger.debug("context dump wrote", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                filePath,
+              });
+            } else {
+              logger.warn("context dump failed", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                filePath,
+                error: dumped.error.message,
+              });
+            }
+          };
+
+          const estimateUsageCostUsd = (
+            usage: LanguageModelUsage | undefined,
+          ): number | undefined => {
+            if (!usage || !modelCapabilityInfo?.cost) return undefined;
+            return modelCapability.estimateCostUsd(modelCapabilityInfo, usage);
+          };
+
+          unsubscribe = agent.subscribe((event: AiSdkPiAgentEvent<ToolSet>) => {
+            markRunActivity(
+              event.type === "tool_execution_start" ||
+                event.type === "tool_execution_update" ||
+                event.type === "tool_execution_end"
+                ? "tool"
+                : "model",
+            );
+
+            if (event.type === "agent_end") {
+              runStats.totalUsage = event.totalUsage;
+              runStats.finalMessages = event.messages;
+            }
+
+            if (event.type === "turn_start") {
+              attemptStartFinalText = stableFinalText;
+              attemptStartPartialText = stablePartialText;
+              currentTurnToolCallIds.clear();
+            }
+
+            if (event.type === "messages_reset") {
+              removePendingSilentTurn();
+            }
+
+            if (event.type === "turn_end") {
+              transientRetryController.reset();
+              retryAttemptHadReasoning = false;
+              const turnText = finalText.slice(turnTextStartIndex);
+              const turnDeliveryText = turnHasFinalAnswerPhase ? turnFinalAnswerText : turnText;
+              const silentTurn = resolveReplyDeliveryFromFinalText(turnDeliveryText) === "skip";
+              lastCompletedTurnWasSilent = silentTurn;
+              lastCompletedTurnFinalAnswerText = turnHasFinalAnswerPhase
+                ? turnFinalAnswerText
+                : undefined;
+              if (silentTurn) {
+                finalText = finalText.slice(0, turnTextStartIndex);
+                if (state.activeRun?.requestId === next.requestId) {
+                  state.activeRun.partialText = state.activeRun.partialText.slice(
+                    0,
+                    turnPartialTextStartIndex,
+                  );
+                }
+                void outputPublisher.publishTextReset({
+                  text:
+                    state.activeRun?.requestId === next.requestId
+                      ? state.activeRun.partialText
+                      : `${next.recovery?.partialText ?? ""}${finalText}`,
+                  ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
+                });
+                pendingSilentTurnStartIndex =
+                  agent.state.messages.length - event.newMessages.length;
+              } else if (bufferNoReplyTurnText && pendingNoReplyTurnText.length > 0) {
+                if (state.activeRun?.requestId === next.requestId) {
+                  state.activeRun.partialText += pendingNoReplyTurnText;
+                }
+                publishPendingNoReplyOutputs();
+              }
+              if (!silentTurn) retainedTextPhase = currentTextPhase ?? retainedTextPhase;
+
+              pendingNoReplyTurnText = "";
+              pendingNoReplyTurnOutputs = [];
+              bufferNoReplyTurnText = true;
+              turnFinalAnswerText = "";
+              turnHasFinalAnswerPhase = false;
+              currentTextPhase = undefined;
+              assistantTextPhaseByPartId.clear();
+              turnTextStartIndex = finalText.length;
+              turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
+              stableFinalText = finalText;
+              stablePartialText = state.activeRun?.partialText ?? stablePartialText;
+
+              turnEndCount++;
+              runStats.lastTurnFinishReason = event.finishReason;
+              runStats.lastTurnEndAt = Date.now();
+
+              const roundEstimatedCostUsd = estimateUsageCostUsd(event.usage);
+              if (roundEstimatedCostUsd !== undefined) {
+                roundEstimatedCostUsdTotal =
+                  (roundEstimatedCostUsdTotal ?? 0) + roundEstimatedCostUsd;
+                roundEstimatedCostCount += 1;
+              }
+
+              logger.info("agent.round.stats", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                round: turnEndCount,
+                finishReason: event.finishReason,
+                inputTokens: event.usage.inputTokens,
+                outputTokens: event.usage.outputTokens,
+                totalTokens: event.usage.totalTokens,
+                cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
+                cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
+                estimatedCostUsd: roundEstimatedCostUsd,
+                estimatedCostUsdTotal: roundEstimatedCostUsdTotal,
+                modelSpec: activeBinding.resolved.spec,
+                costEstimateStatus:
+                  roundEstimatedCostUsd !== undefined ? "estimated" : costEstimateStatus,
+                costEstimateReason:
+                  roundEstimatedCostUsd === undefined ? costEstimateReason : undefined,
+              });
+
+              // Fire-and-forget debug dump; do not block the run.
+              void dumpContextAfterTurn(event);
+            }
+
+            if (event.type === "turn_abort" && event.reason === "interrupt") {
+              transientRetryController.reset();
+            }
+
+            if (event.type === "turn_abort") {
+              if (bufferNoReplyTurnText) {
+                finalText = finalText.slice(0, turnTextStartIndex);
+              }
+              pendingNoReplyTurnText = "";
+              pendingNoReplyTurnOutputs = [];
+              bufferNoReplyTurnText = true;
+              turnFinalAnswerText = "";
+              turnHasFinalAnswerPhase = false;
+              currentTextPhase = undefined;
+              assistantTextPhaseByPartId.clear();
+              turnTextStartIndex = finalText.length;
+              turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
+            }
+
+            if (
+              event.type === "turn_retry" ||
+              (event.type === "messages_reset" && event.reason === "recovery")
+            ) {
+              if (event.type === "messages_reset") {
+                const retainedToolCallIds = toolCallIdsFromMessages(event.messages);
+                const retainsCurrentTurn = [...currentTurnToolCallIds].some((toolCallId) =>
+                  retainedToolCallIds.has(toolCallId),
+                );
+                if (!retainsCurrentTurn) {
+                  stableFinalText = attemptStartFinalText;
+                  stablePartialText = attemptStartPartialText;
+                }
+              }
+              outputPublisher.flush();
+              assistantTextPartBoundaryState.lastTextPartId = null;
+              assistantTextPartBoundaryState.pendingTextPartStartIds.clear();
+              assistantTextPartBoundaryState.pendingRecoveryTextBoundary =
+                event.type === "turn_retry" ? event.hadPartialOutput : true;
+              finalText = stableFinalText;
+              if (state.activeRun?.requestId === next.requestId) {
+                state.activeRun.partialText = stablePartialText;
+              }
+              pendingNoReplyTurnText = "";
+              pendingNoReplyTurnOutputs = [];
+              bufferNoReplyTurnText = true;
+              turnFinalAnswerText = "";
+              turnHasFinalAnswerPhase = false;
+              currentTextPhase = undefined;
+              assistantTextPhaseByPartId.clear();
+              turnTextStartIndex = stableFinalText.length;
+              turnPartialTextStartIndex = stablePartialText.length;
+
+              if (event.type === "messages_reset") {
+                void outputPublisher.publishTextReset({
+                  text: stablePartialText,
+                  ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
+                });
+              }
+
+              if (retryAttemptHadReasoning) {
+                reasoningChunkState.chunks.clear();
+                reasoningChunkState.seq += 1;
+                void publishAuxiliaryOutput(
+                  "failed to clear reasoning after model retry",
+                  { requestId: headers.request_id, sessionId: headers.session_id },
+                  () =>
+                    outputPublisher.publishReasoningBoundary({
+                      delta: "",
+                      seq: reasoningChunkState.seq,
+                    }),
+                );
+              }
+              retryAttemptHadReasoning = false;
+            }
+
+            if (event.type === "turn_warnings") {
+              streamWarnings.push(...event.warnings);
+
+              logger.warn("model stream warnings", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                count: event.warnings.length,
+                warnings: event.warnings.map((warning) => formatCallWarning(warning)),
+              });
+            }
+
+            if (
+              event.type === "message_update" &&
+              event.assistantMessageEvent.type === "text_start"
+            ) {
+              const phase = openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata);
+              if (phase !== undefined) {
+                assistantTextPhaseByPartId.set(event.assistantMessageEvent.id, phase);
+              }
+              markAssistantTextPartStarted(
+                assistantTextPartBoundaryState,
+                event.assistantMessageEvent.id,
+              );
+            }
+
+            if (
+              event.type === "message_update" &&
+              event.assistantMessageEvent.type === "text_delta"
+            ) {
+              runStats.firstTextDeltaAt ??= Date.now();
+              const phase =
+                openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata) ??
+                assistantTextPhaseByPartId.get(event.assistantMessageEvent.id);
+              if (phase === "final_answer" && currentTextPhase === "commentary") {
+                if (pendingNoReplyTurnText.length > 0) {
+                  if (state.activeRun?.requestId === next.requestId) {
+                    state.activeRun.partialText += pendingNoReplyTurnText;
+                  }
+                  publishPendingNoReplyOutputs();
+                  pendingNoReplyTurnText = "";
+                }
+                bufferNoReplyTurnText = true;
+              }
+              currentTextPhase = phase ?? currentTextPhase;
+
+              const delta = consumeAssistantTextDelta({
+                state: assistantTextPartBoundaryState,
+                finalText,
+                recoveryPartialText: next.recovery?.partialText,
+                partId: event.assistantMessageEvent.id,
+                delta: event.assistantMessageEvent.delta,
+              });
+              const phaseBoundaryPrefixChars = Math.max(
+                0,
+                delta.length - event.assistantMessageEvent.delta.length,
+              );
+
+              finalText += delta;
+              if (phase === "final_answer") {
+                turnHasFinalAnswerPhase = true;
+                turnFinalAnswerText += event.assistantMessageEvent.delta;
+              }
+
+              if (bufferNoReplyTurnText) {
+                pendingNoReplyTurnText += delta;
+                appendPendingNoReplyOutput(delta, phase, phaseBoundaryPrefixChars);
+                if (!isPossibleNoReplyPrefix(pendingNoReplyTurnText)) {
+                  bufferNoReplyTurnText = false;
+                  if (state.activeRun?.requestId === next.requestId) {
+                    state.activeRun.partialText += pendingNoReplyTurnText;
+                  }
+                  publishPendingNoReplyOutputs();
+                  pendingNoReplyTurnText = "";
+                }
+              } else {
+                if (state.activeRun?.requestId === next.requestId) {
+                  state.activeRun.partialText += delta;
+                }
+                outputPublisher.publishText(delta, phase, phaseBoundaryPrefixChars);
+              }
+            }
+
+            if (
+              event.type === "message_update" &&
+              event.assistantMessageEvent.type === "text_end"
+            ) {
+              markAssistantTextPartEnded(
+                assistantTextPartBoundaryState,
+                event.assistantMessageEvent.id,
+              );
+              assistantTextPhaseByPartId.delete(event.assistantMessageEvent.id);
+            }
+
+            if (
+              event.type === "message_update" &&
+              event.assistantMessageEvent.type === "thinking_start"
+            ) {
+              const chunkId = event.assistantMessageEvent.id;
+              retryAttemptHadReasoning = true;
+              consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
+
+              void publishAuxiliaryOutput(
+                "failed to publish reasoning start",
+                { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
+                () => outputPublisher.publishReasoningBoundary({ delta: "" }),
+              );
+            }
+
+            if (
+              event.type === "message_update" &&
+              event.assistantMessageEvent.type === "thinking_delta"
+            ) {
+              const chunkId = event.assistantMessageEvent.id;
+              const delta = event.assistantMessageEvent.delta;
+              retryAttemptHadReasoning = true;
+              const update = consumeReasoningChunkEvent(reasoningChunkState, {
+                type: "delta",
+                chunkId,
+                delta,
+              });
+              if (update.publishStart) {
+                void publishAuxiliaryOutput(
+                  "failed to publish implicit reasoning start",
+                  { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
+                  () => outputPublisher.publishReasoningBoundary({ delta: "" }),
+                );
+              }
+
+              if (update.snapshot) {
+                outputPublisher.publishReasoningSnapshot(update.snapshot, Buffer.byteLength(delta));
+              }
+            }
+
+            if (
+              event.type === "message_update" &&
+              event.assistantMessageEvent.type === "thinking_end"
+            ) {
+              const chunkId = event.assistantMessageEvent.id;
+              consumeReasoningChunkEvent(reasoningChunkState, { type: "end", chunkId });
+              outputPublisher.flush();
+            }
+
+            if (event.type === "tool_execution_start") {
+              const startedAt = Date.now();
+              toolStartMs.set(event.toolCallId, startedAt);
+              currentTurnToolCallIds.add(event.toolCallId);
+              state.activeRun?.activeTools.set(event.toolCallId, {
+                toolName: event.toolName,
+                startedAt,
+              });
+
+              if (event.toolName !== "batch") {
+                void publishAuxiliaryOutput(
+                  "failed to publish tool start",
+                  {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    toolCallId: event.toolCallId,
+                    toolName: event.toolName,
+                  },
+                  () =>
+                    outputPublisher.publishToolCall({
+                      toolCallId: event.toolCallId,
+                      status: "start",
+                      display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                    }),
+                );
+              }
+            }
+
+            if (event.type === "tool_execution_end") {
+              state.activeRun?.activeTools.delete(event.toolCallId);
+              const started = toolStartMs.get(event.toolCallId);
+              const toolDurationMs = started ? Date.now() - started : undefined;
+              const toolFailure = summarizeToolFailure({
+                toolName: event.toolName,
+                isError: event.isError,
+                result: event.result,
+                toolSpecs: activeBinding.toolset.specs,
+              });
+              const deferredAccepted =
+                event.toolName === "subagent_delegate" &&
+                isDeferredSubagentAcceptedResult(event.result);
+
+              let ok: boolean;
+              switch (event.toolName) {
+                case "batch":
+                  ok = getBatchOkFromResult(event.result) ?? toolFailure.ok;
+                  break;
+                case "subagent_delegate":
+                  ok = getSubagentOkFromResult(event.result) ?? toolFailure.ok;
+                  break;
+                default:
+                  ok = toolFailure.ok;
+                  break;
+              }
+              const interruptedForRestart = restartAbortRequestIds.has(headers.request_id);
+              const toolFailureError = toolFailure.error ?? "tool failed";
+
+              if (!ok) {
+                logger.warn("tool call failed", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  toolCallId: event.toolCallId,
+                  toolName: event.toolName,
+                  durationMs: toolDurationMs,
+                  failureKind: toolFailure.failureKind ?? "soft",
+                  error: interruptedForRestart ? "server restarted" : toolFailureError,
+                  argsPreview: formatToolLogPreview({
+                    toolName: event.toolName,
+                    value: event.args,
+                  }),
+                  resultPreview: formatToolLogPreview({
+                    toolName: event.toolName,
+                    value: event.result,
+                  }),
+                });
+              }
+
+              logger.debug("tool finished", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                ok,
+                deferredAccepted,
+                durationMs: toolDurationMs,
+                failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
+              });
+
+              if (event.toolName === "batch" || deferredAccepted) {
+                return;
+              }
+
+              let publishedToolError: string | undefined;
+              if (!ok) {
+                publishedToolError = interruptedForRestart ? "server restarted" : toolFailureError;
+              }
+              void publishAuxiliaryOutput(
+                "failed to publish tool end",
+                {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  toolCallId: event.toolCallId,
+                  toolName: event.toolName,
+                },
+                () =>
+                  outputPublisher.publishToolCall({
+                    toolCallId: event.toolCallId,
+                    status: "end",
+                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                    ok,
+                    error: publishedToolError,
+                  }),
+              );
+            }
+
+            if (event.type === "agent_end") {
+              // Best-effort fallback: if deltas didn't populate finalText, take last assistant string.
+              if (!finalText) {
+                const last = event.messages[event.messages.length - 1];
+                if (last && last.role === "assistant") {
+                  if (typeof last.content === "string") {
+                    finalText = last.content;
+                  } else {
+                    const buf: string[] = [];
+                    for (const part of last.content) {
+                      if (part.type !== "text") continue;
+                      buf.push(part.text);
+                    }
+                    finalText = buf.join("\n\n");
+                  }
+                }
+              }
+            }
+          });
+
+          if (next.recovery) {
+            initialMessages = [buildResumePrompt(next.recovery.partialText)];
+            responseStartIndex = agent.state.messages.length + initialMessages.length;
+          } else if (parsedCustomCommand) {
+            initialMessages = [...next.messages];
+            agent.appendMessages(initialMessages);
+            responseStartIndex = agent.state.messages.length;
+            agent.appendMessages(customCommandMessages);
+          } else {
+            // First message should be a prompt.
+            // If additional messages for the same request id were queued before the run started,
+            // merge them into the initial prompt so they don't become separate runs.
+            const mergedInitial = mergeQueuedForSameRequest(next, state.queue);
+            if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+            const control = parseRequestControlFromRaw(next.raw);
+            const reportAutoInjectedThreadSearchError = (message: string, cause: unknown): void => {
+              const error = projectBusAgentRunnerError(cause, message);
+              logger.warn(message, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                ...error.details,
+                error: error.message,
+              });
+            };
+            const autoInjectedThreadSearchMessages =
+              runProfile === "primary" &&
+              !isHeartbeatSessionId(headers.session_id) &&
+              !control.cancel &&
+              !control.requiresActive
+                ? await waitForPreAgent(
+                    maybeBuildAutoInjectedThreadSearchMessages({
+                      cfg,
+                      conversationThreads: params.conversationThreads,
+                      requestId: headers.request_id,
+                      raw: next.raw,
+                      previousMessages: agent.state.messages,
+                      userMessages: mergedInitial,
+                      publishToolStatus: async (update) => {
+                        await outputPublisher.publishToolCall(update);
+                      },
+                      onError: reportAutoInjectedThreadSearchError,
+                      onInjected: (event) => {
+                        logger.info("conversation.thread.auto_inject.appended", {
+                          requestId: headers.request_id,
+                          sessionId: headers.session_id,
+                          toolCallId: event.toolCallId,
+                          mode: event.mode,
+                          limit: event.limit,
+                          searchCount: event.searches.length,
+                          queryCount: event.searches.reduce(
+                            (sum, queries) => sum + queries.length,
+                            0,
+                          ),
+                          searches: event.searches,
+                          participantFilterUserCount: event.participantFilterUserCount,
+                          appendedCount: event.entries.length,
+                          entries: event.entries,
+                        });
+                      },
+                    }),
+                  )
+                : [];
+            initialMessages = [...mergedInitial, ...autoInjectedThreadSearchMessages];
+            if (
+              autoInjectedThreadSearchMessages.length > 0 &&
+              runProfile === "primary" &&
+              next.requestClient === "discord"
+            ) {
+              next.corePrimaryLineage = appendAutoInjectedThreadSearchLineage({
+                lineage: next.corePrimaryLineage,
+                canonicalMessages: mergedInitial,
+                injectedMessages: autoInjectedThreadSearchMessages,
+              });
+              if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
+            }
+            initialMessagesEndWithInjectedTool = autoInjectedThreadSearchMessages.length > 0;
+            responseStartIndex = agent.state.messages.length + initialMessages.length;
+          }
+
+          if (cancelledByRequestId.has(headers.request_id)) {
+            const finalText = "Cancelled.";
+            await publishCurrentLifecycle({
+              state: "cancelled",
+              detail: "cancelled by interrupt",
+              output: finalText,
+            });
+            await outputPublisher.publishResponseText({ finalText });
+            return;
+          }
+
+          if (state.activeRun) state.activeRun.started = true;
+          runIdleWatchdog?.start();
+
+          if (parsedCustomCommand) {
+            await waitForRun(agent.continue());
+          } else if (initialMessagesEndWithInjectedTool) {
+            agent.appendMessages(initialMessages);
+            await waitForRun(agent.continue());
+          } else {
+            await waitForRun(agent.prompt(initialMessages));
+          }
+
+          while (true) {
+            await waitForRun(agent.waitForIdle());
+
+            if (restartAbortRequestIds.delete(headers.request_id)) {
+              return signalBusAgentRunnerHostFailure(new RestartDrainingAbort());
+            }
+
+            const continuationWaitVersion = continuationSignalVersion;
+            const deferredWaitState = liveParentSession?.snapshot();
+
+            if (liveParentSession && deferredWaitState?.hasPendingCompletions) {
+              const decision = await drainDeferredCompletions({
+                modelInputMessages: lastBoundaryModelInputMessages,
+              });
+              if (decision.append.length > 0) agent.appendMessages(decision.append);
+              if (cancelledByRequestId.has(headers.request_id)) break;
+              if (decision.append.length > 0 || decision.forceNextTurn) {
+                await waitForRun(agent.continue());
+              } else if (liveParentSession.snapshot().hasPendingCompletions) {
+                await waitForRun(
+                  waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
+                );
+              }
+              continue;
+            }
+
+            if (!deferredWaitState?.hasOutstandingRuns) {
+              break;
+            }
+            if (!liveParentSession) break;
+
+            await waitForRun(
+              waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
+            );
+            if (agent.state.isStreaming) {
+              continue;
+            }
+          }
+          runIdleWatchdog?.stop();
+
+          let isCancelled = cancelledByRequestId.has(headers.request_id);
+          if (isCancelled) coreNamedClaudeRuntime?.markTerminalFailure(true);
+          if (isCancelled) corePrimaryClaudeRuntime?.markTerminalFailure(true);
+          if (isCancelled && !finalText) {
+            finalText = "Cancelled.";
+          }
+
+          const terminalDeliveryText = isCancelled
+            ? finalText
+            : (lastCompletedTurnFinalAnswerText ?? finalText);
+          const isHeartbeatAckOnly =
+            isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(terminalDeliveryText);
+          const delivery =
+            finalText.length === 0 && lastCompletedTurnWasSilent
+              ? "skip"
+              : resolveReplyDeliveryFromFinalText(terminalDeliveryText);
+          if (
+            !isCancelled &&
+            delivery !== "skip" &&
+            !isHeartbeatAckOnly &&
+            finalText.length === 0
+          ) {
+            return signalBusAgentRunnerHostFailure(
+              new Error(
+                buildNoAssistantTextError({
+                  provider: activeBinding.resolved.provider,
+                  modelId: activeBinding.resolved.modelId,
+                  finishReason: runStats.lastTurnFinishReason,
+                  warningSummary: summarizeCallWarnings(streamWarnings) ?? undefined,
+                }),
+              ),
+            );
+          }
+
+          const shouldSkipSurfaceReply = delivery === "skip" || isHeartbeatAckOnly;
+          if (shouldSkipSurfaceReply) {
+            logger.info("agent requested skip reply", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+            });
+            finalText = "";
+          }
+
+          // Keep skip-reply behavior for primary runs.
+          // For subagent runs we still persist to support explicit session continuation.
+          const transcriptStore = params.transcriptStore;
+          if (transcriptStore && (!shouldSkipSurfaceReply || runProfile !== "primary")) {
+            const persistedTranscript = await captureBusAgentRunnerOperation(
+              "successful transcript persistence",
+              async () => {
+                const finalMessagesForPersistence = runStats.finalMessages ?? agent.state.messages;
+                const checkpointMeta = resolveCompactionCheckpointMeta({
+                  runSucceeded: true,
+                  isPrimary: runProfile === "primary",
+                  isCancelled,
+                  shouldSkipSurfaceReply,
+                  completedCompactionCount,
+                });
+                const isCompactionCheckpoint = checkpointMeta !== undefined;
+                const persistedMessages = (() => {
+                  if (isHeartbeatSessionId(headers.session_id)) {
+                    return buildPersistedHeartbeatMessages(finalText);
+                  }
+
+                  return selectPersistedTranscriptMessages({
+                    finalMessages: finalMessagesForPersistence,
+                    responseStartIndex,
+                    isPrimary: runProfile === "primary",
+                    didCompact: isCompactionCheckpoint,
+                  });
+                })();
+                const targetProviderFamily = classifyHistoryProviderFamily({
+                  type: activeBinding.resolved.provider,
+                });
+                let providerState: HistoryProviderState | undefined;
+                switch (runProfile) {
+                  case "primary":
+                    providerState = resolveCorePrimaryTranscriptProviderState({
+                      targetFamily: targetProviderFamily,
+                      lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                      transcriptStore,
+                    });
+                    break;
+                  case "explore":
+                  case "general":
+                  case "self":
+                    providerState = undefined;
+                    if (stableNamedContinuation && !isCancelled) {
+                      const sourceProviderState =
+                        seededSessionTranscript === null
+                          ? "empty-history"
+                          : (seededSessionTranscript.providerState ?? "unknown-populated-history");
+                      providerState = advanceHistoryProviderState(
+                        sourceProviderState,
+                        targetProviderFamily,
+                      );
+                    }
+                    break;
+                  default: {
+                    const _exhaustive: never = runProfile;
+                    providerState = _exhaustive;
+                    break;
+                  }
+                }
+                const terminalPrimaryLineage =
+                  state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
+                const canPublishCorePrimaryClaude =
+                  corePrimaryClaudeRuntime !== null &&
+                  terminalPrimaryLineage?.state === "complete" &&
+                  !isCompactionCheckpoint;
+
+                transcriptStore.saveRequestTranscript({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  requestClient: headers.request_client,
+                  // Primary runs can reconstruct context from the surface thread.
+                  // Subagent runs need full per-session transcript for explicit continuation.
+                  messages: persistedMessages,
+                  finalText,
+                  modelLabel: resolvedModelLabel,
+                  contextMeta: checkpointMeta,
+                  ...(providerState && !coreNamedClaudeRuntime && !canPublishCorePrimaryClaude
+                    ? { providerState }
+                    : {}),
+                  ...(runProfile === "primary"
+                    ? persistedCompleteLineage(terminalPrimaryLineage)
+                    : {}),
+                  ...(stableNamedContinuation && !isCancelled && !coreNamedClaudeRuntime
+                    ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
+                    : {}),
+                });
+                if (coreNamedClaudeRuntime && !isCancelled) {
+                  if (!providerState) {
+                    return signalBusAgentRunnerHostFailure(
+                      new Error("Core named Claude finalization requires provider history state"),
+                    );
+                  }
+                  const verified = transcriptStore.getRequestTranscript?.({
+                    requestId: headers.request_id,
+                  });
+                  const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+                  if (
+                    !verified ||
+                    verified.messages.length !== persistedMessages.length ||
+                    hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
+                  ) {
+                    return signalBusAgentRunnerHostFailure(
+                      new Error("persisted Core named transcript failed canonical re-read"),
+                    );
+                  }
+                  const promoted = await coreNamedClaudeRuntime.finalize({
+                    terminalTranscript: verified,
+                    canonicalMessages: persistedMessages,
+                    providerState,
+                    isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
+                  });
+                  const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
+                  isCancelled ||= cancelledDuringFinalization;
+                  logger.info("Core named Claude binding promotion", {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    promoted,
+                  });
+                }
+                if (corePrimaryClaudeRuntime && !isCancelled && canPublishCorePrimaryClaude) {
+                  if (!providerState) {
+                    return signalBusAgentRunnerHostFailure(
+                      new Error("Core primary Claude finalization requires provider history state"),
+                    );
+                  }
+                  const verified = transcriptStore.getRequestTranscript?.({
+                    requestId: headers.request_id,
+                  });
+                  const verifiedManifest = transcriptStore.getCorePrimaryLineageManifest?.({
+                    requestId: headers.request_id,
+                  });
+                  const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+                  const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
+                  if (
+                    !verified ||
+                    !verifiedManifest ||
+                    verified.providerState != null ||
+                    verified.messages.length !== persistedMessages.length ||
+                    hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
+                  ) {
+                    return signalBusAgentRunnerHostFailure(
+                      new Error("persisted Core primary transcript failed canonical re-read"),
+                    );
+                  }
+                  const promoted = await corePrimaryClaudeRuntime.finalize({
+                    terminalTranscript: verified,
+                    canonicalMessages: terminalCanonicalMessages,
+                    providerState,
+                    isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
+                  });
+                  const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
+                  isCancelled ||= cancelledDuringFinalization;
+                  logger.info("Core primary Claude binding promotion", {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    promoted,
+                  });
+                } else if (corePrimaryClaudeRuntime && !isCancelled) {
+                  corePrimaryClaudeRuntime.markTerminalFailure(false);
+                }
+                if (isCompactionCheckpoint) {
+                  logger.info("compaction checkpoint persisted", {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    messageCount: persistedMessages.length,
+                    compactionCount: completedCompactionCount,
+                    formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
+                  });
+                }
+              },
+            );
+            if (persistedTranscript.status === "error") {
+              coreNamedClaudeRuntime?.markTerminalFailure(false);
+              corePrimaryClaudeRuntime?.markTerminalFailure(false);
+              logger.error("failed to persist transcript", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                error: persistedTranscript.error.message,
+              });
+            }
+          }
+          if (corePrimaryClaudeRuntime && shouldSkipSurfaceReply) {
+            corePrimaryClaudeRuntime.markTerminalFailure(false);
+          }
+
+          // Build stats in the js-llmcord-ish one-liner format.
+          const endAt = runStats.lastTurnEndAt ?? Date.now();
+          const ttftMs = runStats.firstTextDeltaAt
+            ? runStats.firstTextDeltaAt - runStartedAt
+            : null;
+          const outputTokens = runStats.totalUsage?.outputTokens;
+          const rawTps =
+            typeof outputTokens === "number" &&
+            runStats.lastTurnFinishReason === "stop" &&
+            endAt > runStartedAt
+              ? outputTokens / ((endAt - runStartedAt) / 1000)
+              : null;
+          const tps = rawTps !== null && Number.isFinite(rawTps) ? rawTps : null;
+
+          const responseMessages = runStats.finalMessages
+            ? runStats.finalMessages.slice(responseStartIndex)
+            : [];
+
+          if (transcriptStore && isHeartbeatSessionId(headers.session_id)) {
+            const persistedHandoffs = await captureBusAgentRunnerOperation(
+              "heartbeat handoff transcript persistence",
+              () =>
+                persistHeartbeatSurfaceHandoffs({
+                  logger,
+                  transcriptStore,
+                  requestId: headers.request_id,
+                  requestClient: headers.request_client,
+                  sessionId: headers.session_id,
+                  modelLabel: resolvedModelLabel,
+                  responseMessages,
+                }),
+            );
+            if (persistedHandoffs.status === "error") {
+              logger.error("failed to persist heartbeat handoff transcripts", {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                error: persistedHandoffs.error.message,
+              });
+            }
+          }
+
+          const icLine = buildInputCompositionLine({
+            system: systemPromptToText(agent.state.system),
+            initialMessages,
+            responseMessages,
+            tools: agent.state.tools,
+          });
+
+          const modelLabel = activeBinding.resolved.modelId;
+          const statsLine = buildStatsLine({
+            modelLabel,
+            usage: runStats.totalUsage,
+            ttftMs,
+            tps,
+            icLine,
+          });
+
+          const statsForNerds = getStatsForNerdsOptions(cfg.agent.statsForNerds);
+          const statsForNerdsLine = statsForNerds.enabled
+            ? buildStatsLine({
+                modelLabel,
+                usage: runStats.totalUsage,
+                ttftMs,
+                tps,
+                icLine: statsForNerds.verbose ? icLine : null,
+              })
+            : undefined;
+
+          const estimatedCostUsdFromTotalUsage = didSwitchModel
+            ? undefined
+            : estimateUsageCostUsd(runStats.totalUsage);
+          const estimatedCostUsdTotal =
+            estimatedCostUsdFromTotalUsage ?? roundEstimatedCostUsdTotal;
+          const resolvedCostEstimateStatus =
+            estimatedCostUsdTotal !== undefined ? "estimated" : costEstimateStatus;
+          const resolvedCostEstimateReason =
+            estimatedCostUsdTotal !== undefined ? undefined : costEstimateReason;
+
+          await publishCurrentLifecycle({
+            state: isCancelled ? "cancelled" : "resolved",
+            detail: isCancelled ? "cancelled by interrupt" : undefined,
+            output: finalText,
+            usage: runStats.totalUsage
+              ? {
+                  inputTokens: runStats.totalUsage.inputTokens ?? 0,
+                  outputTokens: runStats.totalUsage.outputTokens ?? 0,
+                  totalTokens: runStats.totalUsage.totalTokens ?? 0,
+                }
+              : undefined,
+          });
+
+          await outputPublisher.publishResponseText({
+            finalText,
+            delivery,
+            statsForNerdsLine,
+            usage: runStats.totalUsage
+              ? {
+                  inputTokens: runStats.totalUsage.inputTokens ?? 0,
+                  outputTokens: runStats.totalUsage.outputTokens ?? 0,
+                  totalTokens: runStats.totalUsage.totalTokens ?? 0,
+                }
+              : undefined,
+          });
+
+          logger.info(statsLine, {
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            turns: turnEndCount,
+            estimatedCostUsd: estimatedCostUsdTotal,
+            costEstimateStatus: resolvedCostEstimateStatus,
+            costEstimateReason: resolvedCostEstimateReason,
+            estimatedCostTurnCoverage:
+              turnEndCount > 0 ? roundEstimatedCostCount / turnEndCount : undefined,
+          });
+
+          logger.info("agent run resolved", {
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            model: activeBinding.resolved.spec,
+            durationMs: Date.now() - runStartedAt,
+            finalTextChars: finalText.length,
+            turns: turnEndCount,
+            estimatedCostUsd: estimatedCostUsdTotal,
+            costEstimateStatus: resolvedCostEstimateStatus,
+            costEstimateReason: resolvedCostEstimateReason,
+          });
+        },
+        (panic) => {
+          terminalPanic = panic;
+        },
+      );
+      if (runResult.status === "error") {
+        const e = runResult.error.cause;
+        const failedCoreNamedRuntime = getCoreNamedClaudeRuntime();
+        const failedCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
+        runIdleWatchdog?.stop();
+
+        if (e instanceof RestartDrainingAbort) {
+          failedCoreNamedRuntime?.markUncertain();
+          failedCorePrimaryRuntime?.markUncertain();
+        } else if (e instanceof PreAgentRunCancelledError) {
+          failedCoreNamedRuntime?.markTerminalFailure(true);
+          failedCorePrimaryRuntime?.markTerminalFailure(true);
+        } else {
+          failedCoreNamedRuntime?.markTerminalFailure(false);
+          failedCorePrimaryRuntime?.markTerminalFailure(false);
+        }
+
+        if (activeCustomCommandTool) {
+          const { toolCallId, display } = activeCustomCommandTool;
+          activeCustomCommandTool = null;
+          let customCommandError: string;
+          if (e instanceof PreAgentRunCancelledError) {
+            customCommandError = "cancelled by interrupt";
+          } else if (e instanceof Error) {
+            customCommandError = e.message;
+          } else {
+            customCommandError = projectBusAgentRunnerError(e).message;
+          }
+          await captureBusAgentRunnerOperation("custom command failure status publish", () =>
+            outputPublisher.publishToolCall({
+              toolCallId,
+              status: "end",
+              display,
+              ok: false,
+              error: customCommandError,
+            }),
+          );
+        }
+
+        const timedOutOperation = getActiveRunOperation();
+        if (
+          (e instanceof AgentIdleTimeoutError || e instanceof PreAgentRunCancelledError) &&
+          timedOutOperation
+        ) {
+          const observeTimedOutOperation = captureBusAgentRunnerOperation(
+            "cancelled agent operation settlement",
+            () => timedOutOperation,
+            (panic) => {
+              terminalPanic ??= panic;
+            },
+          ).then(() => true);
+          const settled = await Promise.race([
+            observeTimedOutOperation,
+            Bun.sleep(AGENT_TIMEOUT_ABORT_GRACE_MS).then(() => false),
+          ]);
+          if (!settled) {
+            logger.warn("agent operation did not settle after cancellation grace period", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              reason: e instanceof AgentIdleTimeoutError ? "idle_timeout" : "cancelled",
+              abortGraceMs: AGENT_TIMEOUT_ABORT_GRACE_MS,
+            });
           }
         }
 
-        const customCancelled = cancelledByRequestId.has(headers.request_id);
-
-        if (customCancelled) {
-          const finalText = "Cancelled.";
-          await outputPublisher.publishToolCall({
-            toolCallId,
-            status: "end",
-            display,
-            ok: false,
-            error: "cancelled by interrupt",
+        if (e instanceof RestartDrainingAbort) {
+          preserveWorkflowClaim = true;
+          if (workflowHint) {
+            params.durableWorkflowStore?.releaseWorkflowRequestClaim(
+              next.requestId,
+              workflowRunnerOwnerId,
+              Date.now(),
+            );
+          }
+          logger.info("agent run interrupted for graceful restart", {
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            durationMs: Date.now() - runStartedAt,
           });
-          activeCustomCommandTool = null;
+          return;
+        }
+
+        if (e instanceof PreAgentRunCancelledError) {
+          if (liveParentSession) {
+            await captureBusAgentRunnerOperation("cancel deferred subagents", () =>
+              liveParentSession.cancelAll("parent request cancelled"),
+            );
+          }
+          const finalText = "Cancelled.";
           await publishCurrentLifecycle({
             state: "cancelled",
             detail: "cancelled by interrupt",
@@ -3349,2636 +6128,137 @@ export async function startBusAgentRunner(params: {
           return;
         }
 
-        if (customError) {
-          output = { type: "error-text", value: customError };
-        }
-
-        output = await waitForPreAgent(
-          Promise.resolve(
-            normalizeToolResultOutput(output, {
-              toolCallId,
-              toolName: CUSTOM_COMMAND_TOOL_NAME,
-            }),
-          ),
+        const rawMsg = formatUnknownErrorForDisplay(e);
+        const msg = maybeAppendWarningSummaryToUnclearError(
+          rawMsg,
+          summarizeCallWarnings(streamWarnings),
         );
 
-        customCommandMessages = buildCustomCommandMessages({
-          toolCallId,
-          name: parsedCustomCommand.name,
-          args: parsedCustomCommand.args,
-          prompt: parsedCustomCommand.prompt,
-          text: parsedCustomCommand.text,
-          source: parsedCustomCommand.source,
-          output,
-        });
+        const failureTranscriptStore = params.transcriptStore;
+        if (failureTranscriptStore) {
+          const persistedFailure = await captureBusAgentRunnerOperation(
+            "failed run transcript persistence",
+            () => {
+              const finalMessagesForPersistence =
+                runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
+              const safeFinalMessages = buildSafeRecoveryCheckpoint(
+                finalMessagesForPersistence,
+                "agent run failed",
+              );
+              const responseMessages = safeFinalMessages.slice(responseStartIndex);
+              const persistedMessages = (() => {
+                if (isHeartbeatSessionId(headers.session_id)) {
+                  return buildPersistedHeartbeatMessages(`Error: ${msg}`);
+                }
 
-        await outputPublisher.publishToolCall({
-          toolCallId,
-          status: "end",
-          display,
-          ok: !customError,
-          error: customError ?? undefined,
-        });
-        activeCustomCommandTool = null;
+                return runProfile === "primary" ? responseMessages : safeFinalMessages;
+              })();
 
-        if (customError) {
-          const finalText = buildCustomCommandFailureFinalText({
-            commandText: parsedCustomCommand.text,
-            normalizedOutput: output,
-          });
-          resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
-
-          if (params.transcriptStore) {
-            try {
-              params.transcriptStore.saveRequestTranscript({
+              failureTranscriptStore.saveRequestTranscript({
                 requestId: headers.request_id,
                 sessionId: headers.session_id,
                 requestClient: headers.request_client,
-                messages: [
-                  ...customCommandMessages,
-                  { role: "assistant", content: finalText } satisfies ModelMessage,
-                ],
-                finalText,
+                messages: persistedMessages,
+                finalText: `Error: ${msg}`,
                 modelLabel: resolvedModelLabel,
-              });
-            } catch (error) {
-              logger.error(
-                "failed to persist transcript after custom command error",
-                { requestId: headers.request_id, sessionId: headers.session_id },
-                error,
-              );
-            }
-          }
-
-          await publishCurrentLifecycle({
-            state: "failed",
-            detail: customError,
-            output: finalText,
-          });
-          await outputPublisher.publishResponseText({ finalText });
-
-          logger.warn("custom command failed", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            commandName: parsedCustomCommand.name,
-            error: customError,
-          });
-          return;
-        }
-      }
-
-      const requestModelOverride =
-        runProfile === "primary"
-          ? (next.modelOverride ?? parseRequestModelOverrideFromRaw(next.raw) ?? undefined)
-          : next.modelOverride;
-      if (
-        workflowPolicy &&
-        requestModelOverride !== undefined &&
-        requestModelOverride !== workflowPolicy.resolvedModelRequest.alias &&
-        requestModelOverride !== workflowPolicy.resolvedModelRequest.spec
-      ) {
-        throw new Error("Workflow request model does not match the approved operation policy");
-      }
-      const modelPlan = resolveAgentRunModel({
-        cfg,
-        runProfile,
-        requestModelOverride,
-        reasoningOverride: subagentMeta.reasoning,
-        resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
-      });
-      const initialResolvedModel = modelPlan.head;
-      resolvedModelLabel = initialResolvedModel.modelId;
-      resolvedProviderFamily = classifyHistoryProviderFamily({
-        type: initialResolvedModel.provider,
-      });
-      if (state.activeRun) {
-        state.activeRun.resolvedModelSpec = initialResolvedModel.spec;
-        state.activeRun.resolvedReasoning = initialResolvedModel.reasoning;
-        state.activeRun.resolvedProviderFamily = resolvedProviderFamily;
-      }
-
-      const skillsSection =
-        runProfile === "explore"
-          ? null
-          : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
-
-      const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
-      const parentChannelResolution =
-        next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
-      const parentChannelId = parentChannelResolution ?? undefined;
-      const safetyMode: SessionSafetyMode =
-        next.requestClient === "discord" && parentChannelResolution === undefined
-          ? "restricted"
-          : resolveSessionSafetyMode(cfg, sessionId, parentChannelId);
-      if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
-        controlCapability =
-          (await params.issueHeartbeatCapability?.({
-            requestId: next.requestId,
-            sessionId: next.sessionId,
-            requestClient: next.requestClient,
-            canonicalCwd: cwd,
-            expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
-          })) ?? null;
-        if (!controlCapability) {
-          throw new Error("Heartbeat request is missing server-issued Level-2 authority");
-        }
-      } else if (
-        workflowPolicy ||
-        next.requestClient === "discord" ||
-        next.requestClient === "github"
-      ) {
-        const capabilityPrincipal = trustedFallbackSurface
-          ? {
-              platform: trustedFallbackSurface.platform,
-              userId: trustedFallbackSurface.userId,
-            }
-          : undefined;
-        const issuedControl = await params.issueControlCapability?.({
-          requestId: next.requestId,
-          sessionId: next.sessionId,
-          requestClient: next.requestClient,
-          profile: runProfile,
-          canonicalCwd: workflowPolicy?.cwd ?? cwd,
-          safetyMode,
-          expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
-          ...(capabilityPrincipal ? { principal: capabilityPrincipal } : {}),
-        });
-        if (!issuedControl) {
-          throw new Error(
-            "Native profile request is missing server-issued Level-2 control authority",
-          );
-        }
-        controlCapability = issuedControl.capability;
-        if (issuedControl.principal) {
-          trustedFallbackSurface = {
-            platform: issuedControl.principal.platform,
-            sessionId: next.sessionId,
-            userId: issuedControl.principal.userId,
-          };
-        }
-      }
-
-      const additionalSessionPrompts = await waitForPreAgent(
-        resolveSessionAdditionalPrompts({
-          entries: cfg.surface.router.sessionModes[sessionConfigId]?.additionalPrompts,
-          onWarn: (warning) => {
-            logger.warn("skipping invalid session additionalPrompts entry", {
-              requestId: next.requestId,
-              sessionId,
-              sessionConfigId,
-              reason: warning.reason,
-              value: warning.value,
-              filePath: warning.filePath,
-              error: warning.error,
-            });
-          },
-        }),
-      );
-
-      const heartbeatOverlay = buildHeartbeatOverlayForRequest({
-        cfg,
-        requestId: next.requestId,
-        sessionId: next.sessionId,
-        runProfile,
-        nowMs: Date.now(),
-      });
-
-      const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
-        cfg,
-        runProfile,
-      });
-
-      const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
-
-      const restrictedSessionOverlay =
-        safetyMode === "restricted"
-          ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
-          : null;
-
-      const buildSystemPrompt = (
-        resolved: ResolvedModelRef,
-        editingToolMode: ReturnType<typeof resolveEditingToolMode>,
-      ): string => {
-        const baseSystemPrompt = buildSystemPromptForProfile({
-          baseSystemPrompt: cfg.agent.systemPrompt,
-          profile: runProfile,
-          profileConfig:
-            runProfile === "primary" ? undefined : resolveNativeSubagentProfile(cfg, runProfile),
-          activeEditingTool: runProfile === "explore" ? null : editingToolMode,
-          exploreOverlay: subagents.profiles.explore.promptOverlay,
-          generalOverlay: subagents.profiles.general.promptOverlay,
-          selfOverlay: subagents.profiles.self.promptOverlay,
-          skillsSection,
-        });
-        let prompt = appendConfiguredAliasPromptBlock({
-          baseSystemPrompt,
-          cfg,
-          coreConfigPath: resolveCoreConfigPath(),
-        });
-        prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
-        for (const overlay of [
-          heartbeatOverlay,
-          autoInjectedThreadSearchOverlay,
-          surfaceMetadataOverlay,
-          restrictedSessionOverlay,
-        ]) {
-          if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
-        }
-        return maybeAppendResponseCommentaryPrompt({
-          baseSystemPrompt: prompt,
-          provider: resolved.provider,
-          responseCommentary: resolved.responseCommentary,
-        });
-      };
-
-      let seededSessionMessages: ModelMessage[] = [];
-      let seededSessionTranscript: ReturnType<
-        NonNullable<TranscriptStore["getLatestCompleteNamedTranscript"]>
-      > = null;
-      if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
-        try {
-          const latest = stableNamedContinuation
-            ? params.transcriptStore.getLatestCompleteNamedTranscript?.({
-                requestClient: stableNamedContinuation.requestClient,
-                sessionId: next.sessionId,
-              })
-            : params.transcriptStore.getLatestTranscriptBySession?.({ sessionId: next.sessionId });
-          if (latest && latest.messages.length > 0) {
-            seededSessionMessages = latest.messages;
-            seededSessionTranscript = latest;
-            logger.info("subagent continuation seeded from transcript", {
-              requestId: next.requestId,
-              sessionId: next.sessionId,
-              fromRequestId: latest.requestId,
-              messagesSeeded: latest.messages.length,
-            });
-          }
-        } catch (e) {
-          logger.warn(
-            "failed to load subagent continuation transcript",
-            {
-              requestId: next.requestId,
-              sessionId: next.sessionId,
-            },
-            e,
-          );
-        }
-      }
-
-      const fallbackSurfaceForDelegation = trustedFallbackSurface;
-      const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
-      const listSelectedCatalogIds = () =>
-        params.transcriptStore?.listSessionToolIds?.({
-          requestClient: next.requestClient,
-          sessionId: next.sessionId,
-        }) ?? [];
-      const buildModelBinding = async (resolved: ResolvedModelRef) => {
-        let capabilityInfo: ModelCapabilityInfo | null = null;
-        let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
-        let bindingCostEstimateReason: string | undefined;
-        try {
-          capabilityInfo = await waitForPreAgent(modelCapability.resolve(resolved.spec));
-          if (capabilityInfo.cost) {
-            bindingCostEstimateStatus = "estimated";
-          } else {
-            bindingCostEstimateReason = "model_cost_missing";
-          }
-        } catch (error) {
-          if (error instanceof PreAgentRunCancelledError) throw error;
-          bindingCostEstimateReason =
-            error instanceof Error
-              ? `capability_resolve_failed:${error.message}`
-              : `capability_resolve_failed:${String(error)}`;
-        }
-
-        const editingToolMode = resolveEditingToolMode({
-          provider: resolved.provider,
-          modelId: resolved.modelId,
-        });
-        const anthropicModel = isAnthropicModelSpec(resolved.spec);
-        const anthropicPromptCachingEnabled = shouldEnableAnthropicPromptCache({
-          spec: resolved.spec,
-          anthropicPromptCache: resolved.anthropicPromptCache,
-        });
-        const reasoningDisplay =
-          resolved.reasoningDisplay ??
-          workflowPolicy?.resolvedModelRequest.reasoningDisplay ??
-          cfg.agent.reasoningDisplay;
-        const providerOptionsWithOpenAIReasoningSummary =
-          withReasoningSummaryDefaultForOpenAIModels({
-            reasoningDisplay,
-            provider: resolved.provider,
-            modelId: resolved.modelId,
-            providerOptions: resolved.providerOptions,
-          });
-        const providerOptionsWithReasoningDisplay = withReasoningDisplayDefaultForAnthropicModels({
-          reasoningDisplay,
-          provider: resolved.provider,
-          modelId: resolved.modelId,
-          providerOptions: providerOptionsWithOpenAIReasoningSummary,
-        });
-        const providerOptionsWithPromptCacheKey = (() => {
-          if (resolved.provider !== "openai" && resolved.provider !== "codex") {
-            return providerOptionsWithReasoningDisplay;
-          }
-          const base = providerOptionsWithReasoningDisplay ?? {};
-          const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
-          return {
-            ...base,
-            openai: {
-              ...existingOpenAI,
-              promptCacheKey: toOpenAIPromptCacheKey(sessionId),
-            },
-          };
-        })();
-        const providerOptionsWithServerCompaction = (() => {
-          if (!resolved.openaiServerCompaction) return providerOptionsWithPromptCacheKey;
-          const base = providerOptionsWithPromptCacheKey ?? {};
-          const existingOpenAI = base.openai ?? {};
-          const include = Array.isArray(existingOpenAI.include)
-            ? existingOpenAI.include.filter((value): value is string => typeof value === "string")
-            : [];
-          return {
-            ...base,
-            openai: {
-              ...existingOpenAI,
-              store: false,
-              include: [...new Set([...include, "reasoning.encrypted_content"])],
-            },
-          };
-        })();
-        const providerOptionsForAgent = anthropicModel
-          ? withStableAnthropicUpstreamOrder(resolved.provider, providerOptionsWithServerCompaction)
-          : providerOptionsWithServerCompaction;
-        const systemPrompt = buildSystemPrompt(resolved, editingToolMode);
-        const agentSystem = anthropicPromptCachingEnabled
-          ? {
-              role: "system" as const,
-              content: systemPrompt,
-              providerOptions: ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-            }
-          : systemPrompt;
-        const experimentalDownload = buildExperimentalDownloadForAnthropicFallback({
-          spec: resolved.spec,
-          provider: resolved.provider,
-          providerOptions: providerOptionsForAgent,
-        });
-        const toolset = await waitForPreAgent(
-          params.pluginManager.buildLevel1Toolset({
-            cwd: executionCwd,
-            runProfile,
-            editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
-            subagentDepth: subagentMeta.depth,
-            subagentConfig: {
-              enabled: subagents.enabled,
-              idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
-              maxDepth: subagents.maxDepth,
-            },
-            requestContext: {
-              requestId: next.requestId,
-              sessionId: next.sessionId,
-              requestClient: next.requestClient,
-              subagentDepth: subagentMeta.depth,
-              subagentProfile: runProfile,
-              safetyMode,
-              metadata: {
-                controlCapability: controlCapability ?? undefined,
-                readFileDirectAttachmentSupported:
-                  supportsReadFileDirectAttachments(capabilityInfo),
-                onActivity: (source: "tool" | "subagent") => markRunActivity(source),
-                onSubagentDelegate:
-                  workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
-                    ? async (registration: SubagentDelegationRegistration) =>
-                        await workflowSubagentDispatcher.delegate({
-                          ...registration,
-                          projectRoot: executionCwd,
-                          fallbackSurface: fallbackSurfaceForDelegation,
-                        })
-                    : undefined,
-              },
-            },
-            reportToolStatus: (update) => {
-              outputPublisher.publishToolCall(update).catch((e: unknown) => {
-                logger.error(
-                  "failed to publish batch tool status",
-                  {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    toolCallId: update.toolCallId,
-                  },
-                  e,
-                );
+                ...(runProfile === "primary"
+                  ? {
+                      providerState: resolveCorePrimaryTranscriptProviderState({
+                        targetFamily: resolvedProviderFamily,
+                        lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                        transcriptStore: failureTranscriptStore,
+                      }),
+                    }
+                  : {}),
+                ...(runProfile === "primary"
+                  ? persistedCompleteLineage(
+                      state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                    )
+                  : {}),
               });
             },
-          }),
-        );
-        return {
-          resolved,
-          capabilityInfo,
-          costEstimateStatus: bindingCostEstimateStatus,
-          costEstimateReason: bindingCostEstimateReason,
-          editingToolMode,
-          anthropicPromptCachingEnabled,
-          providerOptionsForAgent,
-          agentSystem,
-          experimentalDownload,
-          toolset,
-          activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
-        };
-      };
-
-      let activeBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
-      modelCapabilityInfo = activeBinding.capabilityInfo;
-      costEstimateStatus = activeBinding.costEstimateStatus;
-      costEstimateReason = activeBinding.costEstimateReason;
-
-      logger.info("agent run starting", {
-        requestId: next.requestId,
-        sessionId: next.sessionId,
-        requestClient: next.requestClient,
-        runProfile,
-        subagentDepth: subagentMeta.depth,
-        sessionConfigId,
-        safetyMode,
-        requestModelOverride,
-        model: activeBinding.resolved.spec,
-        responseCommentary: activeBinding.resolved.responseCommentary === true,
-        editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
-        fallbackCount: modelPlan.fallbacks.length,
-        isRecoveryResume: Boolean(next.recovery),
-        messageCount: next.messages.length,
-        recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
-        queuedForSession: state.queue.length,
-      });
-
-      let agent: AiSdkPiAgent<ToolSet> | null = null;
-      let activeModelIndex = 0;
-      let didSwitchModel = false;
-      const advanceModel = async () => {
-        if (!agent) throw new Error("Model fallback started before the agent was ready");
-        const nextFallback = selectNextNativeModelFallback({
-          plan: modelPlan,
-          activeIndex: activeModelIndex,
-          onSkipClaudeCode: (candidate, index) => {
-            logger.warn("skipping claude-code model fallback for native agent run", {
+          );
+          if (persistedFailure.status === "error") {
+            logger.error("failed to persist transcript after error", {
               requestId: headers.request_id,
               sessionId: headers.session_id,
-              modelSpec: candidate.spec,
-              fallbackIndex: index,
+              error: persistedFailure.error.message,
             });
-          },
-        });
-        if (!nextFallback) return { ok: false as const, reason: "model fallback exhausted" };
-
-        const nextBinding = await buildModelBinding(nextFallback.candidate);
-        nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
-        agent.setModel(
-          nextBinding.resolved.model,
-          nextBinding.providerOptionsForAgent,
-          nextBinding.resolved.spec,
-          nextBinding.resolved.reasoning,
-        );
-        agent.setSystem(nextBinding.agentSystem);
-        agent.setTools(nextBinding.toolset.tools);
-        agent.setActiveTools(nextBinding.activeToolNames);
-        agent.setExperimentalDownload(nextBinding.experimentalDownload);
-        agent.setGenericOutputNormalizerBypassTools(
-          nextBinding.toolset.genericOutputNormalizerBypassTools,
-        );
-        agent.setAggregateOutputBudgetExemptTools(
-          nextBinding.toolset.aggregateOutputBudgetExemptTools,
-        );
-
-        activeBinding = nextBinding;
-        activeModelIndex = nextFallback.index;
-        didSwitchModel = true;
-        modelCapabilityInfo = nextBinding.capabilityInfo;
-        costEstimateStatus = nextBinding.costEstimateStatus;
-        costEstimateReason = nextBinding.costEstimateReason;
-        resolvedModelLabel = nextBinding.resolved.modelId;
-        resolvedProviderFamily = classifyHistoryProviderFamily({
-          type: nextBinding.resolved.provider,
-        });
-        if (state.activeRun) {
-          state.activeRun.resolvedModelSpec = nextBinding.resolved.spec;
-          state.activeRun.resolvedReasoning = nextBinding.resolved.reasoning;
-          state.activeRun.resolvedProviderFamily = resolvedProviderFamily;
-        }
-        return { ok: true as const, modelSpec: nextBinding.resolved.spec };
-      };
-      const hasNativeModelFallback =
-        activeBinding.resolved.provider !== "claude-code" && modelPlan.fallbacks.length > 0;
-      const transientRetryController = createTransientModelRetryController({
-        retry: cfg.agent.retry,
-        logger,
-        requestId: headers.request_id,
-        sessionId: headers.session_id,
-        modelSpec: activeBinding.resolved.spec,
-        ...(hasNativeModelFallback ? { advanceModel } : {}),
-      });
-      const disabledServerCompactionReplayKeys = new Set<string>();
-      let activeNativeServerCompactionReplayKey: string | null = null;
-      const turnErrorHandler = async (
-        error: unknown,
-        errorContext: Parameters<
-          NonNullable<Parameters<typeof attachAutoCompaction>[1]["baseTurnErrorHandler"]>
-        >[1],
-      ) => {
-        const transientDecision = await transientRetryController.handler(error, errorContext);
-        if (transientDecision === "retry") {
-          await coreNamedClaudeRuntime?.retireForRetry();
-          await corePrimaryClaudeRuntime?.retireForRetry();
-          return "retry" as const;
-        }
-        if (
-          activeNativeServerCompactionReplayKey &&
-          errorContext.phase === "model-call" &&
-          errorContext.retrySafety.canRetry &&
-          errorContext.abortSignal?.aborted !== true
-        ) {
-          disabledServerCompactionReplayKeys.add(activeNativeServerCompactionReplayKey);
-          logger.warn(
-            "OpenAI server compaction replay failed; retrying portable summary",
-            {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              modelSpec: activeBinding.resolved.spec,
-              ...extractAiErrorLogDetails(error),
-            },
-            error,
-          );
-          activeNativeServerCompactionReplayKey = null;
-          return "retry" as const;
-        }
-        return "fail" as const;
-      };
-      if (activeBinding.resolved.provider === "claude-code") {
-        const claudeCodeToolMapping = completeLevel1ToolMapping(activeBinding.toolset);
-        const continuationStore = params.transcriptStore;
-        const materializeClaude = async (
-          nativeSession?: Parameters<typeof materializeClaudeCodeRun>[0]["nativeSession"],
-        ) => {
-          const run = await (params.materializeClaudeCodeRun ?? materializeClaudeCodeRun)({
-            modelId: activeBinding.resolved.modelId,
-            cwd: executionCwd,
-            tools: claudeCodeToolMapping.tools,
-            catalogMetadata: claudeCodeToolMapping.catalogMetadata,
-            // Core admits no Claude built-ins; Lilac remains the only tool source.
-            builtInTools: [],
-            reasoning: activeBinding.resolved.reasoning,
-            ...(nativeSession ? { nativeSession } : {}),
-            execute: async (request) => {
-              if (!activeAgent) {
-                throw new Error("Claude Code tool execution started before the agent was ready");
-              }
-              return await activeAgent.executeExternalToolCall(request);
-            },
-          });
-          if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
-          return run;
-        };
-        const shouldPersistClaude = shouldUsePersistentCoreClaudeRuntime({
-          runProfile,
-          requestClient: next.requestClient,
-          stableNamedContinuation,
-          corePrimaryLineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
-        });
-        if (shouldPersistClaude && continuationStore !== undefined) {
-          const canonicalExecutionCwd = await fs
-            .realpath(executionCwd)
-            .catch(() => path.resolve(executionCwd));
-          const nativeStorageNamespace = path.resolve(
-            process.env["CLAUDE_CONFIG_DIR"] ?? path.join(homedir(), ".claude"),
-          );
-          const profileConfig =
-            runProfile === "primary" ? null : resolveNativeSubagentProfile(cfg, runProfile);
-          const executionScope = hashCoreNamedExecutionScope({
-            canonicalCwd: canonicalExecutionCwd,
-            providerIdentity: "core:claude-code",
-            nativeStorageNamespaceIdentity: nativeStorageNamespace,
-            nativeExecutableConfig: claudeCodeExecutableSettings(),
-            profile: runProfile,
-            safetyMode,
-            profileAuthority: {
-              level1: profileConfig?.level1 ?? null,
-              level2: profileConfig?.level2 ?? null,
-              network: profileConfig?.network ?? null,
-              workspaceWrites: profileConfig?.workspaceWrites ?? null,
-              execution: profileConfig?.execution ?? null,
-              delegation: profileConfig?.delegation ?? null,
-            },
-            pluginAuthority: cfg.plugins ?? null,
-            workflowAuthority: workflowPolicy
-              ? {
-                  profile: workflowPolicy.profile,
-                  cwd: workflowPolicy.cwd,
-                  originClient: workflowPolicy.originSession.client,
-                }
-              : null,
-            systemPolicy: {
-              base: cfg.agent.systemPrompt,
-              profileOverlay: profileConfig?.promptOverlay ?? null,
-              additionalSessionPrompts,
-              skillsSection,
-            },
-            directToolNames: [...activeBinding.toolset.directToolNames],
-            externalToolAuthority: activeBinding.toolset.catalog
-              .map((entry) => ({
-                source: entry.source,
-                sourceId: entry.sourceId,
-                stableId: entry.stableId,
-                modelName: entry.modelName,
-              }))
-              .sort((left, right) => left.stableId.localeCompare(right.stableId)),
-            subagentAuthority: {
-              enabled: subagents.enabled,
-              maxDepth: subagents.maxDepth,
-              currentDepth: subagentMeta.depth,
-            },
-          });
-          if (
-            runProfile === "primary" &&
-            next.requestClient === "discord" &&
-            supportsCorePrimaryContinuationStore(continuationStore)
-          ) {
-            corePrimaryClaudeRuntime = createCorePrimaryClaudeRuntime({
-              store: continuationStore,
-              sessionId: next.sessionId,
-              requestId: next.requestId,
-              providerId: activeBinding.resolved.provider,
-              modelSpecifier: activeBinding.resolved.spec,
-              reasoning: activeBinding.resolved.reasoning ?? "provider-default",
-              executionScopeHash: executionScope.hash,
-              executionCwd,
-              getLineage: () => state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
-              materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
-              onDiagnostic: (event, detail) => {
-                const fields = { lifecycle: event, ...detail };
-                if (
-                  event === "native-source-invalid" ||
-                  event === "candidate-observability-lost" ||
-                  event === "candidate-unpromotable" ||
-                  event === "candidate-finalization-failed" ||
-                  event === "canonical-publication-failed" ||
-                  event === "promotion-failed" ||
-                  event === "promotion-rejected"
-                ) {
-                  logger.warn("core_primary_claude.lifecycle", fields);
-                } else if (event === "canonical-published" || event === "promotion") {
-                  logger.info("core_primary_claude.lifecycle", fields);
-                } else {
-                  logger.debug("core_primary_claude.lifecycle", fields);
-                }
-              },
-            });
-          } else if (
-            stableNamedContinuation !== null &&
-            supportsCoreNamedContinuationStore(continuationStore)
-          ) {
-            coreNamedClaudeRuntime = createCoreNamedClaudeRuntime({
-              store: continuationStore,
-              requestClient: stableNamedContinuation.requestClient,
-              sessionId: next.sessionId,
-              requestId: next.requestId,
-              providerId: activeBinding.resolved.provider,
-              modelSpecifier: activeBinding.resolved.spec,
-              reasoning: activeBinding.resolved.reasoning ?? "provider-default",
-              executionScopeHash: executionScope.hash,
-              executionCwd,
-              sourceTranscript: seededSessionTranscript,
-              getCurrentTurnMessages: () => initialMessages,
-              materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
-              onDiagnostic: (event, detail) => {
-                const fields = { lifecycle: event, ...detail };
-                if (
-                  event === "native-source-invalid" ||
-                  event === "candidate-observability-lost" ||
-                  event === "candidate-unpromotable" ||
-                  event === "candidate-finalization-failed" ||
-                  event === "canonical-publication-failed" ||
-                  event === "promotion-failed" ||
-                  event === "promotion-rejected"
-                ) {
-                  logger.warn("core_named_claude.lifecycle", fields);
-                } else if (event === "canonical-published" || event === "promotion") {
-                  logger.info("core_named_claude.lifecycle", fields);
-                } else {
-                  logger.debug("core_named_claude.lifecycle", fields);
-                }
-              },
-            });
-          } else {
-            claudeCodeRun = await waitForPreAgent(materializeClaude());
           }
-        } else {
-          claudeCodeRun = await waitForPreAgent(materializeClaude());
         }
-      }
 
-      const agentOptions: AiSdkPiAgentOptions<ToolSet> = {
-        system: activeBinding.agentSystem,
-        model: claudeCodeRun?.agentModel ?? activeBinding.resolved.model,
-        modelSpecifier: activeBinding.resolved.spec,
-        messages: next.recovery?.checkpointMessages ?? seededSessionMessages,
-        tools: activeBinding.toolset.tools,
-        providerOptions: activeBinding.providerOptionsForAgent,
-        reasoning: activeBinding.resolved.reasoning,
-        ...(hasNativeModelFallback ||
-        coreNamedClaudeRuntime !== null ||
-        corePrimaryClaudeRuntime !== null
-          ? { streamTextMaxRetries: 0 }
-          : {}),
-        turnErrorHandler,
-        beforeStep:
-          activeBinding.resolved.provider !== "claude-code"
-            ? async () => {
-                if (!agent) throw new Error("Tool refresh started before the agent was ready");
-                await refreshSelectedLevel1Tools({
-                  target: agent,
-                  toolset: activeBinding.toolset,
-                  listSelectedCatalogIds,
-                });
+        if (liveParentSession) {
+          const cancelledSubagents = await captureBusAgentRunnerOperation(
+            "deferred subagent cancellation after parent failure",
+            () => liveParentSession.cancelAll(`parent run failed: ${msg}`),
+          );
+          if (cancelledSubagents.status === "error") {
+            logger.warn("failed to cancel deferred subagents after parent failure", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              error: cancelledSubagents.error.message,
+            });
+          }
+        }
+
+        if (failureTranscriptStore && isHeartbeatSessionId(headers.session_id)) {
+          const persistedFailureHandoffs = await captureBusAgentRunnerOperation(
+            "failed run heartbeat handoff persistence",
+            () => {
+              const finalMessagesForPersistence =
+                runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
+              const responseMessages = buildSafeRecoveryCheckpoint(
+                finalMessagesForPersistence,
+                "agent run failed",
+              ).slice(responseStartIndex);
+
+              persistHeartbeatSurfaceHandoffs({
+                logger,
+                transcriptStore: failureTranscriptStore,
+                requestId: headers.request_id,
+                requestClient: headers.request_client,
+                sessionId: headers.session_id,
+                modelLabel: resolvedModelLabel,
+                responseMessages,
+              });
+            },
+          );
+          if (persistedFailureHandoffs.status === "error") {
+            logger.error("failed to persist heartbeat handoff transcripts after error", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              error: persistedFailureHandoffs.error.message,
+            });
+          }
+        }
+        await publishCurrentLifecycle({
+          state: "failed",
+          detail: msg,
+          output: `Error: ${msg}`,
+          usage: runStats.totalUsage
+            ? {
+                inputTokens: runStats.totalUsage.inputTokens ?? 0,
+                outputTokens: runStats.totalUsage.outputTokens ?? 0,
+                totalTokens: runStats.totalUsage.totalTokens ?? 0,
               }
             : undefined,
-        normalizeToolResultOutput,
-        normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
-        genericOutputNormalizerBypassTools:
-          activeBinding.toolset.genericOutputNormalizerBypassTools,
-        aggregateOutputBudgetExemptTools: activeBinding.toolset.aggregateOutputBudgetExemptTools,
-        experimentalDownload: activeBinding.experimentalDownload,
-        sendToolsToModel: activeBinding.resolved.provider !== "claude-code",
-        debug: {
-          captureModelViewMessages: env.debug.contextDump.enabled,
-        },
-      };
-      agent = params.createAgent
-        ? params.createAgent(agentOptions)
-        : new AiSdkPiAgent<ToolSet>(agentOptions);
-      if (activeBinding.resolved.provider === "claude-code") {
-        applyCompleteLevel1Tools(agent, activeBinding.toolset);
-      }
-      agent.setPrepareModelCall(
-        coreNamedClaudeRuntime?.prepareModelCall ?? corePrimaryClaudeRuntime?.prepareModelCall,
-      );
-      activeAgent = agent;
-
-      agent.setContext({
-        sessionId: next.sessionId,
-        requestId: next.requestId,
-        requestClient: next.requestClient,
-        subagentDepth: subagentMeta.depth,
-        subagentProfile: runProfile,
-        safetyMode,
-      });
-
-      // Drain all buffered messages at boundaries (better UX in chat surfaces).
-      agent.setFollowUpMode("all");
-      agent.setSteeringMode("all");
-
-      const prepareModelView = async (
-        messages: readonly ModelMessage[],
-        transformContext: TransformMessagesContext,
-        fullBudget: boolean,
-      ): Promise<ModelMessage[]> => {
-        const configuredServerCompactionReplayKey = activeBinding.resolved.openaiServerCompaction
-          ? `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`
-          : undefined;
-        const serverCompactionReplayKey =
-          configuredServerCompactionReplayKey &&
-          !disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey)
-            ? configuredServerCompactionReplayKey
-            : undefined;
-        activeNativeServerCompactionReplayKey = null;
-        if (
-          configuredServerCompactionReplayKey &&
-          hasMatchingOpenAIServerCompaction(messages, serverCompactionReplayKey)
-        ) {
-          activeNativeServerCompactionReplayKey = serverCompactionReplayKey ?? null;
-        }
-        const materialized =
-          configuredServerCompactionReplayKey || hasOpenAIServerCompaction(messages)
-            ? materializeOpenAIServerCompaction(messages, serverCompactionReplayKey)
-            : messages;
-        const targetFamily = classifyHistoryProviderFamily({
-          type: activeBinding.resolved.provider,
         });
-        let historyPrepared: readonly ModelMessage[];
-        if (coreNamedClaudeRuntime) {
-          historyPrepared = coreNamedClaudeRuntime.prepareHistoryView(materialized);
-        } else if (corePrimaryClaudeRuntime) {
-          historyPrepared = fullBudget
-            ? corePrimaryClaudeRuntime.prepareFullBudgetView(
-                materialized,
-                transformContext.canonicalStartIndex,
-              )
-            : corePrimaryClaudeRuntime.prepareHistoryView(materialized);
-        } else {
-          switch (runProfile) {
-            case "primary": {
-              const lineage = state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
-              const historicalEnd = lineage?.currentCanonicalStart ?? 0;
-              historyPrepared = prepareCorePrimaryHistoryView({
-                canonicalMessages: materialized,
-                lineage,
-                replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
-                  lineage,
-                  historicalEnd,
-                  store: params.transcriptStore ?? {},
-                  targetFamily,
-                }),
-                targetFamily,
-                modelSpecifier: activeBinding.resolved.spec,
-                canonicalStartIndex: transformContext.canonicalStartIndex,
-              });
-              break;
-            }
-            case "explore":
-            case "general":
-            case "self":
-              historyPrepared = stableNamedContinuation
-                ? prepareCoreNamedHistoryView({
-                    canonicalMessages: materialized,
-                    sourceMessages: seededSessionMessages,
-                    currentTurnMessages: initialMessages,
-                    replayHistoricalPrefix: shouldReplayCoreNamedHistory({
-                      sourceTranscript: seededSessionTranscript,
-                      targetFamily,
-                    }),
-                    targetFamily,
-                    modelSpecifier: activeBinding.resolved.spec,
-                  })
-                : materialized;
-              break;
-            default: {
-              const _exhaustive: never = runProfile;
-              historyPrepared = _exhaustive;
-              break;
-            }
-          }
-        }
-        if (
-          configuredServerCompactionReplayKey &&
-          disabledServerCompactionReplayKeys.has(configuredServerCompactionReplayKey) &&
-          hasMatchingOpenAIServerCompaction(messages, configuredServerCompactionReplayKey)
-        ) {
-          agent.replaceMessages(materializeOpenAIServerCompaction(messages, undefined), {
-            reason: "compaction",
-            preserveRecoveryCheckpoint: true,
-          });
-          disabledServerCompactionReplayKeys.delete(configuredServerCompactionReplayKey);
-        }
-        // First, remove pathological binary blobs from the *model-facing* view.
-        const scrubbed = scrubLargeBinaryForModelView(historyPrepared, {
-          maxBytesPerPart: cfg.tools.media.maxInlineBytesPerPart,
-          maxBytesTotal: cfg.tools.media.maxInlineBytesTotal,
-        });
+        await outputPublisher.publishResponseText({ finalText: `Error: ${msg}` });
 
-        // Then, compact older tool outputs (placeholder) with session-stable state.
-        if (cfg.tools.historicalResultPruning.enabled) {
-          const estimatedPrunedTokens = maybeMarkOldToolOutputsCompacted({
-            messages: scrubbed,
-            compactedToolCallIds: state.compactedToolCallIds,
-            protectTokens: cfg.tools.historicalResultPruning.protectTokens,
-            minimumTokens: cfg.tools.historicalResultPruning.minimumTokens,
-          });
-          if (estimatedPrunedTokens > 0) {
-            logger.info("agent.historical_result_pruned", {
-              requestId: next.requestId,
-              sessionId: next.sessionId,
-              compactedToolCallCount: state.compactedToolCallIds.size,
-              estimatedPrunedTokens,
-            });
-          }
-        }
-
-        const compacted = cfg.tools.historicalResultPruning.enabled
-          ? applyToolOutputCompactionView({
-              messages: scrubbed,
-              compactedToolCallIds: state.compactedToolCallIds,
-            })
-          : scrubbed;
-
-        return compacted;
-      };
-      const toolPruneTransform: PrepareFullModelView = (messages, transformContext) =>
-        prepareModelView(messages, transformContext, false);
-      const fullBudgetTransform: PrepareFullModelView = (messages, transformContext) =>
-        prepareModelView(messages, transformContext, true);
-      // History protocol safety is required even when automatic compaction is disabled.
-      agent.setPrepareFullModelView(toolPruneTransform);
-      agent.setPrepareFullBudgetView(fullBudgetTransform);
-
-      let autoCompactionSeq = 0;
-      let activeAutoCompactionToolCallId: string | null = null;
-      const publishAutoCompactionToolStatus = (update: {
-        toolCallId: string;
-        status: "start" | "end";
-        display: string;
-        ok?: boolean;
-        error?: string;
-      }) => {
-        const publishOne = async () => {
-          try {
-            await outputPublisher.publishToolCall(update);
-          } catch (e: unknown) {
-            logger.error(
-              "failed to publish auto-compaction tool status",
-              {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                toolCallId: update.toolCallId,
-                status: update.status,
-              },
-              e,
-            );
-          }
-        };
-
-        auxiliaryOutputTail = auxiliaryOutputTail.then(publishOne, publishOne);
-      };
-
-      unsubscribeCompaction = await waitForPreAgent(
-        attachAutoCompaction(agent, {
-          model: activeBinding.resolved.spec,
-          summaryModel:
-            claudeCodeRun?.createUtilityModel ??
-            coreNamedClaudeRuntime?.currentRun()?.createUtilityModel ??
-            corePrimaryClaudeRuntime?.currentRun()?.createUtilityModel ??
-            (activeBinding.resolved.provider === "claude-code"
-              ? () => activeBinding.resolved.model
-              : "current"),
-          modelCapability,
-          thresholdInputSource:
-            activeBinding.resolved.provider === "claude-code" ? "transcript-estimate" : "usage",
-          resolveCurrentModelSpecifier: () =>
-            agent.state.modelSpecifier ?? activeBinding.resolved.spec,
-          prepareFullModelView: toolPruneTransform,
-          prepareFullBudgetView: fullBudgetTransform,
-          inputEstimateFloor:
-            coreNamedClaudeRuntime === null && corePrimaryClaudeRuntime === null
-              ? undefined
-              : ({ canonicalMessages, overlay, estimateMessagesTokens }) =>
-                  (coreNamedClaudeRuntime ?? corePrimaryClaudeRuntime)?.inputEstimateFloor({
-                    canonicalMessages,
-                    overlay,
-                    estimateMessagesTokens,
-                  }) ?? null,
-          resolveCurrentInputCanonicalStart: () =>
-            (state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage)
-              ?.currentCanonicalStart ?? null,
-          decorateRequestPayload: (payload) => {
-            const requestPayload =
-              payload.length === 0 && (coreNamedClaudeRuntime || corePrimaryClaudeRuntime)
-                ? ([
-                    {
-                      role: "user",
-                      content: "Continue after the completed tool call.",
-                    },
-                  ] satisfies ModelMessage[])
-                : [...payload];
-            return activeBinding.anthropicPromptCachingEnabled
-              ? withProviderOptionsOnLastUserMessage(
-                  requestPayload,
-                  ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
-                )
-              : requestPayload;
-          },
-          baseTurnErrorHandler: turnErrorHandler,
-          serverCompaction: async ({
-            messages: prefix,
-            portableSummary,
-            context: modelContext,
-            abortSignal,
-          }) => {
-            if (!activeBinding.resolved.openaiServerCompaction) {
-              throw new Error("OpenAI server compaction is disabled for the active model");
-            }
-            return await compactWithOpenAIResponses({
-              model: agent.state.model,
-              replayKey: `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`,
-              portableSummary,
-              messages: prefix,
-              system: modelContext?.system ?? agent.state.system,
-              tools: modelContext?.tools,
-              providerOptions: agent.state.providerOptions,
-              reasoning: agent.state.reasoning,
-              abortSignal,
-            });
-          },
-          serverCompactionEnabled: () => {
-            if (!activeBinding.resolved.openaiServerCompaction) return false;
-            const replayKey = `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`;
-            return !disabledServerCompactionReplayKeys.has(replayKey);
-          },
-          onServerCompactionError: (error) => {
-            logger.warn(
-              "OpenAI server compaction failed; using portable summary",
-              {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                modelSpec: activeBinding.resolved.spec,
-                ...extractAiErrorLogDetails(error),
-              },
-              error,
-            );
-          },
-          onUnknownCapability: ({ spec, reason, error }) => {
-            logger.warn(
-              "auto-compaction capability unknown; disabling threshold compaction",
-              {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                modelSpec: spec,
-                reason,
-              },
-              error,
-            );
-          },
-          onOverflowRecoveryAttempt: ({ spec, attempt, maxAttempts }) => {
-            logger.info("auto-compaction overflow recovery retry", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              modelSpec: spec,
-              attempt,
-              maxAttempts,
-            });
-          },
-          onOverflowRecoveryExhausted: ({ spec, attempts, maxAttempts }) => {
-            logger.warn("auto-compaction overflow recovery exhausted", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              modelSpec: spec,
-              attempts,
-              maxAttempts,
-            });
-          },
-          onCompactionStart: ({
-            spec,
-            reason,
-            messageCountBefore,
-            observedInputTokens,
-            inputTokenSource,
-            estimatedInputTokens,
-            budget,
-          }) => {
-            autoCompactionSeq += 1;
-            activeAutoCompactionToolCallId = buildSyntheticToolCallId({
-              prefix: "auto_compaction",
-              seed: `${headers.request_id}:${autoCompactionSeq}`,
-            });
-
-            publishAutoCompactionToolStatus({
-              toolCallId: activeAutoCompactionToolCallId,
-              status: "start",
-              display: formatAutoCompactionToolDisplay({
-                phase: "start",
-                messageCountBefore,
-              }),
-            });
-
-            logger.info("auto-compaction start", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              subagentDepth: subagentMeta.depth,
-              modelSpec: spec,
-              reason,
-              messageCountBefore,
-              observedInputTokens,
-              inputTokenSource,
-              estimatedInputTokens,
-              inputBudget: budget.inputBudget,
-              safeInputBudget: budget.safeInputBudget,
-              reservedOutputTokens: budget.reservedOutputTokens,
-            });
-          },
-          onCompactionEnd: ({
-            spec,
-            reason,
-            messageCountBefore,
-            messageCountAfter,
-            estimatedInputTokens,
-            estimatedInputTokensAfter,
-            durationMs,
-            status,
-            error,
-            canonicalReplacement,
-          }) => {
-            const toolCallId =
-              activeAutoCompactionToolCallId ??
-              buildSyntheticToolCallId({
-                prefix: "auto_compaction",
-                seed: `${headers.request_id}:orphan-end`,
-              });
-            activeAutoCompactionToolCallId = null;
-
-            publishAutoCompactionToolStatus({
-              toolCallId,
-              status: "end",
-              display: formatAutoCompactionToolDisplay({
-                phase: "end",
-                ok: status === "completed",
-                messageCountBefore,
-                messageCountAfter,
-              }),
-              ok: status === "completed",
-              error: status === "completed" ? undefined : "auto compaction failed",
-            });
-
-            const payload = {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              subagentDepth: subagentMeta.depth,
-              modelSpec: spec,
-              reason,
-              status,
-              durationMs,
-              messageCountBefore,
-              messageCountAfter,
-              estimatedInputTokens,
-              estimatedInputTokensAfter,
-            };
-            if (status === "completed") {
-              completedCompactionCount += 1;
-              if (runProfile === "primary" && next.requestClient === "discord") {
-                const previousLineage =
-                  state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
-                const mappedCurrentStart = (() => {
-                  if (!canonicalReplacement || !previousLineage) return 0;
-                  return mapCorePrimaryCompactionCurrentCanonicalStart({
-                    previousCurrentCanonicalStart: previousLineage.currentCanonicalStart,
-                    replacement: canonicalReplacement,
-                  });
-                })();
-                next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
-                  "compaction-checkpoint-transform",
-                  mappedCurrentStart,
-                );
-                if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-              }
-              logger.info("auto-compaction end", payload);
-              return;
-            }
-            logger.warn(
-              "auto-compaction end",
-              { ...payload, ...extractAiErrorLogDetails(error) },
-              error,
-            );
-          },
-        }),
-      );
-
-      const publishedDeferredCompletionRunIds = new Set<string>();
-      let lastBoundaryModelInputMessages: readonly ModelMessage[] = [];
-      const drainDeferredCompletions = async (input: {
-        modelInputMessages: readonly ModelMessage[];
-        abortSignal?: AbortSignal;
-      }): Promise<{ append: ModelMessage[]; forceNextTurn: boolean }> => {
-        if (!liveParentSession) {
-          return { append: [], forceNextTurn: false };
-        }
-
-        const pendingIdentities = liveParentSession.listPendingIdentities();
-        const consumedBeforeMaterialization = pendingIdentities
-          .filter((identity) =>
-            hasConsumedDeferredSubagentResult(input.modelInputMessages, identity),
-          )
-          .map((identity) => identity.runId);
-        if (consumedBeforeMaterialization.length > 0) {
-          await liveParentSession.acknowledge(consumedBeforeMaterialization);
-        }
-        if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
-
-        let settled: Awaited<ReturnType<typeof liveParentSession.listPendingSettledAsync>>;
-        try {
-          settled = await liveParentSession.listPendingSettledAsync();
-        } catch (error) {
-          logger.warn(
-            "workflow subagent completion query failed; delivery remains pending",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            error,
-          );
-          return { append: [], forceNextTurn: false };
-        }
-
-        if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
-
-        const completions: WorkflowLiveParentCompletion[] = [];
-        for (const result of settled) {
-          let completion: WorkflowLiveParentCompletion | null = null;
-          let materializationError: unknown;
-          if (result.loaded) {
-            try {
-              completion = {
-                ...result.completion,
-                finalText: await normalizeSubagentFinalText({
-                  normalize: normalizeToolResultOutput,
-                  finalText: result.completion.finalText,
-                  toolCallId: buildSubagentResultToolCallId(result.completion.runId),
-                }),
-              };
-            } catch (error) {
-              materializationError = error;
-            }
-          } else {
-            materializationError = result.error;
-          }
-
-          if (completion) {
-            if (!liveParentSession.isPending(completion.runId)) continue;
-            liveParentSession.clearMaterializationFailure(completion.runId);
-            completions.push(completion);
-            continue;
-          }
-
-          const identity = result.loaded ? result.completion : result.identity;
-          const errorMessage =
-            materializationError instanceof Error
-              ? materializationError.message
-              : String(materializationError);
-          const attempts = liveParentSession.recordMaterializationFailure(
-            identity.runId,
-            errorMessage,
-          );
-          logger.warn(
-            "workflow subagent completion materialization failed",
-            {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              runId: identity.runId,
-              attempts,
-              maxAttempts: SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS,
-            },
-            materializationError,
-          );
-          if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS) continue;
-          if (!liveParentSession.isPending(identity.runId)) continue;
-
-          completions.push({
-            ...identity,
-            status: "failed",
-            ok: false,
-            finalText: "",
-            detail: `subagent result delivery failed after ${attempts} attempts: ${errorMessage}`,
-          });
-        }
-
-        const deliverableCompletions = completions.filter((completion) =>
-          liveParentSession.isPending(completion.runId),
-        );
-
-        const provisionalPlan = planDeferredSubagentBoundary({
-          canonicalMessages: agent.state.messages,
-          modelInputMessages: input.modelInputMessages,
-          completions: deliverableCompletions,
-        });
-
-        for (const completion of deliverableCompletions) {
-          if (!liveParentSession.isPending(completion.runId)) continue;
-          if (publishedDeferredCompletionRunIds.has(completion.runId)) continue;
-          try {
-            await outputPublisher.publishToolCall({
-              toolCallId: completion.parentToolCallId,
-              status: "end",
-              display: buildDeferredSubagentDisplay(completion),
-              ok: completion.ok,
-              error: completion.ok
-                ? undefined
-                : (completion.detail ?? `subagent ${completion.status}`),
-            });
-            publishedDeferredCompletionRunIds.add(completion.runId);
-          } catch (error) {
-            logger.warn(
-              "workflow subagent completion publish failed",
-              { runId: completion.runId },
-              error,
-            );
-          }
-        }
-
-        if (provisionalPlan.consumedRunIds.length > 0 && !input.abortSignal?.aborted) {
-          await liveParentSession.acknowledge(provisionalPlan.consumedRunIds);
-        }
-
-        const finalPlan = planDeferredSubagentBoundary({
-          canonicalMessages: agent.state.messages,
-          modelInputMessages: input.modelInputMessages,
-          completions: deliverableCompletions.filter((completion) =>
-            liveParentSession.isPending(completion.runId),
-          ),
-        });
-        if (
-          finalPlan.append.length > 0 &&
-          runProfile === "primary" &&
-          next.requestClient === "discord"
-        ) {
-          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
-            "deferred-result-insertion",
-            agent.state.messages.length,
-          );
-          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        }
-
-        return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
-      };
-      let pendingSilentTurnStartIndex: number | null = null;
-      const removePendingSilentTurn = () => {
-        if (pendingSilentTurnStartIndex === null) return;
-        const startIndex = pendingSilentTurnStartIndex;
-        pendingSilentTurnStartIndex = null;
-        const hasAssistantMessage = agent.state.messages
-          .slice(startIndex)
-          .some((message) => message.role === "assistant");
-        if (!hasAssistantMessage) return;
-
-        const messages = removeSilentAssistantTurnMessages({
-          messages: agent.state.messages,
-          startIndex,
-          messageCount: agent.state.messages.length - startIndex,
-        });
-        if (runProfile === "primary" && next.requestClient === "discord") {
-          const currentCanonicalStart =
-            state.activeRun?.corePrimaryLineage?.currentCanonicalStart ??
-            next.corePrimaryLineage?.currentCanonicalStart ??
-            startIndex;
-          next.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
-            "silent-turn-removal",
-            currentCanonicalStart,
-          );
-          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        }
-        agent.replaceMessages(messages);
-      };
-
-      agent.setTurnBoundaryHandler(async (context) => {
-        await coreNamedClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
-        await corePrimaryClaudeRuntime?.recordSuccessfulModelCall(agent.state.messages);
-        removePendingSilentTurn();
-
-        lastBoundaryModelInputMessages = context.modelInputMessages;
-        return await drainDeferredCompletions({
-          modelInputMessages: context.modelInputMessages,
-          abortSignal: context.abortSignal,
-        });
-      });
-
-      state.agent = agent;
-
-      let finalText = "";
-      let stableFinalText = "";
-      let stablePartialText = state.activeRun?.partialText ?? "";
-      let attemptStartFinalText = stableFinalText;
-      let attemptStartPartialText = stablePartialText;
-      const currentTurnToolCallIds = new Set<string>();
-      let turnTextStartIndex = 0;
-      let turnPartialTextStartIndex = stablePartialText.length;
-      let pendingNoReplyTurnText = "";
-      let pendingNoReplyTurnOutputs: Array<{
-        delta: string;
-        phase?: ReturnType<typeof openAIMessagePhase>;
-        phaseBoundaryPrefixChars: number;
-      }> = [];
-      let bufferNoReplyTurnText = true;
-      let lastCompletedTurnWasSilent = false;
-      let turnFinalAnswerText = "";
-      let turnHasFinalAnswerPhase = false;
-      let lastCompletedTurnFinalAnswerText: string | undefined;
-      let currentTextPhase: ReturnType<typeof openAIMessagePhase>;
-      let retainedTextPhase: ReturnType<typeof openAIMessagePhase>;
-      const assistantTextPhaseByPartId = new Map<
-        string,
-        NonNullable<ReturnType<typeof openAIMessagePhase>>
-      >();
-      const assistantTextPartBoundaryState = createAssistantTextPartBoundaryState(
-        next.recovery?.partialText,
-      );
-      const appendPendingNoReplyOutput = (
-        delta: string,
-        phase: ReturnType<typeof openAIMessagePhase>,
-        phaseBoundaryPrefixChars: number,
-      ): void => {
-        const previous = pendingNoReplyTurnOutputs.at(-1);
-        if (previous !== undefined && previous.phase === phase && phaseBoundaryPrefixChars === 0) {
-          previous.delta += delta;
-          return;
-        }
-        pendingNoReplyTurnOutputs.push({ delta, phase, phaseBoundaryPrefixChars });
-      };
-      const publishPendingNoReplyOutputs = (): void => {
-        for (const output of pendingNoReplyTurnOutputs) {
-          outputPublisher.publishText(output.delta, output.phase, output.phaseBoundaryPrefixChars);
-        }
-        pendingNoReplyTurnOutputs = [];
-      };
-      const reasoningChunkState: ReasoningChunkState = {
-        chunks: new Map<string, string>(),
-        seq: 0,
-      };
-      let retryAttemptHadReasoning = false;
-
-      const toolStartMs = new Map<string, number>();
-
-      const contextDumpEnabled = env.debug.contextDump.enabled;
-      const contextDumpDir = env.debug.contextDump.dir;
-      let turnEndCount = 0;
-
-      const dumpContextAfterTurn = async (
-        event: Extract<AiSdkPiAgentEvent<ToolSet>, { type: "turn_end" }>,
-      ) => {
-        if (!contextDumpEnabled) return;
-
-        const tsMs = Date.now();
-        const safeSessionId = sanitizeFilenameToken(headers.session_id);
-        const safeRequestId = sanitizeFilenameToken(headers.request_id);
-        const fileName = `${safeSessionId}-${safeRequestId}-${tsMs}.json`;
-        const filePath = path.join(contextDumpDir, fileName);
-
-        const modelView = agent.state.debug?.lastModelViewMessages;
-        const modelViewTurn = agent.state.debug?.lastModelViewTurn;
-
-        const payload = {
-          meta: {
-            tsMs,
-            ts: new Date(tsMs).toISOString(),
-            sessionId: headers.session_id,
-            requestId: headers.request_id,
-            requestClient: headers.request_client,
-            runProfile,
-            subagentDepth: subagentMeta.depth,
-            modelSpec: activeBinding.resolved.spec,
-            modelId: activeBinding.resolved.modelId,
-            turnEndIndex: turnEndCount,
-            modelViewTurn,
-          },
-          system: agent.state.system,
-          providerOptions: agent.state.providerOptions,
-          reasoning: agent.state.reasoning,
-          tools: {
-            names: Object.keys(agent.state.tools ?? {}),
-          },
-          usage: {
-            lastTurn: event.usage,
-            lastTurnTotal: event.totalUsage,
-          },
-          transcript: {
-            messages: agent.state.messages,
-          },
-          modelViewMessagesForTurn: modelView,
-        };
-
-        try {
-          await fs.mkdir(contextDumpDir, { recursive: true });
-          await fs.writeFile(filePath, debugJsonStringify(payload), "utf8");
-          logger.debug("context dump wrote", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            filePath,
-          });
-        } catch (e: unknown) {
-          logger.warn(
-            "context dump failed",
-            {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              filePath,
-            },
-            e,
-          );
-        }
-      };
-
-      const estimateUsageCostUsd = (usage: LanguageModelUsage | undefined): number | undefined => {
-        if (!usage || !modelCapabilityInfo?.cost) return undefined;
-        return modelCapability.estimateCostUsd(modelCapabilityInfo, usage);
-      };
-
-      unsubscribe = agent.subscribe((event: AiSdkPiAgentEvent<ToolSet>) => {
-        markRunActivity(
-          event.type === "tool_execution_start" ||
-            event.type === "tool_execution_update" ||
-            event.type === "tool_execution_end"
-            ? "tool"
-            : "model",
-        );
-
-        if (event.type === "agent_end") {
-          runStats.totalUsage = event.totalUsage;
-          runStats.finalMessages = event.messages;
-        }
-
-        if (event.type === "turn_start") {
-          attemptStartFinalText = stableFinalText;
-          attemptStartPartialText = stablePartialText;
-          currentTurnToolCallIds.clear();
-        }
-
-        if (event.type === "messages_reset") {
-          removePendingSilentTurn();
-        }
-
-        if (event.type === "turn_end") {
-          transientRetryController.reset();
-          retryAttemptHadReasoning = false;
-          const turnText = finalText.slice(turnTextStartIndex);
-          const turnDeliveryText = turnHasFinalAnswerPhase ? turnFinalAnswerText : turnText;
-          const silentTurn = resolveReplyDeliveryFromFinalText(turnDeliveryText) === "skip";
-          lastCompletedTurnWasSilent = silentTurn;
-          lastCompletedTurnFinalAnswerText = turnHasFinalAnswerPhase
-            ? turnFinalAnswerText
-            : undefined;
-          if (silentTurn) {
-            finalText = finalText.slice(0, turnTextStartIndex);
-            if (state.activeRun?.requestId === next.requestId) {
-              state.activeRun.partialText = state.activeRun.partialText.slice(
-                0,
-                turnPartialTextStartIndex,
-              );
-            }
-            void outputPublisher.publishTextReset({
-              text:
-                state.activeRun?.requestId === next.requestId
-                  ? state.activeRun.partialText
-                  : `${next.recovery?.partialText ?? ""}${finalText}`,
-              ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
-            });
-            pendingSilentTurnStartIndex = agent.state.messages.length - event.newMessages.length;
-          } else if (bufferNoReplyTurnText && pendingNoReplyTurnText.length > 0) {
-            if (state.activeRun?.requestId === next.requestId) {
-              state.activeRun.partialText += pendingNoReplyTurnText;
-            }
-            publishPendingNoReplyOutputs();
-          }
-          if (!silentTurn) retainedTextPhase = currentTextPhase ?? retainedTextPhase;
-
-          pendingNoReplyTurnText = "";
-          pendingNoReplyTurnOutputs = [];
-          bufferNoReplyTurnText = true;
-          turnFinalAnswerText = "";
-          turnHasFinalAnswerPhase = false;
-          currentTextPhase = undefined;
-          assistantTextPhaseByPartId.clear();
-          turnTextStartIndex = finalText.length;
-          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
-          stableFinalText = finalText;
-          stablePartialText = state.activeRun?.partialText ?? stablePartialText;
-
-          turnEndCount++;
-          runStats.lastTurnFinishReason = event.finishReason;
-          runStats.lastTurnEndAt = Date.now();
-
-          const roundEstimatedCostUsd = estimateUsageCostUsd(event.usage);
-          if (roundEstimatedCostUsd !== undefined) {
-            roundEstimatedCostUsdTotal = (roundEstimatedCostUsdTotal ?? 0) + roundEstimatedCostUsd;
-            roundEstimatedCostCount += 1;
-          }
-
-          logger.info("agent.round.stats", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            round: turnEndCount,
-            finishReason: event.finishReason,
-            inputTokens: event.usage.inputTokens,
-            outputTokens: event.usage.outputTokens,
-            totalTokens: event.usage.totalTokens,
-            cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
-            cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
-            estimatedCostUsd: roundEstimatedCostUsd,
-            estimatedCostUsdTotal: roundEstimatedCostUsdTotal,
-            modelSpec: activeBinding.resolved.spec,
-            costEstimateStatus:
-              roundEstimatedCostUsd !== undefined ? "estimated" : costEstimateStatus,
-            costEstimateReason:
-              roundEstimatedCostUsd === undefined ? costEstimateReason : undefined,
-          });
-
-          // Fire-and-forget debug dump; do not block the run.
-          void dumpContextAfterTurn(event);
-        }
-
-        if (event.type === "turn_abort" && event.reason === "interrupt") {
-          transientRetryController.reset();
-        }
-
-        if (event.type === "turn_abort") {
-          if (bufferNoReplyTurnText) {
-            finalText = finalText.slice(0, turnTextStartIndex);
-          }
-          pendingNoReplyTurnText = "";
-          pendingNoReplyTurnOutputs = [];
-          bufferNoReplyTurnText = true;
-          turnFinalAnswerText = "";
-          turnHasFinalAnswerPhase = false;
-          currentTextPhase = undefined;
-          assistantTextPhaseByPartId.clear();
-          turnTextStartIndex = finalText.length;
-          turnPartialTextStartIndex = state.activeRun?.partialText.length ?? 0;
-        }
-
-        if (
-          event.type === "turn_retry" ||
-          (event.type === "messages_reset" && event.reason === "recovery")
-        ) {
-          if (event.type === "messages_reset") {
-            const retainedToolCallIds = toolCallIdsFromMessages(event.messages);
-            const retainsCurrentTurn = [...currentTurnToolCallIds].some((toolCallId) =>
-              retainedToolCallIds.has(toolCallId),
-            );
-            if (!retainsCurrentTurn) {
-              stableFinalText = attemptStartFinalText;
-              stablePartialText = attemptStartPartialText;
-            }
-          }
-          outputPublisher.flush();
-          assistantTextPartBoundaryState.lastTextPartId = null;
-          assistantTextPartBoundaryState.pendingTextPartStartIds.clear();
-          assistantTextPartBoundaryState.pendingRecoveryTextBoundary =
-            event.type === "turn_retry" ? event.hadPartialOutput : true;
-          finalText = stableFinalText;
-          if (state.activeRun?.requestId === next.requestId) {
-            state.activeRun.partialText = stablePartialText;
-          }
-          pendingNoReplyTurnText = "";
-          pendingNoReplyTurnOutputs = [];
-          bufferNoReplyTurnText = true;
-          turnFinalAnswerText = "";
-          turnHasFinalAnswerPhase = false;
-          currentTextPhase = undefined;
-          assistantTextPhaseByPartId.clear();
-          turnTextStartIndex = stableFinalText.length;
-          turnPartialTextStartIndex = stablePartialText.length;
-
-          if (event.type === "messages_reset") {
-            void outputPublisher.publishTextReset({
-              text: stablePartialText,
-              ...(retainedTextPhase === undefined ? {} : { phase: retainedTextPhase }),
-            });
-          }
-
-          if (retryAttemptHadReasoning) {
-            reasoningChunkState.chunks.clear();
-            reasoningChunkState.seq += 1;
-            outputPublisher
-              .publishReasoningBoundary({ delta: "", seq: reasoningChunkState.seq })
-              .catch((e: unknown) => {
-                logger.error(
-                  "failed to clear reasoning after model retry",
-                  { requestId: headers.request_id, sessionId: headers.session_id },
-                  e,
-                );
-              });
-          }
-          retryAttemptHadReasoning = false;
-        }
-
-        if (event.type === "turn_warnings") {
-          streamWarnings.push(...event.warnings);
-
-          logger.warn("model stream warnings", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            count: event.warnings.length,
-            warnings: event.warnings.map((warning) => formatCallWarning(warning)),
-          });
-        }
-
-        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_start") {
-          const phase = openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata);
-          if (phase !== undefined) {
-            assistantTextPhaseByPartId.set(event.assistantMessageEvent.id, phase);
-          }
-          markAssistantTextPartStarted(
-            assistantTextPartBoundaryState,
-            event.assistantMessageEvent.id,
-          );
-        }
-
-        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-          runStats.firstTextDeltaAt ??= Date.now();
-          const phase =
-            openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata) ??
-            assistantTextPhaseByPartId.get(event.assistantMessageEvent.id);
-          if (phase === "final_answer" && currentTextPhase === "commentary") {
-            if (pendingNoReplyTurnText.length > 0) {
-              if (state.activeRun?.requestId === next.requestId) {
-                state.activeRun.partialText += pendingNoReplyTurnText;
-              }
-              publishPendingNoReplyOutputs();
-              pendingNoReplyTurnText = "";
-            }
-            bufferNoReplyTurnText = true;
-          }
-          currentTextPhase = phase ?? currentTextPhase;
-
-          const delta = consumeAssistantTextDelta({
-            state: assistantTextPartBoundaryState,
-            finalText,
-            recoveryPartialText: next.recovery?.partialText,
-            partId: event.assistantMessageEvent.id,
-            delta: event.assistantMessageEvent.delta,
-          });
-          const phaseBoundaryPrefixChars = Math.max(
-            0,
-            delta.length - event.assistantMessageEvent.delta.length,
-          );
-
-          finalText += delta;
-          if (phase === "final_answer") {
-            turnHasFinalAnswerPhase = true;
-            turnFinalAnswerText += event.assistantMessageEvent.delta;
-          }
-
-          if (bufferNoReplyTurnText) {
-            pendingNoReplyTurnText += delta;
-            appendPendingNoReplyOutput(delta, phase, phaseBoundaryPrefixChars);
-            if (!isPossibleNoReplyPrefix(pendingNoReplyTurnText)) {
-              bufferNoReplyTurnText = false;
-              if (state.activeRun?.requestId === next.requestId) {
-                state.activeRun.partialText += pendingNoReplyTurnText;
-              }
-              publishPendingNoReplyOutputs();
-              pendingNoReplyTurnText = "";
-            }
-          } else {
-            if (state.activeRun?.requestId === next.requestId) {
-              state.activeRun.partialText += delta;
-            }
-            outputPublisher.publishText(delta, phase, phaseBoundaryPrefixChars);
-          }
-        }
-
-        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_end") {
-          markAssistantTextPartEnded(
-            assistantTextPartBoundaryState,
-            event.assistantMessageEvent.id,
-          );
-          assistantTextPhaseByPartId.delete(event.assistantMessageEvent.id);
-        }
-
-        if (
-          event.type === "message_update" &&
-          event.assistantMessageEvent.type === "thinking_start"
-        ) {
-          const chunkId = event.assistantMessageEvent.id;
-          retryAttemptHadReasoning = true;
-          consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
-
-          outputPublisher.publishReasoningBoundary({ delta: "" }).catch((e: unknown) => {
-            logger.error(
-              "failed to publish reasoning start",
-              { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-              e,
-            );
-          });
-        }
-
-        if (
-          event.type === "message_update" &&
-          event.assistantMessageEvent.type === "thinking_delta"
-        ) {
-          const chunkId = event.assistantMessageEvent.id;
-          const delta = event.assistantMessageEvent.delta;
-          retryAttemptHadReasoning = true;
-          const update = consumeReasoningChunkEvent(reasoningChunkState, {
-            type: "delta",
-            chunkId,
-            delta,
-          });
-          if (update.publishStart) {
-            outputPublisher.publishReasoningBoundary({ delta: "" }).catch((e: unknown) => {
-              logger.error(
-                "failed to publish implicit reasoning start",
-                { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                e,
-              );
-            });
-          }
-
-          if (update.snapshot) {
-            outputPublisher.publishReasoningSnapshot(update.snapshot, Buffer.byteLength(delta));
-          }
-        }
-
-        if (
-          event.type === "message_update" &&
-          event.assistantMessageEvent.type === "thinking_end"
-        ) {
-          const chunkId = event.assistantMessageEvent.id;
-          consumeReasoningChunkEvent(reasoningChunkState, { type: "end", chunkId });
-          outputPublisher.flush();
-        }
-
-        if (event.type === "tool_execution_start") {
-          const startedAt = Date.now();
-          toolStartMs.set(event.toolCallId, startedAt);
-          currentTurnToolCallIds.add(event.toolCallId);
-          state.activeRun?.activeTools.set(event.toolCallId, {
-            toolName: event.toolName,
-            startedAt,
-          });
-
-          if (event.toolName !== "batch") {
-            outputPublisher
-              .publishToolCall({
-                toolCallId: event.toolCallId,
-                status: "start",
-                display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
-              })
-              .catch((e: unknown) => {
-                logger.error(
-                  "failed to publish tool start",
-                  {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    toolCallId: event.toolCallId,
-                    toolName: event.toolName,
-                  },
-                  e,
-                );
-              });
-          }
-        }
-
-        if (event.type === "tool_execution_end") {
-          state.activeRun?.activeTools.delete(event.toolCallId);
-          const started = toolStartMs.get(event.toolCallId);
-          const toolDurationMs = started ? Date.now() - started : undefined;
-          const toolFailure = summarizeToolFailure({
-            toolName: event.toolName,
-            isError: event.isError,
-            result: event.result,
-            toolSpecs: activeBinding.toolset.specs,
-          });
-          const deferredAccepted =
-            event.toolName === "subagent_delegate" &&
-            isDeferredSubagentAcceptedResult(event.result);
-
-          let ok: boolean;
-          switch (event.toolName) {
-            case "batch":
-              ok = getBatchOkFromResult(event.result) ?? toolFailure.ok;
-              break;
-            case "subagent_delegate":
-              ok = getSubagentOkFromResult(event.result) ?? toolFailure.ok;
-              break;
-            default:
-              ok = toolFailure.ok;
-              break;
-          }
-          const interruptedForRestart = restartAbortRequestIds.has(headers.request_id);
-          const toolFailureError = toolFailure.error ?? "tool failed";
-
-          if (!ok) {
-            logger.warn("tool call failed", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              toolCallId: event.toolCallId,
-              toolName: event.toolName,
-              durationMs: toolDurationMs,
-              failureKind: toolFailure.failureKind ?? "soft",
-              error: interruptedForRestart ? "server restarted" : toolFailureError,
-              argsPreview: formatToolLogPreview({
-                toolName: event.toolName,
-                value: event.args,
-              }),
-              resultPreview: formatToolLogPreview({
-                toolName: event.toolName,
-                value: event.result,
-              }),
-            });
-          }
-
-          logger.debug("tool finished", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            toolCallId: event.toolCallId,
-            toolName: event.toolName,
-            ok,
-            deferredAccepted,
-            durationMs: toolDurationMs,
-            failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
-          });
-
-          if (event.toolName === "batch" || deferredAccepted) {
-            return;
-          }
-
-          let publishedToolError: string | undefined;
-          if (!ok) {
-            publishedToolError = interruptedForRestart ? "server restarted" : toolFailureError;
-          }
-          outputPublisher
-            .publishToolCall({
-              toolCallId: event.toolCallId,
-              status: "end",
-              display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
-              ok,
-              error: publishedToolError,
-            })
-            .catch((e: unknown) => {
-              logger.error(
-                "failed to publish tool end",
-                {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: event.toolCallId,
-                  toolName: event.toolName,
-                },
-                e,
-              );
-            });
-        }
-
-        if (event.type === "agent_end") {
-          // Best-effort fallback: if deltas didn't populate finalText, take last assistant string.
-          if (!finalText) {
-            const last = event.messages[event.messages.length - 1];
-            if (last && last.role === "assistant") {
-              if (typeof last.content === "string") {
-                finalText = last.content;
-              } else {
-                const buf: string[] = [];
-                for (const part of last.content) {
-                  if (part.type !== "text") continue;
-                  buf.push(part.text);
-                }
-                finalText = buf.join("\n\n");
-              }
-            }
-          }
-        }
-      });
-
-      if (next.recovery) {
-        initialMessages = [buildResumePrompt(next.recovery.partialText)];
-        responseStartIndex = agent.state.messages.length + initialMessages.length;
-      } else if (parsedCustomCommand) {
-        initialMessages = [...next.messages];
-        agent.appendMessages(initialMessages);
-        responseStartIndex = agent.state.messages.length;
-        agent.appendMessages(customCommandMessages);
-      } else {
-        // First message should be a prompt.
-        // If additional messages for the same request id were queued before the run started,
-        // merge them into the initial prompt so they don't become separate runs.
-        const mergedInitial = mergeQueuedForSameRequest(next, state.queue);
-        if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        const control = parseRequestControlFromRaw(next.raw);
-        const autoInjectedThreadSearchMessages =
-          runProfile === "primary" &&
-          !isHeartbeatSessionId(headers.session_id) &&
-          !control.cancel &&
-          !control.requiresActive
-            ? await waitForPreAgent(
-                maybeBuildAutoInjectedThreadSearchMessages({
-                  cfg,
-                  conversationThreads: params.conversationThreads,
-                  requestId: headers.request_id,
-                  raw: next.raw,
-                  previousMessages: agent.state.messages,
-                  userMessages: mergedInitial,
-                  publishToolStatus: async (update) => {
-                    await outputPublisher.publishToolCall(update);
-                  },
-                  onError: (message, error) => {
-                    logger.warn(
-                      message,
-                      {
-                        requestId: headers.request_id,
-                        sessionId: headers.session_id,
-                        ...extractAiErrorLogDetails(error),
-                      },
-                      error,
-                    );
-                  },
-                  onInjected: (event) => {
-                    logger.info("conversation.thread.auto_inject.appended", {
-                      requestId: headers.request_id,
-                      sessionId: headers.session_id,
-                      toolCallId: event.toolCallId,
-                      mode: event.mode,
-                      limit: event.limit,
-                      searchCount: event.searches.length,
-                      queryCount: event.searches.reduce((sum, queries) => sum + queries.length, 0),
-                      searches: event.searches,
-                      participantFilterUserCount: event.participantFilterUserCount,
-                      appendedCount: event.entries.length,
-                      entries: event.entries,
-                    });
-                  },
-                }),
-              )
-            : [];
-        initialMessages = [...mergedInitial, ...autoInjectedThreadSearchMessages];
-        if (
-          autoInjectedThreadSearchMessages.length > 0 &&
-          runProfile === "primary" &&
-          next.requestClient === "discord"
-        ) {
-          next.corePrimaryLineage = appendAutoInjectedThreadSearchLineage({
-            lineage: next.corePrimaryLineage,
-            canonicalMessages: mergedInitial,
-            injectedMessages: autoInjectedThreadSearchMessages,
-          });
-          if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
-        }
-        initialMessagesEndWithInjectedTool = autoInjectedThreadSearchMessages.length > 0;
-        responseStartIndex = agent.state.messages.length + initialMessages.length;
-      }
-
-      if (cancelledByRequestId.has(headers.request_id)) {
-        const finalText = "Cancelled.";
-        await publishCurrentLifecycle({
-          state: "cancelled",
-          detail: "cancelled by interrupt",
-          output: finalText,
-        });
-        await outputPublisher.publishResponseText({ finalText });
-        return;
-      }
-
-      if (state.activeRun) state.activeRun.started = true;
-      runIdleWatchdog?.start();
-
-      if (parsedCustomCommand) {
-        await waitForRun(agent.continue());
-      } else if (initialMessagesEndWithInjectedTool) {
-        agent.appendMessages(initialMessages);
-        await waitForRun(agent.continue());
-      } else {
-        await waitForRun(agent.prompt(initialMessages));
-      }
-
-      while (true) {
-        await waitForRun(agent.waitForIdle());
-
-        if (restartAbortRequestIds.delete(headers.request_id)) {
-          throw new RestartDrainingAbort();
-        }
-
-        const continuationWaitVersion = continuationSignalVersion;
-        const deferredWaitState = liveParentSession?.snapshot();
-
-        if (liveParentSession && deferredWaitState?.hasPendingCompletions) {
-          const decision = await drainDeferredCompletions({
-            modelInputMessages: lastBoundaryModelInputMessages,
-          });
-          if (decision.append.length > 0) agent.appendMessages(decision.append);
-          if (cancelledByRequestId.has(headers.request_id)) break;
-          if (decision.append.length > 0 || decision.forceNextTurn) {
-            await waitForRun(agent.continue());
-          } else if (liveParentSession.snapshot().hasPendingCompletions) {
-            await waitForRun(
-              waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
-            );
-          }
-          continue;
-        }
-
-        if (!deferredWaitState?.hasOutstandingRuns) {
-          break;
-        }
-        if (!liveParentSession) break;
-
-        await waitForRun(
-          waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
-        );
-        if (agent.state.isStreaming) {
-          continue;
-        }
-      }
-      runIdleWatchdog?.stop();
-
-      let isCancelled = cancelledByRequestId.has(headers.request_id);
-      if (isCancelled) coreNamedClaudeRuntime?.markTerminalFailure(true);
-      if (isCancelled) corePrimaryClaudeRuntime?.markTerminalFailure(true);
-      if (isCancelled && !finalText) {
-        finalText = "Cancelled.";
-      }
-
-      const terminalDeliveryText = isCancelled
-        ? finalText
-        : (lastCompletedTurnFinalAnswerText ?? finalText);
-      const isHeartbeatAckOnly =
-        isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(terminalDeliveryText);
-      const delivery =
-        finalText.length === 0 && lastCompletedTurnWasSilent
-          ? "skip"
-          : resolveReplyDeliveryFromFinalText(terminalDeliveryText);
-      if (!isCancelled && delivery !== "skip" && !isHeartbeatAckOnly && finalText.length === 0) {
-        throw new Error(
-          buildNoAssistantTextError({
-            provider: activeBinding.resolved.provider,
-            modelId: activeBinding.resolved.modelId,
-            finishReason: runStats.lastTurnFinishReason,
-            warningSummary: summarizeCallWarnings(streamWarnings) ?? undefined,
-          }),
-        );
-      }
-
-      const shouldSkipSurfaceReply = delivery === "skip" || isHeartbeatAckOnly;
-      if (shouldSkipSurfaceReply) {
-        logger.info("agent requested skip reply", {
-          requestId: headers.request_id,
-          sessionId: headers.session_id,
-        });
-        finalText = "";
-      }
-
-      // Keep skip-reply behavior for primary runs.
-      // For subagent runs we still persist to support explicit session continuation.
-      if (params.transcriptStore && (!shouldSkipSurfaceReply || runProfile !== "primary")) {
-        try {
-          const finalMessagesForPersistence = runStats.finalMessages ?? agent.state.messages;
-          const checkpointMeta = resolveCompactionCheckpointMeta({
-            runSucceeded: true,
-            isPrimary: runProfile === "primary",
-            isCancelled,
-            shouldSkipSurfaceReply,
-            completedCompactionCount,
-          });
-          const isCompactionCheckpoint = checkpointMeta !== undefined;
-          const persistedMessages = (() => {
-            if (isHeartbeatSessionId(headers.session_id)) {
-              return buildPersistedHeartbeatMessages(finalText);
-            }
-
-            return selectPersistedTranscriptMessages({
-              finalMessages: finalMessagesForPersistence,
-              responseStartIndex,
-              isPrimary: runProfile === "primary",
-              didCompact: isCompactionCheckpoint,
-            });
-          })();
-          const targetProviderFamily = classifyHistoryProviderFamily({
-            type: activeBinding.resolved.provider,
-          });
-          let providerState: HistoryProviderState | undefined;
-          switch (runProfile) {
-            case "primary":
-              providerState = resolveCorePrimaryTranscriptProviderState({
-                targetFamily: targetProviderFamily,
-                lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
-                transcriptStore: params.transcriptStore,
-              });
-              break;
-            case "explore":
-            case "general":
-            case "self":
-              providerState = undefined;
-              if (stableNamedContinuation && !isCancelled) {
-                const sourceProviderState =
-                  seededSessionTranscript === null
-                    ? "empty-history"
-                    : (seededSessionTranscript.providerState ?? "unknown-populated-history");
-                providerState = advanceHistoryProviderState(
-                  sourceProviderState,
-                  targetProviderFamily,
-                );
-              }
-              break;
-            default: {
-              const _exhaustive: never = runProfile;
-              providerState = _exhaustive;
-              break;
-            }
-          }
-          const terminalPrimaryLineage =
-            state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
-          const canPublishCorePrimaryClaude =
-            corePrimaryClaudeRuntime !== null &&
-            terminalPrimaryLineage?.state === "complete" &&
-            !isCompactionCheckpoint;
-
-          params.transcriptStore.saveRequestTranscript({
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            requestClient: headers.request_client,
-            // Primary runs can reconstruct context from the surface thread.
-            // Subagent runs need full per-session transcript for explicit continuation.
-            messages: persistedMessages,
-            finalText,
-            modelLabel: resolvedModelLabel,
-            contextMeta: checkpointMeta,
-            ...(providerState && !coreNamedClaudeRuntime && !canPublishCorePrimaryClaude
-              ? { providerState }
-              : {}),
-            ...(runProfile === "primary" ? persistedCompleteLineage(terminalPrimaryLineage) : {}),
-            ...(stableNamedContinuation && !isCancelled && !coreNamedClaudeRuntime
-              ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
-              : {}),
-          });
-          if (coreNamedClaudeRuntime && !isCancelled) {
-            if (!providerState) {
-              throw new Error("Core named Claude finalization requires provider history state");
-            }
-            const verified = params.transcriptStore.getRequestTranscript?.({
-              requestId: headers.request_id,
-            });
-            const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
-            if (
-              !verified ||
-              verified.messages.length !== persistedMessages.length ||
-              hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
-            ) {
-              throw new Error("persisted Core named transcript failed canonical re-read");
-            }
-            const promoted = await coreNamedClaudeRuntime.finalize({
-              terminalTranscript: verified,
-              canonicalMessages: persistedMessages,
-              providerState,
-              isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
-            });
-            const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
-            isCancelled ||= cancelledDuringFinalization;
-            logger.info("Core named Claude binding promotion", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              promoted,
-            });
-          }
-          if (corePrimaryClaudeRuntime && !isCancelled && canPublishCorePrimaryClaude) {
-            if (!providerState) {
-              throw new Error("Core primary Claude finalization requires provider history state");
-            }
-            const verified = params.transcriptStore.getRequestTranscript?.({
-              requestId: headers.request_id,
-            });
-            const verifiedManifest = params.transcriptStore.getCorePrimaryLineageManifest?.({
-              requestId: headers.request_id,
-            });
-            const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
-            const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
-            if (
-              !verified ||
-              !verifiedManifest ||
-              verified.providerState != null ||
-              verified.messages.length !== persistedMessages.length ||
-              hashCanonicalMessagesV1(verified.messages).hash !== expectedHash
-            ) {
-              throw new Error("persisted Core primary transcript failed canonical re-read");
-            }
-            const promoted = await corePrimaryClaudeRuntime.finalize({
-              terminalTranscript: verified,
-              canonicalMessages: terminalCanonicalMessages,
-              providerState,
-              isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
-            });
-            const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
-            isCancelled ||= cancelledDuringFinalization;
-            logger.info("Core primary Claude binding promotion", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              promoted,
-            });
-          } else if (corePrimaryClaudeRuntime && !isCancelled) {
-            corePrimaryClaudeRuntime.markTerminalFailure(false);
-          }
-          if (isCompactionCheckpoint) {
-            logger.info("compaction checkpoint persisted", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              messageCount: persistedMessages.length,
-              compactionCount: completedCompactionCount,
-              formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
-            });
-          }
-        } catch (e) {
-          coreNamedClaudeRuntime?.markTerminalFailure(false);
-          corePrimaryClaudeRuntime?.markTerminalFailure(false);
-          logger.error(
-            "failed to persist transcript",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            e,
-          );
-        }
-      }
-      if (corePrimaryClaudeRuntime && shouldSkipSurfaceReply) {
-        corePrimaryClaudeRuntime.markTerminalFailure(false);
-      }
-
-      // Build stats in the js-llmcord-ish one-liner format.
-      const endAt = runStats.lastTurnEndAt ?? Date.now();
-      const ttftMs = runStats.firstTextDeltaAt ? runStats.firstTextDeltaAt - runStartedAt : null;
-      const outputTokens = runStats.totalUsage?.outputTokens;
-      const rawTps =
-        typeof outputTokens === "number" &&
-        runStats.lastTurnFinishReason === "stop" &&
-        endAt > runStartedAt
-          ? outputTokens / ((endAt - runStartedAt) / 1000)
-          : null;
-      const tps = rawTps !== null && Number.isFinite(rawTps) ? rawTps : null;
-
-      const responseMessages = runStats.finalMessages
-        ? runStats.finalMessages.slice(responseStartIndex)
-        : [];
-
-      if (params.transcriptStore && isHeartbeatSessionId(headers.session_id)) {
-        try {
-          persistHeartbeatSurfaceHandoffs({
-            logger,
-            transcriptStore: params.transcriptStore,
-            requestId: headers.request_id,
-            requestClient: headers.request_client,
-            sessionId: headers.session_id,
-            modelLabel: resolvedModelLabel,
-            responseMessages,
-          });
-        } catch (e) {
-          logger.error(
-            "failed to persist heartbeat handoff transcripts",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            e,
-          );
-        }
-      }
-
-      const icLine = buildInputCompositionLine({
-        system: systemPromptToText(agent.state.system),
-        initialMessages,
-        responseMessages,
-        tools: agent.state.tools,
-      });
-
-      const modelLabel = activeBinding.resolved.modelId;
-      const statsLine = buildStatsLine({
-        modelLabel,
-        usage: runStats.totalUsage,
-        ttftMs,
-        tps,
-        icLine,
-      });
-
-      const statsForNerds = getStatsForNerdsOptions(cfg.agent.statsForNerds);
-      const statsForNerdsLine = statsForNerds.enabled
-        ? buildStatsLine({
-            modelLabel,
-            usage: runStats.totalUsage,
-            ttftMs,
-            tps,
-            icLine: statsForNerds.verbose ? icLine : null,
-          })
-        : undefined;
-
-      const estimatedCostUsdFromTotalUsage = didSwitchModel
-        ? undefined
-        : estimateUsageCostUsd(runStats.totalUsage);
-      const estimatedCostUsdTotal = estimatedCostUsdFromTotalUsage ?? roundEstimatedCostUsdTotal;
-      const resolvedCostEstimateStatus =
-        estimatedCostUsdTotal !== undefined ? "estimated" : costEstimateStatus;
-      const resolvedCostEstimateReason =
-        estimatedCostUsdTotal !== undefined ? undefined : costEstimateReason;
-
-      await publishCurrentLifecycle({
-        state: isCancelled ? "cancelled" : "resolved",
-        detail: isCancelled ? "cancelled by interrupt" : undefined,
-        output: finalText,
-        usage: runStats.totalUsage
-          ? {
-              inputTokens: runStats.totalUsage.inputTokens ?? 0,
-              outputTokens: runStats.totalUsage.outputTokens ?? 0,
-              totalTokens: runStats.totalUsage.totalTokens ?? 0,
-            }
-          : undefined,
-      });
-
-      await outputPublisher.publishResponseText({
-        finalText,
-        delivery,
-        statsForNerdsLine,
-        usage: runStats.totalUsage
-          ? {
-              inputTokens: runStats.totalUsage.inputTokens ?? 0,
-              outputTokens: runStats.totalUsage.outputTokens ?? 0,
-              totalTokens: runStats.totalUsage.totalTokens ?? 0,
-            }
-          : undefined,
-      });
-
-      logger.info(statsLine, {
-        requestId: headers.request_id,
-        sessionId: headers.session_id,
-        turns: turnEndCount,
-        estimatedCostUsd: estimatedCostUsdTotal,
-        costEstimateStatus: resolvedCostEstimateStatus,
-        costEstimateReason: resolvedCostEstimateReason,
-        estimatedCostTurnCoverage:
-          turnEndCount > 0 ? roundEstimatedCostCount / turnEndCount : undefined,
-      });
-
-      logger.info("agent run resolved", {
-        requestId: headers.request_id,
-        sessionId: headers.session_id,
-        model: activeBinding.resolved.spec,
-        durationMs: Date.now() - runStartedAt,
-        finalTextChars: finalText.length,
-        turns: turnEndCount,
-        estimatedCostUsd: estimatedCostUsdTotal,
-        costEstimateStatus: resolvedCostEstimateStatus,
-        costEstimateReason: resolvedCostEstimateReason,
-      });
-    } catch (e) {
-      rethrowBusAgentRunnerPanic(e, (panic) => {
-        terminalPanic = panic;
-      });
-      runIdleWatchdog?.stop();
-
-      if (e instanceof RestartDrainingAbort) {
-        coreNamedClaudeRuntime?.markUncertain();
-        corePrimaryClaudeRuntime?.markUncertain();
-      } else if (e instanceof PreAgentRunCancelledError) {
-        coreNamedClaudeRuntime?.markTerminalFailure(true);
-        corePrimaryClaudeRuntime?.markTerminalFailure(true);
-      } else {
-        coreNamedClaudeRuntime?.markTerminalFailure(false);
-        corePrimaryClaudeRuntime?.markTerminalFailure(false);
-      }
-
-      if (activeCustomCommandTool) {
-        const { toolCallId, display } = activeCustomCommandTool;
-        activeCustomCommandTool = null;
-        let customCommandError: string;
-        if (e instanceof PreAgentRunCancelledError) {
-          customCommandError = "cancelled by interrupt";
-        } else if (e instanceof Error) {
-          customCommandError = e.message;
-        } else {
-          customCommandError = String(e);
-        }
-        await outputPublisher
-          .publishToolCall({
-            toolCallId,
-            status: "end",
-            display,
-            ok: false,
-            error: customCommandError,
-          })
-          .catch(() => undefined);
-      }
-
-      const timedOutOperation = getActiveRunOperation();
-      if (
-        (e instanceof AgentIdleTimeoutError || e instanceof PreAgentRunCancelledError) &&
-        timedOutOperation
-      ) {
-        const settled = await Promise.race([
-          timedOutOperation.then(
-            () => true,
-            () => true,
-          ),
-          Bun.sleep(AGENT_TIMEOUT_ABORT_GRACE_MS).then(() => false),
-        ]);
-        if (!settled) {
-          logger.warn("agent operation did not settle after cancellation grace period", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            reason: e instanceof AgentIdleTimeoutError ? "idle_timeout" : "cancelled",
-            abortGraceMs: AGENT_TIMEOUT_ABORT_GRACE_MS,
-          });
-        }
-      }
-
-      if (e instanceof RestartDrainingAbort) {
-        preserveWorkflowClaim = true;
-        if (workflowHint) {
-          params.durableWorkflowStore?.releaseWorkflowRequestClaim(
-            next.requestId,
-            workflowRunnerOwnerId,
-            Date.now(),
-          );
-        }
-        logger.info("agent run interrupted for graceful restart", {
-          requestId: headers.request_id,
-          sessionId: headers.session_id,
-          durationMs: Date.now() - runStartedAt,
-        });
-        return;
-      }
-
-      if (e instanceof PreAgentRunCancelledError) {
-        await liveParentSession?.cancelAll("parent request cancelled").catch(() => undefined);
-        const finalText = "Cancelled.";
-        await publishCurrentLifecycle({
-          state: "cancelled",
-          detail: "cancelled by interrupt",
-          output: finalText,
-        });
-        await outputPublisher.publishResponseText({ finalText });
-        return;
-      }
-
-      const rawMsg = formatUnknownErrorForDisplay(e);
-      const msg = maybeAppendWarningSummaryToUnclearError(
-        rawMsg,
-        summarizeCallWarnings(streamWarnings),
-      );
-
-      if (params.transcriptStore) {
-        try {
-          const finalMessagesForPersistence =
-            runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
-          const safeFinalMessages = buildSafeRecoveryCheckpoint(
-            finalMessagesForPersistence,
-            "agent run failed",
-          );
-          const responseMessages = safeFinalMessages.slice(responseStartIndex);
-          const persistedMessages = (() => {
-            if (isHeartbeatSessionId(headers.session_id)) {
-              return buildPersistedHeartbeatMessages(`Error: ${msg}`);
-            }
-
-            return runProfile === "primary" ? responseMessages : safeFinalMessages;
-          })();
-
-          params.transcriptStore.saveRequestTranscript({
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            requestClient: headers.request_client,
-            messages: persistedMessages,
-            finalText: `Error: ${msg}`,
-            modelLabel: resolvedModelLabel,
-            ...(runProfile === "primary"
-              ? {
-                  providerState: resolveCorePrimaryTranscriptProviderState({
-                    targetFamily: resolvedProviderFamily,
-                    lineage: state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
-                    transcriptStore: params.transcriptStore,
-                  }),
-                }
-              : {}),
-            ...(runProfile === "primary"
-              ? persistedCompleteLineage(
-                  state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
-                )
-              : {}),
-          });
-        } catch (err) {
-          logger.error(
-            "failed to persist transcript after error",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            err,
-          );
-        }
-      }
-
-      await liveParentSession?.cancelAll(`parent run failed: ${msg}`).catch((err: unknown) => {
-        logger.warn(
-          "failed to cancel deferred subagents after parent failure",
-          { requestId: headers.request_id, sessionId: headers.session_id },
-          err,
-        );
-      });
-
-      if (params.transcriptStore && isHeartbeatSessionId(headers.session_id)) {
-        try {
-          const finalMessagesForPersistence =
-            runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
-          const responseMessages = buildSafeRecoveryCheckpoint(
-            finalMessagesForPersistence,
-            "agent run failed",
-          ).slice(responseStartIndex);
-
-          persistHeartbeatSurfaceHandoffs({
-            logger,
-            transcriptStore: params.transcriptStore,
-            requestId: headers.request_id,
-            requestClient: headers.request_client,
-            sessionId: headers.session_id,
-            modelLabel: resolvedModelLabel,
-            responseMessages,
-          });
-        } catch (err) {
-          logger.error(
-            "failed to persist heartbeat handoff transcripts after error",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            err,
-          );
-        }
-      }
-      await publishCurrentLifecycle({
-        state: "failed",
-        detail: msg,
-        output: `Error: ${msg}`,
-        usage: runStats.totalUsage
-          ? {
-              inputTokens: runStats.totalUsage.inputTokens ?? 0,
-              outputTokens: runStats.totalUsage.outputTokens ?? 0,
-              totalTokens: runStats.totalUsage.totalTokens ?? 0,
-            }
-          : undefined,
-      });
-      await outputPublisher.publishResponseText({ finalText: `Error: ${msg}` });
-
-      logger.error(
-        "agent run failed",
-        {
+        const projectedError = projectBusAgentRunnerError(e, "Agent run failed");
+        logger.error("agent run failed", {
           requestId: headers.request_id,
           sessionId: headers.session_id,
           durationMs: Date.now() - runStartedAt,
           model: resolvedModelLabel,
-          ...extractAiErrorLogDetails(e),
-        },
-        e,
-      );
+          ...projectedError.details,
+          error: projectedError.message,
+        });
+      }
     } finally {
+      const cleanupCoreNamedRuntime = getCoreNamedClaudeRuntime();
+      const cleanupCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
+      const cleanupClaudeCodeRun = getClaudeCodeRun();
       if (terminalPanic) {
         rejectPreAgentCancellation = null;
         const terminalCleanups: BusAgentRunnerTerminalCleanup[] = [];
@@ -6021,22 +6301,22 @@ export async function startBusAgentRunner(params: {
           { label: "compaction-unsubscribe", run: unsubscribeCompaction },
           { label: "output-publisher-drain", run: () => outputPublisher.drain() },
         );
-        if (coreNamedClaudeRuntime) {
-          const runtime = coreNamedClaudeRuntime;
+        if (cleanupCoreNamedRuntime) {
+          const runtime = cleanupCoreNamedRuntime;
           terminalCleanups.push({
             label: "core-named-retire",
             run: () => runtime.retireAtRunEnd(),
           });
         }
-        if (corePrimaryClaudeRuntime) {
-          const runtime = corePrimaryClaudeRuntime;
+        if (cleanupCorePrimaryRuntime) {
+          const runtime = cleanupCorePrimaryRuntime;
           terminalCleanups.push({
             label: "core-primary-retire",
             run: () => runtime.retireAtRunEnd(),
           });
         }
-        if (claudeCodeRun) {
-          const run = claudeCodeRun;
+        if (cleanupClaudeCodeRun) {
+          const run = cleanupClaudeCodeRun;
           terminalCleanups.push({ label: "claude-dispose", run: () => run.dispose() });
         }
         if (liveParentSession) {
@@ -6063,27 +6343,47 @@ export async function startBusAgentRunner(params: {
         unsubscribe();
         unsubscribeCompaction();
         await outputPublisher.drain();
-        await coreNamedClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
-          logger.warn(
-            "failed to retire Core named Claude runtime",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            e,
+        if (cleanupCoreNamedRuntime) {
+          const runtime = cleanupCoreNamedRuntime;
+          const retired = await captureBusAgentRunnerOperation(
+            "Core named Claude runtime retirement",
+            () => runtime.retireAtRunEnd(),
           );
-        });
-        await corePrimaryClaudeRuntime?.retireAtRunEnd().catch((e: unknown) => {
-          logger.warn(
-            "failed to retire Core primary Claude runtime",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            e,
+          if (retired.status === "error") {
+            logger.warn("failed to retire Core named Claude runtime", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              error: retired.error.message,
+            });
+          }
+        }
+        if (cleanupCorePrimaryRuntime) {
+          const runtime = cleanupCorePrimaryRuntime;
+          const retired = await captureBusAgentRunnerOperation(
+            "Core primary Claude runtime retirement",
+            () => runtime.retireAtRunEnd(),
           );
-        });
-        await claudeCodeRun?.dispose().catch((e: unknown) => {
-          logger.warn(
-            "failed to dispose Claude Code run resources",
-            { requestId: headers.request_id, sessionId: headers.session_id },
-            e,
+          if (retired.status === "error") {
+            logger.warn("failed to retire Core primary Claude runtime", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              error: retired.error.message,
+            });
+          }
+        }
+        if (cleanupClaudeCodeRun) {
+          const run = cleanupClaudeCodeRun;
+          const disposed = await captureBusAgentRunnerOperation("Claude Code run disposal", () =>
+            run.dispose(),
           );
-        });
+          if (disposed.status === "error") {
+            logger.warn("failed to dispose Claude Code run resources", {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              error: disposed.error.message,
+            });
+          }
+        }
         await liveParentSession?.close();
       }
       state.agent = null;
@@ -6254,12 +6554,7 @@ async function applyToRunningAgent(
     notifyWaiters?.();
   };
 
-  const cancel = (() => {
-    const raw = entry.raw;
-    if (!raw || typeof raw !== "object") return false;
-    const v = (raw as Record<string, unknown>)["cancel"];
-    return v === true;
-  })();
+  const cancel = parseRequestControlFromRaw(entry.raw).cancel;
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       entry.queue === "steer" || entry.queue === "interrupt"

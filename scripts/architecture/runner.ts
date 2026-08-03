@@ -13,7 +13,7 @@ import type { ArchitectureManifest } from "./manifest.ts";
 import {
   architectureManifest,
   assertArchitectureManifestIntegrity,
-  STAGE_3_MODULES,
+  zeroBaselineScopesByWorkspace,
 } from "./manifest.ts";
 import type { ArchitectureDiagnostic } from "./model.ts";
 import { ARCHITECTURE_RULES } from "./model.ts";
@@ -36,10 +36,24 @@ export function analyzeArchitecture(
     packageName: workspace.packageName,
     root: path.resolve(repositoryRoot, workspace.root),
   }));
+  const activeEventDeliveryApiPackages = new Set([
+    ...manifest.workspaces
+      .filter((workspace) => workspace.eventDeliveryApis.length > 0)
+      .map((workspace) => workspace.packageName),
+    ...manifest.workspaces.flatMap((workspace) =>
+      workspace.eventDeliveryConsumers.map((registration) => registration.apiPackage),
+    ),
+  ]);
   for (const workspace of manifest.workspaces) {
     const workspaceProgram = programFactory(repositoryRoot, workspace);
     diagnostics.push(
-      ...analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program, packageRoots),
+      ...analyzeWorkspace(
+        workspace,
+        workspaceProgram.root,
+        workspaceProgram.program,
+        packageRoots,
+        activeEventDeliveryApiPackages,
+      ),
     );
   }
   return diagnostics;
@@ -116,7 +130,7 @@ async function main(): Promise<void> {
     boundaryValidationBaseline,
     failureFlowBaseline,
     migratedWorkspaceNames(manifest),
-    STAGE_3_MODULES,
+    zeroBaselineScopesByWorkspace(manifest),
   );
   for (const diagnostic of evaluated.diagnostics) printDiagnostic(diagnostic);
   if (evaluated.diagnostics.some((diagnostic) => diagnostic.severity === "error"))

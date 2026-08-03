@@ -1097,18 +1097,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-request-router%2Fcommon.ts%23getDiscordFlags%5BParameter%5D%401|sha256=adfdfd9a2043af3d93d16dd91de89ac125db41de511abb41b3506f9a3a60cf26",
-        identity: "src/surface/bridge/bus-request-router/common.ts#getDiscordFlags[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-request-router/common.ts",
-          line: 368,
-          column: 33,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fdiscord%2Fdiscord-adapter.ts%23discordNotFoundCode%5BParameter%5D%401|sha256=d65297edc05833bc180c5b1c28a4353f600b99f80dcc1c22aec25f3af145735f",
         identity: "src/surface/discord/discord-adapter.ts#discordNotFoundCode[Parameter]@1",
         location: {
@@ -1257,187 +1245,6 @@ export const boundaryValidationBaseline = {
           file: "src/github/github-app-token.ts",
           line: 31,
           column: 27,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23toMsgRefFromSurfaceMsgRef%5BParameter%5D%401|sha256=63618f1d325a55c5eda24bec3b8e64a3d05c0d6c11a331de5d65023e12ebf895",
-        identity: "src/surface/bridge/subscribe-from-bus.ts#toMsgRefFromSurfaceMsgRef[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 208,
-          column: 36,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=b11e2b4bcb4d3509158170339461f27ac045adb52accd1ff8a3ce04331a1339a",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 351,
-          column: 35,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%402|sha256=dcb2ad82a0d4410a9c5d2d69518315e6afeaffc63473ab76c5cce974067b1f90",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.<callback>.<callback>[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 417,
-          column: 17,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%403|sha256=68fb941c0e30b9906ab54ebaa1c294b6426dc0376f0b81293f09a7cc84b77a79",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.<callback>.<callback>[Parameter]@3",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 485,
-          column: 45,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%404|sha256=ae3589530ae4c7ceb7ed35c02db45a9bef7bc2f6b84ef6916057df64cc66f0cc",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.<callback>.<callback>[Parameter]@4",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 563,
-          column: 41,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.publishCreatedForToken.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=2b601b9fe33d4ebc6aba9c39d25c30ec7b9277ba9a77a5cfe1ddbf3247c99340",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.publishCreatedForToken.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 721,
-          column: 17,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.%3Ccallback%3E%5BParameter%5D%401|sha256=e1aae4fd83da49fbd8c1138ee8be55e19d55235fd4f8a4467a90b0b8a95fd66f",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 777,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.bumpTimeout.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=8a500991ca327516951b9993cbd2061c87bd0b5d055d9d5cda85d97e6755ebc0",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.bumpTimeout.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 882,
-          column: 37,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.bumpTimeout.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%402|sha256=e20e2816a8bc1c0e9bd367d17cb4e03ba21009cebf49a0db7841655f36b7d3ac",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.bumpTimeout.<callback>.<callback>[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 885,
-          column: 28,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.deleteCreatedOutputMessages.%3Ccallback%3E%5BParameter%5D%401|sha256=c331ba7653b151aec7ace58d59909387cc9b9196ce597192508d76d62e9d7f9e",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.deleteCreatedOutputMessages.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 903,
-          column: 45,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.%3Ccallback%3E.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=a85c5c656af191de349c6842c70cd1599aa9c48691e612363fc6034cd0bc0a4c",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.<callback>.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 1217,
-          column: 85,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.%3Ccallback%3E.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%402|sha256=fd6c1eda4f17b9fe6f711376545a63f9720a434e05282be027de1475cb02a3f3",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.<callback>.<callback>.<callback>[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 1283,
-          column: 85,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.%3Ccallback%3E.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%403|sha256=3ab514e1585b2c9f23fcfa735075541dbd8310c8f117e1f57309cf4a7c0c8ecb",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.<callback>.<callback>.<callback>[Parameter]@3",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 1356,
-          column: 83,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fsubscribe-from-bus.ts%23bridgeBusToAdapter.startRelay.cancel.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=c5e6ec19e9dd48fa42b1f599775273ec89bc9e082be7976943daf743e19939c4",
-        identity:
-          "src/surface/bridge/subscribe-from-bus.ts#bridgeBusToAdapter.startRelay.cancel.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/subscribe-from-bus.ts",
-          line: 1422,
-          column: 44,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -3089,58 +2896,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-request-router.ts%23startBusRequestRouter.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=68e1aa35625f2dff861823f9536b4df9fcecd206d6c69a5b30cdccc3793edf00",
-        identity:
-          "src/surface/bridge/bus-request-router.ts#startBusRequestRouter.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-request-router.ts",
-          line: 370,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-request-router.ts%23startBusRequestRouter.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%402|sha256=c507ce5ea2f7e2ac78334155802ee2cebb7cd928ff83f88afb047842ffd770f3",
-        identity:
-          "src/surface/bridge/bus-request-router.ts#startBusRequestRouter.<callback>.<callback>[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/bus-request-router.ts",
-          line: 583,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-request-router.ts%23startBusRequestRouter.bufferActiveChannelMessage.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=6352462a34d3e455ead0e68e9ecbefa3a9bd60a1db2f1a3cd77ac9483d741541",
-        identity:
-          "src/surface/bridge/bus-request-router.ts#startBusRequestRouter.bufferActiveChannelMessage.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-request-router.ts",
-          line: 1467,
-          column: 41,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-request-router.ts%23startBusRequestRouter.flushDebounce.%3Ccallback%3E%5BParameter%5D%401|sha256=6043585eb756592153b8501370afb525bbdc2dbede47b28de16e24c80ea9a6a9",
-        identity:
-          "src/surface/bridge/bus-request-router.ts#startBusRequestRouter.flushDebounce.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-request-router.ts",
-          line: 1499,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fshared%2Fagent-output-activity.ts%23createAgentOutputActivityPublisher%5BParameter%5D%401|sha256=9511de4673d09d3027e5b8960349beece21bc896612c6520a508ded7e81238f1",
         identity:
           "src/shared/agent-output-activity.ts#createAgentOutputActivityPublisher[Parameter]@1",
@@ -3187,19 +2942,6 @@ export const boundaryValidationBaseline = {
           file: "src/workflow/workflow-live-parent-bridge.ts",
           line: 670,
           column: 49,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-live-parent-bridge.ts%23WorkflowLiveParentBridge.stopChildActivity.%3Ccallback%3E.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=d1aa0ac4e397697348f56e4f33f0bcae7345e87beb3d75b201b1ff766a27246a",
-        identity:
-          "src/workflow/workflow-live-parent-bridge.ts#WorkflowLiveParentBridge.stopChildActivity.<callback>.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/workflow/workflow-live-parent-bridge.ts",
-          line: 787,
-          column: 44,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -3398,19 +3140,6 @@ export const boundaryValidationBaseline = {
           file: "src/surface/bridge/bus-agent-runner/raw.ts",
           line: 140,
           column: 50,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner%2Fraw.ts%23parseRequestControlFromRaw%5BParameter%5D%401|sha256=eca9bca0418701457e6920ab3bbe35e7c8b4357d9f1405007879bb92676173db",
-        identity:
-          "src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner/raw.ts",
-          line: 151,
-          column: 44,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -3710,214 +3439,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.onError%5BParameter%5D%401|sha256=3780ed3010a645b92397a780df48704ddf87fa88098672dd281971061ca68bdb",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.onError[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 2830,
-          column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.onError%5BParameter%5D%402|sha256=241c9bd14e6774a3d2ad20a591cdfef4676f363a520781ccd158d656d870fb3e",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.onError[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 2877,
-          column: 17,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.onTimeout.%3Ccallback%3E%5BParameter%5D%401|sha256=893946eed06db8172f3a46417a17b9e73439823c4753750bd826de2c283d398b",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.onTimeout.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 2902,
-          column: 24,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.buildModelBinding.reportToolStatus.%3Ccallback%3E%5BParameter%5D%401|sha256=101b3c6ed0486fc0ff650e5f657b56d1012b933dc7ef2f239c778e60ee2cde25",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.buildModelBinding.reportToolStatus.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 3661,
-          column: 62,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.turnErrorHandler%5BParameter%5D%401|sha256=1b917494c999d505e5772965b640950ead538b58d703eb14b0ac2b46e1bf88af",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.turnErrorHandler[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 3782,
-          column: 9,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.onServerCompactionError%5BParameter%5D%401|sha256=31edc9d3444514951956fa00b6e0cc7ae37a7a033de9fdd40412afab6b9b7135",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.onServerCompactionError[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 4257,
-          column: 37,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=6d241a3e28fd7b347e4ff7ad15aadcbb6a8c463d67186d52f68d1260f225df04",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 4905,
-          column: 23,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%402|sha256=0f0250feb63837d3a7252f87f846e1302ee4cc60edff4a2114d06d956844e93e",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>.<callback>[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5008,
-          column: 74,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%403|sha256=a555afdb1168477e11ddc42f2cd98c78e9104005abc035d58c3ebe8341086399",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>.<callback>[Parameter]@3",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5030,
-          column: 76,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%404|sha256=f4c79a54e10f997b61794ff661722ca095dab5a908e4017796a4b0214943fa46",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>.<callback>[Parameter]@4",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5069,
-          column: 23,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%405|sha256=506f23fcbc31de9286680ad4257d4aca1eddea4fc6c4cc392162b8bb2c7bc3af",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>.<callback>[Parameter]@5",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5150,
-          column: 21,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.onError%5BParameter%5D%403|sha256=27bf7b1902645f2ac2b1b58ffe6a6d0bc2f0f13ce057f52c5797240a421215e0",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.onError[Parameter]@3",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5215,
-          column: 38,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E%5BParameter%5D%401|sha256=d9a95f4b5794ecc972639a1819ad23e6cbac8dc1b8d70f75810c808ada1ee09d",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5775,
-          column: 78,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E%5BParameter%5D%401|sha256=72a51f39aa96b865b9a688dc525592ab2f4c16d9633ed5575de37358812a9bfc",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>[Parameter]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5849,
-          column: 61,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E%5BParameter%5D%402|sha256=51fea42dbd9764d7c15913819a8b64338b9ac6e958f90e3b7ba9a48721fae8e5",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>[Parameter]@2",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5856,
-          column: 63,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner.ts%23startBusAgentRunner.drainSessionQueue.%3Ccallback%3E%5BParameter%5D%403|sha256=c2c150cb2f4f4ff503d92bee080611c087f51d0c7b4ce686da3c0016637d2dcc",
-        identity:
-          "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner.drainSessionQueue.<callback>[Parameter]@3",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner.ts",
-          line: 5863,
-          column: 45,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-sandbox.ts%23errorFrom%5BParameter%5D%401|sha256=fc7d98e0794bf1260c3280f86dad8534e25e31eedfd54cda665ca75f26fe51e9",
         identity: "src/workflow/workflow-sandbox.ts#errorFrom[Parameter]@1",
         location: {
@@ -4005,19 +3526,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-engine.ts%23WorkflowEngine.start.%3Ccallback%3E.%3Ccallback%3E%5BParameter%5D%401|sha256=6e5c71cfea1e02f75514f2dce662b5f4a56aa0cb0c14936cf384f5725c8dfe7b",
-        identity:
-          "src/workflow/workflow-engine.ts#WorkflowEngine.start.<callback>.<callback>[Parameter]@1",
-        location: {
-          file: "src/workflow/workflow-engine.ts",
-          line: 224,
-          column: 38,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-engine.ts%23WorkflowEngine.claimAndLaunch.%3Ccallback%3E%5BParameter%5D%401|sha256=7dbf115feee4ed203efda6071c674371bf1d1e46374c08cfcc899f98c331de0a",
         identity:
           "src/workflow/workflow-engine.ts#WorkflowEngine.claimAndLaunch.<callback>[Parameter]@1",
@@ -4037,58 +3545,6 @@ export const boundaryValidationBaseline = {
           file: "src/workflow/workflow-waits.ts",
           line: 35,
           column: 27,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-wait-resolver.ts%23WorkflowWaitResolver.observeSubscription.%3Ccallback%3E%5BParameter%5D%401|sha256=352a5a3449f839d2aa982f7964dbca713ad3263c7c9a1e7594dca4af30de7a42",
-        identity:
-          "src/workflow/workflow-wait-resolver.ts#WorkflowWaitResolver.observeSubscription.<callback>[Parameter]@1",
-        location: {
-          file: "src/workflow/workflow-wait-resolver.ts",
-          line: 158,
-          column: 10,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-wait-resolver.ts%23WorkflowWaitResolver.observeSubscription.%3Ccallback%3E%5BParameter%5D%402|sha256=11ca2a270a3c811dc2ef2e8d32c6910ccd6528c16440073047564bf8cbb4e2ba",
-        identity:
-          "src/workflow/workflow-wait-resolver.ts#WorkflowWaitResolver.observeSubscription.<callback>[Parameter]@2",
-        location: {
-          file: "src/workflow/workflow-wait-resolver.ts",
-          line: 160,
-          column: 15,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-wait-resolver.ts%23WorkflowWaitResolver.handleSubscriptionTermination%5BParameter%5D%401|sha256=b9db69243bcdcbcc385a638ff05bbe11e7eaa74585e81ce9c1edd7b460923190",
-        identity:
-          "src/workflow/workflow-wait-resolver.ts#WorkflowWaitResolver.handleSubscriptionTermination[Parameter]@1",
-        location: {
-          file: "src/workflow/workflow-wait-resolver.ts",
-          line: 165,
-          column: 72,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-domain-unknown|identity=src%2Fworkflow%2Fworkflow-wait-resolver.ts%23WorkflowWaitResolver.handleSubscriptionTermination.%3Ccallback%3E%5BParameter%5D%401|sha256=3f55a79eaed20841c620f6d0016b4aef122f67795caf67dccbac822d83fa7a7c",
-        identity:
-          "src/workflow/workflow-wait-resolver.ts#WorkflowWaitResolver.handleSubscriptionTermination.<callback>[Parameter]@1",
-        location: {
-          file: "src/workflow/workflow-wait-resolver.ts",
-          line: 175,
-          column: 15,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -7930,19 +7386,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Ftool-server%2Frequest-message-cache.ts%23resolveAuthenticatedOrigin%5BCallExpression%5D%401|sha256=8dbe1818af603edaee3de2c40be6b34b5426701954d95fa6babf5b6795e34069",
-        identity:
-          "src/tool-server/request-message-cache.ts#resolveAuthenticatedOrigin[CallExpression]@1",
-        location: {
-          file: "src/tool-server/request-message-cache.ts",
-          line: 80,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fconversation%2Fthread-materializer-worker-isolate.ts%23%3Ccallback%3E%5BCallExpression%5D%401|sha256=36feb435222caaef4b2a4cdd70d8d66a80870268203e1a9a5bf8aaf80efe5828",
         identity:
           "src/conversation/thread-materializer-worker-isolate.ts#<callback>[CallExpression]@1",
@@ -8019,19 +7462,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner%2Fraw.ts%23parseRequestControlFromRaw%5BCallExpression%5D%401|sha256=41664070c02f2dd2cf1da7c91ccf1bf1b6fa0f000b4e597d30cc775dfcb1ff9a",
-        identity:
-          "src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw[CallExpression]@1",
-        location: {
-          file: "src/surface/bridge/bus-agent-runner/raw.ts",
-          line: 152,
-          column: 18,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fsurface%2Fbridge%2Fbus-agent-runner%2Fraw.ts%23parseSubagentMetaFromRaw%5BCallExpression%5D%401|sha256=3101702a13f6396c8eb36b3cef104b122083c3aba1af79cfe656bfaee63f2ff3",
         identity:
           "src/surface/bridge/bus-agent-runner/raw.ts#parseSubagentMetaFromRaw[CallExpression]@1",
@@ -8065,45 +7495,6 @@ export const boundaryValidationBaseline = {
           file: "src/surface/bridge/bus-agent-runner.ts",
           line: 1359,
           column: 23,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fworkflow-action-resolver.ts%23startWorkflowActionResolver.drainOutbox%5BCallExpression%5D%401|sha256=940bd4f9b0a3d0d2e5cedce0ff9c56cfc81a23b45268d5ec85d6c5dbfdc7f543",
-        identity:
-          "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.drainOutbox[CallExpression]@1",
-        location: {
-          file: "src/workflow/workflow-action-resolver.ts",
-          line: 56,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fworkflow-action-resolver.ts%23startWorkflowActionResolver.drainOutbox%5BCallExpression%5D%401|sha256=87881e960cdc260bee30db84c3c830fe285ec6fcf10e3ae503d20822f2583c12",
-        identity:
-          "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.drainOutbox[CallExpression]@1",
-        location: {
-          file: "src/workflow/workflow-action-resolver.ts",
-          line: 62,
-          column: 15,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=apps%2Fcore|rule=architecture%2Fno-unregistered-decoder|identity=src%2Fworkflow%2Fworkflow-action-resolver.ts%23startWorkflowActionResolver.%3Ccallback%3E%5BCallExpression%5D%401|sha256=5c5e62eb0ebdde7329d1fea148a445f198b9c31da5db83b969c2ac0503730597",
-        identity:
-          "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.<callback>[CallExpression]@1",
-        location: {
-          file: "src/workflow/workflow-action-resolver.ts",
-          line: 108,
-          column: 21,
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
@@ -11103,30 +10494,6 @@ export const boundaryValidationBaseline = {
       },
       {
         fingerprint:
-          "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-domain-unknown|identity=redis-streams-bus.ts%23toRecord%5BParameter%5D%401|sha256=18c3af71c86371fe9d0f860a2a6e656ddb0341d63bc31febe2ffd5448ca56eea",
-        identity: "redis-streams-bus.ts#toRecord[Parameter]@1",
-        location: {
-          file: "redis-streams-bus.ts",
-          line: 149,
-          column: 19,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-domain-unknown|identity=redis-streams-bus.ts%23decodeMessage%5BParameter%5D%401|sha256=6a187dc496d2055b54ac9c825a4c44c24d81c4f20516fe5c3e47d202095c7469",
-        identity: "redis-streams-bus.ts#decodeMessage[Parameter]@1",
-        location: {
-          file: "redis-streams-bus.ts",
-          line: 172,
-          column: 50,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
           "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-domain-unknown|identity=redis-streams-bus.ts%23RedisStreamsBus.startAcknowledgedTrim.%3Ccallback%3E%5BParameter%5D%401|sha256=2808c6dad864330d3ba1d2b2715780412db481e70792d6f08a53e2ea6cbfe5ec",
         identity:
           "redis-streams-bus.ts#RedisStreamsBus.startAcknowledgedTrim.<callback>[Parameter]@1",
@@ -11134,18 +10501,6 @@ export const boundaryValidationBaseline = {
           file: "redis-streams-bus.ts",
           line: 369,
           column: 77,
-        },
-        reason:
-          "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-domain-unknown|identity=lilac-spec.ts%23parseCmdRequestMessageData%5BParameter%5D%401|sha256=eaa61175b3eec488c21f77984ce43eaaf9ceb70c44d3dca1650bcce7f22fc6f7",
-        identity: "lilac-spec.ts#parseCmdRequestMessageData[Parameter]@1",
-        location: {
-          file: "lilac-spec.ts",
-          line: 122,
-          column: 44,
         },
         reason:
           "Existing domain-bearing unknown parameter awaiting boundary decoding or an opaque-value exception.",
@@ -11211,42 +10566,6 @@ export const boundaryValidationBaseline = {
         },
         reason:
           "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-unregistered-decoder|identity=lilac-spec.ts%23parseCmdRequestMessageData%5BCallExpression%5D%401|sha256=ab2f626c33116aef74ff93a5ae0106b754c03266ca4b96765ee3ccc9b2477ad9",
-        identity: "lilac-spec.ts#parseCmdRequestMessageData[CallExpression]@1",
-        location: {
-          file: "lilac-spec.ts",
-          line: 123,
-          column: 16,
-        },
-        reason:
-          "Existing boundary validation call awaiting explicit decoder ownership registration.",
-      },
-    ],
-    "architecture/no-unknown-assertion": [
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-unknown-assertion|identity=lilac-bus.ts%23createLilacBus.subscribeType%5BAsExpression%5D%401|sha256=b1f5f2549b900d2c3c32634cf935b6624bd2018d82714c24410d1b6a6502845e",
-        identity: "lilac-bus.ts#createLilacBus.subscribeType[AsExpression]@1",
-        location: {
-          file: "lilac-bus.ts",
-          line: 323,
-          column: 12,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
-      },
-      {
-        fingerprint:
-          "arch-v2|workspace=packages%2Fevent-bus|rule=architecture%2Fno-unknown-assertion|identity=lilac-bus.ts%23createLilacBus.fetchTopic%5BAsExpression%5D%401|sha256=de7f6d1c1bd7479c1bddeaec2be66f863f3c8d78ef444d205230b14d91f50f0d",
-        identity: "lilac-bus.ts#createLilacBus.fetchTopic[AsExpression]@1",
-        location: {
-          file: "lilac-bus.ts",
-          line: 341,
-          column: 19,
-        },
-        reason: "Existing structured assertion from unknown awaiting complete runtime validation.",
       },
     ],
   },

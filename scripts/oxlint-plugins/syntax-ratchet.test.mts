@@ -105,12 +105,36 @@ describe("repository syntax ratchet", () => {
       [finding()],
       baseline,
       new Set(),
-      new Map([["apps/example", ["src/first"]]]),
+      new Map([["apps/example", [{ module: "src/first" }]]]),
     );
 
     expect(evaluation.matched).toBe(0);
     expect(evaluation.diagnostics).toHaveLength(2);
     expect(evaluation.diagnostics.every((item) => item.severity === "error")).toBe(true);
-    expect(evaluation.diagnostics[0]?.message).toContain("modules");
+    expect(evaluation.diagnostics[0]?.message).toContain("scopes");
+  });
+
+  it("owns exact and descendant symbols without colliding with sibling names", () => {
+    const baseline: SyntaxBaseline = {
+      "apps/example": {
+        "lilac/no-exception-flow": [
+          entry(),
+          entry({ symbol: "run.child" }),
+          entry({ symbol: "runner" }),
+        ],
+      },
+    };
+    const evaluation = evaluateSyntaxRatchet(
+      [],
+      baseline,
+      new Set(),
+      new Map([["apps/example", [{ module: "src/first.ts", symbol: "run" }]]]),
+    );
+
+    expect(evaluation.diagnostics.map((item) => [item.entry.symbol, item.severity])).toEqual([
+      ["run", "error"],
+      ["run.child", "error"],
+      ["runner", "warning"],
+    ]);
   });
 });

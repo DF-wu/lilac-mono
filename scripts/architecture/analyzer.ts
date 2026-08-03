@@ -3,7 +3,15 @@ import path from "node:path";
 import ts from "typescript-codegen";
 
 import { createFingerprint, createFingerprintIdentity, relativeModulePath } from "./fingerprint.ts";
-import type { CompatibilitySink, SymbolIdentity, WorkspaceArchitecture } from "./manifest.ts";
+import type {
+  CompatibilitySink,
+  EventCodecRegistryRegistration,
+  EventDeliveryApiRegistration,
+  EventDeliveryConsumerRegistration,
+  RawEventMessageBoundaryRegistration,
+  SymbolIdentity,
+  WorkspaceArchitecture,
+} from "./manifest.ts";
 import { ARCHITECTURE_RULES, type ArchitectureDiagnostic, type ArchitectureRule } from "./model.ts";
 import { isProductionFileName } from "./source-policy.ts";
 
@@ -2580,6 +2588,713 @@ function functionHasImplementation(node: ts.SignatureDeclaration): boolean {
   return false;
 }
 
+function isCallableImplementation(node: ts.Node): node is ts.SignatureDeclaration {
+  return (
+    (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) &&
+    functionHasImplementation(node)
+  );
+}
+
+function isNamedCallableDeclaration(node: ts.Node): node is ts.SignatureDeclaration {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    (ts.isMethodSignature(node) && ts.isInterfaceDeclaration(node.parent))
+  );
+}
+
+function registeredNodes<T extends ts.Node>(
+  identity: SymbolIdentity,
+  workspaceRoot: string,
+  program: ts.Program,
+  predicate: (node: ts.Node) => node is T,
+): readonly T[] {
+  const sourceFile = program
+    .getSourceFiles()
+    .find(
+      (candidate) =>
+        !candidate.isDeclarationFile &&
+        relativeModulePath(workspaceRoot, candidate) === identity.module,
+    );
+  if (!sourceFile) return [];
+  const matches: T[] = [];
+  const visit = (node: ts.Node): void => {
+    if (predicate(node)) {
+      const variableMatch =
+        ts.isVariableDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        relativeModulePath(workspaceRoot, node.getSourceFile()) === identity.module &&
+        node.name.text === identity.exportName;
+      const nestedFunctionType = ts.isFunctionTypeNode(node) && ts.isParameter(node.parent);
+      if (
+        variableMatch ||
+        (!nestedFunctionType && identityMatches(identity, nodeIdentity(node, workspaceRoot)))
+      ) {
+        matches.push(node);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return matches;
+}
+
+function requireOneRegisteredNode<T extends ts.Node>(
+  description: string,
+  identity: SymbolIdentity,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  predicate: (node: ts.Node) => node is T,
+): T {
+  const matches = registeredNodes(identity, workspaceRoot, program, predicate);
+  if (matches.length !== 1) {
+    throw new Error(
+      `${description} ${workspace.name}/${identity.module}#${identity.exportName} must resolve to exactly one declaration; found ${matches.length}.`,
+    );
+  }
+  return matches[0]!;
+}
+
+function isObjectRegistryDeclaration(node: ts.Node): node is ts.VariableDeclaration {
+  return ts.isVariableDeclaration(node) && node.initializer !== undefined;
+}
+
+function objectLiteralInitializer(
+  declaration: ts.VariableDeclaration,
+): ts.ObjectLiteralExpression | undefined {
+  if (!declaration.initializer) return undefined;
+  const initializer = unwrapExpression(declaration.initializer);
+  return ts.isObjectLiteralExpression(initializer) ? initializer : undefined;
+}
+
+function propertyStringValue(
+  property: ts.ObjectLiteralElementLike,
+  checker: ts.TypeChecker,
+): string | undefined {
+  const name = property.name;
+  if (!name) return undefined;
+  if (ts.isStringLiteralLike(name)) return name.text;
+  if (ts.isComputedPropertyName(name)) {
+    const type = checker.getTypeAtLocation(name.expression);
+    return (type.flags & ts.TypeFlags.StringLiteral) !== 0
+      ? (type as ts.StringLiteralType).value
+      : undefined;
+  }
+  return undefined;
+}
+
+function canonicalEventValues(declaration: ts.VariableDeclaration): readonly string[] | undefined {
+  const object = objectLiteralInitializer(declaration);
+  if (!object) return undefined;
+  const values: string[] = [];
+  for (const property of object.properties) {
+    if (!ts.isPropertyAssignment(property)) return undefined;
+    const initializer = unwrapExpression(property.initializer);
+    if (!ts.isStringLiteralLike(initializer)) return undefined;
+    values.push(initializer.text);
+  }
+  return values;
+}
+
+function codecRegistryValues(
+  declaration: ts.VariableDeclaration,
+  checker: ts.TypeChecker,
+): readonly string[] | undefined {
+  const object = objectLiteralInitializer(declaration);
+  if (!object) return undefined;
+  const values: string[] = [];
+  for (const property of object.properties) {
+    if (ts.isSpreadAssignment(property)) return undefined;
+    const value = propertyStringValue(property, checker);
+    if (value === undefined) return undefined;
+    values.push(value);
+  }
+  return values;
+}
+
+function setDifference(left: ReadonlySet<string>, right: ReadonlySet<string>): readonly string[] {
+  return [...left].filter((value) => !right.has(value)).sort();
+}
+
+function analyzeEventCodecRegistry(
+  registration: EventCodecRegistryRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const registry = requireOneRegisteredNode(
+    "Event codec registry",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isObjectRegistryDeclaration,
+  );
+  const canonical = requireOneRegisteredNode(
+    "Canonical event catalog",
+    registration.canonicalEvents,
+    workspace,
+    workspaceRoot,
+    program,
+    isObjectRegistryDeclaration,
+  );
+  const declaredCanonical = new Set(registration.canonicalMembers);
+  const sourceCanonicalValues = canonicalEventValues(canonical);
+  const registryValues = codecRegistryValues(registry, checker);
+  const sourceCanonical = new Set(sourceCanonicalValues ?? []);
+  const sourceRegistry = new Set(registryValues ?? []);
+  const malformed = sourceCanonicalValues === undefined || registryValues === undefined;
+  const catalogMissing = setDifference(declaredCanonical, sourceCanonical);
+  const catalogExtra = setDifference(sourceCanonical, declaredCanonical);
+  const codecMissing = setDifference(declaredCanonical, sourceRegistry);
+  const codecExtra = setDifference(sourceRegistry, declaredCanonical);
+  if (
+    !malformed &&
+    catalogMissing.length === 0 &&
+    catalogExtra.length === 0 &&
+    codecMissing.length === 0 &&
+    codecExtra.length === 0 &&
+    sourceRegistry.size === registryValues?.length
+  ) {
+    return;
+  }
+  const details = [
+    malformed
+      ? "catalog and registry must be explicit object literals with statically named members"
+      : undefined,
+    catalogMissing.length ? `catalog missing ${catalogMissing.join(", ")}` : undefined,
+    catalogExtra.length ? `catalog has undeclared ${catalogExtra.join(", ")}` : undefined,
+    codecMissing.length ? `codecs missing ${codecMissing.join(", ")}` : undefined,
+    codecExtra.length ? `codecs contain noncanonical ${codecExtra.join(", ")}` : undefined,
+    registryValues && sourceRegistry.size !== registryValues.length
+      ? "codec registry contains duplicate canonical keys"
+      : undefined,
+  ].filter((detail): detail is string => detail !== undefined);
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/complete-event-codec-registry",
+      registry,
+      `Registered event codec registry is incomplete: ${details.join("; ")}.`,
+      "Keep the canonical event catalog and codec registry as exact, exhaustive one-to-one maps.",
+    ),
+  );
+}
+
+function messageTypeIsUnknown(
+  type: ts.Type,
+  registration: RawEventMessageBoundaryRegistration,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const direct = typeIsPackageType(
+    type,
+    registration.messageType.package,
+    new Set([registration.messageType.exportName]),
+    packageRoots,
+  );
+  const argument = type.aliasTypeArguments?.[0];
+  if (direct) return argument !== undefined && isUnknown(argument);
+  return (
+    type.isUnion() &&
+    type.types.some((member) => messageTypeIsUnknown(member, registration, packageRoots))
+  );
+}
+
+function messageTypeContainsSpecialization(
+  type: ts.Type,
+  registration: RawEventMessageBoundaryRegistration,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const direct = typeIsPackageType(
+    type,
+    registration.messageType.package,
+    new Set([registration.messageType.exportName]),
+    packageRoots,
+  );
+  if (direct) {
+    const argument = type.aliasTypeArguments?.[0];
+    return argument === undefined || !isUnknown(argument);
+  }
+  return (
+    type.isUnion() &&
+    type.types.some((member) =>
+      messageTypeContainsSpecialization(member, registration, packageRoots),
+    )
+  );
+}
+
+function typeNodeSpecializesMessage(
+  node: ts.TypeNode,
+  registration: RawEventMessageBoundaryRegistration,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (!ts.isTypeReferenceNode(node) || node.typeArguments?.length !== 1) return false;
+  const type = checker.getTypeFromTypeNode(node);
+  if (
+    !typeIsPackageType(
+      type,
+      registration.messageType.package,
+      new Set([registration.messageType.exportName]),
+      packageRoots,
+    )
+  ) {
+    return false;
+  }
+  return node.typeArguments[0]?.kind !== ts.SyntaxKind.UnknownKeyword;
+}
+
+function analyzeRawEventMessageBoundary(
+  registration: RawEventMessageBoundaryRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const declaration = requireOneRegisteredNode(
+    "Raw event message boundary",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isNamedCallableDeclaration,
+  );
+  const handler = declaration.parameters[registration.handlerParameter];
+  const handlerSignature = handler
+    ? checker.getSignaturesOfType(checker.getTypeAtLocation(handler), ts.SignatureKind.Call)[0]
+    : undefined;
+  const message = handlerSignature?.parameters[registration.messageParameter];
+  const messageDeclaration = message?.valueDeclaration ?? message?.declarations?.[0];
+  const messageType = messageDeclaration
+    ? checker.getTypeOfSymbolAtLocation(message!, messageDeclaration)
+    : undefined;
+  const context = handlerSignature?.parameters[registration.contextParameter];
+  const contextDeclaration = context?.valueDeclaration ?? context?.declarations?.[0];
+  const contextType = contextDeclaration
+    ? checker.getTypeOfSymbolAtLocation(context!, contextDeclaration)
+    : undefined;
+  const failures = [
+    declaration.typeParameters?.length ? "raw receive API is generic" : undefined,
+    contextType && !checker.getPropertyOfType(contextType, "commit")
+      ? undefined
+      : "raw handler context exposes commit",
+  ].filter((failure): failure is string => failure !== undefined);
+  if (
+    !messageType ||
+    !messageTypeIsUnknown(messageType, registration, packageRoots) ||
+    messageTypeContainsSpecialization(messageType, registration, packageRoots)
+  ) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/raw-event-message-boundary",
+        handler ?? declaration,
+        `Raw event boundary ${registration.identity.exportName} does not receive the registered Message<unknown> type.`,
+        "Expose decoded transport messages as Message<unknown>; specialize payloads only after codec validation.",
+      ),
+    );
+  }
+  if (failures.length > 0) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/raw-event-message-boundary",
+        handler ?? declaration,
+        `Raw event boundary ${registration.identity.exportName} is invalid: ${failures.join("; ")}.`,
+        "Use a non-generic Message<unknown> receive boundary with transport-owned acknowledgement.",
+      ),
+    );
+  }
+  const container = declaration.parent;
+  if (ts.isInterfaceDeclaration(container) || ts.isClassDeclaration(container)) {
+    const legacy = container.members.find((member) => {
+      if (!ts.isMethodSignature(member) && !ts.isMethodDeclaration(member)) return false;
+      const name = member.name;
+      return (
+        (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) && name.text === "subscribeDelivery"
+      );
+    });
+    if (legacy) {
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/raw-event-message-boundary",
+          legacy,
+          `Legacy raw event delivery API ${legacy.name?.getText() ?? "<unknown>"} remains declared beside the enforced receive boundary.`,
+          "Remove legacy raw subscription aliases and keep one non-generic transport-owned delivery API.",
+        ),
+      );
+    }
+  }
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) &&
+      typeNodeSpecializesMessage(node.type, registration, checker, packageRoots)
+    ) {
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/raw-event-message-boundary",
+          node,
+          `Raw event boundary ${registration.identity.exportName} specializes a message through an assertion.`,
+          "Keep Message<unknown> through the raw receive boundary and invoke a registered codec before specialization.",
+        ),
+      );
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(declaration);
+}
+
+function isTypedHandlerResult(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const symbolName = type.aliasSymbol?.getName() ?? type.getSymbol()?.getName();
+  if (symbolName !== "Promise") return false;
+  const result = typeArguments(type, checker)[0];
+  if (!result || !isDirectResultType(result, packageRoots)) return false;
+  const resultArguments = result.aliasTypeArguments ?? typeArguments(result, checker);
+  const success = resultArguments[0];
+  const error = resultArguments[1];
+  return Boolean(
+    success &&
+    (success.flags & ts.TypeFlags.Void) !== 0 &&
+    error &&
+    (error.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) === 0,
+  );
+}
+
+function analyzeEventDeliveryHandler(
+  registration: EventDeliveryApiRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): ts.SignatureDeclaration {
+  const declaration = requireOneRegisteredNode(
+    "Event delivery API",
+    registration.identity,
+    workspace,
+    workspaceRoot,
+    program,
+    isNamedCallableDeclaration,
+  );
+  const handler = declaration.parameters[registration.handlerParameter];
+  const handlerSignature = handler
+    ? checker.getSignaturesOfType(checker.getTypeAtLocation(handler), ts.SignatureKind.Call)[0]
+    : undefined;
+  const returnType = handlerSignature?.getReturnType();
+  const context = handlerSignature?.parameters[registration.handlerContextParameter];
+  const contextDeclaration = context?.valueDeclaration ?? context?.declarations?.[0];
+  const contextType = contextDeclaration
+    ? checker.getTypeOfSymbolAtLocation(context!, contextDeclaration)
+    : undefined;
+  const failures = [
+    returnType && isTypedHandlerResult(returnType, checker, packageRoots)
+      ? undefined
+      : "handler does not return Promise<Result<void, E>> with a typed error",
+    contextType && !checker.getPropertyOfType(contextType, "commit")
+      ? undefined
+      : "handler context exposes commit",
+    handlerSignature?.parameters[registration.handlerMessageParameter]
+      ? undefined
+      : "registered handler message parameter does not exist",
+  ].filter((failure): failure is string => failure !== undefined);
+  if (failures.length > 0) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/event-handler-result",
+        handler ?? declaration,
+        `Event delivery API ${registration.identity.exportName} is invalid: ${failures.join("; ")}.`,
+        "Use a decoded-message handler returning Promise<Result<void, E>> and keep acknowledgement out of handler context.",
+      ),
+    );
+  }
+  const container = declaration.parent;
+  if (ts.isInterfaceDeclaration(container) || ts.isClassDeclaration(container)) {
+    const forbidden = new Set(["subscribeTopicResult", "fetchTopicResult", "subscribeType"]);
+    const legacy = container.members.find((member) => {
+      if (!ts.isMethodSignature(member) && !ts.isMethodDeclaration(member)) return false;
+      const name = member.name;
+      return (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) && forbidden.has(name.text);
+    });
+    if (legacy) {
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/event-handler-result",
+          legacy,
+          `Legacy event delivery API ${legacy.name?.getText() ?? "<unknown>"} remains declared beside the enforced Result API.`,
+          "Remove legacy handler-owned or pre-final Result API aliases instead of preserving compatibility shims.",
+        ),
+      );
+    }
+  }
+  return declaration;
+}
+
+function switchUsesParameter(
+  node: ts.SwitchStatement,
+  parameter: ts.ParameterDeclaration,
+  checker: ts.TypeChecker,
+): boolean {
+  if (!ts.isIdentifier(parameter.name)) return false;
+  if (expressionDerivesFromSwitch(node.expression, parameter.name, checker)) return true;
+  const selected = selectedProperty(node.expression);
+  return Boolean(
+    selected && expressionDerivesFromSwitch(selected.receiver, parameter.name, checker),
+  );
+}
+
+function deliveryPolicySwitchIssue(
+  node: ts.SwitchStatement,
+  parameter: ts.ParameterDeclaration,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): string | undefined {
+  const parameterType = checker.getTypeAtLocation(parameter);
+  const domain =
+    switchDomain(node, checker, packageRoots) ??
+    literalDomain(
+      checker.getTypeAtLocation(node.expression),
+      checker,
+      packageRoots,
+      parameterType,
+      typeIsProjectOwned(parameterType, checker, packageRoots),
+    );
+  if (!domain) return "delivery error is not a project-owned closed union";
+  const handled = new Set<string>();
+  let defaultClause: ts.DefaultClause | undefined;
+  for (const clause of node.caseBlock.clauses) {
+    if (ts.isDefaultClause(clause)) {
+      defaultClause = clause;
+      continue;
+    }
+    const key = literalKey(checker.getTypeAtLocation(clause.expression), checker);
+    if (key) handled.add(key[0]);
+  }
+  const missing = [...domain.keys]
+    .filter(([key]) => !handled.has(key))
+    .map(([, display]) => display);
+  if (missing.length > 0) return `missing ${missing.join(", ")}`;
+  if (defaultClause && !defaultContainsNeverSink(defaultClause, node.expression, checker)) {
+    return "uses a silent default";
+  }
+  return undefined;
+}
+
+function analyzeEventDeliveryPolicy(
+  registration: EventDeliveryApiRegistration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const policy = requireOneRegisteredNode(
+    "Event delivery policy",
+    registration.deliveryPolicy,
+    workspace,
+    workspaceRoot,
+    program,
+    isNamedCallableDeclaration,
+  );
+  const error = policy.parameters[registration.deliveryErrorParameter];
+  const switches: ts.SwitchStatement[] = [];
+  const visit = (node: ts.Node): void => {
+    if (node !== policy && ts.isFunctionLike(node)) return;
+    if (error && ts.isSwitchStatement(node) && switchUsesParameter(node, error, checker)) {
+      switches.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(policy);
+  const issues = switches.map((node) =>
+    deliveryPolicySwitchIssue(node, error!, checker, packageRoots),
+  );
+  if (switches.length > 0 && issues.every((issue) => issue === undefined)) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/event-delivery-policy-exhaustiveness",
+      switches.find((_node, index) => issues[index] !== undefined) ?? error ?? policy,
+      `Event delivery policy ${registration.deliveryPolicy.exportName} is not exhaustive: ${issues.find((issue) => issue !== undefined) ?? "no switch over the registered error parameter"}.`,
+      "Map every delivery error variant explicitly to commit, park-pending, dead-letter, or stop without a silent default.",
+    ),
+  );
+}
+
+function assertEventDeliveryConsumersResolve(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  activeEventDeliveryApiPackages: ReadonlySet<string>,
+): void {
+  for (const registration of workspace.eventDeliveryConsumers) {
+    const owner = requireOneRegisteredNode(
+      "Event delivery consumer",
+      registration.identity,
+      workspace,
+      workspaceRoot,
+      program,
+      isCallableImplementation,
+    );
+    const actual = new Set<EventDeliveryConsumerRegistration["operations"][number]>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const operation = expressionName(node.expression);
+        if (operation === "subscribeTopic" || operation === "fetchTopic") {
+          const signature = checker.getResolvedSignature(node);
+          if (packageForSignature(signature, packageRoots) === registration.apiPackage) {
+            actual.add(operation);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(owner);
+    const missing = registration.operations.filter((operation) => !actual.has(operation));
+    const undeclared = [...actual].filter(
+      (operation) => !registration.operations.includes(operation),
+    );
+    if (missing.length > 0 || undeclared.length > 0) {
+      throw new Error(
+        `Event delivery consumer ${workspace.name}/${registration.identity.module}#${registration.identity.exportName} operation registration drifted; missing ${missing.join(", ") || "none"}; undeclared ${undeclared.join(", ") || "none"}.`,
+      );
+    }
+  }
+  if (activeEventDeliveryApiPackages.size === 0) return;
+  for (const sourceFile of program.getSourceFiles()) {
+    if (!isProductionSource(sourceFile, workspaceRoot)) continue;
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const operation = expressionName(node.expression);
+        if (operation === "subscribeTopic" || operation === "fetchTopic") {
+          const signature = checker.getResolvedSignature(node);
+          const apiPackage = packageForSignature(signature, packageRoots);
+          if (apiPackage && activeEventDeliveryApiPackages.has(apiPackage)) {
+            const identity = nodeIdentity(node, workspaceRoot);
+            const registered = workspace.eventDeliveryConsumers.some(
+              (registration) =>
+                registration.apiPackage === apiPackage &&
+                registration.operations.includes(operation) &&
+                identityOwns(registration.identity, identity),
+            );
+            if (!registered) {
+              throw new Error(
+                `Unregistered event delivery consumer in ${workspace.name}: ${identity.module}#${identity.symbolPath} calls ${apiPackage}#${operation}.`,
+              );
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+  }
+}
+
+function analyzeRegisteredEventInfrastructure(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  for (const registration of workspace.eventCodecRegistries) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(
+        workspace,
+        "architecture/complete-event-codec-registry",
+        registration.identity.module,
+      )
+    ) {
+      analyzeEventCodecRegistry(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.rawEventMessageBoundaries) {
+    if (
+      registration.status === "enforced" &&
+      ruleApplies(
+        workspace,
+        "architecture/raw-event-message-boundary",
+        registration.identity.module,
+      )
+    ) {
+      analyzeRawEventMessageBoundary(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+  for (const registration of workspace.eventDeliveryApis) {
+    if (registration.status !== "enforced") continue;
+    if (ruleApplies(workspace, "architecture/event-handler-result", registration.identity.module)) {
+      analyzeEventDeliveryHandler(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+    if (
+      ruleApplies(
+        workspace,
+        "architecture/event-delivery-policy-exhaustiveness",
+        registration.deliveryPolicy.module,
+      )
+    ) {
+      analyzeEventDeliveryPolicy(
+        registration,
+        checker,
+        workspace,
+        workspaceRoot,
+        program,
+        packageRoots,
+        diagnostics,
+      );
+    }
+  }
+}
+
 function assertOpenProtocolAdaptersResolve(
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
@@ -2738,10 +3453,29 @@ export function analyzeWorkspace(
   packageRoots: readonly WorkspacePackageRoot[] = [
     { packageName: workspace.packageName, root: workspaceRoot },
   ],
+  activeEventDeliveryApiPackages: ReadonlySet<string> = new Set(
+    workspace.eventDeliveryConsumers.map((registration) => registration.apiPackage),
+  ),
 ): readonly ArchitectureDiagnostic[] {
   assertOpenProtocolAdaptersResolve(workspace, workspaceRoot, program);
   const checker = program.getTypeChecker();
   const diagnostics: ArchitectureDiagnostic[] = [];
+  assertEventDeliveryConsumersResolve(
+    workspace,
+    workspaceRoot,
+    program,
+    checker,
+    packageRoots,
+    activeEventDeliveryApiPackages,
+  );
+  analyzeRegisteredEventInfrastructure(
+    workspace,
+    workspaceRoot,
+    program,
+    checker,
+    packageRoots,
+    diagnostics,
+  );
   const reportedPredicates = new Set<string>();
   const reportedContracts = new Set<string>();
   const reportedMaps = new Set<string>();

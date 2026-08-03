@@ -1,12 +1,28 @@
 import { describe, expect, it } from "bun:test";
 
-import { Panic, Result } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import { CustomCommandDirectoryReadError } from "@stanley2058/lilac-utils";
+import {
+  EventDeliveryTransportFailed,
+  RedisEventDeadLetter,
+  type EventDeliveryDoneError,
+} from "@stanley2058/lilac-event-bus";
+import Redis from "ioredis";
 
 import { CustomCommandManager } from "../../src/custom-commands/manager";
 import {
+  adaptCoreEventBusCleanupResultToHost,
+  adaptCoreEventBusSetupResultToStartup,
   adaptCustomCommandInitializationResultToStartup,
+  captureCoreEventBusCleanup,
+  CoreEventBusCleanupFailed,
+  CoreEventBusSetupFailed,
+  createCoreEventBusDeliveryOptions,
+  createCoreEventBusFatalReporter,
+  createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
+  createCoreRuntimeFatalReporter,
+  superviseCoreRouterDone,
 } from "../../src/runtime/create-core-runtime";
 
 describe("Core runtime startup", () => {
@@ -123,5 +139,230 @@ describe("Core runtime startup", () => {
       cleanup.finish();
       throw startupPanic;
     }).toThrow(startupPanic);
+  });
+});
+
+describe("Core runtime event delivery", () => {
+  it("adapts setup and cleanup Results only at their exact runtime host boundaries", () => {
+    const setupError = new CoreEventBusSetupFailed({
+      operation: "ping-redis",
+      cause: new Error("unavailable"),
+      message: "Core event bus setup failed during ping-redis",
+    });
+    const cleanupError = new CoreEventBusCleanupFailed({
+      cause: new Error("close failed"),
+      message: "Core event bus cleanup failed",
+    });
+
+    expect(() => adaptCoreEventBusSetupResultToStartup(Result.err(setupError))).toThrow(
+      setupError.message,
+    );
+    expect(() => adaptCoreEventBusCleanupResultToHost(Result.err(cleanupError))).toThrow(
+      cleanupError.message,
+    );
+  });
+
+  it("captures ordinary owned Redis cleanup failure and preserves cleanup Panic identity", async () => {
+    const redis = new Redis({ lazyConnect: true });
+    const cleanupError = new Error("redis close failed");
+    Reflect.set(redis, "quit", async () => {
+      throw cleanupError;
+    });
+
+    try {
+      const captured = await captureCoreEventBusCleanup({ redis, raw: null, bus: null });
+      expect(captured.status).toBe("error");
+      if (captured.status === "error") expect(captured.error.cause).toBe(cleanupError);
+
+      const panic = new Panic({ message: "redis cleanup invariant failed" });
+      Reflect.set(redis, "quit", async () => {
+        throw panic;
+      });
+      await expect(captureCoreEventBusCleanup({ redis, raw: null, bus: null })).rejects.toBe(panic);
+    } finally {
+      redis.disconnect();
+    }
+  });
+
+  it("wires the owned Redis client, redacted logger, and fatal reporter", () => {
+    const redis = new Redis({ lazyConnect: true });
+    const reported: Error[] = [];
+    const logs: unknown[] = [];
+
+    try {
+      const options = createCoreEventBusDeliveryOptions({
+        redis,
+        deadLetterEncryptionKey: Buffer.alloc(32, 0x42),
+        logger: {
+          warn: (...args) => logs.push(args),
+          error: (...args) => logs.push(args),
+        },
+        reportFatalError: (error) => reported.push(error),
+      });
+
+      expect(options.deadLetter).toBeInstanceOf(RedisEventDeadLetter);
+      expect(Reflect.get(options.deadLetter!, "redis")).toBe(redis);
+      expect(options.logger).toBeDefined();
+      expect(options.reportFatal).toBeDefined();
+
+      const panic = new Panic({ message: "delivery invariant failed" });
+      options.reportFatal!.report(panic, {
+        topic: "cmd.request",
+        cursor: "1-0",
+        phase: "handler",
+      });
+      expect(reported).toEqual([panic]);
+    } finally {
+      redis.disconnect();
+    }
+  });
+
+  it("forwards only payload-redacted event delivery metadata", () => {
+    const secret = "event-payload-secret";
+    const logs: Array<{ event: unknown; context: unknown }> = [];
+    const logger = createCoreEventBusLogger({
+      warn: (event, context) => logs.push({ event, context }),
+      error: (event, context) => logs.push({ event, context }),
+    });
+
+    logger.warn("event_bus.contract_invalid", {
+      topic: "cmd.request",
+      cursor: "1-0",
+      source: "contract",
+      stage: "payload",
+      eventType: "cmd.request.message",
+      payload: secret,
+      evidence: secret,
+    });
+
+    expect(logs).toEqual([
+      {
+        event: "event_bus.contract_invalid",
+        context: {
+          topic: "cmd.request",
+          cursor: "1-0",
+          source: "contract",
+          stage: "payload",
+          eventType: "cmd.request.message",
+        },
+      },
+    ]);
+    expect(JSON.stringify(logs)).not.toContain(secret);
+  });
+
+  it("propagates fatal identities to process supervision exactly once", () => {
+    const reported: Error[] = [];
+    const reporter = createCoreEventBusFatalReporter((error) => reported.push(error));
+    const panic = new Panic({ message: "delivery panic" });
+    const defect = new Error("delivery defect");
+    const nonErrorDefect = { broken: true };
+    const context = {
+      topic: "cmd.request",
+      cursor: "2-0",
+      phase: "delivery-action" as const,
+    };
+
+    reporter.report(panic, context);
+    reporter.report(panic, context);
+    reporter.report(defect, context);
+    reporter.report(defect, context);
+    reporter.report(nonErrorDefect, context);
+    reporter.report(nonErrorDefect, context);
+
+    expect(reported).toHaveLength(3);
+    expect(reported[0]).toBe(panic);
+    expect(reported[1]).toBe(defect);
+    expect(Panic.is(reported[2])).toBe(true);
+  });
+
+  it("supervises router transport termination without a direct done await", async () => {
+    const routerDone = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+    const fatalObserved = Promise.withResolvers<void>();
+    const reported: Error[] = [];
+    let healthy = true;
+    const reportFatalError = createCoreRuntimeFatalReporter((error) => {
+      reported.push(error);
+      fatalObserved.resolve();
+    });
+    const transportFailure = new EventDeliveryTransportFailed({
+      topic: "evt.request",
+      operation: "ack",
+      cursor: "7-0",
+      cause: new Error("Redis connection closed"),
+      message: "Redis delivery acknowledgement failed",
+    });
+
+    const supervision = superviseCoreRouterDone({
+      done: routerDone.promise,
+      isStopping: () => false,
+      markUnhealthy: () => {
+        healthy = false;
+      },
+      reportFatalError,
+    });
+    routerDone.resolve(Result.err(transportFailure));
+
+    await fatalObserved.promise;
+    reportFatalError(transportFailure);
+    await supervision;
+
+    expect(reported).toEqual([transportFailure]);
+    expect(healthy).toBe(false);
+  });
+
+  it("preserves a rejected router Panic identity at fatal supervision", async () => {
+    const panic = new Panic({ message: "router delivery invariant failed" });
+    const reported: Error[] = [];
+
+    await superviseCoreRouterDone({
+      done: Promise.reject(panic),
+      isStopping: () => false,
+      markUnhealthy: () => {},
+      reportFatalError: (error) => reported.push(error),
+    });
+
+    expect(reported).toEqual([panic]);
+  });
+
+  it("waits for subscription and dead-letter work before closing owned Redis", async () => {
+    const calls: string[] = [];
+    const deliveryStarted = Promise.withResolvers<void>();
+    const releaseDelivery = Promise.withResolvers<void>();
+    const routerDone = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+    const reported: Error[] = [];
+    let stopping = false;
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+    const routerSupervision = superviseCoreRouterDone({
+      done: routerDone.promise,
+      isStopping: () => stopping,
+      markUnhealthy: () => {
+        throw new Error("requested shutdown must not mark the runtime unhealthy");
+      },
+      reportFatalError: (error) => reported.push(error),
+    });
+
+    const shutdown = (async () => {
+      stopping = true;
+      await cleanup.run("subscription.stop", async () => {
+        calls.push("subscription.stop");
+        deliveryStarted.resolve();
+        await releaseDelivery.promise;
+        calls.push("dead-letter.done");
+        routerDone.resolve(Result.ok(undefined));
+      });
+      await cleanup.run("subscription.done", () => routerSupervision);
+      await cleanup.run("bus.close", async () => {
+        calls.push("redis.close");
+      });
+      cleanup.finish();
+    })();
+
+    await deliveryStarted.promise;
+    expect(calls).toEqual(["subscription.stop"]);
+    releaseDelivery.resolve();
+    await shutdown;
+
+    expect(calls).toEqual(["subscription.stop", "dead-letter.done", "redis.close"]);
+    expect(reported).toEqual([]);
   });
 });

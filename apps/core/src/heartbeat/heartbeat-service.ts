@@ -1,10 +1,14 @@
 import {
   lilacEventTypes,
-  type AdapterPlatform,
   type CmdRequestMessageData,
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
 import { createLogger, getCoreConfig, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   buildHeartbeatRequestMessages,
@@ -26,7 +30,62 @@ type HeartbeatTimers = {
   clearTimeout(handle: TimerHandle): void;
 };
 
+type HeartbeatLifecycleSubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
 const DEFAULT_HEARTBEAT_CRON = "*/30 * * * *";
+
+export class HeartbeatLifecycleRequestIdMissing extends TaggedError(
+  "HeartbeatLifecycleRequestIdMissing",
+)<{
+  readonly message: string;
+}> {}
+
+export class HeartbeatLifecycleSessionIdMissing extends TaggedError(
+  "HeartbeatLifecycleSessionIdMissing",
+)<{
+  readonly message: string;
+}> {}
+
+export type HeartbeatLifecycleDeliveryError =
+  | HeartbeatLifecycleRequestIdMissing
+  | HeartbeatLifecycleSessionIdMissing;
+
+export function applyHeartbeatLifecycleDeliveryPolicy(
+  error: HeartbeatLifecycleDeliveryError,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "HeartbeatLifecycleRequestIdMissing":
+    case "HeartbeatLifecycleSessionIdMissing":
+      return "park-pending";
+  }
+}
+
+function subscriptionLifecycleError(
+  phase: "start" | "stop" | "done",
+  error: EventDeliveryStartFailed | EventDeliveryStopFailed | EventDeliveryDoneError,
+): Error {
+  return new Error(`Heartbeat lifecycle subscription ${phase} failed: ${error.message}`, {
+    cause: error,
+  });
+}
+
+function adaptHeartbeatLifecycleStartResultToHost(
+  started: ResultType<HeartbeatLifecycleSubscription, EventDeliveryStartFailed>,
+): HeartbeatLifecycleSubscription {
+  if (started.status === "ok") return started.value;
+  throw subscriptionLifecycleError("start", started.error);
+}
+
+function adaptHeartbeatLifecycleStopResultToHost(
+  stopped: ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>,
+): void {
+  if (stopped.status === "ok") return;
+  const phase = stopped.error._tag === "EventDeliveryStopFailed" ? "stop" : "done";
+  throw subscriptionLifecycleError(phase, stopped.error);
+}
 
 export async function startHeartbeatService(params: {
   bus: LilacBus;
@@ -247,35 +306,64 @@ export async function startHeartbeatService(params: {
     }
   }
 
-  const lifecycleSub = await params.bus.subscribeTopic(
-    "evt.request",
-    {
-      mode: "fanout",
-      subscriptionId: `${params.subscriptionId}:lifecycle`,
-      consumerId: consumerId(`${params.subscriptionId}:lifecycle`),
-      offset: { type: "now" },
-      batch: { maxWaitMs: 1000 },
-    },
-    async (msg, ctx) => {
-      if (msg.type !== lilacEventTypes.EvtRequestLifecycleChanged) {
-        await ctx.commit();
-        return;
-      }
+  async function startHeartbeatLifecycleResult(): Promise<
+    ResultType<HeartbeatLifecycleSubscription, EventDeliveryStartFailed>
+  > {
+    return params.bus.subscribeTopic(
+      "evt.request",
+      {
+        mode: "fanout",
+        subscriptionId: `${params.subscriptionId}:lifecycle`,
+        consumerId: consumerId(`${params.subscriptionId}:lifecycle`),
+        offset: { type: "now" },
+        batch: { maxWaitMs: 1000 },
+      },
+      async (msg): Promise<ResultType<void, HeartbeatLifecycleDeliveryError>> => {
+        if (msg.type !== lilacEventTypes.EvtRequestLifecycleChanged) {
+          return Result.ok(undefined);
+        }
 
-      const requestId = msg.headers?.request_id;
-      const sessionId = msg.headers?.session_id;
-      const requestClient = (msg.headers?.request_client ?? "unknown") as AdapterPlatform;
-      if (!requestId || !sessionId) {
-        throw new Error(
-          "evt.request.lifecycle.changed missing required headers.request_id/session_id",
-        );
-      }
+        const requestId = msg.headers?.request_id;
+        const sessionId = msg.headers?.session_id;
+        if (!requestId) {
+          return Result.err(
+            new HeartbeatLifecycleRequestIdMissing({
+              message: "evt.request.lifecycle.changed missing required headers.request_id",
+            }),
+          );
+        }
+        if (!sessionId) {
+          return Result.err(
+            new HeartbeatLifecycleSessionIdMissing({
+              message: "evt.request.lifecycle.changed missing required headers.session_id",
+            }),
+          );
+        }
 
-      const isHeartbeat = isHeartbeatSessionId(sessionId);
+        const isHeartbeat = isHeartbeatSessionId(sessionId);
 
-      if (isHeartbeat) {
-        if (msg.data.state === "running" || msg.data.state === "queued") {
-          outstandingHeartbeatRequestIds.add(requestId);
+        if (isHeartbeat) {
+          if (msg.data.state === "running" || msg.data.state === "queued") {
+            outstandingHeartbeatRequestIds.add(requestId);
+          }
+
+          if (
+            msg.data.state === "resolved" ||
+            msg.data.state === "failed" ||
+            msg.data.state === "cancelled"
+          ) {
+            outstandingHeartbeatRequestIds.delete(requestId);
+          }
+
+          return Result.ok(undefined);
+        }
+
+        const activityTs = msg.data.ts ?? msg.ts;
+        lastExternalActivityAt = activityTs;
+        lastActivityAt = Math.max(lastActivityAt, activityTs);
+
+        if (msg.data.state === "running") {
+          activeExternalRequestIds.add(requestId);
         }
 
         if (
@@ -283,33 +371,29 @@ export async function startHeartbeatService(params: {
           msg.data.state === "failed" ||
           msg.data.state === "cancelled"
         ) {
-          outstandingHeartbeatRequestIds.delete(requestId);
+          activeExternalRequestIds.delete(requestId);
         }
 
-        await ctx.commit();
-        return;
-      }
+        return Result.ok(undefined);
+      },
+      applyHeartbeatLifecycleDeliveryPolicy,
+    );
+  }
 
-      void requestClient;
-      const activityTs = msg.data.ts ?? msg.ts;
-      lastExternalActivityAt = activityTs;
-      lastActivityAt = Math.max(lastActivityAt, activityTs);
-
-      if (msg.data.state === "running") {
-        activeExternalRequestIds.add(requestId);
-      }
-
-      if (
-        msg.data.state === "resolved" ||
-        msg.data.state === "failed" ||
-        msg.data.state === "cancelled"
-      ) {
-        activeExternalRequestIds.delete(requestId);
-      }
-
-      await ctx.commit();
-    },
+  const lifecycleSub = adaptHeartbeatLifecycleStartResultToHost(
+    await startHeartbeatLifecycleResult(),
   );
+
+  async function stopHeartbeatLifecycleResult(): Promise<
+    ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>
+  > {
+    const lifecycleStopped = await lifecycleSub.stop();
+    if (lifecycleStopped.status === "error") return Result.err(lifecycleStopped.error);
+
+    const lifecycleDone = await lifecycleSub.done;
+    if (lifecycleDone.status === "error") return Result.err(lifecycleDone.error);
+    return Result.ok(undefined);
+  }
 
   ensureScheduledWake(now());
 
@@ -322,7 +406,7 @@ export async function startHeartbeatService(params: {
       clearRetryTimer();
       clearScheduledWakeTimer();
 
-      await lifecycleSub.stop();
+      adaptHeartbeatLifecycleStopResultToHost(await stopHeartbeatLifecycleResult());
       await activeTick;
       activeExternalRequestIds.clear();
       outstandingHeartbeatRequestIds.clear();

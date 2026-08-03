@@ -1,5 +1,13 @@
-import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
-import { createLogger } from "@stanley2058/lilac-utils";
+import {
+  type DeliveryDisposition,
+  type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
+  type EventDeliveryStopFailed,
+  lilacEventTypes,
+  type LilacBus,
+} from "@stanley2058/lilac-event-bus";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
 import { GithubApiError } from "../github/github-api";
 import { SurfaceMessageNotFoundError, type SurfaceAdapter } from "../surface/adapter";
@@ -25,6 +33,37 @@ type CachedActions = {
   recordIds: string[];
   expiresAt: number;
 };
+
+class WorkflowProgressProjectorStopping extends TaggedError("WorkflowProgressProjectorStopping")<{
+  readonly message: string;
+}> {}
+
+type WorkflowProgressProjectorSubscription = {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+};
+
+function workflowProgressProjectorDeliveryPolicy(
+  error: WorkflowProgressProjectorStopping,
+): DeliveryDisposition {
+  switch (error._tag) {
+    case "WorkflowProgressProjectorStopping":
+      return "stop";
+  }
+}
+
+function adaptWorkflowProgressSubscriptionStartResultToHost(
+  started: ResultType<WorkflowProgressProjectorSubscription, EventDeliveryStartFailed>,
+): WorkflowProgressProjectorSubscription {
+  if (started.status === "error") throw started.error;
+  return started.value;
+}
+
+function adaptWorkflowProgressSubscriptionStopResultToHost(
+  stopped: ResultType<void, EventDeliveryStopFailed>,
+): void {
+  if (stopped.status === "error") throw stopped.error;
+}
 
 const WORKFLOW_CARD_TEXT_LIMIT = 4_000;
 
@@ -73,7 +112,7 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
   private readonly actions = new Map<string, CachedActions>();
   private readonly actionRotationTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly projectionInFlight = new Map<string, Promise<MsgRef | null>>();
-  private subscription: { stop(): Promise<void> } | null = null;
+  private subscription: WorkflowProgressProjectorSubscription | null = null;
   private retryTimer: ReturnType<typeof setInterval> | null = null;
   private actionOutboxDrain: Promise<void> | null = null;
   private stopping = false;
@@ -91,9 +130,10 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     },
   ) {}
 
-  async start(): Promise<void> {
-    this.stopping = false;
-    this.subscription = await this.input.bus.subscribeTopic(
+  private startWorkflowProgressSubscriptionResult(): Promise<
+    ResultType<WorkflowProgressProjectorSubscription, EventDeliveryStartFailed>
+  > {
+    return this.input.bus.subscribeTopic(
       "evt.workflow",
       {
         mode: "fanout",
@@ -102,7 +142,14 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         offset: { type: "now" },
         batch: { maxWaitMs: 1_000 },
       },
-      async (message, context) => {
+      async (message): Promise<ResultType<void, WorkflowProgressProjectorStopping>> => {
+        if (this.stopping) {
+          return Result.err(
+            new WorkflowProgressProjectorStopping({
+              message: "Workflow progress projector is stopping",
+            }),
+          );
+        }
         if (
           message.type === lilacEventTypes.EvtWorkflowRunChanged ||
           message.type === lilacEventTypes.EvtWorkflowOperationChanged ||
@@ -112,9 +159,33 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         ) {
           this.requestProjection(message.data.runId);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      workflowProgressProjectorDeliveryPolicy,
     );
+  }
+
+  private stopWorkflowProgressSubscriptionResult(
+    subscription: WorkflowProgressProjectorSubscription,
+  ): Promise<ResultType<void, EventDeliveryStopFailed>> {
+    return subscription.stop();
+  }
+
+  async start(): Promise<void> {
+    this.stopping = false;
+    const subscription = adaptWorkflowProgressSubscriptionStartResultToHost(
+      await this.startWorkflowProgressSubscriptionResult(),
+    );
+    this.subscription = subscription;
+    void subscription.done.then((done) => {
+      if (this.stopping) return;
+      this.logger.error(
+        "Workflow progress projector subscription terminated unexpectedly",
+        done.status === "error"
+          ? formatTaggedErrorForLog(done.error)
+          : { error: "Subscription completed without being stopped" },
+      );
+    });
 
     await this.drainActionOutboxProjections();
     await this.reconcile();
@@ -133,8 +204,20 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     for (const timer of this.actionRotationTimers.values()) clearTimeout(timer);
     this.timers.clear();
     this.actionRotationTimers.clear();
-    await this.subscription?.stop();
+    const subscription = this.subscription;
     this.subscription = null;
+    if (subscription) {
+      adaptWorkflowProgressSubscriptionStopResultToHost(
+        await this.stopWorkflowProgressSubscriptionResult(subscription),
+      );
+      const done = await subscription.done;
+      if (done.status === "error" && done.error._tag !== "EventDeliveryStopped") {
+        this.logger.error(
+          "Workflow progress projector subscription terminated",
+          formatTaggedErrorForLog(done.error),
+        );
+      }
+    }
     await this.actionOutboxDrain;
     while (this.projectionInFlight.size > 0) {
       await Promise.allSettled(this.projectionInFlight.values());

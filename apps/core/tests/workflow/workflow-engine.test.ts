@@ -3,21 +3,40 @@ import { rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { Panic } from "better-result";
 import { z } from "zod";
 import {
   createLilacBus,
   lilacEventTypes,
   outReqTopic,
+  type DeliveryDisposition,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 
+import {
+  okResultForTest,
+  startResultForTest,
+  stopResultForTest,
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscription,
+} from "../helpers/result-raw-bus";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
-import { WorkflowEngine, workflowAgentRequestId } from "../../src/workflow/workflow-engine";
+import {
+  applyWorkflowEventDeliveryPolicy,
+  captureWorkflowIdleCancellationPublication,
+  captureWorkflowTerminalReceiptAdoption,
+  WorkflowEngine,
+  WorkflowLifecycleDeliveryFailed,
+  WorkflowOutputDeliveryFailed,
+  WorkflowWakeDeliveryFailed,
+  runWorkflowTimerTick,
+  workflowAgentRequestId,
+} from "../../src/workflow/workflow-engine";
 import type { WorkflowRequestPolicy } from "../../src/workflow/workflow-request-authority";
 import { canonicalJsonSha256, sha256 } from "../../src/workflow/workflow-definition";
 import {
@@ -77,23 +96,24 @@ class HeartbeatTrackingWorkflowStore extends DurableWorkflowStore {
 class CapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   readonly history: Message<unknown>[] = [];
+  subscribe = subscribeForTest;
 
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
     this.messages.push(message);
     return { id: `${this.messages.length}-0`, cursor: `${this.messages.length}-0` };
   }
-  async subscribe<TData>(
+  async openTestSubscription(
     _topic: string,
     _options: SubscriptionOptions,
-    _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    _handler: TestRawMessageHandler,
   ) {
     return { stop: async () => {} };
   }
-  async fetch<TData>(topic: string, _options: FetchOptions) {
+  async fetch(topic: string, _options: FetchOptions) {
     return {
       messages: this.history
         .filter((message) => message.topic === topic)
-        .map((msg) => ({ msg: msg as Message<TData>, cursor: msg.id })),
+        .map((msg) => ({ msg, cursor: msg.id })),
     };
   }
   async watermark(topic: string) {
@@ -104,10 +124,11 @@ class CapturingRawBus implements RawBus {
 
 class LiveCapturingRawBus implements RawBus {
   readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
+  subscribe = subscribeForTest;
   private sequence = 0;
   private readonly subscriptions = new Set<{
     topic: string;
-    handler: (message: Message<unknown>, context: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
 
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
@@ -116,28 +137,24 @@ class LiveCapturingRawBus implements RawBus {
     const stored: Message<TData> = { ...message, id, ts: Date.now(), topic: options.topic };
     for (const subscription of this.subscriptions) {
       if (subscription.topic === options.topic) {
-        await subscription.handler(stored, { cursor: id, commit: async () => {} });
+        await subscription.handler(stored, id);
       }
     }
     return { id, cursor: id };
   }
 
-  async subscribe<TData>(
+  async openTestSubscription(
     topic: string,
     _options: SubscriptionOptions,
-    handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    handler: TestRawMessageHandler,
   ) {
-    const subscription = {
-      topic,
-      handler: (message: Message<unknown>, context: HandleContext) =>
-        handler(message as Message<TData>, context),
-    };
+    const subscription = { topic, handler };
     this.subscriptions.add(subscription);
     return { stop: async () => void this.subscriptions.delete(subscription) };
   }
 
-  async fetch<TData>(_topic: string, _options: FetchOptions) {
-    return { messages: [] as Array<{ msg: Message<TData>; cursor: string }> };
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
   }
 
   async close() {
@@ -290,6 +307,121 @@ function firstOperationId(source: string): string {
 }
 
 describe("WorkflowEngine", () => {
+  it("maps owned delivery failures to the required subscription dispositions", () => {
+    const cases: readonly [
+      WorkflowWakeDeliveryFailed | WorkflowOutputDeliveryFailed | WorkflowLifecycleDeliveryFailed,
+      DeliveryDisposition,
+    ][] = [
+      [new WorkflowWakeDeliveryFailed({ message: "wake failed" }), "park-pending"],
+      [new WorkflowOutputDeliveryFailed({ message: "output failed" }), "park-pending"],
+      [new WorkflowLifecycleDeliveryFailed({ message: "lifecycle failed" }), "stop"],
+    ];
+    for (const [error, disposition] of cases) {
+      expect(applyWorkflowEventDeliveryPolicy(error)).toBe(disposition);
+    }
+  });
+
+  it("adapts wake subscription start failure to the engine host contract", async () => {
+    const dbPath = join(tmpdir(), `workflow-start-failure-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    class StartFailingRawBus extends CapturingRawBus {
+      override async openTestSubscription(
+        _topic: string,
+        _options: SubscriptionOptions,
+        _handler: TestRawMessageHandler,
+      ): Promise<TestRawSubscription> {
+        throw new Error("workflow subscription unavailable");
+      }
+    }
+    const bus = createLilacBus(new StartFailingRawBus());
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "start-failure",
+    });
+    try {
+      await expect(engine.start()).rejects.toThrow("Test subscription start failed");
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("returns timer failures as values and preserves Panic", async () => {
+    const failed = await runWorkflowTimerTick(async () => {
+      throw new Error("timer operation failed");
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error.message).toContain("timer operation failed");
+    }
+
+    const panic = new Panic({ message: "timer panic" });
+    await expect(
+      runWorkflowTimerTick(async () => {
+        throw panic;
+      }),
+    ).rejects.toBe(panic);
+  });
+
+  it("returns terminal receipt adoption failures as values and preserves Panic", async () => {
+    const failed = await captureWorkflowTerminalReceiptAdoption(async () => {
+      throw new Error("receipt artifact unavailable");
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error.message).toContain("receipt artifact unavailable");
+    }
+
+    const panic = new Panic({ message: "receipt adoption defect" });
+    await expect(
+      captureWorkflowTerminalReceiptAdoption(async () => {
+        throw panic;
+      }),
+    ).rejects.toBe(panic);
+  });
+
+  it("returns idle cancellation publication failures as values and preserves Panic", async () => {
+    class CancellationFailingRawBus extends CapturingRawBus {
+      constructor(private readonly cause: Error) {
+        super();
+      }
+
+      override async publish<TData>(
+        _message: Omit<Message<TData>, "id" | "ts">,
+        _options: PublishOptions,
+      ): Promise<{ id: string; cursor: string }> {
+        throw this.cause;
+      }
+    }
+
+    const failedBus = createLilacBus(
+      new CancellationFailingRawBus(new Error("cancellation transport unavailable")),
+    );
+    const failed = await captureWorkflowIdleCancellationPublication(failedBus, {
+      requestId: "request-1",
+      sessionId: "session-1",
+      dispatchEpoch: "epoch-1",
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") {
+      expect(failed.error.message).toBe("Workflow idle cancellation publication failed");
+    }
+
+    const panic = new Panic({ message: "idle cancellation defect" });
+    const panicBus = createLilacBus(new CancellationFailingRawBus(panic));
+    await expect(
+      captureWorkflowIdleCancellationPublication(panicBus, {
+        requestId: "request-2",
+        sessionId: "session-2",
+        dispatchEpoch: "epoch-2",
+      }),
+    ).rejects.toBe(panic);
+  });
+
   it("paces active run heartbeats independently of polling and event-triggered ticks", async () => {
     const dbPath = join(tmpdir(), `workflow-heartbeat-pacing-${crypto.randomUUID()}.sqlite`);
     const store = new HeartbeatTrackingWorkflowStore(dbPath);
@@ -378,7 +510,9 @@ describe("WorkflowEngine", () => {
       ).rejects.toThrow("wake tick failed");
       await scan;
     } finally {
-      await engine.stop();
+      await expect(engine.stop()).rejects.toThrow(
+        "Workflow engine stop failed while cancelling active work",
+      );
       await bus.close();
       store.close();
       rmSync(dbPath, { force: true });
@@ -746,6 +880,7 @@ describe("WorkflowEngine", () => {
           id: "1-0",
           ts: 10,
           type: lilacEventTypes.EvtAgentOutputResponseText,
+          key: requestId,
           headers,
           data: { finalText: "historical result" },
         },
@@ -754,6 +889,7 @@ describe("WorkflowEngine", () => {
           id: "2-0",
           ts: 11,
           type: lilacEventTypes.EvtRequestLifecycleChanged,
+          key: requestId,
           headers,
           data: { state: terminalState, ts: 11 },
         },
@@ -801,6 +937,87 @@ describe("WorkflowEngine", () => {
     }
   });
 
+  it("fails both reconciliation fetches on contract-invalid events without exposing payloads", async () => {
+    for (const invalidTopic of ["output", "lifecycle"] as const) {
+      const dbPath = join(
+        tmpdir(),
+        `workflow-engine-invalid-${invalidTopic}-fetch-${crypto.randomUUID()}.sqlite`,
+      );
+      const store = new DurableWorkflowStore(dbPath);
+      class ContractInvalidFetchRawBus extends CapturingRawBus {
+        readonly fetchedTopics: string[] = [];
+
+        override async fetch(topic: string, options: FetchOptions) {
+          this.fetchedTopics.push(topic);
+          return await super.fetch(topic, options);
+        }
+      }
+      const raw = new ContractInvalidFetchRawBus();
+      const bus = createLilacBus(raw);
+      createApprovedRun(store);
+      const source = agentWorkflowSource();
+      const operationId = firstOperationId(source);
+      const requestId = workflowAgentRequestId("run-1", operationId, 0);
+      const topic = invalidTopic === "output" ? outReqTopic(requestId) : "evt.request";
+      raw.history.push({
+        topic,
+        id: `invalid-${invalidTopic}-1`,
+        ts: 10,
+        type:
+          invalidTopic === "output"
+            ? lilacEventTypes.EvtAgentOutputResponseText
+            : lilacEventTypes.EvtRequestLifecycleChanged,
+        key: requestId,
+        headers: {
+          request_id: requestId,
+          session_id: `workflow:run-1:${operationId}`,
+          request_client: "unknown",
+          workflow_dispatch_epoch: "invalid-fetch-epoch",
+        },
+        data:
+          invalidTopic === "output"
+            ? { finalText: { secretUndecodedPayload: "must-not-escape" } }
+            : { state: { secretUndecodedPayload: "must-not-escape" } },
+      });
+      const engine = new WorkflowEngine({
+        bus,
+        store,
+        dataDir: dirname(dbPath),
+        subscriptionId: `invalid-${invalidTopic}-fetch`,
+        pollMs: 5,
+        loadSnapshot: async () => source,
+        compileSource: compileTestWorkflow,
+        createDispatchEpoch: () => "invalid-fetch-epoch",
+      });
+      try {
+        await engine.start();
+        await waitFor(() => store.getRun("run-1")?.state === "failed");
+        expect(raw.fetchedTopics).toEqual(
+          invalidTopic === "output" ? [outReqTopic(requestId)] : [outReqTopic(requestId), topic],
+        );
+        expect(store.getRun("run-1")?.terminalDetail).toContain(
+          `Workflow reconciliation rejected an invalid ${topic} event`,
+        );
+        expect(store.getRun("run-1")?.terminalDetail).not.toContain("secretUndecodedPayload");
+        expect(
+          raw.messages.some(
+            (message) =>
+              message.type === lilacEventTypes.CmdRequestMessage &&
+              typeof message.data === "object" &&
+              message.data !== null &&
+              "queue" in message.data &&
+              message.data.queue === "prompt",
+          ),
+        ).toBe(false);
+      } finally {
+        await engine.stop();
+        await bus.close();
+        store.close();
+        rmSync(dbPath, { force: true });
+      }
+    }
+  });
+
   it("fails closed for every terminal lifecycle state that mismatches its exact receipt", async () => {
     const cases = [
       { lifecycleState: "resolved", receiptState: "failed" },
@@ -816,62 +1033,65 @@ describe("WorkflowEngine", () => {
       const raw = new LiveCapturingRawBus();
       const bus = createLilacBus(raw);
       createApprovedRun(store);
-      const responder = await bus.subscribeTopic(
-        "cmd.request",
-        { mode: "fanout", subscriptionId: `mismatch-${lifecycleState}`, offset: { type: "now" } },
-        async (message, context) => {
-          if (
-            message.type === lilacEventTypes.CmdRequestMessage &&
-            message.data.queue === "prompt"
-          ) {
-            const requestId = message.headers?.request_id;
-            const sessionId = message.headers?.session_id;
-            if (!requestId || !sessionId) throw new Error("Missing workflow request identity");
-            const workflow = z
-              .object({
-                workflow: z.strictObject({
-                  runId: z.string(),
-                  operationId: z.string(),
-                  dispatchEpoch: z.string(),
+      const responder = await startResultForTest(
+        bus.subscribeTopic(
+          "cmd.request",
+          { mode: "fanout", subscriptionId: `mismatch-${lifecycleState}`, offset: { type: "now" } },
+          async (message) => {
+            if (
+              message.type === lilacEventTypes.CmdRequestMessage &&
+              message.data.queue === "prompt"
+            ) {
+              const requestId = message.headers?.request_id;
+              const sessionId = message.headers?.session_id;
+              if (!requestId || !sessionId) throw new Error("Missing workflow request identity");
+              const workflow = z
+                .object({
+                  workflow: z.strictObject({
+                    runId: z.string(),
+                    operationId: z.string(),
+                    dispatchEpoch: z.string(),
+                  }),
+                })
+                .parse(message.data.raw).workflow;
+              expect(
+                store.authorizeWorkflowRequest({
+                  requestId,
+                  sessionId,
+                  platform: "unknown",
+                })?.policy,
+              ).toMatchObject(workflow);
+              expect(
+                store.claimWorkflowRequest({
+                  requestId,
+                  dispatchEpoch: workflow.dispatchEpoch,
+                  ownerId: "mismatch-runner",
+                  now: 10,
                 }),
-              })
-              .parse(message.data.raw).workflow;
-            expect(
-              store.authorizeWorkflowRequest({
-                requestId,
-                sessionId,
-                platform: "unknown",
-              })?.policy,
-            ).toMatchObject(workflow);
-            expect(
-              store.claimWorkflowRequest({
-                requestId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "mismatch-runner",
-                now: 10,
-              }),
-            ).toBe(true);
-            expect(
-              store.recordWorkflowRequestTerminal({
-                requestId,
-                runId: workflow.runId,
-                operationId: workflow.operationId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "mismatch-runner",
-                state: receiptState,
-                detail: `receipt ${receiptState}`,
-                ...(receiptState === "resolved" ? { output: "receipt output" } : {}),
-                now: 11,
-              }),
-            ).toBe(true);
-            await bus.publish(
-              lilacEventTypes.EvtRequestLifecycleChanged,
-              { state: lifecycleState, ts: 12 },
-              { headers: message.headers },
-            );
-          }
-          await context.commit();
-        },
+              ).toBe(true);
+              expect(
+                store.recordWorkflowRequestTerminal({
+                  requestId,
+                  runId: workflow.runId,
+                  operationId: workflow.operationId,
+                  dispatchEpoch: workflow.dispatchEpoch,
+                  ownerId: "mismatch-runner",
+                  state: receiptState,
+                  detail: `receipt ${receiptState}`,
+                  ...(receiptState === "resolved" ? { output: "receipt output" } : {}),
+                  now: 11,
+                }),
+              ).toBe(true);
+              await bus.publish(
+                lilacEventTypes.EvtRequestLifecycleChanged,
+                { state: lifecycleState, ts: 12 },
+                { headers: message.headers },
+              );
+            }
+            return okResultForTest();
+          },
+          () => "commit",
+        ),
       );
       const engine = new WorkflowEngine({
         bus,
@@ -899,7 +1119,7 @@ describe("WorkflowEngine", () => {
         );
       } finally {
         await engine.stop();
-        await responder.stop();
+        await stopResultForTest(responder.stop());
         await bus.close();
         store.close();
         rmSync(dbPath, { force: true });
@@ -1008,6 +1228,56 @@ describe("WorkflowEngine", () => {
         output: "receipt result",
         usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
       });
+      expect(
+        raw.messages.some(
+          (message) =>
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "queue" in message.data &&
+            message.data.queue === "prompt",
+        ),
+      ).toBe(false);
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("fails as a value when prompt publication loses without a terminal receipt", async () => {
+    const dbPath = join(tmpdir(), `workflow-engine-missing-receipt-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "missing-terminal-receipt",
+      pollMs: 5,
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: compileTestWorkflow,
+      beforePromptPublication: async ({ requestId, runId, operationId, runOwnerId }) => {
+        expect(
+          store.claimWorkflowRequestPromptPublication({
+            requestId,
+            runId,
+            operationId,
+            runOwnerId,
+            now: 19,
+          }),
+        ).toBe(true);
+      },
+    });
+    try {
+      await engine.start();
+      await waitFor(() => store.getRun("run-1")?.state === "failed");
+      expect(store.getRun("run-1")?.terminalDetail).toBe(
+        "Workflow prompt publication was rejected without a terminal receipt",
+      );
       expect(
         raw.messages.some(
           (message) =>
@@ -1979,6 +2249,7 @@ describe("WorkflowEngine", () => {
               {
                 topic: "evt.request",
                 type: lilacEventTypes.EvtRequestLifecycleChanged,
+                key: requestId,
                 data: { state: "running" },
                 headers: {
                   request_id: requestId,
@@ -2020,6 +2291,7 @@ describe("WorkflowEngine", () => {
               {
                 topic: "evt.request",
                 type: lilacEventTypes.EvtRequestLifecycleChanged,
+                key: requestId,
                 data: { state: "cancelled", detail: "idle process tree quiesced" },
                 headers: {
                   request_id: requestId,

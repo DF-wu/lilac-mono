@@ -12,7 +12,7 @@ import {
   type CmdRequestMessageData,
   type CoreLineageManifestV1,
   type CorePrimaryLineageV1,
-  type HandleContext,
+  type EventDeliveryStopFailed,
   type Message,
   type PublishOptions,
   type RawBus,
@@ -27,7 +27,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import { jsonSchema, tool, type ModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import { Panic, Result } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   AiSdkPiAgent,
   attachAutoCompaction,
@@ -51,7 +51,11 @@ import {
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
   buildAutoInjectedThreadSearchOverlay,
+  BusAgentRunnerIntakeFailed,
+  BusAgentRunnerRequestHeadersInvalid,
+  busAgentRunnerDeliveryDisposition,
   buildCustomCommandFailureFinalText,
+  BusAgentRunnerOperationFailed,
   customCommandExecutionErrorText,
   consumeAssistantTextDelta,
   consumeReasoningChunkEvent,
@@ -59,6 +63,7 @@ import {
   computeTransientRetryDelayMs,
   createAssistantTextPartBoundaryState,
   createAgentRunIdleWatchdog,
+  captureBusAgentRunnerOperation,
   createTransientModelRetryController,
   degradeCorePrimaryLineageForMutation,
   formatAutoCompactionToolDisplay,
@@ -99,6 +104,8 @@ import {
   resolveCompactionCheckpointMeta,
   resolveCorePrimaryTranscriptProviderState,
   resolveCoreStableNamedContinuation,
+  rethrowBusAgentRunnerPanic,
+  signalBusAgentRunnerHostFailure,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
@@ -160,6 +167,11 @@ import {
   shouldForceUrlDownloadForAnthropicFallback,
   withStableAnthropicUpstreamOrder,
 } from "../../../src/surface/bridge/bus-agent-runner/anthropic-fallback-media";
+import {
+  subscribeForTest,
+  type TestRawMessageHandler,
+  type TestRawSubscriptionHost,
+} from "../../helpers/result-raw-bus";
 
 function level1TestTool(execute: () => unknown) {
   return tool({
@@ -1619,16 +1631,19 @@ describe("agent run activity", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const requestId = "activity-request";
     const sources: string[] = [];
-    const sub = await bus.subscribeTopic(
+    const subResult = await bus.subscribeTopic(
       outReqTopic(requestId),
       { mode: "tail", offset: { type: "begin" } },
-      async (msg, ctx) => {
+      async (msg) => {
         if (msg.type === lilacEventTypes.EvtAgentOutputActivity) {
           sources.push(msg.data.source);
         }
-        await ctx.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (subResult.status === "error") throw subResult.error;
+    const sub = subResult.value;
     const publishActivity = createAgentOutputActivityPublisher({
       publish: async (source) => {
         await bus.publish(
@@ -1649,7 +1664,8 @@ describe("agent run activity", () => {
     await Bun.sleep(0);
 
     expect(sources).toEqual(["model", "subagent"]);
-    await sub.stop();
+    const stopped = await sub.stop();
+    if (stopped.status === "error") throw stopped.error;
   });
 });
 
@@ -1792,15 +1808,80 @@ function autoInjectPlanForQuery(query: string, intentSummary: string) {
   };
 }
 
-function createInMemoryRawBus(): RawBus {
+describe("bus agent runner delivery policy", () => {
+  it("dead-letters missing required request headers", () => {
+    const error = new BusAgentRunnerRequestHeadersInvalid({
+      missing: ["session_id"],
+      message: "missing session id",
+    });
+
+    expect(busAgentRunnerDeliveryDisposition(error)).toBe("dead-letter");
+  });
+
+  it("parks expected intake failures", () => {
+    const error = new BusAgentRunnerIntakeFailed({
+      cause: new Error("lifecycle publish unavailable"),
+      message: "request intake failed",
+    });
+
+    expect(busAgentRunnerDeliveryDisposition(error)).toBe("park-pending");
+  });
+
+  it("reports and rethrows Panic without creating a delivery error", () => {
+    const panic = new Panic({ message: "runner invariant failed" });
+    const reported: Panic[] = [];
+
+    expect(() => rethrowBusAgentRunnerPanic(panic, (cause) => reported.push(cause))).toThrow(panic);
+    expect(reported).toEqual([panic]);
+  });
+
+  it("captures ordinary dependency rejection as an owned operation failure", async () => {
+    const cause = new Error("provider unavailable");
+
+    const result = await captureBusAgentRunnerOperation("provider resolution", () =>
+      Promise.reject(cause),
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected operation failure");
+    expect(result.error).toBeInstanceOf(BusAgentRunnerOperationFailed);
+    expect(result.error.operation).toBe("provider resolution");
+    expect(result.error.cause).toBe(cause);
+    expect(result.error.message).toBe("provider unavailable");
+  });
+
+  it("preserves Panic identity through capture and the exact host adapter", async () => {
+    const panic = new Panic({ message: "provider invariant failed" });
+    const reported: Panic[] = [];
+
+    await expect(
+      captureBusAgentRunnerOperation(
+        "provider resolution",
+        () => Promise.reject(panic),
+        (cause) => reported.push(cause),
+      ),
+    ).rejects.toBe(panic);
+    expect(reported).toEqual([panic]);
+
+    const ordinaryCause = new Error("model callback failed");
+    const failure = new BusAgentRunnerOperationFailed({
+      operation: "model callback",
+      cause: ordinaryCause,
+      message: ordinaryCause.message,
+    });
+    expect(() => signalBusAgentRunnerHostFailure(failure)).toThrow(ordinaryCause);
+  });
+});
+
+function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
     topic: string;
     opts: SubscriptionOptions;
-    handler: (msg: Message<unknown>, ctx: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
-
-  return {
+  const raw: RawBus & TestRawSubscriptionHost = {
+    subscribe: subscribeForTest,
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
       const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const stored: Message<unknown> = {
@@ -1810,7 +1891,7 @@ function createInMemoryRawBus(): RawBus {
         ts: Date.now(),
         key: opts.key,
         headers: opts.headers,
-        data: msg.data as unknown,
+        data: msg.data,
       };
 
       const list = topics.get(opts.topic) ?? [];
@@ -1819,22 +1900,17 @@ function createInMemoryRawBus(): RawBus {
 
       for (const s of subs) {
         if (s.topic !== opts.topic) continue;
-        await s.handler(stored, { cursor: id, commit: async () => {} });
+        await s.handler(stored, id);
       }
-
       return { id, cursor: id };
     },
 
-    subscribe: async <TData>(
+    openTestSubscription: async (
       topic: string,
       opts: SubscriptionOptions,
-      handler: (msg: Message<TData>, ctx: HandleContext) => Promise<void>,
+      handler: TestRawMessageHandler,
     ) => {
-      const entry = {
-        topic,
-        opts,
-        handler: handler as unknown as (msg: Message<unknown>, ctx: HandleContext) => Promise<void>,
-      };
+      const entry = { topic, opts, handler };
       subs.add(entry);
 
       const offset = opts.offset;
@@ -1848,10 +1924,7 @@ function createInMemoryRawBus(): RawBus {
               })()
             : existing;
         for (const m of replay) {
-          await handler(m as unknown as Message<TData>, {
-            cursor: m.id,
-            commit: async () => {},
-          });
+          await handler(m, m.id);
         }
       }
 
@@ -1862,11 +1935,11 @@ function createInMemoryRawBus(): RawBus {
       };
     },
 
-    fetch: async <TData>(topic: string) => {
+    fetch: async (topic: string) => {
       const existing = topics.get(topic) ?? [];
       return {
         messages: existing.map((m) => ({
-          msg: m as unknown as Message<TData>,
+          msg: m,
           cursor: m.id,
         })),
         next: existing.length > 0 ? existing[existing.length - 1]?.id : undefined,
@@ -1875,6 +1948,8 @@ function createInMemoryRawBus(): RawBus {
 
     close: async () => {},
   };
+
+  return raw;
 }
 
 function deferred<T>() {
@@ -2045,10 +2120,10 @@ async function observeRequestLifecycle(bus: ReturnType<typeof createLilacBus>, r
   const terminal = deferred<"resolved" | "cancelled" | "failed">();
   const states: string[] = [];
   const details: Array<string | undefined> = [];
-  const subscription = await bus.subscribeTopic(
+  const subscriptionResult = await bus.subscribeTopic(
     "evt.request",
     { mode: "tail", offset: { type: "begin" } },
-    async (message, context) => {
+    async (message) => {
       if (
         message.type === lilacEventTypes.EvtRequestLifecycleChanged &&
         message.headers?.request_id === requestId
@@ -2063,10 +2138,21 @@ async function observeRequestLifecycle(bus: ReturnType<typeof createLilacBus>, r
           terminal.resolve(message.data.state);
         }
       }
-      await context.commit();
+      return Result.ok(undefined);
     },
+    () => "dead-letter",
   );
-  return { states, details, terminal: terminal.promise, stop: subscription.stop };
+  if (subscriptionResult.status === "error") throw subscriptionResult.error;
+  const subscription = subscriptionResult.value;
+  return {
+    states,
+    details,
+    terminal: terminal.promise,
+    stop: async () => {
+      const stopped = await subscription.stop();
+      if (stopped.status === "error") throw stopped.error;
+    },
+  };
 }
 
 async function observeResponseAfterOutputRelay(
@@ -2074,36 +2160,47 @@ async function observeResponseAfterOutputRelay(
   requestId: string,
 ) {
   const relayed = deferred<void>();
-  let outputSubscription: { stop(): Promise<void> } | null = null;
-  const lifecycleSubscription = await bus.subscribeTopic(
+  let outputSubscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | null =
+    null;
+  const lifecycleSubscriptionResult = await bus.subscribeTopic(
     "evt.request",
     { mode: "tail", offset: { type: "now" } },
-    async (message, context) => {
+    async (message) => {
       if (
         message.type === lilacEventTypes.EvtRequestLifecycleChanged &&
         message.headers?.request_id === requestId &&
         message.data.state === "resolved" &&
         outputSubscription === null
       ) {
-        outputSubscription = await bus.subscribeTopic(
+        const outputSubscriptionResult = await bus.subscribeTopic(
           outReqTopic(requestId),
           { mode: "tail", offset: { type: "now" } },
-          async (outputMessage, outputContext) => {
+          async (outputMessage) => {
             if (outputMessage.type === lilacEventTypes.EvtAgentOutputResponseText) {
               relayed.resolve(undefined);
             }
-            await outputContext.commit();
+            return Result.ok(undefined);
           },
+          () => "dead-letter",
         );
+        if (outputSubscriptionResult.status === "error") throw outputSubscriptionResult.error;
+        outputSubscription = outputSubscriptionResult.value;
       }
-      await context.commit();
+      return Result.ok(undefined);
     },
+    () => "dead-letter",
   );
+  if (lifecycleSubscriptionResult.status === "error") throw lifecycleSubscriptionResult.error;
+  const lifecycleSubscription = lifecycleSubscriptionResult.value;
   return {
     relayed: relayed.promise,
     stop: async () => {
-      await lifecycleSubscription.stop();
-      await outputSubscription?.stop();
+      const lifecycleStopped = await lifecycleSubscription.stop();
+      if (lifecycleStopped.status === "error") throw lifecycleStopped.error;
+      if (outputSubscription) {
+        const outputStopped = await outputSubscription.stop();
+        if (outputStopped.status === "error") throw outputStopped.error;
+      }
     },
   };
 }
@@ -2369,7 +2466,9 @@ describe("startBusAgentRunner production path", () => {
         releaseCommand.resolve(undefined);
         await lifecycle.stop();
         await queuedLifecycle.stop();
-        await runner.stop();
+        await runner.stop().catch((cause: unknown) => {
+          expect(cause).toBe(panic);
+        });
         await pluginManager.destroy();
         await bus.close();
         await rm(dataDir, { recursive: true, force: true });
@@ -2616,19 +2715,22 @@ describe("startBusAgentRunner production path", () => {
       phase?: "commentary" | "final_answer";
       phaseBoundaryPrefixChars?: number;
     }> = [];
-    const outputSubscription = await bus.subscribeTopic(
+    const outputSubscriptionResult = await bus.subscribeTopic(
       outReqTopic(requestId),
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           textDeltas.push(message.data);
         }
         if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
           responsePublished.resolve(undefined);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputSubscriptionResult.status === "error") throw outputSubscriptionResult.error;
+    const outputSubscription = outputSubscriptionResult.value;
 
     await publishRunnerRequest({
       bus,
@@ -2656,10 +2758,10 @@ describe("startBusAgentRunner production path", () => {
       finalText: string;
       delivery?: "reply" | "skip";
     }>();
-    const skippedOutputSubscription = await bus.subscribeTopic(
+    const skippedOutputSubscriptionResult = await bus.subscribeTopic(
       outReqTopic(skippedRequestId),
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (message.type === lilacEventTypes.EvtAgentOutputDeltaText) {
           skippedDeltas.push(message.data);
         }
@@ -2669,9 +2771,14 @@ describe("startBusAgentRunner production path", () => {
         if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
           skippedResponse.resolve(message.data);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (skippedOutputSubscriptionResult.status === "error") {
+      throw skippedOutputSubscriptionResult.error;
+    }
+    const skippedOutputSubscription = skippedOutputSubscriptionResult.value;
     await publishRunnerRequest({
       bus,
       requestId: skippedRequestId,
@@ -2687,9 +2794,11 @@ describe("startBusAgentRunner production path", () => {
     expect(skippedDeltas).toEqual([{ delta: "Commentary.", phase: "commentary" }]);
     expect(skippedResets).toEqual([""]);
 
-    await skippedOutputSubscription.stop();
+    const skippedOutputStopped = await skippedOutputSubscription.stop();
+    if (skippedOutputStopped.status === "error") throw skippedOutputStopped.error;
     await skippedLifecycle.stop();
-    await outputSubscription.stop();
+    const outputStopped = await outputSubscription.stop();
+    if (outputStopped.status === "error") throw outputStopped.error;
     await lifecycle.stop();
     await runner.stop();
     await pluginManager.destroy();
@@ -2737,17 +2846,20 @@ describe("startBusAgentRunner production path", () => {
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     const responsePublished = deferred<void>();
     const outputEvents: Array<Message<unknown>> = [];
-    const outputSubscription = await bus.subscribeTopic(
+    const outputSubscriptionResult = await bus.subscribeTopic(
       outReqTopic(requestId),
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         outputEvents.push(message);
         if (message.type === lilacEventTypes.EvtAgentOutputResponseText) {
           responsePublished.resolve(undefined);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputSubscriptionResult.status === "error") throw outputSubscriptionResult.error;
+    const outputSubscription = outputSubscriptionResult.value;
 
     await publishRunnerRequest({
       bus,
@@ -2774,7 +2886,8 @@ describe("startBusAgentRunner production path", () => {
     expect(JSON.stringify(transcript?.messages)).not.toContain("NO_REPLY");
     expect(JSON.stringify(transcript?.messages)).toContain("call-silent");
 
-    await outputSubscription.stop();
+    const outputStopped = await outputSubscription.stop();
+    if (outputStopped.status === "error") throw outputStopped.error;
     await lifecycle.stop();
     await runner.stop();
     await pluginManager.destroy();
@@ -2920,21 +3033,24 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       readonly headers?: Readonly<Record<string, string>>;
       readonly data: CmdRequestMessageData;
     }> = [];
-    const routedSub = await bus.subscribeTopic(
+    const routedSubResult = await bus.subscribeTopic(
       "cmd.request",
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (message.type === lilacEventTypes.CmdRequestMessage) {
           routedRequests.push(message);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (routedSubResult.status === "error") throw routedSubResult.error;
+    const routedSub = routedSubResult.value;
     const outputCreated = deferred<MsgRef>();
-    const outputCreatedSub = await bus.subscribeTopic(
+    const outputCreatedSubResult = await bus.subscribeTopic(
       "evt.surface",
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (
           message.type === lilacEventTypes.EvtSurfaceOutputMessageCreated &&
           message.headers?.request_id === `discord:${sessionId}:input-1`
@@ -2948,23 +3064,29 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
             });
           }
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputCreatedSubResult.status === "error") throw outputCreatedSubResult.error;
+    const outputCreatedSub = outputCreatedSubResult.value;
     const routedOutputUpdates: string[] = [];
-    const outputUpdatedSub = await bus.subscribeTopic(
+    const outputUpdatedSubResult = await bus.subscribeTopic(
       "evt.adapter",
       { mode: "tail", offset: { type: "now" } },
-      async (message, context) => {
+      async (message) => {
         if (
           message.type === lilacEventTypes.EvtAdapterMessageUpdated &&
           message.data.platform === "discord"
         ) {
           routedOutputUpdates.push(message.data.messageId);
         }
-        await context.commit();
+        return Result.ok(undefined);
       },
+      () => "dead-letter",
     );
+    if (outputUpdatedSubResult.status === "error") throw outputUpdatedSubResult.error;
+    const outputUpdatedSub = outputUpdatedSubResult.value;
     const adapterIngress = await bridgeAdapterToBus({
       adapter,
       bus,
@@ -3273,9 +3395,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     await outputRelay.stop();
     await router.stop();
     await adapterIngress.stop();
-    await routedSub.stop();
-    await outputCreatedSub.stop();
-    await outputUpdatedSub.stop();
+    const routedStopped = await routedSub.stop();
+    if (routedStopped.status === "error") throw routedStopped.error;
+    const outputCreatedStopped = await outputCreatedSub.stop();
+    if (outputCreatedStopped.status === "error") throw outputCreatedStopped.error;
+    const outputUpdatedStopped = await outputUpdatedSub.stop();
+    if (outputUpdatedStopped.status === "error") throw outputUpdatedStopped.error;
     store.close();
     await bus.close();
     await rm(dataDir, { recursive: true, force: true });

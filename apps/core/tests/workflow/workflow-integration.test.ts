@@ -7,13 +7,19 @@ import {
   createLilacBus,
   lilacEventTypes,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 
+import {
+  okResultForTest,
+  startResultForTest,
+  stopResultForTest,
+  subscribeForTest,
+  type TestRawMessageHandler,
+} from "../helpers/result-raw-bus";
 import type {
   AdapterEventHandler,
   SurfaceAdapter,
@@ -34,10 +40,11 @@ import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
 
 class LiveRawBus implements RawBus {
+  subscribe = subscribeForTest;
   private sequence = 0;
   private readonly subscriptions = new Set<{
     topic: string;
-    handler: (message: Message<unknown>, context: HandleContext) => Promise<void>;
+    handler: TestRawMessageHandler;
   }>();
 
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
@@ -45,28 +52,24 @@ class LiveRawBus implements RawBus {
     const stored: Message<TData> = { ...message, id, ts: Date.now(), topic: options.topic };
     for (const subscription of this.subscriptions) {
       if (subscription.topic === options.topic) {
-        await subscription.handler(stored, { cursor: id, commit: async () => {} });
+        await subscription.handler(stored, id);
       }
     }
     return { id, cursor: id };
   }
 
-  async subscribe<TData>(
+  async openTestSubscription(
     topic: string,
     _options: SubscriptionOptions,
-    handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    handler: TestRawMessageHandler,
   ) {
-    const subscription = {
-      topic,
-      handler: (message: Message<unknown>, context: HandleContext) =>
-        handler(message as Message<TData>, context),
-    };
+    const subscription = { topic, handler };
     this.subscriptions.add(subscription);
     return { stop: async () => void this.subscriptions.delete(subscription) };
   }
 
-  async fetch<TData>(_topic: string, _options: FetchOptions) {
-    return { messages: [] as Array<{ msg: Message<TData>; cursor: string }> };
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
   }
 
   async close() {
@@ -220,73 +223,79 @@ describe("unified workflow integration", () => {
       progressCards: projector,
     });
     const requestIds: string[] = [];
-    const requestResponder = await bus.subscribeTopic(
-      "cmd.request",
-      { mode: "fanout", subscriptionId: "integration-agent", offset: { type: "now" } },
-      async (message, context) => {
-        if (message.type === lilacEventTypes.CmdRequestMessage && message.data.queue === "prompt") {
-          const requestId = message.headers?.request_id;
-          const sessionId = message.headers?.session_id;
-          if (!requestId || !sessionId) throw new Error("workflow request missing identity");
-          const workflow = z
-            .object({
-              workflow: z.strictObject({
-                runId: z.string(),
-                operationId: z.string(),
-                dispatchEpoch: z.string(),
+    const requestResponder = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        { mode: "fanout", subscriptionId: "integration-agent", offset: { type: "now" } },
+        async (message) => {
+          if (
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            message.data.queue === "prompt"
+          ) {
+            const requestId = message.headers?.request_id;
+            const sessionId = message.headers?.session_id;
+            if (!requestId || !sessionId) throw new Error("workflow request missing identity");
+            const workflow = z
+              .object({
+                workflow: z.strictObject({
+                  runId: z.string(),
+                  operationId: z.string(),
+                  dispatchEpoch: z.string(),
+                }),
+              })
+              .parse(message.data.raw).workflow;
+            expect(
+              store.authorizeWorkflowRequest({
+                requestId,
+                sessionId,
+                platform: "unknown",
+              })?.policy,
+            ).toMatchObject(workflow);
+            expect(
+              store.claimWorkflowRequest({
+                requestId,
+                dispatchEpoch: workflow.dispatchEpoch,
+                ownerId: "integration-agent",
+                now: 100,
               }),
-            })
-            .parse(message.data.raw).workflow;
-          expect(
-            store.authorizeWorkflowRequest({
-              requestId,
-              sessionId,
-              platform: "unknown",
-            })?.policy,
-          ).toMatchObject(workflow);
-          expect(
-            store.claimWorkflowRequest({
-              requestId,
-              dispatchEpoch: workflow.dispatchEpoch,
-              ownerId: "integration-agent",
-              now: 100,
-            }),
-          ).toBe(true);
-          requestIds.push(requestId);
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            { state: "running" },
-            { headers: message.headers },
-          );
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputResponseText,
-            {
-              finalText: "integration result",
-              usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
-            },
-            { headers: message.headers },
-          );
-          expect(
-            store.recordWorkflowRequestTerminal({
-              requestId,
-              runId: workflow.runId,
-              operationId: workflow.operationId,
-              dispatchEpoch: workflow.dispatchEpoch,
-              ownerId: "integration-agent",
-              state: "resolved",
-              output: "integration result",
-              usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
-              now: 100,
-            }),
-          ).toBe(true);
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            { state: "resolved" },
-            { headers: message.headers },
-          );
-        }
-        await context.commit();
-      },
+            ).toBe(true);
+            requestIds.push(requestId);
+            await bus.publish(
+              lilacEventTypes.EvtRequestLifecycleChanged,
+              { state: "running" },
+              { headers: message.headers },
+            );
+            await bus.publish(
+              lilacEventTypes.EvtAgentOutputResponseText,
+              {
+                finalText: "integration result",
+                usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
+              },
+              { headers: message.headers },
+            );
+            expect(
+              store.recordWorkflowRequestTerminal({
+                requestId,
+                runId: workflow.runId,
+                operationId: workflow.operationId,
+                dispatchEpoch: workflow.dispatchEpoch,
+                ownerId: "integration-agent",
+                state: "resolved",
+                output: "integration result",
+                usage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
+                now: 100,
+              }),
+            ).toBe(true);
+            await bus.publish(
+              lilacEventTypes.EvtRequestLifecycleChanged,
+              { state: "resolved" },
+              { headers: message.headers },
+            );
+          }
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
     );
     const engine = new WorkflowEngine({
       bus,
@@ -372,7 +381,7 @@ describe("unified workflow integration", () => {
       expect(JSON.stringify(adapter.contents)).not.toContain("super-secret-value");
     } finally {
       await engine.stop();
-      await requestResponder.stop();
+      await stopResultForTest(requestResponder.stop());
       await actionResolver.stop();
       await projector.stop();
       await tool.destroy();

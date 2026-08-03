@@ -12,11 +12,12 @@ import type {
   ArchitectureManifest,
   OpenProtocolAdapter,
   WorkspaceArchitecture,
+  ZeroBaselineScope,
 } from "./manifest.ts";
 import {
   architectureManifest,
   assertArchitectureManifestIntegrity,
-  STAGE_3_MODULES,
+  zeroBaselineScopeOwns,
 } from "./manifest.ts";
 import type {
   ArchitectureBaseline,
@@ -58,6 +59,12 @@ const BASE_WORKSPACE = {
   structuredLoggers: [],
   taggedErrorFormatters: [],
   operationalResultApis: [],
+  zeroBaselineScopes: [],
+  eventCodecRegistries: [],
+  rawEventMessageBoundaries: [],
+  eventDeliveryApis: [],
+  eventDeliveryConsumers: [],
+  eventFamilyMigrations: [],
   baselines: {
     boundaryValidation: "boundary-validation.baseline.ts",
     failureFlow: "failure-flow.baseline.ts",
@@ -90,6 +97,44 @@ function openProtocolAdapter(
     fallbackVariant: { discriminant: "kind", value: "unsupported" },
     reason: "Fixture open protocol normalization boundary.",
     ...overrides,
+  };
+}
+
+const FIXTURE_EVENT_MEMBERS = ["fixture.alpha", "fixture.beta", "fixture.gamma"] as const;
+
+function fixtureCodecRegistry(exportName: string) {
+  return {
+    status: "enforced" as const,
+    identity: { module: "stage4-events.ts", exportName },
+    canonicalEvents: {
+      module: "stage4-events.ts",
+      exportName: "canonicalFixtureEvents",
+    },
+    canonicalMembers: FIXTURE_EVENT_MEMBERS,
+    codecMembers: FIXTURE_EVENT_MEMBERS,
+  };
+}
+
+function fixtureRawBoundary(exportName: string) {
+  return {
+    status: "enforced" as const,
+    identity: { module: "stage4-events.ts", exportName },
+    messageType: { package: "architecture-fixture", exportName: "Message" },
+    handlerParameter: 0,
+    messageParameter: 0,
+    contextParameter: 1,
+  };
+}
+
+function fixtureDeliveryApi(exportName: string, deliveryPolicy: string) {
+  return {
+    status: "enforced" as const,
+    identity: { module: "stage4-events.ts", exportName },
+    handlerParameter: 0,
+    handlerMessageParameter: 0,
+    handlerContextParameter: 1,
+    deliveryPolicy: { module: "stage4-events.ts", exportName: deliveryPolicy },
+    deliveryErrorParameter: 0,
   };
 }
 
@@ -677,6 +722,226 @@ describe("Stage 2 union rules", () => {
     ]);
   });
 
+  test("registers exact heartbeat and request-cache lifecycle Result boundaries", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    const modules = new Set([
+      "src/heartbeat/heartbeat-service.ts",
+      "src/tool-server/request-message-cache.ts",
+    ]);
+
+    expect(core?.operationalResultApis.filter((api) => modules.has(api.module))).toEqual([
+      {
+        module: "src/heartbeat/heartbeat-service.ts",
+        exportName: "startHeartbeatService.startHeartbeatLifecycleResult",
+      },
+      {
+        module: "src/heartbeat/heartbeat-service.ts",
+        exportName: "startHeartbeatService.stopHeartbeatLifecycleResult",
+      },
+      {
+        module: "src/tool-server/request-message-cache.ts",
+        exportName: "createRequestMessageCache.startRequestMessageCacheResult",
+      },
+      {
+        module: "src/tool-server/request-message-cache.ts",
+        exportName: "createRequestMessageCache.stopRequestMessageCacheResult",
+      },
+    ]);
+    expect(
+      core?.exceptionAdapters
+        .filter((adapter) => modules.has(adapter.identity.module))
+        .map((adapter) => ({
+          identity: adapter.identity,
+          category: adapter.category,
+          externalApi: adapter.externalApi,
+          direction: adapter.direction,
+        })),
+    ).toEqual([
+      {
+        identity: {
+          module: "src/heartbeat/heartbeat-service.ts",
+          exportName: "adaptHeartbeatLifecycleStartResultToHost",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "startHeartbeatService",
+        },
+        direction: "signal-host",
+      },
+      {
+        identity: {
+          module: "src/heartbeat/heartbeat-service.ts",
+          exportName: "adaptHeartbeatLifecycleStopResultToHost",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "HeartbeatService.stop",
+        },
+        direction: "signal-host",
+      },
+      {
+        identity: {
+          module: "src/tool-server/request-message-cache.ts",
+          exportName: "adaptRequestMessageCacheStartResultToHost",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "createRequestMessageCache",
+        },
+        direction: "signal-host",
+      },
+      {
+        identity: {
+          module: "src/tool-server/request-message-cache.ts",
+          exportName: "adaptRequestMessageCacheStopResultToHost",
+        },
+        category: "result-to-framework",
+        externalApi: {
+          package: "@stanley2058/lilac-core",
+          exportName: "RequestMessageCache.stop",
+        },
+        direction: "signal-host",
+      },
+    ]);
+  });
+
+  test("registers workflow action and projector Result boundaries", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    const operationalNames = core?.operationalResultApis.map(
+      (api) => `${api.module}#${api.exportName}`,
+    );
+    expect(core?.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/workflow/workflow-action-resolver.ts",
+        exportName: "decodeWorkflowActionOutboxEvent",
+      },
+      category: "persistence",
+    });
+    expect(core?.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/workflow/workflow-action-resolver.ts",
+        exportName: "decodeWorkflowSurfaceAction",
+      },
+      category: "projection",
+    });
+    for (const identity of [
+      "src/workflow/workflow-action-resolver.ts#captureWorkflowActionOutboxPublication",
+      "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
+      "src/workflow/workflow-action-resolver.ts#startWorkflowActionResolver.stopWorkflowActionSubscriptionResult",
+      "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.startWorkflowProgressSubscriptionResult",
+      "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.stopWorkflowProgressSubscriptionResult",
+    ]) {
+      expect(operationalNames).toContain(identity);
+    }
+    for (const exportName of [
+      "adaptWorkflowActionSubscriptionStartResultToHost",
+      "adaptWorkflowActionSubscriptionStopResultToHost",
+      "adaptWorkflowProgressSubscriptionStartResultToHost",
+      "adaptWorkflowProgressSubscriptionStopResultToHost",
+    ]) {
+      expect(core?.exceptionAdapters).toContainEqual(
+        expect.objectContaining({
+          identity: expect.objectContaining({ exportName }),
+          category: "result-to-framework",
+          direction: "signal-host",
+        }),
+      );
+    }
+    expect(
+      core?.exceptionAdapters
+        .filter(
+          (adapter) =>
+            adapter.identity.module === "src/workflow/workflow-action-resolver.ts" &&
+            adapter.identity.exportName === "captureWorkflowActionOutboxPublication",
+        )
+        .map((adapter) => ({
+          category: adapter.category,
+          direction: adapter.direction,
+          externalApi: adapter.externalApi,
+        })),
+    ).toEqual([
+      {
+        category: "defect-supervisor",
+        direction: "observe-panic",
+        externalApi: { package: "better-result", exportName: "Panic.is" },
+      },
+      {
+        category: "external-to-result",
+        direction: "capture-external",
+        externalApi: {
+          package: "@stanley2058/lilac-event-bus",
+          exportName: "LilacBus.publish",
+        },
+      },
+    ]);
+  });
+
+  test("registers workflow wait resolver Result and exception boundaries", () => {
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/core",
+    );
+    const operationalNames = core?.operationalResultApis.map(
+      (api) => `${api.module}#${api.exportName}`,
+    );
+    for (const exportName of [
+      "startWorkflowWaitResolverResult",
+      "acquireLeaseResult",
+      "startWorkflowWaitSubscriptionResult",
+      "captureWorkflowWaitResolverTrim",
+      "captureWorkflowWaitResolverConsumerGroupRetirement",
+      "failWorkflowWaitResolverActivation",
+      "activateSubscriptionResult",
+      "recoverSubscriptionResult",
+      "stopWorkflowWaitSubscriptionResult",
+      "stopWorkflowWaitResolverResult",
+      "captureWorkflowWaitResolverBarrierPublication",
+      "reconcileTimersResult",
+      "captureWorkflowWaitResolverWakeupPublication",
+    ]) {
+      expect(operationalNames).toContain(
+        `src/workflow/workflow-wait-resolver.ts#WorkflowWaitResolver.${exportName}`,
+      );
+    }
+    for (const exportName of [
+      "adaptWorkflowWaitResolverStartResultToHost",
+      "adaptWorkflowWaitResolverStopResultToHost",
+    ]) {
+      expect(core?.exceptionAdapters).toContainEqual(
+        expect.objectContaining({
+          identity: {
+            module: "src/workflow/workflow-wait-resolver.ts",
+            exportName,
+          },
+          category: "result-to-framework",
+          direction: "signal-host",
+        }),
+      );
+    }
+    for (const exportName of [
+      "WorkflowWaitResolver.captureWorkflowWaitResolverTrim",
+      "WorkflowWaitResolver.captureWorkflowWaitResolverConsumerGroupRetirement",
+      "WorkflowWaitResolver.captureWorkflowWaitResolverBarrierPublication",
+      "WorkflowWaitResolver.captureWorkflowWaitResolverWakeupPublication",
+    ]) {
+      expect(
+        core?.exceptionAdapters
+          .filter(
+            (adapter) =>
+              adapter.identity.module === "src/workflow/workflow-wait-resolver.ts" &&
+              adapter.identity.exportName === exportName,
+          )
+          .map((adapter) => adapter.category),
+      ).toEqual(["defect-supervisor", "external-to-result"]);
+    }
+  });
+
   test("registers exact Stage 3 decoders, opaque inputs, capabilities, and adapters", () => {
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/core",
@@ -978,7 +1243,7 @@ describe("Stage 2 union rules", () => {
     });
   });
 
-  test("keeps every declared Stage 3 module out of semantic and syntax baselines", () => {
+  test("keeps every manifest-owned Stage 3 zero-baseline scope debt-free", () => {
     const semanticBaselines: readonly ArchitectureBaseline[] = [
       boundaryValidationBaseline,
       failureFlowBaseline,
@@ -990,20 +1255,35 @@ describe("Stage 2 union rules", () => {
       readonly semanticDebt: readonly BaselineEntry[];
       readonly syntaxDebt: readonly SyntaxBaselineEntry[];
     }> = [];
-    for (const [workspace, modules] of STAGE_3_MODULES) {
+    for (const workspacePolicy of architectureManifest.workspaces) {
+      const workspace = workspacePolicy.name;
       const semanticEntries = semanticBaselines.flatMap((baseline) =>
         Object.values(baseline[workspace] ?? {}).flatMap((entries) => entries ?? []),
       );
       const syntaxEntries = Object.values(typedSyntaxBaseline[workspace] ?? {}).flatMap(
         (entries) => entries ?? [],
       );
-      for (const module of modules) {
+      for (const scope of workspacePolicy.zeroBaselineScopes) {
+        const typedScope: ZeroBaselineScope = scope;
+        const module = scope.module;
         const syntaxModule = module.replace(/\.(?:[cm]?[jt]sx?)$/u, "");
         const moduleDebt = {
           workspace,
           module,
-          semanticDebt: semanticEntries.filter((entry) => entry.location.file === module),
-          syntaxDebt: syntaxEntries.filter((entry) => entry.module === syntaxModule),
+          semanticDebt: semanticEntries.filter(
+            (entry) =>
+              entry.location.file === module &&
+              zeroBaselineScopeOwns(
+                typedScope,
+                entry.location.file,
+                entry.identity.slice(entry.identity.indexOf("#") + 1).split("[")[0] ?? "",
+              ),
+          ),
+          syntaxDebt: syntaxEntries.filter(
+            (entry) =>
+              entry.module === syntaxModule &&
+              zeroBaselineScopeOwns(typedScope, entry.module, entry.symbol),
+          ),
         };
         if (moduleDebt.semanticDebt.length || moduleDebt.syntaxDebt.length) {
           stage3Debt.push(moduleDebt);
@@ -1061,6 +1341,442 @@ describe("Stage 2 union rules", () => {
     expect(isProductionFileName(path.join(root, "__tests__/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "src/generated/output.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "src/fixtures/production.ts"), root)).toBeFalse();
+  });
+});
+
+describe("Stage 4 event architecture rules", () => {
+  test("registers enforced production foundations and a migrated exhaustive family partition", () => {
+    const eventBus = architectureManifest.workspaces.find(
+      (workspace) => workspace.name === "packages/event-bus",
+    );
+    if (!eventBus) throw new Error("event-bus workspace missing");
+
+    expect(eventBus.eventCodecRegistries).toHaveLength(1);
+    expect(eventBus.eventCodecRegistries[0]).toMatchObject({
+      status: "enforced",
+      identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
+      canonicalEvents: { module: "lilac-spec.ts", exportName: "lilacEventTypes" },
+    });
+    expect(eventBus.rawEventMessageBoundaries).toContainEqual(
+      expect.objectContaining({
+        status: "enforced",
+        identity: { module: "raw-bus.ts", exportName: "RawBus.subscribe" },
+        handlerParameter: 2,
+        messageParameter: 0,
+      }),
+    );
+    expect(eventBus.eventDeliveryApis).toContainEqual(
+      expect.objectContaining({
+        status: "enforced",
+        identity: { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
+        handlerParameter: 2,
+        handlerMessageParameter: 0,
+        handlerContextParameter: 1,
+      }),
+    );
+    expect(eventBus.eventFamilyMigrations.map((family) => family.family)).toEqual([
+      "command-request",
+      "workflow-control",
+      "lifecycle",
+      "adapter",
+      "surface",
+      "agent-output",
+    ]);
+    expect(eventBus.eventFamilyMigrations.every((family) => family.status === "migrated")).toBe(
+      true,
+    );
+    expect(eventBus.eventCodecRegistries[0]?.canonicalMembers).toHaveLength(25);
+    expect(eventBus.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "core-primary-lineage.ts",
+        exportName: "decodeCorePrimaryLineageV1",
+      },
+      category: "projection",
+    });
+    expect(eventBus.exceptionAdapters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          identity: {
+            module: "event-dead-letter.ts",
+            exportName: "checkedDeadLetterAcceptance",
+          },
+          category: "defect-supervisor",
+          direction: "observe-panic",
+        }),
+        expect.objectContaining({
+          identity: {
+            module: "core-primary-lineage.ts",
+            exportName: "decodeCorePrimaryLineageV1",
+          },
+          category: "defect-supervisor",
+          direction: "observe-panic",
+        }),
+        expect.objectContaining({
+          identity: {
+            module: "redis-event-dead-letter.ts",
+            exportName: "RedisEventDeadLetter.constructor",
+          },
+          category: "compatibility",
+          direction: "signal-host",
+        }),
+      ]),
+    );
+    expect(
+      eventBus.eventFamilyMigrations.every((family) => family.zeroBaselineScopes.length > 0),
+    ).toBe(true);
+    const core = architectureManifest.workspaces.find(
+      (workspace) => workspace.name === "apps/core",
+    );
+    if (!core) throw new Error("core workspace missing");
+    expect(core.eventDeliveryConsumers).toHaveLength(13);
+    expect(core.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/surface/bridge/bus-agent-runner/raw.ts",
+        exportName: "parseRequestControlFromRaw",
+      },
+      category: "projection",
+    });
+    expect(
+      core.eventDeliveryConsumers.every((consumer) =>
+        core.zeroBaselineScopes.some(
+          (scope) =>
+            scope.module === consumer.identity.module &&
+            (scope as ZeroBaselineScope).symbol === consumer.identity.exportName,
+        ),
+      ),
+    ).toBe(true);
+    expect(core.eventDeliveryConsumers).toContainEqual(
+      expect.objectContaining({
+        identity: {
+          module: "src/workflow/workflow-engine.ts",
+          exportName: "WorkflowEngine.startWakeSubscription",
+        },
+        operations: ["subscribeTopic"],
+      }),
+    );
+    expect(core.operationalResultApis).toEqual(
+      expect.arrayContaining([
+        {
+          module: "src/workflow/workflow-engine.ts",
+          exportName: "WorkflowEngine.startWakeSubscription",
+        },
+        { module: "src/workflow/workflow-engine.ts", exportName: "runWorkflowTimerTick" },
+        {
+          module: "src/workflow/workflow-engine.ts",
+          exportName: "captureWorkflowTerminalReceiptAdoption",
+        },
+        {
+          module: "src/workflow/workflow-engine.ts",
+          exportName: "captureWorkflowIdleCancellationPublication",
+        },
+        { module: "src/workflow/workflow-engine.ts", exportName: "fetchWorkflowTerminalReceipt" },
+      ]),
+    );
+    expect(core.exceptionAdapters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          identity: {
+            module: "src/workflow/workflow-engine.ts",
+            exportName: "requireWorkflowEngineSubscriptionStart",
+          },
+          category: "result-to-framework",
+          direction: "signal-host",
+        }),
+        expect.objectContaining({
+          identity: {
+            module: "src/workflow/workflow-engine.ts",
+            exportName: "runWorkflowTimerTick",
+          },
+          category: "defect-supervisor",
+          direction: "observe-panic",
+        }),
+      ]),
+    );
+    for (const exportName of [
+      "captureWorkflowTerminalReceiptAdoption",
+      "captureWorkflowIdleCancellationPublication",
+    ]) {
+      expect(
+        core.exceptionAdapters
+          .filter(
+            (adapter) =>
+              adapter.identity.module === "src/workflow/workflow-engine.ts" &&
+              adapter.identity.exportName === exportName,
+          )
+          .map((adapter) => adapter.category),
+      ).toEqual(["defect-supervisor", "external-to-result"]);
+    }
+    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
+  });
+
+  test("checks family exhaustiveness, overlap, codec coverage, zero scopes, and parameter indexes", () => {
+    const registry = fixtureCodecRegistry("completeFixtureEventCodecs");
+    const validWorkspace = {
+      ...BASE_WORKSPACE,
+      zeroBaselineScopes: [{ module: "stage4-events.ts", symbol: "FixtureDeliveryApi.good" }],
+      eventCodecRegistries: [registry],
+      eventDeliveryApis: [
+        fixtureDeliveryApi("FixtureDeliveryApi.good", "exhaustiveDeliveryPolicy"),
+      ],
+      eventFamilyMigrations: [
+        {
+          family: "alpha",
+          status: "migrated" as const,
+          codecRegistry: registry.identity,
+          members: ["fixture.alpha"],
+          zeroBaselineScopes: [
+            {
+              workspace: "fixture",
+              module: "stage4-events.ts",
+              symbol: "FixtureDeliveryApi.good",
+            },
+          ],
+        },
+        {
+          family: "remaining",
+          status: "advisory" as const,
+          codecRegistry: registry.identity,
+          members: ["fixture.beta", "fixture.gamma"],
+          zeroBaselineScopes: [],
+        },
+      ],
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [validWorkspace] }),
+    ).not.toThrow();
+
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...validWorkspace,
+            eventFamilyMigrations: [
+              ...validWorkspace.eventFamilyMigrations,
+              {
+                family: "overlap",
+                status: "advisory",
+                codecRegistry: registry.identity,
+                members: ["fixture.alpha"],
+                zeroBaselineScopes: [],
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("must not overlap");
+
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...validWorkspace,
+            eventFamilyMigrations: validWorkspace.eventFamilyMigrations.slice(0, 1),
+          },
+        ],
+      }),
+    ).toThrow("not exhaustive");
+
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...validWorkspace,
+            eventCodecRegistries: [{ ...registry, status: "advisory", codecMembers: [] }],
+          },
+        ],
+      }),
+    ).toThrow("lacks codec coverage");
+
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...validWorkspace,
+            rawEventMessageBoundaries: [
+              { ...fixtureRawBoundary("RawFixtureBus.receiveGood"), handlerParameter: -1 },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("handlerParameter must be a nonnegative integer");
+  });
+
+  test("requires the exact canonical codec registry to be complete", () => {
+    const complete = findingsFor("architecture/complete-event-codec-registry", "stage4-events.ts", {
+      eventCodecRegistries: [fixtureCodecRegistry("completeFixtureEventCodecs")],
+    });
+    const incomplete = findingsFor(
+      "architecture/complete-event-codec-registry",
+      "stage4-events.ts",
+      { eventCodecRegistries: [fixtureCodecRegistry("incompleteFixtureEventCodecs")] },
+    );
+
+    expect(complete).toEqual([]);
+    expect(incomplete).toHaveLength(1);
+    expect(incomplete[0]?.message).toContain("fixture.gamma");
+  });
+
+  test("requires raw receive handlers to expose Message<unknown> without specialization assertions", () => {
+    const good = findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+      rawEventMessageBoundaries: [fixtureRawBoundary("RawFixtureBus.receiveGood")],
+    });
+    const typed = findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+      rawEventMessageBoundaries: [fixtureRawBoundary("RawFixtureBus.receiveTyped")],
+    });
+    const asserted = findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+      rawEventMessageBoundaries: [fixtureRawBoundary("RawFixtureBus.receiveWithAssertion")],
+    });
+    const generic = findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+      rawEventMessageBoundaries: [fixtureRawBoundary("RawFixtureBus.receiveGeneric")],
+    });
+    const commit = findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+      rawEventMessageBoundaries: [fixtureRawBoundary("RawFixtureBus.receiveWithCommit")],
+    });
+
+    expect(good).toEqual([]);
+    expect(typed).toHaveLength(1);
+    expect(typed[0]?.message).toContain("Message<unknown>");
+    expect(asserted).toHaveLength(1);
+    expect(asserted[0]?.message).toContain("assertion");
+    expect(generic.some((finding) => finding.message.includes("generic"))).toBe(true);
+    expect(commit.some((finding) => finding.message.includes("context exposes commit"))).toBe(true);
+  });
+
+  test("rejects future legacy raw delivery aliases", () => {
+    const findings = findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+      rawEventMessageBoundaries: [fixtureRawBoundary("LegacyRawFixtureBus.receiveGood")],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("subscribeDelivery");
+  });
+
+  test("requires Result-returning handlers and removes handler-owned commit", () => {
+    const good = findingsFor("architecture/event-handler-result", "stage4-events.ts", {
+      eventDeliveryApis: [
+        fixtureDeliveryApi("FixtureDeliveryApi.good", "exhaustiveDeliveryPolicy"),
+      ],
+    });
+    const bad = findingsFor("architecture/event-handler-result", "stage4-events.ts", {
+      eventDeliveryApis: [fixtureDeliveryApi("FixtureDeliveryApi.bad", "exhaustiveDeliveryPolicy")],
+    });
+
+    expect(good).toEqual([]);
+    expect(bad).toHaveLength(1);
+    expect(bad[0]?.message).toContain("handler context exposes commit");
+    expect(bad[0]?.message).toContain("Promise<Result<void, E>>");
+  });
+
+  test("rejects future legacy delivery API aliases", () => {
+    const findings = findingsFor("architecture/event-handler-result", "stage4-events.ts", {
+      eventDeliveryApis: [
+        fixtureDeliveryApi("LegacyFixtureDeliveryApi.good", "exhaustiveDeliveryPolicy"),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.message).toContain("subscribeTopicResult");
+  });
+
+  test("fails closed for unregistered production Result consumers", () => {
+    const registered = {
+      identity: { module: "stage4-events.ts", exportName: "registeredFixtureConsumer" },
+      apiPackage: "architecture-fixture",
+      operations: ["subscribeTopic"] as const,
+    };
+    const unregistered = {
+      identity: { module: "stage4-events.ts", exportName: "unregisteredFixtureConsumer" },
+      apiPackage: "architecture-fixture",
+      operations: ["fetchTopic"] as const,
+    };
+    expect(() =>
+      findingsFor("architecture/event-handler-result", "stage4-events.ts", {
+        eventDeliveryConsumers: [registered, unregistered],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      findingsFor("architecture/event-handler-result", "stage4-events.ts", {
+        eventDeliveryConsumers: [registered],
+      }),
+    ).toThrow("Unregistered event delivery consumer");
+  });
+
+  test("scans workspaces with no local registrations for consumers of manifest APIs", () => {
+    const apiWorkspace = {
+      ...BASE_WORKSPACE,
+      name: "fixture-event-api",
+      packageName: "fixture-event-api",
+      root: "scripts/architecture/fixtures/stage4-event-api",
+      tsconfig: "scripts/architecture/fixtures/stage4-event-api/tsconfig.json",
+      ruleZones: {
+        "architecture/event-handler-result": [{ include: "api.ts" }],
+        "architecture/event-delivery-policy-exhaustiveness": [{ include: "api.ts" }],
+      },
+      eventDeliveryApis: [
+        {
+          status: "advisory",
+          identity: { module: "api.ts", exportName: "FixtureEventBus.subscribeTopic" },
+          handlerParameter: 0,
+          handlerMessageParameter: 0,
+          handlerContextParameter: 1,
+          deliveryPolicy: { module: "api.ts", exportName: "fixtureDeliveryPolicy" },
+          deliveryErrorParameter: 0,
+        },
+      ],
+    } as const satisfies WorkspaceArchitecture;
+    const consumerWorkspace = {
+      ...BASE_WORKSPACE,
+      name: "fixture-event-consumer",
+      packageName: "fixture-event-consumer",
+      root: "scripts/architecture/fixtures/stage4-event-consumer",
+      tsconfig: "scripts/architecture/fixtures/stage4-event-consumer/tsconfig.json",
+    } as const satisfies WorkspaceArchitecture;
+
+    expect(() =>
+      analyzeArchitecture(REPOSITORY_ROOT, {
+        version: 1,
+        workspaces: [apiWorkspace, consumerWorkspace],
+      }),
+    ).toThrow(
+      "Unregistered event delivery consumer in fixture-event-consumer: consumer.ts#unregisteredCrossWorkspaceConsumer calls fixture-event-api#subscribeTopic.",
+    );
+  });
+
+  test("requires an exhaustive registered delivery policy", () => {
+    const good = findingsFor(
+      "architecture/event-delivery-policy-exhaustiveness",
+      "stage4-events.ts",
+      {
+        eventDeliveryApis: [
+          fixtureDeliveryApi("FixtureDeliveryApi.good", "exhaustiveDeliveryPolicy"),
+        ],
+      },
+    );
+    const bad = findingsFor(
+      "architecture/event-delivery-policy-exhaustiveness",
+      "stage4-events.ts",
+      {
+        eventDeliveryApis: [
+          fixtureDeliveryApi("FixtureDeliveryApi.good", "incompleteDeliveryPolicy"),
+        ],
+      },
+    );
+
+    expect(good).toEqual([]);
+    expect(bad).toHaveLength(1);
+    expect(bad[0]?.message).toContain("DeadLetterFailed");
+  });
+
+  test("fails closed when an enforced event registration drifts", () => {
+    expect(() =>
+      findingsFor("architecture/raw-event-message-boundary", "stage4-events.ts", {
+        rawEventMessageBoundaries: [fixtureRawBoundary("RawFixtureBus.missing")],
+      }),
+    ).toThrow("must resolve to exactly one declaration; found 0");
   });
 });
 
@@ -1480,16 +2196,38 @@ describe("ratchet infrastructure", () => {
       boundary,
       {},
       new Set(),
-      new Map([["fixture", ["domain.ts"]]]),
+      new Map([["fixture", [{ module: "domain.ts" }]]]),
     );
     expect(
       migratedModule.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
     ).toBeTrue();
     expect(
       migratedModule.diagnostics.some((diagnostic) =>
-        diagnostic.message.includes("Migrated module"),
+        diagnostic.message.includes("Zero-baseline scope"),
       ),
     ).toBeTrue();
+
+    const baselineEntry = boundary.fixture?.[finding.rule]?.[0];
+    if (!baselineEntry) throw new Error("fixture baseline entry missing");
+    const scopedBaseline = {
+      fixture: {
+        [finding.rule]: [
+          { ...baselineEntry, identity: "domain.ts#run.child" },
+          { ...baselineEntry, identity: "domain.ts#runner" },
+        ],
+      },
+    } satisfies ArchitectureBaseline;
+    const scoped = applyBaselines(
+      [],
+      scopedBaseline,
+      {},
+      new Set(),
+      new Map([["fixture", [{ module: "domain.ts", symbol: "run" }]]]),
+    );
+    expect(scoped.diagnostics.map((diagnostic) => diagnostic.severity)).toEqual([
+      "error",
+      "warning",
+    ]);
   });
 
   test("creates exactly one Program per active workspace", () => {

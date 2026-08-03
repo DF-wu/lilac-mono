@@ -1,17 +1,20 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createLilacBus,
+  lilacEventTypes,
   type FetchOptions,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
+  type RawDeliveryAction,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
+import { Panic } from "better-result";
 
+import { subscribeForTest, type TestRawMessageHandler } from "../helpers/result-raw-bus";
 import type {
   AdapterEventHandler,
   SurfaceAdapter,
@@ -36,24 +39,55 @@ const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
 class CapturingRawBus implements RawBus {
+  readonly subscribe = subscribeForTest;
   readonly publishedOutboxIds: string[] = [];
+  commits = 0;
+  onCommit: (() => void) | null = null;
+  outboxPublicationFailure: Error | null = null;
+  subscriptionStopFailure: Error | null = null;
+  private sequence = 0;
+  private readonly subscriptions: Array<{
+    topic: string;
+    handler: TestRawMessageHandler;
+  }> = [];
 
-  async publish<TData>(_message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
+  async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
     const outboxId = options.headers?.["workflow_outbox_id"];
+    if (outboxId && this.outboxPublicationFailure) throw this.outboxPublicationFailure;
     if (outboxId) this.publishedOutboxIds.push(outboxId);
-    return { id: "1-0", cursor: "1-0" };
+    const id = `${++this.sequence}-0`;
+    const stored: Message<unknown> = { ...message, id, ts: Date.now() };
+    for (const subscription of this.subscriptions) {
+      if (subscription.topic !== message.topic) continue;
+      await subscription.handler(stored, id);
+    }
+    return { id, cursor: id };
   }
 
-  async subscribe<TData>(
-    _topic: string,
+  async openTestSubscription(
+    topic: string,
     _options: SubscriptionOptions,
-    _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
+    handler: TestRawMessageHandler,
   ) {
-    return { stop: async () => {} };
+    const subscription = { topic, handler };
+    this.subscriptions.push(subscription);
+    return {
+      stop: async () => {
+        if (this.subscriptionStopFailure) throw this.subscriptionStopFailure;
+        const index = this.subscriptions.indexOf(subscription);
+        if (index >= 0) this.subscriptions.splice(index, 1);
+      },
+    };
   }
 
-  async fetch<TData>(_topic: string, _options: FetchOptions) {
-    return { messages: [] as Array<{ msg: Message<TData>; cursor: string }> };
+  onTestDeliveryAction(action: RawDeliveryAction): void {
+    if (action.disposition !== "commit" && action.disposition !== "dead-letter") return;
+    this.commits += 1;
+    this.onCommit?.();
+  }
+
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
   }
 
   async close() {}
@@ -376,6 +410,46 @@ describe("WorkflowProgressProjector", () => {
     }
   });
 
+  it("schedules an event projection before transport commit", async () => {
+    const dbPath = tempDbPath("workflow-schedule-before-commit");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter();
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["discord", adapter]]),
+      subscriptionId: "schedule-before-commit",
+      coalesceMs: 1_000_000,
+    });
+    const order: string[] = [];
+    const requestProjection = projector.requestProjection.bind(projector);
+    const requestSpy = spyOn(projector, "requestProjection").mockImplementation((runId) => {
+      order.push("schedule");
+      requestProjection(runId);
+    });
+    raw.onCommit = () => order.push("commit");
+    try {
+      createInvocation(store);
+      await projector.start();
+      order.length = 0;
+      await bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+        runId: "run-1",
+        revisionId: "revision-1",
+        reason: "reconcile",
+        ts: 20,
+      });
+      expect(order).toEqual(["schedule", "commit"]);
+    } finally {
+      requestSpy.mockRestore();
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("reconciles targeted runs at startup and recreates a missing bound card", async () => {
     const dbPath = tempDbPath("workflow-startup-reconcile");
     let store = new DurableWorkflowStore(dbPath);
@@ -668,6 +742,186 @@ describe("WorkflowProgressProjector", () => {
     } finally {
       await resolver?.stop();
       await initialProjector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("records external action outbox publication failures for durable retry", async () => {
+    const dbPath = tempDbPath("workflow-action-outbox-publication-failure");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter();
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["discord", adapter]]),
+      subscriptionId: "outbox-publication-failure-projector",
+      now: () => 20,
+    });
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    let resolver: Awaited<ReturnType<typeof startWorkflowActionResolver>> | null = null;
+    try {
+      createInvocation(store);
+      const messageRef = await projector.ensureInitialCard("run-1");
+      expect(
+        store.applySurfaceAction({
+          tokenSha256: sha256(actionToken(adapter, "Pause")),
+          platform: "discord",
+          userId: "user-1",
+          messageRef,
+          now: 21,
+        }).status,
+      ).toBe("applied");
+      raw.outboxPublicationFailure = new Error("outbox transport unavailable");
+
+      resolver = await startWorkflowActionResolver({
+        bus,
+        store,
+        subscriptionId: "outbox-publication-failure",
+        now: () => 30,
+      });
+
+      expect(store.listPendingActionOutboxEvents(10_000)).toHaveLength(2);
+      expect(store.listPendingActionOutboxEvents(10_000)[0]).toMatchObject({
+        attemptCount: 1,
+        lastError: "Workflow action outbox publication failed",
+      });
+    } finally {
+      warning.mockRestore();
+      await resolver?.stop();
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("preserves Panic identity from action outbox publication", async () => {
+    const dbPath = tempDbPath("workflow-action-outbox-panic");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter();
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const projector = new WorkflowProgressProjector({
+      bus,
+      store,
+      adapters: new Map([["discord", adapter]]),
+      subscriptionId: "outbox-panic-projector",
+      now: () => 20,
+    });
+    const panic = new Panic({ message: "outbox publication defect" });
+    try {
+      createInvocation(store);
+      const messageRef = await projector.ensureInitialCard("run-1");
+      expect(
+        store.applySurfaceAction({
+          tokenSha256: sha256(actionToken(adapter, "Pause")),
+          platform: "discord",
+          userId: "user-1",
+          messageRef,
+          now: 21,
+        }).status,
+      ).toBe("applied");
+      raw.outboxPublicationFailure = panic;
+
+      await expect(
+        startWorkflowActionResolver({
+          bus,
+          store,
+          subscriptionId: "outbox-panic",
+          now: () => 30,
+        }),
+      ).rejects.toBe(panic);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("adapts action and projector subscription lifecycle Result failures", async () => {
+    const dbPath = tempDbPath("workflow-subscription-result-adapters");
+    const store = new DurableWorkflowStore(dbPath);
+    const startFailureRaw = new CapturingRawBus();
+    Reflect.deleteProperty(startFailureRaw, "subscribe");
+    const startFailureBus = createLilacBus(startFailureRaw);
+    const projector = new WorkflowProgressProjector({
+      bus: startFailureBus,
+      store,
+      adapters: new Map(),
+      subscriptionId: "projector-start-result-failure",
+    });
+    try {
+      await expect(
+        startWorkflowActionResolver({
+          bus: startFailureBus,
+          store,
+          subscriptionId: "action-start-result-failure",
+        }),
+      ).rejects.toMatchObject({ _tag: "EventDeliveryStartFailed" });
+      await expect(projector.start()).rejects.toMatchObject({ _tag: "EventDeliveryStartFailed" });
+
+      const stopFailureRaw = new CapturingRawBus();
+      const stopFailureBus = createLilacBus(stopFailureRaw);
+      const actionResolver = await startWorkflowActionResolver({
+        bus: stopFailureBus,
+        store,
+        subscriptionId: "action-stop-result-failure",
+      });
+      const stoppingProjector = new WorkflowProgressProjector({
+        bus: stopFailureBus,
+        store,
+        adapters: new Map(),
+        subscriptionId: "projector-stop-result-failure",
+      });
+      await stoppingProjector.start();
+      stopFailureRaw.subscriptionStopFailure = new Error("subscription cleanup unavailable");
+      await expect(actionResolver.stop()).rejects.toMatchObject({
+        _tag: "EventDeliveryStopFailed",
+      });
+      await expect(stoppingProjector.stop()).rejects.toMatchObject({
+        _tag: "EventDeliveryStopFailed",
+      });
+      await stopFailureBus.close();
+    } finally {
+      await startFailureBus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("commits an authenticated action rejected by owner validation", async () => {
+    const dbPath = tempDbPath("workflow-malformed-action-commit");
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const resolver = await startWorkflowActionResolver({
+      bus,
+      store,
+      subscriptionId: "malformed-action-commit",
+      now: () => 20,
+    });
+    try {
+      await bus.publish(lilacEventTypes.EvtAdapterActionInvoked, {
+        actionId: "malformed-action-token",
+        platform: "discord",
+        userId: "user-1",
+        messageRef: {
+          platform: "github",
+          channelId: "issue-1",
+          messageId: "comment-1",
+        },
+        ts: 20,
+      });
+      expect(raw.commits).toBe(1);
+    } finally {
+      warning.mockRestore();
+      await resolver.stop();
       await bus.close();
       store.close();
       rmSync(dbPath, { force: true });

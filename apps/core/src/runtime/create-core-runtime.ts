@@ -22,11 +22,17 @@ import {
 import path from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   createLilacBus,
   createRedisStreamsBus,
   lilacEventTypes,
+  RedisEventDeadLetter,
+  type CreateLilacBusOptions,
+  type EventDeliveryFatalReporter,
+  type EventDeliveryDoneError,
+  type EventDeliveryLogContext,
+  type EventDeliveryLogger,
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
 
@@ -35,7 +41,7 @@ import { GithubAdapter } from "../surface/github/github-adapter";
 import type { SurfaceAdapter } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../surface/bridge/subscribe-from-bus";
-import { startBusRequestRouter } from "../surface/bridge/bus-request-router";
+import { startBusRequestRouter, type BusRequestRouter } from "../surface/bridge/bus-request-router";
 import {
   resolveAgentRunModel,
   resolveAgentRunModelFallbacks,
@@ -102,6 +108,7 @@ import {
 import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plugins";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
+import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import { createToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
@@ -134,6 +141,440 @@ export type CoreRuntimeOptions = {
   onUnhealthy?: (snapshot: ToolServerHealthSnapshot) => void | Promise<void>;
   reportFatalError: (error: Error) => void;
 };
+
+type CoreEventBusLogSink = {
+  warn(message: string, context: EventDeliveryLogContext): void;
+  error(message: string, context: EventDeliveryLogContext): void;
+};
+
+const CORE_EVENT_BUS_LOG_FIELDS = [
+  "topic",
+  "cursor",
+  "source",
+  "stage",
+  "eventType",
+  "mode",
+  "phase",
+] as const satisfies readonly (keyof EventDeliveryLogContext)[];
+
+function redactEventDeliveryLogContext(context: EventDeliveryLogContext): EventDeliveryLogContext {
+  const redacted: Record<string, string | number | boolean | undefined> = {};
+  for (const field of CORE_EVENT_BUS_LOG_FIELDS) {
+    if (Object.hasOwn(context, field)) redacted[field] = context[field];
+  }
+  return redacted;
+}
+
+export function createCoreEventBusLogger(logger: CoreEventBusLogSink): EventDeliveryLogger {
+  return {
+    warn(event, context) {
+      logger.warn(event, redactEventDeliveryLogContext(context));
+    },
+    error(event, context) {
+      logger.error(event, redactEventDeliveryLogContext(context));
+    },
+  };
+}
+
+export function createCoreEventBusFatalReporter(
+  reportFatalError: (error: Error) => void,
+): EventDeliveryFatalReporter {
+  const reported = new WeakSet<Error>();
+  const normalizedDefects = new WeakMap<object, Error>();
+
+  return {
+    report(cause) {
+      let errorCause: Error | null = null;
+      try {
+        if (cause instanceof Error) errorCause = cause;
+      } catch {
+        // Hostile values are normalized below without inspecting them again.
+      }
+
+      let fatalError: Error;
+      if (errorCause) {
+        fatalError = errorCause;
+      } else if ((typeof cause === "object" && cause !== null) || typeof cause === "function") {
+        const existing = normalizedDefects.get(cause);
+        fatalError = existing ?? new Panic({ message: "Event delivery defect" });
+        if (!existing) normalizedDefects.set(cause, fatalError);
+      } else {
+        fatalError = new Panic({ message: "Event delivery defect" });
+      }
+      if (reported.has(fatalError)) return;
+      reported.add(fatalError);
+      reportFatalError(fatalError);
+    },
+  };
+}
+
+export function createCoreRuntimeFatalReporter(
+  reportFatalError: (error: Error) => void,
+): (error: Error) => void {
+  const reported = new WeakSet<Error>();
+  return (error) => {
+    if (reported.has(error)) return;
+    reported.add(error);
+    reportFatalError(error);
+  };
+}
+
+function normalizeRouterDoneDefect(cause: unknown): Error {
+  if (isPanic(cause)) return cause;
+  if (cause instanceof Error) return cause;
+  return new Panic({ message: "Bus request router subscription rejected" });
+}
+
+export function superviseCoreRouterDone(params: {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  readonly isStopping: () => boolean;
+  readonly markUnhealthy: () => void;
+  readonly reportFatalError: (error: Error) => void;
+}): Promise<void> {
+  const settled = params.done.then((done) => done, normalizeRouterDoneDefect);
+  return settled.then((outcome) => {
+    if (params.isStopping()) return;
+    params.markUnhealthy();
+    if (outcome instanceof Error) {
+      params.reportFatalError(outcome);
+      return;
+    }
+    if (outcome.status === "error") {
+      params.reportFatalError(outcome.error);
+      return;
+    }
+    params.reportFatalError(
+      new Panic({ message: "Bus request router subscriptions completed unexpectedly" }),
+    );
+  });
+}
+
+export function createCoreEventBusDeliveryOptions(params: {
+  readonly redis: Redis;
+  readonly deadLetterEncryptionKey: Uint8Array;
+  readonly logger: CoreEventBusLogSink;
+  readonly reportFatalError: (error: Error) => void;
+}): CreateLilacBusOptions {
+  return {
+    deadLetter: new RedisEventDeadLetter({
+      redis: params.redis,
+      encryptionKey: params.deadLetterEncryptionKey,
+    }),
+    logger: createCoreEventBusLogger(params.logger),
+    reportFatal: createCoreEventBusFatalReporter(params.reportFatalError),
+  };
+}
+
+type CoreEventBusRaw = ReturnType<typeof createRedisStreamsBus>;
+
+export class CoreEventBusSetupFailed extends TaggedError("CoreEventBusSetupFailed")<{
+  readonly operation:
+    | "read-config"
+    | "create-redis"
+    | "prepare-workspace"
+    | "load-dead-letter-key"
+    | "ping-redis"
+    | "create-raw-bus"
+    | "create-lilac-bus";
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CoreEventBusCleanupFailed extends TaggedError("CoreEventBusCleanupFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class CoreEventBusSetupAndCleanupFailed extends TaggedError(
+  "CoreEventBusSetupAndCleanupFailed",
+)<{
+  readonly setup: CoreEventBusSetupFailed;
+  readonly cleanup: CoreEventBusCleanupFailed;
+  readonly message: string;
+}> {}
+
+type CoreEventBusSetupError = CoreEventBusSetupFailed | CoreEventBusSetupAndCleanupFailed;
+
+type CoreEventBusResources = {
+  readonly redis: Redis;
+  readonly raw: CoreEventBusRaw;
+  readonly bus: LilacBus;
+  readonly canonicalWorkspaceRoot: string;
+};
+
+type CoreEventBusOwnership = {
+  readonly redis: Redis;
+  readonly raw: CoreEventBusRaw | null;
+  readonly bus: LilacBus | null;
+};
+
+function captureCoreRedisConstruction(
+  redisUrl: string,
+): ResultType<Redis, CoreEventBusSetupFailed> {
+  try {
+    return Result.ok(new Redis(redisUrl));
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreEventBusSetupFailed({
+        operation: "create-redis",
+        cause,
+        message: "Core event bus setup failed during create-redis",
+      }),
+    );
+  }
+}
+
+async function captureCoreWorkspacePreparation(
+  cwd: string,
+): Promise<ResultType<string, CoreEventBusSetupFailed>> {
+  try {
+    await fs.mkdir(cwd, { recursive: true });
+    return Result.ok(await fs.realpath(cwd));
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreEventBusSetupFailed({
+        operation: "prepare-workspace",
+        cause,
+        message: "Core event bus setup failed during prepare-workspace",
+      }),
+    );
+  }
+}
+
+async function captureCoreRedisConnection(
+  redis: Redis,
+): Promise<ResultType<void, CoreEventBusSetupFailed>> {
+  try {
+    await redis.ping();
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreEventBusSetupFailed({
+        operation: "ping-redis",
+        cause,
+        message: "Core event bus setup failed during ping-redis",
+      }),
+    );
+  }
+}
+
+function captureCoreRawBusConstruction(
+  redis: Redis,
+): ResultType<CoreEventBusRaw, CoreEventBusSetupFailed> {
+  try {
+    return Result.ok(
+      createRedisStreamsBus({
+        redis,
+        ownsRedis: true,
+        subscriberPool: {
+          // Blocking XREAD/XREADGROUP calls use capped, prewarmed dedicated connections.
+          max: 16,
+          warm: 8,
+          autoscale: {
+            enabled: true,
+            min: 16,
+            cap: 256,
+            cooldownMs: 30_000,
+          },
+        },
+      }),
+    );
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreEventBusSetupFailed({
+        operation: "create-raw-bus",
+        cause,
+        message: "Core event bus setup failed during create-raw-bus",
+      }),
+    );
+  }
+}
+
+function captureCoreLilacBusConstruction(params: {
+  readonly redis: Redis;
+  readonly raw: CoreEventBusRaw;
+  readonly deadLetterEncryptionKey: Uint8Array;
+  readonly logger: CoreEventBusLogSink;
+  readonly reportFatalError: (error: Error) => void;
+}): ResultType<LilacBus, CoreEventBusSetupFailed> {
+  try {
+    return Result.ok(
+      createLilacBus(
+        params.raw,
+        createCoreEventBusDeliveryOptions({
+          redis: params.redis,
+          deadLetterEncryptionKey: params.deadLetterEncryptionKey,
+          logger: params.logger,
+          reportFatalError: params.reportFatalError,
+        }),
+      ),
+    );
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreEventBusSetupFailed({
+        operation: "create-lilac-bus",
+        cause,
+        message: "Core event bus setup failed during create-lilac-bus",
+      }),
+    );
+  }
+}
+
+export async function captureCoreEventBusCleanup(
+  ownership: CoreEventBusOwnership,
+): Promise<ResultType<void, CoreEventBusCleanupFailed>> {
+  try {
+    if (ownership.bus) {
+      await ownership.bus.close();
+    } else if (ownership.raw) {
+      await ownership.raw.close();
+    } else {
+      await ownership.redis.quit();
+    }
+    return Result.ok(undefined);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreEventBusCleanupFailed({
+        cause,
+        message: "Core event bus cleanup failed",
+      }),
+    );
+  }
+}
+
+async function coreEventBusSetupFailureWithCleanup(
+  setup: CoreEventBusSetupFailed,
+  ownership: CoreEventBusOwnership,
+): Promise<ResultType<never, CoreEventBusSetupError>> {
+  const cleanup = await captureCoreEventBusCleanup(ownership);
+  if (cleanup.status === "ok") return Result.err(setup);
+  return Result.err(
+    new CoreEventBusSetupAndCleanupFailed({
+      setup,
+      cleanup: cleanup.error,
+      message: `${setup.message}; cleanup also failed`,
+    }),
+  );
+}
+
+export async function setupCoreEventBusResources(params: {
+  readonly redisUrl: string;
+  readonly cwd: string;
+  readonly dataDir: string;
+  readonly logger: CoreEventBusLogSink;
+  readonly reportFatalError: (error: Error) => void;
+  readonly dependencies?: {
+    readonly captureRedisConstruction?: typeof captureCoreRedisConstruction;
+    readonly loadDeadLetterKey?: (options: {
+      readonly dataDir: string;
+    }) => Promise<ResultType<Uint8Array, CoreDeadLetterKeyError>>;
+  };
+}): Promise<ResultType<CoreEventBusResources, CoreEventBusSetupError>> {
+  let redis: Redis | null = null;
+  let raw: CoreEventBusRaw | null = null;
+  let bus: LilacBus | null = null;
+  let cleanupAttempted = false;
+
+  try {
+    const redisCreated = (
+      params.dependencies?.captureRedisConstruction ?? captureCoreRedisConstruction
+    )(params.redisUrl);
+    if (redisCreated.status === "error") return Result.err(redisCreated.error);
+    redis = redisCreated.value;
+
+    const workspacePrepared = await captureCoreWorkspacePreparation(params.cwd);
+    if (workspacePrepared.status === "error") {
+      cleanupAttempted = true;
+      return await coreEventBusSetupFailureWithCleanup(workspacePrepared.error, {
+        redis,
+        raw,
+        bus,
+      });
+    }
+
+    const deadLetterKey = await (
+      params.dependencies?.loadDeadLetterKey ?? loadOrCreateCoreDeadLetterKey
+    )({ dataDir: params.dataDir });
+    if (deadLetterKey.status === "error") {
+      const setupError = new CoreEventBusSetupFailed({
+        operation: "load-dead-letter-key",
+        cause: deadLetterKey.error,
+        message: "Core event bus setup failed during load-dead-letter-key",
+      });
+      cleanupAttempted = true;
+      return await coreEventBusSetupFailureWithCleanup(setupError, { redis, raw, bus });
+    }
+
+    const redisConnected = await captureCoreRedisConnection(redis);
+    if (redisConnected.status === "error") {
+      cleanupAttempted = true;
+      return await coreEventBusSetupFailureWithCleanup(redisConnected.error, { redis, raw, bus });
+    }
+
+    const rawCreated = captureCoreRawBusConstruction(redis);
+    if (rawCreated.status === "error") {
+      cleanupAttempted = true;
+      return await coreEventBusSetupFailureWithCleanup(rawCreated.error, { redis, raw, bus });
+    }
+    raw = rawCreated.value;
+
+    const busCreated = captureCoreLilacBusConstruction({
+      redis,
+      raw,
+      deadLetterEncryptionKey: deadLetterKey.value,
+      logger: params.logger,
+      reportFatalError: params.reportFatalError,
+    });
+    if (busCreated.status === "error") {
+      cleanupAttempted = true;
+      return await coreEventBusSetupFailureWithCleanup(busCreated.error, { redis, raw, bus });
+    }
+    bus = busCreated.value;
+
+    return Result.ok({
+      redis,
+      raw,
+      bus,
+      canonicalWorkspaceRoot: workspacePrepared.value,
+    });
+  } catch (cause) {
+    if (!redis || cleanupAttempted) throw cause;
+    const ownedRedis = redis;
+    const setupPanic = isPanic(cause) ? cause : null;
+    const cleanup = createCoreRuntimeCleanupSupervisor(setupPanic);
+    await cleanup.run("eventBus.setup.close", async () => {
+      adaptCoreEventBusCleanupResultToHost(
+        await captureCoreEventBusCleanup({ redis: ownedRedis, raw, bus }),
+      );
+    });
+    if (cleanup.failures.length > 0) {
+      params.logger.error("event_bus.setup_cleanup_failed", {
+        failureCount: cleanup.failures.length,
+      });
+    }
+    cleanup.finish();
+    throw cause;
+  }
+}
+
+export function adaptCoreEventBusSetupResultToStartup(
+  result: ResultType<CoreEventBusResources, CoreEventBusSetupError>,
+): CoreEventBusResources {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+export function adaptCoreEventBusCleanupResultToHost(
+  result: ResultType<void, CoreEventBusCleanupFailed>,
+): void {
+  if (result.status === "error") throw new Error(result.error.message);
+}
 
 export function adaptCustomCommandInitializationResultToStartup(
   result: ResultType<void, CustomCommandDiscoveryError>,
@@ -262,6 +703,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     process.env.LILAC_WORKSPACE_DIR ??
     path.resolve(process.cwd(), env.dataDir, "workspace");
   const toolServerPort = opts.toolServerPort ?? Number(env.toolServer.port ?? 8080);
+  const reportFatalError = createCoreRuntimeFatalReporter(opts.reportFatalError);
 
   logger.info("Core runtime init", {
     cwd,
@@ -270,44 +712,27 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   });
 
   const redisUrl = env.redisUrl;
+  let eventBusSetup: ResultType<CoreEventBusResources, CoreEventBusSetupError>;
   if (!redisUrl) {
     logger.error("Missing REDIS_URL env var (required)");
-    throw new Error("REDIS_URL must be set");
+    eventBusSetup = Result.err(
+      new CoreEventBusSetupFailed({
+        operation: "read-config",
+        cause: undefined,
+        message: "REDIS_URL must be set",
+      }),
+    );
+  } else {
+    eventBusSetup = await setupCoreEventBusResources({
+      redisUrl,
+      cwd,
+      dataDir: env.dataDir,
+      logger,
+      reportFatalError,
+    });
   }
-  const redis = new Redis(redisUrl);
-
-  await fs.mkdir(cwd, { recursive: true });
-  const canonicalWorkspaceRoot = await fs.realpath(cwd);
-
-  try {
-    await redis.ping();
-  } catch (e) {
-    logger.error("Failed to connect to Redis", e);
-    const msg = errorMessage(e);
-    throw new Error(`Failed to connect to Redis: ${msg}`);
-  }
-
-  const raw = createRedisStreamsBus({
-    redis,
-    ownsRedis: true,
-    subscriberPool: {
-      // We keep subscriptions on dedicated connections because Redis Streams uses
-      // blocking XREAD/XREADGROUP calls.
-      // Cap connections to avoid FD blowups, and warm a few so first-turn latency
-      // doesn't include connection establishment.
-      max: 16,
-      warm: 8,
-      autoscale: {
-        enabled: true,
-        min: 16,
-        cap: 256,
-        // Avoid resize thrash during bursts.
-        cooldownMs: 30_000,
-      },
-    },
-  });
-
-  const bus: LilacBus = createLilacBus(raw);
+  const eventBusResources = adaptCoreEventBusSetupResultToStartup(eventBusSetup);
+  const { redis, raw, bus, canonicalWorkspaceRoot } = eventBusResources;
 
   const customCommandManager = new CustomCommandManager(env.dataDir);
   const customCommands = adaptCustomCommandInitializationResultToStartup(
@@ -345,7 +770,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
 
   let stopAdapterToBus: { stop(): Promise<void> } | null = null;
   let stopDiscordSearchIndexer: { stop(): Promise<void> } | null = null;
-  let stopRouter: { stop(): Promise<void> } | null = null;
+  let stopRouter: BusRequestRouter | null = null;
+  let routerSupervision: Promise<void> | null = null;
   let stopWorkflowActionResolver: { stop(): Promise<void> } | null = null;
   let workflowProgressProjector: WorkflowProgressProjector | null = null;
   let workflowEngine: WorkflowEngine | null = null;
@@ -386,6 +812,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     },
   });
   let runtimeFullyStarted = false;
+  let routerSubscriptionHealthy = true;
   let mcpRegistryInitPromise: Promise<void> | null = null;
   let coreConfigWatcher: FSWatcher | null = null;
   let coreConfigValidationTimer: ReturnType<typeof setTimeout> | null = null;
@@ -454,6 +881,15 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
         ok: runtimeFullyStarted,
         impact: "ready",
         reason: runtimeFullyStarted ? undefined : "core runtime has not completed startup",
+      },
+      {
+        name: "runtime.router-subscriptions",
+        ok: !started || routerSubscriptionHealthy,
+        impact: "live",
+        reason:
+          !started || routerSubscriptionHealthy
+            ? undefined
+            : "bus request router subscriptions terminated unexpectedly",
       },
     ];
 
@@ -660,6 +1096,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   async function start(): Promise<void> {
     if (started) return;
     started = true;
+    routerSubscriptionHealthy = true;
     conversationThreadSummarizationStopping = false;
 
     try {
@@ -955,6 +1392,15 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
           shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
         transcriptStore: transcriptStore ?? undefined,
       });
+      routerSupervision = superviseCoreRouterDone({
+        done: stopRouter.done,
+        isStopping: () => !started,
+        markUnhealthy: () => {
+          routerSubscriptionHealthy = false;
+          runtimeFullyStarted = false;
+        },
+        reportFatalError,
+      });
 
       logger.info("Bus request router started", {
         subscriptionId: subId(subscriptionPrefix, "router"),
@@ -1004,7 +1450,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
 
       toolServer = createToolServer({
         pluginManager,
-        reportFatalToolCallDefect: opts.reportFatalError,
+        reportFatalToolCallDefect: reportFatalError,
         logger: createLogger({
           module: "tool-server",
         }),
@@ -1125,7 +1571,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
       stopAgentRunner = await startBusAgentRunner({
         bus,
         subscriptionId: subId(subscriptionPrefix, "agent-runner"),
-        reportFatalPanic: opts.reportFatalError,
+        reportFatalPanic: reportFatalError,
         pluginManager,
         customCommands,
         cwd: canonicalWorkspaceRoot,
@@ -1248,7 +1694,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
         logger.info("Conversation thread worker started");
       }
 
-      runtimeFullyStarted = true;
+      runtimeFullyStarted = routerSubscriptionHealthy;
 
       logger.info(
         `Core runtime started (tool-server port=${toolServerPort}, subscriptionPrefix=${subscriptionPrefix})`,
@@ -1284,6 +1730,8 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
 
       await safe("graceful.ingress.router.stop", () => stopRouter?.stop() ?? Promise.resolve());
       stopRouter = null;
+      await safe("graceful.ingress.router.done", () => routerSupervision ?? Promise.resolve());
+      routerSupervision = null;
 
       await safe(
         "graceful.ingress.workflowWaitResolver.stop",
@@ -1436,6 +1884,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     await safe("requestMessageCache.stop", () => requestMessageCache?.stop() ?? Promise.resolve());
 
     await safe("router.stop", () => stopRouter?.stop() ?? Promise.resolve());
+    stopRouter = null;
+    await safe("router.done", () => routerSupervision ?? Promise.resolve());
+    routerSupervision = null;
     await safe(
       "workflowActions.stop",
       () => stopWorkflowActionResolver?.stop() ?? Promise.resolve(),
@@ -1475,7 +1926,9 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     await safe("coreConfigWatcher.stop", async () => {
       stopCoreConfigWatcher();
     });
-    await safe("bus.close", () => bus.close());
+    await safe("bus.close", async () => {
+      adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
+    });
 
     runtimeFullyStarted = false;
 

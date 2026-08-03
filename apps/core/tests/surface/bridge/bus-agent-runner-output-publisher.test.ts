@@ -1,11 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 import {
   createLilacBus,
   lilacEventTypes,
-  type HandleContext,
   type Message,
   type PublishOptions,
   type RawBus,
+  type RawDeliveryHandler,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 
@@ -46,11 +47,15 @@ function createRecordingRawBus(options?: {
       });
       return { id, cursor: id };
     },
-    subscribe: async <TData>(
+    subscribe: async (
       _topic: string,
       _options: SubscriptionOptions,
-      _handler: (message: Message<TData>, context: HandleContext) => Promise<void>,
-    ) => ({ stop: async () => {} }),
+      _handler: RawDeliveryHandler,
+    ) =>
+      Result.ok({
+        done: Promise.resolve(Result.ok(undefined)),
+        stop: async () => Result.ok(undefined),
+      }),
     fetch: async () => ({ messages: [] }),
     watermark: async () => null,
     close: async () => {},
