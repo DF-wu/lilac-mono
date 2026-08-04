@@ -3,6 +3,7 @@ import { TaggedError } from "better-result";
 export type ExternalOperation =
   | "access-harness"
   | "cancel-session"
+  | "close-run-cancellation-watch"
   | "close-harness"
   | "create-session"
   | "initialize-harness"
@@ -13,12 +14,15 @@ export type ExternalOperation =
   | "read-run"
   | "read-session-index"
   | "remove-session-lock"
+  | "remove-worker-signals"
   | "session-index-work"
   | "set-session-mode"
   | "set-session-model"
   | "signal-worker"
   | "spawn-worker"
   | "terminate-worker"
+  | "worker-process"
+  | "watch-run-cancellation"
   | "write-run"
   | "write-session-index"
   | "acquire-session-lock";
@@ -43,6 +47,33 @@ export class RunRecordMalformedSerialization extends TaggedError(
 }> {}
 
 export class RunRecordCorruptFields extends TaggedError("RunRecordCorruptFields")<{
+  readonly runId: string;
+  readonly message: string;
+}> {}
+
+export class RunCancellationMalformedSerialization extends TaggedError(
+  "RunCancellationMalformedSerialization",
+)<{
+  readonly runId: string;
+  readonly message: string;
+}> {}
+
+export class RunCancellationUnsupportedVersion extends TaggedError(
+  "RunCancellationUnsupportedVersion",
+)<{
+  readonly runId: string;
+  readonly version: number;
+  readonly message: string;
+}> {}
+
+export class RunCancellationCorruptFields extends TaggedError("RunCancellationCorruptFields")<{
+  readonly runId: string;
+  readonly message: string;
+}> {}
+
+export class RunCancellationMarkerInvalidType extends TaggedError(
+  "RunCancellationMarkerInvalidType",
+)<{
   readonly runId: string;
   readonly message: string;
 }> {}
@@ -72,6 +103,28 @@ export class WorkAndCleanupFailed<Primary> extends TaggedError("WorkAndCleanupFa
   readonly message: string;
 }> {}
 
+export class WorkAndMonitorFailed<Primary, Monitor> extends TaggedError("WorkAndMonitorFailed")<{
+  readonly primary: Primary;
+  readonly monitor: Monitor;
+  readonly message: string;
+}> {}
+
+export class MonitorTerminationFailed<Primary> extends TaggedError("MonitorTerminationFailed")<{
+  readonly primary: Primary;
+  readonly watcherCleanup?: ExternalOperationFailed;
+  readonly termination?: ExternalOperationFailed;
+  readonly message: string;
+}> {}
+
+export class WorkerLifecycleCleanupFailed<Primary> extends TaggedError(
+  "WorkerLifecycleCleanupFailed",
+)<{
+  readonly primary?: Primary;
+  readonly signalCleanup?: ExternalOperationFailed;
+  readonly harnessCleanup?: ExternalOperationFailed;
+  readonly message: string;
+}> {}
+
 export class HarnessUnavailable extends TaggedError("HarnessUnavailable")<{
   readonly harnessId: string;
   readonly message: string;
@@ -90,7 +143,11 @@ export type RunStoreError =
   | ExternalOperationFailed
   | InvalidRunId
   | RunRecordMalformedSerialization
-  | RunRecordCorruptFields;
+  | RunRecordCorruptFields
+  | RunCancellationMalformedSerialization
+  | RunCancellationUnsupportedVersion
+  | RunCancellationCorruptFields
+  | RunCancellationMarkerInvalidType;
 
 export type SessionIndexCodecError =
   | SessionIndexMalformedSerialization

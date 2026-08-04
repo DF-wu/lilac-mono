@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { watch } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { Result, type Result as ResultType } from "better-result";
+import { Result, type Panic, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
@@ -16,6 +17,10 @@ import {
 import {
   ExternalOperationFailed,
   InvalidRunId,
+  RunCancellationCorruptFields,
+  RunCancellationMalformedSerialization,
+  RunCancellationMarkerInvalidType,
+  RunCancellationUnsupportedVersion,
   RunRecordCorruptFields,
   RunRecordMalformedSerialization,
   SessionIndexCorruptFields,
@@ -49,6 +54,12 @@ type PresentPersistedRead<T> = {
 export type SessionIndexRead = PersistedRead<SessionIndex>;
 
 const persistedVersionSchema = z.object({ version: z.number() });
+const runCancellationSchema = z.object({
+  version: z.literal(1),
+  runCreatedAt: z.number().int().nonnegative(),
+  requestedAt: z.number().int().nonnegative(),
+});
+const legacyRunCancellationSchema = runCancellationSchema.extend({ version: z.literal(0) });
 const legacyRunRecordSchema = promptRunRecordSchema
   .omit({ permissions: true })
   .extend({ permissions: z.never().optional() });
@@ -58,6 +69,13 @@ const legacySessionIndexSchema = z.object({
 });
 
 export type RunRecordCodecInput = {
+  readonly runId: string;
+  readonly content: string;
+};
+
+export type RunCancellation = z.output<typeof runCancellationSchema>;
+
+export type RunCancellationCodecInput = {
   readonly runId: string;
   readonly content: string;
 };
@@ -89,6 +107,10 @@ function sessionIndexLockPath(): string {
 
 function runFilePath(runId: string): string {
   return path.join(runsDir(), `${runId}.json`);
+}
+
+function runCancellationPath(runId: string): string {
+  return path.join(runsDir(), `${runId}.cancel.json`);
 }
 
 function validateRunId(runId: string): ResultType<string, InvalidRunId> {
@@ -145,6 +167,50 @@ export function decodeRunRecord(
     new RunRecordCorruptFields({
       runId: input.runId,
       message: `Run record '${input.runId}' is malformed.`,
+    }),
+  );
+}
+
+export function decodeRunCancellation(
+  input: RunCancellationCodecInput,
+): ResultType<
+  PresentPersistedRead<RunCancellation>,
+  | RunCancellationMalformedSerialization
+  | RunCancellationUnsupportedVersion
+  | RunCancellationCorruptFields
+> {
+  const decoded = parseJson(input.content);
+  if (decoded.status === "error") {
+    return Result.err(
+      new RunCancellationMalformedSerialization({
+        runId: input.runId,
+        message: `Run cancellation marker '${input.runId}' contains malformed JSON.`,
+      }),
+    );
+  }
+  const parsed = runCancellationSchema.safeParse(decoded.value);
+  if (parsed.success) return Result.ok({ provenance: "current", value: parsed.data });
+  const legacy = legacyRunCancellationSchema.safeParse(decoded.value);
+  if (legacy.success) {
+    return Result.ok({
+      provenance: "migrated",
+      value: { ...legacy.data, version: 1 },
+    });
+  }
+  const version = persistedVersionSchema.safeParse(decoded.value);
+  if (version.success && version.data.version !== 1) {
+    return Result.err(
+      new RunCancellationUnsupportedVersion({
+        runId: input.runId,
+        version: version.data.version,
+        message: `Run cancellation marker '${input.runId}' has unsupported version ${version.data.version}.`,
+      }),
+    );
+  }
+  return Result.err(
+    new RunCancellationCorruptFields({
+      runId: input.runId,
+      message: `Run cancellation marker '${input.runId}' contains corrupt fields.`,
     }),
   );
 }
@@ -334,6 +400,235 @@ export async function saveRunRecord(
   return atomicWriteFile(runFilePath(run.id), `${JSON.stringify(run)}\n`, "write-run");
 }
 
+export async function loadRunCancellation(
+  run: Pick<PromptRunRecord, "id" | "createdAt">,
+): Promise<ResultType<number | undefined, RunStoreError>> {
+  const markerPath = runCancellationPath(run.id);
+  const marker = await captureExternal("read-run", () => fs.lstat(markerPath));
+  if (marker.status === "error") {
+    return marker.error.code === "ENOENT" ? Result.ok(undefined) : Result.err(marker.error);
+  }
+  if (marker.value.isSymbolicLink() || !marker.value.isFile()) {
+    return Result.err(
+      new RunCancellationMarkerInvalidType({
+        runId: run.id,
+        message: `Run cancellation marker '${run.id}' must be a regular file.`,
+      }),
+    );
+  }
+  const content = await captureExternal("read-run", () => fs.readFile(markerPath, "utf8"));
+  if (content.status === "error") return Result.err(content.error);
+  const decoded = decodeRunCancellation({ runId: run.id, content: content.value });
+  if (decoded.status === "error") return Result.err(decoded.error);
+  if (
+    decoded.value.value.runCreatedAt !== run.createdAt ||
+    decoded.value.value.requestedAt < run.createdAt
+  ) {
+    return Result.ok(undefined);
+  }
+  return Result.ok(decoded.value.value.requestedAt);
+}
+
+function applyRunCancellation(
+  run: PromptRunRecord,
+  requestedAt: number | undefined,
+): PromptRunRecord {
+  if (requestedAt === undefined) return run;
+  const cancelRequestedAt = Math.min(run.cancelRequestedAt ?? requestedAt, requestedAt);
+  if (isTerminalRunStatus(run.status) && run.updatedAt <= cancelRequestedAt) {
+    return { ...run, cancelRequestedAt };
+  }
+  if (!isTerminalRunStatus(run.status)) return { ...run, cancelRequestedAt };
+  if (run.status === "cancelled") return { ...run, cancelRequestedAt };
+  return {
+    ...run,
+    status: "cancelled",
+    cancelRequestedAt,
+    error: run.error ?? "Prompt cancelled.",
+  };
+}
+
+function isTerminalRunStatus(status: PromptRunRecord["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+export async function saveWorkerRunRecord(
+  run: PromptRunRecord,
+): Promise<ResultType<PromptRunRecord, RunStoreError>> {
+  const cancellationBefore = await loadRunCancellation(run);
+  if (cancellationBefore.status === "error") return Result.err(cancellationBefore.error);
+  let next = applyRunCancellation(run, cancellationBefore.value);
+  const saved = await saveRunRecord(next);
+  if (saved.status === "error") return Result.err(saved.error);
+
+  const cancellationAfter = await loadRunCancellation(run);
+  if (cancellationAfter.status === "error") return Result.err(cancellationAfter.error);
+  const merged = applyRunCancellation(next, cancellationAfter.value);
+  if (merged !== next) {
+    const cancellationSaved = await saveRunRecord(merged);
+    if (cancellationSaved.status === "error") return Result.err(cancellationSaved.error);
+    next = merged;
+  }
+  return Result.ok(next);
+}
+
+export type RunCancellationRequestOutcome =
+  | { readonly kind: "requested"; readonly run: PromptRunRecord }
+  | { readonly kind: "already-terminal"; readonly run: PromptRunRecord };
+
+export async function commitRunCancellationRequest(
+  run: PromptRunRecord,
+): Promise<
+  ResultType<Extract<RunCancellationRequestOutcome, { readonly kind: "requested" }>, RunStoreError>
+> {
+  const directory = await captureExternal("write-run", () =>
+    fs.mkdir(runsDir(), { recursive: true }),
+  );
+  if (directory.status === "error") return Result.err(directory.error);
+  const requestedAt = run.cancelRequestedAt ?? Math.max(Date.now(), run.createdAt);
+  const marked = await atomicWriteFile(
+    runCancellationPath(run.id),
+    `${JSON.stringify({
+      version: 1,
+      runCreatedAt: run.createdAt,
+      requestedAt,
+    } satisfies RunCancellation)}\n`,
+    "write-run",
+  );
+  if (marked.status === "error") return Result.err(marked.error);
+  const current = await loadRunRecord(run.id);
+  if (current.status === "error") return Result.err(current.error);
+  return Result.ok({ kind: "requested", run: current.value });
+}
+
+export async function requestRunCancellation(
+  runId: string,
+): Promise<ResultType<RunCancellationRequestOutcome, RunStoreError>> {
+  const safeRunId = validateRunId(runId);
+  if (safeRunId.status === "error") return Result.err(safeRunId.error);
+  const loaded = await loadRunRecord(safeRunId.value);
+  if (loaded.status === "error") return Result.err(loaded.error);
+  if (isTerminalRunStatus(loaded.value.status)) {
+    return Result.ok({ kind: "already-terminal", run: loaded.value });
+  }
+  return commitRunCancellationRequest(loaded.value);
+}
+
+export type RunCancellationObservation = {
+  readonly result: Promise<ResultType<"requested" | "stopped", RunStoreError>>;
+  readonly close: () => Promise<ResultType<void, ExternalOperationFailed>>;
+};
+
+export async function observeRunCancellation(
+  run: Pick<PromptRunRecord, "id" | "createdAt">,
+  inspect: (
+    candidate: Pick<PromptRunRecord, "id" | "createdAt">,
+  ) => Promise<ResultType<number | undefined, RunStoreError>> = loadRunCancellation,
+): Promise<ResultType<RunCancellationObservation, ExternalOperationFailed>> {
+  const watched = await captureExternal("watch-run-cancellation", async () => watch(runsDir()));
+  if (watched.status === "error") return Result.err(watched.error);
+  const watcher = watched.value;
+  let accepting = true;
+  let settled = false;
+  let resolveResult: (result: ResultType<"requested" | "stopped", RunStoreError>) => void = () =>
+    undefined;
+  let rejectResult: (cause: Panic) => void = () => undefined;
+  const result = new Promise<ResultType<"requested" | "stopped", RunStoreError>>(
+    (resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    },
+  );
+  let stopFallbackCheck: () => void = () => undefined;
+  const settle = (resolution: ResultType<"requested" | "stopped", RunStoreError>) => {
+    if (settled) return;
+    settled = true;
+    stopFallbackCheck();
+    resolveResult(resolution);
+  };
+  const settlePanic = (panic: Extract<CapturedAcpFailure, { readonly kind: "panic" }>) => {
+    if (settled) return;
+    settled = true;
+    stopFallbackCheck();
+    rejectResult(panic.panic);
+  };
+  let pendingCheck = Promise.resolve();
+  const scheduleCheck = () => {
+    if (!accepting || settled) return;
+    pendingCheck = pendingCheck.then(async () => {
+      if (settled) return;
+      const inspected = await Result.tryPromise({
+        try: () => inspect(run),
+        catch: captureAcpFailure,
+      });
+      if (inspected.status === "error") {
+        switch (inspected.error.kind) {
+          case "panic":
+            settlePanic(inspected.error);
+            return;
+          case "ordinary":
+            settle(
+              Result.err(
+                new ExternalOperationFailed({
+                  operation: "watch-run-cancellation",
+                  cause: inspected.error.cause,
+                  ...(inspected.error.projection.code
+                    ? { code: inspected.error.projection.code }
+                    : {}),
+                  message: inspected.error.projection.message,
+                }),
+              ),
+            );
+            return;
+        }
+      }
+      if (inspected.value.status === "error") {
+        settle(Result.err(inspected.value.error));
+      } else if (inspected.value.value !== undefined) {
+        settle(Result.ok("requested"));
+      }
+    });
+  };
+  watcher.on("change", scheduleCheck);
+  watcher.on("error", (cause: Error) => {
+    settle(
+      Result.err(
+        new ExternalOperationFailed({
+          operation: "watch-run-cancellation",
+          cause,
+          message: cause.message,
+        }),
+      ),
+    );
+  });
+  scheduleCheck();
+  const fallbackCheck = setInterval(scheduleCheck, 100);
+  fallbackCheck.unref();
+  stopFallbackCheck = () => clearInterval(fallbackCheck);
+  if (settled) stopFallbackCheck();
+
+  let closeResult: Promise<ResultType<void, ExternalOperationFailed>> | undefined;
+  const close = () => {
+    if (closeResult) return closeResult;
+    closeResult = (async () => {
+      accepting = false;
+      stopFallbackCheck();
+      const closed = await captureExternal("close-run-cancellation-watch", async () =>
+        watcher.close(),
+      );
+      await pendingCheck;
+      if (!settled) settle(Result.ok("stopped"));
+      return closed.status === "error" ? Result.err(closed.error) : Result.ok(undefined);
+    })();
+    return closeResult;
+  };
+
+  return Result.ok({
+    result,
+    close,
+  });
+}
+
 export async function loadRunRecord(
   runId: string,
 ): Promise<ResultType<PromptRunRecord, RunStoreError>> {
@@ -344,7 +639,10 @@ export async function loadRunRecord(
   );
   if (content.status === "error") return Result.err(content.error);
   const decoded = decodeRunRecord({ runId: safeRunId.value, content: content.value });
-  return decoded.status === "ok" ? Result.ok(decoded.value.value) : Result.err(decoded.error);
+  if (decoded.status === "error") return Result.err(decoded.error);
+  const cancellation = await loadRunCancellation(decoded.value.value);
+  if (cancellation.status === "error") return Result.err(cancellation.error);
+  return Result.ok(applyRunCancellation(decoded.value.value, cancellation.value));
 }
 
 async function saveSessionIndex(
@@ -426,6 +724,41 @@ export const runRecordCodecCases = {
       runId: fixtureRunId,
       content: JSON.stringify({ ...fixtureRunRecord, permissions: {} }),
     },
+    outcome: "error",
+  },
+} as const;
+
+export const runCancellationCodecCases = {
+  current: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ version: 1, runCreatedAt: 1, requestedAt: 2 }),
+    },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ version: 0, runCreatedAt: 1, requestedAt: 2 }),
+    },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  "missing-defaulted": {
+    input: { runId: fixtureRunId, content: "" },
+    outcome: "error",
+  },
+  "unsupported-version": {
+    input: { runId: fixtureRunId, content: '{"version":2}' },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: { runId: fixtureRunId, content: "{" },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: { runId: fixtureRunId, content: '{"version":1,"runCreatedAt":"bad"}' },
     outcome: "error",
   },
 } as const;

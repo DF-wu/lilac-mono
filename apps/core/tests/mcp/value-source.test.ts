@@ -124,7 +124,13 @@ describe("MCP value sources", () => {
         { file: "panic.txt" },
         { baseDir: "/data", env: {}, readTextFile: () => Promise.reject(panic) },
       ),
-    ).rejects.toBeInstanceOf(Panic);
+    ).rejects.toBe(panic);
+    await expect(
+      resolveMcpValueSourceMap(
+        { TOKEN: { file: "panic.txt" } },
+        { baseDir: "/data", env: {}, readTextFile: () => Promise.reject(panic) },
+      ),
+    ).rejects.toBe(panic);
 
     const hostileCause = {
       toString: () => {

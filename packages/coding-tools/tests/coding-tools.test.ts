@@ -1211,6 +1211,40 @@ describe("coding tools", () => {
     });
   });
 
+  it("maintains expired artifacts after an unavailable artifact read", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "expired-read-artifacts"));
+    expect((await artifacts.init()).status).toBe("ok");
+    const created = await artifacts.create({
+      scopeId: "scope-read",
+      requestId: "request-read",
+      toolCallId: "producer",
+      toolName: "bash",
+      content: "expired",
+      ttlMs: -1,
+      maxBytesPerScope: 1024,
+    });
+    if (created.status === "error") throw created.error;
+    expect(await readdir(artifacts.rootDir)).toHaveLength(2);
+
+    const result = await executable(
+      createCodingToolset({
+        cwd,
+        artifactIntegration: {
+          artifacts,
+          scopeId: "scope-read",
+          requestId: "request-read",
+        },
+      }),
+      "read_file",
+    ).execute({ path: created.value.uri }, options("read-expired-artifact"));
+
+    expect(result).toMatchObject({
+      success: false,
+      error: { code: "UNKNOWN", message: TOOL_RESULT_UNAVAILABLE_MESSAGE },
+    });
+    expect(await readdir(artifacts.rootDir)).toEqual([]);
+  });
+
   it("preloads workspace AGENTS.md and adds only nested instructions to read_file", async () => {
     const packageDirectory = path.join(cwd, "packages", "widget");
     const nestedDirectory = path.join(packageDirectory, "src");

@@ -157,7 +157,7 @@ describe("McpRegistry startup and discovery", () => {
       },
     });
 
-    await expect(registry.init()).rejects.toBeInstanceOf(Panic);
+    await expect(registry.init()).rejects.toBe(panic);
   });
 
   it("initiates client cleanup before propagating a discovery Panic", async () => {

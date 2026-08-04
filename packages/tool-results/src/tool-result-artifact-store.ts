@@ -266,7 +266,10 @@ export function adaptToolResultArtifactReadToAvailability<T extends object>(
 export async function adaptToolResultArtifactReadToUnavailablePolicy<T extends object>(
   store: ToolResultArtifactStore,
   result: ResultType<T, ToolResultArtifactError>,
-  policy: ToolResultArtifactReadMaintenancePolicy = { kind: "none" },
+  policy: ToolResultArtifactReadMaintenancePolicy = {
+    kind: "maintain-after-unavailable",
+    onMaintenanceError: "unavailable",
+  },
 ): Promise<ToolResultArtifactAvailability<T>> {
   if (
     result.status === "error" &&

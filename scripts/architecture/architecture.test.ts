@@ -1082,7 +1082,7 @@ describe("Stage 2 union rules", () => {
         identity: { module: "external-adapters.ts", exportName: "projectExternalFailure" },
         category: "projection",
       },
-      ...["decodeRunRecord", "decodeSessionIndex"].map((exportName) => ({
+      ...["decodeRunRecord", "decodeRunCancellation", "decodeSessionIndex"].map((exportName) => ({
         identity: { module: "run-store.ts", exportName },
         category: "persistence" as const,
       })),
@@ -3035,7 +3035,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         (count, workspace) => count + workspace.persistedCodecs.length,
         0,
       ),
-    ).toBe(25);
+    ).toBe(26);
     expect(
       core.sqliteTransactionConsumers.find(
         ({ identity }) => identity.exportName === "ConversationThreadStore.upsertSummary",

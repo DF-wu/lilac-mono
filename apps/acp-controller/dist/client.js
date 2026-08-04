@@ -16180,6 +16180,18 @@ class RunRecordMalformedSerialization extends h("RunRecordMalformedSerialization
 class RunRecordCorruptFields extends h("RunRecordCorruptFields") {
 }
 
+class RunCancellationMalformedSerialization extends h("RunCancellationMalformedSerialization") {
+}
+
+class RunCancellationUnsupportedVersion extends h("RunCancellationUnsupportedVersion") {
+}
+
+class RunCancellationCorruptFields extends h("RunCancellationCorruptFields") {
+}
+
+class RunCancellationMarkerInvalidType extends h("RunCancellationMarkerInvalidType") {
+}
+
 class SessionIndexMalformedSerialization extends h("SessionIndexMalformedSerialization") {
 }
 
@@ -16193,6 +16205,15 @@ class SessionIndexLockTimedOut extends h("SessionIndexLockTimedOut") {
 }
 
 class WorkAndCleanupFailed extends h("WorkAndCleanupFailed") {
+}
+
+class WorkAndMonitorFailed extends h("WorkAndMonitorFailed") {
+}
+
+class MonitorTerminationFailed extends h("MonitorTerminationFailed") {
+}
+
+class WorkerLifecycleCleanupFailed extends h("WorkerLifecycleCleanupFailed") {
 }
 
 class HarnessUnavailable extends h("HarnessUnavailable") {
@@ -16606,6 +16627,7 @@ async function listResolvedHarnesses() {
 
 // run-store.ts
 import { randomUUID } from "node:crypto";
+import { watch } from "node:fs";
 import fs2 from "node:fs/promises";
 import os from "node:os";
 import path2 from "node:path";
@@ -16701,6 +16723,12 @@ function createEmptyPermissionCounters() {
 
 // run-store.ts
 var persistedVersionSchema = exports_external.object({ version: exports_external.number() });
+var runCancellationSchema = exports_external.object({
+  version: exports_external.literal(1),
+  runCreatedAt: exports_external.number().int().nonnegative(),
+  requestedAt: exports_external.number().int().nonnegative()
+});
+var legacyRunCancellationSchema = runCancellationSchema.extend({ version: exports_external.literal(0) });
 var legacyRunRecordSchema = promptRunRecordSchema.omit({ permissions: true }).extend({ permissions: exports_external.never().optional() });
 var legacySessionIndexSchema = exports_external.object({
   version: exports_external.literal(0),
@@ -16725,6 +16753,9 @@ function sessionIndexLockPath() {
 }
 function runFilePath(runId) {
   return path2.join(runsDir(), `${runId}.json`);
+}
+function runCancellationPath(runId) {
+  return path2.join(runsDir(), `${runId}.cancel.json`);
 }
 function validateRunId(runId) {
   const trimmed = runId.trim();
@@ -16771,6 +16802,37 @@ function decodeRunRecord(input) {
   return ae.err(new RunRecordCorruptFields({
     runId: input.runId,
     message: `Run record '${input.runId}' is malformed.`
+  }));
+}
+function decodeRunCancellation(input) {
+  const decoded = parseJson(input.content);
+  if (decoded.status === "error") {
+    return ae.err(new RunCancellationMalformedSerialization({
+      runId: input.runId,
+      message: `Run cancellation marker '${input.runId}' contains malformed JSON.`
+    }));
+  }
+  const parsed = runCancellationSchema.safeParse(decoded.value);
+  if (parsed.success)
+    return ae.ok({ provenance: "current", value: parsed.data });
+  const legacy = legacyRunCancellationSchema.safeParse(decoded.value);
+  if (legacy.success) {
+    return ae.ok({
+      provenance: "migrated",
+      value: { ...legacy.data, version: 1 }
+    });
+  }
+  const version2 = persistedVersionSchema.safeParse(decoded.value);
+  if (version2.success && version2.data.version !== 1) {
+    return ae.err(new RunCancellationUnsupportedVersion({
+      runId: input.runId,
+      version: version2.data.version,
+      message: `Run cancellation marker '${input.runId}' has unsupported version ${version2.data.version}.`
+    }));
+  }
+  return ae.err(new RunCancellationCorruptFields({
+    runId: input.runId,
+    message: `Run cancellation marker '${input.runId}' contains corrupt fields.`
   }));
 }
 function decodeSessionIndex(content) {
@@ -16908,6 +16970,201 @@ async function saveRunRecord(run) {
   return atomicWriteFile(runFilePath(run.id), `${JSON.stringify(run)}
 `, "write-run");
 }
+async function loadRunCancellation(run) {
+  const markerPath = runCancellationPath(run.id);
+  const marker = await captureExternal("read-run", () => fs2.lstat(markerPath));
+  if (marker.status === "error") {
+    return marker.error.code === "ENOENT" ? ae.ok(undefined) : ae.err(marker.error);
+  }
+  if (marker.value.isSymbolicLink() || !marker.value.isFile()) {
+    return ae.err(new RunCancellationMarkerInvalidType({
+      runId: run.id,
+      message: `Run cancellation marker '${run.id}' must be a regular file.`
+    }));
+  }
+  const content = await captureExternal("read-run", () => fs2.readFile(markerPath, "utf8"));
+  if (content.status === "error")
+    return ae.err(content.error);
+  const decoded = decodeRunCancellation({ runId: run.id, content: content.value });
+  if (decoded.status === "error")
+    return ae.err(decoded.error);
+  if (decoded.value.value.runCreatedAt !== run.createdAt || decoded.value.value.requestedAt < run.createdAt) {
+    return ae.ok(undefined);
+  }
+  return ae.ok(decoded.value.value.requestedAt);
+}
+function applyRunCancellation(run, requestedAt) {
+  if (requestedAt === undefined)
+    return run;
+  const cancelRequestedAt = Math.min(run.cancelRequestedAt ?? requestedAt, requestedAt);
+  if (isTerminalRunStatus(run.status) && run.updatedAt <= cancelRequestedAt) {
+    return { ...run, cancelRequestedAt };
+  }
+  if (!isTerminalRunStatus(run.status))
+    return { ...run, cancelRequestedAt };
+  if (run.status === "cancelled")
+    return { ...run, cancelRequestedAt };
+  return {
+    ...run,
+    status: "cancelled",
+    cancelRequestedAt,
+    error: run.error ?? "Prompt cancelled."
+  };
+}
+function isTerminalRunStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+async function saveWorkerRunRecord(run) {
+  const cancellationBefore = await loadRunCancellation(run);
+  if (cancellationBefore.status === "error")
+    return ae.err(cancellationBefore.error);
+  let next = applyRunCancellation(run, cancellationBefore.value);
+  const saved = await saveRunRecord(next);
+  if (saved.status === "error")
+    return ae.err(saved.error);
+  const cancellationAfter = await loadRunCancellation(run);
+  if (cancellationAfter.status === "error")
+    return ae.err(cancellationAfter.error);
+  const merged = applyRunCancellation(next, cancellationAfter.value);
+  if (merged !== next) {
+    const cancellationSaved = await saveRunRecord(merged);
+    if (cancellationSaved.status === "error")
+      return ae.err(cancellationSaved.error);
+    next = merged;
+  }
+  return ae.ok(next);
+}
+async function commitRunCancellationRequest(run) {
+  const directory = await captureExternal("write-run", () => fs2.mkdir(runsDir(), { recursive: true }));
+  if (directory.status === "error")
+    return ae.err(directory.error);
+  const requestedAt = run.cancelRequestedAt ?? Math.max(Date.now(), run.createdAt);
+  const marked = await atomicWriteFile(runCancellationPath(run.id), `${JSON.stringify({
+    version: 1,
+    runCreatedAt: run.createdAt,
+    requestedAt
+  })}
+`, "write-run");
+  if (marked.status === "error")
+    return ae.err(marked.error);
+  const current = await loadRunRecord(run.id);
+  if (current.status === "error")
+    return ae.err(current.error);
+  return ae.ok({ kind: "requested", run: current.value });
+}
+async function requestRunCancellation(runId) {
+  const safeRunId = validateRunId(runId);
+  if (safeRunId.status === "error")
+    return ae.err(safeRunId.error);
+  const loaded = await loadRunRecord(safeRunId.value);
+  if (loaded.status === "error")
+    return ae.err(loaded.error);
+  if (isTerminalRunStatus(loaded.value.status)) {
+    return ae.ok({ kind: "already-terminal", run: loaded.value });
+  }
+  return commitRunCancellationRequest(loaded.value);
+}
+async function observeRunCancellation(run, inspect = loadRunCancellation) {
+  const watched = await captureExternal("watch-run-cancellation", async () => watch(runsDir()));
+  if (watched.status === "error")
+    return ae.err(watched.error);
+  const watcher = watched.value;
+  let accepting = true;
+  let settled = false;
+  let resolveResult = () => {
+    return;
+  };
+  let rejectResult = () => {
+    return;
+  };
+  const result = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+  let stopFallbackCheck = () => {
+    return;
+  };
+  const settle = (resolution) => {
+    if (settled)
+      return;
+    settled = true;
+    stopFallbackCheck();
+    resolveResult(resolution);
+  };
+  const settlePanic = (panic) => {
+    if (settled)
+      return;
+    settled = true;
+    stopFallbackCheck();
+    rejectResult(panic.panic);
+  };
+  let pendingCheck = Promise.resolve();
+  const scheduleCheck = () => {
+    if (!accepting || settled)
+      return;
+    pendingCheck = pendingCheck.then(async () => {
+      if (settled)
+        return;
+      const inspected = await ae.tryPromise({
+        try: () => inspect(run),
+        catch: captureAcpFailure
+      });
+      if (inspected.status === "error") {
+        switch (inspected.error.kind) {
+          case "panic":
+            settlePanic(inspected.error);
+            return;
+          case "ordinary":
+            settle(ae.err(new ExternalOperationFailed({
+              operation: "watch-run-cancellation",
+              cause: inspected.error.cause,
+              ...inspected.error.projection.code ? { code: inspected.error.projection.code } : {},
+              message: inspected.error.projection.message
+            })));
+            return;
+        }
+      }
+      if (inspected.value.status === "error") {
+        settle(ae.err(inspected.value.error));
+      } else if (inspected.value.value !== undefined) {
+        settle(ae.ok("requested"));
+      }
+    });
+  };
+  watcher.on("change", scheduleCheck);
+  watcher.on("error", (cause) => {
+    settle(ae.err(new ExternalOperationFailed({
+      operation: "watch-run-cancellation",
+      cause,
+      message: cause.message
+    })));
+  });
+  scheduleCheck();
+  const fallbackCheck = setInterval(scheduleCheck, 100);
+  fallbackCheck.unref();
+  stopFallbackCheck = () => clearInterval(fallbackCheck);
+  if (settled)
+    stopFallbackCheck();
+  let closeResult;
+  const close = () => {
+    if (closeResult)
+      return closeResult;
+    closeResult = (async () => {
+      accepting = false;
+      stopFallbackCheck();
+      const closed = await captureExternal("close-run-cancellation-watch", async () => watcher.close());
+      await pendingCheck;
+      if (!settled)
+        settle(ae.ok("stopped"));
+      return closed.status === "error" ? ae.err(closed.error) : ae.ok(undefined);
+    })();
+    return closeResult;
+  };
+  return ae.ok({
+    result,
+    close
+  });
+}
 async function loadRunRecord(runId) {
   const safeRunId = validateRunId(runId);
   if (safeRunId.status === "error")
@@ -16916,7 +17173,12 @@ async function loadRunRecord(runId) {
   if (content.status === "error")
     return ae.err(content.error);
   const decoded = decodeRunRecord({ runId: safeRunId.value, content: content.value });
-  return decoded.status === "ok" ? ae.ok(decoded.value.value) : ae.err(decoded.error);
+  if (decoded.status === "error")
+    return ae.err(decoded.error);
+  const cancellation = await loadRunCancellation(decoded.value.value);
+  if (cancellation.status === "error")
+    return ae.err(cancellation.error);
+  return ae.ok(applyRunCancellation(decoded.value.value, cancellation.value));
 }
 async function saveSessionIndex(entries) {
   const directory = await captureExternal("write-session-index", () => fs2.mkdir(sessionsDir(), { recursive: true }));
@@ -16988,6 +17250,40 @@ var runRecordCodecCases = {
       runId: fixtureRunId,
       content: JSON.stringify({ ...fixtureRunRecord, permissions: {} })
     },
+    outcome: "error"
+  }
+};
+var runCancellationCodecCases = {
+  current: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ version: 1, runCreatedAt: 1, requestedAt: 2 })
+    },
+    outcome: "ok",
+    provenance: "current"
+  },
+  legacy: {
+    input: {
+      runId: fixtureRunId,
+      content: JSON.stringify({ version: 0, runCreatedAt: 1, requestedAt: 2 })
+    },
+    outcome: "ok",
+    provenance: "migrated"
+  },
+  "missing-defaulted": {
+    input: { runId: fixtureRunId, content: "" },
+    outcome: "error"
+  },
+  "unsupported-version": {
+    input: { runId: fixtureRunId, content: '{"version":2}' },
+    outcome: "error"
+  },
+  "malformed-serialization": {
+    input: { runId: fixtureRunId, content: "{" },
+    outcome: "error"
+  },
+  "corrupt-fields": {
+    input: { runId: fixtureRunId, content: '{"version":1,"runCreatedAt":"bad"}' },
     outcome: "error"
   }
 };
@@ -17797,6 +18093,12 @@ function capturedWorkerFailure(operation, captured) {
     message: captured.projection.message
   });
 }
+function capturedCleanupResult(attempted, operation) {
+  if (attempted.status === "ok") {
+    return attempted.value.status === "error" ? attempted.value.error : undefined;
+  }
+  return attempted.error.kind === "panic" ? attempted.error.panic : capturedWorkerFailure(operation, attempted.error);
+}
 function help(commandName) {
   return [
     `${commandName} (ACP harness controller)`,
@@ -18133,30 +18435,20 @@ async function runPromptWait(params) {
   }
 }
 async function runPromptCancel(params) {
-  const loaded = await loadRunRecord(params.runId);
-  if (loaded.status === "error") {
-    params.write({ ok: false, error: loaded.error.message, runId: params.runId });
+  const cancellation = await requestRunCancellation(params.runId);
+  if (cancellation.status === "error") {
+    params.write({ ok: false, error: cancellation.error.message, runId: params.runId });
     return 1;
   }
-  const run = loaded.value;
-  if (isTerminalStatus(run.status)) {
+  if (cancellation.value.kind === "already-terminal") {
     params.write({
       ok: false,
       runId: params.runId,
-      error: `Run '${params.runId}' already finished with status '${run.status}'.`
+      error: `Run '${params.runId}' already finished with status '${cancellation.value.run.status}'.`
     });
     return 1;
   }
-  const next = {
-    ...run,
-    cancelRequestedAt: Date.now(),
-    updatedAt: Date.now()
-  };
-  const saved = await saveRunRecord(next);
-  if (saved.status === "error") {
-    params.write({ ok: false, error: saved.error.message, runId: params.runId });
-    return 1;
-  }
+  const run = cancellation.value.run;
   const alive = await isProcessAlive(run.workerPid);
   if (alive.status === "error") {
     params.write({ ok: false, error: alive.error.message, runId: params.runId });
@@ -18182,7 +18474,13 @@ async function runPromptCancel(params) {
   });
   return 0;
 }
-async function persistRunFromCollector(run, collector) {
+async function persistRunFromCollector(run, collector, persist = async (record2) => {
+  const saved = await saveWorkerRunRecord(record2);
+  if (saved.status === "error")
+    return ae.err(saved.error);
+  Object.assign(record2, saved.value);
+  return ae.ok(undefined);
+}) {
   let sessionUpdate = {};
   if (run.session) {
     sessionUpdate = {
@@ -18206,17 +18504,320 @@ async function persistRunFromCollector(run, collector) {
     ...run,
     updatedAt: Date.now(),
     ...sessionUpdate,
-    ...collector.plan ? { plan: collector.plan } : {},
-    ...collector.history.length > 0 ? { history: collector.history } : {},
+    ...collector.plan ? { plan: collector.plan.map((entry) => ({ ...entry })) } : {},
+    ...collector.history.length > 0 ? { history: collector.history.map((message) => ({ ...message })) } : {},
     ...collector.latestAssistantText() ? { resultText: collector.latestAssistantText() } : {}
   };
+  const saved = await persist(next);
+  if (saved.status === "error")
+    return ae.err(saved.error);
   Object.assign(run, next);
-  return saveRunRecord(run);
+  return ae.ok(undefined);
+}
+function createSessionUpdatePersistence(run, collector, persist = persistRunFromCollector) {
+  let closed = false;
+  let pending = Promise.resolve();
+  let persistenceError;
+  let finalized;
+  const enqueuePersistence = (record2) => {
+    const persisted = pending.then(async () => {
+      const result = await persist(record2, collector);
+      if (result.status === "error") {
+        persistenceError ??= result.error;
+      } else {
+        Object.assign(run, record2);
+      }
+      return result;
+    });
+    pending = persisted.then(() => {
+      return;
+    });
+    return persisted;
+  };
+  return {
+    onUpdate: (notification) => {
+      if (closed)
+        return Promise.resolve();
+      const update = pending.then(async () => {
+        collector.add(notification);
+        const persisted = await persist(run, collector);
+        if (persisted.status === "error")
+          persistenceError ??= persisted.error;
+      });
+      pending = update;
+      return update;
+    },
+    persist: enqueuePersistence,
+    finalize: () => {
+      if (finalized)
+        return finalized;
+      closed = true;
+      finalized = pending.then(() => persistenceError ? ae.err(persistenceError) : ae.ok(undefined));
+      return finalized;
+    }
+  };
+}
+async function runAcpWorkerLifecycle(work, cleanup, removeSignals) {
+  const attempted = await ae.tryPromise({ try: work, catch: captureAcpFailure });
+  const removalAttempted = ae.try({ try: removeSignals, catch: captureAcpFailure });
+  const cleanupAttempted = await ae.tryPromise({ try: cleanup, catch: captureAcpFailure });
+  if (attempted.status === "error" && attempted.error.kind === "panic") {
+    if (removalAttempted.status === "error") {
+      const removalFailure2 = removalAttempted.error.kind === "panic" ? removalAttempted.error.panic : capturedWorkerFailure("remove-worker-signals", removalAttempted.error);
+      recordAcpCleanupFailure(attempted.error.panic, removalFailure2);
+    }
+    if (cleanupAttempted.status === "ok") {
+      if (cleanupAttempted.value.status === "error") {
+        recordAcpCleanupFailure(attempted.error.panic, cleanupAttempted.value.error);
+      }
+    } else {
+      const cleanupFailure = cleanupAttempted.error.kind === "panic" ? cleanupAttempted.error.panic : capturedWorkerFailure("close-harness", cleanupAttempted.error);
+      recordAcpCleanupFailure(attempted.error.panic, cleanupFailure);
+    }
+    return signalAcpDefect(attempted.error.panic);
+  }
+  if (removalAttempted.status === "error" && removalAttempted.error.kind === "panic") {
+    if (cleanupAttempted.status === "ok") {
+      if (cleanupAttempted.value.status === "error") {
+        recordAcpCleanupFailure(removalAttempted.error.panic, cleanupAttempted.value.error);
+      }
+    } else {
+      const cleanupFailure = cleanupAttempted.error.kind === "panic" ? cleanupAttempted.error.panic : capturedWorkerFailure("close-harness", cleanupAttempted.error);
+      recordAcpCleanupFailure(removalAttempted.error.panic, cleanupFailure);
+    }
+    return signalAcpDefect(removalAttempted.error.panic);
+  }
+  if (cleanupAttempted.status === "error" && cleanupAttempted.error.kind === "panic") {
+    if (removalAttempted.status === "error" && removalAttempted.error.kind === "ordinary") {
+      recordAcpCleanupFailure(cleanupAttempted.error.panic, capturedWorkerFailure("remove-worker-signals", removalAttempted.error));
+    }
+    return signalAcpDefect(cleanupAttempted.error.panic);
+  }
+  let result;
+  if (attempted.status === "ok") {
+    result = attempted.value;
+  } else {
+    switch (attempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(attempted.error.panic);
+      case "ordinary":
+        result = ae.err(capturedWorkerFailure("worker-process", attempted.error));
+        break;
+    }
+  }
+  let removalFailure;
+  if (removalAttempted.status === "error") {
+    switch (removalAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(removalAttempted.error.panic);
+      case "ordinary":
+        removalFailure = capturedWorkerFailure("remove-worker-signals", removalAttempted.error);
+        break;
+    }
+  }
+  let cleaned;
+  if (cleanupAttempted.status === "ok") {
+    cleaned = cleanupAttempted.value;
+  } else {
+    switch (cleanupAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(cleanupAttempted.error.panic);
+      case "ordinary":
+        cleaned = ae.err(capturedWorkerFailure("close-harness", cleanupAttempted.error));
+        break;
+    }
+  }
+  const harnessCleanup = cleaned.status === "error" ? cleaned.error : undefined;
+  if (!removalFailure && !harnessCleanup)
+    return result;
+  if (result.status === "ok" && removalFailure && !harnessCleanup) {
+    return ae.err(removalFailure);
+  }
+  if (result.status === "ok" && harnessCleanup && !removalFailure) {
+    return ae.err(harnessCleanup);
+  }
+  return ae.err(new WorkerLifecycleCleanupFailed({
+    ...result.status === "error" ? { primary: result.error } : {},
+    ...removalFailure ? { signalCleanup: removalFailure } : {},
+    ...harnessCleanup ? { harnessCleanup } : {},
+    message: result.status === "error" ? `${result.error.message} Worker lifecycle cleanup also failed.` : "Worker lifecycle cleanup failed."
+  }));
+}
+async function runPromptWithCancellationMonitor(params) {
+  const observed = await params.observe();
+  if (observed.status === "error")
+    return ae.err(observed.error);
+  const observation = observed.value;
+  let promptActive = false;
+  let signalPromptStarted = () => {
+    return;
+  };
+  const promptStarted = new Promise((resolve) => {
+    signalPromptStarted = resolve;
+  });
+  const monitored = (async () => {
+    const cancellation = await observation.result;
+    if (cancellation.status === "error")
+      return ae.err(cancellation.error);
+    if (cancellation.value === "stopped")
+      return ae.ok(undefined);
+    await promptStarted;
+    if (!promptActive)
+      return ae.ok(undefined);
+    return params.cancel();
+  })();
+  const promptedAttemptedPromise = ae.tryPromise({
+    try: () => runAcpWorkerLifecycle(async () => {
+      promptActive = true;
+      signalPromptStarted();
+      const prompt = params.prompt();
+      const result = await prompt;
+      promptActive = false;
+      return result;
+    }, observation.close, () => {
+      return;
+    }),
+    catch: captureAcpFailure
+  });
+  const monitorAttemptedPromise = ae.tryPromise({
+    try: () => monitored,
+    catch: captureAcpFailure
+  });
+  const first = await Promise.race([
+    promptedAttemptedPromise.then((attempted) => ({ kind: "prompt", attempted })),
+    monitorAttemptedPromise.then((attempted) => ({ kind: "monitor", attempted }))
+  ]);
+  if (first.kind === "monitor" && (first.attempted.status === "error" || first.attempted.value.status === "error")) {
+    promptActive = false;
+    const watcherCleanupPromise = ae.tryPromise({
+      try: observation.close,
+      catch: captureAcpFailure
+    });
+    const terminationPromise = ae.tryPromise({
+      try: params.terminate,
+      catch: captureAcpFailure
+    });
+    const [watcherCleanup, termination] = await Promise.all([
+      watcherCleanupPromise,
+      terminationPromise
+    ]);
+    promptedAttemptedPromise.then(() => {
+      return;
+    });
+    let monitorPanic;
+    let monitorError;
+    if (first.attempted.status === "ok") {
+      if (first.attempted.value.status === "ok") {
+        return ae.err(new ExternalOperationFailed({
+          operation: "watch-run-cancellation",
+          cause: new Error("Cancellation monitor unexpectedly succeeded on its failure path."),
+          message: "Cancellation monitor unexpectedly succeeded on its failure path."
+        }));
+      }
+      monitorError = first.attempted.value.error;
+    } else {
+      switch (first.attempted.error.kind) {
+        case "panic":
+          monitorPanic = first.attempted.error.panic;
+          monitorError = new ExternalOperationFailed({
+            operation: "watch-run-cancellation",
+            cause: monitorPanic,
+            message: monitorPanic.message
+          });
+          break;
+        case "ordinary":
+          monitorError = capturedWorkerFailure("watch-run-cancellation", first.attempted.error);
+          break;
+      }
+    }
+    const watcherFailure = capturedCleanupResult(watcherCleanup, "close-run-cancellation-watch");
+    const terminationFailure = capturedCleanupResult(termination, "close-harness");
+    if (monitorPanic) {
+      if (watcherFailure)
+        recordAcpCleanupFailure(monitorPanic, watcherFailure);
+      if (terminationFailure)
+        recordAcpCleanupFailure(monitorPanic, terminationFailure);
+      return signalAcpDefect(monitorPanic);
+    }
+    let cleanupPanic;
+    if (n.is(watcherFailure))
+      cleanupPanic = watcherFailure;
+    else if (n.is(terminationFailure))
+      cleanupPanic = terminationFailure;
+    if (cleanupPanic) {
+      const secondary = cleanupPanic === watcherFailure ? terminationFailure : watcherFailure;
+      if (secondary)
+        recordAcpCleanupFailure(cleanupPanic, secondary);
+      return signalAcpDefect(cleanupPanic);
+    }
+    const watcherError = watcherFailure instanceof ExternalOperationFailed ? watcherFailure : undefined;
+    const terminationError = terminationFailure instanceof ExternalOperationFailed ? terminationFailure : undefined;
+    if (!watcherError && !terminationError)
+      return ae.err(monitorError);
+    return ae.err(new MonitorTerminationFailed({
+      primary: monitorError,
+      ...watcherError ? { watcherCleanup: watcherError } : {},
+      ...terminationError ? { termination: terminationError } : {},
+      message: `${monitorError.message} In-flight prompt termination also failed.`
+    }));
+  }
+  const promptedAttempted = first.kind === "prompt" ? first.attempted : await promptedAttemptedPromise;
+  const monitorAttempted = first.kind === "monitor" ? first.attempted : await monitorAttemptedPromise;
+  if (promptedAttempted.status === "error" && promptedAttempted.error.kind === "panic") {
+    if (monitorAttempted.status === "error") {
+      const secondary = monitorAttempted.error.kind === "panic" ? monitorAttempted.error.panic : capturedWorkerFailure("watch-run-cancellation", monitorAttempted.error);
+      recordAcpCleanupFailure(promptedAttempted.error.panic, secondary);
+    } else if (monitorAttempted.value.status === "error") {
+      const secondary = monitorAttempted.value.error._tag === "ExternalOperationFailed" ? monitorAttempted.value.error : new ExternalOperationFailed({
+        operation: "watch-run-cancellation",
+        cause: monitorAttempted.value.error,
+        message: monitorAttempted.value.error.message
+      });
+      recordAcpCleanupFailure(promptedAttempted.error.panic, secondary);
+    }
+    return signalAcpDefect(promptedAttempted.error.panic);
+  }
+  if (monitorAttempted.status === "error" && monitorAttempted.error.kind === "panic") {
+    return signalAcpDefect(monitorAttempted.error.panic);
+  }
+  let prompted;
+  if (promptedAttempted.status === "ok") {
+    prompted = promptedAttempted.value;
+  } else {
+    switch (promptedAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(promptedAttempted.error.panic);
+      case "ordinary":
+        prompted = ae.err(capturedWorkerFailure("worker-process", promptedAttempted.error));
+        break;
+    }
+  }
+  let monitor;
+  if (monitorAttempted.status === "ok") {
+    monitor = monitorAttempted.value;
+  } else {
+    switch (monitorAttempted.error.kind) {
+      case "panic":
+        return signalAcpDefect(monitorAttempted.error.panic);
+      case "ordinary":
+        monitor = ae.err(capturedWorkerFailure("watch-run-cancellation", monitorAttempted.error));
+        break;
+    }
+  }
+  if (monitor.status === "ok")
+    return prompted;
+  if (prompted.status === "ok")
+    return ae.err(monitor.error);
+  return ae.err(new WorkAndMonitorFailed({
+    primary: prompted.error,
+    monitor: monitor.error,
+    message: `${prompted.error.message} Cancellation monitoring also failed.`
+  }));
 }
 async function runWorkerProcess(runId, version2) {
   const loaded = await loadRunRecord(runId);
   if (loaded.status === "error")
-    return 1;
+    return ae.err(loaded.error);
   const run = loaded.value;
   const resolvedHarness = await resolveHarness(run.harnessId);
   if (resolvedHarness.status === "error" || !resolvedHarness.value) {
@@ -18226,31 +18827,39 @@ async function runWorkerProcess(runId, version2) {
       updatedAt: Date.now(),
       error: resolvedHarness.status === "error" ? resolvedHarness.error.message : getHarnessDescriptor(run.harnessId)?.installHint ?? `Harness '${run.harnessId}' is not launchable.`
     };
-    await saveRunRecord(failed);
-    return 1;
+    const saved = await saveRunRecord(failed);
+    return saved.status === "error" ? ae.err(saved.error) : ae.ok(1);
   }
   const collector = new SessionHistoryCollector;
+  const sessionUpdates = createSessionUpdatePersistence(run, collector);
   const connected = await AcpHarnessClient.connect({
     harness: resolvedHarness.value,
     version: version2,
     permissionBehavior: "always",
     counters: run.permissions,
-    onUpdate: async (notification) => {
-      collector.add(notification);
-      await persistRunFromCollector(run, collector);
-    }
+    onUpdate: sessionUpdates.onUpdate
   });
   if (connected.status === "error") {
+    const updatesFinalized = await sessionUpdates.finalize();
     const failed = {
       ...run,
       status: "failed",
       updatedAt: Date.now(),
       error: connected.error.message
     };
-    await saveRunRecord(failed);
-    return 1;
+    const saved = await sessionUpdates.persist(failed);
+    if (saved.status === "error")
+      return ae.err(saved.error);
+    return updatesFinalized.status === "error" ? ae.err(updatesFinalized.error) : ae.ok(1);
   }
   const client = connected.value;
+  let clientCloseAttempted = false;
+  const closeClient = async () => {
+    if (clientCloseAttempted)
+      return ae.ok(undefined);
+    clientCloseAttempted = true;
+    return client.close();
+  };
   let remoteSessionId = run.remoteSessionId;
   let cancellationRequested = false;
   const onTerminate = () => {
@@ -18260,133 +18869,166 @@ async function runWorkerProcess(runId, version2) {
   };
   process.on("SIGTERM", onTerminate);
   process.on("SIGINT", onTerminate);
-  let workError;
-  if (run.targetKind === "existing") {
-    if (!remoteSessionId) {
-      workError = new RunInvariantFailed({
-        runId: run.id,
-        message: `Run '${run.id}' is missing its remote session ID.`
-      });
-    } else {
-      const sessionLoaded = await client.loadSession(remoteSessionId, run.directory);
-      if (sessionLoaded.status === "error")
-        workError = sessionLoaded.error;
-    }
-  } else {
-    const created = await client.createSession(run.directory);
-    if (created.status === "error") {
-      workError = created.error;
-    } else {
-      remoteSessionId = created.value.sessionId;
-      run.remoteSessionId = remoteSessionId;
-      run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
-      const indexed = await upsertSessionIndexEntries([
-        {
-          sessionRef: run.sessionRef,
-          harnessId: run.harnessId,
-          remoteSessionId,
-          cwd: run.directory,
-          title: run.requestedTitle,
-          updatedAt: undefined,
-          capabilities: client.capabilities(),
-          lastSeenAt: Date.now(),
-          ...run.requestedTitle ? { localTitle: run.requestedTitle } : {}
-        }
-      ]);
-      if (indexed.status === "error")
-        workError = indexed.error;
-      if (!workError && run.requestedTitle) {
-        const titled = await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
-        if (titled.status === "error")
-          workError = titled.error;
-      }
-    }
-  }
-  if (!workError) {
-    if (!remoteSessionId || !run.sessionRef) {
-      workError = new RunInvariantFailed({
-        runId: run.id,
-        message: `Run '${run.id}' could not resolve a session target.`
-      });
-    }
-  }
-  if (!workError && remoteSessionId && run.sessionRef) {
-    const activeSessionId = remoteSessionId;
-    run.session = {
-      title: run.requestedTitle,
-      cwd: run.directory,
-      updatedAt: collector.updatedAt,
-      capabilities: client.capabilities()
-    };
-    run.status = "running";
-    run.userMessageId = randomUUID2();
-    run.updatedAt = Date.now();
-    const runningSaved = await saveRunRecord(run);
-    if (runningSaved.status === "error")
-      workError = runningSaved.error;
-    if (!workError) {
-      const refreshedRun = await loadRunRecord(run.id);
-      if (refreshedRun.status === "error") {
-        workError = refreshedRun.error;
-      } else if (cancellationRequested || refreshedRun.value.cancelRequestedAt) {
-        run.status = "cancelled";
-        run.updatedAt = Date.now();
-        run.error = "Cancelled before prompt submission completed.";
-        await saveRunRecord(run);
-      }
-    }
-    if (!workError && run.status !== "cancelled" && run.requestedMode) {
-      const mode = await client.setMode(activeSessionId, run.requestedMode);
-      if (mode.status === "error")
-        workError = mode.error;
-    }
-    if (!workError && run.status !== "cancelled" && run.requestedModel) {
-      const model = await client.setModel(activeSessionId, run.requestedModel);
-      if (model.status === "error")
-        workError = model.error;
-    }
-    if (!workError && run.status !== "cancelled") {
-      const prompted = await client.prompt(activeSessionId, run.promptText, run.userMessageId);
-      if (prompted.status === "error") {
-        workError = prompted.error;
+  const lifecycle = await runAcpWorkerLifecycle(async () => {
+    let workError2;
+    if (run.targetKind === "existing") {
+      if (!remoteSessionId) {
+        workError2 = new RunInvariantFailed({
+          runId: run.id,
+          message: `Run '${run.id}' is missing its remote session ID.`
+        });
       } else {
-        const promptResponse = prompted.value;
-        run.stopReason = promptResponse.stopReason;
-        run.status = cancellationRequested || isCancelledStopReason(promptResponse.stopReason) ? "cancelled" : "completed";
-        run.updatedAt = Date.now();
-        const persisted = await persistRunFromCollector(run, collector);
-        if (persisted.status === "error")
-          workError = persisted.error;
+        const sessionLoaded = await client.loadSession(remoteSessionId, run.directory);
+        if (sessionLoaded.status === "error")
+          workError2 = sessionLoaded.error;
+      }
+    } else {
+      const created = await client.createSession(run.directory);
+      if (created.status === "error") {
+        workError2 = created.error;
+      } else {
+        remoteSessionId = created.value.sessionId;
+        run.remoteSessionId = remoteSessionId;
+        run.sessionRef = formatSessionRef(run.harnessId, remoteSessionId);
         const indexed = await upsertSessionIndexEntries([
-          buildIndexEntry({
-            harnessId: run.harnessId,
-            sessionId: activeSessionId,
+          {
             sessionRef: run.sessionRef,
-            title: collector.title ?? run.requestedTitle,
+            harnessId: run.harnessId,
+            remoteSessionId,
             cwd: run.directory,
-            updatedAt: collector.updatedAt,
-            capabilities: client.capabilities()
-          }, run.requestedTitle)
+            title: run.requestedTitle,
+            updatedAt: undefined,
+            capabilities: client.capabilities(),
+            lastSeenAt: Date.now(),
+            ...run.requestedTitle ? { localTitle: run.requestedTitle } : {}
+          }
         ]);
         if (indexed.status === "error")
-          workError = indexed.error;
+          workError2 = indexed.error;
+        if (!workError2 && run.requestedTitle) {
+          const titled = await setLocalSessionTitle(run.sessionRef, run.requestedTitle);
+          if (titled.status === "error")
+            workError2 = titled.error;
+        }
       }
     }
-  }
-  process.off("SIGTERM", onTerminate);
-  process.off("SIGINT", onTerminate);
-  const cleanup = await client.close();
-  if (cleanup.status === "error") {
-    if (workError) {
-      workError = new WorkAndCleanupFailed({
-        primary: workError,
-        cleanup: cleanup.error,
-        message: `${workError.message} Harness cleanup also failed.`
-      });
-    } else {
-      workError = cleanup.error;
+    if (!workError2) {
+      if (!remoteSessionId || !run.sessionRef) {
+        workError2 = new RunInvariantFailed({
+          runId: run.id,
+          message: `Run '${run.id}' could not resolve a session target.`
+        });
+      }
     }
-  }
+    if (!workError2 && remoteSessionId && run.sessionRef) {
+      const activeSessionId = remoteSessionId;
+      const userMessageId = randomUUID2();
+      const running = {
+        ...run,
+        session: {
+          title: run.requestedTitle,
+          cwd: run.directory,
+          updatedAt: collector.updatedAt,
+          capabilities: client.capabilities()
+        },
+        status: "running",
+        userMessageId,
+        updatedAt: Date.now()
+      };
+      const runningSaved = await sessionUpdates.persist(running);
+      if (runningSaved.status === "error") {
+        workError2 = runningSaved.error;
+      } else {
+        Object.assign(run, running);
+      }
+      if (!workError2) {
+        const refreshedRun = await loadRunRecord(run.id);
+        if (refreshedRun.status === "error") {
+          workError2 = refreshedRun.error;
+        } else if (cancellationRequested || refreshedRun.value.cancelRequestedAt) {
+          cancellationRequested = true;
+          const updatesFinalized2 = await sessionUpdates.finalize();
+          if (updatesFinalized2.status === "error") {
+            workError2 = updatesFinalized2.error;
+          } else {
+            const cancelled = {
+              ...run,
+              status: "cancelled",
+              updatedAt: Date.now(),
+              error: "Cancelled before prompt submission completed."
+            };
+            const cancelledSaved = await sessionUpdates.persist(cancelled);
+            if (cancelledSaved.status === "error") {
+              workError2 = cancelledSaved.error;
+            } else {
+              Object.assign(run, cancelled);
+            }
+          }
+        }
+      }
+      if (!workError2 && run.status !== "cancelled" && run.requestedMode) {
+        const mode = await client.setMode(activeSessionId, run.requestedMode);
+        if (mode.status === "error")
+          workError2 = mode.error;
+      }
+      if (!workError2 && run.status !== "cancelled" && run.requestedModel) {
+        const model = await client.setModel(activeSessionId, run.requestedModel);
+        if (model.status === "error")
+          workError2 = model.error;
+      }
+      if (!workError2 && run.status !== "cancelled") {
+        const prompted = await runPromptWithCancellationMonitor({
+          observe: () => observeRunCancellation(run),
+          prompt: () => client.prompt(activeSessionId, run.promptText, userMessageId),
+          cancel: () => client.cancel(activeSessionId),
+          terminate: closeClient
+        });
+        if (prompted.status === "error") {
+          workError2 = prompted.error;
+        } else {
+          const updatesFinalized2 = await sessionUpdates.finalize();
+          if (updatesFinalized2.status === "error") {
+            workError2 = updatesFinalized2.error;
+          } else {
+            const promptResponse = prompted.value;
+            const terminal = {
+              ...run,
+              stopReason: promptResponse.stopReason,
+              status: cancellationRequested || isCancelledStopReason(promptResponse.stopReason) ? "cancelled" : "completed",
+              updatedAt: Date.now()
+            };
+            const persisted = await sessionUpdates.persist(terminal);
+            if (persisted.status === "error") {
+              workError2 = persisted.error;
+            } else {
+              Object.assign(run, terminal);
+              const indexed = await upsertSessionIndexEntries([
+                buildIndexEntry({
+                  harnessId: run.harnessId,
+                  sessionId: activeSessionId,
+                  sessionRef: run.sessionRef,
+                  title: collector.title ?? run.requestedTitle,
+                  cwd: run.directory,
+                  updatedAt: collector.updatedAt,
+                  capabilities: client.capabilities()
+                }, run.requestedTitle)
+              ]);
+              if (indexed.status === "error")
+                workError2 = indexed.error;
+            }
+          }
+        }
+      }
+    }
+    const updatesFinalized = await sessionUpdates.finalize();
+    if (!workError2 && updatesFinalized.status === "error")
+      workError2 = updatesFinalized.error;
+    return workError2 ? ae.err(workError2) : ae.ok(undefined);
+  }, closeClient, () => {
+    process.off("SIGTERM", onTerminate);
+    process.off("SIGINT", onTerminate);
+  });
+  let workError = lifecycle.status === "error" ? lifecycle.error : undefined;
   if (workError) {
     const authHint = client.authHint();
     const cancelled = run.status === "cancelled" || cancellationRequested;
@@ -18403,10 +19045,10 @@ async function runWorkerProcess(runId, version2) {
       updatedAt: Date.now(),
       error: runError
     };
-    await saveRunRecord(next);
-    return 1;
+    const saved = await sessionUpdates.persist(next);
+    return saved.status === "error" ? ae.err(saved.error) : ae.ok(1);
   }
-  return run.status === "completed" ? 0 : 1;
+  return ae.ok(run.status === "completed" ? 0 : 1);
 }
 async function main(argv, options) {
   const commandName = "lilac-acp";
@@ -18442,7 +19084,12 @@ async function main(argv, options) {
       write({ ok: false, error: "Missing --run-id for worker." });
       return 1;
     }
-    return runWorkerProcess(runId, packageVersion);
+    const worker = await runWorkerProcess(runId, packageVersion);
+    if (worker.status === "error") {
+      write({ ok: false, error: worker.error.message, runId });
+      return 1;
+    }
+    return worker.value;
   }
   const command = cleanArgv[0] ?? "";
   if (command === "harnesses") {

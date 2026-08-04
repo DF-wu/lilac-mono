@@ -552,18 +552,15 @@ describe("tool result artifact store", () => {
     expect(await readdir(store.rootDir)).toEqual(entriesBeforeRead);
     expect(await readFile(metadataFile)).toEqual(metadataBeforeRead);
 
-    expect(await adaptToolResultArtifactReadToUnavailablePolicy(store, read)).toEqual({
-      ok: false,
-    });
+    expect(
+      await adaptToolResultArtifactReadToUnavailablePolicy(store, read, { kind: "none" }),
+    ).toEqual({ ok: false });
     expect(await readdir(store.rootDir)).toEqual(entriesBeforeRead);
     expect(await readFile(metadataFile)).toEqual(metadataBeforeRead);
 
-    expect(
-      await adaptToolResultArtifactReadToUnavailablePolicy(store, read, {
-        kind: "maintain-after-unavailable",
-        onMaintenanceError: "unavailable",
-      }),
-    ).toEqual({ ok: false });
+    expect(await adaptToolResultArtifactReadToUnavailablePolicy(store, read)).toEqual({
+      ok: false,
+    });
     expect(await readdir(store.rootDir)).toEqual([]);
   });
 
@@ -583,6 +580,10 @@ describe("tool result artifact store", () => {
     const remove = spyOn(fs, "rm").mockRejectedValue(new Error("maintenance cleanup failed"));
 
     try {
+      expect(await adaptToolResultArtifactReadToUnavailablePolicy(store, read)).toEqual({
+        ok: false,
+      });
+
       await expect(
         adaptToolResultArtifactReadToUnavailablePolicy(store, read, {
           kind: "maintain-after-unavailable",
@@ -728,6 +729,24 @@ describe("tool result artifact store", () => {
     expect(await readdir(store.rootDir)).toHaveLength(4);
     expect(await store.maintain()).toEqual({ removedInvalid: 0, removedExpired: 1 });
     expect(await readdir(store.rootDir)).toHaveLength(2);
+  });
+
+  it("maintains expired artifacts after an unavailable read by default", async () => {
+    setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("expired"));
+    if (created.status === "error") throw created.error;
+
+    setSystemTime(new Date("2026-01-01T00:00:02Z"));
+    const read = await store.read(created.value.uri, "session-a");
+    expect(read.status).toBe("error");
+    expect(await readdir(store.rootDir)).toHaveLength(2);
+
+    expect(await adaptToolResultArtifactReadToUnavailablePolicy(store, read)).toEqual({
+      ok: false,
+    });
+    expect(await readdir(store.rootDir)).toEqual([]);
   });
 
   it("enforces a positive hard maximum for artifact pages", async () => {

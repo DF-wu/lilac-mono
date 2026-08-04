@@ -186,22 +186,26 @@ export function resolveJsonPointer(
   return Result.ok(current);
 }
 
-function captureTextFileRead(
+async function captureTextFileRead(
   filePath: string,
   source: string,
   context: McpValueResolutionContext,
 ): Promise<ResultType<string, McpValueFileReadError>> {
-  return Result.tryPromise({
-    try: () => (context.readTextFile ? context.readTextFile(filePath) : Bun.file(filePath).text()),
-    catch: (cause) => {
-      rethrowPanic(cause);
-      return new McpValueFileReadError({
+  try {
+    const text = context.readTextFile
+      ? await context.readTextFile(filePath)
+      : await Bun.file(filePath).text();
+    return Result.ok(text);
+  } catch (cause) {
+    rethrowPanic(cause);
+    return Result.err(
+      new McpValueFileReadError({
         source,
         cause,
         message: `failed to read ${source}: ${opaqueErrorMessage(cause)}`,
-      });
-    },
-  });
+      }),
+    );
+  }
 }
 
 function decodeJsonValue(
@@ -307,15 +311,15 @@ export async function resolveMcpValueSourceMap(
   sources: Readonly<Record<string, McpValueSource>>,
   context: McpValueResolutionContext,
 ): Promise<McpValueMapResolution> {
-  return Result.gen(async function* () {
-    const values: Record<string, string> = {};
-    for (const key of Object.keys(sources).sort()) {
-      const source = sources[key];
-      if (source === undefined) continue;
-      values[key] = yield* Result.await(resolveMcpValueSourceEntry(key, source, context));
-    }
-    return Result.ok(values);
-  });
+  const values: Record<string, string> = {};
+  for (const key of Object.keys(sources).sort()) {
+    const source = sources[key];
+    if (source === undefined) continue;
+    const resolved = await resolveMcpValueSourceEntry(key, source, context);
+    if (resolved.status === "error") return resolved;
+    values[key] = resolved.value;
+  }
+  return Result.ok(values);
 }
 
 const INVALID_HEADER_NAME = /[^!#$%&'*+\-.^_`|~0-9A-Za-z]/;

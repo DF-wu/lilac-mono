@@ -1031,7 +1031,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "external-adapters.ts", exportName: "projectExternalFailure" },
         category: "projection",
       },
-      ...["decodeRunRecord", "decodeSessionIndex"].map((exportName) => ({
+      ...["decodeRunRecord", "decodeRunCancellation", "decodeSessionIndex"].map((exportName) => ({
         identity: { module: "run-store.ts", exportName },
         category: "persistence" as const,
       })),
@@ -5887,6 +5887,13 @@ const ACP_RUN_RECORD_PERSISTED_CODEC = {
   provenance: ["current", "migrated"],
 } as const satisfies PersistedCodecRegistration;
 
+const ACP_RUN_CANCELLATION_PERSISTED_CODEC = {
+  identity: { module: "run-store.ts", exportName: "decodeRunCancellation" },
+  inputParameter: 0,
+  fixtureCatalog: { module: "run-store.ts", exportName: "runCancellationCodecCases" },
+  provenance: ["current", "migrated"],
+} as const satisfies PersistedCodecRegistration;
+
 const ACP_SESSION_INDEX_PERSISTED_CODEC = {
   identity: { module: "run-store.ts", exportName: "decodeSessionIndex" },
   inputParameter: 0,
@@ -5898,6 +5905,10 @@ const ACP_PERSISTED_CONSUMERS = [
   {
     identity: { module: "run-store.ts", exportName: "loadRunRecord" },
     codecs: [ACP_RUN_RECORD_PERSISTED_CODEC.identity],
+  },
+  {
+    identity: { module: "run-store.ts", exportName: "loadRunCancellation" },
+    codecs: [ACP_RUN_CANCELLATION_PERSISTED_CODEC.identity],
   },
   {
     identity: { module: "run-store.ts", exportName: "loadSessionIndex" },
@@ -5924,8 +5935,14 @@ const WAVE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]
       ["external-adapters.ts", "captureExternal"],
       ...[
         "decodeRunRecord",
+        "decodeRunCancellation",
         "decodeSessionIndex",
         "saveRunRecord",
+        "saveWorkerRunRecord",
+        "commitRunCancellationRequest",
+        "requestRunCancellation",
+        "observeRunCancellation",
+        "loadRunCancellation",
         "loadRunRecord",
         "loadSessionIndex",
         "upsertSessionIndexEntries",
@@ -6925,7 +6942,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     unknownFreeModules: root === "apps/mini-lilac-tui" ? TUI_UNKNOWN_FREE_MODULES : [],
     persistedCodecs:
       root === "apps/acp-controller"
-        ? [ACP_RUN_RECORD_PERSISTED_CODEC, ACP_SESSION_INDEX_PERSISTED_CODEC]
+        ? [
+            ACP_RUN_RECORD_PERSISTED_CODEC,
+            ACP_RUN_CANCELLATION_PERSISTED_CODEC,
+            ACP_SESSION_INDEX_PERSISTED_CODEC,
+          ]
         : root === "apps/mini-lilac-tui"
           ? [TUI_BINDING_PREFERENCES_PERSISTED_CODEC]
           : root === "packages/tool-results"
@@ -7781,23 +7802,64 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               direction: "observe-panic",
               reason: "Preserves the original key read Panic when file-handle cleanup also fails.",
             },
-            ...["captureFileOperation", "readMcpConfigFile", "serializeConfig"].map(
-              (exportName) => ({
-                identity: { module: "src/mcp/config-file.ts", exportName: `${exportName}.catch` },
+            ...["captureFileOperation", "readMcpConfigFile"].flatMap((exportName) => [
+              {
+                identity: { module: "src/mcp/config-file.ts", exportName },
+                category: "external-to-result" as const,
+                externalApi: { package: "node:fs/promises", exportName: "filesystem operation" },
+                direction: "capture-external" as const,
+                reason:
+                  "Maps an immediate MCP configuration filesystem failure to an owned Result error.",
+              },
+              {
+                identity: { module: "src/mcp/config-file.ts", exportName },
                 category: "defect-supervisor" as const,
                 externalApi: { package: "better-result", exportName: "Panic.is" },
                 direction: "observe-panic" as const,
                 reason:
-                  "Preserves Panic while mapping the immediate filesystem or serialization exception.",
-              }),
-            ),
-            ...["captureTextFileRead", "decodeJsonValue"].map((exportName) => ({
-              identity: { module: "src/mcp/value-source.ts", exportName: `${exportName}.catch` },
+                  "Preserves exact Panic identity while mapping an immediate MCP configuration filesystem failure.",
+              },
+            ]),
+            {
+              identity: {
+                module: "src/mcp/config-file.ts",
+                exportName: "superviseMcpConfigFilePanicCleanup",
+              },
+              category: "defect-supervisor",
+              externalApi: { package: "better-result", exportName: "Panic.is" },
+              direction: "observe-panic",
+              reason:
+                "Preserves the exact MCP configuration operation Panic while completing required temporary-file cleanup.",
+            },
+            {
+              identity: { module: "src/mcp/config-file.ts", exportName: "serializeConfig.catch" },
               category: "defect-supervisor" as const,
               externalApi: { package: "better-result", exportName: "Panic.is" },
               direction: "observe-panic" as const,
-              reason: "Preserves Panic while mapping the immediate filesystem or JSON exception.",
-            })),
+              reason: "Preserves Panic while mapping the immediate serialization exception.",
+            },
+            {
+              identity: { module: "src/mcp/value-source.ts", exportName: "captureTextFileRead" },
+              category: "external-to-result" as const,
+              externalApi: { package: "filesystem", exportName: "text file read" },
+              direction: "capture-external" as const,
+              reason: "Maps an immediate MCP value file read failure to an owned Result error.",
+            },
+            {
+              identity: { module: "src/mcp/value-source.ts", exportName: "captureTextFileRead" },
+              category: "defect-supervisor" as const,
+              externalApi: { package: "better-result", exportName: "Panic.is" },
+              direction: "observe-panic" as const,
+              reason:
+                "Preserves exact Panic identity while mapping an MCP value file read failure.",
+            },
+            {
+              identity: { module: "src/mcp/value-source.ts", exportName: "decodeJsonValue.catch" },
+              category: "defect-supervisor" as const,
+              externalApi: { package: "better-result", exportName: "Panic.is" },
+              direction: "observe-panic" as const,
+              reason: "Preserves Panic while mapping the immediate JSON exception.",
+            },
             ...["captureRunEvent", "captureChildActivity"].map((exportName) => ({
               identity: {
                 module: "src/workflow/workflow-live-parent-bridge.ts",
@@ -8399,6 +8461,18 @@ const PRECISE_EXCEPTION_ADAPTER_KEYS = new Set(
 
 const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
   preciseExceptionAdapterKey(
+    "apps/core",
+    "src/mcp/config-file.ts",
+    "captureFileOperation",
+    "capture-external",
+  ),
+  preciseExceptionAdapterKey(
+    "apps/core",
+    "src/mcp/value-source.ts",
+    "captureTextFileRead",
+    "capture-external",
+  ),
+  preciseExceptionAdapterKey(
     "packages/event-bus",
     "redis-streams-bus.ts",
     "RedisStreamsBus.subscribe.reportFatal",
@@ -8562,7 +8636,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "dc5852941a0ccaa5fee9ea9b3f2e89171b227269c22bb10bcea0f8339af38ebb";
+  "72483b25560f5d882a2b5a8079b1703586b7813ae9e1009156bf31dda076cd42";
 
 export const architectureManifest = {
   version: 1,

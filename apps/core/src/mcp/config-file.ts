@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
@@ -98,12 +98,6 @@ export class McpConfigFileOperationAndCleanupError extends TaggedError(
   readonly message: string;
 }> {}
 
-class McpConfigFileMissingError extends TaggedError("McpConfigFileMissingError")<{
-  readonly configPath: string;
-  readonly cause: unknown;
-  readonly message: string;
-}> {}
-
 export type McpConfigReadError = McpConfigError;
 export type McpConfigWriteError =
   | McpConfigSerializationError
@@ -156,23 +150,41 @@ function enqueueMutation<T, E>(
   });
 }
 
-function captureFileOperation<T>(options: {
+async function captureFileOperation<T>(options: {
   readonly configPath: string;
   readonly operation: McpConfigFileOperation;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, McpConfigFileOperationError>> {
-  return Result.tryPromise({
-    try: options.run,
-    catch: (cause) => {
-      rethrowPanic(cause);
-      return new McpConfigFileOperationError({
+  try {
+    return Result.ok(await options.run());
+  } catch (cause) {
+    rethrowPanic(cause);
+    return Result.err(
+      new McpConfigFileOperationError({
         configPath: options.configPath,
         operation: options.operation,
         cause,
         message: `Failed to ${options.operation.replaceAll("_", " ")} for MCP configuration at ${options.configPath}: ${opaqueErrorMessage(cause)}`,
-      });
-    },
-  });
+      }),
+    );
+  }
+}
+
+async function superviseMcpConfigFilePanicCleanup<T>(
+  operation: () => Promise<T>,
+  cleanup: () => Promise<void>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (cause) {
+    if (!Panic.is(cause)) throw cause;
+    try {
+      await cleanup();
+    } catch {
+      throw cause;
+    }
+    throw cause;
+  }
 }
 
 function serializeConfig(
@@ -231,32 +243,24 @@ export function resolveMcpConfigPath(options: { dataDir: string }): string {
 }
 
 export async function readMcpConfigFile(configPath: string): Promise<McpConfigFileResult> {
-  const source = await Result.tryPromise({
-    try: () => fs.readFile(configPath, "utf8"),
-    catch: (cause) => {
-      rethrowPanic(cause);
-      if (isMissingFileError(cause)) {
-        return new McpConfigFileMissingError({
-          configPath,
-          cause,
-          message: `MCP configuration does not exist at ${configPath}`,
-        });
-      }
-      return new McpConfigError({
+  let source: string;
+  try {
+    source = await fs.readFile(configPath, "utf8");
+  } catch (cause) {
+    rethrowPanic(cause);
+    if (isMissingFileError(cause)) {
+      return Result.ok({ configPath, exists: false, config: createEmptyMcpConfig() });
+    }
+    return Result.err(
+      new McpConfigError({
         configPath,
         issues: [`<root>: failed to read file: ${opaqueErrorMessage(cause)}`],
         cause,
-      });
-    },
-  });
-  if (source.status === "error") {
-    if (McpConfigFileMissingError.is(source.error)) {
-      return Result.ok({ configPath, exists: false, config: createEmptyMcpConfig() });
-    }
-    return Result.err(source.error);
+      }),
+    );
   }
 
-  const parsed = parseMcpConfigYaml(source.value);
+  const parsed = parseMcpConfigYaml(source);
   if (!parsed.ok) return Result.err(new McpConfigError({ configPath, issues: parsed.issues }));
   return Result.ok({ configPath, exists: true, config: parsed.config });
 }
@@ -289,18 +293,17 @@ export async function writeMcpConfigFileAtomic(
       run: () => dependencies.rm(temporaryPath, { force: true }),
     });
 
-  let openCompleted = false;
-  let opened: ResultType<McpConfigFileHandle, McpConfigFileOperationError>;
-  try {
-    opened = await captureFileOperation({
-      configPath,
-      operation: "open_temporary",
-      run: () => dependencies.open(temporaryPath, "wx", 0o600),
-    });
-    openCompleted = true;
-  } finally {
-    if (!openCompleted) await removeTemporary();
-  }
+  const opened = await superviseMcpConfigFilePanicCleanup(
+    () =>
+      captureFileOperation({
+        configPath,
+        operation: "open_temporary",
+        run: () => dependencies.open(temporaryPath, "wx", 0o600),
+      }),
+    async () => {
+      await removeTemporary();
+    },
+  );
   if (opened.status === "error") {
     return combineOperationAndCleanup(configPath, opened, await removeTemporary());
   }
@@ -312,62 +315,50 @@ export async function writeMcpConfigFileAtomic(
       operation: "close_temporary",
       run: () => handle.close(),
     });
-  let writeCompleted = false;
-  let written: ResultType<void, McpConfigFileOperationError>;
-  try {
-    written = await Result.gen(async function* () {
-      yield* Result.await(
-        captureFileOperation({
-          configPath,
-          operation: "write_temporary",
-          run: () => handle.writeFile(source.value, "utf8"),
-        }),
-      );
-      yield* Result.await(
-        captureFileOperation({
+  const written = await superviseMcpConfigFilePanicCleanup(
+    async () => {
+      let result = await captureFileOperation({
+        configPath,
+        operation: "write_temporary",
+        run: () => handle.writeFile(source.value, "utf8"),
+      });
+      if (result.status === "ok") {
+        result = await captureFileOperation({
           configPath,
           operation: "sync_temporary",
           run: () => handle.sync(),
-        }),
-      );
-      return Result.ok();
-    });
-    writeCompleted = true;
-  } finally {
-    if (!writeCompleted) {
+        });
+      }
+      return result;
+    },
+    async () => {
       try {
         await closeTemporary();
       } finally {
         await removeTemporary();
       }
-    }
-  }
+    },
+  );
 
-  let closeCompleted = false;
-  let closed: ResultType<void, McpConfigFileOperationError>;
-  try {
-    closed = await closeTemporary();
-    closeCompleted = true;
-  } finally {
-    if (!closeCompleted) await removeTemporary();
-  }
+  const closed = await superviseMcpConfigFilePanicCleanup(closeTemporary, async () => {
+    await removeTemporary();
+  });
   const prepared = combineOperationAndCleanup(configPath, written, closed);
   if (prepared.status === "error") {
     return combineOperationAndCleanup(configPath, prepared, await removeTemporary());
   }
 
-  let renameCompleted = false;
-  let renamed: ResultType<void, McpConfigFileOperationError>;
-  try {
-    renamed = await captureFileOperation({
-      configPath,
-      operation: "rename_temporary",
-      run: () => dependencies.rename(temporaryPath, configPath),
-    });
-    renameCompleted = true;
-  } finally {
-    if (!renameCompleted) await removeTemporary();
-  }
+  const renamed = await superviseMcpConfigFilePanicCleanup(
+    () =>
+      captureFileOperation({
+        configPath,
+        operation: "rename_temporary",
+        run: () => dependencies.rename(temporaryPath, configPath),
+      }),
+    async () => {
+      await removeTemporary();
+    },
+  );
   if (renamed.status === "error") {
     return combineOperationAndCleanup(configPath, renamed, await removeTemporary());
   }
@@ -383,20 +374,27 @@ export function mutateMcpConfigFile(options: {
   readonly mutation: McpConfigMutation;
   readonly fileDependencies?: McpConfigFileDependencies;
 }): Promise<ResultType<McpConfigMutationResult, McpConfigMutationError>> {
-  return enqueueMutation(options.configPath, async () =>
-    Result.gen(async function* () {
-      const snapshot = yield* Result.await(readMcpConfigFile(options.configPath));
-      const previousConfig = snapshot.config;
+  return enqueueMutation<McpConfigMutationResult, McpConfigMutationError>(
+    options.configPath,
+    async () => {
+      const snapshot = await readMcpConfigFile(options.configPath);
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      const previousConfig = snapshot.value.config;
       const servers = { ...previousConfig.servers };
 
       switch (options.mutation.type) {
         case "upsert": {
-          yield* validateMutationServerId(options.configPath, options.mutation.server.id);
+          const validated = validateMutationServerId(
+            options.configPath,
+            options.mutation.server.id,
+          );
+          if (validated.status === "error") return Result.err(validated.error);
           servers[options.mutation.server.id] = options.mutation.server;
           break;
         }
         case "remove": {
-          yield* validateMutationServerId(options.configPath, options.mutation.serverId);
+          const validated = validateMutationServerId(options.configPath, options.mutation.serverId);
+          if (validated.status === "error") return Result.err(validated.error);
           delete servers[options.mutation.serverId];
           break;
         }
@@ -406,16 +404,21 @@ export function mutateMcpConfigFile(options: {
         configVersion: previousConfig.configVersion,
         servers,
       };
-      const previousSource = yield* serializeConfig(options.configPath, previousConfig);
-      const nextSource = yield* serializeConfig(options.configPath, config);
-      const changed = previousSource !== nextSource;
+      const previousSource = serializeConfig(options.configPath, previousConfig);
+      if (previousSource.status === "error") return Result.err(previousSource.error);
+      const nextSource = serializeConfig(options.configPath, config);
+      if (nextSource.status === "error") return Result.err(nextSource.error);
+      const changed = previousSource.value !== nextSource.value;
       if (changed) {
-        yield* Result.await(
-          writeMcpConfigFileAtomic(options.configPath, config, options.fileDependencies),
+        const written = await writeMcpConfigFileAtomic(
+          options.configPath,
+          config,
+          options.fileDependencies,
         );
+        if (written.status === "error") return Result.err(written.error);
       }
 
       return Result.ok({ configPath: options.configPath, changed, previousConfig, config });
-    }),
+    },
   );
 }

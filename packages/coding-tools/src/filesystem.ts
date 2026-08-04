@@ -212,7 +212,6 @@ export function createFilesystemTools(params: {
                     maxOutputBytes,
                   },
                 ),
-                { kind: "none" },
               )
             : { ok: false as const };
           if (!artifact.ok) {

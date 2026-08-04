@@ -12,10 +12,14 @@ import {
   projectExternalFailure,
 } from "../external-adapters.ts";
 import {
+  commitRunCancellationRequest,
+  decodeRunCancellation,
   decodeRunRecord,
   decodeSessionIndex,
   loadRunRecord,
   loadSessionIndex,
+  observeRunCancellation,
+  requestRunCancellation,
   saveRunRecord,
   upsertSessionIndexEntries,
 } from "../run-store.ts";
@@ -52,6 +56,33 @@ function runRecord(): PromptRunRecord {
 }
 
 describe("run persistence codecs", () => {
+  it("distinguishes cancellation marker codec failures", () => {
+    const runId = runRecord().id;
+    const malformed = decodeRunCancellation({ runId, content: "{" });
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "error") {
+      expect(malformed.error._tag).toBe("RunCancellationMalformedSerialization");
+    }
+
+    const unsupported = decodeRunCancellation({
+      runId,
+      content: JSON.stringify({ version: 2, runCreatedAt: 1, requestedAt: 2 }),
+    });
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "error") {
+      expect(unsupported.error._tag).toBe("RunCancellationUnsupportedVersion");
+    }
+
+    const corrupt = decodeRunCancellation({
+      runId,
+      content: JSON.stringify({ version: 1, runCreatedAt: "invalid", requestedAt: 2 }),
+    });
+    expect(corrupt.status).toBe("error");
+    if (corrupt.status === "error") {
+      expect(corrupt.error._tag).toBe("RunCancellationCorruptFields");
+    }
+  });
+
   it("distinguishes current, malformed, and corrupt run records", () => {
     const current = decodeRunRecord({
       runId: runRecord().id,
@@ -130,6 +161,210 @@ describe("run persistence codecs", () => {
 });
 
 describe("run store adapters", () => {
+  it("rejects invalid cancellation marker objects and corrupt marker files", async () => {
+    const run = runRecord();
+    expect((await saveRunRecord(run)).status).toBe("ok");
+    const runsDir = path.join(tempRoot, "lilac-acp-controller", "runs");
+    const markerPath = path.join(runsDir, `${run.id}.cancel.json`);
+
+    await fs.mkdir(markerPath);
+    const directoryMarker = await loadRunRecord(run.id);
+    expect(directoryMarker.status).toBe("error");
+    if (directoryMarker.status === "error") {
+      expect(directoryMarker.error._tag).toBe("RunCancellationMarkerInvalidType");
+    }
+
+    await fs.rm(markerPath, { recursive: true, force: true });
+    await fs.symlink(path.join(runsDir, `${run.id}.json`), markerPath);
+    const symlinkMarker = await loadRunRecord(run.id);
+    expect(symlinkMarker.status).toBe("error");
+    if (symlinkMarker.status === "error") {
+      expect(symlinkMarker.error._tag).toBe("RunCancellationMarkerInvalidType");
+    }
+
+    await fs.rm(markerPath, { force: true });
+    await fs.writeFile(markerPath, "{", "utf8");
+    const corruptMarker = await loadRunRecord(run.id);
+    expect(corruptMarker.status).toBe("error");
+    if (corruptMarker.status === "error") {
+      expect(corruptMarker.error._tag).toBe("RunCancellationMalformedSerialization");
+    }
+  });
+
+  it("ignores and supersedes stale cancellation markers", async () => {
+    const run = { ...runRecord(), createdAt: 100, updatedAt: 100 };
+    expect((await saveRunRecord(run)).status).toBe("ok");
+    const markerPath = path.join(tempRoot, "lilac-acp-controller", "runs", `${run.id}.cancel.json`);
+    await fs.writeFile(
+      markerPath,
+      `${JSON.stringify({ version: 1, runCreatedAt: 1, requestedAt: 2 })}\n`,
+      "utf8",
+    );
+
+    const stale = await loadRunRecord(run.id);
+    expect(stale.status).toBe("ok");
+    if (stale.status === "ok") expect(stale.value.cancelRequestedAt).toBeUndefined();
+
+    const requested = await requestRunCancellation(run.id);
+    expect(requested.status).toBe("ok");
+    if (requested.status === "ok") {
+      expect(requested.value.kind).toBe("requested");
+      expect(requested.value.run.cancelRequestedAt).toBeNumber();
+    }
+    const marker = decodeRunCancellation({
+      runId: run.id,
+      content: await fs.readFile(markerPath, "utf8"),
+    });
+    expect(marker.status).toBe("ok");
+    if (marker.status === "ok") expect(marker.value.value.runCreatedAt).toBe(run.createdAt);
+  });
+
+  it("reports a committed cancellation request as successful across terminal persistence", async () => {
+    const running = { ...runRecord(), status: "running" as const, updatedAt: Date.now() - 10 };
+    expect((await saveRunRecord(running)).status).toBe("ok");
+    const completed: PromptRunRecord = {
+      ...running,
+      status: "completed",
+      updatedAt: Date.now() - 5,
+    };
+    expect((await saveRunRecord(completed)).status).toBe("ok");
+
+    const requested = await commitRunCancellationRequest(running);
+    expect(requested.status).toBe("ok");
+    if (requested.status === "ok") {
+      expect(requested.value.kind).toBe("requested");
+      expect(requested.value.run.status).toBe("completed");
+      expect(requested.value.run.cancelRequestedAt).toBeNumber();
+    }
+  });
+
+  it("preserves the earliest timestamp across repeated cancellation requests", async () => {
+    const running = { ...runRecord(), status: "running" as const, createdAt: 1, updatedAt: 10 };
+    expect((await saveRunRecord(running)).status).toBe("ok");
+    const markerPath = path.join(
+      tempRoot,
+      "lilac-acp-controller",
+      "runs",
+      `${running.id}.cancel.json`,
+    );
+    await fs.writeFile(
+      markerPath,
+      `${JSON.stringify({ version: 1, runCreatedAt: running.createdAt, requestedAt: 20 })}\n`,
+      "utf8",
+    );
+
+    const repeated = await requestRunCancellation(running.id);
+    expect(repeated.status).toBe("ok");
+    const marker = decodeRunCancellation({
+      runId: running.id,
+      content: await fs.readFile(markerPath, "utf8"),
+    });
+    expect(marker.status).toBe("ok");
+    if (marker.status === "ok") expect(marker.value.value.requestedAt).toBe(20);
+  });
+
+  it("uses terminal-wins ties while preserving strict cancellation ordering", async () => {
+    const completed: PromptRunRecord = {
+      ...runRecord(),
+      status: "completed",
+      createdAt: 1,
+      updatedAt: 100,
+    };
+    expect((await saveRunRecord(completed)).status).toBe("ok");
+    const markerPath = path.join(
+      tempRoot,
+      "lilac-acp-controller",
+      "runs",
+      `${completed.id}.cancel.json`,
+    );
+    const writeMarker = (requestedAt: number) =>
+      fs.writeFile(
+        markerPath,
+        `${JSON.stringify({ version: 1, runCreatedAt: completed.createdAt, requestedAt })}\n`,
+        "utf8",
+      );
+
+    await writeMarker(100);
+    const tied = await loadRunRecord(completed.id);
+    expect(tied.status).toBe("ok");
+    if (tied.status === "ok") expect(tied.value.status).toBe("completed");
+
+    await writeMarker(99);
+    const cancellationFirst = await loadRunRecord(completed.id);
+    expect(cancellationFirst.status).toBe("ok");
+    if (cancellationFirst.status === "ok") expect(cancellationFirst.value.status).toBe("cancelled");
+
+    await writeMarker(101);
+    const terminalFirst = await loadRunRecord(completed.id);
+    expect(terminalFirst.status).toBe("ok");
+    if (terminalFirst.status === "ok") expect(terminalFirst.value.status).toBe("completed");
+
+    expect(
+      (
+        await saveRunRecord({
+          ...completed,
+          updatedAt: 100,
+          cancelRequestedAt: 99,
+        })
+      ).status,
+    ).toBe("ok");
+    await writeMarker(101);
+    const repeatedAfterTerminal = await loadRunRecord(completed.id);
+    expect(repeatedAfterTerminal.status).toBe("ok");
+    if (repeatedAfterTerminal.status === "ok") {
+      expect(repeatedAfterTerminal.value.status).toBe("cancelled");
+      expect(repeatedAfterTerminal.value.cancelRequestedAt).toBe(99);
+    }
+  });
+
+  it("observes a cancellation marker through the watcher or fallback check", async () => {
+    const run = runRecord();
+    expect((await saveRunRecord(run)).status).toBe("ok");
+    const observation = await observeRunCancellation(run);
+    expect(observation.status).toBe("ok");
+    if (observation.status === "error") return;
+
+    const requested = await requestRunCancellation(run.id);
+    expect(requested.status).toBe("ok");
+    const observed = await observation.value.result;
+    expect(observed.status).toBe("ok");
+    if (observed.status === "ok") expect(observed.value).toBe("requested");
+    expect((await observation.value.close()).status).toBe("ok");
+  });
+
+  it("rejects cancellation observation with the exact inspection Panic and settles close", async () => {
+    const run = runRecord();
+    expect((await saveRunRecord(run)).status).toBe("ok");
+    const panic = new Panic({ message: "cancellation marker invariant" });
+    const observation = await observeRunCancellation(run, () => Promise.reject(panic));
+    expect(observation.status).toBe("ok");
+    if (observation.status === "error") return;
+
+    await expect(observation.value.result).rejects.toBe(panic);
+    expect((await observation.value.close()).status).toBe("ok");
+    expect((await observation.value.close()).status).toBe("ok");
+  });
+
+  it("maps ordinary cancellation inspection rejection to an owned observation error", async () => {
+    const run = runRecord();
+    expect((await saveRunRecord(run)).status).toBe("ok");
+    const observation = await observeRunCancellation(run, () =>
+      Promise.reject(new Error("inspection failed")),
+    );
+    expect(observation.status).toBe("ok");
+    if (observation.status === "error") return;
+
+    const result = await observation.value.result;
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ExternalOperationFailed");
+      if (result.error._tag === "ExternalOperationFailed") {
+        expect(result.error.operation).toBe("watch-run-cancellation");
+      }
+    }
+    expect((await observation.value.close()).status).toBe("ok");
+  });
+
   it("round trips records and reports missing session index provenance", async () => {
     const missing = await loadSessionIndex();
     expect(missing.status).toBe("ok");
