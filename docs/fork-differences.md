@@ -1,74 +1,76 @@
 # Fork Differences
 
-本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
+Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditional Chinese (translation)`](./fork-differences.zh-TW.md)
 
-比較基準為 2026-08-03 的 `main`：本 fork 已包含 upstream commit [`8f5fdec`](https://github.com/stanley2058/lilac-mono/commit/8f5fdec8266402560563885e901a4ffa6f40272b)，並在其上保留下列功能與維運修改。
+This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
+
+The comparison baseline is `main` as of 2026-08-03: this fork includes upstream commit [`8f5fdec`](https://github.com/stanley2058/lilac-mono/commit/8f5fdec8266402560563885e901a4ffa6f40272b) and retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
-> 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
+> This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
 
-## 現行 Fork-only 功能
+## Current Fork-only Features
 
-| 領域 | 差異 | 使用入口 | 限制或注意事項 |
+| Area | Difference | Entry point | Limitations or considerations |
 | --- | --- | --- | --- |
-| Telegram surface | 新增 DM、group、forum topic ingress；streamed HTML output；cancel、reaction、command menu、outbound attachments、workflow cards/actions 與 same-surface tools | [`telegram-surface.md`](./telegram-surface.md)、fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | 預設停用；沒有 inbound attachment bytes；僅 long polling；history 來自 local SQLite index |
-| OpenAI-compatible image routing | 以 v2 config 將所有既有 `generate.image` aliases 路由到單一 operator endpoint | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md)、fork PR [#47](https://github.com/DF-wu/lilac-mono/pull/47) | 無 custom alias mapping、official-provider fallback 或 cross-provider retry；部分 aliases 的 `aspectRatio` 只產生 warning |
-| GitHub reply permalinks | `In reply to` 連結會指向指定 issue/PR body 或 comment anchor | [`github-reply-permalinks.md`](./github-reply-permalinks.md)、fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | Body target 需要 issue database ID；取不到時退回 thread URL |
-| Custom media plugin example | 提供 external Level 2 image/video plugin，使用 OpenAI-compatible image API 與 QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md)、fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugin 是 trusted in-process code；restricted callers 目前不能直接使用 external callables |
-| ACP controller reliability | Detached run 將 Linux zombie worker 視為已停止，cancel 時關閉 harness client 讓 worker settle | Commit [`91ef3fd`](https://github.com/DF-wu/lilac-mono/commit/91ef3fd6) | Zombie detection 為 Linux-specific；可用 harness 仍取決於本機 discovery |
-| Compatible-provider tool calls | Compatible provider 即使回傳 `other` 等非標準 finish reason，只要已解析出 local tool calls 仍會執行並保存結果 | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | 只信任已通過 parser 的 local tool calls；不會把任意 provider text 當成 tool invocation |
-| Container delivery | Build workflow 發布 `catalina`、`claudia`、SHA tags，`latest` 指向 `catalina`；image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 目前兩個 tag 使用相同 Dockerfile user 與 UID；`CONTAINER_USER` build arg 未被 Dockerfile 使用，因此不是實際的 user variants |
-| Upstream maintenance | Scheduled workflow 每 6 小時 fetch upstream `main`，有新 commits 時嘗試 merge，成功後觸發 image build | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml) | Merge conflict 會使 workflow 失敗，必須人工整合與驗證 |
+| Telegram surface | Adds DM, group, and forum topic ingress; streamed HTML output; cancellation, reactions, command menus, outbound attachments, workflow cards/actions, and same-surface tools | [`telegram-surface.md`](./telegram-surface.md), fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | Disabled by default; no inbound attachment bytes; long polling only; history comes from the local SQLite index |
+| OpenAI-compatible image routing | Uses v2 config to route all existing `generate.image` aliases to a single operator-specified endpoint | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md), fork PR [#47](https://github.com/DF-wu/lilac-mono/pull/47) | No custom alias mapping, official-provider fallback, or cross-provider retry; `aspectRatio` produces only a warning for some aliases |
+| GitHub reply permalinks | `In reply to` links point to the specified issue/PR body or comment anchor | [`github-reply-permalinks.md`](./github-reply-permalinks.md), fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | Body targets require the issue database ID; falls back to the thread URL when unavailable |
+| Custom media plugin example | Provides an external Level 2 image/video plugin using an OpenAI-compatible image API and a QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md), fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugins are trusted in-process code; restricted callers currently cannot use external callables directly |
+| ACP controller reliability | Detached runs treat Linux zombie workers as stopped, and cancellation closes the harness client so the worker can settle | Commit [`91ef3fd`](https://github.com/DF-wu/lilac-mono/commit/91ef3fd6) | Zombie detection is Linux-specific; available harnesses still depend on local discovery |
+| Compatible-provider tool calls | When a compatible provider returns a nonstandard finish reason such as `other`, parsed local tool calls are still executed and their results preserved | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | Trusts only local tool calls that passed the parser; arbitrary provider text is not treated as a tool invocation |
+| Container delivery | The build workflow publishes `catalina`, `claudia`, and SHA tags, with `latest` pointing to `catalina`; the image also includes `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml), [`Dockerfile`](../Dockerfile) | Both tags currently use the same Dockerfile user and UID; the Dockerfile does not use the `CONTAINER_USER` build arg, so these are not actual user variants |
+| Upstream maintenance | A scheduled workflow fetches upstream `main` every 6 hours, attempts a merge when new commits exist, and triggers an image build after a successful merge | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml) | Merge conflicts fail the workflow and require manual integration and validation |
 
-## Telegram 現況
+## Current Telegram Status
 
-Telegram 是目前最大的 fork-only product delta。已實作的主要路徑包括：
+Telegram is currently the largest fork-only product delta. The main implemented paths include:
 
-- DMs、groups、supergroups 與 forum topics。
-- Mention/active routing、streamed edits、HTML rendering 與 4096-character chunking。
-- Reply context、cancel、typing indicators、reactions、custom commands 與 menu aliases。
-- Outbound attachments、workflow progress/actions、`waitForReply` 與 allowlist-bound surface tools。
+- DMs, groups, supergroups, and forum topics.
+- Mention/active routing, streamed edits, HTML rendering, and 4096-character chunking.
+- Reply context, cancellation, typing indicators, reactions, custom commands, and menu aliases.
+- Outbound attachments, workflow progress/actions, `waitForReply`, and allowlist-bound surface tools.
 
-仍未實作或受平台限制的項目：
+Items that remain unimplemented or are constrained by the platform:
 
-- Inbound photo/document bytes 不會送入 model；caption 仍可觸發 request。追蹤於 [issue #42](https://github.com/DF-wu/lilac-mono/issues/42)。
-- 只有 long polling，沒有 webhook ingress。
-- 沒有 Telegram-native conversation search index、inline queries、business accounts 或 voice/video transcription。
-- Message history 只包含 bot 實際觀察或送出的內容，不是 Telegram 既有完整歷史。
+- Inbound photo/document bytes are not sent to the model; captions can still trigger a request. Tracked in [issue #42](https://github.com/DF-wu/lilac-mono/issues/42).
+- Only long polling is supported; there is no webhook ingress.
+- There is no Telegram-native conversation search index, inline query support, business account support, or voice/video transcription.
+- Message history includes only content the bot actually observed or sent, not Telegram's complete pre-existing history.
 
-精確 feature matrix 與平台差異以 [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) 為準。
+See [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) for the precise feature matrix and platform differences.
 
-## 已被上游接收的貢獻
+## Accepted Upstream Contributions
 
-以下能力目前存在於本 fork，但已不再構成 fork divergence：
+The following capabilities currently exist in this fork but no longer constitute fork divergence:
 
-| 原始貢獻 | Upstream 狀態 | 分類方式 |
+| Original contribution | Upstream status | Classification |
 | --- | --- | --- |
-| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) 已 merge | 視為 inherited upstream capability |
-| `TAVILY_API_BASE_URL` 與相關 normalization/docs | Upstream PR [#4](https://github.com/stanley2058/lilac-mono/pull/4)、[#5](https://github.com/stanley2058/lilac-mono/pull/5) 已 merge | 視為 inherited upstream capability |
-| GitHub agent-comment marker、safe trigger parsing 與 self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) 已 merge | 不列入 fork-only GitHub 差異 |
+| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) has been merged | Treated as an inherited upstream capability |
+| `TAVILY_API_BASE_URL` and related normalization/docs | Upstream PRs [#4](https://github.com/stanley2058/lilac-mono/pull/4) and [#5](https://github.com/stanley2058/lilac-mono/pull/5) have been merged | Treated as an inherited upstream capability |
+| GitHub agent-comment marker, safe trigger parsing, and self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) has been merged | Not listed as a fork-only GitHub difference |
 
-## 不應列為現行差異
+## Items That Should Not Be Listed as Current Differences
 
-- **Core runtime、Discord、GitHub webhook 基礎、event bus、workflows、tools、plugins、Mini Lilac**：它們主要來自 upstream。README 可以正常介紹，但不能歸功於本 fork。
-- **Architecture Atlas**：相關 workspace 與功能已完整 revert。
-- **Fork-specific Discord working-indicator defaults**：已回復 upstream defaults。
-- **舊 empty-reply feature flag**：已 revert 或由後續 upstream 行為取代。
-- **`smart-search` 基礎 runtime**：相關實作目前不存在於 tree，屬於 reverted/superseded 行為，不是現行 container capability。
+- **Core runtime, Discord, GitHub webhook foundation, event bus, workflows, tools, plugins, and Mini Lilac**: these primarily come from upstream. The README may describe them normally, but they must not be credited to this fork.
+- **Architecture Atlas**: the related workspace and functionality have been fully reverted.
+- **Fork-specific Discord working-indicator defaults**: these have been restored to the upstream defaults.
+- **Old empty-reply feature flag**: this has been reverted or superseded by later upstream behavior.
+- **`smart-search` foundational runtime**: the relevant implementation is not currently present in the tree. It is reverted/superseded behavior, not a current container capability.
 
-## 相容性與安全邊界
+## Compatibility and Security Boundaries
 
-本 fork 保留 upstream 的主要架構與 config migration policy，但新增功能可能需要 `configVersion: 2`。Greenfield changes 可能是 breaking changes；升級前請閱讀 [`../MIGRATIONS.md`](../MIGRATIONS.md)。
+This fork retains the main upstream architecture and config migration policy, but new features may require `configVersion: 2`. Greenfield changes may be breaking changes; read [`../MIGRATIONS.md`](../MIGRATIONS.md) before upgrading.
 
-下列機制是 guardrails 或 trusted execution，不是 hostile-code sandbox：
+The following mechanisms are guardrails or trusted execution, not hostile-code sandboxes:
 
-- Core 與 Mini 的 Bash/filesystem checks。
-- Programmatic workflow policy。
-- External plugins 與 MCP stdio processes。
-- Tool server request capabilities。
-- Docker 內同 UID process 之間的 filesystem access。
+- Core and Mini Bash/filesystem checks.
+- Programmatic workflow policy.
+- External plugins and MCP stdio processes.
+- Tool server request capabilities.
+- Filesystem access between processes running under the same UID inside Docker.
 
-部署時請同時閱讀 [`docker-deployment.md`](./docker-deployment.md) 與 [`../PROJECT.md`](../PROJECT.md)。
+For deployment, also read [`docker-deployment.md`](./docker-deployment.md) and [`../PROJECT.md`](../PROJECT.md).
 
 ## Upstream Sync Policy
 
@@ -84,16 +86,16 @@ flowchart TD
     Clean -->|No| Manual[Resolve and validate manually]
 ```
 
-同步原則：
+Sync principles:
 
-1. 保留 upstream commit history，以 merge 方式整合。
-2. Fork-only features 必須有獨立 tests 與文件，避免 sync 時只能依賴 commit message 猜測行為。
-3. Upstream 接收同等功能後，先比較 contract，再移除重複 patch 與本文件中的 fork-only claim。
-4. 發生 conflict 時不以忽略 tests 或直接覆蓋 fork behavior 的方式換取綠色 sync。
+1. Preserve upstream commit history by integrating with merges.
+2. Fork-only features must have independent tests and documentation so their behavior does not have to be inferred from commit messages during a sync.
+3. After upstream accepts equivalent functionality, compare the contracts before removing the duplicate patch and its fork-only claim from this document.
+4. When conflicts occur, do not obtain a green sync by ignoring tests or directly overwriting fork behavior.
 
-## 更新本文件
+## Updating This Document
 
-每次新增 fork-only feature 或完成大型 upstream sync 時，至少核對：
+Whenever a fork-only feature is added or a major upstream sync is completed, run at least the following checks:
 
 ```bash
 git fetch origin
@@ -102,9 +104,9 @@ git log --no-merges upstream/main..origin/main
 git diff --stat upstream/main..origin/main
 ```
 
-分類時要區分：
+Distinguish among these classifications:
 
-- **Fork-only**：目前 upstream 沒有同等 contract。
-- **Inherited**：直接來自 upstream。
-- **Upstream-accepted**：最初由 fork 貢獻，但現在兩邊都具備。
-- **Reverted/superseded**：不再存在，不應出現在 README feature list。
+- **Fork-only**: upstream does not currently provide an equivalent contract.
+- **Inherited**: comes directly from upstream.
+- **Upstream-accepted**: originally contributed by the fork, but now available in both repositories.
+- **Reverted/superseded**: no longer exists and should not appear in the README feature list.
