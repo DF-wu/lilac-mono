@@ -113,6 +113,18 @@ export type TelegramAdapterOptions = {
   customCommands?: CustomCommandManager;
 };
 
+export type TelegramConfigRefreshResult = {
+  restartRequiredFor: string[];
+};
+
+const TELEGRAM_RESTART_REQUIRED_FIELDS = [
+  "enabled",
+  "token",
+  "apiRoot",
+  "dbPath",
+  "commandMenu",
+] as const;
+
 function sanitizeTelegramErrorMessage(message: string, token?: string): string {
   let sanitized = message;
   if (token) sanitized = sanitized.split(token).join("<redacted>");
@@ -473,8 +485,37 @@ export class TelegramAdapter implements SurfaceAdapter {
     return { ...this.healthState };
   }
 
-  async refreshCoreConfig(): Promise<void> {
-    this.cfg = await this.resolveCoreConfig();
+  async refreshCoreConfig(): Promise<TelegramConfigRefreshResult> {
+    const next = await this.resolveCoreConfig();
+    const current = this.cfg;
+    if (!current || !this.bot) {
+      this.cfg = next;
+      return { restartRequiredFor: [] };
+    }
+
+    const restartRequiredFor = TELEGRAM_RESTART_REQUIRED_FIELDS.filter(
+      (field) => next.surface.telegram[field] !== current.surface.telegram[field],
+    );
+
+    // Authorization and rendering settings are safe to reload immediately.
+    // Connection-lifecycle settings remain pinned to the active bot/store so a
+    // config edit cannot claim to rotate or disable a poller that is still live.
+    this.cfg = {
+      ...next,
+      surface: {
+        ...next.surface,
+        telegram: {
+          ...next.surface.telegram,
+          enabled: current.surface.telegram.enabled,
+          token: current.surface.telegram.token,
+          apiRoot: current.surface.telegram.apiRoot,
+          dbPath: current.surface.telegram.dbPath,
+          commandMenu: current.surface.telegram.commandMenu,
+        },
+      },
+    };
+
+    return { restartRequiredFor };
   }
 
   async getSelf(): Promise<SurfaceSelf> {

@@ -397,8 +397,11 @@ docker/telegram-verify-stack.sh start      # separate Redis db, own volume, no p
 docker/telegram-verify-stack.sh logs
 ```
 
-Stop it before deploying for real — two pollers on one bot token produce
-`409 Conflict`.
+The reference config must contain `surface.telegram.token` but must have the
+Telegram surface disabled. The script refuses to start when the reference has
+Telegram enabled or still uses the removed `tokenEnv` field. This prevents a
+second poller from taking the live bot offline with `409 Conflict`. Stop the
+verification container before enabling Telegram in the deployment.
 
 ### Cleaning up afterwards
 

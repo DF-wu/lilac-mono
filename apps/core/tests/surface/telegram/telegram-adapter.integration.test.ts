@@ -145,6 +145,31 @@ afterEach(async () => {
 });
 
 describe("telegram adapter against a fake Bot API", () => {
+  it("pins connection settings until restart while accepting a config refresh", async () => {
+    let cfg = testConfig({ dbPath: path.join(scratchDir, "telegram.db") });
+    const created = new TelegramAdapter({
+      apiRoot: server.url,
+      getConfig: async () => cfg,
+    });
+    await created.connect();
+    await created.whenReady();
+    adapter = created;
+
+    cfg = testConfig({
+      enabled: false,
+      token: "111111:rotated-token",
+      apiRoot: "http://127.0.0.1:9999",
+      dbPath: path.join(scratchDir, "other.db"),
+      commandMenu: false,
+      allowedChatIds: ["2002"],
+    });
+
+    await expect(created.refreshCoreConfig()).resolves.toEqual({
+      restartRequiredFor: ["enabled", "token", "apiRoot", "dbPath", "commandMenu"],
+    });
+    expect(created.getHealthSnapshot().isReady).toBe(true);
+  });
+
   it("renders action buttons on sends and replaces them on edits", async () => {
     const { adapter: a } = await connectAdapter({});
     const sessionRef = { platform: "telegram", channelId: String(ALLOWED_CHAT) } as const;

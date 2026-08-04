@@ -521,7 +521,14 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
       await adapter.refreshCoreConfig();
       // Telegram authorization reads the adapter's cached config, so skipping
       // this leaves a removed chat or user allowlisted until the next restart.
-      await telegramAdapter?.refreshCoreConfig();
+      const telegramRefresh = await telegramAdapter?.refreshCoreConfig();
+      if (telegramRefresh && telegramRefresh.restartRequiredFor.length > 0) {
+        logger.warn("telegram config change requires a core restart", {
+          configKeys: telegramRefresh.restartRequiredFor.map(
+            (field) => `surface.telegram.${field}`,
+          ),
+        });
+      }
       conversationThreadMaterializer?.markAllDirty();
     } catch (e) {
       const msg = errorMessage(e);

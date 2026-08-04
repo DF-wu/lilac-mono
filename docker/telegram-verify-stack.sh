@@ -10,9 +10,10 @@
 #     (see apps/core/src/surface/discord/discord-channel-guards.ts: both lists
 #     empty means every message is rejected)
 #
-# The Telegram token is copied into the derived verification config. The
-# temporary named volume contains secret material and must be removed with the
-# stop command after verification.
+# The Telegram token is copied into the derived verification config. Start is
+# refused when Telegram is already enabled in the reference config, because two
+# long-polling runtimes cannot safely share one bot token. The temporary named
+# volume contains secret material and must be removed after verification.
 #
 # Usage:
 #   docker/telegram-verify-stack.sh start
@@ -108,6 +109,12 @@ cmd_start() {
   [ -n "${TELEGRAM_CHAT_ID:-}" ] || die "set TELEGRAM_CHAT_ID to the chat you want to allowlist"
   docker image inspect "${IMAGE}" >/dev/null 2>&1 || die "image '${IMAGE}' not built"
 
+  # Derive and validate before creating anything. In particular, refuse a live
+  # Telegram-enabled reference before a second poller can contend for its token.
+  local derived_config
+  derived_config="$(seed_config "${TELEGRAM_CHAT_ID}")" ||
+    die "could not derive a safe Telegram verification config"
+
   docker rm -f "${NAME}" >/dev/null 2>&1 || true
   docker volume create "${VOLUME}" >/dev/null
 
@@ -140,7 +147,8 @@ cmd_start() {
     "${IMAGE}" >/dev/null
 
   # Seed the config, then restart so the runtime reads it on boot.
-  seed_config "${TELEGRAM_CHAT_ID}" | docker exec -i "${NAME}" sh -c 'cat > /data/core-config.yaml'
+  printf '%s\n' "${derived_config}" |
+    docker exec -i "${NAME}" sh -c 'umask 077; cat > /data/core-config.yaml'
   docker restart "${NAME}" >/dev/null
 
   echo "==> started. follow with: docker/telegram-verify-stack.sh logs"
