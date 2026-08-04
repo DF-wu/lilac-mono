@@ -2,7 +2,7 @@
 
 這裡收錄 root README 以外的操作與設計文件。`README.md` 是本 repository 的規範入口與 canonical 文件；首次使用請先閱讀 [`../README.md`](../README.md)。繁體中文翻譯請見 [`../README.zh-TW.md`](../README.zh-TW.md)，再依需求進入下列主題。
 
-語言入口：[`English README (canonical)`](../README.md) · [`繁體中文翻譯`](../README.zh-TW.md)
+語言入口：[`English README (canonical)`](../README.md) · [`繁體中文翻譯`](../README.zh-TW.md) · [`English documentation index`](./README.md)
 
 ## Fork 與架構
 
