@@ -296,7 +296,7 @@ const discordSurfaceSchema = z
 const telegramSurfaceSchema = z
   .object({
     enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.enabled),
-    tokenEnv: z.string().min(1).default(TELEGRAM_SURFACE_DEFAULTS.tokenEnv),
+    token: z.string().trim().min(1).optional(),
     botName: z
       .string()
       .min(1)

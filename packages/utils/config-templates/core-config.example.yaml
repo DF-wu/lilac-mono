@@ -200,7 +200,8 @@ surface:
     # The adapter is only constructed when this is true.
     enabled: false
 
-    tokenEnv: "TELEGRAM_BOT_TOKEN"
+    # Keep this file private: the token is stored directly in core-config.yaml.
+    # token: "123456789:replace-with-your-bot-token"
 
     # Fails closed: while allowedChatIds is empty the bot ignores every chat.
     # Use numeric chat ids (negative for groups/supergroups), as strings.

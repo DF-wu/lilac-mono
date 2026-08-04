@@ -23,12 +23,10 @@ import { BOT_USER_ID, BOT_USERNAME } from "./telegram-fixtures";
  * until shutdown.
  */
 const ALLOWED_CHAT = 1001;
-const TOKEN_ENV = "TELEGRAM_BOT_TOKEN";
 
 let server: FakeBotApiServer;
 let adapter: TelegramAdapter | null = null;
 let scratchDir = "";
-let previousToken: string | undefined;
 
 function testConfig(): CoreConfig {
   const cfg = parseCoreConfigV2ToUniversal({
@@ -36,6 +34,7 @@ function testConfig(): CoreConfig {
     surface: {
       telegram: {
         enabled: true,
+        token: "000000:fake-token",
         botName: "lilac",
         allowedChatIds: [String(ALLOWED_CHAT)],
         commandMenu: false,
@@ -73,8 +72,6 @@ async function waitForPollingExit(a: TelegramAdapter): Promise<void> {
 }
 
 beforeEach(async () => {
-  previousToken = process.env[TOKEN_ENV];
-  process.env[TOKEN_ENV] = "000000:fake-token";
   scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-poll-"));
   server = new FakeBotApiServer(BOT_USER_ID, BOT_USERNAME);
 });
@@ -84,9 +81,6 @@ afterEach(async () => {
   adapter = null;
   await server.close();
   await rm(scratchDir, { recursive: true, force: true });
-
-  if (previousToken === undefined) delete process.env[TOKEN_ENV];
-  else process.env[TOKEN_ENV] = previousToken;
 });
 
 describe("fatal polling exit classification", () => {

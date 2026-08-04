@@ -113,6 +113,12 @@ export type TelegramAdapterOptions = {
   customCommands?: CustomCommandManager;
 };
 
+function sanitizeTelegramErrorMessage(message: string, token?: string): string {
+  let sanitized = message;
+  if (token) sanitized = sanitized.split(token).join("<redacted>");
+  return sanitized.replace(/\/bot[^\s/]+/gu, "/bot<redacted>");
+}
+
 const TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64;
 
 export function buildTelegramActionKeyboard(
@@ -276,11 +282,12 @@ export class TelegramAdapter implements SurfaceAdapter {
             : cause instanceof Error
               ? cause.message
               : String(cause);
+      const safeMessage = sanitizeTelegramErrorMessage(message, this.cfg?.surface.telegram.token);
 
       this.healthState = {
         ...this.healthState,
         lastErrorAt: Date.now(),
-        lastError: message,
+        lastError: safeMessage,
       };
       this.logger.error("telegram update handler failed", { updateId: err.ctx.update.update_id });
     });
@@ -356,8 +363,11 @@ export class TelegramAdapter implements SurfaceAdapter {
         : error instanceof Error
           ? error
           : new Error(String(error));
+    const safeFailure = new Error(
+      sanitizeTelegramErrorMessage(failure.message, this.cfg?.surface.telegram.token),
+    );
 
-    this.pollingFailure = failure;
+    this.pollingFailure = safeFailure;
     this.healthState = {
       ...this.healthState,
       connectionState: "failed",
@@ -365,13 +375,13 @@ export class TelegramAdapter implements SurfaceAdapter {
       pollingExitedAt: Date.now(),
       pollingExitFatal: fatal,
       lastErrorAt: Date.now(),
-      lastError: failure.message,
+      lastError: safeFailure.message,
     };
 
     this.logger.error(
       "telegram long polling exited; surface is no longer receiving updates",
       { fatal, willRecoverOnRestart: !fatal },
-      failure,
+      safeFailure,
     );
 
     // Unblock anyone waiting on readiness; whenReady() surfaces the failure.

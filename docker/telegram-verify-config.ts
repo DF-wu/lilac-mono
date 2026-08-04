@@ -16,7 +16,7 @@
 const chatId = process.argv[2];
 const apiRoot = process.argv[3];
 if (!chatId) {
-  console.error("usage: telegram-verify-config.ts <chatId>");
+  console.error("usage: telegram-verify-config.ts <chatId> <apiRoot>");
   process.exit(2);
 }
 

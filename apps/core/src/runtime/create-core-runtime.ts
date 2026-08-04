@@ -855,7 +855,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions = {}): Promise<
         });
       } else if (startupConfig.surface.telegram.enabled) {
         logger.warn("telegram surface enabled but no token available; skipping", {
-          tokenEnv: startupConfig.surface.telegram.tokenEnv,
+          configKey: "surface.telegram.token",
         });
       }
 

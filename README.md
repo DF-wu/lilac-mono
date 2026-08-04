@@ -168,7 +168,7 @@ If you persist `/data`, the `smart-search` config and provider credentials persi
 
 - The runtime expects **Redis** and reads seeded runtime config from `data/core-config.yaml`.
 - Discord uses `DISCORD_TOKEN` by default unless `surface.discord.tokenEnv` is changed in `core-config.yaml`.
-- Telegram is off by default. Set `surface.telegram.enabled: true` (requires `configVersion: 2`) and `TELEGRAM_BOT_TOKEN`; see `docs/telegram-surface.md`.
+- Telegram is off by default. Set `surface.telegram.enabled: true` and `surface.telegram.token` in `core-config.yaml` (requires `configVersion: 2`); see `docs/telegram-surface.md`.
 - GitHub webhook ingress requires `GITHUB_WEBHOOK_SECRET`.
 - GitHub auth can be configured through user or app credentials, depending on the workflow.
 

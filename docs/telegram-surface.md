@@ -75,7 +75,7 @@ configVersion: 2
 surface:
   telegram:
     enabled: true
-    tokenEnv: "TELEGRAM_BOT_TOKEN"
+    token: "123456789:replace-with-your-bot-token"
     # apiRoot: "http://127.0.0.1:8081"   # self-hosted Bot API server
     botName: "lilac"
     # botUsername: "Catalina_agentbot"   # resolved from getMe when omitted
@@ -98,20 +98,17 @@ surface:
       fallbackMode: list
 ```
 
-Then set the token in the environment:
-
-```bash
-TELEGRAM_BOT_TOKEN=8792842071:AAF...
-```
-
-`compose.yaml` already forwards `TELEGRAM_BOT_TOKEN` into the container.
+The token is stored directly in `core-config.yaml`. Treat that file as a secret,
+restrict its permissions, and do not commit it. Compose does not inject a Telegram
+token from the environment. Changing the token requires restarting Core because
+the grammY client receives it when the adapter is constructed.
 
 ### Option reference
 
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `enabled` | `false` | The adapter is only constructed when true. |
-| `tokenEnv` | `TELEGRAM_BOT_TOKEN` | Env var holding the bot token. |
+| `token` | — | Bot API token stored directly in `core-config.yaml`. Treat the config file as secret material. |
 | `botName` | `lilac` | Identity used for mention detection and prompt attribution. No spaces. |
 | `botUsername` | — | The `@handle` without the `@`. Resolved from `getMe` on connect when omitted. |
 | `allowedChatIds` | `[]` | **Fails closed.** Empty means the bot ignores every chat. |
@@ -357,7 +354,7 @@ cleaned up.
 | Bot never responds in a DM | The chat id is not in `allowedChatIds`. The allowlist fails closed. |
 | Bot responds in DMs but not in a group | Privacy mode is on and the message did not mention or reply to the bot. See §1. |
 | Bot responds to mentions but never to plain group messages | Same as above; `active` mode needs privacy mode disabled. |
-| `telegram surface enabled but no token available` | `enabled: true` but the env var named by `tokenEnv` is unset. |
+| `telegram surface enabled but no token available` | `enabled: true` but `surface.telegram.token` is unset in `core-config.yaml`. |
 | Answers arrive all at once, not streamed | `streamEditIntervalMs` is high, or the answer was short enough to be a single send. |
 | Formatting looks broken | Try `parseMode: plain` to isolate whether the HTML renderer is at fault, and report the input. |
 | `409 Conflict` in logs | Two processes are polling the same bot token. Only one runtime may poll a given bot. |

@@ -19,12 +19,10 @@ import { FakeBotApiServer } from "./fake-bot-api-server";
 import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
 
 const ALLOWED_CHAT = 1001;
-const TOKEN_ENV = "TELEGRAM_BOT_TOKEN";
 
 let server: FakeBotApiServer;
 let adapter: TelegramAdapter | null = null;
 let scratchDir = "";
-let previousToken: string | undefined;
 
 /**
  * Collects adapter events and lets a test await a specific one, so nothing has
@@ -67,6 +65,7 @@ function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
     surface: {
       telegram: {
         enabled: true,
+        token: "000000:fake-token",
         botName: "lilac",
         allowedChatIds: [String(ALLOWED_CHAT)],
         streamEditIntervalMs: 500,
@@ -134,8 +133,6 @@ function inboundMessage(overrides: Partial<Message> = {}): NonNullable<Update["m
 }
 
 beforeEach(async () => {
-  previousToken = process.env[TOKEN_ENV];
-  process.env[TOKEN_ENV] = "000000:fake-token";
   scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-it-"));
   server = new FakeBotApiServer(BOT_USER_ID, BOT_USERNAME);
 });
@@ -145,9 +142,6 @@ afterEach(async () => {
   adapter = null;
   await server.close();
   await rm(scratchDir, { recursive: true, force: true });
-
-  if (previousToken === undefined) delete process.env[TOKEN_ENV];
-  else process.env[TOKEN_ENV] = previousToken;
 });
 
 describe("telegram adapter against a fake Bot API", () => {
