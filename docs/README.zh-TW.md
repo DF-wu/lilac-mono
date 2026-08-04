@@ -8,7 +8,7 @@
 
 | 文件 | 內容 |
 | --- | --- |
-| [`fork-differences.md`](./fork-differences.md) | 本 fork 與 upstream 的現行差異、限制、同步政策與已 upstreamed 貢獻 |
+| [`fork-differences.zh-TW.md`](./fork-differences.zh-TW.md) | 本 fork 與 upstream 的現行差異、限制、同步政策與已 upstreamed 貢獻 |
 | [`../PROJECT.md`](../PROJECT.md) | Core 與 Mini Lilac 的完整架構、名詞、資料流與設定模型 |
 | [`../MIGRATIONS.md`](../MIGRATIONS.md) | Core config 與儲存格式的 migration contract |
 

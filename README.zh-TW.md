@@ -20,7 +20,7 @@
   <a href="#本-fork-的主要差異">Fork 差異</a> ·
   <a href="#快速開始">快速開始</a> ·
   <a href="#core-surfaces">Surfaces</a> ·
-  <a href="./docs/README.md">完整文件</a> ·
+  <a href="./docs/README.zh-TW.md">完整文件</a> ·
   <a href="./PROJECT.md">架構細節</a>
 </p>
 
@@ -43,7 +43,7 @@ Mini Lilac 是上游持續發展的產品，本 fork 會隨上游同步。若你
 
 ## 本 Fork 的主要差異
 
-以下只列出目前仍與上游不同的行為。完整依據、限制與已回饋上游的項目見 [`docs/fork-differences.md`](./docs/fork-differences.md)。
+以下只列出目前仍與上游不同的行為。完整依據、限制與已回饋上游的項目見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
 
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
@@ -350,11 +350,11 @@ bun run fmt:check
 
 - 本 fork 新功能、部署 workflow、Telegram 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
 - 可在未修改 upstream 重現的問題：先確認 upstream 狀態，再向 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues) 回報。
-- 歷史上由本 fork 回饋並已被 upstream 接收的功能，不再列為當前差異。清單見 [`docs/fork-differences.md`](./docs/fork-differences.md#已被上游接收的貢獻)。
+- 歷史上由本 fork 回饋並已被 upstream 接收的功能，不再列為當前差異。清單見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#已被上游接收的貢獻)。
 
 ## 文件
 
-從 [`docs/README.md`](./docs/README.md) 開始查找部署、surface、fork 功能與 extension 文件。
+從 [`docs/README.zh-TW.md`](./docs/README.zh-TW.md) 開始查找部署、surface、fork 功能與 extension 文件。
 
 ## License 與致謝
 
