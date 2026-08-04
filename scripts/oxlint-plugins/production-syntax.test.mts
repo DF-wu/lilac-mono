@@ -26,9 +26,7 @@ function policyWith(overrides: Partial<SyntacticPolicy> = {}): SyntacticPolicy {
   return { ...SYNTACTIC_POLICY, ...overrides };
 }
 
-function manifestWithUnknownFreeModule(
-  status: "advisory" | "enforced",
-): FixtureArchitectureManifest {
+function manifestWithUnknownFreeModule(): FixtureArchitectureManifest {
   const manifest = manifestWithAdapters([]);
   const workspace = manifest.workspaces[0];
   if (!workspace) throw new Error("fixture workspace missing");
@@ -37,14 +35,14 @@ function manifestWithUnknownFreeModule(
     workspaces: [
       {
         ...workspace,
-        unknownFreeModules: [{ status, module: "src/render.ts" }],
+        unknownFreeModules: [{ module: "src/render.ts" }],
       },
     ],
   };
 }
 
 function manifestWithPresentationBoundaries(): FixtureArchitectureManifest {
-  const manifest = manifestWithUnknownFreeModule("enforced");
+  const manifest = manifestWithUnknownFreeModule();
   const workspace = manifest.workspaces[0];
   if (!workspace) throw new Error("fixture workspace missing");
   return {
@@ -60,7 +58,6 @@ function manifestWithPresentationBoundaries(): FixtureArchitectureManifest {
         ],
         resultDecoders: [
           {
-            status: "enforced",
             identity: { module: "src/projection.ts", exportName: "decodeKnownObservation" },
             category: "projection",
             inputParameter: 0,
@@ -77,7 +74,6 @@ function manifestWithPresentationBoundaries(): FixtureArchitectureManifest {
         ],
         toolCodecRegistries: [
           {
-            status: "enforced",
             identity: {
               module: "src/projection.ts",
               exportName: "toolObservationCodecRegistry",
@@ -105,7 +101,6 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): FixtureArc
         packageName: "@example/app",
         root: "apps/example",
         tsconfig: "apps/example/tsconfig.json",
-        status: "inventory",
         ruleZones: {},
         boundaryDecoders: [],
         opaqueUnknown: [],
@@ -117,7 +112,6 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): FixtureArc
         structuredLoggers: [],
         taggedErrorFormatters: [],
         operationalResultApis: [],
-        zeroBaselineScopes: [],
         eventCodecRegistries: [],
         toolCodecRegistries: [],
         resultDecoders: [],
@@ -129,14 +123,13 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): FixtureArc
         rawEventMessageBoundaries: [],
         eventDeliveryApis: [],
         eventDeliveryConsumers: [],
-        eventFamilyMigrations: [],
-        baselines: { boundaryValidation: "unused", failureFlow: "unused" },
+        eventFamilies: [],
       },
     ],
   };
 }
 
-function manifestWithStage6(status: "advisory" | "enforced"): FixtureArchitectureManifest {
+function manifestWithStage6(): FixtureArchitectureManifest {
   const manifest = manifestWithAdapters([]);
   const workspace = manifest.workspaces[0];
   if (!workspace) throw new Error("fixture workspace missing");
@@ -147,7 +140,6 @@ function manifestWithStage6(status: "advisory" | "enforced"): FixtureArchitectur
         ...workspace,
         persistedCodecs: [
           {
-            status,
             identity: { module: "src/codecs.ts", exportName: "decodeStoredValue" },
             inputParameter: 0,
             fixtureCatalog: { module: "tests/codecs.test.ts", exportName: "storedValueCases" },
@@ -156,14 +148,12 @@ function manifestWithStage6(status: "advisory" | "enforced"): FixtureArchitectur
         ],
         persistedStoreConsumers: [
           {
-            status,
             identity: { module: "src/store.ts", exportName: "Store.load" },
             codecs: [{ module: "src/codecs.ts", exportName: "decodeStoredValue" }],
           },
         ],
         sqliteTransactionAdapters: [
           {
-            status,
             identity: { module: "src/sqlite-adapter.ts", exportName: "runTransaction" },
             databaseParameter: 0,
             operationParameter: 1,
@@ -177,7 +167,6 @@ function manifestWithStage6(status: "advisory" | "enforced"): FixtureArchitectur
         ],
         sqliteTransactionConsumers: [
           {
-            status,
             identity: { module: "src/store.ts", exportName: "Store.save" },
             adapter: { module: "src/sqlite-adapter.ts", exportName: "runTransaction" },
           },
@@ -413,6 +402,58 @@ describe("production exception syntax", () => {
     ]);
   });
 
+  it("allows observe-panic flow only in the exact registered callable", () => {
+    const code = `
+      export function observePanic() {
+        try { return operation(); } catch (cause) {
+          if (Panic.is(cause)) throw cause;
+          return fallback(cause);
+        }
+      }
+      export function observeRejectedPanic() {
+        return Promise.resolve().catch((cause) => {
+          if (Panic.is(cause)) throw cause;
+          return fallback(cause);
+        });
+      }
+    `;
+    const manifest = manifestWithAdapters([
+      adapter("observePanic", "observe-panic"),
+      adapter("observeRejectedPanic.catch.<callback@1>", "observe-panic"),
+    ]);
+
+    expect(
+      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith(), manifest),
+    ).toEqual([]);
+  });
+
+  it("does not let observe-panic authorize signaling forms or sibling callables", () => {
+    const code = `
+      export function observePanic() { return Promise.reject(error); }
+      export function sibling() {
+        try { return operation(); } catch (cause) { throw cause; }
+      }
+      export function signalStream() {
+        return new ReadableStream({ start(controller) { controller.error(error); } });
+      }
+    `;
+    const manifest = manifestWithAdapters([
+      adapter("observePanic", "observe-panic"),
+      adapter("signalStream.start", "observe-panic"),
+    ]);
+
+    expect(
+      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith(), manifest).map(
+        ({ symbol, kind }) => [symbol, kind],
+      ),
+    ).toEqual([
+      ["observePanic", "promise-reject"],
+      ["sibling", "catch-clause"],
+      ["sibling", "throw"],
+      ["signalStream.start", "stream-error-signal"],
+    ]);
+  });
+
   it("attributes rejection handlers to named and inline callback identities", () => {
     const code = `
       function namedRejection(cause: unknown) { return cause; }
@@ -535,7 +576,7 @@ describe("production exception syntax", () => {
 });
 
 describe("Stage 5 presentation syntax", () => {
-  it("forbids runtime Zod imports only after an exact unknown-free module is enforced", () => {
+  it("forbids runtime Zod imports in an exact unknown-free module", () => {
     const source = `
       import { z } from "zod";
       import type { ZodType } from "zod";
@@ -546,23 +587,15 @@ describe("Stage 5 presentation syntax", () => {
         source,
         "apps/example/src/render.ts",
         policyWith(),
-        manifestWithUnknownFreeModule("enforced"),
+        manifestWithUnknownFreeModule(),
       ).map((finding) => finding.kind),
     ).toEqual(["presentation-decoder-import"]);
     expect(
       findPresentationDecoderImportViolations(
         source,
-        "apps/example/src/render.ts",
-        policyWith(),
-        manifestWithUnknownFreeModule("advisory"),
-      ),
-    ).toEqual([]);
-    expect(
-      findPresentationDecoderImportViolations(
-        source,
         "apps/example/src/other.ts",
         policyWith(),
-        manifestWithUnknownFreeModule("enforced"),
+        manifestWithUnknownFreeModule(),
       ),
     ).toEqual([]);
   });
@@ -573,7 +606,7 @@ describe("Stage 5 presentation syntax", () => {
         'import type { ZodType } from "zod";',
         "apps/example/src/render.ts",
         policyWith(),
-        manifestWithUnknownFreeModule("enforced"),
+        manifestWithUnknownFreeModule(),
       ),
     ).toEqual([]);
   });
@@ -714,7 +747,7 @@ describe("Result callback syntax", () => {
 });
 
 describe("Stage 6 persistence and SQLite syntax", () => {
-  it("blocks inline JSON and schema decoding only in exact enforced store scopes", () => {
+  it("blocks inline JSON and schema decoding only in exact registered store scopes", () => {
     const source = `
       class Store {
         load(raw: string) {
@@ -730,26 +763,18 @@ describe("Stage 6 persistence and SQLite syntax", () => {
         }
       }
     `;
-    const enforced = findStoreInlineDecodingViolations(
+    const findings = findStoreInlineDecodingViolations(
       source,
       "apps/example/src/store.ts",
       policyWith(),
-      manifestWithStage6("enforced"),
+      manifestWithStage6(),
     );
-    expect(enforced.map(({ kind, symbol }) => [kind, symbol])).toEqual([
+    expect(findings.map(({ kind, symbol }) => [kind, symbol])).toEqual([
       ["store-inline-json-decoding", "Store.load.nested"],
       ["store-inline-json-decoding", "Store.load"],
       ["store-inline-schema-decoding", "Store.load"],
       ["store-inline-schema-decoding", "Store.load"],
     ]);
-    expect(
-      findStoreInlineDecodingViolations(
-        source,
-        "apps/example/src/store.ts",
-        policyWith(),
-        manifestWithStage6("advisory"),
-      ),
-    ).toEqual([]);
   });
 
   it("blocks direct transaction APIs and manual control in consumers and descendants", () => {
@@ -773,7 +798,7 @@ describe("Stage 6 persistence and SQLite syntax", () => {
       `,
       "apps/example/src/store.ts",
       policyWith(),
-      manifestWithStage6("enforced"),
+      manifestWithStage6(),
     );
     expect(findings.map(({ kind, symbol }) => [kind, symbol])).toEqual([
       ["manual-sqlite-transaction-control", "Store.save"],
@@ -781,17 +806,6 @@ describe("Stage 6 persistence and SQLite syntax", () => {
       ["direct-sqlite-transaction", "Store.save"],
       ["manual-sqlite-transaction-control", "Store.save"],
     ]);
-  });
-
-  it("does not activate transaction syntax policy for advisory registrations", () => {
-    expect(
-      findDirectSqliteTransactionViolations(
-        `class Store { save() { return this.db.transaction(() => write()).immediate(); } }`,
-        "apps/example/src/store.ts",
-        policyWith(),
-        manifestWithStage6("advisory"),
-      ),
-    ).toEqual([]);
   });
 });
 

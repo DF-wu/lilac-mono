@@ -1268,9 +1268,7 @@ function analyzeCall(
     const identity = nodeIdentity(node, workspaceRoot);
     const registered =
       workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)) ||
-      workspace.resultDecoders.some(
-        (decoder) => decoder.status === "enforced" && identityOwns(decoder.identity, identity),
-      );
+      workspace.resultDecoders.some((decoder) => identityOwns(decoder.identity, identity));
     if (!registered) {
       diagnostics.push(
         makeDiagnostic(
@@ -1666,12 +1664,8 @@ function registeredUnknownInterpreterOwns(
 ): boolean {
   return (
     workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)) ||
-    workspace.resultDecoders.some(
-      (decoder) => decoder.status === "enforced" && identityOwns(decoder.identity, identity),
-    ) ||
-    workspace.persistedCodecs.some(
-      (codec) => codec.status === "enforced" && identityOwns(codec.identity, identity),
-    ) ||
+    workspace.resultDecoders.some((decoder) => identityOwns(decoder.identity, identity)) ||
+    workspace.persistedCodecs.some((codec) => identityOwns(codec.identity, identity)) ||
     workspace.openProtocolAdapters.some((adapter) => identityOwns(adapter.identity, identity)) ||
     workspace.capabilityPredicates.some((predicate) =>
       identityOwns(predicate.identity, identity),
@@ -5013,7 +5007,6 @@ function analyzeRegisteredEventInfrastructure(
 ): void {
   for (const registration of workspace.eventCodecRegistries) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(
         workspace,
         "architecture/complete-event-codec-registry",
@@ -5032,7 +5025,6 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.toolCodecRegistries) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(
         workspace,
         "architecture/complete-tool-codec-registry",
@@ -5052,7 +5044,6 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.resultDecoders) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(workspace, "architecture/result-decoder-contract", registration.identity.module)
     ) {
       analyzeResultDecoder(
@@ -5067,10 +5058,7 @@ function analyzeRegisteredEventInfrastructure(
     }
   }
   for (const registration of workspace.unknownFreeModules) {
-    if (
-      registration.status === "enforced" &&
-      ruleApplies(workspace, "architecture/unknown-free-module", registration.module)
-    ) {
+    if (ruleApplies(workspace, "architecture/unknown-free-module", registration.module)) {
       analyzeUnknownFreeModule(
         registration,
         checker,
@@ -5083,17 +5071,16 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.persistedCodecs) {
     if (
-      registration.status === "enforced" &&
-      (ruleApplies(
+      ruleApplies(
         workspace,
         "architecture/persisted-codec-contract",
         registration.identity.module,
       ) ||
-        ruleApplies(
-          workspace,
-          "architecture/persisted-codec-fixture-catalog",
-          registration.identity.module,
-        ))
+      ruleApplies(
+        workspace,
+        "architecture/persisted-codec-fixture-catalog",
+        registration.identity.module,
+      )
     ) {
       analyzePersistedCodec(
         registration,
@@ -5108,7 +5095,6 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.persistedStoreConsumers) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(workspace, "architecture/persisted-codec-contract", registration.identity.module)
     ) {
       analyzePersistedStoreConsumer(
@@ -5124,7 +5110,6 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.sqliteTransactionAdapters) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(
         workspace,
         "architecture/sqlite-transaction-adapter-contract",
@@ -5144,7 +5129,6 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.sqliteTransactionConsumers) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(
         workspace,
         "architecture/sqlite-transaction-consumer",
@@ -5164,7 +5148,6 @@ function analyzeRegisteredEventInfrastructure(
   }
   for (const registration of workspace.rawEventMessageBoundaries) {
     if (
-      registration.status === "enforced" &&
       ruleApplies(
         workspace,
         "architecture/raw-event-message-boundary",
@@ -5183,7 +5166,6 @@ function analyzeRegisteredEventInfrastructure(
     }
   }
   for (const registration of workspace.eventDeliveryApis) {
-    if (registration.status !== "enforced") continue;
     if (ruleApplies(workspace, "architecture/event-handler-result", registration.identity.module)) {
       analyzeEventDeliveryHandler(
         registration,
@@ -5255,7 +5237,6 @@ function assertOperationalResultApisResolve(
   workspaceRoot: string,
   program: ts.Program,
 ): void {
-  if (workspace.status !== "migrated") return;
   for (const api of workspace.operationalResultApis) {
     const matches: ts.SignatureDeclaration[] = [];
     const sourceFile = program
@@ -5970,15 +5951,14 @@ export function analyzeWorkspace(
     workspace.eventDeliveryConsumers.map((registration) => registration.apiPackage),
   ),
   activePersistenceInfrastructure: ActivePersistenceInfrastructure = {
-    persistedCodecs: workspace.persistedCodecs
-      .filter(({ status }) => status === "enforced")
-      .map(({ identity }) => ({ packageName: workspace.packageName, identity })),
-    sqliteTransactionAdapters: workspace.sqliteTransactionConsumers
-      .filter(({ status }) => status === "enforced")
-      .map(({ adapter }) => ({
-        packageName: adapter.package ?? workspace.packageName,
-        identity: adapter,
-      })),
+    persistedCodecs: workspace.persistedCodecs.map(({ identity }) => ({
+      packageName: workspace.packageName,
+      identity,
+    })),
+    sqliteTransactionAdapters: workspace.sqliteTransactionConsumers.map(({ adapter }) => ({
+      packageName: adapter.package ?? workspace.packageName,
+      identity: adapter,
+    })),
     scanAllProductionModules: false,
   },
   approvedExceptionAdapters: readonly ApprovedExceptionAdapter[] = APPROVED_EXCEPTION_ADAPTER_CATALOG,

@@ -1,40 +1,43 @@
 import path from "node:path";
 
-import { analyzeWorkspace } from "./analyzer.ts";
 import {
-  applyBaselines,
-  baselineFromFindings,
-  formatBaselineModule,
-  stage0BaselineReason,
-} from "./baseline.ts";
-import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
-import { failureFlowBaseline } from "./failure-flow.baseline.ts";
+  analyzeWorkspace,
+  type ActivePersistenceInfrastructure,
+  type WorkspacePackageRoot,
+} from "./analyzer.ts";
 import type { ArchitectureManifest, WorkspaceArchitecture } from "./manifest.ts";
-import {
-  architectureManifest,
-  assertArchitectureManifestIntegrity,
-  PACKAGE_WIDE_ARCHITECTURE_RULES,
-  zeroBaselineScopesByWorkspace,
-} from "./manifest.ts";
+import { architectureManifest, assertArchitectureManifestIntegrity } from "./manifest.ts";
 import type { ArchitectureDiagnostic } from "./model.ts";
-import { ARCHITECTURE_RULES } from "./model.ts";
 import { createWorkspaceProgram, type WorkspaceProgram } from "./program.ts";
-import { assertStage7EnforcementPreflight } from "./stage7-preflight.ts";
 import { validateWorkspaceInventory } from "./workspace-inventory.ts";
-import { syntaxBaseline } from "../oxlint-plugins/syntax-baseline.mts";
+import {
+  ARCHITECTURE_FINDINGS_EXIT_CODE,
+  ARCHITECTURE_WORKSPACE_FIXTURE_ENV,
+} from "./workspace-runner-protocol.ts";
+
+export { ARCHITECTURE_FINDINGS_EXIT_CODE } from "./workspace-runner-protocol.ts";
 
 export type ProgramFactory = (
   repositoryRoot: string,
   workspace: ArchitectureManifest["workspaces"][number],
 ) => WorkspaceProgram;
 
-export function analyzeArchitecture(
+export interface ArchitectureAnalysisContext {
+  readonly packageRoots: readonly WorkspacePackageRoot[];
+  readonly activeEventDeliveryApiPackages: ReadonlySet<string>;
+  readonly activePersistenceInfrastructure: ActivePersistenceInfrastructure;
+  readonly approvedExceptionAdapters: ArchitectureManifest["approvedExceptionAdapters"];
+}
+
+export type WorkspaceProcessRunner = (
   repositoryRoot: string,
-  manifest: ArchitectureManifest = architectureManifest,
-  programFactory: ProgramFactory = createWorkspaceProgram,
-): readonly ArchitectureDiagnostic[] {
-  assertArchitectureManifestIntegrity(manifest);
-  const diagnostics: ArchitectureDiagnostic[] = [];
+  workspaceRoot: string,
+) => Promise<number>;
+
+export function createArchitectureAnalysisContext(
+  repositoryRoot: string,
+  manifest: ArchitectureManifest,
+): ArchitectureAnalysisContext {
   const packageRoots = manifest.workspaces.map((workspace) => ({
     packageName: workspace.packageName,
     root: path.resolve(repositoryRoot, workspace.root),
@@ -49,64 +52,62 @@ export function analyzeArchitecture(
   ]);
   const activePersistenceInfrastructure = {
     persistedCodecs: manifest.workspaces.flatMap((workspace) =>
-      workspace.persistedCodecs
-        .filter(({ status }) => status === "enforced")
-        .map(({ identity }) => ({ packageName: workspace.packageName, identity })),
+      workspace.persistedCodecs.map(({ identity }) => ({
+        packageName: workspace.packageName,
+        identity,
+      })),
     ),
     sqliteTransactionAdapters: manifest.workspaces.flatMap((workspace) =>
-      workspace.sqliteTransactionAdapters
-        .filter(({ status }) => status === "enforced")
-        .map(({ identity }) => ({ packageName: workspace.packageName, identity })),
+      workspace.sqliteTransactionAdapters.map(({ identity }) => ({
+        packageName: workspace.packageName,
+        identity,
+      })),
     ),
     scanAllProductionModules: true,
   };
+  return {
+    packageRoots,
+    activeEventDeliveryApiPackages,
+    activePersistenceInfrastructure,
+    approvedExceptionAdapters: manifest.approvedExceptionAdapters,
+  };
+}
+
+export function analyzeArchitectureWorkspace(
+  repositoryRoot: string,
+  workspace: WorkspaceArchitecture,
+  context: ArchitectureAnalysisContext,
+  programFactory: ProgramFactory = createWorkspaceProgram,
+): readonly ArchitectureDiagnostic[] {
+  const workspaceProgram = programFactory(repositoryRoot, workspace);
+  return analyzeWorkspace(
+    workspace,
+    workspaceProgram.root,
+    workspaceProgram.program,
+    context.packageRoots,
+    context.activeEventDeliveryApiPackages,
+    context.activePersistenceInfrastructure,
+    context.approvedExceptionAdapters,
+  );
+}
+
+export function analyzeArchitecture(
+  repositoryRoot: string,
+  manifest: ArchitectureManifest = architectureManifest,
+  programFactory: ProgramFactory = createWorkspaceProgram,
+): readonly ArchitectureDiagnostic[] {
+  assertArchitectureManifestIntegrity(manifest);
+  const context = createArchitectureAnalysisContext(repositoryRoot, manifest);
+  const diagnostics: ArchitectureDiagnostic[] = [];
   for (const workspace of manifest.workspaces) {
-    const workspaceProgram = programFactory(repositoryRoot, workspace);
     diagnostics.push(
-      ...analyzeWorkspace(
-        workspace,
-        workspaceProgram.root,
-        workspaceProgram.program,
-        packageRoots,
-        activeEventDeliveryApiPackages,
-        activePersistenceInfrastructure,
-        manifest.approvedExceptionAdapters ?? [],
-      ),
+      ...analyzeArchitectureWorkspace(repositoryRoot, workspace, context, programFactory),
     );
   }
   return diagnostics;
 }
 
-export function inventoryManifest(manifest: ArchitectureManifest): ArchitectureManifest {
-  const inventoryRuleZones = (workspace: WorkspaceArchitecture) =>
-    Object.fromEntries(
-      ARCHITECTURE_RULES.map((rule) => [
-        rule,
-        PACKAGE_WIDE_ARCHITECTURE_RULES.has(rule)
-          ? [{ include: "**" }]
-          : (workspace.ruleZones[rule] ?? []),
-      ]),
-    );
-  if (manifest.approvedExceptionAdapters === undefined) {
-    return {
-      version: manifest.version,
-      workspaces: manifest.workspaces.map((workspace) => ({
-        ...workspace,
-        exceptionAdapters: [],
-        ruleZones: inventoryRuleZones(workspace),
-      })),
-    };
-  }
-  return {
-    ...manifest,
-    workspaces: manifest.workspaces.map((workspace) => ({
-      ...workspace,
-      ruleZones: inventoryRuleZones(workspace),
-    })),
-  };
-}
-
-function printDiagnostic(diagnostic: ArchitectureDiagnostic): void {
+export function printDiagnostic(diagnostic: ArchitectureDiagnostic): void {
   const location = diagnostic.location
     ? `${diagnostic.workspace}/${diagnostic.location.file}:${diagnostic.location.line}:${diagnostic.location.column}`
     : diagnostic.workspace;
@@ -115,60 +116,54 @@ function printDiagnostic(diagnostic: ArchitectureDiagnostic): void {
   );
 }
 
-function migratedWorkspaceNames(manifest: ArchitectureManifest): ReadonlySet<string> {
-  return new Set(
-    manifest.workspaces
-      .filter((workspace) => workspace.status === "migrated")
-      .map((workspace) => workspace.name),
+async function runWorkspaceProcess(repositoryRoot: string, workspaceRoot: string): Promise<number> {
+  const environment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name !== ARCHITECTURE_WORKSPACE_FIXTURE_ENV),
   );
+  const subprocess = Bun.spawn({
+    cmd: [process.execPath, path.join(import.meta.dir, "workspace-runner.ts"), workspaceRoot],
+    cwd: repositoryRoot,
+    env: environment,
+    stdin: "ignore",
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  return subprocess.exited;
+}
+
+export async function analyzeArchitectureInWorkspaceProcesses(
+  repositoryRoot: string,
+  manifest: ArchitectureManifest = architectureManifest,
+  processRunner: WorkspaceProcessRunner = runWorkspaceProcess,
+): Promise<boolean> {
+  assertArchitectureManifestIntegrity(manifest);
+  let hasFindings = false;
+  for (const workspace of manifest.workspaces) {
+    const exitCode = await processRunner(repositoryRoot, workspace.root);
+    if (exitCode === ARCHITECTURE_FINDINGS_EXIT_CODE) {
+      hasFindings = true;
+      continue;
+    }
+    if (exitCode !== 0) {
+      throw new Error(
+        `Architecture analysis subprocess for ${workspace.name} failed with exit code ${exitCode}.`,
+      );
+    }
+  }
+  return hasFindings;
 }
 
 async function main(): Promise<void> {
   const repositoryRoot = path.resolve(import.meta.dir, "../..");
   const command = Bun.argv[2] ?? "check";
-  if (command !== "check" && command !== "inventory" && command !== "write-baselines") {
-    throw new Error(`Unknown architecture command: ${command}`);
+  if (command !== "check") {
+    throw new Error(
+      `Unknown architecture command '${command}'. The permanent gate supports only 'check'; inventory and baseline generation were removed after migration.`,
+    );
   }
   await validateWorkspaceInventory(repositoryRoot);
-  assertStage7EnforcementPreflight(architectureManifest, {
-    semantic: [boundaryValidationBaseline, failureFlowBaseline],
-    syntax: syntaxBaseline,
-  });
-  const manifest =
-    command === "check" ? architectureManifest : inventoryManifest(architectureManifest);
-  const findings = analyzeArchitecture(repositoryRoot, manifest);
-
-  if (command === "inventory") {
-    console.log(JSON.stringify(findings, null, 2));
-    return;
-  }
-
-  if (command === "write-baselines") {
-    const boundary = baselineFromFindings(findings, "boundary-validation", stage0BaselineReason);
-    const failure = baselineFromFindings(findings, "failure-flow", stage0BaselineReason);
-    await Promise.all([
-      Bun.write(
-        path.join(import.meta.dir, "boundary-validation.baseline.ts"),
-        formatBaselineModule("boundaryValidationBaseline", boundary),
-      ),
-      Bun.write(
-        path.join(import.meta.dir, "failure-flow.baseline.ts"),
-        formatBaselineModule("failureFlowBaseline", failure),
-      ),
-    ]);
-    return;
-  }
-
-  const evaluated = applyBaselines(
-    findings,
-    boundaryValidationBaseline,
-    failureFlowBaseline,
-    migratedWorkspaceNames(manifest),
-    zeroBaselineScopesByWorkspace(manifest),
-  );
-  for (const diagnostic of evaluated.diagnostics) printDiagnostic(diagnostic);
-  if (evaluated.diagnostics.some((diagnostic) => diagnostic.severity === "error"))
-    process.exitCode = 1;
+  const hasFindings = await analyzeArchitectureInWorkspaceProcesses(repositoryRoot);
+  if (hasFindings) process.exitCode = 1;
 }
 
 if (import.meta.main) await main();

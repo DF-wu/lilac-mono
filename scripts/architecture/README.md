@@ -1,108 +1,92 @@
-# Semantic Architecture Checker
+# Architecture Gate
 
-The checker uses the `typescript-codegen` TypeScript 6 compiler API and creates one `Program` for each
-active workspace in `manifest.ts`.
-
-Commands are available directly until root scripts are wired in a separate change:
+The permanent architecture gate combines TypeScript semantic analysis with focused production-syntax
+checks. It creates one TypeScript `Program` per active Bun workspace and reports every finding as an error
+with an exact workspace, source location, rule, owning symbol, remediation, and fingerprint.
 
 ```sh
+# Standalone subsets for focused development
 bun scripts/architecture/runner.ts check
-bun scripts/architecture/runner.ts inventory
-bun scripts/architecture/runner.ts write-baselines --reason "reviewed Stage 0 inventory"
+bun scripts/oxlint-plugins/check-production-syntax.mts
 bun test scripts/architecture/architecture.test.ts
+
+# Full permanent gate, then complete repository CI
+bun run lint
+bun run ci
 ```
 
-`write-baselines` keeps boundary-validation and failure-flow findings in separate package/rule maps.
-Existing entries suppress matching findings, new findings remain errors, and stale entries are warnings.
-Fingerprints use the owning symbol, syntax kind, and normalized local structure rather than line numbers.
-`inventory` and `write-baselines` scan all supported rules across production files; `check` enforces only
-the migration zones activated in the manifest.
+The standalone commands cover only their named subset. Use `bun run lint` for the complete lint and
+architecture gate, or `bun run ci` for all generated-code, lint, test, typecheck, and format validation.
 
-This initial semantic checker owns only rules that use resolved symbols or types. Pure throw, catch,
-rejection, nested-ternary, and duplicate-record-guard syntax remains owned by Oxlint and is deliberately
-not duplicated here.
+There is no baseline, suppression, inventory-expansion, or migration-status path. `runner.ts` accepts only
+`check`; new findings must be fixed or represented by one of the exact reviewed registrations below.
 
-Stage 2 adds semantic checks for project-owned closed-union switches, exhaustive union-keyed maps, and
-registered open-protocol normalization. Closed-union switch and map rules apply to all production
-workspaces. Open-protocol rules apply only to exact registered adapter and consumer modules. A
-registration names the exact adapter, external protocol type and parameter, and local fallback
-discriminant/value; manifest integrity rejects blank fields and duplicate callable registrations, and
-direct switching on the registered external type is allowed only inside that adapter.
+## Fail-Closed Inventory
 
-The mini-client owns the raw stream trust boundary: `normalizeStreamChunk` converts `unknown` wire
-values into a validated installed `UIMessageChunk`, representing a future non-data chunk with the
-reserved `data-*` sentinel validated by `miniLilacUnsupportedUIMessageChunkSchema`. The TUI detects that sentinel and
-performs its registered Zod subtype classification in `projectMiniLilacStreamChunk`, while
-`projectUIMessageChunk` remains the exact open AI SDK adapter with its local unsupported fallback.
-Malformed stream frames signal through the exact registered stream-host adapters, including the
-`ChatTransport` rejection contract in `MiniLilacTransport.responseStream`.
+`workspace-inventory.ts` discovers every `apps/*` and `packages/*` directory containing `package.json`.
+The gate fails before analysis when a discovered workspace is missing from `ACTIVE_WORKSPACES`, a manifest
+workspace no longer exists, or a root is duplicated. Adding a workspace therefore requires adding its
+architecture policy in the same change.
 
-Stage 3 zero-debt enforcement is declared by each workspace's `zeroBaselineScopes`. A scope owns either
-an exact module or one exact symbol; both the semantic and syntax ratchets reject baseline entries in
-that scope. Migrated workspaces still retain package-wide zero-debt enforcement.
+Every active workspace always receives every rule in `FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES` over the
+single `**` zone. Registration-owned rules remain exact: manifest integrity derives their complete module
+set from the registrations and rejects missing, stale, wildcard, or extra zones.
 
-Stage 4 adds manifest infrastructure for exact event codec registries, raw receive boundaries, delivery
-APIs, delivery policies, and event-family migrations. Registrations use exact module/symbol identities
-and zero-based parameter indexes. Family declarations must partition every registered canonical event
-exactly once. A migrated family must have declared codec coverage and workspace-owned zero-baseline
-scopes.
+## Exact Registrations
 
-The event-bus codec, raw receive, handler Result, and delivery-policy foundations are enforced. Exact
-`eventDeliveryConsumers` cover every production `subscribeTopic` and `fetchTopic` owner;
-each consumer must own a matching symbol zero-baseline scope, and unregistered calls fail analysis.
-All six event families are `migrated`: the manifest partitions all 25 canonical events, links each
-family to exact cross-workspace delivery registrations and zero-baseline scopes, and requires complete
-codec coverage. Enforced raw and typed APIs reject generic receive contracts, handler-owned `commit`
-contexts, legacy API aliases, generic message specialization assertions, and unregistered production
-consumers.
+`manifest.ts` is the reviewed catalog for:
 
-Stage 5 adds an exact presentation codec registry resolved against the shared Mini Lilac protocol
-catalog of 14 canonical tool names, exact
-Result-decoder registrations, and recursively unknown-free presentation modules. Enforced tool
-registries must use an explicit or const-tuple-composed string tuple and an explicit object literal
-with one codec per tool; the shared catalog may combine explicit executable and transcript-only const tuples, while broad
-computed keys, duplicate keys, missing codecs, and extra codecs fail. Canonical and codec members are
-read from those source declarations rather than copied into the manifest. Enforced Result
-decoders are non-generic exact symbols that accept boundary data containing `unknown` and return a
-direct `Result<Decoded, SpecificError>` whose success and error types recursively exclude `unknown`,
-`any`, and `never`.
+- boundary decoders, opaque values, and exact capability predicates;
+- open-protocol adapters and their explicit local fallback variants;
+- event, tool, Result-decoder, persistence, and SQLite contracts;
+- event delivery APIs and cross-workspace consumers;
+- operational Result APIs, compatibility outputs, and Panic sites; and
+- exception adapters and defect supervisors.
 
-An enforced unknown-free module rejects `unknown` recursively through parameters, returns, aliases,
-properties, nested imported contracts, method and call signatures, generics, maps, unions, callback
-contracts, and local variables. Traversal has a fixed property budget and fails closed if that budget
-is exhausted. Such a module may not own either kind of decoder registration. The syntax ratchet also
-rejects runtime `zod` imports and value imports or calls of registered projection/decoder boundaries in
-an enforced unknown-free module. Registered tool codec registry values and their exported or local
-aliases are covered as well; type-only projection imports remain allowed.
+Registrations name exact modules and symbols. Specialized Result-bearing registrations must also appear
+in `operationalResultApis`. Event family declarations partition every canonical event exactly once, and
+event codec coverage must be complete.
 
-The landed Mini Lilac tool catalog, codec registry, Result decoder, parser owners, and raw observation
-adapters are enforced. The six Zod parser calls are owned by `parseInput`, `decodeBash` (two calls),
-`decodeEditFile`, `decodeSubagentDelegate`, and `decodeWebsearch`; `projectToolObservation`,
-`observationFromCanonicalPart`, and `UIMessageChunkProjectionState.toolChunk` own the raw projection
-edges. `render.ts` and `transcript-buffer.ts` are recursively unknown-free, and runtime Zod imports are
-forbidden there. Module-wide zero-baseline scopes cover render, UI-message projection, tool-observation
-projection, and transcript buffering, including all descendant symbols.
+`APPROVED_EXCEPTION_ADAPTER_CATALOG` is derived from the exact exception-adapter registrations. Manifest
+integrity validates callable identity, direction, syntax kinds, provenance, external/host relationship,
+reason, complete registration coverage, and `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256`. Change the
+owning registration, review the derived catalog metadata, then update the digest and focused tests.
 
-Stage 6 adds registered persisted codecs, six-case compatibility fixture catalogs, exact persisted-store
-consumers, and SQLite Result transaction adapters and consumers. Codec contracts require a direct
-`Result<{ value; provenance }, SpecificStorageError>` with an exact declared provenance union. Fixture
-catalogs must explicitly cover current, legacy, missing-defaulted, unsupported-version,
-malformed-serialization, and corrupt-fields behavior; their static expected outcomes must agree with the
-contract provenance.
+## Permanent Rules
 
-An enforced persisted-store consumer must call every codec named by its registration. The syntax ratchet
-then rejects inline `JSON.parse` and schema parse calls in that exact symbol and all descendants. An
-enforced SQLite consumer must call its exact registered adapter; the syntax ratchet rejects direct
-`.transaction()` and manual `BEGIN`, `COMMIT`, or `ROLLBACK` in the same descendant-aware scope. The
-semantic callback rule resolves real `bun:sqlite` and `better-result` declarations and rejects a raw
-driver callback whose return type or body can produce `Err`.
+Semantic rules enforce boundary decoding, domain-owned `unknown`, assertion and predicate safety, closed
+union exhaustiveness, Result handling, Panic registration, compatibility serialization, redacted
+TaggedError logging, event delivery, persisted codecs, and SQLite transaction atomicity.
 
-Transaction adapter validation requires one non-exported rollback sentinel, a raw callback returning a
-plain value, exact `better-result#Panic.is` observation, an exact registered driver classifier, and
-unknown-defect rethrow. Codec, adapter, and consumer identities must also be listed in
-`operationalResultApis`. Enforced consumers require a zero-baseline scope that owns the registered symbol
-and descendants in both semantic and syntax ratchets. See `STAGE6.md` for activation and fixture details.
+The syntax gate rejects unregistered exception flow, inline async Result callbacks, presentation decoder
+imports, store-owned inline decoding, and direct SQLite transactions. Oxlint also applies the permanent
+package-wide nested-ternary and local-record-guard rules. Syntax registrations use the same exact manifest
+identities as semantic analysis; there is no separate syntax exception catalog.
 
-Stage 7 adds the fail-closed package migration preflight, explicit status registry, permanent package-wide
-semantic and syntax rule sets, unknown-member/custom-decoder provenance checks, and inventory isolation
-for exact registration zones. See `STAGE7.md` for the per-package integration procedure.
+Production tests, generated output, and the generated Core remote-runner bundle are excluded by
+`source-policy.ts` and `syntax-policy.mts`; their TypeScript source remains enforced.
+
+## Performance
+
+`runner.ts check` validates workspace inventory and manifest integrity once in the parent, then analyzes
+workspaces sequentially in isolated subprocesses. Each child resolves one workspace configuration, creates
+exactly one TypeScript `Program`, prints that workspace's diagnostics, and exits. The operating system then
+reclaims the Program, checker, source files, and lazy declaration indexes before the next workspace starts.
+Package-root, event-delivery, persistence, and approved-exception catalogs are still derived from the full
+manifest in every workspace analysis, so partitioning does not narrow cross-workspace rules.
+
+Workers run in manifest order with inherited output, preserving deterministic diagnostics. Exit status is
+aggregated so findings from any worker fail the unchanged parent command; an unexpected worker exit aborts
+the gate and fails closed. Nothing is cached across processes, and workers never overlap, so peak memory is
+bounded by the parent plus the largest single workspace rather than all workspace Programs retained by one
+runtime.
+
+Focused integration tests spawn the real worker against checked-in `fixtures/workspace-runner` projects and
+assert its exact output and exit protocol. The fixture manifest is selected only for those direct test
+processes; `runner.ts check` removes the fixture selector from every production worker environment.
+
+On 2026-08-04, `/usr/bin/time -v bun scripts/architecture/runner.ts check` on the Stage 8 development
+checkout measured 61.67 seconds and 5,993,228 KB maximum RSS before subprocess partitioning. The same
+command after partitioning measured 76.68 seconds and 3,830,520 KB maximum RSS, a 36.1% peak reduction.
+Re-run the command and record both wall time and maximum RSS when changing program creation, process
+partitioning, source traversal, or registration resolution.

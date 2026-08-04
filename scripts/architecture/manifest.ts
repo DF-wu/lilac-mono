@@ -132,33 +132,7 @@ export interface RuleZone {
   readonly include: string;
 }
 
-export interface ZeroBaselineScope {
-  readonly module: string;
-  readonly symbol?: string;
-}
-
-const SOURCE_MODULE_EXTENSION = /\.(?:[cm]?[jt]sx?)$/u;
-
-export function zeroBaselineScopeOwns(
-  scope: ZeroBaselineScope,
-  module: string,
-  symbol: string,
-): boolean {
-  if (
-    scope.module.replace(SOURCE_MODULE_EXTENSION, "") !==
-    module.replace(SOURCE_MODULE_EXTENSION, "")
-  ) {
-    return false;
-  }
-  return (
-    scope.symbol === undefined || symbol === scope.symbol || symbol.startsWith(`${scope.symbol}.`)
-  );
-}
-
-export type ArchitectureRegistrationStatus = "advisory" | "enforced";
-
 export interface EventCodecRegistryRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly canonicalEvents: SymbolIdentity;
   readonly canonicalMembers: readonly string[];
@@ -166,21 +140,18 @@ export interface EventCodecRegistryRegistration {
 }
 
 export interface ToolCodecRegistryRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly aliases: readonly SymbolIdentity[];
   readonly canonicalTools: PackageSymbolIdentity;
 }
 
 export interface ResultDecoderRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly category: BoundaryCategory;
   readonly inputParameter: number;
 }
 
 export interface UnknownFreeModuleRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly module: string;
 }
 
@@ -198,7 +169,6 @@ export type PersistedValueProvenance = "current" | "migrated" | "missing-default
 export type PersistedMissingOutcome = "missing-defaulted" | "missing-rejected";
 
 export interface PersistedCodecRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly inputParameter: number;
   readonly fixtureCatalog: SymbolIdentity;
@@ -207,13 +177,11 @@ export interface PersistedCodecRegistration {
 }
 
 export interface PersistedStoreConsumerRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly codecs: readonly PackageSymbolIdentity[];
 }
 
 export interface SqliteTransactionAdapterRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly databaseParameter: number;
   readonly operationParameter: number;
@@ -223,13 +191,11 @@ export interface SqliteTransactionAdapterRegistration {
 }
 
 export interface SqliteTransactionConsumerRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly adapter: PackageSymbolIdentity;
 }
 
 export interface RawEventMessageBoundaryRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly messageType: ExternalSymbolIdentity;
   readonly handlerParameter: number;
@@ -238,7 +204,6 @@ export interface RawEventMessageBoundaryRegistration {
 }
 
 export interface EventDeliveryApiRegistration {
-  readonly status: ArchitectureRegistrationStatus;
   readonly identity: SymbolIdentity;
   readonly handlerParameter: number;
   readonly handlerMessageParameter: number;
@@ -255,12 +220,10 @@ export interface EventDeliveryConsumerRegistration {
   readonly operations: readonly EventDeliveryOperation[];
 }
 
-export interface EventFamilyMigration {
+export interface EventFamilyRegistration {
   readonly family: string;
-  readonly status: "advisory" | "migrating" | "migrated";
   readonly codecRegistry: SymbolIdentity;
   readonly members: readonly string[];
-  readonly zeroBaselineScopes: readonly (ZeroBaselineScope & { readonly workspace: string })[];
 }
 
 export interface WorkspaceArchitecture {
@@ -268,7 +231,6 @@ export interface WorkspaceArchitecture {
   readonly packageName: string;
   readonly root: string;
   readonly tsconfig: string;
-  readonly status: "inventory" | "migrating" | "migrated";
   readonly ruleZones: Partial<Readonly<Record<ArchitectureRule, readonly RuleZone[]>>>;
   readonly boundaryDecoders: readonly BoundaryDecoder[];
   readonly opaqueUnknown: readonly ReasonedSymbolException[];
@@ -280,7 +242,6 @@ export interface WorkspaceArchitecture {
   readonly structuredLoggers: readonly StructuredLogger[];
   readonly taggedErrorFormatters: readonly CompatibilitySink[];
   readonly operationalResultApis: readonly SymbolIdentity[];
-  readonly zeroBaselineScopes: readonly ZeroBaselineScope[];
   readonly eventCodecRegistries: readonly EventCodecRegistryRegistration[];
   readonly toolCodecRegistries: readonly ToolCodecRegistryRegistration[];
   readonly resultDecoders: readonly ResultDecoderRegistration[];
@@ -292,14 +253,8 @@ export interface WorkspaceArchitecture {
   readonly rawEventMessageBoundaries: readonly RawEventMessageBoundaryRegistration[];
   readonly eventDeliveryApis: readonly EventDeliveryApiRegistration[];
   readonly eventDeliveryConsumers: readonly EventDeliveryConsumerRegistration[];
-  readonly eventFamilyMigrations: readonly EventFamilyMigration[];
-  readonly baselines: {
-    readonly boundaryValidation: string;
-    readonly failureFlow: string;
-  };
+  readonly eventFamilies: readonly EventFamilyRegistration[];
 }
-
-export type WorkspaceArchitectureStatus = WorkspaceArchitecture["status"];
 
 type WorkspaceArchitectureWithoutExceptionAdapters = Omit<
   WorkspaceArchitecture,
@@ -321,12 +276,6 @@ export type ArchitectureManifest =
       readonly approvedExceptionAdapterCatalogSha256: string;
       readonly workspaces: readonly WorkspaceArchitecture[];
     };
-
-const STAGE_1_PILOT_RULES = new Set<ArchitectureRule>([
-  "architecture/no-unhandled-exception-contract",
-  "architecture/no-unredacted-tagged-error-log",
-  "architecture/fallible-api-result",
-]);
 
 export const EXACT_REGISTRATION_ARCHITECTURE_RULES = new Set<ArchitectureRule>([
   "architecture/open-protocol-normalization",
@@ -362,24 +311,14 @@ export const FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES = [
   "architecture/fallible-api-result",
 ] as const satisfies readonly ArchitectureRule[];
 
-export const PACKAGE_WIDE_ARCHITECTURE_RULES = new Set<ArchitectureRule>(
-  FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES,
-);
-
 const DEFAULT_RULE_ZONES = Object.fromEntries(
   ARCHITECTURE_RULES.map((rule) => [
     rule,
-    STAGE_1_PILOT_RULES.has(rule) ||
-    EXACT_REGISTRATION_ARCHITECTURE_RULES.has(rule) ||
-    rule === "architecture/no-unknown-member-read" ||
-    rule === "architecture/no-unregistered-custom-decoder"
-      ? []
-      : [{ include: "**" }],
+    EXACT_REGISTRATION_ARCHITECTURE_RULES.has(rule) ? [] : [{ include: "**" }],
   ]),
 );
 
 const EMPTY_POLICY = {
-  status: "inventory",
   ruleZones: DEFAULT_RULE_ZONES,
   boundaryDecoders: [],
   opaqueUnknown: [],
@@ -391,7 +330,6 @@ const EMPTY_POLICY = {
   structuredLoggers: [],
   taggedErrorFormatters: [],
   operationalResultApis: [],
-  zeroBaselineScopes: [],
   eventCodecRegistries: [],
   toolCodecRegistries: [],
   resultDecoders: [],
@@ -403,11 +341,7 @@ const EMPTY_POLICY = {
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
-  eventFamilyMigrations: [],
-  baselines: {
-    boundaryValidation: "scripts/architecture/boundary-validation.baseline.ts",
-    failureFlow: "scripts/architecture/failure-flow.baseline.ts",
-  },
+  eventFamilies: [],
 } as const;
 
 export const ACTIVE_WORKSPACES = [
@@ -432,61 +366,6 @@ export const ACTIVE_WORKSPACES = [
 ] as const;
 
 export type ActiveWorkspaceRoot = (typeof ACTIVE_WORKSPACES)[number][0];
-
-function defineWorkspaceStatuses(
-  statuses: Readonly<Record<ActiveWorkspaceRoot, WorkspaceArchitectureStatus>>,
-): Readonly<Record<ActiveWorkspaceRoot, WorkspaceArchitectureStatus>> {
-  return statuses;
-}
-
-export const WORKSPACE_STATUSES = defineWorkspaceStatuses({
-  "apps/acp-controller": "migrated",
-  "apps/core": "migrated",
-  "apps/mini-lilac": "migrated",
-  "apps/mini-lilac-server": "migrated",
-  "apps/mini-lilac-tui": "migrated",
-  "apps/tool-bridge": "migrated",
-  "packages/agent": "migrated",
-  "packages/bash-safety": "migrated",
-  "packages/claude-code-bridge": "migrated",
-  "packages/coding-tools": "migrated",
-  "packages/event-bus": "migrated",
-  "packages/fs": "migrated",
-  "packages/mini-lilac-client": "migrated",
-  "packages/mini-lilac-runtime": "migrated",
-  "packages/plugin-runtime": "migrated",
-  "packages/remote-fs-runner": "migrated",
-  "packages/tool-results": "migrated",
-  "packages/utils": "migrated",
-});
-
-const STAGE_3_ZERO_BASELINE_MODULES = new Map<string, readonly string[]>([
-  [
-    "apps/core",
-    [
-      "src/conversation/thread-summarization-worker-protocol.ts",
-      "src/conversation/thread-summarization-worker.ts",
-      "src/conversation/thread-worker.ts",
-      "src/custom-commands/manager.ts",
-      "src/plugins/manager.ts",
-      "src/ssh/remote-js/bundled-runner-failure.ts",
-      "src/ssh/remote-js/remote-runner-entry.ts",
-      "src/ssh/remote-js.ts",
-      "src/ssh/ssh-exec.ts",
-      "src/tool-server/create-tool-server.ts",
-      "src/tool-server/tools/conversation-thread.ts",
-      "src/tools/fs/remote-fs.ts",
-    ],
-  ],
-  ["packages/coding-tools", ["src/filesystem.ts"]],
-  ["packages/fs", ["src/remote-runner-protocol.ts"]],
-  [
-    "packages/plugin-runtime",
-    ["capabilities.ts", "discovery.ts", "hooks.ts", "loader.ts", "manager.ts"],
-  ],
-  ["packages/remote-fs-runner", ["src/cli.ts"]],
-  ["packages/utils", ["custom-commands.ts"]],
-]);
 
 const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]>([
   [
@@ -837,78 +716,6 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
     ].map((exportName) => ({ module: "src/cli.ts", exportName })),
   ],
 ]);
-
-const STAGE_3_BOUNDARY_RULES = [
-  "architecture/no-unregistered-decoder",
-  "architecture/no-domain-unknown",
-  "architecture/no-unknown-assertion",
-  "architecture/no-rich-unknown-predicate",
-] as const satisfies readonly ArchitectureRule[];
-
-const STAGE_3_RESULT_RULES = [
-  "architecture/no-unhandled-exception-contract",
-  "architecture/no-unredacted-tagged-error-log",
-  "architecture/fallible-api-result",
-] as const satisfies readonly ArchitectureRule[];
-
-const STAGE_1_CORE_RULE_ZONES = [
-  { include: "src/mcp/value-source.ts" },
-  { include: "src/mcp/config-file.ts" },
-] as const satisfies readonly RuleZone[];
-
-const CORE_TOOL_SERVER_PARTITION_MODULES = [
-  "src/tool-server/health-state.ts",
-  "src/tool-server/index.ts",
-  "src/tool-server/request-control-authority.ts",
-  "src/tool-server/runtime-diagnostics.ts",
-  "src/tool-server/schema.ts",
-  "src/tool-server/tools/attachment.ts",
-  "src/tool-server/tools/codex.ts",
-  "src/tool-server/tools/content-inspect.ts",
-  "src/tool-server/tools/discovery.ts",
-  "src/tool-server/tools/generate.ts",
-  "src/tool-server/tools/index.ts",
-  "src/tool-server/tools/mcp.ts",
-  "src/tool-server/tools/onboarding.ts",
-  "src/tool-server/tools/programmatic-workflow.ts",
-  "src/tool-server/tools/resolve-discord-session-id.ts",
-  "src/tool-server/tools/skills.ts",
-  "src/tool-server/tools/ssh.ts",
-  "src/tool-server/tools/surface.ts",
-  "src/tool-server/tools/web-search/default-web-search-providers.ts",
-  "src/tool-server/tools/web-search/exa-web-search-provider.ts",
-  "src/tool-server/tools/web-search/firecrawl-web-search-provider.ts",
-  "src/tool-server/tools/web-search/resolve-provider.ts",
-  "src/tool-server/tools/web-search/shared.ts",
-  "src/tool-server/tools/web-search/tavily-web-search-provider.ts",
-  "src/tool-server/tools/web-search/types.ts",
-  "src/tool-server/tools/web-search.ts",
-  "src/tool-server/tools/web.ts",
-  "src/tool-server/tools/zod-cli.ts",
-  "src/tool-server/types.ts",
-  "src/tool-server/validation-error-message.ts",
-] as const;
-
-const CORE_PARTITION_8_MODULES = [
-  "build-remote-runner.ts",
-  "scripts/bench-fs-search.ts",
-  "src/discovery/discovery-service.ts",
-  "src/heartbeat/common.ts",
-  "src/heartbeat/heartbeat-service.ts",
-  "src/shared/agent-output-activity.ts",
-  "src/shared/attachment-utils.ts",
-  "src/shared/event-bus-result.ts",
-  "src/shared/idle-timer.ts",
-  "src/shared/is-adapter-platform.ts",
-  "src/shared/magic-token.ts",
-  "src/shared/markdown-table-renderer.ts",
-  "src/shared/req-context.ts",
-  "src/shared/sqlite.ts",
-  "src/shared/tool-server-context.ts",
-  "src/ssh/ssh-config.ts",
-  "src/ssh/ssh-cwd.ts",
-  "src/ssh/remote-js/remote-runner-utils.ts",
-] as const;
 
 const CORE_PARTITION_8_EXCEPTION_ADAPTERS = [
   ...[
@@ -5997,7 +5804,6 @@ const CANONICAL_LILAC_EVENT_MEMBERS = [
 ] as const;
 
 const EVENT_BUS_CODEC_REGISTRY: EventCodecRegistryRegistration = {
-  status: "enforced",
   identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
   canonicalEvents: { module: "lilac-spec.ts", exportName: "lilacEventTypes" },
   canonicalMembers: CANONICAL_LILAC_EVENT_MEMBERS,
@@ -6005,7 +5811,6 @@ const EVENT_BUS_CODEC_REGISTRY: EventCodecRegistryRegistration = {
 };
 
 const TUI_TOOL_CODEC_REGISTRY: ToolCodecRegistryRegistration = {
-  status: "enforced",
   identity: {
     module: "src/tool-observation-projection.ts",
     exportName: "toolObservationCodecRegistry",
@@ -6024,7 +5829,6 @@ const TUI_TOOL_CODEC_REGISTRY: ToolCodecRegistryRegistration = {
 };
 
 const TUI_RESULT_DECODER: ResultDecoderRegistration = {
-  status: "enforced",
   identity: {
     module: "src/tool-observation-projection.ts",
     exportName: "decodeKnownToolObservation",
@@ -6038,19 +5842,16 @@ const WAVE_2_RESULT_DECODERS = new Map<string, readonly ResultDecoderRegistratio
     "packages/claude-code-bridge",
     [
       {
-        status: "enforced",
         identity: { module: "claude-code-run.ts", exportName: "decodeClaudeContextUsage" },
         category: "plugin",
         inputParameter: 0,
       },
       {
-        status: "enforced",
         identity: { module: "claude-code-run.ts", exportName: "decodeClaudeStopHookInput" },
         category: "plugin",
         inputParameter: 0,
       },
       {
-        status: "enforced",
         identity: { module: "claude-code-run.ts", exportName: "decodeClaudeSessionInfo" },
         category: "plugin",
         inputParameter: 0,
@@ -6060,7 +5861,6 @@ const WAVE_2_RESULT_DECODERS = new Map<string, readonly ResultDecoderRegistratio
   [
     "packages/utils",
     ["parseFriendlyByteSizeResult", "parseFriendlyDurationMsResult"].map((exportName) => ({
-      status: "enforced" as const,
       identity: { module: "friendly-units.ts", exportName },
       category: "request" as const,
       inputParameter: 0,
@@ -6069,7 +5869,6 @@ const WAVE_2_RESULT_DECODERS = new Map<string, readonly ResultDecoderRegistratio
 ]);
 
 const UTILS_CODEX_TOKENS_PERSISTED_CODEC = {
-  status: "enforced",
   identity: { module: "codex-oauth.ts", exportName: "decodeCodexTokens" },
   inputParameter: 0,
   fixtureCatalog: { module: "codex-oauth.ts", exportName: "codexTokensCodecCases" },
@@ -6077,13 +5876,11 @@ const UTILS_CODEX_TOKENS_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const UTILS_CODEX_TOKENS_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: { module: "codex-oauth.ts", exportName: "readCodexTokensResult" },
   codecs: [UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const ACP_RUN_RECORD_PERSISTED_CODEC = {
-  status: "enforced",
   identity: { module: "run-store.ts", exportName: "decodeRunRecord" },
   inputParameter: 0,
   fixtureCatalog: { module: "run-store.ts", exportName: "runRecordCodecCases" },
@@ -6091,7 +5888,6 @@ const ACP_RUN_RECORD_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const ACP_SESSION_INDEX_PERSISTED_CODEC = {
-  status: "enforced",
   identity: { module: "run-store.ts", exportName: "decodeSessionIndex" },
   inputParameter: 0,
   fixtureCatalog: { module: "run-store.ts", exportName: "sessionIndexCodecCases" },
@@ -6100,19 +5896,16 @@ const ACP_SESSION_INDEX_PERSISTED_CODEC = {
 
 const ACP_PERSISTED_CONSUMERS = [
   {
-    status: "enforced",
     identity: { module: "run-store.ts", exportName: "loadRunRecord" },
     codecs: [ACP_RUN_RECORD_PERSISTED_CODEC.identity],
   },
   {
-    status: "enforced",
     identity: { module: "run-store.ts", exportName: "loadSessionIndex" },
     codecs: [ACP_SESSION_INDEX_PERSISTED_CODEC.identity],
   },
 ] as const satisfies readonly PersistedStoreConsumerRegistration[];
 
 const TUI_BINDING_PREFERENCES_PERSISTED_CODEC = {
-  status: "enforced",
   identity: { module: "src/preferences.ts", exportName: "decodeBindingPreferences" },
   inputParameter: 0,
   fixtureCatalog: { module: "src/preferences.ts", exportName: "bindingPreferencesCodecCases" },
@@ -6120,7 +5913,6 @@ const TUI_BINDING_PREFERENCES_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const TUI_BINDING_PREFERENCES_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: { module: "src/preferences.ts", exportName: "loadBindingPreferences" },
   codecs: [TUI_BINDING_PREFERENCES_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
@@ -6243,20 +6035,12 @@ const WAVE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]
 ]);
 
 const TUI_UNKNOWN_FREE_MODULES = [
-  { status: "enforced", module: "src/render.ts" },
-  { status: "enforced", module: "src/transcript-buffer.ts" },
+  { module: "src/render.ts" },
+  { module: "src/transcript-buffer.ts" },
 ] as const satisfies readonly UnknownFreeModuleRegistration[];
-
-const STAGE_5_TUI_MODULES = [
-  "src/render.ts",
-  "src/ui-message-chunk-projection.ts",
-  "src/tool-observation-projection.ts",
-  "src/transcript-buffer.ts",
-] as const;
 
 const CORE_THREAD_PERSISTED_CODECS = [
   {
-    status: "enforced",
     identity: {
       module: "src/conversation/thread-summary-persistence-codec.ts",
       exportName: "decodeConversationThreadSummaryRow",
@@ -6276,7 +6060,6 @@ const CORE_THREAD_PERSISTED_CONSUMERS = [
   "ConversationThreadStore.searchSemantic",
 ].map(
   (exportName): PersistedStoreConsumerRegistration => ({
-    status: "enforced",
     identity: { module: "src/conversation/thread-store.ts", exportName },
     codecs: [CORE_THREAD_PERSISTED_CODECS[0].identity],
   }),
@@ -6290,7 +6073,6 @@ const CORE_TRANSCRIPT_PERSISTED_CODECS = [
   ["decodeCoreLineageManifestRow", "coreLineageManifestRowCodecCases"],
 ].map(
   ([exportName, fixtureExportName]): PersistedCodecRegistration => ({
-    status: "enforced",
     identity: { module: "src/transcript/transcript-persistence-codec.ts", exportName },
     inputParameter: 0,
     fixtureCatalog: {
@@ -6309,7 +6091,6 @@ const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
   ["decodeCoreLineageManifestRow", [4]],
 ].map(
   ([exportName, codecIndexes]): PersistedStoreConsumerRegistration => ({
-    status: "enforced",
     identity: { module: "src/transcript/transcript-store.ts", exportName: String(exportName) },
     codecs: (codecIndexes as number[]).map(
       (index) => CORE_TRANSCRIPT_PERSISTED_CODECS[index]!.identity,
@@ -6318,7 +6099,6 @@ const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
 );
 
 const CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC = {
-  status: "enforced",
   identity: {
     module: "src/workflow/workflow-artifact-persistence-codec.ts",
     exportName: "decodeWorkflowValueArtifact",
@@ -6332,7 +6112,6 @@ const CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const CORE_WORKFLOW_ROW_PERSISTED_CODEC = {
-  status: "enforced",
   identity: {
     module: "src/workflow/workflow-persistence-codec.ts",
     exportName: "decodeWorkflowPersistenceRow",
@@ -6371,7 +6150,6 @@ const CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS = [
   "decodeWorkflowActionOutboxRow",
 ].map(
   (exportName): PersistedStoreConsumerRegistration => ({
-    status: "enforced",
     identity: { module: "src/workflow/durable-workflow-store.ts", exportName },
     codecs: [CORE_WORKFLOW_ROW_PERSISTED_CODEC.identity],
   }),
@@ -6411,7 +6189,6 @@ const CORE_WORKFLOW_STORE_READ_RESULT_APIS = [
 ].map((exportName) => ({ module: "src/workflow/durable-workflow-store.ts", exportName }));
 
 const CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/workflow/workflow-artifact-store.ts",
     exportName: "readWorkflowValueArtifact",
@@ -6420,7 +6197,6 @@ const CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER = {
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const TOOL_RESULT_ARTIFACT_METADATA_CODEC = {
-  status: "enforced",
   identity: {
     module: "src/tool-result-artifact-metadata-codec.ts",
     exportName: "decodeToolResultArtifactMetadata",
@@ -6434,7 +6210,6 @@ const TOOL_RESULT_ARTIFACT_METADATA_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const TOOL_RESULT_ARTIFACT_METADATA_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/tool-result-artifact-store.ts",
     exportName: "createToolResultArtifactStore.readMetadata",
@@ -6443,7 +6218,6 @@ const TOOL_RESULT_ARTIFACT_METADATA_CONSUMER = {
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const CORE_GRACEFUL_RESTART_PERSISTED_CODEC = {
-  status: "enforced",
   identity: {
     module: "src/runtime/graceful-restart-store.ts",
     exportName: "decodeGracefulRestartSnapshot",
@@ -6457,7 +6231,6 @@ const CORE_GRACEFUL_RESTART_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/runtime/graceful-restart-store.ts",
     exportName: "SqliteGracefulRestartStore.loadAndConsumeCompletedSnapshot",
@@ -6466,7 +6239,6 @@ const CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const CORE_GRACEFUL_RESTART_ENCODER_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/runtime/graceful-restart-store.ts",
     exportName: "encodeGracefulRestartSnapshot",
@@ -6509,7 +6281,6 @@ const MINI_WORKSPACE_HISTORY_PERSISTED_CODECS = (
   ] as const
 ).map(
   ([exportName, fixtureExportName, provenance]): PersistedCodecRegistration => ({
-    status: "enforced",
     identity: { module: "src/workspace-history-persistence-codec.ts", exportName },
     inputParameter: 0,
     fixtureCatalog: {
@@ -6531,7 +6302,6 @@ const MINI_WORKSPACE_HISTORY_PERSISTED_CONSUMERS = (
   ] as const
 ).map(
   ([exportName, codecIndex]): PersistedStoreConsumerRegistration => ({
-    status: "enforced",
     identity: { module: "src/workspace-history-store.ts", exportName },
     codecs: [MINI_WORKSPACE_HISTORY_PERSISTED_CODECS[codecIndex]!.identity],
   }),
@@ -6543,7 +6313,6 @@ const MINI_SQLITE_TRANSCRIPT_PERSISTED_CODECS = [
   ["decodeMiniLilacCommandRequest", "miniLilacCommandRequestCodecCases"],
 ].map(
   ([exportName, fixtureExportName]): PersistedCodecRegistration => ({
-    status: "enforced",
     identity: { module: "src/sqlite-persistence-codec.ts", exportName },
     inputParameter: 0,
     fixtureCatalog: { module: "src/sqlite-persistence-codec.ts", exportName: fixtureExportName },
@@ -6552,7 +6321,6 @@ const MINI_SQLITE_TRANSCRIPT_PERSISTED_CODECS = [
 );
 
 const MINI_SQLITE_TODO_PERSISTED_CODEC = {
-  status: "enforced",
   identity: {
     module: "src/sqlite-todo-persistence-codec.ts",
     exportName: "decodeMiniLilacTodos",
@@ -6566,7 +6334,6 @@ const MINI_SQLITE_TODO_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const MINI_SQLITE_TODO_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/sqlite-todo-persistence-codec.ts",
     exportName: "readMiniLilacTodos",
@@ -6575,13 +6342,11 @@ const MINI_SQLITE_TODO_PERSISTED_CONSUMER = {
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const MINI_SQLITE_TODO_STORE_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: { module: "src/sqlite-store.ts", exportName: "decodeMiniLilacTodos" },
   codecs: [MINI_SQLITE_TODO_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CODEC = {
-  status: "enforced",
   identity: {
     module: "src/sqlite-history-persistence-codec.ts",
     exportName: "decodeMiniLilacStructuralHistoryRow",
@@ -6595,7 +6360,6 @@ const MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const MINI_SQLITE_MIGRATION_RUN_RESULT_DECODER = {
-  status: "enforced",
   identity: {
     module: "src/sqlite-history-persistence-codec.ts",
     exportName: "decodeMiniLilacMigrationRunRow",
@@ -6605,7 +6369,6 @@ const MINI_SQLITE_MIGRATION_RUN_RESULT_DECODER = {
 } as const satisfies ResultDecoderRegistration;
 
 const MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/sqlite-store.ts",
     exportName: "MiniLilacSqliteStore.decodeStructuralHistoryRow",
@@ -6615,7 +6378,6 @@ const MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CONSUMER = {
 
 const MINI_SQLITE_STRUCTURAL_HISTORY_ROWS_PERSISTED_CONSUMERS = [
   {
-    status: "enforced",
     identity: {
       module: "src/sqlite-history-persistence-codec.ts",
       exportName: "decodeMiniLilacStructuralHistoryRows",
@@ -6625,7 +6387,6 @@ const MINI_SQLITE_STRUCTURAL_HISTORY_ROWS_PERSISTED_CONSUMERS = [
 ] as const satisfies readonly PersistedStoreConsumerRegistration[];
 
 const MINI_SQLITE_HISTORY_RECOVERY_PERSISTED_CONSUMER = {
-  status: "enforced",
   identity: {
     module: "src/sqlite-store.ts",
     exportName: "readMiniLilacHistoryRecoveryStatusResult",
@@ -6640,7 +6401,6 @@ const MINI_SQLITE_TRANSCRIPT_PERSISTED_CONSUMERS = (
   ] as const
 ).map(
   ([exportName, codecIndexes]): PersistedStoreConsumerRegistration => ({
-    status: "enforced",
     identity: { module: "src/sqlite-store.ts", exportName },
     codecs: codecIndexes.map((index) => MINI_SQLITE_TRANSCRIPT_PERSISTED_CODECS[index]!.identity),
   }),
@@ -6800,12 +6560,10 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   {
     module: "src/conversation/thread-store.ts",
     exportName: "ConversationThreadStore.upsertSummary",
-    status: "enforced" as const,
   },
   {
     module: "src/transcript/transcript-store.ts",
     exportName: "SqliteTranscriptStore.saveRequestTranscript",
-    status: "enforced" as const,
   },
   ...[
     "SqliteTranscriptStore.admitCoreSurfaceProjection",
@@ -6823,27 +6581,22 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   ].map((exportName) => ({
     module: "src/transcript/transcript-store.ts",
     exportName,
-    status: "enforced" as const,
   })),
   {
     module: "src/workflow/durable-workflow-store.ts",
     exportName: "DurableWorkflowStore.createInvocation",
-    status: "enforced" as const,
   },
   {
     module: "src/workflow/durable-workflow-store.ts",
     exportName: "DurableWorkflowStore.applySurfaceAction",
-    status: "enforced" as const,
   },
   {
     module: "src/workflow/durable-workflow-store.ts",
     exportName: "runWorkflowTransaction",
-    status: "enforced" as const,
   },
   {
     module: "src/workflow/workflow-migrations.ts",
     exportName: "applyWorkflowSchemaMigrations",
-    status: "enforced" as const,
   },
   ...[
     "SqliteGracefulRestartStore.clear",
@@ -6852,11 +6605,9 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   ].map((exportName) => ({
     module: "src/runtime/graceful-restart-store.ts",
     exportName,
-    status: "enforced" as const,
   })),
 ].map(
-  ({ status, ...identity }): SqliteTransactionConsumerRegistration => ({
-    status,
+  (identity): SqliteTransactionConsumerRegistration => ({
     identity,
     adapter: UTILS_SQLITE_TRANSACTION_ADAPTER_IDENTITY,
   }),
@@ -6864,7 +6615,6 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
 
 const MINI_SQLITE_TRANSACTION_CONSUMERS = [
   {
-    status: "enforced",
     identity: {
       module: "src/sqlite-store.ts",
       exportName: "MiniLilacSqliteStore.initializeSchemaResult",
@@ -6872,7 +6622,6 @@ const MINI_SQLITE_TRANSACTION_CONSUMERS = [
     adapter: UTILS_SQLITE_TRANSACTION_ADAPTER_IDENTITY,
   },
   {
-    status: "enforced",
     identity: {
       module: "src/sqlite-store.ts",
       exportName: "MiniLilacSqliteStore.runStoreTransactionResult",
@@ -6881,22 +6630,10 @@ const MINI_SQLITE_TRANSACTION_CONSUMERS = [
   },
 ] as const satisfies readonly SqliteTransactionConsumerRegistration[];
 
-function coreEventScope(module: string, symbol: string) {
-  return { workspace: "apps/core", module, symbol } as const;
-}
-
-const EVENT_BUS_FAMILY_MIGRATIONS = [
+const EVENT_BUS_FAMILIES = [
   {
     family: "command-request",
     members: ["cmd.request.message", "cmd.surface.output.reanchor", "cmd.agent.create"],
-    scopes: [
-      coreEventScope(
-        "src/tool-server/request-message-cache.ts",
-        "createRequestMessageCache.startRequestMessageCacheResult",
-      ),
-      coreEventScope("src/surface/bridge/bus-agent-runner.ts", "startBusAgentRunner"),
-      coreEventScope("src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter"),
-    ],
   },
   {
     family: "workflow-control",
@@ -6908,30 +6645,10 @@ const EVENT_BUS_FAMILY_MIGRATIONS = [
       "evt.workflow.usage.changed",
       "evt.workflow.result.ready",
     ],
-    scopes: [
-      coreEventScope("src/workflow/workflow-engine.ts", "WorkflowEngine.startWakeSubscription"),
-      coreEventScope(
-        "src/workflow/workflow-live-parent-bridge.ts",
-        "WorkflowLiveParentBridge.start",
-      ),
-      coreEventScope(
-        "src/workflow/workflow-progress-projector.ts",
-        "WorkflowProgressProjector.startWorkflowProgressSubscriptionResult",
-      ),
-    ],
   },
   {
     family: "lifecycle",
     members: ["evt.request.lifecycle.changed", "evt.request.reply"],
-    scopes: [
-      coreEventScope(
-        "src/heartbeat/heartbeat-service.ts",
-        "startHeartbeatServiceResult.startHeartbeatLifecycleResult",
-      ),
-      coreEventScope("src/surface/bridge/bus-request-router.ts", "startBusRequestRouter"),
-      coreEventScope("src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter"),
-      coreEventScope("src/workflow/workflow-engine.ts", "WorkflowEngine.waitForAgentRequest"),
-    ],
   },
   {
     family: "adapter",
@@ -6943,22 +6660,10 @@ const EVENT_BUS_FAMILY_MIGRATIONS = [
       "evt.adapter.reaction.removed",
       "evt.adapter.action.invoked",
     ],
-    scopes: [
-      coreEventScope("src/surface/bridge/bus-request-router.ts", "startBusRequestRouter"),
-      coreEventScope(
-        "src/workflow/workflow-action-resolver.ts",
-        "startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
-      ),
-      coreEventScope(
-        "src/workflow/workflow-wait-resolver.ts",
-        "WorkflowWaitResolver.startWorkflowWaitSubscriptionResult",
-      ),
-    ],
   },
   {
     family: "surface",
     members: ["evt.surface.output.message.created"],
-    scopes: [coreEventScope("src/surface/bridge/bus-request-router.ts", "startBusRequestRouter")],
   },
   {
     family: "agent-output",
@@ -6971,26 +6676,12 @@ const EVENT_BUS_FAMILY_MIGRATIONS = [
       "evt.agent.output.toolcall",
       "evt.agent.output.activity",
     ],
-    scopes: [
-      coreEventScope("src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter"),
-      coreEventScope("src/workflow/workflow-engine.ts", "WorkflowEngine.waitForAgentRequest"),
-      coreEventScope(
-        "src/workflow/workflow-live-parent-bridge.ts",
-        "WorkflowLiveParentBridge.ensureChildOutputSubscription",
-      ),
-      coreEventScope(
-        "src/workflow/workflow-live-parent-bridge.ts",
-        "WorkflowLiveParentBridge.reconcileTerminalChildActivity",
-      ),
-    ],
   },
 ].map(
-  ({ family, members, scopes }): EventFamilyMigration => ({
+  ({ family, members }): EventFamilyRegistration => ({
     family,
-    status: "migrated",
     codecRegistry: EVENT_BUS_CODEC_REGISTRY.identity,
     members,
-    zeroBaselineScopes: scopes,
   }),
 );
 
@@ -7102,269 +6793,8 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
 ] as const satisfies readonly EventDeliveryConsumerRegistration[];
 
 const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
-  const status = WORKSPACE_STATUSES[root];
-  const zeroBaselineScopes = [
-    ...(STAGE_3_ZERO_BASELINE_MODULES.get(root) ?? []).map((module) => ({ module })),
-    ...(root === "apps/core"
-      ? [...CORE_TOOL_SERVER_PARTITION_MODULES, ...CORE_PARTITION_8_MODULES]
-          .filter(
-            (module) => !(STAGE_3_ZERO_BASELINE_MODULES.get("apps/core") ?? []).includes(module),
-          )
-          .map((module) => ({ module }))
-      : []),
-    ...(WAVE_2_RESULT_DECODERS.get(root) ?? []).map(({ identity }) => ({
-      module: identity.module,
-      symbol: identity.exportName,
-    })),
-    ...(root === "packages/utils"
-      ? [UTILS_CODEX_TOKENS_PERSISTED_CODEC, UTILS_CODEX_TOKENS_PERSISTED_CONSUMER].map(
-          ({ identity }) => ({ module: identity.module, symbol: identity.exportName }),
-        )
-      : []),
-    ...(root === "apps/acp-controller"
-      ? [
-          ACP_RUN_RECORD_PERSISTED_CODEC,
-          ACP_SESSION_INDEX_PERSISTED_CODEC,
-          ...ACP_PERSISTED_CONSUMERS,
-        ].map(({ identity }) => ({ module: identity.module, symbol: identity.exportName }))
-      : root === "apps/mini-lilac-tui"
-        ? [TUI_BINDING_PREFERENCES_PERSISTED_CODEC, TUI_BINDING_PREFERENCES_PERSISTED_CONSUMER].map(
-            ({ identity }) => ({ module: identity.module, symbol: identity.exportName }),
-          )
-        : []),
-    ...(root === "apps/core"
-      ? [
-          {
-            module: "src/surface/bridge/bus-request-router/common.ts",
-            symbol: "getDiscordFlags",
-          },
-          ...CORE_EVENT_DELIVERY_CONSUMERS.map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-          ...CORE_THREAD_PERSISTED_CONSUMERS.map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-          ...CORE_THREAD_PERSISTED_CODECS.map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-          ...CORE_TRANSCRIPT_PERSISTED_CODECS.map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-          ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS.map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-          {
-            module: CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity.module,
-            symbol: CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity.exportName,
-          },
-          {
-            module: CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity.module,
-            symbol: CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity.exportName,
-          },
-          {
-            module: CORE_GRACEFUL_RESTART_ENCODER_CONSUMER.identity.module,
-            symbol: CORE_GRACEFUL_RESTART_ENCODER_CONSUMER.identity.exportName,
-          },
-          {
-            module: "src/runtime/graceful-restart-store.ts",
-            symbol: "decodeOpaqueSuperJsonValue",
-          },
-          {
-            module: CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity.module,
-            symbol: CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity.exportName,
-          },
-          {
-            module: CORE_WORKFLOW_ROW_PERSISTED_CODEC.identity.module,
-            symbol: CORE_WORKFLOW_ROW_PERSISTED_CODEC.identity.exportName,
-          },
-          {
-            module: CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER.identity.module,
-            symbol: CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER.identity.exportName,
-          },
-          ...CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS.map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-          ...CORE_WORKFLOW_STORE_READ_RESULT_APIS.map(({ module, exportName }) => ({
-            module,
-            symbol: exportName,
-          })),
-          {
-            module: "src/workflow/workflow-artifact-store.ts",
-            symbol: "writeWorkflowValueArtifact",
-          },
-          ...CORE_SQLITE_TRANSACTION_CONSUMERS.filter(
-            ({ status, identity }) =>
-              status === "enforced" &&
-              ![
-                ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
-                CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER,
-              ].some(
-                (consumer) =>
-                  consumer.identity.module === identity.module &&
-                  consumer.identity.exportName === identity.exportName,
-              ),
-          ).map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          })),
-        ]
-      : []),
-    ...(root === "apps/mini-lilac-tui" ? STAGE_5_TUI_MODULES.map((module) => ({ module })) : []),
-    ...(root === "packages/tool-results"
-      ? [
-          {
-            module: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
-            symbol: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.exportName,
-          },
-          {
-            module: TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.module,
-            symbol: TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.exportName,
-          },
-          ...[
-            "createToolResultArtifactStore.init",
-            "createToolResultArtifactStore.create",
-            "createToolResultArtifactStore.createFromFile",
-            "createToolResultArtifactStore.createFromStream",
-            "createToolResultArtifactStore.read",
-            "createToolResultArtifactStore.readWindow",
-            "createToolResultArtifactStore.maintain",
-          ].map((symbol) => ({ module: "src/tool-result-artifact-store.ts", symbol })),
-        ]
-      : []),
-    ...(root === "packages/mini-lilac-runtime"
-      ? [
-          ...MINI_WORKSPACE_HISTORY_PERSISTED_CODECS,
-          ...MINI_SQLITE_TRANSCRIPT_PERSISTED_CODECS.filter(({ status }) => status === "enforced"),
-          MINI_SQLITE_TODO_PERSISTED_CODEC,
-          MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CODEC,
-        ]
-          .map(({ identity }) => ({
-            module: identity.module,
-            symbol: identity.exportName,
-          }))
-          .concat({
-            module: MINI_SQLITE_TODO_PERSISTED_CONSUMER.identity.module,
-            symbol: MINI_SQLITE_TODO_PERSISTED_CONSUMER.identity.exportName,
-          })
-          .concat({
-            module: MINI_SQLITE_TODO_STORE_PERSISTED_CONSUMER.identity.module,
-            symbol: MINI_SQLITE_TODO_STORE_PERSISTED_CONSUMER.identity.exportName,
-          })
-          .concat({
-            module: MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CONSUMER.identity.module,
-            symbol: MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CONSUMER.identity.exportName,
-          })
-          .concat({
-            module: "src/sqlite-history-persistence-codec.ts",
-            symbol: "decodeMiniLilacStructuralHistoryRows",
-          })
-          .concat({
-            module: MINI_SQLITE_HISTORY_RECOVERY_PERSISTED_CONSUMER.identity.module,
-            symbol: MINI_SQLITE_HISTORY_RECOVERY_PERSISTED_CONSUMER.identity.exportName,
-          })
-          .concat(
-            MINI_SQLITE_TRANSCRIPT_PERSISTED_CONSUMERS.filter(
-              ({ status }) => status === "enforced",
-            ).map(({ identity }) => ({
-              module: identity.module,
-              symbol: identity.exportName,
-            })),
-          )
-          .concat(
-            MINI_WORKSPACE_HISTORY_PERSISTED_CONSUMERS.map(({ identity }) => ({
-              module: identity.module,
-              symbol: identity.exportName,
-            })),
-          )
-          .concat(
-            MINI_SQLITE_TRANSACTION_CONSUMERS.map(({ identity }) => ({
-              module: identity.module,
-              symbol: identity.exportName,
-            })),
-          )
-          .concat(
-            MINI_SQLITE_STORE_RESULT_APIS.filter(
-              ({ module, exportName }) =>
-                !MINI_SQLITE_TRANSCRIPT_PERSISTED_CONSUMERS.some(
-                  ({ identity }) =>
-                    identity.module === module && identity.exportName === exportName,
-                ) &&
-                !(
-                  MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CONSUMER.identity.module === module &&
-                  MINI_SQLITE_STRUCTURAL_HISTORY_PERSISTED_CONSUMER.identity.exportName ===
-                    exportName
-                ) &&
-                !(
-                  MINI_SQLITE_HISTORY_RECOVERY_PERSISTED_CONSUMER.identity.module === module &&
-                  MINI_SQLITE_HISTORY_RECOVERY_PERSISTED_CONSUMER.identity.exportName === exportName
-                ),
-            ).map(({ module, exportName }) => ({ module, symbol: exportName })),
-          )
-          .concat(
-            MINI_SESSION_SERVICE_RESULT_APIS.map(({ module, exportName }) => ({
-              module,
-              symbol: exportName,
-            })),
-          )
-      : []),
-  ];
-  const stage3Zones = [
-    ...(STAGE_3_ZERO_BASELINE_MODULES.get(root) ?? []),
-    ...(root === "apps/core"
-      ? [...CORE_TOOL_SERVER_PARTITION_MODULES, ...CORE_PARTITION_8_MODULES]
-      : []),
-    ...(root === "packages/tool-results"
-      ? ["src/tool-result-artifact-metadata-codec.ts", "src/tool-result-artifact-store.ts"]
-      : []),
-  ].map((include) => ({ include }));
   const ruleZones: WorkspaceArchitecture["ruleZones"] = {
     ...EMPTY_POLICY.ruleZones,
-    ...Object.fromEntries(
-      STAGE_3_BOUNDARY_RULES.map((rule) => [
-        rule,
-        [...(EMPTY_POLICY.ruleZones[rule] ?? []), ...stage3Zones],
-      ]),
-    ),
-    "architecture/no-unknown-member-read":
-      root === "apps/core"
-        ? [
-            ...CORE_PARTITION_8_MODULES,
-            "src/custom-commands/manager.ts",
-            "src/ssh/remote-js/bundled-runner-failure.ts",
-            "src/ssh/remote-js/remote-runner-entry.ts",
-            "src/ssh/remote-js.ts",
-            "src/ssh/ssh-exec.ts",
-          ].map((include) => ({ include }))
-        : [],
-    "architecture/no-unregistered-custom-decoder":
-      root === "apps/core"
-        ? [
-            ...CORE_PARTITION_8_MODULES,
-            "src/custom-commands/manager.ts",
-            "src/ssh/remote-js/bundled-runner-failure.ts",
-            "src/ssh/remote-js/remote-runner-entry.ts",
-            "src/ssh/remote-js.ts",
-            "src/ssh/ssh-exec.ts",
-          ].map((include) => ({ include }))
-        : [],
-    ...Object.fromEntries(
-      STAGE_3_RESULT_RULES.map((rule) => [
-        rule,
-        [
-          ...(root === "apps/core" ? STAGE_1_CORE_RULE_ZONES : []),
-          ...(root === "apps/mini-lilac-tui"
-            ? [{ include: "src/tool-observation-projection.ts" }]
-            : []),
-          ...stage3Zones,
-        ],
-      ]),
-    ),
     "architecture/open-protocol-normalization": OPEN_PROTOCOL_RULE_ZONES.get(root) ?? [],
     "architecture/complete-event-codec-registry":
       root === "packages/event-bus" ? [{ include: "lilac-codecs.ts" }] : [],
@@ -7480,16 +6910,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/event-bus" ? [{ include: "lilac-bus.ts" }] : [],
     "architecture/event-delivery-policy-exhaustiveness":
       root === "packages/event-bus" ? [{ include: "event-delivery.ts" }] : [],
-    ...(status === "migrated"
-      ? Object.fromEntries(
-          FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES.map((rule) => [rule, [{ include: "**" }]]),
-        )
-      : {}),
   };
   return {
     ...EMPTY_POLICY,
     ruleZones,
-    zeroBaselineScopes,
     eventCodecRegistries: root === "packages/event-bus" ? [EVENT_BUS_CODEC_REGISTRY] : [],
     toolCodecRegistries: root === "apps/mini-lilac-tui" ? [TUI_TOOL_CODEC_REGISTRY] : [],
     resultDecoders:
@@ -7557,7 +6981,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/utils"
         ? [
             {
-              status: "enforced",
               identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
               databaseParameter: 0,
               operationParameter: 1,
@@ -7583,7 +7006,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/event-bus"
         ? [
             {
-              status: "enforced",
               identity: { module: "raw-bus.ts", exportName: "RawBus.subscribe" },
               messageType: {
                 package: "@stanley2058/lilac-event-bus",
@@ -7594,7 +7016,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               contextParameter: 1,
             },
             {
-              status: "enforced",
               identity: {
                 module: "redis-streams-bus.ts",
                 exportName: "RedisStreamsBus.subscribe",
@@ -7613,7 +7034,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/event-bus"
         ? [
             {
-              status: "enforced",
               identity: { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
               handlerParameter: 2,
               handlerMessageParameter: 0,
@@ -7627,7 +7047,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     eventDeliveryConsumers: root === "apps/core" ? CORE_EVENT_DELIVERY_CONSUMERS : [],
-    eventFamilyMigrations: root === "packages/event-bus" ? EVENT_BUS_FAMILY_MIGRATIONS : [],
+    eventFamilies: root === "packages/event-bus" ? EVENT_BUS_FAMILIES : [],
     boundaryDecoders: [
       ...(root === "packages/event-bus"
         ? ([
@@ -8940,7 +8360,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           }))
         : []),
     ],
-    status,
     name: root,
     packageName,
     root,
@@ -9234,16 +8653,68 @@ function requireUniqueValues(values: readonly string[], description: string): Se
   return unique;
 }
 
-function scopeKey(scope: ZeroBaselineScope): string {
-  return `${scope.module}#${scope.symbol ?? "**"}`;
+function requiredExactRuleModules(
+  workspace: WorkspaceArchitecture,
+): ReadonlyMap<ArchitectureRule, ReadonlySet<string>> {
+  const modules = new Map<ArchitectureRule, Set<string>>();
+  const add = (rule: ArchitectureRule, module: string): void => {
+    const registered = modules.get(rule) ?? new Set<string>();
+    registered.add(module);
+    modules.set(rule, registered);
+  };
+  for (const { identity } of workspace.openProtocolAdapters) {
+    add("architecture/open-protocol-normalization", identity.module);
+  }
+  for (const { identity } of workspace.eventCodecRegistries) {
+    add("architecture/complete-event-codec-registry", identity.module);
+  }
+  for (const { identity, aliases } of workspace.toolCodecRegistries) {
+    for (const registered of [identity, ...aliases]) {
+      add("architecture/complete-tool-codec-registry", registered.module);
+    }
+  }
+  for (const { identity } of workspace.resultDecoders) {
+    add("architecture/result-decoder-contract", identity.module);
+  }
+  for (const { module } of workspace.unknownFreeModules) {
+    add("architecture/unknown-free-module", module);
+  }
+  for (const { identity } of workspace.persistedCodecs) {
+    add("architecture/persisted-codec-contract", identity.module);
+    add("architecture/persisted-codec-fixture-catalog", identity.module);
+  }
+  for (const { identity } of workspace.persistedStoreConsumers) {
+    add("architecture/persisted-codec-contract", identity.module);
+  }
+  for (const { identity } of workspace.sqliteTransactionAdapters) {
+    add("architecture/sqlite-transaction-adapter-contract", identity.module);
+    add("architecture/no-result-err-in-sqlite-callback", identity.module);
+  }
+  for (const { identity } of workspace.sqliteTransactionConsumers) {
+    add("architecture/sqlite-transaction-consumer", identity.module);
+    add("architecture/no-result-err-in-sqlite-callback", identity.module);
+  }
+  for (const { identity } of workspace.rawEventMessageBoundaries) {
+    add("architecture/raw-event-message-boundary", identity.module);
+  }
+  for (const { identity, deliveryPolicy } of workspace.eventDeliveryApis) {
+    add("architecture/event-handler-result", identity.module);
+    add("architecture/event-delivery-policy-exhaustiveness", deliveryPolicy.module);
+  }
+  return modules;
 }
 
-export function zeroBaselineScopesByWorkspace(
-  manifest: ArchitectureManifest,
-): ReadonlyMap<string, readonly ZeroBaselineScope[]> {
-  return new Map(
-    manifest.workspaces.map((workspace) => [workspace.name, workspace.zeroBaselineScopes]),
-  );
+function requiredOperationalResultApis(
+  workspace: WorkspaceArchitecture,
+): readonly SymbolIdentity[] {
+  return [
+    ...workspace.resultDecoders.map(({ identity }) => identity),
+    ...workspace.persistedCodecs.map(({ identity }) => identity),
+    ...workspace.persistedStoreConsumers.map(({ identity }) => identity),
+    ...workspace.sqliteTransactionAdapters.map(({ identity }) => identity),
+    ...workspace.sqliteTransactionConsumers.map(({ identity }) => identity),
+    ...workspace.eventDeliveryApis.map(({ identity }) => identity),
+  ];
 }
 
 export function assertArchitectureManifestIntegrity(manifest: ArchitectureManifest): void {
@@ -9341,27 +8812,30 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
     const operationalResultApiKeys = new Set(
       workspace.operationalResultApis.map((identity) => identityKey(identity)),
     );
-    const zeroScopeKeys = new Set<string>();
-    for (const scope of workspace.zeroBaselineScopes) {
-      requireNonempty(scope.module, "zero-baseline scope module");
-      if (scope.module.includes("*")) {
+    for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
+      const zones = workspace.ruleZones[rule] ?? [];
+      if (zones.length !== 1 || zones[0]?.include !== "**") {
         throw new Error(
-          `Architecture manifest zero-baseline scope must name an exact module: ${scope.module}.`,
+          `Workspace ${workspace.name} must enforce permanent package-wide rule ${rule} with the single '**' zone.`,
         );
       }
-      if (scope.symbol !== undefined) {
-        requireNonempty(scope.symbol, "zero-baseline scope symbol");
-        if (scope.symbol.includes("*") || scope.symbol === "<module>") {
-          throw new Error(
-            `Architecture manifest zero-baseline scope must name an exact symbol: ${scope.module}#${scope.symbol}.`,
-          );
-        }
+    }
+    const requiredModules = requiredExactRuleModules(workspace);
+    for (const rule of EXACT_REGISTRATION_ARCHITECTURE_RULES) {
+      const actual = new Set((workspace.ruleZones[rule] ?? []).map(({ include }) => include));
+      const expected = requiredModules.get(rule) ?? new Set<string>();
+      if (actual.size !== expected.size || [...expected].some((module) => !actual.has(module))) {
+        throw new Error(
+          `Workspace ${workspace.name} exact ${rule} zones must equal registered modules; expected ${[...expected].sort().join(", ") || "none"}; received ${[...actual].sort().join(", ") || "none"}. Remove broad or stale zones and register every exact owner.`,
+        );
       }
-      const key = scopeKey(scope);
-      if (zeroScopeKeys.has(key)) {
-        throw new Error(`Duplicate zero-baseline scope in ${workspace.name}: ${key}.`);
+    }
+    for (const identity of requiredOperationalResultApis(workspace)) {
+      if (!operationalResultApiKeys.has(identityKey(identity))) {
+        throw new Error(
+          `Workspace ${workspace.name} registered Result boundary ${identityKey(identity)} must also be listed in operationalResultApis.`,
+        );
       }
-      zeroScopeKeys.add(key);
     }
     const unknownFreeModules = new Map<string, UnknownFreeModuleRegistration>();
     for (const registration of workspace.unknownFreeModules) {
@@ -9501,16 +8975,6 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
       ) {
         throw new Error(`Persisted store consumer ${key} is outside its workspace rule zones.`);
       }
-      if (
-        consumer.status === "enforced" &&
-        !workspace.zeroBaselineScopes.some((scope) =>
-          zeroBaselineScopeOwns(scope, consumer.identity.module, consumer.identity.exportName),
-        )
-      ) {
-        throw new Error(
-          `Enforced persisted store consumer ${key} must be owned by a descendant-aware zero-baseline scope.`,
-        );
-      }
     }
     const transactionAdapterIdentities = new Set<string>();
     for (const adapter of workspace.sqliteTransactionAdapters) {
@@ -9588,16 +9052,6 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
       ) {
         throw new Error(`SQLite transaction consumer ${key} is outside its workspace rule zones.`);
       }
-      if (
-        consumer.status === "enforced" &&
-        !workspace.zeroBaselineScopes.some((scope) =>
-          zeroBaselineScopeOwns(scope, consumer.identity.module, consumer.identity.exportName),
-        )
-      ) {
-        throw new Error(
-          `Enforced SQLite transaction consumer ${key} must be owned by a descendant-aware zero-baseline scope.`,
-        );
-      }
     }
     for (const exception of [...workspace.opaqueUnknown, ...workspace.capabilityPredicates]) {
       requireExactIdentity(exception.identity, "reasoned symbol registration");
@@ -9657,9 +9111,9 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
           );
         }
       }
-      if (registry.status === "enforced" && codecs.size !== canonical.size) {
+      if (codecs.size !== canonical.size) {
         throw new Error(
-          `Enforced event codec registry ${key} must declare codec coverage for every canonical member.`,
+          `Event codec registry ${key} must declare codec coverage for every canonical member.`,
         );
       }
     }
@@ -9769,22 +9223,15 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
           `Architecture manifest event delivery consumer ${key} must declare operations.`,
         );
       }
-      if (
-        !zeroScopeKeys.has(
-          scopeKey({ module: consumer.identity.module, symbol: consumer.identity.exportName }),
-        )
-      ) {
-        throw new Error(
-          `Event delivery consumer ${key} must own an exact workspace zero-baseline symbol scope.`,
-        );
-      }
     }
     const familyNames = new Set<string>();
     const claimedMembers = new Map<string, string>();
-    for (const family of workspace.eventFamilyMigrations) {
+    for (const family of workspace.eventFamilies) {
       requireNonempty(family.family, "event family name");
       if (familyNames.has(family.family)) {
-        throw new Error(`Duplicate event family migration in ${workspace.name}: ${family.family}.`);
+        throw new Error(
+          `Duplicate event family registration in ${workspace.name}: ${family.family}.`,
+        );
       }
       familyNames.add(family.family);
       const registryKey = identityKey(family.codecRegistry);
@@ -9814,46 +9261,8 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
             `Event family ${family.family} in ${workspace.name} contains noncanonical member '${member}'.`,
           );
         }
-        if (family.status === "migrated" && !registry.codecMembers.includes(member)) {
-          throw new Error(
-            `Migrated event family ${family.family} lacks codec coverage for '${member}'.`,
-          );
-        }
-      }
-      if (family.status === "migrated") {
-        if (family.zeroBaselineScopes.length === 0) {
-          throw new Error(
-            `Migrated event family ${family.family} must declare at least one zero-baseline scope.`,
-          );
-        }
-        for (const scope of family.zeroBaselineScopes) {
-          requireNonempty(scope.workspace, "event family zero-baseline workspace");
-          requireNonempty(scope.module, "event family zero-baseline module");
-          requireNonempty(scope.symbol ?? "", "event family zero-baseline symbol");
-          const targetWorkspace = workspacesByName.get(scope.workspace);
-          const owned = targetWorkspace?.zeroBaselineScopes.some(
-            (candidate) => scopeKey(candidate) === scopeKey(scope),
-          );
-          if (!targetWorkspace || !owned) {
-            throw new Error(
-              `Migrated event family ${family.family} zero-baseline scope ${scope.workspace}/${scopeKey(scope)} is not owned by that workspace.`,
-            );
-          }
-          const registeredOwner =
-            targetWorkspace.eventDeliveryConsumers.some(
-              (consumer) =>
-                consumer.identity.module === scope.module &&
-                consumer.identity.exportName === scope.symbol,
-            ) ||
-            targetWorkspace.eventDeliveryApis.some(
-              (api) =>
-                api.identity.module === scope.module && api.identity.exportName === scope.symbol,
-            );
-          if (!registeredOwner) {
-            throw new Error(
-              `Migrated event family ${family.family} zero-baseline scope ${scope.workspace}/${scopeKey(scope)} is not an exact event delivery registration.`,
-            );
-          }
+        if (!registry.codecMembers.includes(member)) {
+          throw new Error(`Event family ${family.family} lacks codec coverage for '${member}'.`);
         }
       }
     }

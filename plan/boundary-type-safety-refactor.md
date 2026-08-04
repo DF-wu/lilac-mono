@@ -1,16 +1,13 @@
 # Boundary-First Type And Failure Safety Refactor
 
-Status: proposed multi-stage implementation plan.
+This document records the staged implementation and the compatibility decisions that remain permanent.
 
-This plan removes repeated runtime parsing from internal code, replaces weak structural guards and
-unsafe assertions with owned boundary codecs, replaces expected exceptions with typed Result values,
-and makes closed-union control flow exhaustive. It also updates repository instructions before or
-alongside enforcement so newly generated code follows the target architecture instead of adding to the
-migration backlog.
+The refactor removed repeated runtime parsing from internal code, replaced weak structural guards and
+unsafe assertions with owned boundary codecs, moved expected exceptions to typed Result values, and
+made closed-union control flow exhaustive. The permanent gate now rejects violations directly.
 
-The rollout uses package-level ratchets. Internal APIs may break freely, but existing wire formats,
-persisted data, and external plugin contracts must remain compatible unless a separate migration is
-explicitly approved.
+Internal APIs may break freely, but existing wire formats, persisted data, and external plugin contracts
+remain compatible unless a separate compatibility change is explicitly approved.
 
 ## Outcome
 
@@ -28,7 +25,7 @@ remains available only for unrecoverable defects and hard invariants. The refact
 value becomes typed, where an external exception becomes a typed error value, and where framework
 exception semantics may exist.
 
-When complete:
+The permanent architecture requires:
 
 - Every external crossing has an owned decoder or normalizer.
 - Internal functions accept the narrowest useful typed input rather than `unknown`.
@@ -197,12 +194,12 @@ introduce a wrapper abstraction preemptively.
   or `malformed` variant before entering internal control flow.
 - Fallible internal functions return `Result<T, E>`, `Promise<Result<T, E>>`, or
   `AsyncIterable<Result<TChunk, TTerminalError>>`; expected failures must not throw or reject.
-- Migrated internal code must not contain `throw`, catch clauses, `Promise.reject`, rejection callbacks,
+- Production code must not contain `throw`, catch clauses, `Promise.reject`, rejection callbacks,
   `.catch`, stream error signaling, or other exception control flow outside a registered adapter.
 - `try/finally` remains allowed for resource cleanup.
 - `TaggedError` instances are returned with `Result.err`; they are never thrown.
 - `Result.try` and `Result.tryPromise` require an explicit `catch` mapper to a specific domain error.
-  The generic `UnhandledException` form is prohibited in migrated production code.
+  The generic `UnhandledException` form is prohibited in production code.
 - `Result.unwrap`, unsafe Result codecs, and equivalent assertion-style extraction are prohibited in
   production flow.
 - Explicit `panic()` is allowed only at an individually registered hard-invariant site.
@@ -210,7 +207,7 @@ introduce a wrapper abstraction preemptively.
   or reject.
 - Inline async callbacks in Result combinators are prohibited. Use a named Result-returning adapter or a
   declarative `Result.gen` workflow so external capture remains visible and reviewable.
-- `Result.allAsync` inputs must be statically `Promise<Result<T, E>>` from migrated non-rejecting APIs;
+- `Result.allAsync` inputs must be statically `Promise<Result<T, E>>` from non-rejecting Result APIs;
   otherwise capture each input first or use an explicit adapter.
 - Internal Results and TaggedErrors must not cross existing wire, persistence, tool, or plugin
   compatibility boundaries without an explicit schema-backed mapping.
@@ -236,174 +233,46 @@ introduce a wrapper abstraction preemptively.
 - Opaque `cause: unknown` metadata on an in-memory tagged error when it is not inspected as domain data
   or serialized without redaction.
 
-### Advisory Checks
+### Review Requirements
 
-The following start as review diagnostics because reliable whole-program proof would be noisy:
+Automated rules do not replace review of schema completeness, compatibility behavior, broad catch
+regions, hidden effects in named Result callbacks, tolerant persistence fallback, cancellation races,
+or fire-and-forget supervision. These are permanent review concerns, not advisory checker findings.
 
-- A predicate that may validate fewer fields than its return type promises.
-- A typed `isX` helper that may be clearer as a direct discriminant check.
-- A cast that may be hiding an API typing problem rather than bridging a real compiler limitation.
-- Tolerant persistence fallback that may be masking corruption.
-- A fallible-looking `Promise<T>` API that may reject for an expected condition.
-- A Result combinator callback containing I/O, parsing, mutation, or another effect hidden behind a
-  named helper. This remains advisory because TypeScript does not encode effects.
-- A broad adapter catch region covering domain orchestration rather than one external call.
-- A helper that maps every unknown exception to one generic error without preserving caller-relevant
-  distinctions.
-- A fire-and-forget promise without an explicit Result observer or defect supervisor.
-- `Result.allAsync` whose static types pass but whose implementations have not yet migrated to the
-  non-rejecting contract.
+## Permanent `AGENTS.md` Guidance
 
-Advisory findings become hard errors only after the analyzer demonstrates low false-positive rates on
-the active tree.
-
-## Planned `AGENTS.md` Changes
-
-Stage 0 replaces the current broad advice to pass `unknown` and prefer user-defined type guards. The
-new guidance must land before semantic migration starts so model-generated changes follow the target
-architecture.
-
-Add a dedicated `Trust boundaries and runtime validation` section with these instructions:
-
-- Keep `unknown` at real trust boundaries. Decode it immediately and return a typed value.
-- Do not accept `unknown` in an internal function merely because its caller originally received
-  external data. Move parsing to the caller's boundary adapter and type the internal parameter.
-- Decode again when data crosses another process, wire, persistence, plugin, or SDK boundary.
-- Use Zod for rich external structures. Validate the complete envelope and every payload field relied
-  on after parsing.
-- Do not call `parse` or `safeParse` in ordinary service, domain, orchestration, or render functions.
-  Use a registered boundary decoder, projection, or persistence codec. Domain constructors accept
-  already typed values.
-- Keep boundary schemas and `z.output` types together. Use `z.input` explicitly when input and output
-  differ.
-- Do not write generic `parseJson<T>` helpers that establish `T` only through an assertion.
-- For persisted data, define explicit behavior for valid current data, supported legacy data,
-  unsupported versions, malformed serialization, and corrupt fields.
-
-Replace the current broad type-guard recommendation with:
-
-- Use `isX` for semantic predicates over typed values or exact capability checks.
-- Do not use a partial `isX(value: unknown): value is RichType` guard. Use a complete schema-backed
-  decoder when downstream code relies on a rich structure.
-- On a project-owned discriminated union, prefer a direct discriminant check, exhaustive switch, or
-  precise `Extract`-based predicate.
-- Never add a local `isRecord`; use the centralized utility only for small boundary inspections.
-
-Add union-control-flow guidance:
-
-- Do not write nested ternaries. Extract the decision or use a switch.
-- Treat project-owned unions as closed. Handle every member with an exhaustive switch or exhaustive
-  typed map.
-- Do not use `default: return`, a generic fallback, or a final ternary arm to hide an unhandled closed
-  union member.
-- Treat third-party/open protocols as open only in their adapter. Normalize unknown variants to an
-  explicit local fallback before internal use.
-
-Strengthen assertion guidance:
-
-- Never cast `unknown` to a structured domain type and never use `as unknown as T`.
-- A cast is not a substitute for boundary validation or a typed function signature.
-- Assertions are allowed only for documented representation-preserving bridges where the source is
-  already typed and TypeScript cannot express the relationship.
-- Prefer fixing producer and consumer signatures over adding a cast or guard.
-
-Add a dedicated `Errors as values` section with these instructions:
-
-- Return expected failures as `Result<T, E>` or `Promise<Result<T, E>>`; do not throw or reject them.
-- Use `better-result` directly. The root catalog pins the exact version and every importing workspace
-  declares `"better-result": "catalog:"`.
-- Define expected error variants in the vocabulary of the owning domain. Prefer `TaggedError` variants
-  with stable `_tag` discriminants over strings or generic `Error`.
-- Instantiate a `TaggedError` and return it with `Result.err`; never throw it.
-- Catch an external exception only in the smallest immediate adapter and map it to a specific typed
-  error. Do not pass `unknown`, `UnhandledException`, SDK errors, or driver errors to consumers.
-- Use `Result.gen` and `Result.await` for multi-step linear workflows. Keep effects in named
-  Result-returning functions and keep generator bodies declarative.
-- Use direct `result.status` branching for one or two steps. Handle or translate the complete error
-  union at the next policy boundary.
-- Do not use `unwrap`, unsafe Result codecs, or generic `Result.try`/`tryPromise` in production flow.
-- Keep Result callbacks total. Capture throwing/rejecting operations before passing values into
-  `map`, `andThen`, `match`, `tap`, collection helpers, or a Result generator.
-- For a stream that can fail after yielding data, use `AsyncIterable<Result<TChunk, TTerminalError>>`.
-  Yield one terminal Err and close; do not reject the iterator for an expected failure.
-- Use Panic only for an individually registered unrecoverable defect or hard invariant. Never convert a
-  Panic to an ordinary Err.
-- Do not wrap total helpers in Result and do not flatten state-machine outcomes such as cancelled,
-  stale, expired, or skipped into generic success/error when those states carry domain meaning.
-- Do not serialize `better-result` objects or TaggedErrors onto existing contracts. Map to the existing
-  wire, storage, tool, or plugin representation at its compatibility adapter.
-- Never pass a TaggedError to implicit `JSON.stringify` or generic structured logging. Its `toJSON()`
-  includes `cause`; format it through a repository redaction helper that emits only an approved tag,
-  message, and explicitly safe fields.
-
-Add framework-edge guidance:
-
-- `try/finally` is allowed for cleanup; catch clauses are restricted to registered adapters and defect
-  supervisors.
-- A result-to-framework adapter may signal an exception only when the host contract requires rollback,
-  delivery parking, stream termination, or callback failure.
-- SQLite transaction bodies must not return Err after partial writes unless a transaction adapter turns
-  that Err into a private rollback sentinel and converts it back immediately outside.
-- Event handlers return typed delivery Results. Handler code does not acknowledge messages directly
-  after migration; the subscription policy maps each error to commit, park-pending, dead-letter, or
-  stop.
-- Cancellation is a typed expected result. External abort rejections are captured using the exact owned
-  `AbortSignal`; do not classify arbitrary errors solely by an `AbortError` name.
-- `Result.tryPromise` stopping an aborted retry delay returns its latest Err; it does not synthesize a
-  cancellation error. Where cancellation must remain distinct, use a cancellation-aware adapter that
-  checks the owned signal before and after each attempt and delay, or do not use built-in retry.
-- Expected cleanup operations return Result explicitly. If the main operation succeeds and cleanup
-  fails, return the cleanup Err. If both fail, return a domain-owned combined failure preserving both.
-  A rollback failure that leaves atomicity unknown is a Panic. Do not put expected throwing cleanup in a
-  Result generator's `finally` block.
-
-The instruction update and each matching lint rule must be reviewed together. If a rule needs a
-recurring exception, `AGENTS.md` must explain the accepted pattern so models can produce compliant
-code without guessing. Repeated model violations are an instruction defect and must trigger a guidance
-update in the same change as the enforcement fix.
+`AGENTS.md` is the operational source for boundary decoding, predicates, union exhaustiveness,
+assertions, Result composition, Panic, persistence, presentation projections, event delivery, and
+framework adapters. Update its accepted pattern in the same change as an enforcement change. Repeated
+model violations indicate an instruction defect; do not add broad exceptions to silence them.
 
 ## Enforcement Architecture
 
-### Oxlint
+### Production Syntax
 
-Use Oxlint only for rules that are reliably syntactic in the current setup:
-
-- Enable built-in `no-nested-ternary` for all active production JavaScript and TypeScript extensions,
-  including JS, JSX, CJS, MJS, TS, and TSX.
-- Add `lilac/no-local-is-record` to reject local declarations named `isRecord`, `isPlainObject`, or an
-  equivalent configured canonical duplicate outside approved utility files.
-- Add `lilac/no-exception-flow` as the single authoritative syntactic rule for production `throw`, catch
-  clauses, `Promise.reject`, rejection callbacks, `.catch`, and stream/framework error signaling.
-  Registered adapter and test exclusions come from the architecture manifest rather than path-name
-  guesses. The rule owns existing-violation ratchets; the semantic checker must not duplicate it.
-- Add a narrow syntactic Result-callback rule that rejects inline async callbacks in Result combinators.
-  Do not attempt to classify every named helper's totality; hidden effects remain an advisory review
-  finding.
-- Keep rule implementation and RuleTester coverage under `scripts/oxlint-plugins/`, following the
-  existing test-wait rule structure.
-
-Do not embed a new TypeScript program in every Oxlint file callback. The current plugin API does not
-provide a shared `TypeChecker`, and reparsing/typechecking per file would be slow and inconsistent.
+Oxlint owns package-wide `no-nested-ternary` and `lilac/no-local-is-record`. The production syntax gate
+owns exception flow, inline async Result callbacks, presentation decoder imports, store-owned inline
+decoding, and direct SQLite transactions. It scans active production files and uses exact manifest
+registrations; tests, generated output, and the generated remote-runner bundle follow the shared source
+policy. There is no syntax baseline or separate syntax exception catalog.
 
 ### Semantic Architecture Check
 
-Add a standalone checker under `scripts/architecture/` using the existing `typescript-codegen` alias
-pinned to the TypeScript 6 compiler API, one `Program` per workspace. TypeScript 6 is the preparation
-line for TypeScript 7 and is an acceptable programmatic compiler for these checks; production typecheck
-continues to use TypeScript 7. Prefer syntax plus import/export graph checks where type queries add no
-value, and reserve the TypeChecker for rules that genuinely need resolved types or symbols.
+The standalone checker under `scripts/architecture/` uses the `typescript-codegen` TypeScript 6 compiler
+API. Each architecture run creates exactly one `Program` per active workspace; it does not cache Programs
+across workspaces or runs. Declaration indexes are cached per `Program` and identity root while that
+Program is analyzed. Production typecheck remains TypeScript 7.
 
 The semantic checker owns only checks requiring symbol or type information:
 
 - `architecture/no-unregistered-decoder`: resolve Zod parse APIs and permit runtime decoding only in a
   registered boundary, projection, or persistence codec. Hard-invariant code receives typed values and
   may Panic on an impossible typed state; it may not decode `unknown`.
-- `architecture/no-domain-unknown`: reject domain-bearing `unknown` parameters in migrated internal
-  zones.
+- `architecture/no-domain-unknown`: reject domain-bearing `unknown` parameters in production code.
 - `architecture/no-unknown-assertion`: reject assertions whose source type is `unknown` and target is a
   structured type.
-- `architecture/no-rich-unknown-predicate`: reject structural predicates from `unknown` in migrated
-  internal zones unless registered as an exact boundary capability check.
+- `architecture/no-rich-unknown-predicate`: reject structural predicates from `unknown` unless registered
+  as an exact boundary capability check.
 - `architecture/closed-union-exhaustiveness`: reject incomplete switches and silent defaults over
   project-owned literal unions.
 - `architecture/closed-union-map-exhaustiveness`: require typed maps over closed unions to use a
@@ -419,7 +288,7 @@ The semantic checker owns only checks requiring symbol or type information:
   APIs in production.
 - `architecture/no-unmapped-result-capture`: reject generic `Result.try` and `Result.tryPromise` forms
   that expose `UnhandledException` rather than a specific mapped error.
-- `architecture/no-unhandled-exception-contract`: reject `UnhandledException` in migrated Result error
+- `architecture/no-unhandled-exception-contract`: reject `UnhandledException` in Result error
   types or exported contracts.
 - `architecture/no-result-wire-leak`: reject Result or TaggedError values passed directly to registered
   HTTP, Redis, worker, subprocess, persistence, tool, or plugin outputs.
@@ -428,60 +297,65 @@ The semantic checker owns only checks requiring symbol or type information:
   approved redacting formatter.
 - `architecture/registered-panic-site`: permit explicit `panic()` only at a fingerprinted callsite with
   an invariant reason.
-- `architecture/fallible-api-result`: require migrated fallible exported and internal APIs to return
-  Result, Promise<Result>, or the fallible stream contract instead of a rejecting contract. Each package
-  migration names only the operational API surfaces being migrated; the checker does not infer
-  fallibility or classify total helper functions.
-- `architecture/no-handler-commit`: reject handler-owned event acknowledgement in migrated subscription
-  APIs.
+- `architecture/fallible-api-result`: require registered operational fallible APIs to return Result,
+  Promise<Result>, or the fallible stream contract instead of a rejecting contract.
+- `architecture/raw-event-message-boundary`, `architecture/complete-event-codec-registry`,
+  `architecture/event-handler-result`, and `architecture/event-delivery-policy-exhaustiveness`: enforce
+  unknown raw receive data, complete codec coverage, typed handler Results, and exhaustive delivery
+  policy ownership.
+- `architecture/complete-tool-codec-registry`, `architecture/result-decoder-contract`, and
+  `architecture/unknown-free-module`: enforce complete tool projection ownership and closed presentation
+  inputs.
+- `architecture/persisted-codec-contract`, `architecture/persisted-codec-fixture-catalog`,
+  `architecture/sqlite-transaction-adapter-contract`, `architecture/sqlite-transaction-consumer`, and
+  `architecture/no-result-err-in-sqlite-callback`: enforce persistence provenance and transaction
+  atomicity.
 
-Use a typed architecture manifest containing:
+### Manifest Contributions
 
-- Boundary module or exported decoder identity.
-- Boundary category.
-- Internal zones where domain-bearing `unknown` is prohibited.
-- Explicit opaque-unknown exceptions with a reason.
-- Exception adapter category, exact symbol, external or host API, and permitted exception direction.
-- Explicit Panic callsite fingerprint and hard-invariant reason.
-- Compatibility boundaries where Result and TaggedError values must be mapped to an existing
-  representation.
-- Package migration zones and the limited operational API surfaces currently required to satisfy a
-  Result signature.
-- Package migration status and baseline location.
+- Use exact `module#exportName` identities for registrations whose schema owns a symbol, including
+  decoders, adapters, codecs, consumers, operational Result APIs, and local compatibility sinks.
+- Use exact module paths for module registries such as `unknownFreeModules` and registration-owned rule
+  zones. Wildcards and broad module exemptions are rejected.
+- Supply reasons only for schemas that define them, including opaque-unknown and capability exceptions,
+  compatibility outputs, structured loggers, open-protocol adapters, Panic sites, and exception
+  adapters. Do not invent reason fields for registrations that do not own one.
+- Link specialized Result-bearing registrations through `operationalResultApis` when manifest integrity
+  requires it. Event family declarations must partition the canonical event catalog exactly once.
+- Add exception adapters to the owning workspace. `APPROVED_EXCEPTION_ADAPTER_CATALOG` is derived from
+  workspace registrations; review its derived metadata and update
+  `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256` plus focused tests. Do not hand-add a duplicate approval.
 
 Registration is not proof that a decoder is correct. It makes boundary ownership visible and
 reviewable. Reviews and focused tests must still verify full shape validation and compatibility
 behavior.
 
-### Ratchets
+### Permanent Gate
 
-- Generate independent baselines per package and rule.
-- Keep boundary-validation and failure-flow baselines separate so progress remains visible.
-- Reject new findings immediately in every package.
-- Report stale baseline entries as warnings during migration so ordinary moves and renames do not block
-  unrelated work; promote stale entries to errors only in Stage 8.
-- Prefer exported-symbol or local-symbol paths plus syntax kind and normalized structural context.
-  Fingerprints must tolerate line movement and unrelated edits within a file.
-- Require a reason for every persistent exception.
-- Mark a package migrated only when its intended hard-rule baseline reaches zero.
-- Once migrated, CI must reject any new baseline entry for that package.
-- Do not baseline a broad adapter module when only one symbol or callsite requires exception mechanics.
+Every semantic or production-syntax finding is an error. The runner accepts only `check`; there is no
+baseline generation, finding suppression, inventory-expansion mode, registration status, or stale-entry
+path. Every active workspace receives the package-wide rule set over `**`, while manifest integrity
+derives exact modules for registration-owned rules and rejects missing, stale, wildcard, or extra zones.
 
 ### Root Commands
 
-Add and wire these scripts:
+The permanent scripts are:
 
-- `lint:architecture`: run the semantic architecture checker against active workspaces.
-- `test:architecture`: run analyzer unit tests and fixture tests.
-- `typecheck:architecture`: typecheck checker, manifest, and fixtures.
-- Include `lint:architecture` in `lint` or `ci` once baselines are committed.
-- Include `test:architecture` in `test:all` and `test:ci`.
-- Extend root formatting and typecheck globs to include `scripts/architecture/**/*.{ts,mts,json}`.
+- `bun run lint:architecture`: run the semantic checker and production syntax gate.
+- `bun run test:architecture`: run analyzer and fixture tests.
+- `bun run test:lint-rules`: run focused Oxlint rule tests.
+- `bun run typecheck:architecture`: typecheck the checker, manifest, and fixtures.
+- Root `lint`, `test:all`, and `typecheck` include the corresponding architecture commands; `ci` also
+  runs the repository format check.
 
-Each policy has one enforcement owner. Pure syntax belongs to Oxlint; resolved type/symbol policy
-belongs to the standalone checker. Do not implement the same rule in both systems. An enforcement owner
-may change only when the replacement removes the old implementation and preserves diagnostics,
-performance, exclusions, and package-level ratchets.
+Each policy has one enforcement owner. Pure syntax belongs to Oxlint or the production syntax gate;
+resolved type/symbol policy belongs to the standalone checker. Do not implement the same rule twice.
+
+## Historical Rollout
+
+The Stage 0 through Stage 7 sections preserve the implementation sequence. Their references to advisory
+checks, baselines, ratchets, inventories, migration statuses, and staged activation are historical and
+do not describe the permanent contribution workflow above.
 
 ## Stage 0: Instructions, Inventory, And Ratchet Infrastructure
 
@@ -901,92 +775,83 @@ must not introduce a duplicate decoder because its lower layer has not migrated 
 - Every migrated fallible stream represents expected terminal failure as a value rather than iterator
   rejection.
 
-## Stage 8: Close Ratchets And Simplify Governance
+## Stage 8: Install The Permanent Gate
 
 ### Goal
 
-Turn migration machinery into a small permanent quality gate.
+Delete the rollout machinery and leave one fail-direct quality gate.
 
 ### Work
 
-1. Delete zeroed boundary-validation and failure-flow package baselines and prohibit recreating them
-   without explicit approval.
-2. Promote stale-baseline diagnostics from warning to error, then remove advisory checks that did not
-   prove useful and promote other reliable checks to errors.
+1. Delete semantic and syntax baseline files, generators, application code, and migration-status
+   registries. Do not retain a path that can suppress a finding.
+2. Replace the syntax ratchet with a production syntax gate and make both semantic and syntax checks fail
+   directly on every finding.
 3. Consolidate instruction text based on actual failure patterns and remove temporary migration notes.
 4. Document the final boundary architecture briefly in `PROJECT.md`.
 5. Verify custom rule and architecture-check diagnostics remain actionable for models and humans.
-6. Measure CI cost and cache or partition TypeScript programs if needed without weakening checks.
+6. Measure architecture-gate cost while retaining exactly one TypeScript `Program` per workspace per run
+   and per-Program declaration indexes. Do not claim cross-run or cross-workspace Program caching.
 7. Run the complete repository validation suite and inspect the final active-tree inventory.
 
 ### Exit Criteria
 
-- No hard-rule baseline remains.
+- No baseline, suppression, advisory, inventory-expansion, or migration-status path remains.
+- The semantic and production syntax gates report every finding as an error.
 - `AGENTS.md`, lint diagnostics, architecture diagnostics, and code examples describe the same accepted
   patterns.
 - The checker has focused tests for every permanent rule and exception mechanism.
 - Full tests, typecheck, lint, format, and required builds pass.
 
-## Migration Gates For Exception-Heavy Subsystems
+## Permanent Subsystem Contracts
 
-Do not use these areas as the initial Result pilot. Their migration starts only after the named
-prerequisites are complete:
-
-- Mini Lilac SQLite and workspace history require the Stage 6 transaction adapter, rollback tests,
-  cleanup policy, and versioned persistence Results.
-- Durable workflow store and engine require the transaction adapter plus Stage 4 event delivery Results,
-  explicit park/dead-letter/stop dispositions, and regression proof that the existing durable action
-  outbox and projection recovery semantics remain unchanged.
-- Agent streaming, AI SDK integration, SSE, WebSocket, timeout races, and interrupt/cancellation flow
-  require the fallible stream contract, proven exact-signal cancellation adapters, and tests for
-  rejected external async iterators and terminal framework mapping.
-- Event-bus handler conversion may use `park-pending` with today's manual recovery semantics. Automatic
-  retry claims remain prohibited until the separate reclamation/idempotency follow-up is implemented.
+- Mini Lilac SQLite and workspace history use the registered transaction adapter, typed cleanup policy,
+  rollback coverage, and versioned persistence Results.
+- The durable workflow store and engine preserve transaction-scoped state/action/outbox consistency,
+  explicit delivery dispositions, and existing projection recovery semantics.
+- Agent streaming, AI SDK integration, SSE, WebSocket, timeout races, and interrupt/cancellation flow use
+  fallible streams, exact-signal cancellation adapters, and explicit terminal framework mapping.
+- Event-bus handlers may return `park-pending` with manual recovery semantics. Automatic retry claims
+  remain prohibited until the separate reclamation/idempotency work is implemented.
 - Public filesystem contracts retain their existing operation-specific `success` results unless a
   separate compatibility decision approves a public API change.
 - External plugin interfaces retain their existing throwing/rejecting callback contract. Only the
-  internal manager side becomes Result-based.
-
-Deferral does not permit new exception debt. The package ratchet still blocks new unregistered throws,
-catches, rejection paths, unsafe extraction, and broad adapter allowances in these subsystems.
+  internal manager side is Result-based.
 
 ## Validation Strategy
 
-Every stage must run:
+- Run focused tests for changed codecs, Results, tagged errors, adapters, protocols, analyzers, and rules.
+- Run `bun run lint:architecture`, `bun run test:architecture`, `bun run test:lint-rules`, and
+  `bun run typecheck:architecture` for architecture changes.
+- Run the changed workspace typecheck and tests.
+- Run root `bun run lint:fix`, `bun run fmt`, `bun run lint`, `bun run test:all`, `bun run typecheck`, and
+  `bun run fmt:check` before completion, plus required builds for affected applications.
 
-- Focused tests for changed codecs, Results, tagged errors, adapters, protocols, analyzers, and rules.
-- Typecheck for every changed workspace.
-- `bun run test:architecture` after Stage 0.
-- `bun run test:lint-rules` after changing Oxlint plugins.
-- Root `bun run lint:fix` and `bun run fmt` before completion.
-- Root `bun run typecheck` and relevant workspace tests before a stage is declared complete.
-- `bun run test:all` at major stage boundaries, especially event-bus, TUI, and persistence completion.
+Compatibility-sensitive changes maintain fixtures representing data emitted before the change. Tests
+prove old wire/storage/plugin inputs still decode, new encoding preserves the existing golden output
+shape or bytes, round trips preserve supported information where applicable, and plugin invocation,
+thrown/rejected hooks, skip behavior, and cleanup remain compatible.
 
-Compatibility-sensitive stages must maintain fixtures representing data emitted by the current code
-before refactoring. Tests must prove old wire/storage/plugin inputs still decode, new encoding preserves
-the existing golden output shape or bytes, round trips preserve supported information where applicable,
-and plugin invocation, thrown/rejected hooks, skip behavior, and cleanup remain compatible.
-
-Failure-sensitive stages must cover every tagged error branch plus Panic behavior. Async adapters must
-test pre-abort, in-flight abort, retry-delay abort, completion races, external rejection, and unrelated
-errors that merely resemble cancellation. Transaction adapters must test rollback after partial writes,
-successful commit, driver failure, private sentinel containment, cleanup failure, and Panic propagation.
+Failure-sensitive changes cover every tagged error branch plus Panic behavior. Async adapters test
+pre-abort, in-flight abort, retry-delay abort, completion races, external rejection, and unrelated errors
+that merely resemble cancellation. Transaction adapters test rollback after partial writes, successful
+commit, driver failure, private sentinel containment, cleanup failure, and Panic propagation.
 
 ## Completion Criteria
 
 The refactor is complete when all of the following hold:
 
-1. The raw-source inventory and semantic checker report no unregistered production
-   `unknown -> structured type` conversion, member read, custom decoder, or manual object assembly;
-   migrated package review confirms no alternate raw-data path bypasses those checks.
+1. The semantic checker reports no unregistered production `unknown -> structured type` conversion,
+   member read, custom decoder, or manual object assembly; review confirms no alternate raw-data path
+   bypasses those checks.
 2. Internal services, workflow logic, and renderers do not accept domain-bearing `unknown`.
 3. No assertion narrows `unknown` to a structured domain type.
-4. Every migrated expected failure returns through `Result<T, E>`, `Promise<Result<T, E>>`, or the
-   fallible stream contract; no expected condition throws or rejects.
+4. Every expected failure returns through `Result<T, E>`, `Promise<Result<T, E>>`, or the fallible stream
+   contract; no expected condition throws or rejects.
 5. Workers, IPC, plugins, custom commands, event-bus handlers, and persisted records validate complete
    runtime contracts.
 6. External throwing/rejecting APIs are captured by immediate registered adapters and mapped to specific
-   domain errors; no migrated Result contract contains `UnhandledException`.
+   domain errors; no Result contract contains `UnhandledException`.
 7. TaggedErrors are returned as values and never thrown; Result `unwrap` and unsafe codecs do not appear
    in production flow.
 8. Explicit Panic sites are individually registered, reported, and propagated rather than converted to
@@ -996,19 +861,19 @@ The refactor is complete when all of the following hold:
     nested ternaries.
 11. Open external protocols have explicit local fallback variants.
 12. Transaction Result adapters preserve rollback and commit atomicity.
-13. Migrated event handlers return delivery Results and cannot acknowledge messages directly.
+13. Event handlers return delivery Results, while subscription policy owns acknowledgement and delivery
+    disposition.
 14. Decode failures default to durable dead-letter disposition, parked entries are not described as
     automatic retries, and existing workflow outbox/projection recovery behavior has no regression.
 15. Expected cleanup failures have typed precedence, while rollback failure that leaves atomicity unknown
     becomes Panic.
-16. Every package has zero boundary-validation and failure-flow hard-rule findings and no ratchet
-    baseline.
+16. The semantic and production syntax gates report zero findings, and no baseline, suppression,
+    advisory, inventory-expansion, or migration-status path exists.
 17. Existing supported wire formats, persisted data, filesystem-tool results, and plugin contracts
     remain compatible; no Result or TaggedError object leaks onto them.
 18. The root Bun catalog pins the approved exact `better-result` version and every importing workspace
     declares `"better-result": "catalog:"`.
-19. `AGENTS.md` teaches every enforced pattern with concise positive and negative guidance, preventing
-    model-generated code from recreating the migration.
+19. `AGENTS.md` teaches every enforced pattern with concise positive and negative guidance.
 
 ## Explicit Non-Goals
 

@@ -9,9 +9,12 @@
 - Keep changes scoped to the agreed plan. Document residual review findings here and defer them unless
   they block the current stage.
 
-## Current Stage
+## Historical Stages
 
-Stages 0 through 7 complete. Stage 8, Close Ratchets And Simplify Governance, is active.
+Stages 0 through 7 record the completed rollout. Baseline, ratchet, advisory, inventory, and migration
+status references in those sections are historical, not current contribution guidance.
+
+Stage 8 is complete. The permanent baseline-free architecture and syntax gates are active.
 
 ## Stage 0
 
@@ -159,41 +162,26 @@ Stages 0 through 7 complete. Stage 8, Close Ratchets And Simplify Governance, is
 
 ## Stage 8
 
-- [ ] Delete obsolete zeroed migration baseline machinery and prohibit unapproved recreation.
-- [ ] Promote stale-baseline diagnostics to errors and remove advisory checks that did not prove useful.
-- [ ] Consolidate permanent Result, boundary, Panic, adapter, and persistence guidance.
-- [ ] Remove temporary Stage 7 migration notes and status machinery that no longer serves the final gate.
-- [ ] Document the final boundary architecture briefly in `PROJECT.md`.
-- [ ] Verify every permanent rule and exception mechanism has focused actionable diagnostics and tests.
-- [ ] Measure final CI cost and retain the checker program/index caching without weakening diagnostics.
-- [ ] Run independent Stage 8 review and resolve all blocking findings.
-- [ ] Run the complete repository validation suite and inspect the final active-tree inventory.
-- [ ] Commit Stage 8 separately with a conventional commit.
+- [x] Delete semantic and syntax baseline files, generators, application code, and migration-status paths.
+- [x] Replace the syntax ratchet with the fail-direct production syntax gate; keep the semantic runner
+      check-only and make every finding an error.
+- [x] Consolidate permanent Result, boundary, Panic, adapter, and persistence guidance.
+- [x] Replace active migration, advisory, baseline, status, and nonexistent-rule wording with the
+      permanent manifest and gate contracts.
+- [x] Document the final boundary architecture briefly in `PROJECT.md`.
+- [x] Verify every permanent rule and exception mechanism has focused actionable diagnostics and tests.
+- [x] Measure final architecture-gate cost while retaining one TypeScript `Program` per workspace per run
+      and per-Program declaration indexes without claiming cross-run or cross-workspace Program caching.
+- [x] Run independent Stage 8 review and resolve all blocking findings.
+- [x] Run the complete repository validation suite and inspect the final active-tree inventory.
+- [x] Commit Stage 8 separately with a conventional commit.
 
-## Later Stages
-
-- [x] Stage 1: `better-result` foundation and pilot migrations.
-- [x] Stage 2: mechanical union, predicate, and failure guardrails.
-- [x] Stage 3: high-risk process and extension boundaries.
-- [x] Stage 4: typed event-bus codec and delivery registry.
-- [x] Stage 5: TUI tool-observation projection.
-- [x] Stage 6: versioned persistence codecs and transaction Results.
-- [x] Stage 7: package-by-package internal API migration.
-- [ ] Stage 8: close ratchets and simplify governance.
-
-## Deferred Findings
-
-- Advanced alias and provenance coverage in the semantic checker remains advisory until later migration evidence justifies hard enforcement.
-- Add the repository TaggedError redaction formatter in Stage 1; until then, callers must avoid implicit serialization and emit only explicitly approved safe fields.
-- Hard-activate nested-ternary and duplicate record-guard enforcement in Stage 2 after the planned cleanup.
-- Add later-stage specialized semantic rules only when their first migrations consume them.
-- Remove the Node `MODULE_TYPELESS_PACKAGE_JSON` warning from the standalone Oxlint RuleTester path
-  without changing root package module semantics.
-
-## Work Log
+## Historical Work Log
 
 - 2026-08-02: Started Stage 0 and created this persistent execution ledger.
-- 2026-08-02: Independent review of the completed Stage 0 preflight and documentation found no blocking issues; compatibility, pre-formatter redaction, and cleanup-precedence guidance were clarified, with non-blocking later-stage findings deferred above.
+- 2026-08-02: Independent review of the completed Stage 0 preflight and documentation found no blocking
+  issues; compatibility, pre-formatter redaction, and cleanup-precedence guidance were clarified, with
+  non-blocking later-stage findings recorded at the time.
 - 2026-08-02: Added active semantic and syntax ratchets for all 18 workspaces, package/rule baselines,
   fail-closed workspace inventory checks, root CI wiring, and focused analyzer/rule fixtures. Independent
   reviews found and drove fixes for no-op semantic zones, collision-prone per-file baselines, common
@@ -280,3 +268,12 @@ Stages 0 through 7 complete. Stage 8, Close Ratchets And Simplify Governance, is
   tool-bridge and ACP builds, lint, formatting, and `git diff --check`. Semantic inventory is empty,
   syntax reports zero findings, all baselines are empty, and independent acceptance found no remaining
   blocker, high, or medium issues.
+- 2026-08-04: Stage 8 removed semantic/syntax baseline files, generators, workspace migration statuses,
+  stale-diagnostic matching, and temporary preflight documentation. Every active workspace now receives
+  the permanent package-wide semantic rules, exact registration zones, digest-bound exception approval,
+  and fail-direct production syntax checks without a suppression path.
+- 2026-08-04: Permanent diagnostics gained focused Panic-supervisor and digest-format coverage plus the
+  full Object/Reflect/coercer call/apply/bind provenance matrix. Independent Stage 8 reviews accepted the
+  final gate and documentation with no blocker, high, or medium findings. Sequential per-workspace
+  subprocesses reduced the semantic runner from as much as 8.1 GB to about 3.8 GB peak RSS at roughly
+  77 seconds; typecheck measured about 2.1 GB and 14 seconds, and the syntax gate about 4 seconds.

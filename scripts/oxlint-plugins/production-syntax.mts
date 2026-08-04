@@ -1020,9 +1020,7 @@ export function findPresentationDecoderImportViolations(
   const enforced = manifest.workspaces
     .find((workspace) => workspace.name === identity.workspace)
     ?.unknownFreeModules.some(
-      (registration) =>
-        registration.status === "enforced" &&
-        registration.module.replace(/\.(?:[cm]?[jt]sx?)$/u, ".ts") === sourceModule,
+      (registration) => registration.module.replace(/\.(?:[cm]?[jt]sx?)$/u, ".ts") === sourceModule,
     );
   if (!enforced) return [];
 
@@ -1498,9 +1496,8 @@ export function findStoreInlineDecodingViolations(
   const sourceFile = sourceFileOf(sourceText, filePath);
   const identity = sourceIdentity(filePath);
   const registrations =
-    manifest.workspaces
-      .find((workspace) => workspace.name === identity.workspace)
-      ?.persistedStoreConsumers.filter((registration) => registration.status === "enforced") ?? [];
+    manifest.workspaces.find((workspace) => workspace.name === identity.workspace)
+      ?.persistedStoreConsumers ?? [];
   if (registrations.length === 0) return [];
   const decoderAliases = collectMemberFunctionAliases(
     sourceFile,
@@ -1520,13 +1517,13 @@ export function findStoreInlineDecodingViolations(
           add(
             node,
             "store-inline-json-decoding",
-            "Call the registered persisted codec instead of an aliased JSON parser inside a migrated store scope",
+            "Call the registered persisted codec instead of an aliased JSON parser inside this registered store scope",
           );
         } else if (aliasedMember && STORE_SCHEMA_DECODER_MEMBERS.has(aliasedMember)) {
           add(
             node,
             "store-inline-schema-decoding",
-            "Call the registered persisted codec instead of an aliased schema decoder inside a migrated store scope",
+            "Call the registered persisted codec instead of an aliased schema decoder inside this registered store scope",
           );
         }
       }
@@ -1537,13 +1534,13 @@ export function findStoreInlineDecodingViolations(
           add(
             node,
             "store-inline-json-decoding",
-            "Call the registered persisted codec instead of JSON.parse inside a migrated store scope",
+            "Call the registered persisted codec instead of JSON.parse inside this registered store scope",
           );
         } else if (STORE_SCHEMA_DECODER_MEMBERS.has(parts[1])) {
           add(
             node,
             "store-inline-schema-decoding",
-            "Call the registered persisted codec instead of invoking a schema decoder inside a migrated store scope",
+            "Call the registered persisted codec instead of invoking a schema decoder inside this registered store scope",
           );
         }
       }
@@ -1609,10 +1606,8 @@ export function findDirectSqliteTransactionViolations(
   const sourceFile = sourceFileOf(sourceText, filePath);
   const identity = sourceIdentity(filePath);
   const registrations =
-    manifest.workspaces
-      .find((workspace) => workspace.name === identity.workspace)
-      ?.sqliteTransactionConsumers.filter((registration) => registration.status === "enforced") ??
-    [];
+    manifest.workspaces.find((workspace) => workspace.name === identity.workspace)
+      ?.sqliteTransactionConsumers ?? [];
   if (registrations.length === 0) return [];
   const transactionAliases = collectMemberFunctionAliases(sourceFile, new Set(["transaction"]));
   const staticStrings = collectStaticStrings(sourceFile);
@@ -1636,7 +1631,7 @@ export function findDirectSqliteTransactionViolations(
         add(
           node,
           "direct-sqlite-transaction",
-          "Call the registered SQLite Result adapter instead of Database.transaction in a migrated consumer",
+          "Call the registered SQLite Result adapter instead of Database.transaction in this registered consumer",
         );
       }
       for (const argument of node.arguments) {
@@ -1695,10 +1690,10 @@ export const noPresentationDecoderImportRule = ruleFromFinder(
   findPresentationDecoderImportViolations,
 );
 export const noStoreInlineDecodingRule = ruleFromFinder(
-  "Disallow inline JSON and schema decoding in exact migrated store scopes",
+  "Disallow inline JSON and schema decoding in exact registered store scopes",
   findStoreInlineDecodingViolations,
 );
 export const noDirectSqliteTransactionRule = ruleFromFinder(
-  "Disallow raw SQLite transactions and manual transaction control in exact migrated consumers",
+  "Disallow raw SQLite transactions and manual transaction control in exact registered consumers",
   findDirectSqliteTransactionViolations,
 );

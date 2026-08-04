@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 import { describe, expect, test } from "bun:test";
 import ts from "typescript-codegen";
@@ -9,9 +9,6 @@ import {
   assertCoreFinalExceptionAdaptersResolve,
   declarationPackageName,
 } from "./analyzer.ts";
-import { applyBaselines, baselineFromFindings, formatBaselineModule } from "./baseline.ts";
-import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
-import { failureFlowBaseline } from "./failure-flow.baseline.ts";
 import { createFingerprint } from "./fingerprint.ts";
 import type {
   ApprovedExceptionAdapter,
@@ -23,8 +20,6 @@ import type {
   SqliteTransactionAdapterRegistration,
   ToolCodecRegistryRegistration,
   WorkspaceArchitecture,
-  WorkspaceArchitectureStatus,
-  ZeroBaselineScope,
 } from "./manifest.ts";
 import {
   ACTIVE_WORKSPACES,
@@ -32,39 +27,44 @@ import {
   assertArchitectureManifestIntegrity,
   EXACT_REGISTRATION_ARCHITECTURE_RULES,
   FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES,
-  WORKSPACE_STATUSES,
-  zeroBaselineScopeOwns,
 } from "./manifest.ts";
-import type {
-  ArchitectureBaseline,
-  ArchitectureDiagnostic,
-  ArchitectureRule,
-  BaselineEntry,
-} from "./model.ts";
+import type { ArchitectureDiagnostic, ArchitectureRule } from "./model.ts";
 import { createWorkspaceProgram } from "./program.ts";
-import { analyzeArchitecture, inventoryManifest } from "./runner.ts";
+import {
+  analyzeArchitecture,
+  analyzeArchitectureInWorkspaceProcesses,
+  analyzeArchitectureWorkspace,
+  ARCHITECTURE_FINDINGS_EXIT_CODE,
+  createArchitectureAnalysisContext,
+} from "./runner.ts";
 import { isProductionFileName } from "./source-policy.ts";
-import { assertStage7EnforcementPreflight } from "./stage7-preflight.ts";
+import {
+  ARCHITECTURE_WORKSPACE_FIXTURE_ENV,
+  ARCHITECTURE_WORKSPACE_FIXTURE_VALUE,
+} from "./workspace-runner-protocol.ts";
 import {
   assertWorkspaceInventoryMatches,
   compareWorkspaceInventory,
 } from "./workspace-inventory.ts";
-import { syntaxBaseline } from "../oxlint-plugins/syntax-baseline.mts";
-import type {
-  SyntaxBaseline,
-  SyntaxBaselineEntry,
-} from "../oxlint-plugins/check-syntax-ratchet.mts";
 
 const REPOSITORY_ROOT = path.resolve(import.meta.dir, "../..");
 const FIXTURE_ROOT = path.join(import.meta.dir, "fixtures/stage0");
 const FIXTURE_TSCONFIG = "scripts/architecture/fixtures/stage0/tsconfig.json";
+const WORKSPACE_RUNNER = path.join(import.meta.dir, "workspace-runner.ts");
+const WORKSPACE_RUNNER_FIXTURE_ROOT = "scripts/architecture/fixtures/workspace-runner";
+const EXPECTED_WORKSPACE_RUNNER_DIAGNOSTICS = [
+  "fixture-findings/fixture.ts:2:10 error architecture/no-unknown-assertion: Structured domain type is asserted directly from unknown. Use a registered complete decoder and pass its typed output to domain code. [arch-v2|workspace=fixture-findings|rule=architecture%2Fno-unknown-assertion|identity=fixture.ts%23firstProjection%5BAsExpression%5D%401|sha256=62b6c3f086079fbd4adc4882b9fc33238b8429a62bf7534fb11c0e39c6a15c26]",
+  "fixture-findings/fixture.ts:6:10 error architecture/no-unknown-assertion: Structured domain type is asserted directly from unknown. Use a registered complete decoder and pass its typed output to domain code. [arch-v2|workspace=fixture-findings|rule=architecture%2Fno-unknown-assertion|identity=fixture.ts%23secondProjection%5BAsExpression%5D%401|sha256=0853d92c35230fba42ba6a904f3fcd68c9db63f050c31ff6b8f9f591d7abc797]",
+] as const;
+const PERMANENT_RULE_ZONES = Object.fromEntries(
+  FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES.map((rule) => [rule, [{ include: "**" }]]),
+);
 
 const BASE_WORKSPACE = {
   name: "fixture",
   packageName: "architecture-fixture",
   root: "scripts/architecture/fixtures/stage0",
   tsconfig: FIXTURE_TSCONFIG,
-  status: "migrating",
   ruleZones: {},
   boundaryDecoders: [],
   opaqueUnknown: [],
@@ -76,7 +76,6 @@ const BASE_WORKSPACE = {
   structuredLoggers: [],
   taggedErrorFormatters: [],
   operationalResultApis: [],
-  zeroBaselineScopes: [],
   eventCodecRegistries: [],
   toolCodecRegistries: [],
   resultDecoders: [],
@@ -88,14 +87,36 @@ const BASE_WORKSPACE = {
   rawEventMessageBoundaries: [],
   eventDeliveryApis: [],
   eventDeliveryConsumers: [],
-  eventFamilyMigrations: [],
-  baselines: {
-    boundaryValidation: "boundary-validation.baseline.ts",
-    failureFlow: "failure-flow.baseline.ts",
-  },
+  eventFamilies: [],
 } as const satisfies WorkspaceArchitecture;
 
 const fixtureProgram = createWorkspaceProgram(REPOSITORY_ROOT, BASE_WORKSPACE).program;
+
+interface WorkspaceRunnerResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+async function runFixtureWorkspaceProcess(workspaceRoot: string): Promise<WorkspaceRunnerResult> {
+  const subprocess = Bun.spawn({
+    cmd: [process.execPath, WORKSPACE_RUNNER, workspaceRoot],
+    cwd: REPOSITORY_ROOT,
+    env: {
+      ...process.env,
+      [ARCHITECTURE_WORKSPACE_FIXTURE_ENV]: ARCHITECTURE_WORKSPACE_FIXTURE_VALUE,
+    },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    subprocess.exited,
+    new Response(subprocess.stdout).text(),
+    new Response(subprocess.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
 
 function fixtureExceptionSyntaxKinds(
   direction: ExceptionAdapter["direction"],
@@ -179,7 +200,6 @@ const FIXTURE_EVENT_MEMBERS = ["fixture.alpha", "fixture.beta", "fixture.gamma"]
 
 function fixtureCodecRegistry(exportName: string) {
   return {
-    status: "enforced" as const,
     identity: { module: "stage4-events.ts", exportName },
     canonicalEvents: {
       module: "stage4-events.ts",
@@ -192,7 +212,6 @@ function fixtureCodecRegistry(exportName: string) {
 
 function fixtureRawBoundary(exportName: string) {
   return {
-    status: "enforced" as const,
     identity: { module: "stage4-events.ts", exportName },
     messageType: { package: "architecture-fixture", exportName: "Message" },
     handlerParameter: 0,
@@ -203,7 +222,6 @@ function fixtureRawBoundary(exportName: string) {
 
 function fixtureDeliveryApi(exportName: string, deliveryPolicy: string) {
   return {
-    status: "enforced" as const,
     identity: { module: "stage4-events.ts", exportName },
     handlerParameter: 0,
     handlerMessageParameter: 0,
@@ -215,7 +233,6 @@ function fixtureDeliveryApi(exportName: string, deliveryPolicy: string) {
 
 function fixtureToolCodecRegistry(exportName: string): ToolCodecRegistryRegistration {
   return {
-    status: "enforced",
     identity: { module: "stage5-tools.ts", exportName },
     aliases: [],
     canonicalTools: { module: "stage5-tools.ts", exportName: "canonicalTuiToolNames" },
@@ -224,7 +241,6 @@ function fixtureToolCodecRegistry(exportName: string): ToolCodecRegistryRegistra
 
 function fixtureResultDecoder(exportName: string): ResultDecoderRegistration {
   return {
-    status: "enforced",
     identity: { module: "stage5-tools.ts", exportName },
     category: "projection",
     inputParameter: 0,
@@ -902,6 +918,7 @@ describe("Stage 2 union rules", () => {
     const workspace = {
       ...BASE_WORKSPACE,
       ruleZones: {
+        ...PERMANENT_RULE_ZONES,
         "architecture/open-protocol-normalization": [{ include: "unions.ts" }],
       },
       openProtocolAdapters: [openProtocolAdapter("normalizeProtocolEvent")],
@@ -941,12 +958,13 @@ describe("Stage 2 union rules", () => {
           {
             ...workspace,
             ruleZones: {
+              ...PERMANENT_RULE_ZONES,
               "architecture/open-protocol-normalization": [{ include: "consumer.ts" }],
             },
           },
         ],
       }),
-    ).toThrow("outside its workspace rule zones");
+    ).toThrow("exact architecture/open-protocol-normalization zones must equal registered modules");
     expect(() =>
       assertArchitectureManifestIntegrity({
         version: 1,
@@ -954,12 +972,13 @@ describe("Stage 2 union rules", () => {
           {
             ...workspace,
             ruleZones: {
+              ...PERMANENT_RULE_ZONES,
               "architecture/open-protocol-normalization": [{ include: "**" }],
             },
           },
         ],
       }),
-    ).toThrow("must name an exact module");
+    ).toThrow("exact architecture/open-protocol-normalization zones must equal registered modules");
   });
 
   test("activates closed unions globally and open protocols only in exact registered zones", () => {
@@ -1295,10 +1314,14 @@ describe("Stage 2 union rules", () => {
     );
   });
 
-  test("keeps every reviewed semantic and syntax baseline empty", () => {
-    expect(boundaryValidationBaseline).toEqual({});
-    expect(failureFlowBaseline).toEqual({});
-    expect(syntaxBaseline).toEqual({});
+  test("does not permit migration baselines or generators in the governance inventory", () => {
+    const architectureFiles = readdirSync(import.meta.dir);
+    const syntaxFiles = readdirSync(path.join(import.meta.dir, "../oxlint-plugins"));
+    expect(architectureFiles).not.toContain("baseline.ts");
+    expect(architectureFiles.some((file) => file.includes(".baseline."))).toBeFalse();
+    expect(architectureFiles).not.toContain("stage7-preflight.ts");
+    expect(syntaxFiles.some((file) => file.includes("syntax-baseline"))).toBeFalse();
+    expect(syntaxFiles.some((file) => file.includes("generate-syntax-baseline"))).toBeFalse();
   });
 
   test("registers exact workspace-history host and Panic behavior without Legacy inference", () => {
@@ -1482,11 +1505,7 @@ describe("Stage 2 union rules", () => {
       (workspace) => workspace.root === "packages/remote-fs-runner",
     );
 
-    expect(core?.status).toBe("migrated");
-    expect(coding?.status).toBe("migrated");
-    expect(plugins?.status).toBe("migrated");
-    expect(remoteRunner?.status).toBe("migrated");
-    expect(utils?.status).toBe("migrated");
+    expect([core, coding, plugins, remoteRunner, utils].every(Boolean)).toBeTrue();
     expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
       "decodeThreadSummarizationWorkerRequest",
     );
@@ -1679,56 +1698,6 @@ describe("Stage 2 union rules", () => {
     });
   });
 
-  test("keeps every manifest-owned Stage 3 zero-baseline scope debt-free", () => {
-    const semanticBaselines: readonly ArchitectureBaseline[] = [
-      boundaryValidationBaseline,
-      failureFlowBaseline,
-    ];
-    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
-    const stage3Debt: Array<{
-      readonly workspace: string;
-      readonly module: string;
-      readonly semanticDebt: readonly BaselineEntry[];
-      readonly syntaxDebt: readonly SyntaxBaselineEntry[];
-    }> = [];
-    for (const workspacePolicy of architectureManifest.workspaces) {
-      const workspace = workspacePolicy.name;
-      const semanticEntries = semanticBaselines.flatMap((baseline) =>
-        Object.values(baseline[workspace] ?? {}).flatMap((entries) => entries ?? []),
-      );
-      const syntaxEntries = Object.values(typedSyntaxBaseline[workspace] ?? {}).flatMap(
-        (entries) => entries ?? [],
-      );
-      for (const scope of workspacePolicy.zeroBaselineScopes) {
-        const typedScope: ZeroBaselineScope = scope;
-        const module = scope.module;
-        const syntaxModule = module.replace(/\.(?:[cm]?[jt]sx?)$/u, "");
-        const moduleDebt = {
-          workspace,
-          module,
-          semanticDebt: semanticEntries.filter(
-            (entry) =>
-              entry.location.file === module &&
-              zeroBaselineScopeOwns(
-                typedScope,
-                entry.location.file,
-                entry.identity.slice(entry.identity.indexOf("#") + 1).split("[")[0] ?? "",
-              ),
-          ),
-          syntaxDebt: syntaxEntries.filter(
-            (entry) =>
-              entry.module === syntaxModule &&
-              zeroBaselineScopeOwns(typedScope, entry.module, entry.symbol),
-          ),
-        };
-        if (moduleDebt.semanticDebt.length || moduleDebt.syntaxDebt.length) {
-          stage3Debt.push(moduleDebt);
-        }
-      }
-    }
-    expect(stage3Debt).toEqual([]);
-  });
-
   test("requires exact reasoned and exception-adapter registrations", () => {
     expect(() =>
       assertArchitectureManifestIntegrity({
@@ -1736,6 +1705,7 @@ describe("Stage 2 union rules", () => {
         workspaces: [
           {
             ...BASE_WORKSPACE,
+            ruleZones: PERMANENT_RULE_ZONES,
             opaqueUnknown: [
               { identity: { module: "domain.ts", exportName: "<module>" }, reason: "broad" },
             ],
@@ -1752,6 +1722,7 @@ describe("Stage 2 union rules", () => {
         workspaces: [
           {
             ...BASE_WORKSPACE,
+            ruleZones: PERMANENT_RULE_ZONES,
             exceptionAdapters: [
               {
                 identity: { module: "adapter.ts", exportName: "capture.catch" },
@@ -1792,13 +1763,11 @@ describe("Stage 4 event architecture rules", () => {
 
     expect(eventBus.eventCodecRegistries).toHaveLength(1);
     expect(eventBus.eventCodecRegistries[0]).toMatchObject({
-      status: "enforced",
       identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
       canonicalEvents: { module: "lilac-spec.ts", exportName: "lilacEventTypes" },
     });
     expect(eventBus.rawEventMessageBoundaries).toContainEqual(
       expect.objectContaining({
-        status: "enforced",
         identity: { module: "raw-bus.ts", exportName: "RawBus.subscribe" },
         handlerParameter: 2,
         messageParameter: 0,
@@ -1806,14 +1775,13 @@ describe("Stage 4 event architecture rules", () => {
     );
     expect(eventBus.eventDeliveryApis).toContainEqual(
       expect.objectContaining({
-        status: "enforced",
         identity: { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
         handlerParameter: 2,
         handlerMessageParameter: 0,
         handlerContextParameter: 1,
       }),
     );
-    expect(eventBus.eventFamilyMigrations.map((family) => family.family)).toEqual([
+    expect(eventBus.eventFamilies.map((family) => family.family)).toEqual([
       "command-request",
       "workflow-control",
       "lifecycle",
@@ -1821,9 +1789,6 @@ describe("Stage 4 event architecture rules", () => {
       "surface",
       "agent-output",
     ]);
-    expect(eventBus.eventFamilyMigrations.every((family) => family.status === "migrated")).toBe(
-      true,
-    );
     expect(eventBus.eventCodecRegistries[0]?.canonicalMembers).toHaveLength(25);
     expect(eventBus.boundaryDecoders).toContainEqual({
       identity: {
@@ -1860,9 +1825,6 @@ describe("Stage 4 event architecture rules", () => {
         }),
       ]),
     );
-    expect(
-      eventBus.eventFamilyMigrations.every((family) => family.zeroBaselineScopes.length > 0),
-    ).toBe(true);
     const core = architectureManifest.workspaces.find(
       (workspace) => workspace.name === "apps/core",
     );
@@ -1875,15 +1837,6 @@ describe("Stage 4 event architecture rules", () => {
       },
       category: "projection",
     });
-    expect(
-      core.eventDeliveryConsumers.every((consumer) =>
-        core.zeroBaselineScopes.some(
-          (scope) =>
-            scope.module === consumer.identity.module &&
-            (scope as ZeroBaselineScope).symbol === consumer.identity.exportName,
-        ),
-      ),
-    ).toBe(true);
     expect(core.eventDeliveryConsumers).toContainEqual(
       expect.objectContaining({
         identity: {
@@ -1945,35 +1898,33 @@ describe("Stage 4 event architecture rules", () => {
     expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
   });
 
-  test("checks family exhaustiveness, overlap, codec coverage, zero scopes, and parameter indexes", () => {
+  test("checks family exhaustiveness, overlap, codec coverage, and parameter indexes", () => {
     const registry = fixtureCodecRegistry("completeFixtureEventCodecs");
     const validWorkspace = {
       ...BASE_WORKSPACE,
-      zeroBaselineScopes: [{ module: "stage4-events.ts", symbol: "FixtureDeliveryApi.good" }],
+      ruleZones: {
+        ...PERMANENT_RULE_ZONES,
+        "architecture/complete-event-codec-registry": [{ include: "stage4-events.ts" }],
+        "architecture/event-handler-result": [{ include: "stage4-events.ts" }],
+        "architecture/event-delivery-policy-exhaustiveness": [{ include: "stage4-events.ts" }],
+      },
       eventCodecRegistries: [registry],
       eventDeliveryApis: [
         fixtureDeliveryApi("FixtureDeliveryApi.good", "exhaustiveDeliveryPolicy"),
       ],
-      eventFamilyMigrations: [
+      operationalResultApis: [
+        { module: "stage4-events.ts", exportName: "FixtureDeliveryApi.good" },
+      ],
+      eventFamilies: [
         {
           family: "alpha",
-          status: "migrated" as const,
           codecRegistry: registry.identity,
           members: ["fixture.alpha"],
-          zeroBaselineScopes: [
-            {
-              workspace: "fixture",
-              module: "stage4-events.ts",
-              symbol: "FixtureDeliveryApi.good",
-            },
-          ],
         },
         {
           family: "remaining",
-          status: "advisory" as const,
           codecRegistry: registry.identity,
           members: ["fixture.beta", "fixture.gamma"],
-          zeroBaselineScopes: [],
         },
       ],
     } satisfies WorkspaceArchitecture;
@@ -1987,14 +1938,12 @@ describe("Stage 4 event architecture rules", () => {
         workspaces: [
           {
             ...validWorkspace,
-            eventFamilyMigrations: [
-              ...validWorkspace.eventFamilyMigrations,
+            eventFamilies: [
+              ...validWorkspace.eventFamilies,
               {
                 family: "overlap",
-                status: "advisory",
                 codecRegistry: registry.identity,
                 members: ["fixture.alpha"],
-                zeroBaselineScopes: [],
               },
             ],
           },
@@ -2008,7 +1957,7 @@ describe("Stage 4 event architecture rules", () => {
         workspaces: [
           {
             ...validWorkspace,
-            eventFamilyMigrations: validWorkspace.eventFamilyMigrations.slice(0, 1),
+            eventFamilies: validWorkspace.eventFamilies.slice(0, 1),
           },
         ],
       }),
@@ -2020,11 +1969,11 @@ describe("Stage 4 event architecture rules", () => {
         workspaces: [
           {
             ...validWorkspace,
-            eventCodecRegistries: [{ ...registry, status: "advisory", codecMembers: [] }],
+            eventCodecRegistries: [{ ...registry, codecMembers: [] }],
           },
         ],
       }),
-    ).toThrow("lacks codec coverage");
+    ).toThrow("must declare codec coverage for every canonical member");
 
     expect(() =>
       assertArchitectureManifestIntegrity({
@@ -2032,6 +1981,10 @@ describe("Stage 4 event architecture rules", () => {
         workspaces: [
           {
             ...validWorkspace,
+            ruleZones: {
+              ...validWorkspace.ruleZones,
+              "architecture/raw-event-message-boundary": [{ include: "stage4-events.ts" }],
+            },
             rawEventMessageBoundaries: [
               { ...fixtureRawBoundary("RawFixtureBus.receiveGood"), handlerParameter: -1 },
             ],
@@ -2149,12 +2102,12 @@ describe("Stage 4 event architecture rules", () => {
       root: "scripts/architecture/fixtures/stage4-event-api",
       tsconfig: "scripts/architecture/fixtures/stage4-event-api/tsconfig.json",
       ruleZones: {
+        ...PERMANENT_RULE_ZONES,
         "architecture/event-handler-result": [{ include: "api.ts" }],
         "architecture/event-delivery-policy-exhaustiveness": [{ include: "api.ts" }],
       },
       eventDeliveryApis: [
         {
-          status: "advisory",
           identity: { module: "api.ts", exportName: "FixtureEventBus.subscribeTopic" },
           handlerParameter: 0,
           handlerMessageParameter: 0,
@@ -2163,6 +2116,7 @@ describe("Stage 4 event architecture rules", () => {
           deliveryErrorParameter: 0,
         },
       ],
+      operationalResultApis: [{ module: "api.ts", exportName: "FixtureEventBus.subscribeTopic" }],
     } as const satisfies WorkspaceArchitecture;
     const consumerWorkspace = {
       ...BASE_WORKSPACE,
@@ -2170,6 +2124,7 @@ describe("Stage 4 event architecture rules", () => {
       packageName: "fixture-event-consumer",
       root: "scripts/architecture/fixtures/stage4-event-consumer",
       tsconfig: "scripts/architecture/fixtures/stage4-event-consumer/tsconfig.json",
+      ruleZones: PERMANENT_RULE_ZONES,
     } as const satisfies WorkspaceArchitecture;
 
     expect(() =>
@@ -2225,7 +2180,6 @@ describe("Stage 5 presentation architecture rules", () => {
 
     expect(tui.toolCodecRegistries).toEqual([
       {
-        status: "enforced",
         identity: {
           module: "src/tool-observation-projection.ts",
           exportName: "toolObservationCodecRegistry",
@@ -2245,7 +2199,6 @@ describe("Stage 5 presentation architecture rules", () => {
     ]);
     expect(tui.resultDecoders).toEqual([
       expect.objectContaining({
-        status: "enforced",
         identity: {
           module: "src/tool-observation-projection.ts",
           exportName: "decodeKnownToolObservation",
@@ -2253,17 +2206,9 @@ describe("Stage 5 presentation architecture rules", () => {
       }),
     ]);
     expect(tui.unknownFreeModules).toEqual([
-      { status: "enforced", module: "src/render.ts" },
-      { status: "enforced", module: "src/transcript-buffer.ts" },
+      { module: "src/render.ts" },
+      { module: "src/transcript-buffer.ts" },
     ]);
-    expect(tui.zeroBaselineScopes).toEqual(
-      expect.arrayContaining([
-        { module: "src/render.ts" },
-        { module: "src/ui-message-chunk-projection.ts" },
-        { module: "src/tool-observation-projection.ts" },
-        { module: "src/transcript-buffer.ts" },
-      ]),
-    );
     expect(tui.operationalResultApis).toContainEqual({
       module: "src/tool-observation-projection.ts",
       exportName: "decodeKnownToolObservation",
@@ -2439,6 +2384,7 @@ describe("Stage 5 presentation architecture rules", () => {
     const valid = {
       ...BASE_WORKSPACE,
       ruleZones: {
+        ...PERMANENT_RULE_ZONES,
         "architecture/complete-tool-codec-registry": [{ include: "stage5-tools.ts" }],
       },
       toolCodecRegistries: [registry],
@@ -2489,6 +2435,10 @@ describe("Stage 5 presentation architecture rules", () => {
         workspaces: [
           {
             ...valid,
+            ruleZones: {
+              ...valid.ruleZones,
+              "architecture/complete-tool-codec-registry": [{ include: "stage5-*.ts" }],
+            },
             toolCodecRegistries: [
               {
                 ...registry,
@@ -2529,8 +2479,12 @@ describe("Stage 5 presentation architecture rules", () => {
     const decoder = fixtureResultDecoder("decodeKnownToolObservation");
     const valid = {
       ...BASE_WORKSPACE,
-      ruleZones: { "architecture/result-decoder-contract": [{ include: "stage5-tools.ts" }] },
+      ruleZones: {
+        ...PERMANENT_RULE_ZONES,
+        "architecture/result-decoder-contract": [{ include: "stage5-tools.ts" }],
+      },
       resultDecoders: [decoder],
+      operationalResultApis: [decoder.identity],
     } satisfies WorkspaceArchitecture;
     expect(() =>
       assertArchitectureManifestIntegrity({ version: 1, workspaces: [valid] }),
@@ -2553,30 +2507,27 @@ describe("Stage 5 presentation architecture rules", () => {
                 identity: { module: "stage5-tools.ts", exportName: "decode*" },
               },
             ],
+            operationalResultApis: [{ module: "stage5-tools.ts", exportName: "decode*" }],
           },
         ],
       }),
     ).toThrow("must name an exact symbol");
   });
 
-  test("only enforced Result decoder registrations own Zod parser calls", () => {
+  test("every Result decoder registration owns its exact Zod parser calls", () => {
     const decoder = {
       ...fixtureResultDecoder("registeredDecode"),
       identity: { module: "boundary.ts", exportName: "registeredDecode" },
     };
-    const enforced = findingsFor("architecture/no-unregistered-decoder", "boundary.ts", {
+    const findings = findingsFor("architecture/no-unregistered-decoder", "boundary.ts", {
       resultDecoders: [decoder],
     });
-    expect(enforced).toHaveLength(1);
-    const advisory = findingsFor("architecture/no-unregistered-decoder", "boundary.ts", {
-      resultDecoders: [{ ...decoder, status: "advisory" }],
-    });
-    expect(advisory).toHaveLength(2);
+    expect(findings).toHaveLength(1);
   });
 
   test("recursively rejects unknown in parameters, returns, aliases, properties, generics, maps, unions, and locals", () => {
     const findings = findingsFor("architecture/unknown-free-module", "stage5-render-bad.ts", {
-      unknownFreeModules: [{ status: "enforced", module: "stage5-render-bad.ts" }],
+      unknownFreeModules: [{ module: "stage5-render-bad.ts" }],
     });
     const messages = findings.map((finding) => finding.message);
     const identities = findings.map((finding) => finding.identity);
@@ -2599,16 +2550,16 @@ describe("Stage 5 presentation architecture rules", () => {
 
     expect(
       findingsFor("architecture/unknown-free-module", "stage5-render-good.ts", {
-        unknownFreeModules: [{ status: "enforced", module: "stage5-render-good.ts" }],
+        unknownFreeModules: [{ module: "stage5-render-good.ts" }],
       }),
     ).toEqual([]);
   });
 
   test("forbids every decoder registration inside an unknown-free render module", () => {
-    const unknownFreeModules = [{ status: "enforced" as const, module: "stage5-render-good.ts" }];
+    const unknownFreeModules = [{ module: "stage5-render-good.ts" }] as const;
     const ruleZones = {
+      ...PERMANENT_RULE_ZONES,
       "architecture/unknown-free-module": [{ include: "stage5-render-good.ts" }],
-      "architecture/result-decoder-contract": [{ include: "stage5-render-good.ts" }],
     };
     expect(() =>
       assertArchitectureManifestIntegrity({
@@ -2634,7 +2585,10 @@ describe("Stage 5 presentation architecture rules", () => {
         workspaces: [
           {
             ...BASE_WORKSPACE,
-            ruleZones,
+            ruleZones: {
+              ...ruleZones,
+              "architecture/result-decoder-contract": [{ include: "stage5-render-good.ts" }],
+            },
             unknownFreeModules,
             resultDecoders: [
               {
@@ -2644,6 +2598,9 @@ describe("Stage 5 presentation architecture rules", () => {
                   exportName: "renderToolProjection",
                 },
               },
+            ],
+            operationalResultApis: [
+              { module: "stage5-render-good.ts", exportName: "renderToolProjection" },
             ],
           },
         ],
@@ -2708,7 +2665,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     ],
   ): PersistedCodecRegistration {
     return {
-      status: "enforced",
       identity: { module: "stage6-persistence.ts", exportName },
       inputParameter: 0,
       fixtureCatalog: { module: "stage6-persistence.ts", exportName: fixtureExportName },
@@ -2717,7 +2673,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
   }
 
   const transactionAdapter: SqliteTransactionAdapterRegistration = {
-    status: "enforced",
     identity: { module: "stage6-transactions.ts", exportName: "runFixtureSqliteTransaction" },
     databaseParameter: 0,
     operationParameter: 1,
@@ -2746,7 +2701,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       persistedCodecs: codecs,
       persistedStoreConsumers: [
         {
-          status: "enforced",
           identity: {
             module: "stage6-persistence.ts",
             exportName: "consumeFixturePersistence",
@@ -2758,11 +2712,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         ...codecs.map(({ identity }) => identity),
         { module: "stage6-persistence.ts", exportName: "consumeFixturePersistence" },
       ],
-      zeroBaselineScopes: [
-        { module: "stage6-persistence.ts", symbol: "consumeFixturePersistence" },
-      ],
     } satisfies WorkspaceArchitecture;
-    assertArchitectureManifestIntegrity({ version: 1, workspaces: [workspace] });
     const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
     expect(analyzeWorkspace(workspace, realRoot, program)).toEqual([]);
   });
@@ -2831,7 +2781,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     );
     expect(workflowCodecs).toEqual([
       expect.objectContaining({
-        status: "enforced",
         identity: {
           module: workflowModule,
           exportName: "decodeWorkflowPersistenceRow",
@@ -2930,17 +2879,18 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     expect(findings[0]?.message).toContain("exact SQLite driver classifier");
   });
 
-  test("manifest integrity requires exact Panic identity, operational linkage, and descendant zero debt", () => {
+  test("manifest integrity requires exact Panic identity and operational linkage", () => {
     const base = {
       ...realWorkspaceBase,
       ruleZones: {
+        ...PERMANENT_RULE_ZONES,
         "architecture/sqlite-transaction-adapter-contract": [{ include: "stage6-transactions.ts" }],
         "architecture/sqlite-transaction-consumer": [{ include: "stage6-transactions.ts" }],
+        "architecture/no-result-err-in-sqlite-callback": [{ include: "stage6-transactions.ts" }],
       },
       sqliteTransactionAdapters: [transactionAdapter],
       sqliteTransactionConsumers: [
         {
-          status: "enforced",
           identity: {
             module: "stage6-transactions.ts",
             exportName: "goodFixtureTransactionConsumer",
@@ -2951,9 +2901,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       operationalResultApis: [
         transactionAdapter.identity,
         { module: "stage6-transactions.ts", exportName: "goodFixtureTransactionConsumer" },
-      ],
-      zeroBaselineScopes: [
-        { module: "stage6-transactions.ts", symbol: "goodFixtureTransactionConsumer" },
       ],
     } satisfies WorkspaceArchitecture;
     expect(() =>
@@ -2980,13 +2927,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         version: 1,
         workspaces: [{ ...base, operationalResultApis: [transactionAdapter.identity] }],
       }),
-    ).toThrow("operational Result API");
-    expect(() =>
-      assertArchitectureManifestIntegrity({
-        version: 1,
-        workspaces: [{ ...base, zeroBaselineScopes: [] }],
-      }),
-    ).toThrow("descendant-aware zero-baseline scope");
+    ).toThrow("must also be listed in operationalResultApis");
   });
 
   test("requires transaction consumers to call the exact registered adapter", () => {
@@ -2998,7 +2939,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       sqliteTransactionAdapters: [transactionAdapter],
       sqliteTransactionConsumers: [
         {
-          status: "enforced",
           identity: {
             module: "stage6-transactions.ts",
             exportName: "goodFixtureTransactionConsumer",
@@ -3006,7 +2946,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
           adapter: transactionAdapter.identity,
         },
         {
-          status: "enforced",
           identity: {
             module: "stage6-transactions.ts",
             exportName: "badFixtureTransactionConsumer",
@@ -3018,10 +2957,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         transactionAdapter.identity,
         { module: "stage6-transactions.ts", exportName: "goodFixtureTransactionConsumer" },
         { module: "stage6-transactions.ts", exportName: "badFixtureTransactionConsumer" },
-      ],
-      zeroBaselineScopes: [
-        { module: "stage6-transactions.ts", symbol: "goodFixtureTransactionConsumer" },
-        { module: "stage6-transactions.ts", symbol: "badFixtureTransactionConsumer" },
       ],
     } satisfies WorkspaceArchitecture;
     const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
@@ -3040,7 +2975,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       sqliteTransactionAdapters: [transactionAdapter],
       sqliteTransactionConsumers: [
         {
-          status: "enforced",
           identity: {
             module: "stage6-transactions.ts",
             exportName: "badFixtureTransactionConsumer",
@@ -3051,9 +2985,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       operationalResultApis: [
         transactionAdapter.identity,
         { module: "stage6-transactions.ts", exportName: "badFixtureTransactionConsumer" },
-      ],
-      zeroBaselineScopes: [
-        { module: "stage6-transactions.ts", symbol: "badFixtureTransactionConsumer" },
       ],
     } satisfies WorkspaceArchitecture;
     const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
@@ -3089,7 +3020,6 @@ describe("Stage 6 persistence and SQLite architecture", () => {
       ),
     ).toEqual([
       expect.objectContaining({
-        status: "enforced",
         identity: {
           module: "src/conversation/thread-summary-persistence-codec.ts",
           exportName: "decodeConversationThreadSummaryRow",
@@ -3106,28 +3036,13 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         0,
       ),
     ).toBe(25);
-    expect(core.persistedCodecs.every(({ status }) => status === "enforced")).toBeTrue();
-    expect(mini.persistedCodecs.every(({ status }) => status === "enforced")).toBeTrue();
-    expect(mini.persistedStoreConsumers.every(({ status }) => status === "enforced")).toBeTrue();
-    expect(core.persistedStoreConsumers.every(({ status }) => status === "enforced")).toBeTrue();
     expect(
       core.sqliteTransactionConsumers.find(
         ({ identity }) => identity.exportName === "ConversationThreadStore.upsertSummary",
-      )?.status,
-    ).toBe("enforced");
-    expect(
-      core.sqliteTransactionConsumers
-        .filter(({ identity }) => identity.module === "src/transcript/transcript-store.ts")
-        .every(({ status }) => status === "enforced"),
-    ).toBeTrue();
-    expect(
-      core.sqliteTransactionConsumers
-        .filter(({ identity }) => identity.module !== "src/transcript/transcript-store.ts")
-        .every(({ status }) => status === "enforced"),
-    ).toBeTrue();
+      ),
+    ).toBeDefined();
     expect(utils.sqliteTransactionAdapters).toContainEqual(
       expect.objectContaining({
-        status: "enforced",
         identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
       }),
     );
@@ -3155,7 +3070,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         "architecture/sqlite-transaction-adapter-contract": [{ include: "persistence.ts" }],
         "architecture/no-result-err-in-sqlite-callback": [{ include: "persistence.ts" }],
       },
-      sqliteTransactionAdapters: [{ ...registration, status: "enforced" }],
+      sqliteTransactionAdapters: [registration],
     } satisfies WorkspaceArchitecture;
     const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
     const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
@@ -3170,545 +3085,84 @@ describe("Stage 6 persistence and SQLite architecture", () => {
   });
 });
 
-describe("Stage 7 enforcement preflight", () => {
-  const emptyBaselines = {
-    semantic: [{}, {}] as const,
-    syntax: {},
-  } satisfies Parameters<typeof assertStage7EnforcementPreflight>[1];
-
-  type AdapterlessWorkspace = Omit<WorkspaceArchitecture, "exceptionAdapters"> & {
-    readonly exceptionAdapters: readonly [];
-  };
-
-  function migratedWorkspace(
-    overrides: Partial<Omit<WorkspaceArchitecture, "exceptionAdapters">> = {},
-  ): AdapterlessWorkspace {
-    return {
-      ...BASE_WORKSPACE,
-      exceptionAdapters: [],
-      status: "migrated",
-      ruleZones: Object.fromEntries(
-        FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES.map((rule) => [rule, [{ include: "**" }]]),
-      ),
-      ...overrides,
-    };
-  }
-
-  test("declares all 18 active workspaces migrated", () => {
-    const roots = ACTIVE_WORKSPACES.map(([root]) => root);
-    expect(Object.keys(WORKSPACE_STATUSES).sort()).toEqual([...roots].sort());
-    expect(roots).toHaveLength(18);
+describe("permanent architecture governance", () => {
+  test("enforces all active workspaces without migration status", () => {
+    expect(architectureManifest.workspaces).toHaveLength(18);
+    expect(architectureManifest.workspaces.map(({ root }) => root).sort()).toEqual(
+      ACTIVE_WORKSPACES.map(([root]) => root).sort(),
+    );
     for (const workspace of architectureManifest.workspaces) {
-      const status: WorkspaceArchitectureStatus = WORKSPACE_STATUSES[workspace.root];
-      expect(status).toBe("migrated");
-      expect(workspace.status).toBe(status);
-    }
-  });
-
-  test("integrates the first five migrated packages with exact live registrations", () => {
-    const migrated = [
-      "packages/bash-safety",
-      "packages/tool-results",
-      "packages/fs",
-      "packages/plugin-runtime",
-      "packages/remote-fs-runner",
-    ];
-    const boundaryBaseline: ArchitectureBaseline = boundaryValidationBaseline;
-    const failureBaseline: ArchitectureBaseline = failureFlowBaseline;
-    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
-    for (const root of migrated) {
-      const workspace = architectureManifest.workspaces.find(
-        (candidate) => candidate.root === root,
-      );
-      expect(workspace?.status).toBe("migrated");
+      expect("status" in workspace).toBeFalse();
       for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
-        expect(workspace?.ruleZones[rule]).toEqual([{ include: "**" }]);
+        expect(workspace.ruleZones[rule]).toEqual([{ include: "**" }]);
       }
-      expect(boundaryBaseline[root]).toBeUndefined();
-      expect(failureBaseline[root]).toBeUndefined();
-      expect(typedSyntaxBaseline[root]).toBeUndefined();
-    }
-
-    const bashSafety = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/bash-safety",
-    );
-    expect(
-      bashSafety?.exceptionAdapters.map((adapter) => [
-        adapter.identity.exportName,
-        adapter.direction,
-      ]),
-    ).toEqual([
-      ["parseBashCommand.catch", "capture-external"],
-      ["parseBashCommand.catch", "signal-host"],
-      ["resolveRmPaths.catch", "capture-external"],
-      ["resolveRmPaths.catch", "signal-host"],
-    ]);
-
-    const fs = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/fs",
-    );
-    expect(fs?.boundaryDecoders).toContainEqual({
-      identity: { module: "src/filesystem-operation.ts", exportName: "decodeFilesystemFailure" },
-      category: "projection",
-    });
-    expect(fs?.boundaryDecoders).toContainEqual({
-      identity: { module: "src/ripgrep.ts", exportName: "decodeRipgrepMatchLine" },
-      category: "wire",
-    });
-
-    const toolResults = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/tool-results",
-    );
-    expect(
-      toolResults?.exceptionAdapters.some(
-        ({ identity }) =>
-          identity.exportName === "createOverflowReferenceNormalizer.normalizeCapturedText",
-      ),
-    ).toBeFalse();
-    expect(toolResults?.operationalResultApis).toContainEqual({
-      module: "src/tool-result-output-normalizer.ts",
-      exportName: "serializeOutput",
-    });
-    expect(
-      toolResults?.exceptionAdapters
-        .filter(({ identity }) => identity.exportName === "serializeOutput")
-        .map((adapter) => adapter.direction),
-    ).toEqual(["capture-external", "signal-host"]);
-  });
-
-  test("integrates wave-two packages with exact specialized registrations", () => {
-    const roots = [
-      "packages/utils",
-      "packages/event-bus",
-      "packages/coding-tools",
-      "packages/mini-lilac-client",
-      "packages/claude-code-bridge",
-    ];
-    const boundaryBaseline: ArchitectureBaseline = boundaryValidationBaseline;
-    const failureBaseline: ArchitectureBaseline = failureFlowBaseline;
-    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
-    for (const root of roots) {
-      const workspace = architectureManifest.workspaces.find(
-        (candidate) => candidate.root === root,
-      );
-      expect(workspace?.status).toBe("migrated");
-      for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
-        expect(workspace?.ruleZones[rule]).toEqual([{ include: "**" }]);
+      for (const rule of EXACT_REGISTRATION_ARCHITECTURE_RULES) {
+        expect(
+          workspace.ruleZones[rule]?.every(({ include }) => !include.includes("*")),
+        ).toBeTrue();
       }
-      expect(boundaryBaseline[root]).toBeUndefined();
-      expect(failureBaseline[root]).toBeUndefined();
-      expect(typedSyntaxBaseline[root]).toBeUndefined();
     }
-
-    const utils = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/utils",
-    );
-    expect(utils?.persistedCodecs).toContainEqual({
-      status: "enforced",
-      identity: { module: "codex-oauth.ts", exportName: "decodeCodexTokens" },
-      inputParameter: 0,
-      fixtureCatalog: { module: "codex-oauth.ts", exportName: "codexTokensCodecCases" },
-      provenance: ["current", "migrated", "missing-defaulted"],
-    });
-    expect(utils?.persistedStoreConsumers).toContainEqual({
-      status: "enforced",
-      identity: { module: "codex-oauth.ts", exportName: "readCodexTokensResult" },
-      codecs: [{ module: "codex-oauth.ts", exportName: "decodeCodexTokens" }],
-    });
-    expect(utils?.ruleZones["architecture/persisted-codec-contract"]).toContainEqual({
-      include: "codex-oauth.ts",
-    });
-    expect(utils?.ruleZones["architecture/no-result-err-in-sqlite-callback"]).toEqual([
-      { include: "persistence.ts" },
-    ]);
-
-    const claude = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/claude-code-bridge",
-    );
-    expect(claude?.openProtocolAdapters).not.toContainEqual(
-      expect.objectContaining({
-        identity: { module: "claude-code-run.ts", exportName: "projectClaudeSdkMessage" },
-      }),
-    );
-    expect(claude?.boundaryDecoders).toContainEqual({
-      identity: { module: "claude-code-run.ts", exportName: "projectClaudeSdkMessage" },
-      category: "plugin",
-    });
-    expect(claude?.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "claude-code-run.ts",
-        exportName: "materializeClaudeCodeRunResult.observeSdkMessage",
-      },
-      category: "plugin",
-    });
-    expect(claude?.ruleZones["architecture/open-protocol-normalization"]).toEqual([]);
-    expect(claude?.operationalResultApis).toContainEqual({
-      module: "claude-code-run.ts",
-      exportName: "MaterializedClaudeCodeRun.createUtilityModelResult",
-    });
-
-    const eventBus = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/event-bus",
-    );
-    expect(eventBus?.operationalResultApis).toContainEqual({
-      module: "lilac-bus.ts",
-      exportName: "LilacBus.subscribeTopic",
-    });
-
-    const codingTools = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/coding-tools",
-    );
-    expect(codingTools?.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "src/instructions.ts",
-        exportName: "decodePreviouslyLoadedInstructionPaths",
-      },
-      category: "projection",
-    });
-
-    const miniClient = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-client",
-    );
-    expect(miniClient?.boundaryDecoders).toContainEqual({
-      identity: { module: "mini-lilac-transport.ts", exportName: "decodeMiniLilacBoundary" },
-      category: "wire",
-    });
+    expect(() => assertArchitectureManifestIntegrity(architectureManifest)).not.toThrow();
   });
 
-  test("requires every final package-wide rule zone before marking a workspace migrated", () => {
-    const valid = migratedWorkspace();
-    expect(() =>
-      assertStage7EnforcementPreflight({ version: 1, workspaces: [valid] }, emptyBaselines),
-    ).not.toThrow();
-
-    const missingRule = FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES[0];
-    expect(() =>
-      assertStage7EnforcementPreflight(
-        {
-          version: 1,
-          workspaces: [
-            {
-              ...valid,
-              ruleZones: { ...valid.ruleZones, [missingRule]: [] },
-            },
-          ],
-        },
-        emptyBaselines,
-      ),
-    ).toThrow(`package-wide rule ${missingRule}`);
-  });
-
-  test("requires exact registration zones and operational Result API registration", () => {
+  test("rejects missing and broad exact-registration zones", () => {
     const decoder = fixtureResultDecoder("decodeKnownToolObservation");
-    const withDecoder = migratedWorkspace({
+    const workspace = {
+      ...BASE_WORKSPACE,
+      ruleZones: PERMANENT_RULE_ZONES,
       resultDecoders: [decoder],
       operationalResultApis: [decoder.identity],
-    });
+    } satisfies WorkspaceArchitecture;
     expect(() =>
-      assertStage7EnforcementPreflight({ version: 1, workspaces: [withDecoder] }, emptyBaselines),
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [workspace] }),
     ).toThrow("exact architecture/result-decoder-contract zones must equal registered modules");
 
-    const withZone = migratedWorkspace({
+    const broad = {
+      ...workspace,
       ruleZones: {
-        ...withDecoder.ruleZones,
+        ...workspace.ruleZones,
+        "architecture/result-decoder-contract": [{ include: "**" }],
+      },
+    } satisfies WorkspaceArchitecture;
+    expect(() => assertArchitectureManifestIntegrity({ version: 1, workspaces: [broad] })).toThrow(
+      "Remove broad or stale zones",
+    );
+
+    const exact = {
+      ...workspace,
+      ruleZones: {
+        ...workspace.ruleZones,
+        "architecture/result-decoder-contract": [{ include: decoder.identity.module }],
+      },
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [exact] }),
+    ).not.toThrow();
+  });
+
+  test("requires registered Result boundaries in the operational catalog", () => {
+    const decoder = fixtureResultDecoder("decodeKnownToolObservation");
+    const workspace = {
+      ...BASE_WORKSPACE,
+      ruleZones: {
+        ...PERMANENT_RULE_ZONES,
         "architecture/result-decoder-contract": [{ include: decoder.identity.module }],
       },
       resultDecoders: [decoder],
-    });
+    } satisfies WorkspaceArchitecture;
     expect(() =>
-      assertStage7EnforcementPreflight({ version: 1, workspaces: [withZone] }, emptyBaselines),
-    ).toThrow("unregistered operational Result API");
-
-    const withExtraZone = migratedWorkspace({
-      ruleZones: {
-        ...withDecoder.ruleZones,
-        "architecture/result-decoder-contract": [
-          { include: decoder.identity.module },
-          { include: "**" },
-        ],
-      },
-      resultDecoders: [decoder],
-      operationalResultApis: [decoder.identity],
-    });
-    expect(() =>
-      assertStage7EnforcementPreflight({ version: 1, workspaces: [withExtraZone] }, emptyBaselines),
-    ).toThrow("exact architecture/result-decoder-contract zones must equal registered modules");
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [workspace] }),
+    ).toThrow("must also be listed in operationalResultApis");
   });
 
-  test("does not infer a Result return contract from event-consumer ownership", () => {
-    const identity = { module: "consumer.ts", exportName: "startLegacyConsumer" };
-    const workspace = migratedWorkspace({
-      eventDeliveryConsumers: [
-        {
-          identity,
-          apiPackage: "@example/event-bus",
-          operations: ["subscribeTopic"],
-        },
-      ],
-    });
-
-    expect(() =>
-      assertStage7EnforcementPreflight({ version: 1, workspaces: [workspace] }, emptyBaselines),
-    ).not.toThrow();
-  });
-
-  test("rejects stale operational Result API identities in migrated workspaces", () => {
-    const workspace = migratedWorkspace({
+  test("rejects stale operational Result identities", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
       operationalResultApis: [{ module: "result.ts", exportName: "missingResultApi" }],
-    });
+    } satisfies WorkspaceArchitecture;
     expect(() => analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram)).toThrow(
       "must resolve to exactly one callable implementation; found 0",
     );
-  });
-
-  test("resolves an exact operational Result contract method signature", () => {
-    const workspace = migratedWorkspace({
-      operationalResultApis: [
-        {
-          module: "stage4-events.ts",
-          exportName: "LegacyFixtureDeliveryApi.subscribeTopicResult",
-        },
-      ],
-    });
-    expect(() => analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram)).not.toThrow();
-  });
-
-  test("requires zero semantic and syntax baselines for a migrated workspace", () => {
-    const workspace = migratedWorkspace();
-    const semanticBaseline: ArchitectureBaseline = {
-      fixture: {
-        "architecture/no-domain-unknown": [
-          {
-            fingerprint: "semantic",
-            identity: "domain.ts#decode[Parameter]@1",
-            location: { file: "domain.ts", line: 1, column: 1 },
-            reason: "Fixture debt",
-          },
-        ],
-      },
-    };
-    expect(() =>
-      assertStage7EnforcementPreflight(
-        { version: 1, workspaces: [workspace] },
-        { semantic: [semanticBaseline], syntax: {} },
-      ),
-    ).toThrow("every semantic and syntax baseline to be empty");
-
-    const syntax: SyntaxBaseline = {
-      fixture: {
-        "lilac/no-exception-flow": [
-          {
-            workspace: "fixture",
-            module: "domain",
-            symbol: "decode",
-            kind: "throw",
-            digest: "a".repeat(64),
-            reason: "Fixture debt",
-          },
-        ],
-      },
-    };
-    expect(() =>
-      assertStage7EnforcementPreflight(
-        { version: 1, workspaces: [workspace] },
-        { semantic: [], syntax },
-      ),
-    ).toThrow("every semantic and syntax baseline to be empty");
-
-    expect(() =>
-      assertStage7EnforcementPreflight(
-        { version: 1, workspaces: [workspace] },
-        {
-          semantic: [{ ghost: semanticBaseline.fixture }],
-          syntax: {},
-        },
-      ),
-    ).toThrow("unknown workspace partition ghost");
-  });
-
-  test("promotes wave-three workspaces with no active baseline partitions", () => {
-    const waveThree = new Set([
-      "apps/acp-controller",
-      "apps/mini-lilac",
-      "apps/mini-lilac-server",
-      "apps/mini-lilac-tui",
-      "apps/tool-bridge",
-      "packages/agent",
-    ]);
-    const workspaces = architectureManifest.workspaces.filter(({ root }) => waveThree.has(root));
-    const semanticBaseline: ArchitectureBaseline = boundaryValidationBaseline;
-    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
-    expect(workspaces).toHaveLength(waveThree.size);
-    expect(workspaces.every(({ status }) => status === "migrated")).toBeTrue();
-    for (const workspace of waveThree) {
-      expect(semanticBaseline[workspace]).toBeUndefined();
-      expect(typedSyntaxBaseline[workspace]).toBeUndefined();
-    }
-    expect(() =>
-      assertStage7EnforcementPreflight(architectureManifest, {
-        semantic: [boundaryValidationBaseline, failureFlowBaseline],
-        syntax: syntaxBaseline,
-      }),
-    ).not.toThrow();
-  });
-
-  test("promotes Mini Lilac Runtime with exact reviewed boundaries and no baseline debt", () => {
-    const runtime = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-runtime",
-    );
-    if (!runtime) throw new Error("Mini Lilac Runtime workspace missing");
-    const semanticBaseline: ArchitectureBaseline = boundaryValidationBaseline;
-    const typedFailureBaseline: ArchitectureBaseline = failureFlowBaseline;
-    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
-
-    expect(runtime.status).toBe("migrated");
-    for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
-      expect(runtime.ruleZones[rule]).toEqual([{ include: "**" }]);
-    }
-    expect(semanticBaseline[runtime.root]).toBeUndefined();
-    expect(typedFailureBaseline[runtime.root]).toBeUndefined();
-    expect(typedSyntaxBaseline[runtime.root]).toBeUndefined();
-    expect(runtime.capabilityPredicates).toContainEqual({
-      identity: {
-        module: "src/sqlite-transcript-projection.ts",
-        exportName: "acceptsMiniLilacPersistedSuperJsonValue",
-      },
-      reason:
-        "Checks only whether a persisted opaque value survives the exact SuperJSON representation round trip.",
-    });
-    expect(runtime.capabilityPredicates).toContainEqual({
-      identity: { module: "src/workspace-history-store.ts", exportName: "isMissingExecutable" },
-      reason:
-        "Checks only the exact Node filesystem ENOENT capability on an opaque process failure.",
-    });
-    expect(runtime.operationalResultApis).toContainEqual({
-      module: "src/config.ts",
-      exportName: "loadRuntimeConfigResult",
-    });
-    expect(runtime.operationalResultApis).toContainEqual({
-      module: "src/workspace-history-store.ts",
-      exportName: "WorkspaceHistoryStore.captureResult",
-    });
-    expect(runtime.operationalResultApis).toContainEqual({
-      module: "src/webfetch.ts",
-      exportName: "executeWebfetchResult",
-    });
-    expect(runtime.operationalResultApis).not.toContainEqual({
-      module: "src/webfetch.ts",
-      exportName: "executeWebfetch",
-    });
-    expect(() =>
-      assertStage7EnforcementPreflight(architectureManifest, {
-        semantic: [boundaryValidationBaseline, failureFlowBaseline],
-        syntax: syntaxBaseline,
-      }),
-    ).not.toThrow();
-  });
-
-  test("does not retain settled broad runtime, TUI, and Agent cleanup identities", () => {
-    const runtime = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/mini-lilac-runtime",
-    );
-    const tui = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/mini-lilac-tui",
-    );
-    const agent = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/agent",
-    );
-    if (!runtime || !tui || !agent) throw new Error("settled review workspaces missing");
-
-    const removedRuntimeAdapters = new Set([
-      "executeWebfetch",
-      "ModelCatalog.cancelResponseReader",
-      "loadProviderAuthResult",
-      "WorkspaceHistoryStore.writeAtomicPrivateFile",
-    ]);
-    expect(
-      runtime.exceptionAdapters.filter((adapter) =>
-        removedRuntimeAdapters.has(adapter.identity.exportName),
-      ),
-    ).toEqual([]);
-    expect(
-      tui.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "resolveTerminalShutdownOutcome",
-      ),
-    ).toBeFalse();
-    expect(agent.boundaryDecoders).toContainEqual({
-      identity: {
-        module: "atomic-tool-execution.ts",
-        exportName: "resolveAtomicToolFailureAfterCleanup",
-      },
-      category: "projection",
-    });
-    expect(
-      agent.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "cleanupFailedAtomicToolCall",
-      ),
-    ).toBeTrue();
-  });
-
-  test("pins reviewed Event Bus and Tool Results cleanup adapter ownership", () => {
-    const eventBus = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/event-bus",
-    );
-    const toolResults = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "packages/tool-results",
-    );
-    if (!eventBus || !toolResults) throw new Error("reviewed cleanup workspaces missing");
-
-    expect(eventBus.exceptionAdapters).toContainEqual(
-      expect.objectContaining({
-        identity: {
-          module: "redis-streams-bus.ts",
-          exportName: "RedisStreamsBus.subscribe.cleanupLease.<callback>",
-        },
-        direction: "capture-external",
-      }),
-    );
-    expect(
-      eventBus.exceptionAdapters.filter((adapter) =>
-        [
-          "RedisStreamsBus.subscribe.cleanupLease",
-          "RedisStreamsBus.subscribe.stop.then.<callback@2>",
-        ].includes(adapter.identity.exportName),
-      ),
-    ).toEqual([]);
-    expect(
-      toolResults.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName === "createToolResultArtifactStore.rethrowAfterCleanup",
-      ),
-    ).toBeFalse();
-  });
-
-  test("inventory expands only package-wide rules and preserves every exact registration zone", () => {
-    const exactRuleZones = Object.fromEntries(
-      [...EXACT_REGISTRATION_ARCHITECTURE_RULES].map((rule) => [
-        rule,
-        [{ include: `exact/${rule.slice("architecture/".length)}.ts` }],
-      ]),
-    );
-    const manifest: ArchitectureManifest = {
-      version: 1,
-      workspaces: [
-        {
-          ...BASE_WORKSPACE,
-          ruleZones: {
-            ...exactRuleZones,
-            "architecture/no-domain-unknown": [{ include: "partial/**" }],
-          },
-        },
-      ],
-    };
-    const inventory = inventoryManifest(manifest).workspaces[0];
-    if (!inventory) throw new Error("inventory workspace missing");
-
-    for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
-      expect(inventory.ruleZones[rule]).toEqual([{ include: "**" }]);
-    }
-    for (const rule of EXACT_REGISTRATION_ARCHITECTURE_RULES) {
-      expect(inventory.ruleZones[rule]).toEqual(manifest.workspaces[0]?.ruleZones[rule]);
-    }
   });
 });
 
@@ -3743,7 +3197,6 @@ describe("real declaration integration", () => {
 
   test("recursively rejects unknown error payloads through real better-result declarations", () => {
     const resultDecoder = (exportName: string): ResultDecoderRegistration => ({
-      status: "enforced",
       identity: { module: "fixture.ts", exportName },
       category: "projection",
       inputParameter: 0,
@@ -4141,7 +3594,7 @@ describe("real declaration integration", () => {
   });
 });
 
-describe("ratchet infrastructure", () => {
+describe("gate infrastructure", () => {
   test("requires the manifest to exactly match discovered Bun workspaces", () => {
     expect(
       compareWorkspaceInventory(
@@ -4233,84 +3686,12 @@ describe("ratchet infrastructure", () => {
     ).not.toBe(createFingerprint({ ...common, symbolPath: "Left.decode", node: left }));
   });
 
-  test("separates package/rule baselines and reports stale entries as warnings", () => {
-    const finding = findingsFor("architecture/no-unknown-assertion", "domain.ts")[0];
-    if (!finding) throw new Error("fixture finding missing");
-    const boundary = baselineFromFindings(
-      [finding],
-      "boundary-validation",
-      "reviewed existing finding",
-    );
-    const matched = applyBaselines([finding], boundary, {});
-    expect(matched.diagnostics).toHaveLength(0);
-    const stale = applyBaselines([], boundary, {});
-    expect(stale.diagnostics).toHaveLength(1);
-    expect(stale.diagnostics[0]?.severity).toBe("warning");
-    expect(formatBaselineModule("boundaryValidationBaseline", boundary)).toContain(
-      '"architecture/no-unknown-assertion"',
-    );
-    const migrated = applyBaselines([finding], boundary, {}, new Set(["fixture"]));
-    expect(migrated.diagnostics.some((diagnostic) => diagnostic.severity === "error")).toBeTrue();
-    expect(
-      migrated.diagnostics.some((diagnostic) => diagnostic.message.includes("Migrated package")),
-    ).toBeTrue();
-    const migratedModule = applyBaselines(
-      [finding],
-      boundary,
-      {},
-      new Set(),
-      new Map([["fixture", [{ module: "domain.ts" }]]]),
-    );
-    expect(
-      migratedModule.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
-    ).toBeTrue();
-    expect(
-      migratedModule.diagnostics.some((diagnostic) =>
-        diagnostic.message.includes("Zero-baseline scope"),
-      ),
-    ).toBeTrue();
-
-    const baselineEntry = boundary.fixture?.[finding.rule]?.[0];
-    if (!baselineEntry) throw new Error("fixture baseline entry missing");
-    const scopedBaseline = {
-      fixture: {
-        [finding.rule]: [
-          { ...baselineEntry, identity: "domain.ts#run.child" },
-          { ...baselineEntry, identity: "domain.ts#runner" },
-        ],
-      },
-    } satisfies ArchitectureBaseline;
-    const scoped = applyBaselines(
-      [],
-      scopedBaseline,
-      {},
-      new Set(),
-      new Map([["fixture", [{ module: "domain.ts", symbol: "run" }]]]),
-    );
-    expect(scoped.diagnostics.map((diagnostic) => diagnostic.severity)).toEqual([
-      "error",
-      "warning",
-    ]);
-
-    const ghostBaseline = {
-      ghost: boundary.fixture,
-    } satisfies ArchitectureBaseline;
-    const ghost = applyBaselines([finding], ghostBaseline, {});
-    expect(ghost.matched).toBe(0);
-    expect(ghost.diagnostics).toContainEqual(finding);
-    expect(
-      ghost.diagnostics.some((diagnostic) =>
-        diagnostic.fingerprint.startsWith("partition-mismatch:"),
-      ),
-    ).toBeTrue();
-  });
-
   test("creates exactly one Program per active workspace", () => {
     const manifest = {
       version: 1,
       workspaces: [
-        { ...BASE_WORKSPACE, name: "fixture-a" },
-        { ...BASE_WORKSPACE, name: "fixture-b" },
+        { ...BASE_WORKSPACE, name: "fixture-a", ruleZones: PERMANENT_RULE_ZONES },
+        { ...BASE_WORKSPACE, name: "fixture-b", ruleZones: PERMANENT_RULE_ZONES },
       ],
     } satisfies ArchitectureManifest;
     let programs = 0;
@@ -4319,5 +3700,169 @@ describe("ratchet infrastructure", () => {
       return { root: FIXTURE_ROOT, program: fixtureProgram };
     });
     expect(programs).toBe(2);
+  });
+
+  test("preserves diagnostics when analysis is partitioned by workspace", () => {
+    const manifest = {
+      version: 1,
+      workspaces: [
+        { ...BASE_WORKSPACE, name: "fixture-a", ruleZones: PERMANENT_RULE_ZONES },
+        { ...BASE_WORKSPACE, name: "fixture-b", ruleZones: PERMANENT_RULE_ZONES },
+      ],
+    } satisfies ArchitectureManifest;
+    const programFactory: typeof createWorkspaceProgram = (_root, _workspace) => ({
+      root: FIXTURE_ROOT,
+      program: fixtureProgram,
+    });
+    const context = createArchitectureAnalysisContext(REPOSITORY_ROOT, manifest);
+    const partitioned = manifest.workspaces.flatMap((workspace) =>
+      analyzeArchitectureWorkspace(REPOSITORY_ROOT, workspace, context, programFactory),
+    );
+    const direct = manifest.workspaces.flatMap((workspace) =>
+      analyzeWorkspace(
+        workspace,
+        FIXTURE_ROOT,
+        fixtureProgram,
+        context.packageRoots,
+        context.activeEventDeliveryApiPackages,
+        context.activePersistenceInfrastructure,
+        context.approvedExceptionAdapters,
+      ),
+    );
+
+    expect([...partitioned]).toEqual([...direct]);
+  });
+
+  test("real workspace subprocess exits cleanly without writing output", async () => {
+    const result = await runFixtureWorkspaceProcess(`${WORKSPACE_RUNNER_FIXTURE_ROOT}/clean`);
+
+    expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+  });
+
+  test("real workspace subprocess writes exact ordered diagnostics and exits 42", async () => {
+    const result = await runFixtureWorkspaceProcess(`${WORKSPACE_RUNNER_FIXTURE_ROOT}/findings`);
+
+    expect(result.exitCode).toBe(ARCHITECTURE_FINDINGS_EXIT_CODE);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(`${EXPECTED_WORKSPACE_RUNNER_DIAGNOSTICS.join("\n")}\n`);
+  });
+
+  test("maps a real workspace subprocess error to fail-closed parent behavior", async () => {
+    const cleanRoot = `${WORKSPACE_RUNNER_FIXTURE_ROOT}/clean`;
+    const missingRoot = `${WORKSPACE_RUNNER_FIXTURE_ROOT}/missing`;
+    const unvisitedRoot = `${WORKSPACE_RUNNER_FIXTURE_ROOT}/findings`;
+    const manifest = {
+      version: 1,
+      workspaces: [
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-clean",
+          root: cleanRoot,
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-missing",
+          root: missingRoot,
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-unvisited",
+          root: unvisitedRoot,
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+      ],
+    } satisfies ArchitectureManifest;
+    const observed: (WorkspaceRunnerResult & { readonly workspaceRoot: string })[] = [];
+
+    await expect(
+      analyzeArchitectureInWorkspaceProcesses(
+        REPOSITORY_ROOT,
+        manifest,
+        async (_root, workspaceRoot) => {
+          const result = await runFixtureWorkspaceProcess(workspaceRoot);
+          observed.push({ workspaceRoot, ...result });
+          return result.exitCode;
+        },
+      ),
+    ).rejects.toThrow(
+      "Architecture analysis subprocess for fixture-missing failed with exit code 1",
+    );
+    expect(observed.map(({ workspaceRoot }) => workspaceRoot)).toEqual([cleanRoot, missingRoot]);
+    expect(observed[0]).toEqual({ workspaceRoot: cleanRoot, exitCode: 0, stdout: "", stderr: "" });
+    expect(observed[1]?.exitCode).toBe(1);
+    expect(observed[1]?.stdout).toBe("");
+    expect(observed[1]?.stderr).toContain(`Unknown architecture workspace '${missingRoot}'.`);
+  });
+
+  test("runs workspace subprocesses sequentially and preserves finding status", async () => {
+    const manifest = {
+      version: 1,
+      workspaces: [
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-a",
+          root: "fixture-a",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-b",
+          root: "fixture-b",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+      ],
+    } satisfies ArchitectureManifest;
+    const visited: string[] = [];
+    const hasFindings = await analyzeArchitectureInWorkspaceProcesses(
+      REPOSITORY_ROOT,
+      manifest,
+      async (_root, workspaceRoot) => {
+        visited.push(workspaceRoot);
+        return workspaceRoot === "fixture-a" ? ARCHITECTURE_FINDINGS_EXIT_CODE : 0;
+      },
+    );
+
+    expect(visited).toEqual(["fixture-a", "fixture-b"]);
+    expect(hasFindings).toBeTrue();
+  });
+
+  test("fails closed when a workspace subprocess cannot complete", async () => {
+    const manifest = {
+      version: 1,
+      workspaces: [
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-a",
+          root: "fixture-a",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-b",
+          root: "fixture-b",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+        {
+          ...BASE_WORKSPACE,
+          name: "fixture-c",
+          root: "fixture-c",
+          ruleZones: PERMANENT_RULE_ZONES,
+        },
+      ],
+    } satisfies ArchitectureManifest;
+    const visited: string[] = [];
+    await expect(
+      analyzeArchitectureInWorkspaceProcesses(
+        REPOSITORY_ROOT,
+        manifest,
+        async (_root, workspaceRoot) => {
+          visited.push(workspaceRoot);
+          return workspaceRoot === "fixture-b" ? 2 : 0;
+        },
+      ),
+    ).rejects.toThrow("Architecture analysis subprocess for fixture-b failed with exit code 2");
+    expect(visited).toEqual(["fixture-a", "fixture-b"]);
   });
 });

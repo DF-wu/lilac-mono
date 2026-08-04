@@ -73,6 +73,12 @@ Before wrapping up any task that changes code/config/docs, run lint + format che
 - `bun run lint:fix`
 - `bun run fmt`
 
+### Architecture enforcement
+
+- `scripts/architecture/manifest.ts` is the catalog of registered boundary decoders, projections, persistence codecs, compatibility outputs, Panic sites, and exception adapters. Use exact `module#exportName` identities for symbol-owned registrations and exact module paths for module registries. Add a reason only when that registration schema requires one; broad module or path exemptions are not accepted.
+- Add or change exception mechanics in the owning workspace's `exceptionAdapters`. The global approval catalog is derived from those registrations; review the derived callable, external API, direction, syntax, provenance, relationship, and reason, then update `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256` and focused tests. Do not hand-maintain a second approval entry, and do not treat catalog membership as review of the adapter or external contract.
+- `bun run lint:architecture` runs the semantic checker and production syntax gate. `bun run test:architecture`, `bun run test:lint-rules`, and `bun run typecheck:architecture` cover their fixtures and typechecking. Root `lint`, `test:all`, and `typecheck` include these checks. The permanent gate has no baseline, advisory, inventory-expansion, or migration-status path; fix every finding or add the exact reviewed registration the manifest schema calls for.
+
 ## Code Style Guidelines (TypeScript)
 
 ### Types (important)
@@ -255,7 +261,7 @@ logger.warn("Configuration load failed", {
 - `try/finally` is allowed for cleanup; catch clauses are restricted to registered adapters and defect supervisors.
 - A result-to-framework adapter may signal an exception only when the host contract requires rollback, delivery parking, stream termination, or callback failure.
 - SQLite transaction bodies must not return Err after partial writes unless a transaction adapter turns that Err into a private rollback sentinel and converts it back immediately outside.
-- Event handlers return typed delivery Results. After migration, subscription policy maps each error to commit, park-pending, dead-letter, or stop; handlers do not acknowledge messages directly.
+- Event handlers return typed delivery Results. Subscription policy maps each error to commit, park-pending, dead-letter, or stop; handlers do not acknowledge messages directly.
 - Cancellation is a typed expected result. Capture external abort rejections using the exact owned `AbortSignal`; do not classify arbitrary errors solely by an `AbortError` name.
 - If `Result.tryPromise` stops an aborted retry delay, return its latest Err rather than synthesizing cancellation. When cancellation must remain distinct, use a cancellation-aware adapter that checks the owned signal around every attempt and delay, or do not use built-in retry.
 - Expected cleanup returns Result explicitly: cleanup Err wins after a successful main operation; if both fail, return a domain-owned combined failure preserving both. A rollback failure that leaves atomicity unknown is a Panic. Do not put expected throwing cleanup in a Result generator's `finally` block.

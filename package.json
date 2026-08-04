@@ -17,7 +17,7 @@
     "docker:verify-image": "bash docker/verify-image.sh",
     "lint": "oxlint --tsconfig tsconfig.json apps packages scripts/generate-provider-option-shapes.ts scripts/architecture scripts/oxlint-plugins examples __tests__ && bun run lint:architecture",
     "lint:fix": "oxlint --tsconfig tsconfig.json --fix apps packages scripts/generate-provider-option-shapes.ts scripts/architecture scripts/oxlint-plugins examples __tests__",
-    "lint:architecture": "bun scripts/architecture/runner.ts check && bun scripts/oxlint-plugins/check-syntax-ratchet.mts",
+    "lint:architecture": "bun scripts/architecture/runner.ts check && bun scripts/oxlint-plugins/check-production-syntax.mts",
     "test:all": "bun run test:root && bun run test:workspaces && bun run test:lint-rules && bun run test:architecture",
     "test:ci": "set -e; bun run test:root -- --only-failures; for dir in apps/* packages/*; do bun --cwd=\"$dir\" run test -- --only-failures; done; bun test --only-failures ./scripts/oxlint-plugins/*.test.mts; node --experimental-strip-types scripts/oxlint-plugins/test-waits.rule-test.mts; bun run test:architecture -- --only-failures",
     "test:architecture": "bun test ./scripts/architecture/*.test.ts",
