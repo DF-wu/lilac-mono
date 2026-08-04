@@ -100,7 +100,6 @@ function historyRuntimeConfig(): RuntimeConfig {
       subagents: {
         enabled: false,
         maxDepth: 1,
-        idleTimeoutMs: 300_000,
       },
       profiles: {
         coding: {

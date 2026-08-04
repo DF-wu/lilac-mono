@@ -51,7 +51,6 @@ describe("runtime config", () => {
     expect(config.agent.subagents).toEqual({
       enabled: true,
       maxDepth: 1,
-      idleTimeoutMs: 360_000,
     });
     expect(config.agent.compaction).toEqual({
       model: "inherit",

@@ -9,6 +9,7 @@ import {
 } from "@stanley2058/lilac-plugin-runtime";
 import {
   createLogger,
+  deriveSubagentIdleTimeoutMs,
   getCoreConfig,
   profileIncludes,
   resolveCoreConfigPath,
@@ -83,7 +84,7 @@ export type BuildLevel1ToolsetParams = {
   subagentDepth: number;
   subagentConfig: {
     enabled: boolean;
-    idleTimeoutMs: number;
+    idleTimeoutMs?: number;
     maxDepth: number;
   };
   requestContext?: Level1ExecutionRequestContext;
@@ -175,7 +176,12 @@ export function createCoreToolPluginManager(params: {
         runProfile: buildParams.runProfile,
         editingToolMode: buildParams.editingToolMode,
         subagentDepth: buildParams.subagentDepth,
-        subagentConfig: buildParams.subagentConfig,
+        subagentConfig: {
+          ...buildParams.subagentConfig,
+          idleTimeoutMs:
+            buildParams.subagentConfig.idleTimeoutMs ??
+            deriveSubagentIdleTimeoutMs(resolvedConfig.agent.idleTimeoutMs),
+        },
         requestContext: buildParams.requestContext,
       };
 

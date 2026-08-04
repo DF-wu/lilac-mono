@@ -75,10 +75,14 @@ export function createAgentRunIdleWatchdog(params: {
   let timedOut = false;
   let monitoring = false;
   let rejectTimeout: ((error: AgentIdleTimeoutError) => void) | null = null;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    rejectTimeout = reject;
-  });
-  void timeoutPromise.catch(() => undefined);
+  let timeoutPromise: Promise<never>;
+  const renewTimeoutPromise = () => {
+    timeoutPromise = new Promise<never>((_, reject) => {
+      rejectTimeout = reject;
+    });
+    void timeoutPromise.catch(() => undefined);
+  };
+  renewTimeoutPromise();
 
   const timer = createIdleTimer(
     params.idleTimeoutMs,
@@ -97,6 +101,13 @@ export function createAgentRunIdleWatchdog(params: {
     start() {
       if (timedOut) return;
       monitoring = true;
+      timer.reset();
+    },
+    restart() {
+      timer.stop();
+      timedOut = false;
+      monitoring = true;
+      renewTimeoutPromise();
       timer.reset();
     },
     reset() {

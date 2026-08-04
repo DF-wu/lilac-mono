@@ -310,6 +310,7 @@ const bashExecutionErrorSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("timeout"),
     timeoutMs: z.number().nonnegative(),
+    timeoutKind: z.enum(["no_output", "wall_clock"]).optional().default("wall_clock"),
     signal: z.literal("SIGTERM"),
   }),
   z.object({ type: z.literal("exception"), message: z.string() }),
@@ -757,7 +758,9 @@ function shellOutput(output: unknown): string | undefined {
     executionError?.type === "blocked"
       ? executionError.reason
       : executionError?.type === "timeout"
-        ? `Command timed out after ${executionError.timeoutMs}ms`
+        ? executionError.timeoutKind === "no_output"
+          ? `Command terminated after ${executionError.timeoutMs}ms without output`
+          : `Command timed out after ${executionError.timeoutMs}ms`
         : executionError?.type === "aborted"
           ? "Command aborted"
           : executionError?.type === "exception"

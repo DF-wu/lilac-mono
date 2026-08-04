@@ -387,6 +387,51 @@ describe("Core primary Claude continuation", () => {
     store.close();
   });
 
+  it("keeps a trailing completed tool exchange structural when replay covers the full history", async () => {
+    const store = await createStore();
+    const messages = [
+      { role: "user", content: "run lint" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "lint-call",
+            toolName: "bash",
+            input: { command: "bun run lint" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "lint-call",
+            toolName: "bash",
+            output: { type: "error-text", value: "lint failed" },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+    const lineage = createCorePrimaryLineageFreshOnlyV1(
+      "deferred-result-insertion",
+      messages.length,
+    );
+
+    const prepared = prepareCorePrimaryHistoryView({
+      canonicalMessages: messages,
+      lineage,
+      replayHistoricalPrefix: true,
+      targetFamily: "ai-sdk",
+      modelSpecifier: "codex/gpt-5.6-sol",
+    });
+
+    expect(prepared.slice(-2)).toEqual(messages.slice(-2));
+    expect(prepared.at(-1)?.role).toBe("tool");
+    store.close();
+  });
+
   it("promotes mixed fresh history without output IDs, then exact-forks only after reachability", async () => {
     const store = await createStore();
     const starts: ClaudeNativeSessionStart[] = [];

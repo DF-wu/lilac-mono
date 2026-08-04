@@ -187,6 +187,13 @@ export function dedupeToolResultMessages(messages: readonly ModelMessage[]): Mod
   const out: ModelMessage[] = [];
 
   for (const message of messages) {
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        // Providers may reuse an ID in a later exchange; that call opens a new result scope.
+        if (part.type === "tool-call") seenToolCallIds.delete(part.toolCallId);
+      }
+    }
+
     if (message.role !== "tool") {
       out.push(message);
       continue;

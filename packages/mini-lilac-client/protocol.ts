@@ -310,7 +310,7 @@ export const miniLilacTranscriptResetSchema = z
 export type MiniLilacTranscriptReset = z.infer<typeof miniLilacTranscriptResetSchema>;
 
 export const miniLilacOutputRollbackSchema = z.strictObject({
-  reason: z.enum(["cancel", "interrupt"]),
+  reason: z.enum(["cancel", "interrupt", "recovery"]),
   reasoningIds: z.array(identifierSchema),
   textIds: z.array(identifierSchema),
   toolCallIds: z.array(identifierSchema),

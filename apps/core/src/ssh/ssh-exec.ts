@@ -10,7 +10,7 @@ const DEFAULT_SSH_STDIN_MODE: SshBashStdinMode = "error";
 export type SshBashStdinMode = "error" | "eof";
 
 export type SshExecOptions = {
-  timeoutMs: number;
+  timeoutMs?: number;
   signal?: AbortSignal;
   /**
    * Maximum stdout/stderr characters to capture per stream.
@@ -134,7 +134,7 @@ export async function readStreamTextCapped(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (!value) continue;
+        if (!value || value.byteLength === 0) continue;
 
         options?.onActivity?.();
         if (capped) await writeOverflowChunk(value);
@@ -279,7 +279,7 @@ export async function sshExecBash(params: {
   cmd: string;
   cwd?: string;
   stdinMode?: SshBashStdinMode;
-  timeoutMs: number;
+  timeoutMs?: number;
   signal?: AbortSignal;
   maxOutputChars: number;
   overflowOutputPath?: string;
@@ -292,8 +292,7 @@ export async function sshExecBash(params: {
   await requireConfiguredSshHost(params.host);
 
   const controller = new AbortController();
-  let timedOut = false;
-  let aborted = false;
+  let termination: "timeout" | "aborted" | undefined;
 
   let child: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -320,19 +319,23 @@ export async function sshExecBash(params: {
         killProcessGroupBestEffort(pid, "SIGKILL");
       }
     }, HARD_KILL_DELAY_MS);
+    hardKillTimer.unref?.();
+  };
+
+  const terminate = (reason: "timeout" | "aborted") => {
+    if (termination) return;
+    termination = reason;
+    controller.abort();
+    const pid = child?.pid;
+    if (pid) {
+      killProcessGroupBestEffort(pid, "SIGTERM");
+      scheduleHardKill();
+    }
   };
 
   let abortListener: (() => void) | null = null;
   if (params.signal) {
-    const onAbort = () => {
-      aborted = true;
-      controller.abort();
-      const pid = child?.pid;
-      if (pid) {
-        killProcessGroupBestEffort(pid, "SIGTERM");
-        scheduleHardKill();
-      }
-    };
+    const onAbort = () => terminate("aborted");
     if (params.signal.aborted) {
       onAbort();
     } else {
@@ -341,15 +344,19 @@ export async function sshExecBash(params: {
     }
   }
 
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-    const pid = child?.pid;
-    if (pid) {
-      killProcessGroupBestEffort(pid, "SIGTERM");
-      scheduleHardKill();
+  const timeout =
+    params.timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => terminate("timeout"), params.timeoutMs);
+  const stopWatchingExecution = () => {
+    if (timeout) clearTimeout(timeout);
+    abortListener?.();
+    abortListener = null;
+    if (hardKillTimer && !termination) {
+      clearTimeout(hardKillTimer);
+      hardKillTimer = null;
     }
-  }, params.timeoutMs);
+  };
 
   const startedAt = Date.now();
   try {
@@ -405,6 +412,7 @@ export async function sshExecBash(params: {
       }),
       child.exited,
     ]);
+    stopWatchingExecution();
 
     const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value.text : "";
     const stderr = stderrResult.status === "fulfilled" ? stderrResult.value.text : "";
@@ -417,8 +425,8 @@ export async function sshExecBash(params: {
       stderr,
       exitCode,
       durationMs: Date.now() - startedAt,
-      timedOut,
-      aborted,
+      timedOut: termination === "timeout",
+      aborted: termination === "aborted",
       capped: {
         stdout: stdoutResult.status === "fulfilled" ? stdoutResult.value.capped : false,
         stderr: stderrResult.status === "fulfilled" ? stderrResult.value.capped : false,
@@ -432,12 +440,7 @@ export async function sshExecBash(params: {
       transportError,
     };
   } finally {
-    clearTimeout(timeout);
-    abortListener?.();
-    if (hardKillTimer) {
-      clearTimeout(hardKillTimer);
-      hardKillTimer = null;
-    }
+    stopWatchingExecution();
   }
 }
 

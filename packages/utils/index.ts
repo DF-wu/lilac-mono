@@ -19,6 +19,7 @@ export * from "./runtime-utils";
 export * from "./friendly-units";
 export * from "./ai-error";
 export * from "./subagent-profile";
+export * from "./subagent-idle-timeout";
 export * from "./reasoning-summary";
 export * from "./working-indicators";
 export * from "./server-compaction-request";

@@ -321,6 +321,29 @@ function bashToolResult(command: string, dangerouslyAllow?: boolean) {
   };
 }
 
+function textThenBashToolResult(command: string) {
+  return {
+    stream: simulateReadableStream({
+      chunks: [
+        { type: "text-start" as const, id: "idle-draft" },
+        { type: "text-delta" as const, id: "idle-draft", delta: "starting command" },
+        { type: "text-end" as const, id: "idle-draft" },
+        {
+          type: "tool-call" as const,
+          toolCallId: "silent-bash",
+          toolName: "bash",
+          input: JSON.stringify({ command }),
+        },
+        {
+          type: "finish" as const,
+          finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+          usage: zeroUsage(),
+        },
+      ],
+    }),
+  };
+}
+
 function grepToolResult(pattern: string) {
   return {
     stream: simulateReadableStream({
@@ -729,7 +752,6 @@ function config(): RuntimeConfig {
       subagents: {
         enabled: true,
         maxDepth: 1,
-        idleTimeoutMs: 300_000,
       },
       profiles: {
         reader: {
@@ -7053,16 +7075,16 @@ describe("SessionService", () => {
     service.close();
   });
 
-  it("aborts a root run when a tool remains silent past the idle timeout", async () => {
+  it("recovers a root run when a tool remains silent past the idle timeout", async () => {
     const runtimeConfig = config();
-    runtimeConfig.agent.idleTimeoutMs = 30;
+    runtimeConfig.agent.idleTimeoutMs = 1_500;
     const reader = runtimeConfig.agent.profiles.reader;
     if (!reader) throw new Error("reader profile missing");
     reader.tools = ["bash"];
     reader.execution = true;
     reader.workspaceWrites = true;
     const model = new MockLanguageModelV4({
-      doStream: [bashToolResult("sleep 1"), textResult("recovered", "follow-up works")],
+      doStream: [textThenBashToolResult("sleep 10"), textResult("recovered", "follow-up works")],
     });
     const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-root-idle-timeout-"));
     temporaryDirectories.push(directory);
@@ -7070,6 +7092,12 @@ describe("SessionService", () => {
       config: runtimeConfig,
       databasePath: path.join(directory, "runtime.sqlite"),
       modelResolver: () => model,
+      transientModelRetry: {
+        enabled: true,
+        maxRetries: 1,
+        baseDelayMs: 0,
+        maxDelayMs: 0,
+      },
     });
     const session = await service.createSession({
       cwd: directory,
@@ -7080,24 +7108,21 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("run a silent tool"));
     const chunks = await collect(started.stream);
 
-    expect(model.doStreamCalls).toHaveLength(1);
-    expect(JSON.stringify(chunks)).toContain(
-      "agent idle timed out after 30ms without model, tool, or subagent activity",
-    );
+    expect(model.doStreamCalls).toHaveLength(2);
     expect(service.store.getRun(started.runId)).toMatchObject({
-      status: "error",
-      error: "agent idle timed out after 30ms without model, tool, or subagent activity",
+      status: "completed",
+      error: null,
     });
-    expect(service.getSnapshot(session.id).status).toBe("error");
+    expect(service.getSnapshot(session.id).status).toBe("idle");
     expect(JSON.stringify(service.store.getModelMessages(session.id))).not.toContain("silent-bash");
     expect(chunks.find((chunk) => chunk.type === "data-outputRollback")).toMatchObject({
-      data: { reason: "cancel", toolCallIds: ["silent-bash"] },
+      data: {
+        reason: "recovery",
+        textIds: ["idle-draft"],
+        toolCallIds: ["silent-bash"],
+      },
     });
-
-    const followUp = await service.startPrompt(session.id, userMessage("continue after timeout"));
-    await collect(followUp.stream);
-    expect(model.doStreamCalls).toHaveLength(2);
-    expect(service.getSnapshot(session.id).status).toBe("idle");
+    expect(chunks.some((chunk) => chunk.type === "abort")).toBe(false);
     expect(JSON.stringify(service.getMessages(session.id))).toContain("follow-up works");
     service.close();
   });
@@ -7254,7 +7279,7 @@ describe("SessionService", () => {
   for (const mode of ["sync", "deferred"] as const) {
     it(`cancels an inactive ${mode} child after the configured idle timeout`, async () => {
       const runtimeConfig = config();
-      runtimeConfig.agent.subagents.idleTimeoutMs = 20;
+      runtimeConfig.agent.idleTimeoutMs = 1_500;
       let first = true;
       const model = new MockLanguageModelV4({
         doStream: async (options) => {
@@ -7303,7 +7328,7 @@ describe("SessionService", () => {
 
   it("resets the child idle timeout on model activity", async () => {
     const runtimeConfig = config();
-    runtimeConfig.agent.subagents.idleTimeoutMs = 30;
+    runtimeConfig.agent.idleTimeoutMs = 1_500;
     let first = true;
     const activeChildResult = {
       stream: simulateReadableStream({
@@ -7318,7 +7343,7 @@ describe("SessionService", () => {
             usage: zeroUsage(),
           },
         ],
-        chunkDelayInMs: 15,
+        chunkDelayInMs: 400,
       }),
     };
     const model = new MockLanguageModelV4({

@@ -29,6 +29,7 @@ export type CodingToolsetOptions = {
   fffCacheDir?: string;
   denyPaths?: readonly string[];
   extraTools?: ToolSet;
+  /** Optional Bash wall-clock deadline. The fixed no-output deadline is independent. */
   bashTimeoutMs?: number;
   bashMaxOutputBytes?: number;
   /** Maximum UTF-8 bytes in a read_file textual payload. */

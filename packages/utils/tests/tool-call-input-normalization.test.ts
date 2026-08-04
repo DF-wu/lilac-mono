@@ -157,6 +157,58 @@ describe("tool call input normalization", () => {
     expect(dedupeToolResultMessages(messages)).toEqual(messages.slice(0, 2));
   });
 
+  it("preserves results when a later tool call reuses the same ID", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "reused-call",
+            toolName: "bash",
+            input: { command: "first" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "reused-call",
+            toolName: "bash",
+            output: { type: "text", value: "first result" },
+          },
+        ],
+      },
+      { role: "user", content: "run it again" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "reused-call",
+            toolName: "bash",
+            input: { command: "second" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "reused-call",
+            toolName: "bash",
+            output: { type: "text", value: "second result" },
+          },
+        ],
+      },
+    ];
+
+    expect(dedupeToolResultMessages(messages)).toEqual(messages);
+  });
+
   it("normalizes legacy user image parts to file parts", () => {
     const message: ModelMessage = {
       role: "user",

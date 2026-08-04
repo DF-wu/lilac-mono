@@ -228,7 +228,6 @@ function config(profileTools: readonly string[] = ["read_file", "websearch"]): R
       subagents: {
         enabled: true,
         maxDepth: 1,
-        idleTimeoutMs: 300_000,
       },
       profiles: {
         reader: {

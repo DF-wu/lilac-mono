@@ -67,7 +67,7 @@ export const runtimeConfigSchema = z
         idleTimeoutMs: z
           .number()
           .int()
-          .positive()
+          .min(1_500)
           .max(86_400_000)
           .default(15 * 60 * 1000),
         compaction: z
@@ -81,13 +81,11 @@ export const runtimeConfigSchema = z
           .object({
             enabled: z.boolean().default(true),
             maxDepth: z.number().int().min(0).max(16).default(1),
-            idleTimeoutMs: z.number().int().positive().max(86_400_000).default(360_000),
           })
           .strict()
           .default({
             enabled: true,
             maxDepth: 1,
-            idleTimeoutMs: 360_000,
           }),
         profiles: z
           .record(slugSchema, profileSchema)
