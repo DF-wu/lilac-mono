@@ -59,7 +59,7 @@ function isAgentActivityHandler(value: unknown): value is AgentActivityHandler {
 
 const coreToolRequestMetadataSchema = z
   .object({
-    readFileDirectAttachmentSupported: z.literal(true).optional(),
+    readFileDirectAttachmentSupported: z.boolean().optional(),
     controlCapability: z.string().optional(),
     onSubagentDelegate: z.custom<DelegateHandler>(isDelegateHandler).optional(),
     onActivity: z.custom<AgentActivityHandler>(isAgentActivityHandler).optional(),

@@ -118,7 +118,7 @@ const modelLimitsSchema = z.object({ context: z.number(), output: z.number() });
 const modelsDevModelSchema = z.object({
   id: z.string(),
   name: z.string(),
-  family: z.string(),
+  family: z.string().optional(),
   attachment: z.boolean().optional(),
   reasoning: z.boolean().optional(),
   tool_call: z.boolean().optional(),

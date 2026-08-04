@@ -8,6 +8,7 @@ import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lila
 import { Panic, Result } from "better-result";
 
 import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
+import { decodeCoreToolRequestMetadata } from "../../src/plugins/builtin/local-tools";
 import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
@@ -197,6 +198,27 @@ describe("core tool plugin manager", () => {
     tmpRoot = null;
   });
 
+  it("preserves request metadata when direct attachment support is false", () => {
+    const onSubagentDelegate = async () => ({
+      runId: "run:metadata-decode",
+      completion: Promise.resolve({ status: "resolved" as const, finalText: "" }),
+      cancel: async () => {},
+    });
+    const onActivity = () => {};
+
+    const decoded = decodeCoreToolRequestMetadata({
+      readFileDirectAttachmentSupported: false,
+      controlCapability: "level-2-control-capability",
+      onSubagentDelegate,
+      onActivity,
+    });
+
+    expect(decoded.readFileDirectAttachmentSupported).toBe(false);
+    expect(decoded.controlCapability).toBe("level-2-control-capability");
+    expect(decoded.onSubagentDelegate).toBe(onSubagentDelegate);
+    expect(decoded.onActivity).toBe(onActivity);
+  });
+
   it("preserves built-in Level 1 tool exposure across profiles and edit modes", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -383,6 +405,86 @@ describe("core tool plugin manager", () => {
     });
 
     expect(getToolDescription(toolset.tools, "read_file")).toContain(
+      "calling read_file attaches the original file to your context for native visual or document analysis",
+    );
+  });
+
+  it("retains delegation and Level 2 metadata when direct attachment support is false", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    let delegationCount = 0;
+    const activitySources: string[] = [];
+    const requestContext = {
+      requestId: "req:false-attachment-metadata",
+      sessionId: "test-session",
+      requestClient: "test",
+      subagentDepth: 0,
+      subagentProfile: "primary" as const,
+      metadata: {
+        readFileDirectAttachmentSupported: false,
+        controlCapability: "level-2-control-capability",
+        onSubagentDelegate: async () => {
+          delegationCount += 1;
+          return {
+            runId: "run:false-attachment-metadata",
+            completion: Promise.resolve({ status: "resolved" as const, finalText: "" }),
+            cancel: async () => {},
+          };
+        },
+        onActivity: (source: "tool" | "subagent") => {
+          activitySources.push(source);
+        },
+      },
+    };
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        config: cfg,
+      },
+      dataDir,
+    });
+
+    await manager.init();
+    await fs.mkdir(dataDir, { recursive: true });
+    const toolset = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents!,
+      requestContext,
+    });
+    const executableTools = toolset.tools as Record<
+      string,
+      { execute?: (...args: readonly unknown[]) => unknown }
+    >;
+
+    const bashResult = await resolveExecuteResult(
+      getExecutableTool(executableTools, "bash").execute(
+        { command: 'printf "%s" "$LILAC_CONTROL_CAPABILITY"' },
+        { context: requestContext, toolCallId: "bash-metadata", messages: [] },
+      ),
+    );
+    expect(bashResult).toMatchObject({
+      stdout: "level-2-control-capability",
+      exitCode: 0,
+    });
+    expect(activitySources).toContain("tool");
+
+    const delegationResult = await resolveExecuteResult(
+      getExecutableTool(executableTools, "subagent_delegate").execute(
+        { profile: "explore", task: "Check metadata", mode: "deferred" },
+        { context: requestContext, toolCallId: "delegate-metadata", messages: [] },
+      ),
+    );
+    expect(delegationResult).toMatchObject({
+      ok: true,
+      status: "accepted",
+      workflowRunId: "run:false-attachment-metadata",
+    });
+    expect(delegationCount).toBe(1);
+    expect(getToolDescription(toolset.tools, "read_file")).not.toContain(
       "calling read_file attaches the original file to your context for native visual or document analysis",
     );
   });

@@ -82,6 +82,98 @@ describe("ModelCapability", () => {
     expect(info.limit.context).toBe(128_000);
   });
 
+  it("resolves codex/openai when an unrelated model has no family", async () => {
+    const registry = {
+      openai: {
+        id: "openai",
+        npm: "@ai-sdk/openai",
+        name: "OpenAI",
+        models: {
+          "gpt-4o": {
+            id: "gpt-4o",
+            name: "GPT-4o",
+            family: "gpt-4o",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 128_000, output: 16_384 },
+          },
+        },
+      },
+      unrelated: {
+        id: "unrelated",
+        npm: "@ai-sdk/openai-compatible",
+        name: "Unrelated Provider",
+        models: {
+          model: {
+            id: "model",
+            name: "Family-less model",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 32_000, output: 4_096 },
+          },
+        },
+      },
+    };
+    const mc = new ModelCapability({ fetch: createRegistryFetch(registry) });
+
+    const info = await mc.resolve("codex/gpt-4o");
+
+    expect(info.provider).toBe("codex");
+    expect(info.family).toBe("gpt-4o");
+    expect(info.limit).toEqual({ context: 128_000, output: 16_384 });
+  });
+
+  it("tolerates modern unknown models.dev fields", async () => {
+    const registry = {
+      openai: {
+        id: "openai",
+        npm: "@ai-sdk/openai",
+        api: "https://api.openai.com/v1",
+        name: "OpenAI",
+        models: {
+          "gpt-4o": {
+            id: "gpt-4o",
+            name: "GPT-4o",
+            family: "gpt-4o",
+            structured_output: true,
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: 128_000, input: 128_000, output: 16_384 },
+          },
+        },
+      },
+    };
+    const mc = new ModelCapability({ fetch: createRegistryFetch(registry) });
+
+    const info = await mc.resolve("codex/gpt-4o");
+
+    expect(info.limit).toEqual({ context: 128_000, output: 16_384 });
+  });
+
+  it("rejects malformed consumed models.dev limit data", async () => {
+    const registry = {
+      openai: {
+        id: "openai",
+        npm: "@ai-sdk/openai",
+        name: "OpenAI",
+        models: {
+          "gpt-4o": {
+            id: "gpt-4o",
+            name: "GPT-4o",
+            modalities: { input: ["text"], output: ["text"] },
+            limit: { context: "128000", output: 16_384 },
+          },
+        },
+      },
+    };
+    const mc = new ModelCapability({ fetch: createRegistryFetch(registry) });
+
+    const result = await mc.resolveResult("codex/gpt-4o");
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ModelCapabilityResolutionFailed");
+      expect(result.error.message).toBe("models.dev registry JSON has an invalid shape");
+    }
+  });
+
   it("maps claude-code/* provider to anthropic/* for models.dev lookup", async () => {
     const registry = {
       anthropic: {

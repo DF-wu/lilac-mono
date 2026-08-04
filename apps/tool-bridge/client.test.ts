@@ -208,6 +208,28 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
+  it("reports the owned network failure after loading the operator token", async () => {
+    const root = await fs.mkdtemp(path.join(tmpdir(), "tool-bridge-operator-network-"));
+    const tokenPath = path.join(root, "operator-token");
+    await fs.writeFile(tokenPath, "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678\n", { mode: 0o600 });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["--operator", "--list"],
+        backendUrl: "http://127.0.0.1:1",
+        env: { LILAC_OPERATOR_TOKEN_FILE: tokenPath },
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr: "Error: fetch tools list failed\n",
+        exitCode: 1,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("forwards generic control capability but not workflow capability", async () => {
     const requests: Request[] = [];
     const server = Bun.serve({
