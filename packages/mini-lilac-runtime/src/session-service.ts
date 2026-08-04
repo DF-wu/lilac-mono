@@ -14,6 +14,7 @@ import {
   compactMessages,
   compactWithOpenAIResponses,
   createAgentRunIdleWatchdog,
+  createRetryBackoffBudget,
   createTransientModelRetryController,
   hasMatchingOpenAIServerCompaction,
   hasOpenAIServerCompaction,
@@ -30,6 +31,7 @@ import {
   type TurnBoundaryDecision,
   type BeforeSteeringDeliveryContext,
   type HistoryProviderState,
+  type IdleRecoveryResult,
   type PrepareModelCall,
 } from "@stanley2058/lilac-agent";
 import {
@@ -121,6 +123,7 @@ import {
 import {
   createLogger,
   claudeCodeExecutableSettings,
+  deriveSubagentIdleTimeoutMs,
   getCodexAuthStoragePath,
   ModelCapability,
   openAIMessagePhase,
@@ -530,6 +533,9 @@ type RunProjection = {
   toolOutputsAvailable: Set<string>;
   openReasoningIds: Set<string>;
   openTextIds: Set<string>;
+  turnReasoningIds: Set<string>;
+  turnTextIds: Set<string>;
+  turnToolCallIds: Set<string>;
   visibleToolCallIds: Set<string>;
   preliminaryToolOutputBytes: Map<string, number>;
   truncatedPreliminaryToolOutputs: Set<string>;
@@ -1525,6 +1531,9 @@ class SessionActor {
           toolOutputsAvailable: new Set(),
           openReasoningIds: new Set(),
           openTextIds: new Set(),
+          turnReasoningIds: new Set(),
+          turnTextIds: new Set(),
+          turnToolCallIds: new Set(),
           visibleToolCallIds: new Set(),
           preliminaryToolOutputBytes: new Map(),
           truncatedPreliminaryToolOutputs: new Set(),
@@ -3064,21 +3073,53 @@ class SessionActor {
     context: RunContext,
     userModelMessage: ModelMessage,
   ): Promise<void> {
+    const idleRetryBudget = createRetryBackoffBudget(this.transientModelRetry);
+    const idleRecovery: { promise: Promise<IdleRecoveryResult> | null } = { promise: null };
     const idleWatchdog = createAgentRunIdleWatchdog({
       idleTimeoutMs: context.idleTimeoutMs ?? this.config.agent.idleTimeoutMs,
       onTimeout: (error) => {
         const active = this.active;
-        if (active?.runId === context.runId) active.eventError ??= error.message;
         logger.warn("agent run idle timeout", {
           requestId: context.runId,
           sessionId: this.snapshot.id,
           idleTimeoutMs: context.idleTimeoutMs ?? this.config.agent.idleTimeoutMs,
         });
+        if (context.depth > 0) {
+          if (active?.runId === context.runId) active.eventError ??= error.message;
+          this.requestClaudeCodeInterrupt(
+            active?.claudeRuntime ?? null,
+            active?.claudeCodeRun ?? null,
+          );
+          agent.cancel();
+          return;
+        }
         // Stop the Claude subprocess too, so it cannot outlive the run.
         if (active?.runId === context.runId) {
           this.requestClaudeCodeInterrupt(active.claudeRuntime, active.claudeCodeRun);
         }
-        agent.cancel();
+        idleRecovery.promise = agent.requestIdleRecovery(
+          error,
+          async (_idleError, { abortSignal }) => {
+            for (const cancel of this.delegatedCancels.values()) cancel();
+            context.deferred.forEach((child) => {
+              child.readyAtBoundary = true;
+            });
+            const completed = await this.finishDeferredChildren(context);
+            if (completed.append?.length) agent.appendMessages([...completed.append]);
+
+            await active?.claudeRuntime?.retireForRetry();
+            const retry = await idleRetryBudget.next(abortSignal).catch(() => null);
+            if (!retry) return "fail";
+            logger.warn("agent idle timeout; retrying", {
+              requestId: context.runId,
+              sessionId: this.snapshot.id,
+              attempt: retry.attempt,
+              maxRetries: this.transientModelRetry.maxRetries,
+              delayMs: retry.delayMs,
+            });
+            return "retry";
+          },
+        );
       },
     });
     context.reportActivity = () => idleWatchdog.reset();
@@ -3087,7 +3128,27 @@ class SessionActor {
     const operation = agent.prompt(userModelMessage);
     let thrown: string | undefined;
     try {
-      await idleWatchdog.waitFor(operation);
+      while (true) {
+        try {
+          await idleWatchdog.waitFor(operation);
+          break;
+        } catch (error) {
+          const recovery = idleRecovery.promise;
+          if (!(error instanceof AgentIdleTimeoutError) || !recovery) throw error;
+          const result = await recovery;
+          if (idleRecovery.promise === recovery) idleRecovery.promise = null;
+          if (
+            result.status !== "retried" &&
+            !(
+              result.status === "superseded" &&
+              (result.reason === "cancel" || result.reason === "interrupt")
+            )
+          ) {
+            throw error;
+          }
+          idleWatchdog.restart();
+        }
+      }
     } catch (error) {
       thrown = error instanceof Error ? error.message : String(error);
       if (error instanceof AgentIdleTimeoutError) {
@@ -3423,6 +3484,9 @@ class SessionActor {
           await this.appendChunk(runId, { type: "finish-step" });
         }
         projection.stepOpen = true;
+        projection.turnReasoningIds.clear();
+        projection.turnTextIds.clear();
+        projection.turnToolCallIds.clear();
         await this.appendChunk(runId, { type: "start-step" });
         return;
       case "turn_end":
@@ -3466,7 +3530,13 @@ class SessionActor {
           projection.stepOpen = false;
           await this.appendChunk(runId, { type: "finish-step" });
         }
-        if (event.reason === "cancel" || event.reason === "interrupt") return;
+        if (
+          event.reason === "cancel" ||
+          event.reason === "interrupt" ||
+          event.reason === "recovery"
+        ) {
+          return;
+        }
         await this.appendChunk(runId, {
           type: "abort",
           reason: event.detail ?? `${event.reason}:${event.phase}`,
@@ -3489,6 +3559,7 @@ class SessionActor {
             projection.openReasoningIds.clear();
             projection.openTextIds.clear();
             projection.openTextIds.add(update.id);
+            projection.turnTextIds.add(update.id);
             await this.appendChunk(runId, {
               type: "text-start",
               id: update.id,
@@ -3499,6 +3570,7 @@ class SessionActor {
             projection.openReasoningIds.clear();
             if (!projection.openTextIds.has(update.id)) projection.openTextIds.clear();
             projection.openTextIds.add(update.id);
+            projection.turnTextIds.add(update.id);
             await this.appendChunk(runId, {
               type: "text-delta",
               id: update.id,
@@ -3518,6 +3590,7 @@ class SessionActor {
             projection.openTextIds.clear();
             projection.openReasoningIds.clear();
             projection.openReasoningIds.add(update.id);
+            projection.turnReasoningIds.add(update.id);
             await this.appendChunk(runId, {
               type: "reasoning-start",
               id: update.id,
@@ -3528,6 +3601,7 @@ class SessionActor {
             projection.openTextIds.clear();
             if (!projection.openReasoningIds.has(update.id)) projection.openReasoningIds.clear();
             projection.openReasoningIds.add(update.id);
+            projection.turnReasoningIds.add(update.id);
             await this.appendChunk(runId, {
               type: "reasoning-delta",
               id: update.id,
@@ -3557,6 +3631,7 @@ class SessionActor {
               return;
             }
             projection.streamedToolInputIds.add(update.toolCallId);
+            projection.turnToolCallIds.add(update.toolCallId);
             projection.visibleToolCallIds.add(update.toolCallId);
             await this.appendChunk(runId, {
               type: "tool-input-start",
@@ -3621,6 +3696,7 @@ class SessionActor {
       case "tool_execution_start":
         projection.openReasoningIds.clear();
         projection.openTextIds.clear();
+        projection.turnToolCallIds.add(event.toolCallId);
         projection.visibleToolCallIds.add(event.toolCallId);
         if (projection.toolInputsAvailable.has(event.toolCallId)) return;
         projection.toolInputsAvailable.set(event.toolCallId, {
@@ -3709,12 +3785,24 @@ class SessionActor {
         }
         return;
       case "messages_reset":
-        if (event.reason === "cancel" || event.reason === "interrupt") {
+        if (
+          event.reason === "cancel" ||
+          event.reason === "interrupt" ||
+          event.reason === "recovery"
+        ) {
           const retainedToolCallIds = modelToolCallIds(event.messages);
+          const retainsCurrentTurn = [...projection.turnToolCallIds].some((toolCallId) =>
+            retainedToolCallIds.has(toolCallId),
+          );
+          const rollbackCompletedTurn = event.reason === "recovery" && !retainsCurrentTurn;
           const rollback: MiniLilacOutputRollback = {
             reason: event.reason,
-            reasoningIds: [...projection.openReasoningIds],
-            textIds: [...projection.openTextIds],
+            reasoningIds: rollbackCompletedTurn
+              ? [...projection.turnReasoningIds]
+              : [...projection.openReasoningIds],
+            textIds: rollbackCompletedTurn
+              ? [...projection.turnTextIds]
+              : [...projection.openTextIds],
             toolCallIds: [...projection.visibleToolCallIds].filter(
               (toolCallId) => !retainedToolCallIds.has(toolCallId),
             ),
@@ -3725,6 +3813,9 @@ class SessionActor {
           });
           projection.openReasoningIds.clear();
           projection.openTextIds.clear();
+          projection.turnReasoningIds.clear();
+          projection.turnTextIds.clear();
+          projection.turnToolCallIds.clear();
           projection.suppressedClaudeMcpToolInputIds.clear();
           for (const toolCallId of rollback.toolCallIds) {
             projection.visibleToolCallIds.delete(toolCallId);
@@ -5786,7 +5877,7 @@ export class SessionService {
         {
           depth: request.depth,
           profileId: request.profileId,
-          idleTimeoutMs: this.options.config.agent.subagents.idleTimeoutMs,
+          idleTimeoutMs: deriveSubagentIdleTimeoutMs(this.options.config.agent.idleTimeoutMs),
           namedContinuation: request.namedContinuation,
         },
       );

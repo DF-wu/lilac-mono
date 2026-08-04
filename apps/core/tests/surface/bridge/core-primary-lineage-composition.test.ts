@@ -419,6 +419,61 @@ describe("Core primary lineage composition", () => {
     store.close();
   });
 
+  it("falls back to the surface projection when a linked request transcript is empty", async () => {
+    const { store } = await createStore();
+    store.saveRequestTranscript({
+      requestId: "failed-request",
+      sessionId: "channel",
+      requestClient: "discord",
+      messages: [],
+      finalText: "Error: failed before producing a recoverable transcript",
+      providerState: { lastFamily: "ai-sdk", containsCrossFamilyTurns: true },
+    });
+    const failedOutput = surfaceMessage({
+      id: "failed-output",
+      text: "Visible progress\n\nError: failed before producing a recoverable transcript",
+      ts: 1,
+      userId: "bot",
+    });
+    const retry = surfaceMessage({
+      id: "retry",
+      text: "continue",
+      ts: 2,
+      raw: { reference: { messageId: failedOutput.ref.messageId, channelId: "channel" } },
+    });
+    store.linkSurfaceMessagesToRequest({
+      requestId: "failed-request",
+      created: [failedOutput.ref],
+      last: failedOutput.ref,
+    });
+
+    const composed = await composeRequestMessages(new MutableAdapter([failedOutput, retry]), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      transcriptStore: store,
+      trigger: { type: "reply", msgRef: retry.ref },
+    });
+
+    expect(composed.messages).toEqual([
+      { role: "assistant", content: failedOutput.text },
+      expect.objectContaining({ role: "user" }),
+    ]);
+    if (composed.corePrimaryLineage.state !== "complete") throw new Error("expected lineage");
+    expect(composed.corePrimaryLineage.segments[0]?.atoms).toEqual([
+      expect.objectContaining({ kind: "surface", messageId: failedOutput.ref.messageId }),
+    ]);
+    expect(
+      composed.corePrimaryLineage.segments.flatMap((segment) =>
+        segment.atoms.filter((atom) => atom.kind === "request"),
+      ),
+    ).toEqual([]);
+    expect(() =>
+      parseCorePrimaryLineageV1(composed.corePrimaryLineage, composed.messages),
+    ).not.toThrow();
+    store.close();
+  });
+
   it("restores a persisted synthetic input suffix before its request atom", async () => {
     const { store } = await createStore();
     const firstInput = surfaceMessage({ id: "input-1", text: "first", ts: 1 });

@@ -307,7 +307,7 @@ agent:
   idleTimeoutMs: 900000
 
   retry:
-    # Retry transient upstream failures such as overloaded/503/rate-limit stream errors.
+    # Retry transient upstream failures and replay-safe primary-agent idle timeouts.
     enabled: true
     maxRetries: 3
     baseDelayMs: 2000
@@ -319,8 +319,8 @@ agent:
     # Max delegation depth (primary=0). Default 2 allows self->(explore|general)
     # while explore/general remain non-delegating by policy.
     maxDepth: 2
-    # Stop a subagent after this long without model or tool activity.
-    idleTimeoutMs: 360000
+    # Subagent idle timeout is derived from agent.idleTimeoutMs: floor(2/3),
+    # with a 1000ms minimum.
     # Optional free-form guidance appended to the parent-visible
     # subagent_delegate tool description. Use this for model-routing policy,
     # escalation rules, cost guidance, or workflow-specific preferences.

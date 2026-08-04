@@ -40,11 +40,11 @@ Field renames from v1:
 - `tools.experimental_hashline_edit` -> `tools.editFile.hashline`
 - `surface.discord.previewFinalOutputStyle` -> `surface.discord.outputPreviewModeFinalStyle`
 - `surface.discord.experimental.markdownTableRender` -> `surface.discord.markdownTableRender`
-- `agent.subagents.defaultTimeoutMs` -> `agent.subagents.idleTimeoutMs`; the timeout now measures inactivity rather than total runtime.
 
 Removed v2 fields:
 
-- `agent.subagents.maxTimeoutMs`; the universal runtime config no longer exposes a hard timeout cap. Frozen v1 configs may still contain this field, but it is not carried into the universal config.
+- `agent.subagents.idleTimeoutMs`; subagent idle timeouts are derived from `agent.idleTimeoutMs` as `floor(2/3)`, with a `1000ms` minimum.
+- `agent.subagents.defaultTimeoutMs` and `agent.subagents.maxTimeoutMs`; frozen v1 configs may still contain these legacy fields, but they are ignored during universal parsing.
 
 New v2 fields:
 
@@ -88,7 +88,7 @@ Default changes from v1:
 - `surface.discord.outputNotification: true`
 - `surface.discord.markdownTableRender: { enabled: true, style: unicode, maxWidth: 50, fallbackMode: list }`
 - `agent.reasoningDisplay: detailed`
-- `agent.subagents.idleTimeoutMs: 360000`; explicit v1 `defaultTimeoutMs` values are preserved, while omitted values use the new universal default.
+- Subagent idle timeouts derive from the primary agent timeout as `floor(2/3)`, with a `1000ms` minimum. This produces `600000` for the default `900000ms` primary timeout. Frozen v1 legacy timeout fields are ignored.
 
 ## Mini Lilac Database Schema 3
 
@@ -273,7 +273,7 @@ Schema 22 adds durable materialization attempt/error state to live-parent comple
 
 Schema 23 and runtime `lilac-workflow-js-v4` remove the workflow-wide wall-time contract. Workflow programs, sleeps, reply waits, pauses, and recovery have no total elapsed-time limit. Individual child-agent operations retain `operationIdleTimeoutMs`, and explicit cancellation still forcibly terminates the workflow subprocess.
 
-The v4 API also removes the unused public `parallel(..., { concurrency })` option; `parallel(promises)` joins already-created promises, while `pipeline(..., { concurrency })` provides bounded fan-out. Reply waits are explicitly limited to the authenticated originating Discord session. Literal host-call option objects receive static validation before a definition is saved or triggered.
+The v4 API also removes the unused public `parallel(..., { concurrency })` option; `parallel(promises)` joins already-created promises, while `pipeline(..., { concurrency })` provides bounded fan-out. Reply waits are explicitly limited to the authenticated originating Discord or Telegram session and user. Matching replies are suppressed from ordinary surface routing so they resume only the waiting workflow. Telegram durable progress targets must use the originating Telegram session; scheduled fire and every progress-card send/edit/recreation recheck the current `allowedChatIds`, so removing a chat stops persisted schedules and projections without deleting their durable records. Literal host-call option objects receive static validation before a definition is saved or triggered.
 
 Terminal results, terminal detail, and requested result artifacts are returned without sensitivity gating. Sensitive input fields, argument hashes, and progress values remain redacted. The obsolete `includeSensitiveResult` run-inspection option is removed.
 

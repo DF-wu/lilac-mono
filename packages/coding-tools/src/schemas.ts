@@ -22,7 +22,13 @@ export const bashInputSchema = z.object({
     .describe(
       "Working directory (supports ~). Also supports ssh-style '<host>:<path>' when the runtime adapter has SSH configured.",
     ),
-  timeoutMs: z.number().optional().describe("Timeout in ms (default: 1h)"),
+  timeoutMs: z
+    .number()
+    .nonnegative()
+    .optional()
+    .describe(
+      "Optional wall-clock timeout in ms. There is no default wall-clock limit; independently, commands are terminated after 3 minutes without stdout or stderr. Restricted execution cannot stream output and therefore applies the 3-minute inactivity policy as a wall-clock cap.",
+    ),
   stdinMode: z
     .enum(["error", "eof"])
     .optional()

@@ -102,7 +102,6 @@ function runtimeConfig(authTokenEnv?: string): RuntimeConfig {
       subagents: {
         enabled: true,
         maxDepth: 1,
-        idleTimeoutMs: 300_000,
       },
       profiles: {
         coding: {

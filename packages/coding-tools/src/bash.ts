@@ -24,14 +24,19 @@ import {
 } from "./guardrails";
 import { bashInputSchema, type BashInput } from "./schemas";
 
-const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
+export const BASH_NO_OUTPUT_TIMEOUT_MS = 3 * 60 * 1000;
 const DEFAULT_OUTPUT_CAP_BYTES = 40 * 1024;
 const HARD_KILL_DELAY_MS = 500;
 
 export type BashExecutionError =
   | { type: "blocked"; reason: string; segment?: string }
   | { type: "aborted"; signal: "SIGTERM" }
-  | { type: "timeout"; timeoutMs: number; signal: "SIGTERM" }
+  | {
+      type: "timeout";
+      timeoutMs: number;
+      timeoutKind: "no_output" | "wall_clock";
+      signal: "SIGTERM";
+    }
   | { type: "exception"; message: string };
 
 export type BashOutput = {
@@ -200,6 +205,7 @@ async function readBoundedStream(
   maxBytes: number,
   onDelta?: (delta: string) => void,
   onChunk?: (chunk: Uint8Array) => Promise<void>,
+  onRawChunk?: () => void,
 ): Promise<BoundedStreamCapture> {
   const reader = stream.getReader();
   const decoder = onDelta ? new TextDecoder() : undefined;
@@ -212,6 +218,7 @@ async function readBoundedStream(
     while (true) {
       const next = await reader.read();
       if (next.done) break;
+      if (next.value.byteLength > 0) onRawChunk?.();
       const delta = decoder?.decode(next.value, { stream: true });
       if (delta) onDelta?.(delta);
       totalBytes += next.value.byteLength;
@@ -418,7 +425,7 @@ export async function executeLocalBash(
   assertGuardrailBypassAllowed(input.dangerouslyAllow, options.allowGuardrailBypass ?? false);
   if (input.cwd) assertLocalCwd(input.cwd);
   const cwd = path.resolve(expandTilde(input.cwd ?? options.cwd));
-  const timeoutMs = input.timeoutMs ?? options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const wallClockTimeoutMs = input.timeoutMs ?? options.defaultTimeoutMs;
   const maxOutputBytes = Math.max(
     1,
     Math.floor(options.maxOutputBytes ?? DEFAULT_OUTPUT_CAP_BYTES),
@@ -505,18 +512,59 @@ export async function executeLocalBash(
     };
   }
 
-  let termination: "aborted" | "timeout" | undefined;
+  let termination:
+    | { type: "aborted" }
+    | { type: "timeout"; timeoutKind: "no_output" | "wall_clock"; timeoutMs: number }
+    | undefined;
   let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
-  const terminate = (reason: "aborted" | "timeout") => {
+  let noOutputTimer: ReturnType<typeof setTimeout> | undefined;
+  let wallClockTimer: ReturnType<typeof setTimeout> | undefined;
+  const terminate = (
+    reason:
+      | { type: "aborted" }
+      | { type: "timeout"; timeoutKind: "no_output" | "wall_clock"; timeoutMs: number },
+  ) => {
     if (termination) return;
     termination = reason;
     killProcessGroup(child.pid, "SIGTERM");
     hardKillTimer = setTimeout(() => killProcessGroup(child.pid, "SIGKILL"), HARD_KILL_DELAY_MS);
+    hardKillTimer.unref?.();
   };
-  const timeout = setTimeout(() => terminate("timeout"), timeoutMs);
-  const onAbort = () => terminate("aborted");
+  const resetNoOutputTimer = () => {
+    if (termination) return;
+    if (noOutputTimer) clearTimeout(noOutputTimer);
+    noOutputTimer = setTimeout(
+      () =>
+        terminate({
+          type: "timeout",
+          timeoutKind: "no_output",
+          timeoutMs: BASH_NO_OUTPUT_TIMEOUT_MS,
+        }),
+      BASH_NO_OUTPUT_TIMEOUT_MS,
+    );
+  };
+  resetNoOutputTimer();
+  if (wallClockTimeoutMs !== undefined) {
+    wallClockTimer = setTimeout(
+      () =>
+        terminate({
+          type: "timeout",
+          timeoutKind: "wall_clock",
+          timeoutMs: wallClockTimeoutMs,
+        }),
+      wallClockTimeoutMs,
+    );
+  }
+  const onAbort = () => terminate({ type: "aborted" });
   if (options.abortSignal?.aborted) onAbort();
   else options.abortSignal?.addEventListener("abort", onAbort, { once: true });
+
+  const stopWatchingExecution = () => {
+    if (noOutputTimer) clearTimeout(noOutputTimer);
+    if (wallClockTimer) clearTimeout(wallClockTimer);
+    if (hardKillTimer && !termination) clearTimeout(hardKillTimer);
+    options.abortSignal?.removeEventListener("abort", onAbort);
+  };
 
   try {
     const stdoutStream = child.stdout;
@@ -544,15 +592,18 @@ export async function executeLocalBash(
         maxOutputBytes,
         publishOutput,
         (chunk) => spool?.write("stdout", chunk) ?? Promise.resolve(),
+        resetNoOutputTimer,
       ),
       readBoundedStream(
         stderrStream,
         maxOutputBytes,
         publishOutput,
         (chunk) => spool?.write("stderr", chunk) ?? Promise.resolve(),
+        resetNoOutputTimer,
       ),
       child.exited,
     ]);
+    stopWatchingExecution();
     if (stdoutSettled.status === "rejected") throw stdoutSettled.reason;
     if (stderrSettled.status === "rejected") throw stderrSettled.reason;
     if (exitSettled.status === "rejected") throw exitSettled.reason;
@@ -580,9 +631,9 @@ export async function executeLocalBash(
       ? false
       : stderrStreamResult.totalBytes > budgets.stderr;
     const executionError: BashExecutionError | undefined =
-      termination === "timeout"
-        ? { type: "timeout", timeoutMs, signal: "SIGTERM" }
-        : termination === "aborted"
+      termination?.type === "timeout"
+        ? { ...termination, signal: "SIGTERM" }
+        : termination?.type === "aborted"
           ? { type: "aborted", signal: "SIGTERM" }
           : undefined;
     let truncation: BashTruncation | undefined;
@@ -651,9 +702,7 @@ export async function executeLocalBash(
       },
     };
   } finally {
-    clearTimeout(timeout);
-    if (hardKillTimer) clearTimeout(hardKillTimer);
-    options.abortSignal?.removeEventListener("abort", onAbort);
+    stopWatchingExecution();
     await spool?.cleanup();
   }
 }
@@ -735,7 +784,7 @@ export function createBashTool(params: {
   return {
     bash: tool({
       description:
-        "Execute a command in local bash from the caller-supplied cwd. Output is capped with a head/tail preview and interactive stdin is disabled. When complete truncated output is retained, truncation.artifactUri can be paged with read_file using the returned nextStart. Bash safety blocks known destructive operations and protected paths but is not a sandbox. Set dangerouslyAllow=true only to intentionally bypass every Bash guardrail for one call.",
+        "Execute a command in local bash from the caller-supplied cwd. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Output is capped with a head/tail preview and interactive stdin is disabled. When complete truncated output is retained, truncation.artifactUri can be paged with read_file using the returned nextStart. Bash safety blocks known destructive operations and protected paths but is not a sandbox. Set dangerouslyAllow=true only to intentionally bypass every Bash guardrail for one call.",
       inputSchema: bashInputSchema,
       execute: (input, { abortSignal, toolCallId }) => {
         const options = {

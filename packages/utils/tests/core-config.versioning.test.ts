@@ -6,6 +6,7 @@ import {
   parseCoreConfigV2ToUniversal,
   readCoreConfigVersion,
 } from "../core-config";
+import { deriveSubagentIdleTimeoutMs } from "../subagent-idle-timeout";
 
 describe("core config versioning", () => {
   it("preserves explicit v1 web tool settings", async () => {
@@ -146,7 +147,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.web.fetch.mode).toBe("auto");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(false);
-    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+    expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
 
@@ -174,7 +175,7 @@ describe("core config versioning", () => {
       baseDelayMs: 2_000,
       maxDelayMs: 30_000,
     });
-    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+    expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.models.main.reasoning).toBeUndefined();
     expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
@@ -424,7 +425,7 @@ describe("core config versioning", () => {
     ).rejects.toThrow();
   });
 
-  it("uses the v2 subagent idle timeout default for partial configs", async () => {
+  it("does not expose a v2 subagent idle timeout for partial configs", async () => {
     const parsed = await parseCoreConfig({
       configVersion: 2,
       agent: {
@@ -434,7 +435,7 @@ describe("core config versioning", () => {
       },
     });
 
-    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+    expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
   });
 
   it("does not expose legacy subagent timeout fields in v2", async () => {
@@ -448,7 +449,7 @@ describe("core config versioning", () => {
       },
     });
 
-    expect(parsed.agent.subagents.idleTimeoutMs).toBe(6 * 60 * 1000);
+    expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect("defaultTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect("maxTimeoutMs" in parsed.agent.subagents).toBe(false);
   });
@@ -498,13 +499,13 @@ describe("core config versioning", () => {
     expect(parsed.agent.subagents).toMatchObject({
       enabled: true,
       maxDepth: 2,
-      idleTimeoutMs: 240_000,
       profiles: {
         explore: { modelSlot: "main", execution: false, workspaceWrites: false },
         general: { modelSlot: "main", execution: true, workspaceWrites: true },
         self: { modelSlot: "main", execution: true, workspaceWrites: true, delegation: true },
       },
     });
+    expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
   });
 
   it("maps v1 field names into the universal config shape", async () => {
@@ -549,9 +550,16 @@ describe("core config versioning", () => {
       maxWidth: 100,
       fallbackMode: "passthrough",
     });
-    expect(parsed.agent.subagents.idleTimeoutMs).toBe(240_000);
+    expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect("defaultTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect("maxTimeoutMs" in parsed.agent.subagents).toBe(false);
+  });
+
+  it("derives subagent idle timeouts from the primary timeout", () => {
+    expect(deriveSubagentIdleTimeoutMs(900_000)).toBe(600_000);
+    expect(deriveSubagentIdleTimeoutMs(1_502)).toBe(1_001);
+    expect(deriveSubagentIdleTimeoutMs(1)).toBe(1_000);
+    expect(deriveSubagentIdleTimeoutMs(Number.NaN)).toBe(1_000);
   });
 
   it("rejects unsupported config versions", async () => {

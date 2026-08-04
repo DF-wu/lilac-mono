@@ -113,13 +113,13 @@ the grammY client receives it when the adapter is constructed.
 | `botUsername` | — | The `@handle` without the `@`. Resolved from `getMe` on connect when omitted. |
 | `allowedChatIds` | `[]` | **Fails closed.** Empty means the bot ignores every chat. |
 | `allowedUserIds` | `[]` | Empty means no user-level restriction; the chat allowlist still applies. |
-| `dbPath` | `<dataDir>/telegram-surface.db` | Local message index (see §6). |
+| `dbPath` | `<dataDir>/telegram-surface.db` | Local message index (see §7). |
 | `apiRoot` | `https://api.telegram.org` | Bot API endpoint. Set this to use a [self-hosted Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server). Must be a full URL. Read once at connect, so a change needs a restart. |
 | `outputMode` | `preview` | Cancellation behaviour only. Telegram edits the streamed message in place, so a **successful** run is identical in both modes. `preview` deletes the streamed messages when a request is cancelled; `inline` leaves the partial answer visible. |
 | `parseMode` | `html` | `html` renders markdown as Telegram HTML; `plain` sends unformatted text. |
 | `streamEditIntervalMs` | `1500` | Minimum gap between streaming edits. Minimum accepted value is 500. |
 | `outputNotification` | `true` | `false` sends with `disable_notification`. |
-| `commandMenu` | `true` | Publishes the custom-command menu via `setMyCommands` on connect (see §6). `false` leaves whatever menu the bot already has untouched. |
+| `commandMenu` | `true` | Publishes the custom-command menu via `setMyCommands` on connect (see §7). `false` leaves whatever menu the bot already has untouched. |
 | `workingIndicators` | shared default | Streaming progress phrases. |
 | `markdownTableRender` | enabled | Renders markdown tables as fixed-width blocks. |
 
@@ -182,7 +182,90 @@ already contains a colon, the message id is always the final segment.
 
 ---
 
-## 6. Design notes and platform constraints
+## 6. Workflows and authorization
+
+Telegram-origin workflows support durable progress cards, scheduled triggers, and
+`waitForReply`. These paths deliberately retain the originating Telegram identity;
+they are not a way to address an arbitrary chat.
+
+### Progress cards and scheduled delivery
+
+When `workflow.run.trigger` or `workflow.trigger.create` is called from an
+authenticated Telegram request, its durable progress target is the current
+Telegram session. An explicit Telegram `progress.client`/`progress.sessionId`
+pair, when supplied, must identify that same session. Cross-chat and
+cross-platform Telegram targets are rejected. The chat part of a forum-topic
+session must also be present in the current `allowedChatIds`.
+
+Authorization is not frozen when a schedule is created. The runtime reloads the
+current config and checks `allowedChatIds`:
+
+1. before a due schedule is committed as a workflow run, and
+2. immediately before every progress-card send, edit, and deleted-card
+   recreation.
+
+Removing a chat from `allowedChatIds` therefore stops an existing schedule from
+creating new runs for that chat and stops existing runs from sending or editing
+cards there. A denied due trigger is normally skipped before claim. If permission
+is revoked during the claim-to-fire race, the scheduler releases the claim. In
+both cases no run is created, the due occurrence remains due, and a warning is
+logged once per runtime process. Restoring the chat to `allowedChatIds` allows a
+later scheduler reconciliation to retry it. Cancel the trigger explicitly if it
+should never run again.
+
+This delivery check intentionally uses `allowedChatIds`. `allowedUserIds` gates
+inbound principals; a progress-card delivery targets a chat rather than acting as
+a user.
+
+### Waiting for a Telegram reply
+
+A workflow that declares `resources.waits: ["reply"]` may call:
+
+```js
+const reply = await waitForReply({
+  prompt: "Waiting for confirmation",
+  timeoutMs: 86400000,
+});
+```
+
+`prompt` is only a label in the durable progress view; it does not send a
+separate Telegram message. The wait defaults to the run's authenticated origin.
+If `platform`, `channelId`, or `fromUserId` is supplied, each value must still
+match the originating Telegram platform, session, and user. A workflow without
+an authenticated Discord or Telegram origin cannot create a reply wait.
+
+Supplying `messageId` makes the match stricter: the incoming Telegram message
+must be a direct reply to that message. Without `messageId`, the next message
+from the authenticated originating user in that session can resolve the wait.
+The resolved value has this shape:
+
+```js
+{
+  platform: "telegram",
+  channelId: "-1001234567890:7",
+  messageId: "456",
+  userId: "123456789",
+  userName: "optional username",
+  text: "confirmed",
+  ts: 1893456000000,
+}
+```
+
+A matching reply is reserved for the workflow while the wait is pending. After
+consumption, an exact platform/session/message suppression record remains for
+five minutes to cover ordinary adapter redelivery. While the workflow store and
+suppression hook are available, one reply resumes the workflow exactly once and
+does not also launch an unrelated agent request. Unmatched messages continue
+through normal routing. If the suppression hook itself fails, the router logs
+`router suppression hook failed; proceeding` and deliberately fails open into
+normal routing rather than dropping the user message.
+
+For the full workflow definition and trigger schemas, load the built-in
+`workflow-authoring` skill.
+
+---
+
+## 7. Design notes and platform constraints
 
 These are the Telegram behaviours the implementation works around. They are
 worth knowing when reading logs.
@@ -268,7 +351,7 @@ commands are logged.
 
 ---
 
-## 7. Verifying a change
+## 8. Verifying a change
 
 Automated coverage does not touch `api.telegram.org`. A Telegram bot cannot send
 messages to itself, so a fully automated real end-to-end test is impossible
@@ -347,7 +430,7 @@ cleaned up.
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause |
 |---------|-------|
@@ -358,10 +441,12 @@ cleaned up.
 | Answers arrive all at once, not streamed | `streamEditIntervalMs` is high, or the answer was short enough to be a single send. |
 | Formatting looks broken | Try `parseMode: plain` to isolate whether the HTML renderer is at fault, and report the input. |
 | `409 Conflict` in logs | Two processes are polling the same bot token. Only one runtime may poll a given bot. |
+| A due workflow schedule logs `progress target is no longer authorized` and creates no run | Its chat was removed from `allowedChatIds`. Restore the chat to retry the still-due occurrence, or cancel the trigger. |
+| A reply resumes a workflow but does not start a normal agent response | Expected. A message matching a pending or consumed `waitForReply` is reserved for that workflow and suppressed from ordinary routing. |
 
 ---
 
-## 9. What works, and what does not
+## 10. What works, and what does not
 
 The conversational path is complete: messages in, routing, streamed replies,
 chunking, HTML rendering, reply-chain context, cancellation, custom commands and
@@ -412,4 +497,4 @@ code that assumes Discord semantics will be surprised.
   the local cache, not that it still exists remotely. Direct edit/delete calls
   tombstone cache entries when Telegram confirms they are gone; workflow startup
   reconciliation probes unchanged cards with an edit and recreates a card
-  immediately when that probe proves it was deleted. See §6.
+  immediately when that probe proves it was deleted. See §7.

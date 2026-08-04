@@ -139,6 +139,7 @@ describe("core config unknown keys", () => {
           subagents: {
             defaultTimeoutMs: 240_000,
             maxTimeoutMs: 480_000,
+            idleTimeoutMs: 360_000,
           },
         },
       },
@@ -149,6 +150,7 @@ describe("core config unknown keys", () => {
     expect(v2Warnings.paths).toEqual([
       ["agent", "subagents", "defaultTimeoutMs"],
       ["agent", "subagents", "maxTimeoutMs"],
+      ["agent", "subagents", "idleTimeoutMs"],
     ]);
   });
 

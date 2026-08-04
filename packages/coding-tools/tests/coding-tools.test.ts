@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { isToolExpansion } from "@stanley2058/lilac-agent";
 import {
   createToolResultArtifactStore,
@@ -14,6 +14,7 @@ import { asSchema, tool, type ToolExecutionOptions, type ToolSet } from "ai";
 import { z } from "zod";
 
 import {
+  BASH_NO_OUTPUT_TIMEOUT_MS,
   createCodingToolset,
   createEditFileInputSchema,
   createGrepInputSchema,
@@ -103,11 +104,25 @@ describe("coding tools", () => {
       Buffer.byteLength(cappedOutput.stdout + cappedOutput.stderr, "utf8"),
     ).toBeLessThanOrEqual(8);
 
+    // test-wait-justification: verifies the explicit wall deadline while the command emits output
     const timeout = await bash.execute(
-      { command: "sleep 5", timeoutMs: 20 },
+      { command: "while true; do printf tick; sleep 0.01; done", timeoutMs: 50 },
       options("bash-timeout"),
     );
-    expect(timeout).toMatchObject({ executionError: { type: "timeout" } });
+    expect(timeout).toMatchObject({
+      stdout: expect.stringContaining("tick"),
+      executionError: { type: "timeout", timeoutMs: 50, timeoutKind: "wall_clock" },
+    });
+
+    // test-wait-justification: verifies the deadline remains armed after the shell leader exits while a descendant retains its output pipes
+    const backgroundTimeout = await bash.execute(
+      { command: "sleep 5 &", timeoutMs: 50 },
+      options("bash-background-timeout"),
+    );
+    expect(backgroundTimeout).toMatchObject({
+      executionError: { type: "timeout", timeoutMs: 50, timeoutKind: "wall_clock" },
+    });
+    expect(BASH_NO_OUTPUT_TIMEOUT_MS).toBe(3 * 60 * 1000);
 
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 20);
@@ -162,6 +177,38 @@ describe("coding tools", () => {
       options("bash-eof-stdin"),
     );
     expect(eofStdin).toMatchObject({ stdout: "stdin_read_ok\n", exitCode: 0 });
+  });
+
+  it("reports the fixed inactivity deadline as a no-output timeout", async () => {
+    const nativeSetTimeout = globalThis.setTimeout;
+    const shortenedSetTimeout = Object.assign(
+      (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) =>
+        nativeSetTimeout(callback, delay === BASH_NO_OUTPUT_TIMEOUT_MS ? 200 : delay, ...args),
+      { __promisify__: nativeSetTimeout.__promisify__ },
+    );
+    const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+      shortenedSetTimeout as typeof setTimeout,
+    );
+
+    try {
+      const bash = executable(createCodingToolset({ cwd }), "bash");
+      // test-wait-justification: verifies the fixed no-output deadline through a scoped shortened timer
+      const result = await bash.execute(
+        { command: "printf partial; sleep 5" },
+        options("bash-no-output-timeout"),
+      );
+      expect(result).toMatchObject({
+        stdout: "partial",
+        executionError: {
+          type: "timeout",
+          timeoutMs: BASH_NO_OUTPUT_TIMEOUT_MS,
+          timeoutKind: "no_output",
+          signal: "SIGTERM",
+        },
+      });
+    } finally {
+      timerSpy.mockRestore();
+    }
   });
 
   it("blocks expansion-sensitive deletion unless dangerouslyAllow is explicit", async () => {
@@ -495,7 +542,10 @@ describe("coding tools", () => {
       { command: "printf '%0100d' 0; sleep 5", timeoutMs: 20 },
       options("bash-artifact-timeout"),
     );
-    expect(timeout).toMatchObject({ executionError: { type: "timeout" } });
+    expect(timeout).toMatchObject({
+      stdout: expect.stringContaining("0"),
+      executionError: { type: "timeout", timeoutKind: "wall_clock" },
+    });
 
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 20);

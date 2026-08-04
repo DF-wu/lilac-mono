@@ -97,7 +97,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0, roots.length).map((root) => rm(root, { recursive: true })));
 });
 
-async function setup(maxActiveRuns?: number) {
+async function setup(maxActiveRuns?: number, now?: () => number) {
   const root = await mkdtemp(path.join(tmpdir(), "lilac-subagent-workflow-"));
   roots.push(root);
   const workspaceRoot = path.join(root, "workspace");
@@ -114,10 +114,31 @@ async function setup(maxActiveRuns?: number) {
     store,
     dataDir,
     pollMs: 1,
+    now,
     getMaxActiveRuns: maxActiveRuns === undefined ? undefined : () => maxActiveRuns,
   });
   return { root, workspaceRoot, projectRoot, dataDir, dbPath, store, dispatcher };
 }
+
+it("times out an accepted subagent before agent dispatch", async () => {
+  let now = 1_000;
+  const setupResult = await setup(undefined, () => now);
+  const handle = await setupResult.dispatcher.delegate({
+    ...registration(setupResult.projectRoot),
+    mode: "sync",
+    idleTimeoutMs: 1_000,
+  });
+
+  now = 2_001;
+  await expect(handle.completion).resolves.toMatchObject({
+    status: "timeout",
+    detail: "Subagent idle timeout before agent dispatch",
+  });
+  expect(setupResult.store.getRun(handle.runId)).toMatchObject({
+    state: "cancelled",
+    terminalDetail: "Subagent idle timeout before agent dispatch",
+  });
+});
 
 function registration(
   projectRoot: string,

@@ -22,6 +22,7 @@ const bashExecutionErrorSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("timeout"),
     timeoutMs: z.number(),
+    timeoutKind: z.enum(["no_output", "wall_clock"]),
     signal: z.string(),
   }),
   z.object({
@@ -52,7 +53,7 @@ export function bashTool() {
   return {
     bash: tool({
       description:
-        "Execute command in bash. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read_file with truncation.artifactUri to inspect the complete transient result.",
+        "Execute command in bash. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read_file with truncation.artifactUri to inspect the complete transient result.",
       inputSchema: bashInputSchema,
       outputSchema: bashOutputSchema,
       execute: (input, { context, abortSignal, toolCallId }) =>
@@ -86,7 +87,7 @@ export function bashToolWithCwd(
   return {
     bash: tool({
       description:
-        "Execute command in bash. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read_file with truncation.artifactUri to inspect the complete transient result.",
+        "Execute command in bash. Commands are terminated after 3 minutes without stdout or stderr; timeoutMs optionally adds an independent wall-clock deadline. Safety guardrails may block destructive commands unless dangerouslyAllow=true. When output is truncated, use read_file with truncation.artifactUri to inspect the complete transient result.",
       inputSchema: bashInputSchema,
       outputSchema: bashOutputSchema,
       execute: (input, { context, abortSignal, toolCallId }) => {

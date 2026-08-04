@@ -298,6 +298,13 @@ export class WorkflowSubagentDispatcher {
     runId: string,
     acknowledgeSynchronousDelivery: boolean,
   ): Promise<SubagentDelegationOutcome> {
+    const initialRun = this.input.store.getRun(runId);
+    if (!initialRun) throw new Error(`Subagent workflow run disappeared: ${runId}`);
+    const revision = this.input.store.getRevision(initialRun.revisionId);
+    if (!revision)
+      throw new Error(`Subagent workflow revision disappeared: ${initialRun.revisionId}`);
+    const preDispatchDeadline = initialRun.createdAt + revision.resources.operationIdleTimeoutMs;
+
     while (true) {
       const run = this.input.store.getRun(runId);
       if (!run) throw new Error(`Subagent workflow run disappeared: ${runId}`);
@@ -315,6 +322,29 @@ export class WorkflowSubagentDispatcher {
           );
         }
         return completion;
+      }
+
+      const hasDispatchedAgentOperation = this.input.store
+        .listOperations(runId, { limit: 1_000 })
+        .some((operation) => operation.kind === "agent" && operation.state !== "queued");
+      if (
+        !hasDispatchedAgentOperation &&
+        (this.input.now?.() ?? Date.now()) >= preDispatchDeadline
+      ) {
+        const cancelled = this.input.store.cancelRunAndChildren({
+          runId,
+          now: this.input.now?.() ?? Date.now(),
+          detail: "Subagent idle timeout before agent dispatch",
+        });
+        if (cancelled?.state === "cancelled") {
+          await this.input.onRunCancelled?.(cancelled, run.state);
+          return {
+            status: "timeout",
+            finalText: "",
+            detail: "Subagent idle timeout before agent dispatch",
+          };
+        }
+        continue;
       }
       await Bun.sleep(this.input.pollMs ?? 100);
     }

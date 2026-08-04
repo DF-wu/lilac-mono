@@ -6,6 +6,7 @@ import {
   computeTransientRetryDelayMs,
   createAgentRunIdleWatchdog,
   createIdleTimer,
+  createRetryBackoffBudget,
   createTransientModelRetryController,
   isRetryableTransientModelError,
 } from "../index";
@@ -41,6 +42,26 @@ describe("agent run idle watchdog", () => {
     await Bun.sleep(20);
 
     expect(timeoutCount).toBe(0);
+    watchdog.stop();
+  });
+
+  it("can restart with a fresh timeout race after recovery", async () => {
+    let timeoutCount = 0;
+    const watchdog = createAgentRunIdleWatchdog({
+      idleTimeoutMs: 15,
+      onTimeout: () => {
+        timeoutCount += 1;
+      },
+    });
+
+    watchdog.start();
+    await expect(watchdog.waitFor(new Promise<void>(() => {}))).rejects.toThrow(
+      "agent idle timed out after 15ms",
+    );
+
+    watchdog.restart();
+    await expect(watchdog.waitFor(Promise.resolve("recovered"))).resolves.toBe("recovered");
+    expect(timeoutCount).toBe(1);
     watchdog.stop();
   });
 
@@ -114,5 +135,49 @@ describe("transient model retry", () => {
         retrySafety: { canRetry: false, reason: "provider-executed-tool" },
       }),
     ).resolves.toBe("fail");
+  });
+});
+
+describe("retry backoff budget", () => {
+  it("persists its attempt count until exhausted", async () => {
+    const budget = createRetryBackoffBudget({
+      enabled: true,
+      maxRetries: 2,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    });
+
+    await expect(budget.next()).resolves.toEqual({ attempt: 1, delayMs: 0 });
+    expect(budget.attempts).toBe(1);
+    await expect(budget.next()).resolves.toEqual({ attempt: 2, delayMs: 0 });
+    await expect(budget.next()).resolves.toBeNull();
+    expect(budget.attempts).toBe(2);
+  });
+
+  it("refuses attempts when retry is disabled", async () => {
+    const budget = createRetryBackoffBudget({
+      enabled: false,
+      maxRetries: 3,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    });
+
+    await expect(budget.next()).resolves.toBeNull();
+    expect(budget.attempts).toBe(0);
+  });
+
+  it("does not consume an attempt when backoff is aborted", async () => {
+    const budget = createRetryBackoffBudget({
+      enabled: true,
+      maxRetries: 1,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(budget.next(controller.signal)).rejects.toThrow();
+    expect(budget.attempts).toBe(0);
+    await expect(budget.next()).resolves.toEqual({ attempt: 1, delayMs: 0 });
   });
 });

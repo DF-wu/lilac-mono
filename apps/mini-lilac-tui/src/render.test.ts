@@ -1656,13 +1656,46 @@ describe("renderInitialMessages", () => {
         stdout: "work completed before timeout\n",
         stderr: "",
         exitCode: 143,
-        executionError: { type: "timeout", timeoutMs: 500, signal: "SIGTERM" },
+        executionError: {
+          type: "timeout",
+          timeoutMs: 500,
+          signal: "SIGTERM",
+        },
       },
       dynamic: true,
     });
     expect(entries()[0]).toMatchObject({
       tone: "danger",
       text: "$ slow-command\n\nwork completed before timeout\nCommand timed out after 500ms",
+    });
+
+    renderer.startRun();
+    renderer.handle({
+      type: "tool-input-available",
+      toolCallId: "bash-no-output",
+      toolName: "bash",
+      input: { command: "quiet-command" },
+      dynamic: true,
+    });
+    renderer.handle({
+      type: "tool-output-available",
+      toolCallId: "bash-no-output",
+      output: {
+        stdout: "partial output",
+        stderr: "",
+        exitCode: 143,
+        executionError: {
+          type: "timeout",
+          timeoutMs: 180_000,
+          timeoutKind: "no_output",
+          signal: "SIGTERM",
+        },
+      },
+      dynamic: true,
+    });
+    expect(entries().at(-1)).toMatchObject({
+      tone: "danger",
+      text: "$ quiet-command\n\npartial output\nCommand terminated after 180000ms without output",
     });
 
     renderer.startRun();

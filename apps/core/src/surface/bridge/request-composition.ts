@@ -507,7 +507,7 @@ async function composeSelectedSurfaceChain(input: {
       const pendingSurfaceIds: string[] = [];
       for (const messageId of chunk.messageIds) {
         const snapshot = transcriptSnapshotByMessageId.get(messageId);
-        if (!snapshot) {
+        if (!snapshot || snapshot.messages.length === 0) {
           pendingSurfaceIds.push(messageId);
           continue;
         }
@@ -575,15 +575,20 @@ async function composeSelectedSurfaceChain(input: {
         : segmentInputs
             .slice(0, currentSegmentIndex)
             .reduce((count, segment) => count + segment.canonicalMessages.length, 0);
+    const hasEmptyLineageSegment = segmentInputs.some(
+      (segment) => segment.canonicalMessages.length === 0,
+    );
     const corePrimaryLineage =
-      lineageComplete && segmentInputs.length > 0
+      lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment
         ? buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex })
         : createCorePrimaryLineageFreshOnlyV1(
-            currentSegmentIndex < 0
-              ? "current-input-boundary-unreachable"
-              : projectionStore
-                ? "incomplete-request-metadata"
-                : "projection-store-unavailable",
+            hasEmptyLineageSegment
+              ? "empty-lineage-segment"
+              : currentSegmentIndex < 0
+                ? "current-input-boundary-unreachable"
+                : projectionStore
+                  ? "incomplete-request-metadata"
+                  : "projection-store-unavailable",
             currentCanonicalStart,
           );
     return {

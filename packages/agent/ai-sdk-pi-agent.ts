@@ -203,7 +203,7 @@ export type AiSdkPiAssistantMessageEvent<TOOLS extends ToolSet> =
     };
 
 /** Why a turn ended without producing a `turn_end`. */
-export type TurnAbortReason = "cancel" | "interrupt" | "manual";
+export type TurnAbortReason = "cancel" | "interrupt" | "manual" | "recovery";
 
 /** Where the abort occurred: model streaming vs tool execution. */
 export type TurnAbortPhase = "model" | "tools";
@@ -269,7 +269,7 @@ export type AiSdkPiAgentEvent<TOOLS extends ToolSet> =
    */
   | {
       type: "messages_reset";
-      reason: "cancel" | "interrupt";
+      reason: "cancel" | "interrupt" | "recovery";
       messages: ModelMessage[];
       droppedMessageCount: number;
     }
@@ -430,6 +430,20 @@ export type PrepareModelCall = (
 ) => PreparedModelCall | Promise<PreparedModelCall>;
 
 export type TurnErrorHandlerDecision = "retry" | "fail";
+
+export type IdleRecoveryDecisionHandler = (
+  error: unknown,
+  context: { readonly abortSignal: AbortSignal },
+) => TurnErrorHandlerDecision | Promise<TurnErrorHandlerDecision>;
+
+export type IdleRecoveryResult =
+  | { readonly status: "retried" }
+  | { readonly status: "failed" }
+  | { readonly status: "inactive" }
+  | {
+      readonly status: "superseded";
+      readonly reason: Exclude<TurnAbortReason, "recovery">;
+    };
 
 export type TurnErrorPhase = "before-step" | "transform-messages" | "model-call" | "post-model";
 
@@ -733,6 +747,13 @@ type SteeringDeliveryPreparation = SteeringDeliverySelection & {
 type AwaitedSteeringInterruptRequest = {
   settled: boolean;
   readonly resolve: (result: AsyncInterruptQueuedSteeringResult) => void;
+};
+
+type IdleRecoveryRequest = {
+  readonly error: unknown;
+  readonly decideRetry: IdleRecoveryDecisionHandler;
+  readonly resolve: (result: IdleRecoveryResult) => void;
+  settled: boolean;
 };
 
 function takeAll<T>(queue: T[]): T[] {
@@ -1040,6 +1061,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private awaitedSteeringInterrupt: AwaitedSteeringInterruptRequest | null = null;
   private cancelResetPending = false;
   private abortRequestedReason: TurnAbortReason | null = null;
+  private idleRecoveryRequest: IdleRecoveryRequest | null = null;
 
   private prepareFullModelView: PrepareFullModelView | undefined;
   private prepareFullBudgetView: PrepareFullBudgetView | undefined;
@@ -1543,8 +1565,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.abortRequestedReason = "cancel";
     } else if (reason === "interrupt" && this.abortRequestedReason !== "cancel") {
       this.abortRequestedReason = "interrupt";
-    } else if (!this.abortRequestedReason) {
+    } else if (
+      reason === "manual" &&
+      this.abortRequestedReason !== "cancel" &&
+      this.abortRequestedReason !== "interrupt"
+    ) {
       this.abortRequestedReason = "manual";
+    } else if (reason === "recovery" && !this.abortRequestedReason) {
+      this.abortRequestedReason = "recovery";
     }
 
     this.abortController?.abort();
@@ -1624,6 +1652,43 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
     this.pendingInterrupt = [makeUserMessage(message)];
     this.requestAbort("interrupt");
+  }
+
+  /**
+   * Abort and replay the active attempt from its latest recovery checkpoint.
+   * The decision runs only after the model and tools have cooperatively settled.
+   */
+  requestIdleRecovery(
+    error: unknown,
+    decideRetry: IdleRecoveryDecisionHandler,
+  ): Promise<IdleRecoveryResult> {
+    if (!this.state.isStreaming) return Promise.resolve({ status: "inactive" });
+    if (this.idleRecoveryRequest) {
+      return Promise.reject(new Error("Idle recovery already pending"));
+    }
+    if (this.cancelResetPending) {
+      return Promise.resolve({ status: "superseded", reason: "cancel" });
+    }
+    if (this.pendingInterrupt || this.awaitedSteeringInterrupt) {
+      return Promise.resolve({ status: "superseded", reason: "interrupt" });
+    }
+    if (
+      this.abortController?.signal.aborted &&
+      this.abortRequestedReason &&
+      this.abortRequestedReason !== "recovery"
+    ) {
+      return Promise.resolve({ status: "superseded", reason: this.abortRequestedReason });
+    }
+
+    return new Promise<IdleRecoveryResult>((resolve) => {
+      this.idleRecoveryRequest = {
+        error,
+        decideRetry,
+        resolve,
+        settled: false,
+      };
+      this.requestAbort("recovery");
+    });
   }
 
   /** Wait until the agent finishes processing (or aborts/errors). */
@@ -1833,9 +1898,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     });
   }
 
-  private beginFreshPostInterruptPhase(): void {
+  private beginFreshPostInterruptPhase(): AbortSignal {
     this.abortController = new AbortController();
     this.abortRequestedReason = null;
+    return this.abortController.signal;
   }
 
   private async prepareQueuedSteeringDelivery(): Promise<
@@ -1926,15 +1992,22 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   private resetMessagesAfterAbort(
-    reason: "cancel" | "interrupt",
+    reason: "cancel" | "interrupt" | "recovery",
     appendBeforeRecovery: ModelMessage[] = [],
   ) {
     const truncated = truncateToLastValidBoundary(this.state.messages);
     const checkpoint = this.recoveryCheckpoint;
+    const checkpointSuffix = checkpoint === null ? [] : cloneMessages(checkpoint.suffixMessages);
+    const retryableSuffix =
+      reason === "recovery" &&
+      checkpointSuffix.at(-1)?.role === "assistant" &&
+      !hasInlineToolResult(checkpointSuffix.at(-1)!)
+        ? []
+        : checkpointSuffix;
     this.state.messages = [
       ...(checkpoint === null ? truncated.messages : cloneMessages(checkpoint.baseMessages)),
       ...appendBeforeRecovery,
-      ...(checkpoint === null ? [] : cloneMessages(checkpoint.suffixMessages)),
+      ...retryableSuffix,
     ];
     this.state.streamMessage = null;
     this.state.pendingToolCalls = new Set();
@@ -1947,6 +2020,54 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       messages: this.state.messages.map(cloneMessage),
       droppedMessageCount: truncated.droppedMessageCount,
     });
+  }
+
+  private settleIdleRecovery(request: IdleRecoveryRequest, result: IdleRecoveryResult): void {
+    if (request.settled) return;
+    request.settled = true;
+    if (this.idleRecoveryRequest === request) this.idleRecoveryRequest = null;
+    request.resolve(result);
+  }
+
+  private idleRecoverySupersedingReason(): Exclude<TurnAbortReason, "recovery"> | null {
+    if (this.cancelResetPending) return "cancel";
+    if (this.pendingInterrupt || this.awaitedSteeringInterrupt) return "interrupt";
+    if (!this.abortController?.signal.aborted) return null;
+    const reason = this.abortRequestedReason;
+    return reason && reason !== "recovery" ? reason : null;
+  }
+
+  private async finishIdleRecovery(request: IdleRecoveryRequest): Promise<void> {
+    const beforeResetReason = this.idleRecoverySupersedingReason();
+    if (beforeResetReason) {
+      this.settleIdleRecovery(request, { status: "superseded", reason: beforeResetReason });
+      return;
+    }
+
+    this.resetMessagesAfterAbort("recovery");
+    const abortSignal = this.beginFreshPostInterruptPhase();
+
+    let decision: TurnErrorHandlerDecision = "fail";
+    try {
+      decision = await request.decideRetry(request.error, {
+        abortSignal,
+      });
+    } catch {
+      // A failed retry decision refuses recovery; the original idle error remains authoritative.
+    }
+
+    const supersedingReason = this.idleRecoverySupersedingReason();
+    if (supersedingReason) {
+      this.settleIdleRecovery(request, { status: "superseded", reason: supersedingReason });
+      return;
+    }
+    if (decision === "retry") {
+      this.settleIdleRecovery(request, { status: "retried" });
+      return;
+    }
+
+    this.settleIdleRecovery(request, { status: "failed" });
+    throw request.error;
   }
 
   private checkpointRecoveryDraft(message: AssistantModelMessage): void {
@@ -1963,6 +2084,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   }
 
   private finishCancellation() {
+    const recoveryRequest = this.idleRecoveryRequest;
+    if (recoveryRequest) {
+      this.settleIdleRecovery(recoveryRequest, { status: "superseded", reason: "cancel" });
+    }
     const awaitedInterrupt = this.awaitedSteeringInterrupt;
     if (awaitedInterrupt) {
       this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
@@ -2006,6 +2131,21 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             this.emit({ type: "turn_abort", reason: "cancel", phase: "tools" });
             this.finishCancellation();
             break;
+          }
+
+          const idleRecoveryRequest = this.idleRecoveryRequest;
+          if (idleRecoveryRequest) {
+            const supersedingReason = this.idleRecoverySupersedingReason();
+            if (supersedingReason) {
+              this.settleIdleRecovery(idleRecoveryRequest, {
+                status: "superseded",
+                reason: supersedingReason,
+              });
+            } else {
+              this.emit({ type: "turn_abort", reason: "recovery", phase: "tools" });
+              await this.finishIdleRecovery(idleRecoveryRequest);
+              continue;
+            }
           }
 
           // Awaited steering interrupts prepare only after the active phase has settled.
@@ -2190,12 +2330,24 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             break;
           } catch (err) {
             if (err instanceof TurnAbortedError) {
+              const idleRecoveryRequest = this.idleRecoveryRequest;
+              if (idleRecoveryRequest && err.reason !== "recovery") {
+                this.settleIdleRecovery(idleRecoveryRequest, {
+                  status: "superseded",
+                  reason: err.reason,
+                });
+              }
               this.emit({
                 type: "turn_abort",
                 reason: err.reason,
                 phase: err.phase,
                 detail: err.detail,
               });
+
+              if (err.reason === "recovery" && idleRecoveryRequest) {
+                await this.finishIdleRecovery(idleRecoveryRequest);
+                continue;
+              }
 
               if (this.cancelResetPending && err.reason !== "cancel") {
                 this.finishCancellation();
@@ -2332,6 +2484,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         const awaitedInterrupt = this.awaitedSteeringInterrupt;
         if (awaitedInterrupt) {
           this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
+        }
+        const idleRecoveryRequest = this.idleRecoveryRequest;
+        if (idleRecoveryRequest) {
+          this.settleIdleRecovery(idleRecoveryRequest, { status: "inactive" });
         }
         this.state.isStreaming = false;
         this.state.streamMessage = null;
@@ -2488,7 +2644,15 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       : selectedCanonical;
     messagesForModel = normalizeReplayMessages(messagesForModel);
     if (messagesForModel.at(-1)?.role === "assistant") {
-      throw new Error("Cannot append an ephemeral overlay after an assistant message");
+      throw new Error("Cannot append an ephemeral overlay after an assistant message", {
+        cause: {
+          code: "INVALID_PRE_OVERLAY_MODEL_VIEW",
+          suffixStart,
+          canonicalMessageCount: canonicalMessages.length,
+          selectedCanonicalRoles: selectedCanonical.slice(-4).map((message) => message.role),
+          preparedModelRoles: messagesForModel.slice(-4).map((message) => message.role),
+        },
+      });
     }
     const payloadOverlay = this.buildEphemeralOverlay
       ? await this.buildEphemeralOverlay(preparationContext)

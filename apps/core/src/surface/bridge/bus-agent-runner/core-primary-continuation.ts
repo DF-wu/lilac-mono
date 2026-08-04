@@ -190,13 +190,20 @@ export function prepareCorePrimaryHistoryView(input: {
   readonly canonicalStartIndex?: number;
 }): ModelMessage[] {
   if (!input.replayHistoricalPrefix) return [...input.canonicalMessages];
-  const historicalEnd = Math.max(
+  const requestedHistoricalEnd = Math.max(
     0,
     Math.min(
       input.canonicalMessages.length,
       (input.lineage?.currentCanonicalStart ?? 0) - (input.canonicalStartIndex ?? 0),
     ),
   );
+  const trailingToolExchangeStart =
+    requestedHistoricalEnd === input.canonicalMessages.length
+      ? completedTrailingToolExchangeStart(input.canonicalMessages, requestedHistoricalEnd)
+      : null;
+  // A continuation-triggering tool result must remain structural even if a stale
+  // lineage boundary classifies the whole transcript as portable history.
+  const historicalEnd = trailingToolExchangeStart ?? requestedHistoricalEnd;
   return [
     ...preparePlainTextReplayForTarget(input.canonicalMessages.slice(0, historicalEnd), {
       providerFamily: input.targetFamily,
@@ -208,9 +215,48 @@ export function prepareCorePrimaryHistoryView(input: {
   ];
 }
 
+function completedTrailingToolExchangeStart(
+  messages: readonly ModelMessage[],
+  end: number,
+): number | null {
+  if (end <= 0 || messages[end - 1]?.role !== "tool") return null;
+
+  let firstToolIndex = end - 1;
+  while (firstToolIndex > 0 && messages[firstToolIndex - 1]?.role === "tool") {
+    firstToolIndex -= 1;
+  }
+
+  const assistantIndex = firstToolIndex - 1;
+  const assistant = messages[assistantIndex];
+  if (assistant?.role !== "assistant" || !Array.isArray(assistant.content)) return null;
+
+  const unresolved = new Set<string>();
+  for (const part of assistant.content) {
+    if (part.type === "tool-call") {
+      if (unresolved.has(part.toolCallId)) return null;
+      unresolved.add(part.toolCallId);
+    } else if (part.type === "tool-result" && !unresolved.delete(part.toolCallId)) {
+      return null;
+    }
+  }
+  if (unresolved.size === 0) return null;
+
+  for (let index = firstToolIndex; index < end; index += 1) {
+    const message = messages[index];
+    if (message?.role !== "tool") return null;
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || !unresolved.delete(part.toolCallId)) return null;
+    }
+  }
+
+  return unresolved.size === 0 ? assistantIndex : null;
+}
+
 function lineageFingerprint(lineage: CorePrimaryLineageV1 | undefined): string {
   if (!lineage) return "missing";
-  if (lineage.state === "fresh-only") return `fresh-only:${lineage.reason}`;
+  if (lineage.state === "fresh-only") {
+    return `fresh-only:${lineage.reason}:${lineage.currentCanonicalStart}`;
+  }
   const last = lineage.segments[lineage.segments.length - 1];
   return last
     ? `complete:${lineage.currentCanonicalStart}:${last.cumulativeAtomCount}:${last.cumulativePrefixDigest}:${last.canonicalEnd}`
