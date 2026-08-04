@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { env } from "./env";
+import { isPanic, isRecord, opaqueErrorMessage } from "./runtime-utils";
+import { redactErrorTextForLog } from "./tagged-error-log";
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 type FetchInit = Parameters<typeof globalThis.fetch>[1];
@@ -21,7 +23,7 @@ const SENSITIVE_KEY_RE = /(authorization|api[_-]?key|token|secret|password|cooki
 const PREVIEW_TEXT_LIMIT = 2_000;
 
 class JsonlWriter {
-  private queue: Promise<void> = Promise.resolve();
+  private queue: Promise<boolean> = Promise.resolve(true);
   private failed = false;
   private failureLogged = false;
 
@@ -34,19 +36,26 @@ class JsonlWriter {
     if (this.failed) return;
 
     const line = `${JSON.stringify(entry)}\n`;
-    this.queue = this.queue
-      .then(() => fs.appendFile(this.filePath, line, "utf8"))
-      .catch((error) => {
-        this.failed = true;
-        if (!this.failureLogged) {
-          this.failureLogged = true;
-          this.onError({ filePath: this.filePath, error });
-        }
-      });
+    this.queue = this.queue.then(() => this.append(line));
   }
 
-  flush(): Promise<void> {
-    return this.queue;
+  async flush(): Promise<void> {
+    await this.queue;
+  }
+
+  private async append(line: string): Promise<boolean> {
+    try {
+      await fs.appendFile(this.filePath, line, "utf8");
+      return true;
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
+      this.failed = true;
+      if (!this.failureLogged) {
+        this.failureLogged = true;
+        this.onError({ filePath: this.filePath, error: cause });
+      }
+      return false;
+    }
   }
 }
 
@@ -93,7 +102,7 @@ export function withLlmWireDebugFetch(params: {
         event: "request.error",
         data: {
           elapsedMs: Date.now() - startedAt,
-          error: error instanceof Error ? error.message : String(error),
+          error: redactErrorTextForLog(opaqueErrorMessage(error, "Unknown LLM request failure")),
         },
       });
       await writer?.flush();
@@ -150,11 +159,11 @@ export function withLlmWireDebugFetch(params: {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
-      }) as FetchResponse;
+      });
     }
 
     void captureNonStreamingResponse({
-      response: response.clone() as unknown as FetchResponse,
+      response: response.clone(),
       writer,
       provider: params.provider,
       traceId,
@@ -179,15 +188,18 @@ async function createWriter(
         provider,
         traceId,
         filePath: failedPath,
-        error: error instanceof Error ? error.message : String(error),
+        error: redactErrorTextForLog(
+          opaqueErrorMessage(error, "Unknown trace-file creation failure"),
+        ),
       });
     });
   } catch (error) {
+    if (isPanic(error)) throw error;
     warn?.("llm wire debug disabled for request (failed to create trace file)", {
       provider,
       traceId,
       filePath,
-      error: error instanceof Error ? error.message : String(error),
+      error: redactErrorTextForLog(opaqueErrorMessage(error, "Unknown response body read failure")),
     });
     return null;
   }
@@ -225,7 +237,7 @@ async function captureRequestSnapshot(input: {
 }
 
 async function captureNonStreamingResponse(input: {
-  response: FetchResponse;
+  response: { text(): Promise<string> };
   writer: JsonlWriter | null;
   provider: string;
   traceId: string;
@@ -239,8 +251,9 @@ async function captureNonStreamingResponse(input: {
     const text = await response.text();
     body = toRedactedBodyPreview(text, maxBodyBytes);
   } catch (error) {
+    if (isPanic(error)) throw error;
     body = {
-      error: error instanceof Error ? error.message : String(error),
+      error: redactErrorTextForLog(opaqueErrorMessage(error, "Unknown response body read failure")),
     };
   }
 
@@ -282,6 +295,7 @@ async function consumeSseDebugStream(input: {
   let buffered = "";
   let eventCount = 0;
   let truncated = false;
+  let deferredPanic: unknown;
 
   try {
     while (true) {
@@ -341,25 +355,28 @@ async function consumeSseDebugStream(input: {
           event: "response.sse.event",
           data: {
             index: eventCount,
-            eventType:
-              parsed && typeof parsed === "object" && "type" in parsed
-                ? String((parsed as Record<string, unknown>).type)
-                : null,
+            eventType: projectWireDebugEventType(isRecord(parsed) ? parsed : null),
             payload: parsed ? redactValue(parsed) : previewText(data, maxBodyBytes),
           },
         });
       }
     }
   } catch (error) {
-    writer?.write({
-      ts: new Date().toISOString(),
-      provider,
-      traceId,
-      event: "response.sse.error",
-      data: {
-        error: error instanceof Error ? error.message : String(error),
-      },
-    });
+    if (isPanic(error)) {
+      deferredPanic = error;
+    } else {
+      writer?.write({
+        ts: new Date().toISOString(),
+        provider,
+        traceId,
+        event: "response.sse.error",
+        data: {
+          error: redactErrorTextForLog(
+            opaqueErrorMessage(error, "Unknown SSE debug stream failure"),
+          ),
+        },
+      });
+    }
   } finally {
     writer?.write({
       ts: new Date().toISOString(),
@@ -372,11 +389,18 @@ async function consumeSseDebugStream(input: {
         eventCount,
       },
     });
-    await writer?.flush();
+    try {
+      await writer?.flush();
+    } catch (cause) {
+      if (deferredPanic === undefined && isPanic(cause)) deferredPanic = cause;
+    }
     try {
       reader.releaseLock();
-    } catch {}
+    } catch (cause) {
+      if (deferredPanic === undefined && isPanic(cause)) deferredPanic = cause;
+    }
   }
+  if (deferredPanic !== undefined) throw deferredPanic;
 }
 
 function extractSseData(frame: string): string {
@@ -392,9 +416,15 @@ function extractSseData(frame: string): string {
 function safeParseJson(text: string): unknown | null {
   try {
     return JSON.parse(text) as unknown;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return null;
   }
+}
+
+function projectWireDebugEventType(value: Record<string, unknown> | null): string | null {
+  if (!value) return null;
+  return typeof value.type === "string" ? value.type : null;
 }
 
 function toRedactedBodyPreview(body: string | undefined, maxBytes: number): unknown {
@@ -441,9 +471,9 @@ function redactValue(value: unknown, depth = 0): unknown {
     return value.slice(0, 100).map((item) => redactValue(item, depth + 1));
   }
 
-  if (typeof value === "object") {
+  if (isRecord(value)) {
     const out: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    for (const [key, item] of Object.entries(value)) {
       if (SENSITIVE_KEY_RE.test(key)) {
         out[key] = "<redacted>";
       } else {
@@ -543,7 +573,8 @@ async function decodeRequestBody(input: FetchInput, init?: FetchInit): Promise<s
   if (input instanceof Request) {
     try {
       return await input.clone().text();
-    } catch {
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
       return undefined;
     }
   }

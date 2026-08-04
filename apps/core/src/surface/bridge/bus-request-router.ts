@@ -3,7 +3,6 @@ import {
   extractAiErrorLogDetails,
   getCoreConfig,
   env,
-  errorMessage,
   isPanic,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
@@ -17,12 +16,18 @@ import {
   type EventDeliveryStopFailed,
   type EvtAdapterMessageCreatedData,
   type LilacBus,
+  type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter } from "../adapter";
 import type { MsgRef } from "../types";
 import type { TranscriptStore } from "../../transcript/transcript-store";
-import { composeRequestMessages, composeSingleMessageWithLineage } from "./request-composition";
+import {
+  composeRequestMessages,
+  composeSingleMessageWithLineage,
+  type RequestCompositionResult,
+} from "./request-composition";
 import { formatDiscordMessageRequestId } from "./request-ids";
 
 import {
@@ -50,6 +55,7 @@ import {
   getDiscordFlags,
   withDefaultToolsConfig,
 } from "./bus-request-router/common";
+
 import {
   type BufferedMessage,
   type RouterGateInput,
@@ -82,6 +88,21 @@ import {
   customCommandInvocationErrorText,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
+import { formatBridgeTaggedErrorForLog } from "./bridge-log";
+
+function createFreshOnlyLineage(
+  reason: string,
+  currentCanonicalStart: number,
+): CorePrimaryLineageV1 {
+  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  if (created.status === "ok") return created.value;
+  return {
+    state: "fresh-only",
+    lineageVersion: 1,
+    currentCanonicalStart: 0,
+    reason: "lineage-fallback-construction-failed",
+  };
+}
 
 type ActiveSessionState = {
   requestId: string;
@@ -115,6 +136,16 @@ export class BusRequestRouterDebounceFlushFailed extends TaggedError(
   "BusRequestRouterDebounceFlushFailed",
 )<{
   readonly sessionId: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class BusRequestRouterConfigReloadFailed extends TaggedError("BusRequestRouterConfigReloadFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class BusRequestRouterSuppressionFailed extends TaggedError("BusRequestRouterSuppressionFailed")<{
   readonly cause: unknown;
   readonly message: string;
 }> {}
@@ -220,6 +251,22 @@ function adaptRouterSubscriptionStart(
   return result.value;
 }
 
+function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
+  if (result.status === "ok") return result.value;
+  let failure: unknown;
+  switch (result.error._tag) {
+    case "CoreConfigV1Invalid":
+    case "CoreConfigV2Invalid":
+      failure = result.error.cause;
+      break;
+    case "CoreConfigVersionInvalid":
+    case "CoreConfigMustBeObject":
+      failure = new Error(result.error.message);
+      break;
+  }
+  throw failure;
+}
+
 function superviseRouterSubscriptionsDone(
   subscriptions: readonly RouterDeliverySubscription[],
 ): Promise<ResultType<void, EventDeliveryDoneError>> {
@@ -283,14 +330,20 @@ export async function startBusRequestRouter(params: {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
+  /** Optional structured logger injection for embedding and tests. */
+  logger?: Logger;
 }): Promise<BusRequestRouter> {
   const { adapter, bus, subscriptionId, customCommands } = params;
 
-  const logger = createLogger({
-    module: "bus-request-router",
-  });
+  const logger =
+    params.logger ??
+    createLogger({
+      module: "bus-request-router",
+    });
 
-  let cfg = params.config ? await withDefaultToolsConfig(params.config) : await getCoreConfig();
+  let cfg = params.config
+    ? adaptRouterConfigResult(withDefaultToolsConfig(params.config))
+    : await getCoreConfig();
   let coreConfigReloadHadError = false;
   let lastCoreConfigReloadError: string | null = null;
 
@@ -310,12 +363,16 @@ export async function startBusRequestRouter(params: {
       lastCoreConfigReloadError = null;
     } catch (e) {
       if (isPanic(e)) throw e;
-      const msg = errorMessage(e);
+      const failure = new BusRequestRouterConfigReloadFailed({
+        cause: e,
+        message: "Core config reload failed",
+      });
+      const logContext = formatBridgeTaggedErrorForLog(failure, {
+        path: "core-config.yaml",
+      });
+      const msg = logContext.errorMessage;
       if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
-        logger.warn("core-config reload failed; using last known config", {
-          path: "core-config.yaml",
-          error: msg,
-        });
+        logger.warn("core-config reload failed; using last known config", logContext);
       }
 
       coreConfigReloadHadError = true;
@@ -384,7 +441,15 @@ export async function startBusRequestRouter(params: {
       return await params.shouldSuppressAdapterEvent({ evt });
     } catch (cause) {
       if (isPanic(cause)) throw cause;
-      logger.error("router suppression hook failed; proceeding", cause);
+      logger.error(
+        "router suppression hook failed; proceeding",
+        formatBridgeTaggedErrorForLog(
+          new BusRequestRouterSuppressionFailed({
+            cause,
+            message: "Router suppression hook failed",
+          }),
+        ),
+      );
       return { suppress: false };
     }
   }
@@ -397,10 +462,17 @@ export async function startBusRequestRouter(params: {
       return await evaluateRouterGate(input.gateInput);
     } catch (cause) {
       if (isPanic(cause)) throw cause;
+      const failure = new BusRequestRouterActiveBatchGateFailed({
+        sessionId: input.sessionId,
+        cause,
+        message: "Direct-reply router gate failed",
+      });
       logger.error(
         "router direct-reply gate failed; forwarding",
-        { sessionId: input.sessionId, ...extractAiErrorLogDetails(cause) },
-        cause,
+        formatBridgeTaggedErrorForLog(failure, {
+          sessionId: input.sessionId,
+          ...extractAiErrorLogDetails(cause),
+        }),
       );
       return { forward: true, reason: "error-fail-open" };
     }
@@ -980,11 +1052,18 @@ export async function startBusRequestRouter(params: {
         msgRef: last.msgRef,
       },
     });
+    if (composed.status === "error") {
+      logger.error("request composition failed", {
+        requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+      return;
+    }
+    const composition = composed.value;
 
-    const chainMessageIds = new Set(composed.chainMessageIds);
-    const extraCompositions: Array<
-      NonNullable<Awaited<ReturnType<typeof composeSingleMessageWithLineage>>>
-    > = [];
+    const chainMessageIds = new Set(composition.chainMessageIds);
+    const extraCompositions: RequestCompositionResult[] = [];
     const batchParticipantUserIds: string[] = [];
 
     for (const item of batch.items) {
@@ -1001,53 +1080,61 @@ export async function startBusRequestRouter(params: {
         transformUserText: transformPendingUserText(item),
       });
 
-      if (!extra) continue;
-      extraCompositions.push(extra);
+      if (extra.status === "error") {
+        logger.error("request composition failed", {
+          requestId,
+          sessionId: input.sessionId,
+          error: "Core owned blob integrity check failed",
+        });
+        return;
+      }
+      if (!extra.value) continue;
+      extraCompositions.push(extra.value);
       chainMessageIds.add(item.msgRef.messageId);
     }
 
-    let baseInsertAt = composed.messages.length;
+    let baseInsertAt = composition.messages.length;
     const finalMessages = (() => {
       const extraMessages = extraCompositions.flatMap((extra) => extra.messages);
-      if (extraMessages.length === 0) return composed.messages;
+      if (extraMessages.length === 0) return composition.messages;
 
-      for (let i = composed.messages.length - 1; i >= 0; i--) {
-        if (composed.messages[i]?.role === "user") {
+      for (let i = composition.messages.length - 1; i >= 0; i--) {
+        if (composition.messages[i]?.role === "user") {
           baseInsertAt = i;
           break;
         }
       }
 
-      if (baseInsertAt === composed.messages.length) {
-        return [...composed.messages, ...extraMessages];
+      if (baseInsertAt === composition.messages.length) {
+        return [...composition.messages, ...extraMessages];
       }
 
       return [
-        ...composed.messages.slice(0, baseInsertAt),
+        ...composition.messages.slice(0, baseInsertAt),
         ...extraMessages,
-        ...composed.messages.slice(baseInsertAt),
+        ...composition.messages.slice(baseInsertAt),
       ];
     })();
     const finalLineage = (() => {
-      if (extraCompositions.length === 0) return composed.corePrimaryLineage;
+      if (extraCompositions.length === 0) return composition.corePrimaryLineage;
       if (
-        composed.corePrimaryLineage.state !== "complete" ||
+        composition.corePrimaryLineage.state !== "complete" ||
         extraCompositions.some((extra) => extra.corePrimaryLineage.state !== "complete")
       ) {
-        return createCorePrimaryLineageFreshOnlyV1(
+        return createFreshOnlyLineage(
           "deferred-batch-incomplete-lineage",
-          Math.min(baseInsertAt, composed.corePrimaryLineage.currentCanonicalStart),
+          Math.min(baseInsertAt, composition.corePrimaryLineage.currentCanonicalStart),
         );
       }
-      const baseSegments = composed.corePrimaryLineage.segments;
+      const baseSegments = composition.corePrimaryLineage.segments;
       const insertSegmentIndex =
-        baseInsertAt === composed.messages.length
+        baseInsertAt === composition.messages.length
           ? baseSegments.length
           : baseSegments.findIndex((segment) => segment.canonicalStart === baseInsertAt);
       if (insertSegmentIndex < 0) {
-        return createCorePrimaryLineageFreshOnlyV1(
+        return createFreshOnlyLineage(
           "deferred-batch-unaligned-insertion",
-          composed.corePrimaryLineage.currentCanonicalStart,
+          composition.corePrimaryLineage.currentCanonicalStart,
         );
       }
       const extraSegments = extraCompositions.flatMap((extra) =>
@@ -1059,7 +1146,8 @@ export async function startBusRequestRouter(params: {
         ...baseSegments.slice(insertSegmentIndex),
       ];
       const baseCurrentSegment = baseSegments.findIndex(
-        (segment) => segment.canonicalStart === composed.corePrimaryLineage.currentCanonicalStart,
+        (segment) =>
+          segment.canonicalStart === composition.corePrimaryLineage.currentCanonicalStart,
       );
       const currentSegmentIndex = Math.min(
         insertSegmentIndex,
@@ -1068,7 +1156,7 @@ export async function startBusRequestRouter(params: {
           : baseCurrentSegment +
               (insertSegmentIndex <= baseCurrentSegment ? extraSegments.length : 0),
       );
-      return buildCoreLineageManifestV1(
+      const built = buildCoreLineageManifestV1(
         combinedSegments.map((segment) => ({
           atoms: segment.atoms,
           canonicalMessages: segment.canonicalMessages,
@@ -1076,6 +1164,12 @@ export async function startBusRequestRouter(params: {
         })),
         { currentSegmentIndex },
       );
+      return built.status === "ok"
+        ? built.value
+        : createFreshOnlyLineage(
+            "deferred-batch-lineage-build-failed",
+            composition.corePrimaryLineage.currentCanonicalStart,
+          );
     })();
 
     await publishBusRequest({
@@ -1092,10 +1186,10 @@ export async function startBusRequestRouter(params: {
       raw: {
         triggerType: "reply",
         chainMessageIds: [...chainMessageIds],
-        mergedGroups: composed.mergedGroups,
+        mergedGroups: composition.mergedGroups,
         participantUserIds: uniqueParticipantUserIds({
           values: [
-            ...composed.mergedGroups.map((group) => group.authorId),
+            ...composition.mergedGroups.map((group) => group.authorId),
             ...batchParticipantUserIds,
           ],
           exclude: self.userId,
@@ -1676,7 +1770,10 @@ export async function startBusRequestRouter(params: {
       reportFatalPanic: debounceDefect.reject,
     });
     if (flushed.status === "error") {
-      logger.error("router flushDebounce failed", { sessionId }, flushed.error.cause);
+      logger.error(
+        "router flushDebounce failed",
+        formatBridgeTaggedErrorForLog(flushed.error, { sessionId }),
+      );
     }
   }
 
@@ -1707,8 +1804,10 @@ export async function startBusRequestRouter(params: {
       if (evaluated.status === "error") {
         logger.error(
           "router gate failed; skipping",
-          { sessionId, ...extractAiErrorLogDetails(evaluated.error.cause) },
-          evaluated.error.cause,
+          formatBridgeTaggedErrorForLog(evaluated.error, {
+            sessionId,
+            ...extractAiErrorLogDetails(evaluated.error.cause),
+          }),
         );
         decision = { forward: false, reason: "error" };
       } else {
@@ -2007,7 +2106,7 @@ export async function startBusRequestRouter(params: {
 
   async function publishComposedRequest(input: PublishComposedLocalInput) {
     const { adapter, bus, cfg, ...requestInput } = input;
-    await publishComposedRequestImpl({
+    const published = await publishComposedRequestImpl({
       adapter,
       bus,
       cfg,
@@ -2015,6 +2114,13 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+    }
   }
 
   type PublishActiveChannelPromptLocalInput = Parameters<
@@ -2028,7 +2134,7 @@ export async function startBusRequestRouter(params: {
 
   async function publishActiveChannelPrompt(input: PublishActiveChannelPromptLocalInput) {
     const { adapter, bus, cfg, markActive, ...requestInput } = input;
-    await publishActiveChannelPromptImpl({
+    const published = await publishActiveChannelPromptImpl({
       adapter,
       bus,
       cfg,
@@ -2036,6 +2142,14 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+      return;
+    }
 
     if (markActive) {
       activeBySession.set(input.sessionId, {
@@ -2057,7 +2171,7 @@ export async function startBusRequestRouter(params: {
     input: PublishSingleMessageToActiveRequestLocalInput,
   ) {
     const { adapter, bus, cfg, ...requestInput } = input;
-    await publishSingleMessageToActiveRequestImpl({
+    const published = await publishSingleMessageToActiveRequestImpl({
       adapter,
       bus,
       cfg,
@@ -2065,6 +2179,13 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+    }
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<
@@ -2077,7 +2198,7 @@ export async function startBusRequestRouter(params: {
 
   async function publishSingleMessagePrompt(input: PublishSingleMessagePromptLocalInput) {
     const { adapter, bus, cfg, ...requestInput } = input;
-    await publishSingleMessagePromptImpl({
+    const published = await publishSingleMessagePromptImpl({
       adapter,
       bus,
       cfg,
@@ -2085,6 +2206,13 @@ export async function startBusRequestRouter(params: {
       logger,
       input: requestInput,
     });
+    if (published.status === "error") {
+      logger.error("request composition failed", {
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        error: "Core owned blob integrity check failed",
+      });
+    }
   }
 
   async function publishSurfaceOutputReanchor(

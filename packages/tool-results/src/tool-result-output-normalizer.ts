@@ -1,12 +1,9 @@
 import { createLogger } from "@stanley2058/lilac-utils";
 import type { ToolModelMessage } from "ai";
-import { Panic } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { stripVTControlCharacters } from "node:util";
 
-import {
-  ToolResultArtifactTooLargeError,
-  type ToolResultArtifactStore,
-} from "./tool-result-artifact-store";
+import { type ToolResultArtifactStore } from "./tool-result-artifact-store";
 
 const GENERATED_OVERFLOW_REFERENCE =
   /^\[tool result overflow\]\nThe tool completed, but its output exceeded the inline limit\.\n(?:Complete captured output: tool-result:\/\/[0-9a-f-]{36}\nUse read_file with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse nextStart unchanged while more content remains\. Do not re-run the original tool\.|The complete output could not be retained\. Narrow the request or re-run the tool\.)$/u;
@@ -16,6 +13,8 @@ export type ToolResultOutput = Extract<
   ToolModelMessage["content"][number],
   { type: "tool-result" }
 >["output"];
+
+type JsonToolResultOutput = Extract<ToolResultOutput, { type: "json" | "error-json" }>;
 
 type MeasuredText = {
   outputIndex: number;
@@ -62,10 +61,15 @@ export type LegacyToolResultOutputNormalizerConfig = {
   maxArtifactBytes?: number;
 };
 
-export type ToolResultOutputNormalizerOwner = (
-  | { scopeId: string; sessionId?: string }
-  | { scopeId?: string; sessionId: string }
-) & { requestId: string };
+export type ToolResultOutputNormalizerOwner = ({ scopeId: string } | { sessionId: string }) & {
+  requestId: string;
+};
+
+class ToolResultOutputSerializationFailed extends TaggedError(
+  "ToolResultOutputSerializationFailed",
+)<{
+  readonly message: string;
+}> {}
 
 export type ToolResultOutputNormalizerOptions = {
   artifacts?: ToolResultArtifactStore;
@@ -118,9 +122,22 @@ function resolveConfig(
 }
 
 function ownerScopeId(owner: ToolResultOutputNormalizerOwner): string {
-  const scopeId = owner.scopeId ?? owner.sessionId;
-  if (!scopeId) throw new Error("Tool result normalizer owner scopeId is required");
-  return scopeId;
+  return "scopeId" in owner ? owner.scopeId : owner.sessionId;
+}
+
+function serializeOutput(
+  value: JsonToolResultOutput["value"],
+): ResultType<string | undefined, ToolResultOutputSerializationFailed> {
+  try {
+    return Result.ok(JSON.stringify(value, null, 2));
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new ToolResultOutputSerializationFailed({
+        message: "Tool result output is not JSON-serializable",
+      }),
+    );
+  }
 }
 
 export function createOverflowReferenceNormalizer(
@@ -146,35 +163,23 @@ export function createOverflowReferenceNormalizer(
     if (!spill) return value;
 
     let uri: string | undefined;
-    let artifact: Awaited<ReturnType<ToolResultArtifactStore["create"]>> | undefined;
-    try {
-      artifact = await params.artifacts?.create({
-        scopeId: ownerScopeId(params.owner),
-        requestId: params.owner.requestId,
-        ...context,
-        content: value,
-        ttlMs: config.artifactTtlMs,
-        maxBytesPerScope: config.maxArtifactBytesPerScope,
-        ...(config.maxArtifactBytes === undefined
-          ? {}
-          : { maxArtifactBytes: config.maxArtifactBytes }),
-      });
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      logger.warn("tool.artifact.write_failed", {
-        toolName: context.toolName,
-        errorTag: "ArtifactPersistenceRejected",
-      });
-    }
+    const artifact = await params.artifacts?.create({
+      scopeId: ownerScopeId(params.owner),
+      requestId: params.owner.requestId,
+      ...context,
+      content: value,
+      ttlMs: config.artifactTtlMs,
+      maxBytesPerScope: config.maxArtifactBytesPerScope,
+      ...(config.maxArtifactBytes === undefined
+        ? {}
+        : { maxArtifactBytes: config.maxArtifactBytes }),
+    });
     if (artifact?.status === "ok") {
       uri = artifact.value.uri;
     } else if (artifact?.status === "error") {
       logger.warn("tool.artifact.write_failed", {
         toolName: context.toolName,
-        errorTag:
-          artifact.error instanceof ToolResultArtifactTooLargeError
-            ? artifact.error.name
-            : artifact.error._tag,
+        errorTag: artifact.error._tag,
       });
     }
 
@@ -212,13 +217,9 @@ export function createOverflowReferenceNormalizer(
     }
 
     if (output.type === "json" || output.type === "error-json") {
-      try {
-        const value = JSON.stringify(output.value, null, 2);
-        if (value === undefined) return [];
-        return [{ outputIndex, value, bytes: utf8Bytes(value) }];
-      } catch {
-        return [];
-      }
+      const serialized = serializeOutput(output.value);
+      if (serialized.status === "error" || serialized.value === undefined) return [];
+      return [{ outputIndex, value: serialized.value, bytes: utf8Bytes(serialized.value) }];
     }
 
     if (output.type === "content") {
@@ -285,19 +286,14 @@ export function createOverflowReferenceNormalizer(
     }
 
     if (output.type === "json" || output.type === "error-json") {
-      let serialized: string | undefined;
-      try {
-        serialized = JSON.stringify(output.value, null, 2);
-      } catch {
-        serialized = undefined;
-      }
-      if (serialized === undefined) {
+      const serialized = serializeOutput(output.value);
+      if (serialized.status === "error" || serialized.value === undefined) {
         return output.type === "error-json"
           ? { ...output, type: "error-text", value: UNSERIALIZABLE_JSON_OUTPUT }
           : { ...output, type: "text", value: UNSERIALIZABLE_JSON_OUTPUT };
       }
       if (!spillOutput) return output;
-      const value = await normalizeCapturedText(serialized, context, true, config);
+      const value = await normalizeCapturedText(serialized.value, context, true, config);
       return output.type === "error-json"
         ? { ...output, type: "error-text", value }
         : { ...output, type: "text", value };

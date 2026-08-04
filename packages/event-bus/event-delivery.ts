@@ -27,6 +27,36 @@ export class EventDeadLetterFailed extends TaggedError("EventDeadLetterFailed")<
 
 export type EventDeliveryError = EventContractInvalid | EventHandlerFailed | EventDeadLetterFailed;
 
+export class EventPublishContractInvalid extends TaggedError("EventPublishContractInvalid")<{
+  readonly eventType: string;
+  readonly message: string;
+}> {}
+
+export class EventPublishTransportFailed extends TaggedError("EventPublishTransportFailed")<{
+  readonly cause: unknown;
+  readonly eventType: string;
+  readonly topic: string;
+  readonly message: string;
+}> {}
+
+export class EventTopicOperationUnsupported extends TaggedError("EventTopicOperationUnsupported")<{
+  readonly operation: "watermark" | "trim" | "retire-consumer-group";
+  readonly topic: string;
+  readonly message: string;
+}> {}
+
+export class EventTopicOperationFailed extends TaggedError("EventTopicOperationFailed")<{
+  readonly cause: unknown;
+  readonly operation: "watermark" | "trim" | "retire-consumer-group";
+  readonly topic: string;
+  readonly message: string;
+}> {}
+
+export class EventBusCloseFailed extends TaggedError("EventBusCloseFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
 /** Default delivery policy for package-owned delivery failures. */
 export function applyEventDeliveryPolicy(error: EventDeliveryError): DeliveryDisposition {
   switch (error._tag) {

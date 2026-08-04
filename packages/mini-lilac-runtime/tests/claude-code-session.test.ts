@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  ClaudeCodeRunExternalFailure,
   ClaudeNativeSessionPreflightError,
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
@@ -12,6 +13,7 @@ import {
 import type { MiniLilacUIMessage } from "@stanley2058/mini-lilac-client";
 import type { LanguageModel } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Result } from "better-result";
 
 import type { RuntimeConfig } from "../src/config";
 import {
@@ -23,6 +25,7 @@ import {
   SessionService,
   type MiniLilacRuntimeChunk,
   type SessionServiceOptions,
+  resolveMiniClaudeCompactionSummaryModel,
 } from "../src/session-service";
 
 const temporaryDirectories: string[] = [];
@@ -329,9 +332,13 @@ function fakeClaudeCode(options: {
       reasoning: input.reasoning,
     });
     if (options.rejectForks && input.nativeSession?.mode === "fork") {
-      throw new ClaudeNativeSessionPreflightError([
-        { code: "source-preflight-missing", message: "test source is missing" },
-      ]);
+      const issues = [
+        { code: "source-preflight-missing" as const, message: "test source is missing" },
+      ];
+      throw new ClaudeNativeSessionPreflightError({
+        issues,
+        message: "Claude native fork preflight requires a fresh start: test source is missing",
+      });
     }
     const requestedSessionId =
       input.nativeSession?.mode === "ephemeral" ? null : (input.nativeSession?.sessionId ?? null);
@@ -339,10 +346,13 @@ function fakeClaudeCode(options: {
     const sourceSessionId =
       input.nativeSession?.mode === "fork" ? input.nativeSession.baseSessionId : null;
     let disposed = false;
+    const createUtilityModel = () => options.utilityModel ?? new MockLanguageModelV4({});
     const run: FakeClaudeRun = {
       agentModel: options.agentModel,
       continuationModel: options.agentModel,
-      createUtilityModel: () => options.utilityModel ?? new MockLanguageModelV4({}),
+      createUtilityModelResult: () =>
+        Result.ok(options.utilityModel ?? new MockLanguageModelV4({})),
+      createUtilityModel,
       injected: [],
       interrupts: 0,
       disposals: 0,
@@ -356,7 +366,14 @@ function fakeClaudeCode(options: {
           run.interrupts += 1;
           return true;
         },
+        async interruptResult() {
+          return Result.ok(await this.interrupt());
+        },
         clear() {},
+        clearResult() {
+          this.clear();
+          return Result.ok();
+        },
       },
       nativeSession: {
         getObservation: () => ({
@@ -425,11 +442,18 @@ function fakeClaudeCode(options: {
                   },
           };
         },
+        async finalizeResult() {
+          return Result.ok(await this.finalize());
+        },
       },
       dispose: async () => {
         if (disposed) return;
         disposed = true;
         run.disposals += 1;
+      },
+      async disposeResult() {
+        await this.dispose();
+        return Result.ok();
       },
     };
     options.runs?.push(run);
@@ -513,6 +537,60 @@ async function collect(stream: ReadableStream<MiniLilacRuntimeChunk>) {
 }
 
 describe("claude-code sessions", () => {
+  it("uses the utility-model Result without calling the throwing compatibility adapter", () => {
+    const utilityModel = new MockLanguageModelV4({ modelId: "utility" });
+    const fallbackModel = new MockLanguageModelV4({ modelId: "fallback" });
+    let compatibilityCalls = 0;
+    let fallbackCalls = 0;
+    const run = {
+      createUtilityModelResult: () => Result.ok(utilityModel),
+      createUtilityModel: () => {
+        compatibilityCalls += 1;
+        return fallbackModel;
+      },
+    };
+
+    const model = resolveMiniClaudeCompactionSummaryModel({
+      run,
+      fallback: () => {
+        fallbackCalls += 1;
+        return fallbackModel;
+      },
+      onFailure: () => {
+        throw new Error("unexpected utility model failure");
+      },
+    });
+
+    expect(model).toBe(utilityModel);
+    expect(compatibilityCalls).toBe(0);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it("falls back from an owned utility-model failure without rejection flow", () => {
+    const fallbackModel = new MockLanguageModelV4({ modelId: "fallback" });
+    const reported: ClaudeCodeRunExternalFailure[] = [];
+    const failure = new ClaudeCodeRunExternalFailure({
+      operation: "Claude utility model construction",
+      cause: new Error("construction failed"),
+      message: "Claude utility model construction failed",
+    });
+    const run = {
+      createUtilityModelResult: () => Result.err(failure),
+      createUtilityModel: () => {
+        throw failure;
+      },
+    };
+
+    const model = resolveMiniClaudeCompactionSummaryModel({
+      run,
+      fallback: () => fallbackModel,
+      onFailure: (error) => reported.push(error),
+    });
+
+    expect(model).toBe(fallbackModel);
+    expect(reported).toEqual([failure]);
+  });
+
   it("runs on the materialized model, withholds tool declarations, and disposes on completion", async () => {
     const model = new MockLanguageModelV4({ doStream: [textResult("answer", "done")] });
     const calls: MaterializeCall[] = [];

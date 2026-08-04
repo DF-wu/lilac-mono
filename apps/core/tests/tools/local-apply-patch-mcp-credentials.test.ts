@@ -4,7 +4,21 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { createCoreToolPluginManager } from "../../src/plugins";
+import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
+
+function createCoreToolPluginManager(
+  params: Parameters<typeof createCoreToolPluginManagerResult>[0],
+) {
+  const manager = createCoreToolPluginManagerResult(params);
+  return {
+    ...manager,
+    async buildLevel1Toolset(buildParams: Parameters<typeof manager.buildLevel1ToolsetResult>[0]) {
+      const built = await manager.buildLevel1ToolsetResult(buildParams);
+      if (built.status === "error") throw new Error(built.error.message, { cause: built.error });
+      return built.value;
+    },
+  };
+}
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (

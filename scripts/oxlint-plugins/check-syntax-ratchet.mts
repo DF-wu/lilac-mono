@@ -17,16 +17,10 @@ import {
   findStoreInlineDecodingViolations,
 } from "./production-syntax.mts";
 import { syntaxBaseline } from "./syntax-baseline.mts";
+import { ACTIVE_SYNTAX_RULES, type ActiveSyntaxRule } from "./syntax-policy.mts";
 import type { SyntacticFinding } from "./syntax-rule-utils.mts";
 
-export const ACTIVE_SYNTAX_RULES = [
-  "lilac/no-exception-flow",
-  "lilac/no-inline-async-result-callback",
-  "lilac/no-presentation-decoder-import",
-  "lilac/no-store-inline-decoding",
-  "lilac/no-direct-sqlite-transaction",
-] as const;
-export type ActiveSyntaxRule = (typeof ACTIVE_SYNTAX_RULES)[number];
+export { ACTIVE_SYNTAX_RULES, type ActiveSyntaxRule } from "./syntax-policy.mts";
 
 export interface SyntaxBaselineEntry {
   readonly workspace: string;

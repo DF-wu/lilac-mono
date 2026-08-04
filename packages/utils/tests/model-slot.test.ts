@@ -9,6 +9,7 @@ import {
   resolveModelPlan,
   resolveModelRef,
   resolveModelSlot,
+  resolveModelSlotResult,
   resolveModelSlotPlan,
   toDurableResolvedModelPlan,
   withModelPlanReasoning,
@@ -172,6 +173,9 @@ describe("resolveModelSlot", () => {
       expect(() => resolveModelSlot(cfg, "main")).toThrow(
         "Provider 'openai-compatible' is not configured",
       );
+      const result = resolveModelSlotResult(cfg, "main");
+      expect(result.status).toBe("error");
+      if (result.status === "error") expect(result.error.issue).toBe("provider-not-configured");
     } finally {
       providerMap["openai-compatible"] = originalProvider ?? null;
     }

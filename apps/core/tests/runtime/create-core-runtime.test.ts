@@ -3,9 +3,11 @@ import { describe, expect, it } from "bun:test";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { CustomCommandDirectoryReadError } from "@stanley2058/lilac-utils";
 import {
+  createLilacBus,
   EventDeliveryTransportFailed,
   RedisEventDeadLetter,
   type EventDeliveryDoneError,
+  type RawBus,
 } from "@stanley2058/lilac-event-bus";
 import Redis from "ioredis";
 
@@ -22,6 +24,7 @@ import {
   createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
   createCoreRuntimeFatalReporter,
+  superviseDetachedCoreConfigValidation,
   superviseCoreRouterDone,
 } from "../../src/runtime/create-core-runtime";
 
@@ -116,6 +119,37 @@ describe("Core runtime startup", () => {
     expect(() => cleanup.finish()).toThrow(firstPanic);
   });
 
+  it("reports detached config validation Panic with exact identity", async () => {
+    const panic = new Panic({ message: "config validation invariant failed" });
+    const reported: Error[] = [];
+
+    await superviseDetachedCoreConfigValidation({
+      validate: async () => {
+        throw panic;
+      },
+      reportFatalError: (error) => reported.push(error),
+    });
+
+    expect(reported).toEqual([panic]);
+  });
+
+  it("supervises typed cleanup outcomes without converting them back to rejections", async () => {
+    const cleanupPanic = new Panic({ message: "typed cleanup invariant failed" });
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+
+    await cleanup.runOutcome("ordinary", async () => ({
+      kind: "result",
+      result: Result.err(new Error("typed cleanup failed")),
+    }));
+    await cleanup.runOutcome("panic", async () => ({ kind: "panic", panic: cleanupPanic }));
+
+    expect(cleanup.failures).toEqual([
+      { label: "ordinary", error: "typed cleanup failed", panic: false },
+      { label: "panic", error: "typed cleanup invariant failed", panic: true },
+    ]);
+    expect(() => cleanup.finish()).toThrow(cleanupPanic);
+  });
+
   it("contains a revoked cleanup cause, continues cleanup, and preserves the startup Panic", async () => {
     const startupPanic = new Panic({ message: "startup invariant failed" });
     const { proxy, revoke } = Proxy.revocable({}, {});
@@ -179,6 +213,38 @@ describe("Core runtime event delivery", () => {
         throw panic;
       });
       await expect(captureCoreEventBusCleanup({ redis, raw: null, bus: null })).rejects.toBe(panic);
+    } finally {
+      redis.disconnect();
+    }
+  });
+
+  it("adapts a typed bus close Err into owned runtime cleanup failure", async () => {
+    const redis = new Redis({ lazyConnect: true });
+    const closeFailure = new Error("event transport close failed");
+    const raw: RawBus = {
+      publish: async () => ({ id: "1-0", cursor: "1-0" }),
+      subscribe: async () => {
+        throw new Error("unused test subscription");
+      },
+      fetch: async () => ({ messages: [] }),
+      close: async () => {
+        throw closeFailure;
+      },
+    };
+
+    try {
+      const captured = await captureCoreEventBusCleanup({
+        redis,
+        raw: null,
+        bus: createLilacBus(raw),
+      });
+      expect(captured.status).toBe("error");
+      if (captured.status === "error") {
+        expect(captured.error.cause).toMatchObject({
+          _tag: "EventBusCloseFailed",
+          cause: closeFailure,
+        });
+      }
     } finally {
       redis.disconnect();
     }

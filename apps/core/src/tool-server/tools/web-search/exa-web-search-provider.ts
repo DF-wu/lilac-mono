@@ -1,4 +1,5 @@
 import Exa from "exa-js";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   normalizeBaseUrl,
@@ -9,6 +10,17 @@ import {
 import type { WebSearchInput, WebSearchProvider, WebSearchResult } from "./types";
 
 type ExaCategory = "news" | "financial report";
+
+class ExaProviderConfigurationInvalid extends TaggedError("ExaProviderConfigurationInvalid")<{
+  readonly message: string;
+}> {}
+
+function adaptExaProviderResultToHost<TValue>(
+  result: ResultType<TValue, ExaProviderConfigurationInvalid>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
 
 function mapTopicToExaCategory(topic: WebSearchInput["topic"]): ExaCategory | undefined {
   switch (topic) {
@@ -37,17 +49,19 @@ export class ExaWebSearchProvider implements WebSearchProvider {
     return typeof this.config.apiKey === "string" && this.config.apiKey.length > 0;
   }
 
-  private getClient(): Exa {
-    if (this.client) return this.client;
+  private getClient(): ResultType<Exa, ExaProviderConfigurationInvalid> {
+    if (this.client) return Result.ok(this.client);
 
     const apiKey = this.config.apiKey;
     if (!apiKey) {
-      throw new Error("EXA_API_KEY is not configured.");
+      return Result.err(
+        new ExaProviderConfigurationInvalid({ message: "EXA_API_KEY is not configured." }),
+      );
     }
 
     const baseUrlRaw = this.config.baseUrl?.trim();
     this.client = baseUrlRaw ? new Exa(apiKey, normalizeBaseUrl(baseUrlRaw)) : new Exa(apiKey);
-    return this.client;
+    return Result.ok(this.client);
   }
 
   async search(
@@ -56,7 +70,7 @@ export class ExaWebSearchProvider implements WebSearchProvider {
       signal?: AbortSignal;
     },
   ): Promise<readonly WebSearchResult[]> {
-    const client = this.getClient();
+    const client = adaptExaProviderResultToHost(this.getClient());
 
     const startPublishedDate =
       input.startDate ?? (input.timeRange ? startDateFromTimeRange(input.timeRange) : undefined);

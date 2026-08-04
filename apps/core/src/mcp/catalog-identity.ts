@@ -27,13 +27,12 @@ export type CatalogStableIdParseResult =
 
 /** A versioned, delimiter-safe persistence key. */
 export function catalogToolStableId(identity: CatalogToolIdentity): string {
-  const parsed = catalogToolIdentitySchema.parse(identity);
   return JSON.stringify([
     "lilac.catalog-tool",
     CATALOG_TOOL_ID_VERSION,
-    parsed.source,
-    parsed.sourceId,
-    parsed.rawToolName,
+    identity.source,
+    identity.sourceId,
+    identity.rawToolName,
   ]);
 }
 
@@ -41,9 +40,8 @@ export function parseCatalogToolStableId(stableId: string): CatalogStableIdParse
   let decoded: unknown;
   try {
     decoded = JSON.parse(stableId);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: `invalid catalog tool ID JSON: ${message}` };
+  } catch {
+    return { ok: false, error: "invalid catalog tool ID JSON" };
   }
 
   const parsed = stableIdSchema.safeParse(decoded);
@@ -78,11 +76,10 @@ function appendHash(base: string, identity: CatalogToolIdentity): string {
 
 /** Deterministic candidate before catalog-wide collision resolution. */
 export function baseCatalogToolName(identity: CatalogToolIdentity): string {
-  const parsed = catalogToolIdentitySchema.parse(identity);
-  const sourceId = normalizeNameSegment(parsed.sourceId) || "source";
-  const rawToolName = normalizeNameSegment(parsed.rawToolName) || "tool";
-  const base = `${parsed.source}_${sourceId}_${rawToolName}`;
-  return base.length <= MAX_MODEL_TOOL_NAME_LENGTH ? base : appendHash(base, parsed);
+  const sourceId = normalizeNameSegment(identity.sourceId) || "source";
+  const rawToolName = normalizeNameSegment(identity.rawToolName) || "tool";
+  const base = `${identity.source}_${sourceId}_${rawToolName}`;
+  return base.length <= MAX_MODEL_TOOL_NAME_LENGTH ? base : appendHash(base, identity);
 }
 
 export type CatalogToolNameCollision = {
@@ -106,8 +103,7 @@ export function assignCatalogToolNames(
 ): CatalogToolNameAssignment {
   const unique = new Map<string, CatalogToolIdentity>();
   for (const identity of identities) {
-    const parsed = catalogToolIdentitySchema.parse(identity);
-    unique.set(catalogToolStableId(parsed), parsed);
+    unique.set(catalogToolStableId(identity), identity);
   }
   const sorted = [...unique.entries()].sort(([left], [right]) => compareText(left, right));
 

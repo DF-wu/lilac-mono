@@ -8,8 +8,14 @@ import {
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
-import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  formatTaggedErrorForLog,
+  isPanic,
+  opaqueErrorMessage,
+} from "@stanley2058/lilac-utils";
 
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import { DurableWorkflowStore, type DurableWorkflowReadError } from "./durable-workflow-store";
 import type { WorkflowWait } from "./workflow-domain";
 import { matchWorkflowReplyWait, workflowReplyMatchKey } from "./workflow-waits";
@@ -209,8 +215,8 @@ export class WorkflowWaitResolver {
   private async startWorkflowWaitSubscriptionResult(
     checkpoint: string | null,
   ): Promise<ResultType<WorkflowWaitResolverSubscription, EventDeliveryStartFailed>> {
-    try {
-      return await this.input.bus.subscribeTopic(
+    const [settled] = await Promise.allSettled([
+      this.input.bus.subscribeTopic(
         "evt.adapter",
         {
           mode: "tail",
@@ -265,40 +271,57 @@ export class WorkflowWaitResolver {
           return Result.ok(undefined);
         },
         workflowWaitResolverDeliveryPolicy,
-      );
-    } catch (cause) {
+      ),
+    ]);
+    if (settled.status === "rejected") {
       this.releaseLease();
-      throw cause;
+      if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
+      const cause =
+        settled.reason instanceof Error
+          ? settled.reason
+          : new Error("Opaque workflow wait subscription failure");
+      return adaptToolResultToHost(
+        Result.err(
+          new Error(opaqueErrorMessage(cause, "Workflow wait subscription failed to start")),
+        ),
+      );
     }
+    return settled.value;
   }
 
   private async captureWorkflowWaitResolverTrim(
     cursor: string,
   ): Promise<ResultType<void, WorkflowWaitResolverTrimFailed>> {
-    try {
-      await this.input.bus.trimTopicBeforeCheckpoint("evt.adapter", cursor, 100);
-      return Result.ok(undefined);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
+    const trimmed = await this.input.bus.trimTopicBeforeCheckpoint("evt.adapter", cursor, 100);
+    if (trimmed.status === "error") {
       return Result.err(
         new WorkflowWaitResolverTrimFailed({
-          cause,
+          cause: trimmed.error,
           cursor,
           message: "Workflow adapter stream reclamation failed",
         }),
       );
     }
+    return Result.ok(undefined);
   }
 
   private async captureWorkflowWaitResolverConsumerGroupRetirement(
     subscription: WorkflowWaitResolverSubscription,
   ): Promise<ResultType<void, WorkflowWaitResolverConsumerGroupRetirementFailed>> {
     try {
-      await this.input.bus.retireTopicConsumerGroup(
+      const retired = await this.input.bus.retireTopicConsumerGroup(
         "evt.adapter",
         this.input.subscriptionId,
         this.input.confirmLegacyGroupSingleVersionRollout ?? false,
       );
+      if (retired.status === "error") {
+        return Result.err(
+          new WorkflowWaitResolverConsumerGroupRetirementFailed({
+            cause: retired.error,
+            message: "Workflow wait resolver consumer-group retirement failed",
+          }),
+        );
+      }
       return Result.ok(undefined);
     } catch (cause) {
       if (Panic.is(cause)) {
@@ -552,22 +575,20 @@ export class WorkflowWaitResolver {
     barrierId: string,
     now: number,
   ): Promise<ResultType<{ readonly cursor: string }, WorkflowWaitResolverBarrierPublishFailed>> {
-    try {
-      const published = await this.input.bus.publish(
-        lilacEventTypes.EvtWorkflowWaitResolverBarrier,
-        { barrierId, ts: now },
-      );
-      return Result.ok({ cursor: published.cursor });
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
+    const published = await this.input.bus.publish(lilacEventTypes.EvtWorkflowWaitResolverBarrier, {
+      barrierId,
+      ts: now,
+    });
+    if (published.status === "error") {
       return Result.err(
         new WorkflowWaitResolverBarrierPublishFailed({
-          cause,
+          cause: published.error,
           barrierId,
           message: "Workflow wait resolver barrier publication failed",
         }),
       );
     }
+    return Result.ok({ cursor: published.value.cursor });
   }
 
   private async reconcileTimersResult(): Promise<
@@ -662,25 +683,23 @@ export class WorkflowWaitResolver {
     if (runResult.status === "error") return Result.err(runResult.error);
     const run = runResult.value;
     if (!run) return Result.ok(undefined);
-    try {
-      await this.input.bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-        runId: run.runId,
-        revisionId: run.revisionId,
-        reason: "operation_changed",
-        ts: this.now(),
-      });
-      return Result.ok(undefined);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
+    const published = await this.input.bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+      runId: run.runId,
+      revisionId: run.revisionId,
+      reason: "operation_changed",
+      ts: this.now(),
+    });
+    if (published.status === "error") {
       return Result.err(
         new WorkflowWaitResolverWakeupPublishFailed({
-          cause,
+          cause: published.error,
           runId: wait.runId,
           operationId: wait.operationId,
           message: "Workflow wait wakeup publication failed after durable resolution",
         }),
       );
     }
+    return Result.ok(undefined);
   }
 
   private async publishWakeupAdvisory(wait: WorkflowWait): Promise<void> {

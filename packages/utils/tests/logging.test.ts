@@ -391,6 +391,85 @@ describe("logging", () => {
     );
   });
 
+  it("redacts OpenObserve endpoint credentials and response details from stderr", async () => {
+    const endpointPassword = "endpoint-password-secret";
+    const responseToken = "response-token-secret";
+    await withEnv(
+      {
+        LILAC_LOG_OPENOBSERVE_BASE_URL: `https://endpoint-user:${endpointPassword}@redaction.example?token=query-secret`,
+      },
+      async () => {
+        await withCapturedStderr(async (stderrChunks) => {
+          await withMockFetch(
+            async () => {
+              const logger = createLogger({
+                module: "logging-test",
+                logLevel: "info",
+                stdout: new MemoryWriteStream(),
+                stderr: new MemoryWriteStream(),
+              });
+
+              logger.info("hello-redacted-response");
+              await waitForAsyncLogging();
+
+              const stderrText = stderrChunks.join("");
+              expect(stderrText).toContain("https://redaction.example/api/default/lilac/_json");
+              expect(stderrText).toContain("token=<redacted>");
+              expect(stderrText).not.toContain("endpoint-user");
+              expect(stderrText).not.toContain(endpointPassword);
+              expect(stderrText).not.toContain(responseToken);
+              expect(stderrText).not.toContain("query-secret");
+            },
+            () =>
+              new Response(`token=${responseToken}`, {
+                status: 401,
+                statusText: "Unauthorized",
+              }),
+          );
+        });
+      },
+    );
+  });
+
+  it("redacts OpenObserve request error text from stderr", async () => {
+    const errorPassword = "request-error-password";
+    const queryToken = "request-query-token";
+    await withEnv(
+      {
+        LILAC_LOG_OPENOBSERVE_BASE_URL: "https://request-redaction.example",
+      },
+      async () => {
+        await withCapturedStderr(async (stderrChunks) => {
+          await withMockFetch(
+            async () => {
+              const logger = createLogger({
+                module: "logging-test",
+                logLevel: "info",
+                stdout: new MemoryWriteStream(),
+                stderr: new MemoryWriteStream(),
+              });
+
+              logger.info("hello-redacted-error");
+              await waitForAsyncLogging();
+
+              const stderrText = stderrChunks.join("");
+              expect(stderrText).toContain("password=<redacted>");
+              expect(stderrText).toContain("https://failure.example/path");
+              expect(stderrText).not.toContain("failure-user");
+              expect(stderrText).not.toContain(errorPassword);
+              expect(stderrText).not.toContain(queryToken);
+            },
+            () => {
+              throw new Error(
+                `password=${errorPassword}; https://failure-user:failure-pass@failure.example/path?token=${queryToken}`,
+              );
+            },
+          );
+        });
+      },
+    );
+  });
+
   it("mirrors generic fatal logs before local process exit", async () => {
     await withEnv(
       {

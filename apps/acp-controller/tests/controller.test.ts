@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Panic, Result } from "better-result";
 
+import { persistSpawnedWorkerAdmission } from "../controller.ts";
+import { acpCleanupFailuresForPanic } from "../external-adapters.ts";
+import { ExternalOperationFailed } from "../failures.ts";
 import { saveRunRecord } from "../run-store.ts";
 import { createEmptyPermissionCounters } from "../types.ts";
 
@@ -339,6 +343,93 @@ afterEach(async () => {
 });
 
 describe("lilac-acp controller", () => {
+  it("terminates an uncommitted worker when PID persistence fails", async () => {
+    const run = {
+      id: "run_11111111-1111-4111-8111-111111111111",
+      status: "submitted",
+      createdAt: 1,
+      updatedAt: 1,
+      directory: "/repo",
+      harnessId: "opencode",
+      targetKind: "new",
+      promptText: "build feature",
+      textPreview: "build feature",
+      permissions: createEmptyPermissionCounters(),
+    } as const;
+    const persistenceFailure = new ExternalOperationFailed({
+      operation: "write-run",
+      cause: new Error("disk full"),
+      message: "disk full",
+    });
+    let terminationCount = 0;
+    let detachCount = 0;
+
+    const admitted = await persistSpawnedWorkerAdmission(
+      run,
+      {
+        pid: 1234,
+        detach: () => detachCount++,
+        terminate: async () => {
+          terminationCount++;
+          return Result.ok(undefined);
+        },
+      },
+      async (record) => {
+        expect(record.workerPid).toBe(1234);
+        return Result.err(persistenceFailure);
+      },
+    );
+
+    expect(admitted.status).toBe("error");
+    if (admitted.status === "error") expect(admitted.error).toBe(persistenceFailure);
+    expect(terminationCount).toBe(1);
+    expect(detachCount).toBe(0);
+  });
+
+  it("terminates on persistence Panic without masking the exact Panic with cleanup failure", async () => {
+    const run = {
+      id: "run_11111111-1111-4111-8111-111111111111",
+      status: "submitted",
+      createdAt: 1,
+      updatedAt: 1,
+      directory: "/repo",
+      harnessId: "opencode",
+      targetKind: "new",
+      promptText: "build feature",
+      textPreview: "build feature",
+      permissions: createEmptyPermissionCounters(),
+    } as const;
+    const panic = new Panic({ message: "PID persistence invariant" });
+    const cleanupFailure = new ExternalOperationFailed({
+      operation: "terminate-worker",
+      cause: new Error("termination failed"),
+      message: "termination failed",
+    });
+    let terminationCount = 0;
+    let observed: unknown;
+
+    try {
+      await persistSpawnedWorkerAdmission(
+        run,
+        {
+          pid: 1234,
+          detach: () => undefined,
+          terminate: async () => {
+            terminationCount++;
+            return Result.err(cleanupFailure);
+          },
+        },
+        () => Promise.reject(panic),
+      );
+    } catch (cause) {
+      observed = cause;
+    }
+
+    expect(terminationCount).toBe(1);
+    expect(observed).toBe(panic);
+    expect(acpCleanupFailuresForPanic(panic)).toEqual([cleanupFailure]);
+  });
+
   it("merges sessions across discovered harnesses", async () => {
     await createFakeHarness(tempRoot, {
       commandName: "opencode",

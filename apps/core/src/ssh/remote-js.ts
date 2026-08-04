@@ -1,7 +1,9 @@
 import path from "node:path";
 
-import { isPanic, opaqueErrorCause } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { projectRuntimeError } from "../runtime/error-format";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 
 let cached: string | null = null;
 
@@ -19,17 +21,18 @@ export async function getRemoteRunnerJsText(): Promise<
   const filePath = path.resolve(import.meta.dir, "remote-js", "remote-runner.cjs");
   const loaded = await Result.tryPromise({
     try: () => Bun.file(filePath).text(),
-    catch: (caught) => {
-      if (isPanic(caught)) throw caught;
-      const cause = opaqueErrorCause(caught, "Opaque bundled remote runner read failure");
-      return new RemoteRunnerSourceReadError({
+    catch: projectRuntimeError("Opaque bundled remote runner read failure"),
+  });
+  if (loaded.status === "error") {
+    const cause = preserveToolPanic(loaded.error);
+    return Result.err(
+      new RemoteRunnerSourceReadError({
         filePath,
         cause,
         message: `Failed to read bundled remote runner: ${filePath}`,
-      });
-    },
-  });
-  if (loaded.status === "error") return Result.err(loaded.error);
+      }),
+    );
+  }
   cached = loaded.value;
   return Result.ok(loaded.value);
 }

@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { CodexOAuthLogin } from "@stanley2058/lilac-utils";
+import { CodexOAuthLoginFailed, type CodexOAuthLoginWithResult } from "@stanley2058/lilac-utils";
 import {
   MINI_LILAC_DATABASE_SCHEMA_VERSION,
   MiniLilacSqliteStore,
@@ -20,20 +20,28 @@ import {
   type RuntimeConfig,
 } from "@stanley2058/mini-lilac-runtime";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
+import { Panic, Result } from "better-result";
 
 import {
   acquireDatabaseLock,
   createMiniLilacAuthDependencies,
   databaseLockPath,
   initializeMiniLilacState,
+  initializeMiniLilacStateResult,
   MINI_LILAC_SERVER_HELP,
   main,
   miniLilacStatePaths,
   parseCliArgs,
+  parseCliArgsResult,
   runHistoryRecoveryCommand,
+  shutdownMiniLilacServerAndReleaseLockResult,
   shutdownMiniLilacServer,
+  shutdownMiniLilacServerResult,
+  superviseMiniLilacSignalShutdown,
   type MiniLilacAuthDependencies,
+  type MiniLilacDatabaseLock,
   type MiniLilacServerCliOptions,
+  MiniLilacServerCleanupFailure,
 } from "../src/main";
 
 const temporaryDirectories: string[] = [];
@@ -271,6 +279,27 @@ describe("mini-lilac server CLI", () => {
     expect(() =>
       parseCliArgs(["history-recovery", "status", "--acknowledge-partial-worktree"]),
     ).toThrow("valid only with abandon");
+  });
+
+  it("returns typed CLI and initialization failures without changing compatibility wrappers", async () => {
+    const invalidCli = parseCliArgsResult(["auth", "codex", "--status", "--logout"]);
+    expect(invalidCli.status).toBe("error");
+    if (invalidCli.status === "error") {
+      expect(invalidCli.error._tag).toBe("MiniLilacServerFailure");
+      expect(invalidCli.error.message).toContain("only one");
+    }
+
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-init-failure-"));
+    temporaryDirectories.push(directory);
+    const paths = miniLilacStatePaths({ XDG_STATE_HOME: directory });
+    await writeFile(paths.directory, "not a directory");
+    const initialized = await initializeMiniLilacStateResult(paths);
+    expect(initialized.status).toBe("error");
+    if (initialized.status === "error") {
+      expect(initialized.error._tag).toBe("MiniLilacServerFailure");
+      expect(initialized.error.operation).toBe("initialize Mini Lilac directories");
+    }
+    await expect(initializeMiniLilacState(paths)).rejects.toThrow();
   });
 
   it("reports and exactly filters retained history recovery without creating a database", async () => {
@@ -608,7 +637,13 @@ describe("mini-lilac server CLI", () => {
 
   it("prints the authorization URL and storage location, waits, and closes", async () => {
     let closed = 0;
-    const login: CodexOAuthLogin = {
+    const exchangeFailure = new CodexOAuthLoginFailed({
+      issue: "provider-error",
+      message: "unexpected exchange",
+    });
+    const exchangeResult: CodexOAuthLoginWithResult["exchangeResult"] = async () =>
+      Result.err(exchangeFailure);
+    const login: CodexOAuthLoginWithResult = {
       authorizeUrl: "https://auth.example/authorize",
       redirectUri: "http://localhost:1455/auth/callback",
       port: 1455,
@@ -621,8 +656,11 @@ describe("mini-lilac server CLI", () => {
         expires: 123,
         storagePath: "/data/secret/codex.json",
       }),
-      exchange: async () => {
-        throw new Error("unexpected exchange");
+      exchangeResult,
+      exchange: async (input) => {
+        const exchanged = await exchangeResult(input);
+        if (exchanged.status === "error") throw new Error(exchanged.error.message);
+        return exchanged.value;
       },
       close: async () => void (closed += 1),
     };
@@ -798,6 +836,214 @@ describe("mini-lilac-server database lock", () => {
 });
 
 describe("mini-lilac-server shutdown", () => {
+  function testLock(
+    events: string[],
+    releaseResult: () => ReturnType<MiniLilacDatabaseLock["releaseResult"]>,
+  ): MiniLilacDatabaseLock {
+    return {
+      lockPath: "/test/mini-lilac.lock",
+      releaseResult: async () => {
+        events.push("release-lock");
+        return releaseResult();
+      },
+      release: async () => {},
+    };
+  }
+
+  function cleanupError(operation: string, message: string): MiniLilacServerCleanupFailure {
+    return new MiniLilacServerCleanupFailure({
+      operation,
+      cause: new Error(message),
+      message,
+    });
+  }
+
+  it("preserves typed operation and cleanup failures and never downgrades Panic", async () => {
+    let now = 0;
+    const combined = await shutdownMiniLilacServerResult({
+      stopListener: (force) => {
+        if (force) throw new Error("listener cleanup failed");
+        return new Promise<void>(() => {});
+      },
+      listActiveRuns: () => [],
+      cancelRun: async () => {},
+      closeRuntime: () => {
+        throw new Error("runtime cleanup failed");
+      },
+      graceMs: 1,
+      pollIntervalMs: 1,
+      now: () => now,
+      sleep: async (milliseconds) => void (now += milliseconds),
+    });
+    expect(combined.status).toBe("error");
+    if (combined.status === "error") {
+      expect(combined.error._tag).toBe("MiniLilacServerOperationAndCleanupFailure");
+      expect(combined.error.message).toContain("listener cleanup failed");
+      expect(combined.error.message).toContain("runtime cleanup failed");
+    }
+
+    const panic = new Panic({ message: "shutdown invariant" });
+    let closed = false;
+    await expect(
+      shutdownMiniLilacServerResult({
+        stopListener: () => {},
+        listActiveRuns: () => {
+          throw panic;
+        },
+        cancelRun: async () => {},
+        closeRuntime: () => void (closed = true),
+      }),
+    ).rejects.toBe(panic);
+    expect(closed).toBe(true);
+  });
+
+  it("attempts runtime and lock cleanup before rethrowing the first shutdown Panic", async () => {
+    const panicSources = ["listener", "runs", "cancel", "admission"] as const;
+    for (const source of panicSources) {
+      const events: string[] = [];
+      const panic = new Panic({ message: `${source} invariant` });
+      let now = 0;
+      const activeRuns = source === "cancel" ? [{ sessionId: "session-1", runId: "run-1" }] : [];
+      const lock = testLock(events, async () =>
+        Result.err(cleanupError("release database lock", "lock release failed")),
+      );
+
+      await expect(
+        shutdownMiniLilacServerAndReleaseLockResult(
+          {
+            stopListener: () => {
+              events.push("stop-listener");
+              if (source === "listener") throw panic;
+            },
+            requestRuntimeShutdown: () => {
+              events.push("request-runtime-shutdown");
+              if (source === "admission") throw panic;
+            },
+            listActiveRuns: () => {
+              if (source === "runs") throw panic;
+              return activeRuns;
+            },
+            cancelRun: async () => {
+              events.push("cancel-run");
+              if (source === "cancel") throw panic;
+            },
+            closeRuntime: () => void events.push("close-runtime"),
+            graceMs: 1,
+            pollIntervalMs: 1,
+            now: () => now,
+            sleep: async (milliseconds) => void (now += milliseconds),
+          },
+          lock,
+        ),
+      ).rejects.toBe(panic);
+      expect(events).toContain("close-runtime");
+      expect(events).toContain("release-lock");
+      expect(events.indexOf("close-runtime")).toBeLessThan(events.indexOf("release-lock"));
+    }
+
+    const panicEvents: string[] = [];
+    const firstPanic = new Panic({ message: "listener invariant first" });
+    const runtimePanic = new Panic({ message: "runtime invariant second" });
+    const lockPanic = new Panic({ message: "lock invariant third" });
+    await expect(
+      shutdownMiniLilacServerAndReleaseLockResult(
+        {
+          stopListener: () => {
+            throw firstPanic;
+          },
+          listActiveRuns: () => [],
+          cancelRun: async () => {},
+          closeRuntime: () => {
+            panicEvents.push("close-runtime");
+            throw runtimePanic;
+          },
+        },
+        testLock(panicEvents, async () => {
+          throw lockPanic;
+        }),
+      ),
+    ).rejects.toBe(firstPanic);
+    expect(panicEvents).toEqual(["close-runtime", "release-lock"]);
+  });
+
+  it("preserves runtime and lock cleanup failures for cleanup-only and operation failures", async () => {
+    const cleanupOnlyEvents: string[] = [];
+    const cleanupOnly = await shutdownMiniLilacServerAndReleaseLockResult(
+      {
+        stopListener: () => {},
+        listActiveRuns: () => [],
+        cancelRun: async () => {},
+        closeRuntime: () => {
+          throw new Error("runtime close failed");
+        },
+      },
+      testLock(cleanupOnlyEvents, async () =>
+        Result.err(cleanupError("release database lock", "lock release failed")),
+      ),
+    );
+    expect(cleanupOnly.status).toBe("error");
+    if (cleanupOnly.status === "error") {
+      expect(cleanupOnly.error._tag).toBe("MiniLilacServerCleanupCombinedFailure");
+      if (cleanupOnly.error._tag === "MiniLilacServerCleanupCombinedFailure") {
+        expect(cleanupOnly.error.failures.map((failure) => failure.message)).toEqual([
+          "runtime close failed",
+          "lock release failed",
+        ]);
+      }
+    }
+
+    const combinedEvents: string[] = [];
+    let now = 0;
+    const combined = await shutdownMiniLilacServerAndReleaseLockResult(
+      {
+        stopListener: (force) => {
+          if (force) throw new Error("listener force-close failed");
+          return new Promise<void>(() => {});
+        },
+        listActiveRuns: () => [],
+        cancelRun: async () => {},
+        closeRuntime: () => {
+          throw new Error("runtime close failed");
+        },
+        graceMs: 1,
+        pollIntervalMs: 1,
+        now: () => now,
+        sleep: async (milliseconds) => void (now += milliseconds),
+      },
+      testLock(combinedEvents, async () =>
+        Result.err(cleanupError("release database lock", "lock release failed")),
+      ),
+    );
+    expect(combined.status).toBe("error");
+    if (combined.status === "error") {
+      expect(combined.error._tag).toBe("MiniLilacServerOperationAndCleanupFailure");
+      if (combined.error._tag === "MiniLilacServerOperationAndCleanupFailure") {
+        expect(combined.error.operationError.message).toBe("listener force-close failed");
+        expect(combined.error.cleanupError._tag).toBe("MiniLilacServerCleanupCombinedFailure");
+        if (combined.error.cleanupError._tag === "MiniLilacServerCleanupCombinedFailure") {
+          expect(combined.error.cleanupError.failures.map((failure) => failure.message)).toEqual([
+            "runtime close failed",
+            "lock release failed",
+          ]);
+        }
+      }
+    }
+  });
+
+  it("supervises a detached signal shutdown rejection", async () => {
+    const panic = new Panic({ message: "detached shutdown invariant" });
+    const logs: string[] = [];
+    let markedFailed = false;
+    await expect(
+      superviseMiniLilacSignalShutdown(() => Promise.reject(panic), {
+        logError: (message) => logs.push(message),
+        markFailed: () => void (markedFailed = true),
+      }),
+    ).resolves.toBeUndefined();
+    expect(logs).toEqual(["Mini Lilac shutdown failed: detached shutdown invariant"]);
+    expect(markedFailed).toBe(true);
+  });
+
   it("starts listener drain before cancellation and closes after runs drain", async () => {
     const events: string[] = [];
     let active = true;

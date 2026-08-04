@@ -72,6 +72,7 @@ export class RemoteFsDaemonSpawnError extends TaggedError("RemoteFsDaemonSpawnEr
 
 export class RemoteFsRuntimeSetupError extends TaggedError("RemoteFsRuntimeSetupError")<{
   readonly cause: unknown;
+  readonly code?: string;
   readonly message: string;
 }> {}
 
@@ -109,36 +110,35 @@ type RemoteFsRunRequestError =
   | RemoteFsStartupLockCleanupError
   | RemoteFsRequestCleanupCombinedError;
 
-function getErrorCode(error: Error): string | undefined {
-  if (!("code" in error)) return undefined;
-  return typeof error.code === "string" ? error.code : undefined;
+function preservePanic(error: Panic): never {
+  Panic.is(error);
+  throw error;
 }
 
-function preservePanic(error: unknown): void {
-  let panic = false;
+function opaqueErrorMessage(error: Error): string {
   try {
-    panic = Panic.is(error);
-  } catch {
-    return;
-  }
-  if (panic) throw error;
-}
-
-function opaqueErrorMessage(error: unknown): string {
-  try {
-    return error instanceof Error ? error.message : String(error);
+    return error.message;
   } catch {
     return "Opaque remote fs runner failure";
   }
 }
 
-function opaqueErrorCause(error: unknown): unknown {
+type ExternalErrorProjection =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "error"; readonly error: Error; readonly code?: string };
+
+function opaqueErrorCause(error: unknown): ExternalErrorProjection {
   try {
-    if (error instanceof Error) return error;
-  } catch {
-    return new Error("Opaque remote fs runner failure");
+    if (Panic.is(error)) return { kind: "panic", panic: error };
+    if (error instanceof Error) {
+      const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+      return { kind: "error", error, code };
+    }
+  } catch (inspectionCause) {
+    if (Panic.is(inspectionCause)) return { kind: "panic", panic: inspectionCause };
+    return { kind: "error", error: new Error("Opaque remote fs runner failure") };
   }
-  return error;
+  return { kind: "error", error: new Error("Opaque remote fs runner failure") };
 }
 
 async function captureRuntimeOperation<T>(
@@ -148,9 +148,11 @@ async function captureRuntimeOperation<T>(
   try {
     return Result.ok(await operation());
   } catch (caught) {
-    preservePanic(caught);
     const cause = opaqueErrorCause(caught);
-    return Result.err(new RemoteFsRuntimeSetupError({ cause, message }));
+    if (cause.kind === "panic") preservePanic(cause.panic);
+    return Result.err(
+      new RemoteFsRuntimeSetupError({ cause: cause.error, code: cause.code, message }),
+    );
   }
 }
 
@@ -205,10 +207,13 @@ async function readStdinText(): Promise<ResultType<string, RemoteFsStdinReadErro
     }
     return Result.ok(Buffer.concat(chunks).toString("utf8"));
   } catch (caught) {
-    preservePanic(caught);
-    const cause = opaqueErrorCause(caught);
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
     return Result.err(
-      new RemoteFsStdinReadError({ cause, message: "failed to read remote fs CLI stdin" }),
+      new RemoteFsStdinReadError({
+        cause: projected.error,
+        message: "failed to read remote fs CLI stdin",
+      }),
     );
   }
 }
@@ -445,11 +450,11 @@ export async function spawnDaemon(
   try {
     child = launchDaemon();
   } catch (caught) {
-    preservePanic(caught);
-    const cause = opaqueErrorCause(caught);
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
     return Result.err(
       new RemoteFsDaemonSpawnError({
-        cause,
+        cause: projected.error,
         message: "failed to spawn remote fs daemon",
       }),
     );
@@ -511,7 +516,7 @@ export async function tryAcquireStartupLock(
     () => createLock(target),
   );
   if (created.status === "ok") return Result.ok(true);
-  if (!(created.error.cause instanceof Error) || getErrorCode(created.error.cause) !== "EEXIST") {
+  if (created.error.code !== "EEXIST") {
     return Result.err(created.error);
   }
 
@@ -520,10 +525,7 @@ export async function tryAcquireStartupLock(
     () => fs.stat(target),
   );
   if (statResult.status === "error") {
-    if (
-      statResult.error.cause instanceof Error &&
-      getErrorCode(statResult.error.cause) === "ENOENT"
-    ) {
+    if (statResult.error.code === "ENOENT") {
       return Result.ok(false);
     }
     return Result.err(statResult.error);
@@ -543,7 +545,7 @@ export async function tryAcquireStartupLock(
     () => createLock(target),
   );
   if (recreated.status === "ok") return Result.ok(true);
-  if (recreated.error.cause instanceof Error && getErrorCode(recreated.error.cause) === "EEXIST") {
+  if (recreated.error.code === "EEXIST") {
     return Result.ok(false);
   }
   return Result.err(recreated.error);
@@ -559,12 +561,12 @@ export async function releaseStartupLock(
     await removeLock(target);
     return Result.ok(undefined);
   } catch (caught) {
-    preservePanic(caught);
-    const cause = opaqueErrorCause(caught);
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
     return Result.err(
       new RemoteFsStartupLockCleanupError({
         lockPath: target,
-        cause,
+        cause: projected.error,
         message: `failed to release remote fs startup lock: ${target}`,
       }),
     );
@@ -591,7 +593,7 @@ type StartupLockOperationOutcome =
       readonly kind: "result";
       readonly result: ResultType<ResponseEnvelope, RemoteFsRequestOperationError>;
     }
-  | { readonly kind: "rejection"; readonly cause: unknown };
+  | { readonly kind: "rejection"; readonly cause: Error };
 
 async function captureStartupLockOperation(
   operation: () => Promise<ResultType<ResponseEnvelope, RemoteFsRequestOperationError>>,
@@ -599,7 +601,11 @@ async function captureStartupLockOperation(
   try {
     return { kind: "result", result: await operation() };
   } catch (cause) {
-    return { kind: "rejection", cause };
+    const projected = opaqueErrorCause(cause);
+    return {
+      kind: "rejection",
+      cause: projected.kind === "panic" ? projected.panic : projected.error,
+    };
   }
 }
 
@@ -710,11 +716,11 @@ export async function executeDaemonRequest(
   try {
     return Result.ok(await execute(request));
   } catch (caught) {
-    preservePanic(caught);
-    const cause = opaqueErrorCause(caught);
+    const projected = opaqueErrorCause(caught);
+    if (projected.kind === "panic") preservePanic(projected.panic);
     return Result.err(
       new RemoteFsSocketTransportError({
-        cause,
+        cause: projected.error,
         message: `remote fs daemon failed to execute ${request.op}`,
       }),
     );
@@ -873,8 +879,9 @@ async function main(): Promise<void> {
 }
 
 export function reportMainFailure(error: unknown): void {
-  preservePanic(error);
-  writeJson({ ok: false, error: opaqueErrorMessage(error) } satisfies ResponseEnvelope);
+  const projected = opaqueErrorCause(error);
+  if (projected.kind === "panic") preservePanic(projected.panic);
+  writeJson({ ok: false, error: opaqueErrorMessage(projected.error) } satisfies ResponseEnvelope);
   process.exitCode = 1;
 }
 

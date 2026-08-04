@@ -96,6 +96,17 @@ describe("extractAiErrorLogDetails", () => {
     expect(details).not.toHaveProperty("responseBody");
   });
 
+  it("redacts primary error messages and contains hostile inspection", () => {
+    const details = extractAiErrorLogDetails(
+      createApiCallError({ message: "request failed token=sk-super-secret" }),
+    );
+    expect(details?.aiErrorMessage).toBe("request failed token=<redacted>");
+
+    const hostile = Proxy.revocable({}, {});
+    hostile.revoke();
+    expect(extractAiErrorLogDetails(hostile.proxy)).toBeUndefined();
+  });
+
   it("does not retain unrelated JSON response fields", () => {
     const details = extractAiErrorLogDetails(
       createApiCallError({

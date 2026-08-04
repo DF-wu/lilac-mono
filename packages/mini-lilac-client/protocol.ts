@@ -629,16 +629,11 @@ const reasoningFilePartSchema = z.strictObject({
 
 const customPartSchema = z.strictObject({
   type: z.literal("custom"),
-  kind: z.custom<`${string}.${string}`>(
-    (value): value is `${string}.${string}` => typeof value === "string" && value.includes("."),
-  ),
+  kind: z.templateLiteral([z.string(), ".", z.string()]),
   ...standardPartMetadataFields,
 });
 
-const toolTypeSchema = z.custom<`tool-${string}`>(
-  (value): value is `tool-${string}` =>
-    typeof value === "string" && value.startsWith("tool-") && value.length > "tool-".length,
-);
+const toolTypeSchema = z.templateLiteral(["tool-", z.string().min(1)]);
 
 const toolPartBaseFields = {
   toolCallId: z.string(),

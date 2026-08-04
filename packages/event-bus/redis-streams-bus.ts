@@ -1,6 +1,6 @@
 import type Redis from "ioredis";
 import SuperJSON from "superjson";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import { createLogger, errorMessage } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
@@ -49,6 +49,7 @@ const TAIL_REPLAY_TOPICS = new Set<Topic>(["evt.request", "evt.adapter"]);
 const MAX_EVIDENCE_VALUES = 32;
 const MAX_EVIDENCE_VALUE_CHARS = 1024;
 const STRING_HEADERS_SCHEMA = z.record(z.string(), z.string());
+const REDIS_STREAM_ID_PATTERN = /^\d+-\d+$/;
 
 const XADD_WITH_EXPIRY_SCRIPT = `
 local id = redis.call("XADD", KEYS[1], unpack(ARGV, 2))
@@ -182,6 +183,83 @@ function redisIdForOffset(offset: Offset): string {
 function redisIdForOptionalOffset(offset: Offset | undefined): string {
   if (offset === undefined) return "$";
   return redisIdForOffset(offset);
+}
+
+type RedisReadEntry = {
+  readonly id: string;
+  readonly message: RawMessageDecodeOutcome;
+  readonly evidence: EventTransportEvidence;
+};
+type RedisResponseDecodeResult<T> =
+  | { readonly status: "ok"; readonly value: T }
+  | { readonly status: "error"; readonly message: string };
+
+function isRedisStreamId(value: string): boolean {
+  return REDIS_STREAM_ID_PATTERN.test(value);
+}
+
+function isRedisCount(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function decodeRedisReadResponse(
+  response: unknown,
+  topic: Topic,
+  expectedStreamKey: string,
+  logger?: Logger,
+): RedisResponseDecodeResult<readonly RedisReadEntry[]> {
+  if (response === null) return { status: "ok", value: [] };
+  if (!Array.isArray(response) || response.length !== 1) {
+    return { status: "error", message: "Redis XREAD returned an invalid stream collection" };
+  }
+  const stream = response[0];
+  if (
+    !Array.isArray(stream) ||
+    stream.length !== 2 ||
+    stream[0] !== expectedStreamKey ||
+    !Array.isArray(stream[1])
+  ) {
+    return { status: "error", message: "Redis XREAD returned an invalid stream entry" };
+  }
+
+  const entries: RedisReadEntry[] = [];
+  for (const entry of stream[1]) {
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      return { status: "error", message: "Redis XREAD returned an invalid message entry" };
+    }
+    if (typeof entry[0] !== "string" || !isRedisStreamId(entry[0])) {
+      return { status: "error", message: "Redis XREAD returned an invalid message id" };
+    }
+    const id = entry[0];
+    const fields = entry[1];
+    entries.push({
+      id,
+      message: decodeMessage(topic, expectedStreamKey, id, fields, logger),
+      evidence: redisTransportEvidence(topic, expectedStreamKey, id, fields),
+    });
+  }
+  return { status: "ok", value: entries };
+}
+
+function decodeRedisWatermarkResponse(response: unknown): RedisResponseDecodeResult<string | null> {
+  if (!Array.isArray(response)) {
+    return { status: "error", message: "Redis XREVRANGE returned an invalid entry collection" };
+  }
+  if (response.length === 0) return { status: "ok", value: null };
+  if (response.length !== 1) {
+    return { status: "error", message: "Redis XREVRANGE returned too many entries" };
+  }
+  const latest = response[0];
+  if (
+    !Array.isArray(latest) ||
+    latest.length !== 2 ||
+    typeof latest[0] !== "string" ||
+    !isRedisStreamId(latest[0]) ||
+    !Array.isArray(latest[1])
+  ) {
+    return { status: "error", message: "Redis XREVRANGE returned an invalid entry" };
+  }
+  return { status: "ok", value: latest[0] };
 }
 
 type RedisFieldsDecodeResult =
@@ -446,34 +524,59 @@ async function ensureGroup(options: {
   group: string;
   startId: string;
   logger?: Logger;
-}): Promise<boolean> {
+}): Promise<ResultType<boolean, RedisConsumerGroupEnsureFailed>> {
   try {
-    await options.redis.xgroup(
+    const created = await options.redis.xgroup(
       "CREATE",
       options.streamKey,
       options.group,
       options.startId,
       "MKSTREAM",
     );
+    if (created !== "OK") {
+      return Result.err(
+        new RedisConsumerGroupEnsureFailed({
+          cause: new Error("Redis XGROUP CREATE returned an invalid response"),
+          streamKey: options.streamKey,
+          group: options.group,
+          message: "Redis consumer-group initialization failed",
+        }),
+      );
+    }
 
     options.logger?.info("created consumer group", {
       streamKey: options.streamKey,
       group: options.group,
       startId: options.startId,
     });
-    return true;
+    return Result.ok(true);
   } catch (e) {
+    if (Panic.is(e)) throw e;
     const msg = errorMessage(e);
     if (msg.includes("BUSYGROUP")) {
       options.logger?.debug("consumer group exists", {
         streamKey: options.streamKey,
         group: options.group,
       });
-      return false;
+      return Result.ok(false);
     }
-    throw e;
+    return Result.err(
+      new RedisConsumerGroupEnsureFailed({
+        cause: e,
+        streamKey: options.streamKey,
+        group: options.group,
+        message: "Redis consumer-group initialization failed",
+      }),
+    );
   }
 }
+
+class RedisConsumerGroupEnsureFailed extends TaggedError("RedisConsumerGroupEnsureFailed")<{
+  readonly cause: unknown;
+  readonly streamKey: string;
+  readonly group: string;
+  readonly message: string;
+}> {}
 
 /** Options for `RedisStreamsBus`. */
 export type RedisStreamsBusOptions = {
@@ -518,6 +621,7 @@ export class RedisStreamsBus implements RawBus {
   private readonly subPool: RedisConnectionPool;
   private readonly trimTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activeTrims = new Set<Promise<void>>();
+  private acknowledgedTrimPanic: Panic | null = null;
   private closing = false;
 
   /** Create a new bus using an existing ioredis client. */
@@ -572,11 +676,21 @@ export class RedisStreamsBus implements RawBus {
   }
 
   private startAcknowledgedTrim(topic: Topic, streamKey: string): void {
-    const activeTrim = this.trimAcknowledgedPrefix(topic, streamKey).catch((e: unknown) => {
-      this.logger.error("event_bus.trim_failed", { topic }, e);
-    });
+    const activeTrim = this.captureAcknowledgedTrim(topic, streamKey);
     this.activeTrims.add(activeTrim);
-    void activeTrim.finally(() => this.activeTrims.delete(activeTrim));
+    void activeTrim.then(() => this.activeTrims.delete(activeTrim));
+  }
+
+  private async captureAcknowledgedTrim(topic: Topic, streamKey: string): Promise<void> {
+    try {
+      await this.trimAcknowledgedPrefix(topic, streamKey);
+    } catch (cause) {
+      if (Panic.is(cause)) {
+        if (this.acknowledgedTrimPanic === null) this.acknowledgedTrimPanic = cause;
+        return;
+      }
+      this.logger.error("event_bus.trim_failed", { topic }, cause);
+    }
   }
 
   async flushPendingTrims(): Promise<void> {
@@ -586,11 +700,15 @@ export class RedisStreamsBus implements RawBus {
       this.startAcknowledgedTrim(streamKey.slice(this.keyPrefix.length + 1), streamKey);
     }
     await Promise.allSettled(this.activeTrims);
+    if (this.acknowledgedTrimPanic !== null) throw this.acknowledgedTrimPanic;
   }
 
   private async trimAcknowledgedPrefix(topic: Topic, streamKey: string): Promise<void> {
     const trimmed = await this.redis.eval(TRIM_ACKNOWLEDGED_PREFIX_SCRIPT, 1, streamKey);
-    if (typeof trimmed === "number" && trimmed > 0) {
+    if (typeof trimmed !== "number" || !isRedisCount(trimmed)) {
+      throw new Panic({ message: "Redis XTRIM returned an invalid count" });
+    }
+    if (trimmed > 0) {
       this.logger.debug("event_bus.trimmed", { topic, trimmed });
     }
   }
@@ -609,7 +727,9 @@ export class RedisStreamsBus implements RawBus {
       String(retainedCount),
       EPHEMERAL_GROUP_PREFIX,
     );
-    if (typeof trimmed !== "number") throw new Error("Redis XTRIM returned an invalid count");
+    if (typeof trimmed !== "number" || !isRedisCount(trimmed)) {
+      throw new Panic({ message: "Redis XTRIM returned an invalid count" });
+    }
     if (trimmed > 0) {
       this.logger.debug("event_bus.checkpoint_trimmed", { topic, checkpoint, trimmed });
     }
@@ -635,7 +755,7 @@ export class RedisStreamsBus implements RawBus {
     }
     if (result === 0) return "absent";
     if (result === 1) return "destroyed";
-    throw new Error("Redis XGROUP DESTROY returned an invalid result");
+    throw new Panic({ message: "Redis XGROUP DESTROY returned an invalid result" });
   }
 
   /** Publish a message via `XADD`. */
@@ -680,7 +800,9 @@ export class RedisStreamsBus implements RawBus {
         )
       : await this.redis.xadd(streamKey, ...xaddArgs);
 
-    if (typeof id !== "string") throw new Error("Redis XADD returned invalid id");
+    if (typeof id !== "string" || !isRedisStreamId(id)) {
+      throw new Panic({ message: "Redis XADD returned invalid id" });
+    }
 
     this.logger.debug("event_bus.publish", {
       topic: opts.topic,
@@ -715,24 +837,14 @@ export class RedisStreamsBus implements RawBus {
       evidence: EventTransportEvidence;
     }> = [];
 
-    // Shape: [[streamKey, [[id, [k,v...]], ...]]]
-    const streams = Array.isArray(res) ? res : [];
-    for (const s of streams) {
-      const entries = Array.isArray(s) ? s[1] : undefined;
-      if (!Array.isArray(entries)) continue;
-
-      for (const entry of entries) {
-        const id = Array.isArray(entry) ? entry[0] : undefined;
-        const fields = Array.isArray(entry) ? entry[1] : undefined;
-        if (typeof id !== "string") continue;
-
-        const decoded = decodeMessage(topic, streamKey, id, fields, this.logger);
-        messages.push({
-          msg: decoded,
-          cursor: id,
-          evidence: redisTransportEvidence(topic, streamKey, id, fields),
-        });
-      }
+    const decodedResponse = decodeRedisReadResponse(res, topic, streamKey, this.logger);
+    if (decodedResponse.status === "error") throw new Error(decodedResponse.message);
+    for (const entry of decodedResponse.value) {
+      messages.push({
+        msg: entry.message,
+        cursor: entry.id,
+        evidence: entry.evidence,
+      });
     }
 
     const next = messages.length > 0 ? messages[messages.length - 1]!.cursor : undefined;
@@ -747,9 +859,9 @@ export class RedisStreamsBus implements RawBus {
       "COUNT",
       1,
     )) as unknown;
-    if (!Array.isArray(entries) || entries.length === 0) return null;
-    const latest = entries[0];
-    return Array.isArray(latest) && typeof latest[0] === "string" ? latest[0] : null;
+    const decoded = decodeRedisWatermarkResponse(entries);
+    if (decoded.status === "error") throw new Error(decoded.message);
+    return decoded.value;
   }
 
   /** Subscribe with transport-owned delivery actions and typed operational Results. */
@@ -769,19 +881,17 @@ export class RedisStreamsBus implements RawBus {
   > {
     const streamKey = this.streamKey(topic);
     const abortController = new AbortController();
-    let lease: Awaited<ReturnType<RedisConnectionPool["acquire"]>>;
-    try {
-      lease = await this.subPool.acquire();
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
+    const acquired = await this.subPool.acquire();
+    if (acquired.status === "error") {
       return Result.err(
         new EventDeliveryStartFailed({
-          cause,
+          cause: acquired.error,
           topic,
           message: "Failed to acquire a Redis delivery connection",
         }),
       );
     }
+    const lease = acquired.value;
 
     const subRedis = lease.redis;
     let disconnectOnStop = false;
@@ -803,13 +913,24 @@ export class RedisStreamsBus implements RawBus {
           : opts.subscriptionId;
         consumerId = opts.consumerId ?? randomConsumerId();
         const startId = opts.offset?.type === "begin" ? "0-0" : "$";
-        createdGroup = await ensureGroup({
+        const ensuredGroup = await ensureGroup({
           redis: subRedis,
           streamKey,
           group,
           startId,
           logger: this.logger,
         });
+        if (ensuredGroup.status === "error") {
+          if (!lease.shared) await lease.release({ unhealthy: true });
+          return Result.err(
+            new EventDeliveryStartFailed({
+              cause: ensuredGroup.error,
+              topic,
+              message: "Failed to initialize Redis delivery",
+            }),
+          );
+        }
+        createdGroup = ensuredGroup.value;
         if (opts.ephemeral && !createdGroup) {
           throw new Error(`Ephemeral consumer group already exists: ${group}`);
         }
@@ -873,19 +994,19 @@ export class RedisStreamsBus implements RawBus {
     };
 
     const handleEntry = async (
-      id: Cursor,
-      fields: unknown,
+      entry: RedisReadEntry,
     ): Promise<
       | { readonly status: "advance" }
       | { readonly status: "park" }
       | { readonly status: "stop"; readonly error: EventDeliveryStopped }
       | { readonly status: "transport-error"; readonly error: EventDeliveryTransportFailed }
     > => {
-      const evidence = redisTransportEvidence(topic, streamKey, id, fields);
-      const message = decodeMessage(topic, streamKey, id, fields, this.logger);
+      const id = entry.id;
       let action: RawDeliveryAction;
       try {
-        action = deliveryAction(await handler(message, { cursor: id, mode: opts.mode, evidence }));
+        action = deliveryAction(
+          await handler(entry.message, { cursor: id, mode: opts.mode, evidence: entry.evidence }),
+        );
       } catch (cause) {
         const phase = Panic.is(cause) ? "delivery-action" : "handler";
         await reportFatal(cause, id, phase);
@@ -977,97 +1098,185 @@ export class RedisStreamsBus implements RawBus {
         message: "Redis delivery read failed",
       });
 
-    const running: Promise<ResultType<void, EventDeliveryDoneError>> = (async () => {
-      try {
-        if (opts.mode === "tail") {
-          let cursor = redisIdForOptionalOffset(opts.offset);
-          while (!abortController.signal.aborted) {
-            let response: unknown;
-            try {
-              response = await subRedis.xread(
-                "COUNT",
-                String(maxMessages),
-                "BLOCK",
-                String(blockMs),
-                "STREAMS",
-                streamKey,
-                cursor,
-              );
-            } catch (cause) {
-              if (abortController.signal.aborted) return Result.ok(undefined);
-              if (Panic.is(cause)) throw cause;
-              releaseUnhealthy = true;
-              return Result.err(readFailure(cause, cursor));
-            }
-
-            const streams = Array.isArray(response) ? response : [];
-            for (const stream of streams) {
-              const entries = Array.isArray(stream) ? stream[1] : undefined;
-              if (!Array.isArray(entries)) continue;
-              for (const entry of entries) {
-                const id = Array.isArray(entry) ? entry[0] : undefined;
-                const fields = Array.isArray(entry) ? entry[1] : undefined;
-                if (typeof id !== "string") continue;
-                const handled = await handleEntry(id, fields);
-                if (handled.status === "stop") return Result.err(handled.error);
-                if (handled.status === "transport-error") return Result.err(handled.error);
-                if (handled.status === "park") {
-                  throw new Panic({ message: "Tail delivery produced an impossible park action" });
-                }
-                cursor = id;
-              }
-            }
-          }
-          return Result.ok(undefined);
-        }
-
-        if (!group || !consumerId) {
-          throw new Panic({ message: "Redis delivery started without a group and consumer" });
-        }
+    const runLoop = async (): Promise<ResultType<void, EventDeliveryDoneError>> => {
+      if (opts.mode === "tail") {
+        let cursor = redisIdForOptionalOffset(opts.offset);
         while (!abortController.signal.aborted) {
           let response: unknown;
           try {
-            response = await subRedis.xreadgroup(
-              "GROUP",
-              group,
-              consumerId,
+            response = await subRedis.xread(
               "COUNT",
               String(maxMessages),
               "BLOCK",
               String(blockMs),
               "STREAMS",
               streamKey,
-              ">",
+              cursor,
             );
           } catch (cause) {
-            if (abortController.signal.aborted) return Result.ok(undefined);
             if (Panic.is(cause)) throw cause;
+            if (
+              disconnectOnStop &&
+              abortController.signal.aborted &&
+              cause instanceof Error &&
+              cause.name === "Error" &&
+              cause.message === "Connection is closed."
+            ) {
+              return Result.ok(undefined);
+            }
             releaseUnhealthy = true;
-            return Result.err(readFailure(cause));
+            return Result.err(readFailure(cause, cursor));
           }
 
-          const streams = Array.isArray(response) ? response : [];
-          for (const stream of streams) {
-            const entries = Array.isArray(stream) ? stream[1] : undefined;
-            if (!Array.isArray(entries)) continue;
-            for (const entry of entries) {
-              const id = Array.isArray(entry) ? entry[0] : undefined;
-              const fields = Array.isArray(entry) ? entry[1] : undefined;
-              if (typeof id !== "string") continue;
-              const handled = await handleEntry(id, fields);
-              if (handled.status === "stop") return Result.err(handled.error);
-              if (handled.status === "transport-error") return Result.err(handled.error);
+          const decodedResponse = decodeRedisReadResponse(response, topic, streamKey, this.logger);
+          if (decodedResponse.status === "error") {
+            releaseUnhealthy = true;
+            return Result.err(readFailure(new Error(decodedResponse.message), cursor));
+          }
+          for (const entry of decodedResponse.value) {
+            const handled = await handleEntry(entry);
+            if (handled.status === "stop") return Result.err(handled.error);
+            if (handled.status === "transport-error") return Result.err(handled.error);
+            if (handled.status === "park") {
+              throw new Panic({ message: "Tail delivery produced an impossible park action" });
             }
+            cursor = entry.id;
           }
         }
         return Result.ok(undefined);
-      } finally {
-        if (!lease.shared) {
-          await lease.release({ unhealthy: disconnectOnStop || releaseUnhealthy });
+      }
+
+      if (!group || !consumerId) {
+        throw new Panic({ message: "Redis delivery started without a group and consumer" });
+      }
+      while (!abortController.signal.aborted) {
+        let response: unknown;
+        try {
+          response = await subRedis.xreadgroup(
+            "GROUP",
+            group,
+            consumerId,
+            "COUNT",
+            String(maxMessages),
+            "BLOCK",
+            String(blockMs),
+            "STREAMS",
+            streamKey,
+            ">",
+          );
+        } catch (cause) {
+          if (Panic.is(cause)) throw cause;
+          if (
+            disconnectOnStop &&
+            abortController.signal.aborted &&
+            cause instanceof Error &&
+            cause.name === "Error" &&
+            cause.message === "Connection is closed."
+          ) {
+            return Result.ok(undefined);
+          }
+          releaseUnhealthy = true;
+          return Result.err(readFailure(cause));
         }
+
+        const decodedResponse = decodeRedisReadResponse(response, topic, streamKey, this.logger);
+        if (decodedResponse.status === "error") {
+          releaseUnhealthy = true;
+          return Result.err(readFailure(new Error(decodedResponse.message)));
+        }
+        for (const entry of decodedResponse.value) {
+          const handled = await handleEntry(entry);
+          if (handled.status === "stop") return Result.err(handled.error);
+          if (handled.status === "transport-error") return Result.err(handled.error);
+        }
+      }
+      return Result.ok(undefined);
+    };
+
+    type CleanupAttempt =
+      | { readonly status: "ok" }
+      | { readonly status: "error"; readonly cause: unknown };
+    let leaseCleanup: Promise<CleanupAttempt> | null = null;
+    const cleanupLease = (): Promise<CleanupAttempt> => {
+      leaseCleanup ??= (async () => {
+        if (lease.shared) return { status: "ok" };
+        try {
+          await lease.release({ unhealthy: disconnectOnStop || releaseUnhealthy });
+          return { status: "ok" };
+        } catch (cause) {
+          return { status: "error", cause };
+        }
+      })();
+      return leaseCleanup;
+    };
+
+    type LoopCompletion =
+      | { readonly status: "completed" }
+      | { readonly status: "defect"; readonly cause: unknown };
+    let settleLoopCompletion!: (completion: LoopCompletion) => void;
+    const loopCompletion = new Promise<LoopCompletion>((resolve) => {
+      settleLoopCompletion = resolve;
+    });
+    const running: Promise<ResultType<void, EventDeliveryDoneError>> = (async () => {
+      try {
+        const loopResult = await runLoop();
+        const released = await cleanupLease();
+        if (released.status === "error") {
+          if (Panic.is(released.cause)) throw released.cause;
+          return Result.err(
+            new EventDeliveryTransportFailed({
+              cause: released.cause,
+              operation: "cleanup",
+              topic,
+              message: "Redis delivery lease cleanup failed",
+            }),
+          );
+        }
+        return loopResult;
+      } catch (cause) {
+        await cleanupLease();
+        settleLoopCompletion({ status: "defect", cause });
+        throw cause;
+      } finally {
+        settleLoopCompletion({ status: "completed" });
       }
     })();
     void running.catch(() => undefined);
+
+    const cleanupGroup = async (): Promise<CleanupAttempt> => {
+      try {
+        if (group && consumerId) {
+          if (ephemeral && createdGroup) {
+            const destroyed = await this.redis.xgroup("DESTROY", streamKey, group);
+            if (destroyed !== 1) {
+              throw new Error("Redis XGROUP DESTROY returned an invalid cleanup response");
+            }
+            this.scheduleAcknowledgedTrim(topic, streamKey);
+          } else {
+            const pending = (await this.redis.xpending(
+              streamKey,
+              group,
+              "-",
+              "+",
+              1,
+              consumerId,
+            )) as unknown;
+            if (!Array.isArray(pending)) {
+              throw new Error("Redis XPENDING returned an invalid cleanup response");
+            }
+            if (pending.length === 0) {
+              const removed = await this.redis.xgroup("DELCONSUMER", streamKey, group, consumerId);
+              if (typeof removed !== "number" || !isRedisCount(removed)) {
+                throw new Error("Redis XGROUP DELCONSUMER returned an invalid cleanup response");
+              }
+            }
+          }
+        }
+        return { status: "ok" };
+      } catch (cause) {
+        return { status: "error", cause };
+      }
+    };
 
     return Result.ok({
       done: running,
@@ -1077,38 +1286,34 @@ export class RedisStreamsBus implements RawBus {
           disconnectOnStop = true;
           subRedis.disconnect();
         }
-        await running;
+        const completedLoop = await loopCompletion;
+        const groupCleanup = await cleanupGroup();
+        const released = await cleanupLease();
 
-        try {
-          if (group && consumerId) {
-            if (ephemeral && createdGroup) {
-              await this.redis.xgroup("DESTROY", streamKey, group);
-              this.scheduleAcknowledgedTrim(topic, streamKey);
-            } else {
-              const pending = (await this.redis.xpending(
-                streamKey,
-                group,
-                "-",
-                "+",
-                1,
-                consumerId,
-              )) as unknown;
-              if (Array.isArray(pending) && pending.length === 0) {
-                await this.redis.xgroup("DELCONSUMER", streamKey, group, consumerId);
-              }
-            }
-          }
-          return Result.ok(undefined);
-        } catch (cause) {
-          if (Panic.is(cause)) throw cause;
+        if (completedLoop.status === "defect") throw completedLoop.cause;
+        if (groupCleanup.status === "error" && Panic.is(groupCleanup.cause)) {
+          throw groupCleanup.cause;
+        }
+        if (released.status === "error" && Panic.is(released.cause)) throw released.cause;
+        if (groupCleanup.status === "error") {
           return Result.err(
             new EventDeliveryStopFailed({
-              cause,
+              cause: groupCleanup.cause,
               topic,
               message: "Redis delivery cleanup failed",
             }),
           );
         }
+        if (released.status === "error") {
+          return Result.err(
+            new EventDeliveryStopFailed({
+              cause: released.cause,
+              topic,
+              message: "Redis delivery lease cleanup failed",
+            }),
+          );
+        }
+        return Result.ok(undefined);
       },
     });
   }
@@ -1120,10 +1325,12 @@ export class RedisStreamsBus implements RawBus {
     this.trimTimers.clear();
     await Promise.allSettled(this.activeTrims);
     await this.subPool.close();
-    if (!this.ownsRedis) return;
+    if (this.ownsRedis) {
+      // Do not `disconnect()` because it drops queued commands; `quit()` is clean.
+      await this.redis.quit();
+    }
 
-    // Do not `disconnect()` because it drops queued commands; `quit()` is clean.
-    await this.redis.quit();
+    if (this.acknowledgedTrimPanic !== null) throw this.acknowledgedTrimPanic;
   }
 }
 

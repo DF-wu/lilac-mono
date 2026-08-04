@@ -1,7 +1,9 @@
 import { z } from "zod";
 import path from "node:path";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ServerTool } from "../types";
+import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
 
 export { parseSshHostsFromConfigText } from "../../ssh/ssh-config";
@@ -10,6 +12,66 @@ import { readConfiguredSshHosts, requireConfiguredSshHost } from "../../ssh/ssh-
 const DEFAULT_SSH_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
 const MAX_OUTPUT_CHARS = 200_000;
+
+const sshProbeOutputSchema = z.strictObject({
+  ok: z.literal(true),
+  system: z.strictObject({
+    uname: z.strictObject({ s: z.string(), m: z.string(), r: z.string() }),
+    osRelease: z.strictObject({ id: z.string(), versionId: z.string() }),
+    user: z.string(),
+    home: z.string(),
+    shell: z.string(),
+    pwd: z.string(),
+  }),
+  cwd: z.strictObject({ attempted: z.string(), used: z.string() }),
+  git: z.strictObject({
+    isRepo: z.boolean(),
+    topLevel: z.string(),
+    head: z.string(),
+    branch: z.string(),
+    statusPorcelain: z.string(),
+  }),
+  expectedTools: z.array(z.string()),
+  tools: z.record(
+    z.string(),
+    z.strictObject({ present: z.boolean(), path: z.string(), version: z.string() }),
+  ),
+});
+
+export type SshProbeOutput = z.output<typeof sshProbeOutputSchema>;
+
+export class SshProbeOutputInvalid extends TaggedError("SshProbeOutputInvalid")<{
+  readonly message: string;
+}> {}
+
+class SshToolFailure extends TaggedError("SshToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptSshResultToToolHost<TValue>(result: ResultType<TValue, SshToolFailure>): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalSshFailureToToolHost(message: string): never {
+  return adaptSshResultToToolHost(Result.err(new SshToolFailure({ message })));
+}
+
+export function decodeSshProbeOutput(
+  text: string,
+): ResultType<SshProbeOutput, SshProbeOutputInvalid> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return Result.err(new SshProbeOutputInvalid({ message: "SSH probe returned invalid JSON" }));
+  }
+  const decoded = sshProbeOutputSchema.safeParse(parsed);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new SshProbeOutputInvalid({ message: "SSH probe returned an invalid response contract" }),
+  );
+}
 
 const emptyInputSchema = z.object({});
 
@@ -207,7 +269,7 @@ export class SSH implements ServerTool {
     }
 
     if (callableId === "ssh.run") {
-      const input = runInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: runInputSchema });
 
       await requireConfiguredSshHost(input.host);
 
@@ -303,11 +365,9 @@ export class SSH implements ServerTool {
           },
           transportError,
           errors: {
-            stdoutRead:
-              stdoutResult.status === "rejected" ? String(stdoutResult.reason) : undefined,
-            stderrRead:
-              stderrResult.status === "rejected" ? String(stderrResult.reason) : undefined,
-            exitRead: exitResult.status === "rejected" ? String(exitResult.reason) : undefined,
+            stdoutRead: stdoutResult.status === "rejected" ? "stdout read failed" : undefined,
+            stderrRead: stderrResult.status === "rejected" ? "stderr read failed" : undefined,
+            exitRead: exitResult.status === "rejected" ? "exit status read failed" : undefined,
             stdinWrite: undefined,
           },
         };
@@ -318,7 +378,7 @@ export class SSH implements ServerTool {
     }
 
     if (callableId === "ssh.probe") {
-      const input = probeInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: probeInputSchema });
 
       await requireConfiguredSshHost(input.host);
 
@@ -390,15 +450,13 @@ export class SSH implements ServerTool {
 
         const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
 
-        let probe: unknown | undefined;
+        let probe: SshProbeOutput | undefined;
         let parseError: string | undefined;
 
         if (exitCode === 0 && !timedOut) {
-          try {
-            probe = JSON.parse(stdout.trim()) as unknown;
-          } catch (e) {
-            parseError = e instanceof Error ? e.message : String(e);
-          }
+          const decodedProbe = decodeSshProbeOutput(stdout.trim());
+          if (decodedProbe.status === "ok") probe = decodedProbe.value;
+          else parseError = decodedProbe.error.message;
         }
 
         return {
@@ -436,6 +494,6 @@ export class SSH implements ServerTool {
       }
     }
 
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return signalSshFailureToToolHost(`Invalid callable ID '${callableId}'`);
   }
 }

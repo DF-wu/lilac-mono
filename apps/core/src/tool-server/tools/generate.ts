@@ -1,4 +1,5 @@
-import { env, getModelProviders } from "@stanley2058/lilac-utils";
+import { env, errorMessage, getModelProviders } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   experimental_generateVideo as generateVideo,
   generateImage,
@@ -17,7 +18,23 @@ import {
   resolveToolPathForRequestContext,
 } from "../../shared/attachment-utils";
 import type { RequestContext, ServerTool } from "../types";
+import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
+
+class GenerateToolFailure extends TaggedError("GenerateToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptGenerateResultToToolHost<TValue>(
+  result: ResultType<TValue, GenerateToolFailure>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalGenerateFailureToToolHost(message: string): never {
+  return adaptGenerateResultToToolHost(Result.err(new GenerateToolFailure({ message })));
+}
 
 type SupportedImageModelId =
   /**
@@ -321,7 +338,7 @@ function validateGptImageInput(
   modelId: "gpt-image-2" | "gpt-5-image",
 ): void {
   if (input.aspectRatio && !isOneOf(GPT_IMAGE_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GPT_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
     );
   }
@@ -332,7 +349,7 @@ function validateGptImageInput(
     if (isOneOf(GPT_IMAGE_STANDARD_SIZES, input.size)) return;
 
     const context = modelId === "gpt-image-2" ? " image edits" : "";
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported size '${input.size}' for ${modelId}${context}. Allowed: ${GPT_IMAGE_STANDARD_SIZES.join(" | ")}.`,
     );
   }
@@ -350,7 +367,7 @@ function validateGptImageInput(
     pixels < GPT_IMAGE_2_MIN_PIXELS ||
     pixels > GPT_IMAGE_2_MAX_PIXELS
   ) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported size '${input.size}' for gpt-image-2. Both edges must be multiples of 16 and at most ${GPT_IMAGE_2_MAX_EDGE}px, the aspect ratio must not exceed 3:1, and total pixels must be ${GPT_IMAGE_2_MIN_PIXELS}-${GPT_IMAGE_2_MAX_PIXELS}.`,
     );
   }
@@ -366,17 +383,19 @@ function validateNanobananaInput(
       : NANOBANANA_ALLOWED_ASPECT_RATIOS;
 
   if (input.aspectRatio && !isOneOf(allowedAspectRatios, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${allowedAspectRatios.join(", ")}.`,
     );
   }
 
   if (modelId === "nanobanana-2-lite" && input.size) {
-    throw new Error("nanobanana-2-lite produces 1K output; use aspectRatio instead of size.");
+    return signalGenerateFailureToToolHost(
+      "nanobanana-2-lite produces 1K output; use aspectRatio instead of size.",
+    );
   }
 
   if (modelId === "nanobanana-2-lite" && input.maskImage) {
-    throw new Error("nanobanana-2-lite does not support maskImage.");
+    return signalGenerateFailureToToolHost("nanobanana-2-lite does not support maskImage.");
   }
 }
 
@@ -407,21 +426,23 @@ function validateGrokImagineInput(
   modelId: "grok-imagine-image" | "grok-imagine-image-pro",
 ): void {
   if (input.size) {
-    throw new Error(`${modelId} does not support size. Use aspectRatio instead.`);
+    return signalGenerateFailureToToolHost(
+      `${modelId} does not support size. Use aspectRatio instead.`,
+    );
   }
 
   if (input.aspectRatio && !isOneOf(GROK_IMAGE_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GROK_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
     );
   }
 
   if (input.maskImage) {
-    throw new Error(`${modelId} does not support maskImage.`);
+    return signalGenerateFailureToToolHost(`${modelId} does not support maskImage.`);
   }
 
   if ((input.inputImages?.length ?? 0) > 1) {
-    throw new Error(`${modelId} supports only one input image.`);
+    return signalGenerateFailureToToolHost(`${modelId} supports only one input image.`);
   }
 }
 
@@ -522,13 +543,13 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
 
 function validateGrokVideoInput(input: VideoGenerateInput): void {
   if (input.aspectRatio && !isOneOf(GROK_VIDEO_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported aspectRatio '${input.aspectRatio}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
     );
   }
 
   if (input.resolution && !isOneOf(GROK_VIDEO_ALLOWED_RESOLUTIONS, input.resolution)) {
-    throw new Error(
+    return signalGenerateFailureToToolHost(
       `Unsupported resolution '${input.resolution}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_RESOLUTIONS.join(", ")}.`,
     );
   }
@@ -604,7 +625,7 @@ function pickModel<TId extends string, TModel>(
   if (requested) {
     const model = available[requested as TId];
     if (!model) {
-      throw new Error(
+      return signalGenerateFailureToToolHost(
         `Requested model '${requested}' is not available for ${modalityLabel} generation (configured: ${Object.keys(available).join(", ") || "none"}).`,
       );
     }
@@ -622,7 +643,7 @@ function pickModel<TId extends string, TModel>(
     }
   }
 
-  throw new Error(
+  return signalGenerateFailureToToolHost(
     `No ${modalityLabel} generation models are configured. Configure at least one provider for ${modalityLabel} generation.`,
   );
 }
@@ -687,7 +708,7 @@ async function readImageDataFromPath(path: string, displayPath = path): Promise<
     return bytes;
   }
 
-  throw new Error(`Input file '${displayPath}' is not a valid image file.`);
+  return signalGenerateFailureToToolHost(`Input file '${displayPath}' is not a valid image file.`);
 }
 
 export async function resolveImageEditInputs(
@@ -809,11 +830,11 @@ async function writeFileWithUniqueName(targetPath: string, bytes: Uint8Array): P
       if (code === "EEXIST") {
         continue;
       }
-      throw error;
+      return signalGenerateFailureToToolHost(errorMessage(error));
     }
   }
 
-  throw new Error(`Failed to find an available filename for: ${targetPath}`);
+  return signalGenerateFailureToToolHost(`Failed to find an available filename for: ${targetPath}`);
 }
 
 export function generateImageWithModel(
@@ -917,7 +938,7 @@ export class Generate implements ServerTool {
       return await this.callGenerateVideo(input, opts);
     }
 
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return signalGenerateFailureToToolHost(`Invalid callable ID '${callableId}'`);
   }
 
   private async callGenerateImage(
@@ -927,7 +948,11 @@ export class Generate implements ServerTool {
       context?: RequestContext;
     },
   ): Promise<unknown> {
-    const payload = imageGenerateInputSchema.parse(input);
+    const payload = parseToolInput({
+      callableId: "generate.image",
+      input,
+      schema: imageGenerateInputSchema,
+    });
     const availableModels = getAvailableImageModels();
     const picked = pickModel(
       availableModels.available,
@@ -938,7 +963,7 @@ export class Generate implements ServerTool {
 
     const descriptor = availableModels.byId.get(picked.id);
     if (!descriptor) {
-      throw new Error(`Model descriptor not found for '${picked.id}'.`);
+      return signalGenerateFailureToToolHost(`Model descriptor not found for '${picked.id}'.`);
     }
     descriptor.validateInput(payload);
 
@@ -982,7 +1007,11 @@ export class Generate implements ServerTool {
       context?: RequestContext;
     },
   ): Promise<unknown> {
-    const payload = videoGenerateInputSchema.parse(input);
+    const payload = parseToolInput({
+      callableId: "generate.video",
+      input,
+      schema: videoGenerateInputSchema,
+    });
     const availableModels = getAvailableVideoModels();
     const picked = pickModel(
       availableModels.available,
@@ -993,7 +1022,7 @@ export class Generate implements ServerTool {
 
     const descriptor = availableModels.byId.get(picked.id);
     if (!descriptor) {
-      throw new Error(`Model descriptor not found for '${picked.id}'.`);
+      return signalGenerateFailureToToolHost(`Model descriptor not found for '${picked.id}'.`);
     }
     descriptor.validateInput(payload);
 

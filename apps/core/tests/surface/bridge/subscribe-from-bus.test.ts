@@ -3183,20 +3183,24 @@ describe("bridgeBusToAdapter", () => {
         },
       },
     );
-    const accepted = await bus.publish(
+    const acceptedResult = await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: "accepted" },
       { headers: { request_id: requestId } },
     );
+    if (acceptedResult.status === "error") throw acceptedResult.error;
+    const accepted = acceptedResult.value;
     expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
 
     if (!adapter.stream) throw new Error("relay output stream was not started");
     adapter.stream.nextPushFailure = new Error("forced output push failure");
-    const failed = await bus.publish(
+    const failedResult = await bus.publish(
       lilacEventTypes.EvtAgentOutputDeltaText,
       { delta: " rejected" },
       { headers: { request_id: requestId } },
     );
+    if (failedResult.status === "error") throw failedResult.error;
+    const failed = failedResult.value;
 
     expect(deliveries.find((delivery) => delivery.cursor === failed.cursor)).toMatchObject({
       disposition: "stop",

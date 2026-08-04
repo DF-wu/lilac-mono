@@ -2,9 +2,10 @@ import crypto from "node:crypto";
 import Elysia from "elysia";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { lilacEventTypes } from "@stanley2058/lilac-event-bus";
-import { createLogger, env } from "@stanley2058/lilac-utils";
+import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { ModelMessage } from "ai";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
@@ -27,34 +28,154 @@ import {
 } from "../github-state";
 import { isMarkedGithubAgentComment } from "../github-comment-marker";
 import { parseGithubWorkflowActionReply } from "../../surface/github/github-actions";
+import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
 
 type GithubWebhookOptions = {
   bus: LilacBus;
   subscriptionId: string;
+  reportFatalError: (error: Error) => void;
 };
 
-const githubWorkflowActionPayloadSchema = z.object({
+const githubRepositorySchema = z.object({ full_name: z.string().min(1) });
+const githubWebhookBasePayloadSchema = z.object({
+  action: z.string().optional(),
+  repository: githubRepositorySchema.optional(),
+});
+const githubIssueCommentPayloadSchema = z.object({
+  action: z.literal("created"),
+  repository: githubRepositorySchema,
   issue: z.object({ number: z.number().int().positive() }),
   comment: z.object({
     id: z.number().int().positive(),
     body: z.string(),
+    html_url: z.string().optional(),
     created_at: z.string().optional(),
-    user: z.object({ login: z.string().min(1) }),
+    user: z.object({ login: z.string().min(1) }).optional(),
   }),
 });
-const githubWebhookSenderSchema = z.object({
-  sender: z.object({ login: z.string().min(1) }),
+const githubReviewRequestedPayloadSchema = z.object({
+  action: z.literal("review_requested"),
+  repository: githubRepositorySchema,
+  pull_request: z.object({
+    number: z.number().int().positive(),
+    head: z.object({ sha: z.string().min(1) }),
+  }),
+  requested_reviewer: z.object({ login: z.string().min(1) }).optional(),
+  sender: z.object({ login: z.string().min(1) }).optional(),
+});
+const githubPullRequestSynchronizePayloadSchema = z.object({
+  action: z.literal("synchronize"),
+  repository: githubRepositorySchema,
+  pull_request: z.object({
+    number: z.number().int().positive(),
+    head: z.object({ sha: z.string().min(1) }),
+  }),
 });
 
-function timingSafeEqualHex(a: string, b: string): boolean {
+type ProjectedGithubWebhookEvent =
+  | {
+      readonly kind: "issue-comment-created";
+      readonly payload: z.output<typeof githubIssueCommentPayloadSchema>;
+    }
+  | {
+      readonly kind: "review-requested";
+      readonly payload: z.output<typeof githubReviewRequestedPayloadSchema>;
+    }
+  | {
+      readonly kind: "pull-request-synchronize";
+      readonly payload: z.output<typeof githubPullRequestSynchronizePayloadSchema>;
+    }
+  | {
+      readonly kind: "unsupported";
+      readonly action?: string;
+      readonly repoFullName?: string;
+      readonly reason: "payload_invalid" | "unsupported_event";
+    };
+
+export class GithubWebhookOperationError extends TaggedError("GithubWebhookOperationError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export function decodeGithubWebhookEvent(
+  event: string,
+  payload: unknown,
+): ProjectedGithubWebhookEvent {
+  const decoded = Result.try({
+    try: (): ProjectedGithubWebhookEvent => {
+      const base = githubWebhookBasePayloadSchema.safeParse(payload);
+      const fallback = {
+        kind: "unsupported",
+        reason: base.success ? "unsupported_event" : "payload_invalid",
+        ...(base.success && base.data.action ? { action: base.data.action } : {}),
+        ...(base.success && base.data.repository
+          ? { repoFullName: base.data.repository.full_name }
+          : {}),
+      } as const;
+
+      if (!base.success) return fallback;
+      if (event === "issue_comment" && base.data.action === "created") {
+        const projected = githubIssueCommentPayloadSchema.safeParse(payload);
+        return projected.success
+          ? { kind: "issue-comment-created", payload: projected.data }
+          : fallback;
+      }
+      if (event === "pull_request" && base.data.action === "review_requested") {
+        const projected = githubReviewRequestedPayloadSchema.safeParse(payload);
+        return projected.success ? { kind: "review-requested", payload: projected.data } : fallback;
+      }
+      if (event === "pull_request" && base.data.action === "synchronize") {
+        const projected = githubPullRequestSynchronizePayloadSchema.safeParse(payload);
+        return projected.success
+          ? { kind: "pull-request-synchronize", payload: projected.data }
+          : fallback;
+      }
+      return fallback;
+    },
+    catch: (cause) => cause,
+  });
+  if (decoded.status === "ok") return decoded.value;
+  if (Panic.is(decoded.error)) return adaptToolResultToHost(Result.err(decoded.error));
+  return { kind: "unsupported", reason: "payload_invalid" };
+}
+
+async function captureGithubWebhookOperation<T>(
+  operation: string,
+  run: () => Promise<T>,
+): Promise<ResultType<T, GithubWebhookOperationError>> {
   try {
-    const ab = Buffer.from(a, "hex");
-    const bb = Buffer.from(b, "hex");
-    if (ab.length !== bb.length) return false;
-    return crypto.timingSafeEqual(ab, bb);
-  } catch {
-    return false;
+    return Result.ok(await run());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new GithubWebhookOperationError({
+        operation,
+        cause,
+        message: `GitHub webhook ${operation} failed`,
+      }),
+    );
   }
+}
+
+export async function superviseGithubWebhookHandler<T>(options: {
+  readonly run: () => Promise<T>;
+  readonly reportFatalError: (error: Error) => void;
+}): Promise<ResultType<T, GithubWebhookOperationError>> {
+  try {
+    return await captureGithubWebhookOperation("handler", options.run);
+  } catch (cause) {
+    if (!Panic.is(cause)) throw cause;
+    options.reportFatalError(cause);
+    throw cause;
+  }
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "hex");
+  const bb = Buffer.from(b, "hex");
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
 }
 
 export function verifyGithubWebhookSignature(input: {
@@ -72,17 +193,12 @@ export function verifyGithubWebhookSignature(input: {
 
 async function resolveBotMentions(): Promise<string[]> {
   const out: string[] = [];
-
-  const userLogin = await getGithubUserLoginOrNull().catch(() => null);
-  if (userLogin) {
-    out.push(userLogin);
-  }
-
-  // Also derive the GitHub App bot login when possible.
-  const slug = await getGithubAppSlugOrNull().catch(() => null);
-  if (slug) {
-    out.push(`${slug}[bot]`);
-  }
+  const [userLogin, appSlug] = await Promise.allSettled([
+    getGithubUserLoginOrNull(),
+    getGithubAppSlugOrNull(),
+  ]);
+  if (userLogin.status === "fulfilled" && userLogin.value) out.push(userLogin.value);
+  if (appSlug.status === "fulfilled" && appSlug.value) out.push(`${appSlug.value}[bot]`);
 
   // De-dupe while preserving order.
   return [...new Set(out)];
@@ -328,10 +444,10 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
       return { ok: true, deduped: true };
     }
 
-    let payload: unknown;
-    try {
-      payload = JSON.parse(new TextDecoder().decode(raw));
-    } catch {
+    const payload = await captureGithubWebhookOperation("decode JSON", async () =>
+      JSON.parse(new TextDecoder().decode(raw)),
+    );
+    if (payload.status === "error") {
       logger.warn("github.webhook.rejected", {
         event,
         deliveryId,
@@ -343,14 +459,20 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
       return { ok: false, error: "invalid json" };
     }
 
-    try {
-      const result = await handleEvent({
-        bus: options.bus,
-        logger,
-        event,
-        payload,
-        botLogins,
-      });
+    const projected = decodeGithubWebhookEvent(event, payload.value);
+    const handled = await superviseGithubWebhookHandler({
+      reportFatalError: options.reportFatalError,
+      run: () =>
+        handleEvent({
+          bus: options.bus,
+          logger,
+          event,
+          projected,
+          botLogins,
+        }),
+    });
+    if (handled.status === "ok") {
+      const result = handled.value;
       logger.info("github.webhook.ingress", {
         event,
         deliveryId,
@@ -362,19 +484,12 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
         statusCode: 200,
         durationMs: Date.now() - startedAt,
       });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      logger.error("webhook handler failed", { event, deliveryId }, e);
-      logger.error("github.webhook.rejected", {
-        event,
-        deliveryId,
-        reason: "handler_error",
-        errorClass: e instanceof Error ? e.name : "unknown",
-        statusCode: 500,
-        durationMs: Date.now() - startedAt,
-      });
+    } else {
+      const errorMessage = handled.error.message;
+      logger.error("webhook handler failed", formatTaggedErrorForLog(handled.error));
+      logger.error("github.webhook.rejected", formatTaggedErrorForLog(handled.error));
       set.status = 500;
-      return { ok: false, error: msg };
+      return { ok: false, error: errorMessage };
     }
 
     return { ok: true };
@@ -385,11 +500,7 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
 
   return {
     stop: async () => {
-      try {
-        server.stop();
-      } catch {
-        // ignore
-      }
+      await captureGithubWebhookOperation("server stop", async () => server.stop());
     },
   };
 }
@@ -398,7 +509,7 @@ async function handleEvent(input: {
   bus: LilacBus;
   logger: Logger;
   event: string;
-  payload: unknown;
+  projected: ProjectedGithubWebhookEvent;
   botLogins: readonly string[];
 }): Promise<{
   handled: boolean;
@@ -407,137 +518,112 @@ async function handleEvent(input: {
   repoFullName?: string;
   requestId?: string;
 }> {
-  const p = input.payload;
-  if (!p || typeof p !== "object") {
-    return { handled: false, reason: "payload_not_object" };
+  const projected = input.projected;
+  switch (projected.kind) {
+    case "issue-comment-created": {
+      const repoFullName = projected.payload.repository.full_name;
+      const requestId = await onIssueCommentCreated({
+        bus: input.bus,
+        logger: input.logger,
+        repoFullName,
+        payload: projected.payload,
+        botLogins: input.botLogins,
+      });
+      return {
+        handled: Boolean(requestId),
+        reason: requestId ? undefined : "issue_comment_not_triggered",
+        action: "created",
+        repoFullName,
+        requestId: requestId ?? undefined,
+      };
+    }
+    case "review-requested": {
+      const repoFullName = projected.payload.repository.full_name;
+      const requestId = await onReviewRequested({
+        bus: input.bus,
+        logger: input.logger,
+        repoFullName,
+        payload: projected.payload,
+        botLogins: input.botLogins,
+      });
+      return {
+        handled: Boolean(requestId),
+        reason: requestId ? undefined : "review_requested_not_for_bot",
+        action: "review_requested",
+        repoFullName,
+        requestId: requestId ?? undefined,
+      };
+    }
+    case "pull-request-synchronize": {
+      const repoFullName = projected.payload.repository.full_name;
+      const requestId = await onPullRequestSynchronize({
+        bus: input.bus,
+        logger: input.logger,
+        repoFullName,
+        payload: projected.payload,
+      });
+      return {
+        handled: Boolean(requestId),
+        reason: requestId ? undefined : "synchronize_ignored",
+        action: "synchronize",
+        repoFullName,
+        requestId: requestId ?? undefined,
+      };
+    }
+    case "unsupported":
+      input.logger.debug("github.webhook.ignored", {
+        event: input.event,
+        action: projected.action,
+        repo: projected.repoFullName,
+        reason: projected.reason,
+      });
+      return {
+        handled: false,
+        reason: projected.reason,
+        action: projected.action,
+        repoFullName: projected.repoFullName,
+      };
   }
-  const action = (p as Record<string, unknown>)["action"];
-  const repo = (p as Record<string, unknown>)["repository"];
-  const repoFullName =
-    repo && typeof repo === "object"
-      ? ((repo as Record<string, unknown>)["full_name"] as unknown)
-      : undefined;
-
-  if (typeof repoFullName !== "string" || repoFullName.length === 0) {
-    return {
-      handled: false,
-      reason: "missing_repo",
-      action: typeof action === "string" ? action : undefined,
-    };
-  }
-
-  if (input.event === "issue_comment" && action === "created") {
-    const requestId = await onIssueCommentCreated({
-      bus: input.bus,
-      logger: input.logger,
-      repoFullName,
-      payload: p as Record<string, unknown>,
-      botLogins: input.botLogins,
-    });
-    return {
-      handled: Boolean(requestId),
-      reason: requestId ? undefined : "issue_comment_not_triggered",
-      action: "created",
-      repoFullName,
-      requestId: requestId ?? undefined,
-    };
-  }
-
-  if (input.event === "pull_request" && action === "review_requested") {
-    const requestId = await onReviewRequested({
-      bus: input.bus,
-      logger: input.logger,
-      repoFullName,
-      payload: p as Record<string, unknown>,
-      botLogins: input.botLogins,
-    });
-    return {
-      handled: Boolean(requestId),
-      reason: requestId ? undefined : "review_requested_not_for_bot",
-      action: "review_requested",
-      repoFullName,
-      requestId: requestId ?? undefined,
-    };
-  }
-
-  if (input.event === "pull_request" && action === "synchronize") {
-    const requestId = await onPullRequestSynchronize({
-      bus: input.bus,
-      logger: input.logger,
-      repoFullName,
-      payload: p as Record<string, unknown>,
-    });
-    return {
-      handled: Boolean(requestId),
-      reason: requestId ? undefined : "synchronize_ignored",
-      action: "synchronize",
-      repoFullName,
-      requestId: requestId ?? undefined,
-    };
-  }
-
-  input.logger.debug("github.webhook.ignored", {
-    event: input.event,
-    action,
-    repo: repoFullName,
-    reason: "unsupported_event",
-  });
-
-  return {
-    handled: false,
-    reason: "unsupported_event",
-    action: typeof action === "string" ? action : undefined,
-    repoFullName,
-  };
 }
 
 async function onIssueCommentCreated(input: {
   bus: LilacBus;
   logger: Logger;
   repoFullName: string;
-  payload: Record<string, unknown>;
+  payload: z.output<typeof githubIssueCommentPayloadSchema>;
   botLogins: readonly string[];
 }): Promise<string | null> {
-  const actionPayload = githubWorkflowActionPayloadSchema.safeParse(input.payload);
-  if (actionPayload.success) {
-    const workflowAction = parseGithubWorkflowActionReply(actionPayload.data.comment.body);
+  const actionPayload = input.payload;
+  if (actionPayload.comment.user) {
+    const workflowAction = parseGithubWorkflowActionReply(actionPayload.comment.body);
     if (workflowAction) {
-      const sessionId = `${input.repoFullName}#${actionPayload.data.issue.number}`;
-      const parsedTs = actionPayload.data.comment.created_at
-        ? Date.parse(actionPayload.data.comment.created_at)
+      const sessionId = `${input.repoFullName}#${actionPayload.issue.number}`;
+      const parsedTs = actionPayload.comment.created_at
+        ? Date.parse(actionPayload.comment.created_at)
         : Number.NaN;
-      await input.bus.publish(lilacEventTypes.EvtAdapterActionInvoked, {
-        actionId: workflowAction.actionId,
-        platform: "github",
-        userId: actionPayload.data.comment.user.login,
-        messageRef: {
+      adaptEventPublishResultToHost(
+        await input.bus.publish(lilacEventTypes.EvtAdapterActionInvoked, {
+          actionId: workflowAction.actionId,
           platform: "github",
-          channelId: sessionId,
-          messageId: workflowAction.messageId,
-        },
-        sourceMessageId: String(actionPayload.data.comment.id),
-        ts: Number.isFinite(parsedTs) ? parsedTs : Date.now(),
-      });
-      return `workflow-action:${actionPayload.data.comment.id}`;
+          userId: actionPayload.comment.user.login,
+          messageRef: {
+            platform: "github",
+            channelId: sessionId,
+            messageId: workflowAction.messageId,
+          },
+          sourceMessageId: String(actionPayload.comment.id),
+          ts: Number.isFinite(parsedTs) ? parsedTs : Date.now(),
+        }),
+      );
+      return `workflow-action:${actionPayload.comment.id}`;
     }
   }
 
-  const issue = input.payload["issue"];
-  const comment = input.payload["comment"];
-  if (!issue || typeof issue !== "object") return null;
-  if (!comment || typeof comment !== "object") return null;
-
-  const issueNumber = (issue as Record<string, unknown>)["number"];
-  const commentId = (comment as Record<string, unknown>)["id"];
-  const body = (comment as Record<string, unknown>)["body"];
-  const htmlUrl = (comment as Record<string, unknown>)["html_url"];
-  const user = (comment as Record<string, unknown>)["user"];
-  const author =
-    user && typeof user === "object"
-      ? ((user as Record<string, unknown>)["login"] as unknown)
-      : undefined;
-
-  if (typeof issueNumber !== "number" || typeof commentId !== "number") return null;
+  const issueNumber = input.payload.issue.number;
+  const commentId = input.payload.comment.id;
+  const body = input.payload.comment.body;
+  const htmlUrl = input.payload.comment.html_url;
+  const author = input.payload.comment.user?.login;
   if (typeof body !== "string" || body.trim().length === 0) return null;
 
   if (isMarkedGithubAgentComment(body)) {
@@ -583,18 +669,20 @@ async function onIssueCommentCreated(input: {
   });
 
   // Ack quickly with 👀 (best-effort).
-  try {
-    const reactionId = await addEyesReactionToIssueComment({
+  const ack = await captureGithubWebhookOperation("issue comment acknowledgement", () =>
+    addEyesReactionToIssueComment({
       owner,
       repo,
       commentId,
-    });
+    }),
+  );
+  if (ack.status === "ok") {
     setGithubAck(requestId, {
       target: { kind: "comment", commentId, issueNumber },
-      reactionId,
+      reactionId: ack.value,
     });
-  } catch (e) {
-    input.logger.warn("failed to add 👀 reaction", { requestId }, e);
+  } else {
+    input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
   }
 
   const issueData = await getIssue({ owner, repo, number: issueNumber });
@@ -628,30 +716,32 @@ async function onIssueCommentCreated(input: {
     createdAtMs: Date.now(),
   });
 
-  await input.bus.publish(
-    lilacEventTypes.CmdRequestMessage,
-    {
-      queue: "prompt",
-      messages,
-      raw: {
-        authenticatedActor: {
-          platform: "github",
-          userId: typeof author === "string" ? author : undefined,
-        },
-        github: {
-          repoFullName: input.repoFullName,
-          issueNumber,
-          trigger: { kind: "comment", commentId },
+  adaptEventPublishResultToHost(
+    await input.bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "prompt",
+        messages,
+        raw: {
+          authenticatedActor: {
+            platform: "github",
+            userId: typeof author === "string" ? author : undefined,
+          },
+          github: {
+            repoFullName: input.repoFullName,
+            issueNumber,
+            trigger: { kind: "comment", commentId },
+          },
         },
       },
-    },
-    {
-      headers: {
-        request_id: requestId,
-        session_id: sessionId,
-        request_client: "github",
+      {
+        headers: {
+          request_id: requestId,
+          session_id: sessionId,
+          request_client: "github",
+        },
       },
-    },
+    ),
   );
 
   return requestId;
@@ -661,23 +751,15 @@ async function onReviewRequested(input: {
   bus: LilacBus;
   logger: Logger;
   repoFullName: string;
-  payload: Record<string, unknown>;
+  payload: z.output<typeof githubReviewRequestedPayloadSchema>;
   botLogins: readonly string[];
 }): Promise<string | null> {
-  const pr = input.payload["pull_request"];
-  if (!pr || typeof pr !== "object") return null;
-
-  const requested = input.payload["requested_reviewer"];
-  const requestedLogin =
-    requested && typeof requested === "object"
-      ? ((requested as Record<string, unknown>)["login"] as unknown)
-      : undefined;
-  if (typeof requestedLogin !== "string" || requestedLogin.length === 0) {
+  const requestedLogin = input.payload.requested_reviewer?.login;
+  if (!requestedLogin) {
     // If this is a team review request, ignore for now.
     return null;
   }
-  const sender = githubWebhookSenderSchema.safeParse(input.payload);
-  const senderLogin = sender.success ? sender.data.sender.login : undefined;
+  const senderLogin = input.payload.sender?.login;
 
   if (input.botLogins.length > 0 && !input.botLogins.includes(requestedLogin)) {
     // Review request is for someone else.
@@ -691,14 +773,8 @@ async function onReviewRequested(input: {
     return null;
   }
 
-  const prNumber = (pr as Record<string, unknown>)["number"];
-  const head = (pr as Record<string, unknown>)["head"];
-  const headSha =
-    head && typeof head === "object"
-      ? ((head as Record<string, unknown>)["sha"] as unknown)
-      : undefined;
-
-  if (typeof prNumber !== "number" || typeof headSha !== "string" || !headSha) return null;
+  const prNumber = input.payload.pull_request.number;
+  const headSha = input.payload.pull_request.head.sha;
 
   const [owner, repo] = input.repoFullName.split("/");
   if (!owner || !repo) return null;
@@ -718,14 +794,16 @@ async function onReviewRequested(input: {
   });
 
   // Ack quickly on the PR description (issue).
-  try {
-    const reactionId = await addEyesReactionToIssue({ owner, repo, issueNumber: prNumber });
+  const ack = await captureGithubWebhookOperation("review acknowledgement", () =>
+    addEyesReactionToIssue({ owner, repo, issueNumber: prNumber }),
+  );
+  if (ack.status === "ok") {
     setGithubAck(requestId, {
       target: { kind: "issue", issueNumber: prNumber },
-      reactionId,
+      reactionId: ack.value,
     });
-  } catch (e) {
-    input.logger.warn("failed to add 👀 reaction", { requestId }, e);
+  } else {
+    input.logger.warn("failed to add eyes reaction", formatTaggedErrorForLog(ack.error));
   }
 
   const prData = await getPullRequest({ owner, repo, number: prNumber });
@@ -752,32 +830,34 @@ async function onReviewRequested(input: {
     pr: { prNumber, headSha: prData.head.sha, mode: "review" },
   });
 
-  await input.bus.publish(
-    lilacEventTypes.CmdRequestMessage,
-    {
-      queue: "prompt",
-      messages,
-      raw: {
-        authenticatedActor: {
-          platform: "github",
-          userId: typeof senderLogin === "string" ? senderLogin : undefined,
-        },
-        github: {
-          repoFullName: input.repoFullName,
-          prNumber,
-          headSha: prData.head.sha,
-          trigger: { kind: "issue", issueNumber: prNumber },
-          mode: "review",
+  adaptEventPublishResultToHost(
+    await input.bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "prompt",
+        messages,
+        raw: {
+          authenticatedActor: {
+            platform: "github",
+            userId: typeof senderLogin === "string" ? senderLogin : undefined,
+          },
+          github: {
+            repoFullName: input.repoFullName,
+            prNumber,
+            headSha: prData.head.sha,
+            trigger: { kind: "issue", issueNumber: prNumber },
+            mode: "review",
+          },
         },
       },
-    },
-    {
-      headers: {
-        request_id: requestId,
-        session_id: sessionId,
-        request_client: "github",
+      {
+        headers: {
+          request_id: requestId,
+          session_id: sessionId,
+          request_client: "github",
+        },
       },
-    },
+    ),
   );
 
   return requestId;
@@ -787,17 +867,10 @@ async function onPullRequestSynchronize(input: {
   bus: LilacBus;
   logger: Logger;
   repoFullName: string;
-  payload: Record<string, unknown>;
+  payload: z.output<typeof githubPullRequestSynchronizePayloadSchema>;
 }): Promise<string | null> {
-  const pr = input.payload["pull_request"];
-  if (!pr || typeof pr !== "object") return null;
-  const prNumber = (pr as Record<string, unknown>)["number"];
-  const head = (pr as Record<string, unknown>)["head"];
-  const headSha =
-    head && typeof head === "object"
-      ? ((head as Record<string, unknown>)["sha"] as unknown)
-      : undefined;
-  if (typeof prNumber !== "number" || typeof headSha !== "string" || !headSha) return null;
+  const prNumber = input.payload.pull_request.number;
+  const headSha = input.payload.pull_request.head.sha;
 
   const sessionId = `${input.repoFullName}#${prNumber}`;
   const latest = getGithubLatestRequestForSession(sessionId);
@@ -841,26 +914,28 @@ async function onPullRequestSynchronize(input: {
 
   // Cancel the in-flight request to unblock the session queue ASAP.
   // This message is only applied if the request is currently active.
-  await input.bus.publish(
-    lilacEventTypes.CmdRequestMessage,
-    {
-      queue: "interrupt",
-      messages: [
-        {
-          role: "user",
-          content:
-            "Branch updated (new commits pushed). Cancel the current review immediately and stop producing output.",
-        },
-      ],
-      raw: { cancel: true, requiresActive: true },
-    },
-    {
-      headers: {
-        request_id: meta.requestId,
-        session_id: sessionId,
-        request_client: "github",
+  adaptEventPublishResultToHost(
+    await input.bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "interrupt",
+        messages: [
+          {
+            role: "user",
+            content:
+              "Branch updated (new commits pushed). Cancel the current review immediately and stop producing output.",
+          },
+        ],
+        raw: { cancel: true, requiresActive: true },
       },
-    },
+      {
+        headers: {
+          request_id: meta.requestId,
+          session_id: sessionId,
+          request_client: "github",
+        },
+      },
+    ),
   );
 
   // Keep the 👀 reaction as the "in progress" indicator.
@@ -888,29 +963,31 @@ async function onPullRequestSynchronize(input: {
     pr: { prNumber, headSha: prData.head.sha, mode: "review" },
   });
 
-  await input.bus.publish(
-    lilacEventTypes.CmdRequestMessage,
-    {
-      queue: "prompt",
-      messages,
-      raw: {
-        github: {
-          repoFullName: input.repoFullName,
-          prNumber,
-          headSha: prData.head.sha,
-          trigger: { kind: "issue", issueNumber: prNumber },
-          mode: "review",
-          restartedFrom: meta.requestId,
+  adaptEventPublishResultToHost(
+    await input.bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: "prompt",
+        messages,
+        raw: {
+          github: {
+            repoFullName: input.repoFullName,
+            prNumber,
+            headSha: prData.head.sha,
+            trigger: { kind: "issue", issueNumber: prNumber },
+            mode: "review",
+            restartedFrom: meta.requestId,
+          },
         },
       },
-    },
-    {
-      headers: {
-        request_id: requestId,
-        session_id: sessionId,
-        request_client: "github",
+      {
+        headers: {
+          request_id: requestId,
+          session_id: sessionId,
+          request_client: "github",
+        },
       },
-    },
+    ),
   );
 
   return requestId;

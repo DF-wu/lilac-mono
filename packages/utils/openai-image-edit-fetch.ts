@@ -14,10 +14,8 @@ function requestUrl(input: FetchInput): URL {
 }
 
 function blobFilename(blob: Blob): string | undefined {
-  if (!("name" in blob) || typeof blob.name !== "string" || blob.name.length === 0) {
-    return undefined;
-  }
-  return blob.name;
+  const name = Reflect.get(blob, "name");
+  return typeof name === "string" && name.length > 0 ? name : undefined;
 }
 
 function filenameFor(key: string, blob: Blob): string {

@@ -55,11 +55,16 @@ function fakeAuthProvider(tokens: OAuthTokens | undefined): OAuthClientProvider 
   };
 }
 
+function reportUnexpectedFatalError(error: Error): never {
+  throw error;
+}
+
 describe("McpRegistry startup and discovery", () => {
   it("initializes empty and retains a safe diagnostic when startup config is malformed", async () => {
     let createCount = 0;
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => {
           return Result.err(
@@ -77,7 +82,7 @@ describe("McpRegistry startup and discovery", () => {
     });
 
     await expect(registry.init()).resolves.toBeUndefined();
-    await expect(registry.waitUntilInitialized()).resolves.toBeUndefined();
+    await expect(registry.waitUntilInitialized()).resolves.toEqual(Result.ok(undefined));
     expect(registry.list()).toEqual([]);
     expect(registry.getTools()).toEqual([]);
     expect(registry.getConfigStatus()).toEqual({
@@ -99,6 +104,7 @@ describe("McpRegistry startup and discovery", () => {
     const second = new FakeMcpClient();
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async (configPath) => {
           readPaths.push(configPath);
@@ -144,6 +150,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       readTextFile: () => Promise.reject(panic),
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([definition])),
@@ -161,6 +168,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("panic")])),
         createClient: async () => client,
@@ -198,6 +206,7 @@ describe("McpRegistry startup and discovery", () => {
     ]);
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       env: { STDIO_TOKEN: "stdio-secret", HTTP_TOKEN: "Bearer http-secret" },
       dependencies: {
         readConfig: async () => configSnapshot(config),
@@ -256,6 +265,7 @@ describe("McpRegistry startup and discovery", () => {
     });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () =>
           configSnapshot(mcpConfig([httpDefinition("native-http", server.url.toString())])),
@@ -342,6 +352,7 @@ describe("McpRegistry startup and discovery", () => {
     });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () =>
           configSnapshot(mcpConfig([httpDefinition("stateful-http", server.url.toString())])),
@@ -401,6 +412,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([authServer])),
         createAuthProvider: async () => {
@@ -475,6 +487,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([authServer])),
         createAuthProvider: async () => {
@@ -568,6 +581,7 @@ describe("McpRegistry startup and discovery", () => {
 
     const failedRegistry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([authServer])),
         createAuthProvider: async () => {
@@ -597,6 +611,7 @@ describe("McpRegistry startup and discovery", () => {
     let transportInput: McpRegistryTransportInput | undefined;
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () =>
           configSnapshot(
@@ -645,6 +660,7 @@ describe("McpRegistry startup and discovery", () => {
     });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("large")])),
         createClient: async () => client,
@@ -693,6 +709,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("loop")])),
         createClient: async () => client,
@@ -720,6 +737,7 @@ describe("McpRegistry startup and discovery", () => {
     factory.enqueue("healthy", healthy);
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () =>
           configSnapshot(mcpConfig([stdioDefinition("duplicate"), stdioDefinition("healthy")])),
@@ -757,6 +775,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       initDeadlineMs: 10,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("slow")])),
@@ -797,6 +816,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       initDeadlineMs: 25,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("silent")])),
@@ -822,6 +842,44 @@ describe("McpRegistry startup and discovery", () => {
     expect(transportCloseCount).toBe(1);
   });
 
+  it("reports a detached transport cleanup Panic with exact identity", async () => {
+    const panic = new Panic({ message: "transport cleanup invariant failed" });
+    const fatalObserved = deferred<Error>();
+    const createStarted = deferred<void>();
+    const never = deferred<McpRegistryClient>();
+    let deadlineCallback: (() => void) | undefined;
+    const transport: MCPTransport = {
+      start: async () => undefined,
+      send: async () => undefined,
+      close: async () => {
+        throw panic;
+      },
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      initDeadlineMs: 25,
+      reportFatalError: (error) => fatalObserved.resolve(error),
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("panic-cleanup")])),
+        createTransport: () => transport,
+        createClient: async () => {
+          createStarted.resolve();
+          return never.promise;
+        },
+        scheduleDeadline: (callback) => {
+          deadlineCallback = callback;
+          return () => undefined;
+        },
+      },
+    });
+
+    const initializing = registry.init();
+    await createStarted.promise;
+    deadlineCallback?.();
+    expect(await fatalObserved.promise).toBe(panic);
+    await initializing;
+  });
+
   it("closes a client that is created after the deadline exactly once", async () => {
     const createGate = deferred<McpRegistryClient>();
     const createStarted = deferred<void>();
@@ -836,6 +894,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       initDeadlineMs: 10,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("late")])),
@@ -880,6 +939,7 @@ describe("McpRegistry startup and discovery", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       initDeadlineMs: 15,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("hanging")])),
@@ -904,9 +964,34 @@ describe("McpRegistry startup and discovery", () => {
     expect(client.closeCount).toBe(1);
     await registry.shutdown();
     expect(client.closeCount).toBe(1);
-    await expect(registry.waitUntilInitialized()).rejects.toThrow(
-      "MCP registry has been shut down",
-    );
+    const stopped = await registry.waitUntilInitialized();
+    expect(stopped.status).toBe("error");
+    if (stopped.status === "error") {
+      expect(stopped.error.message).toBe("MCP registry has been shut down");
+    }
+  });
+
+  it("preserves and reports a client shutdown Panic instead of stringifying it", async () => {
+    const panic = new Panic({ message: "client cleanup invariant failed" });
+    const reported: Error[] = [];
+    const client = new FakeMcpClient();
+    client.close = async () => {
+      client.closeCount += 1;
+      throw panic;
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: (error) => reported.push(error),
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("panic-cleanup")])),
+        createClient: async () => client,
+      },
+    });
+    await registry.init();
+
+    await expect(registry.shutdown()).rejects.toBe(panic);
+    expect(reported).toEqual([panic]);
+    expect(client.closeCount).toBe(1);
   });
 });
 
@@ -926,6 +1011,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const client = new FakeMcpClient();
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       readTextFile: async () => {
         if (readMode === "panic") throw panic;
         if (readMode === "error") throw new Error("credential file unavailable");
@@ -966,6 +1052,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("healthy-tool")] } });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => {
           if (readResult === "invalid") {
@@ -1023,6 +1110,7 @@ describe("McpRegistry reload and terminal failures", () => {
     let createCount = 0;
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("stable")])),
         createClient: async () => {
@@ -1098,6 +1186,7 @@ describe("McpRegistry reload and terminal failures", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       readTextFile: async () => secret,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([definition])),
@@ -1142,6 +1231,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("before")] } });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("stable")])),
         createClient: async (config) => {
@@ -1193,6 +1283,7 @@ describe("McpRegistry reload and terminal failures", () => {
     };
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([authServer])),
         createAuthProvider: async () =>
@@ -1248,6 +1339,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const second = new FakeMcpClient({ first: { tools: [mcpToolDefinition("after")] } });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       initDeadlineMs: 20,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("retry")])),
@@ -1292,6 +1384,7 @@ describe("McpRegistry reload and terminal failures", () => {
   it("returns not_found for an unknown targeted reload", async () => {
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([])),
       },
@@ -1324,6 +1417,7 @@ describe("McpRegistry reload and terminal failures", () => {
     factory.enqueue("stable", stable);
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(config),
         createClient: factory.create,
@@ -1403,6 +1497,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("before")] } });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("local")])),
         createTransport: () => {
@@ -1439,6 +1534,41 @@ describe("McpRegistry reload and terminal failures", () => {
     expect(client.closeCount).toBe(1);
   });
 
+  it("reports a cached terminal cleanup Panic once and preserves it through shutdown", async () => {
+    const panic = new Panic({ message: "terminal cleanup invariant failed" });
+    const reported = Promise.withResolvers<void>();
+    const reports: Error[] = [];
+    let clientConfig: MCPClientConfig | undefined;
+    const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("before")] } });
+    client.close = async () => {
+      client.closeCount += 1;
+      throw panic;
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: (error) => {
+        reports.push(error);
+        reported.resolve();
+      },
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("terminal-panic")])),
+        createClient: async (config) => {
+          clientConfig = config;
+          return client;
+        },
+      },
+    });
+    await registry.init();
+
+    clientConfig?.onUncaughtError?.(new Error("terminal transport failure"));
+    await reported.promise;
+    expect(client.closeCount).toBe(1);
+
+    await expect(registry.shutdown()).rejects.toBe(panic);
+    expect(reports).toEqual([panic]);
+    expect(client.closeCount).toBe(1);
+  });
+
   it("preserves MCP application errors but retires on transport rejection", async () => {
     const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("run")] } });
     client.executeTool = async () => ({
@@ -1447,6 +1577,7 @@ describe("McpRegistry reload and terminal failures", () => {
     });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("local")])),
         createClient: async () => client,
@@ -1496,6 +1627,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("run")] } });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("local")])),
         createClient: async (config) => {
@@ -1537,6 +1669,7 @@ describe("McpRegistry reload and terminal failures", () => {
     const second = new FakeMcpClient({ first: { tools: [mcpToolDefinition("after")] } });
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () =>
           configSnapshot(

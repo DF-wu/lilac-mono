@@ -1,4 +1,8 @@
-import type { ProtocolEvent } from "open-protocol-sdk";
+import type {
+  GenericProtocolEvent,
+  GenericProtocolVariant,
+  ProtocolEvent,
+} from "open-protocol-sdk";
 import type { ExternalState } from "third-party-closed";
 
 import * as unionMaps from "./union-types";
@@ -256,6 +260,19 @@ export type NormalizedEvent =
   | { readonly kind: "updated"; readonly payload?: string }
   | { readonly kind: "unsupported"; readonly externalKind: string };
 
+type GenericNormalizedEvent<T> =
+  | {
+      readonly [Kind in "created" | "updated"]: {
+        readonly kind: Kind;
+        readonly payload?: T;
+      };
+    }["created" | "updated"]
+  | { readonly kind: "unsupported"; readonly externalKind: string };
+
+type LeakyGenericNormalizedEvent<T> =
+  | GenericProtocolVariant<T>
+  | { readonly kind: "unsupported"; readonly externalKind: string };
+
 export function normalizeProtocolEvent(event: ProtocolEvent): NormalizedEvent {
   switch (event.kind) {
     case "created":
@@ -265,6 +282,25 @@ export function normalizeProtocolEvent(event: ProtocolEvent): NormalizedEvent {
     default:
       return { kind: "unsupported", externalKind: event.kind };
   }
+}
+
+export function normalizeGenericProtocolEvent<T>(
+  event: GenericProtocolEvent<T>,
+): GenericNormalizedEvent<T> {
+  switch (event.kind) {
+    case "created":
+      return { kind: "created", payload: event.payload };
+    case "updated":
+      return { kind: "updated", payload: event.payload };
+    default:
+      return { kind: "unsupported", externalKind: event.kind };
+  }
+}
+
+export function normalizeToExternalGenericVariants<T>(
+  event: GenericProtocolEvent<T>,
+): LeakyGenericNormalizedEvent<T> {
+  return { kind: "unsupported", externalKind: event.kind };
 }
 
 export function normalizeWithoutExplicitFallback(event: ProtocolEvent): NormalizedEvent {

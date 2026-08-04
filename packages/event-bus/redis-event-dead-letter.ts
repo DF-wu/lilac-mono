@@ -370,6 +370,95 @@ const eventDeadLetterRecordSchema: z.ZodType<EventDeadLetterRecordV1> = z.strict
   evidence: eventTransportEvidenceSchema,
 });
 
+const REDIS_STREAM_ID_PATTERN = /^\d+-\d+$/;
+const redisEvidenceEntrySchema = z.tuple([z.string(), z.array(z.string())]);
+const redisEvidenceEntriesSchema = z.array(redisEvidenceEntrySchema).length(1);
+const redisTransactionResultSchema = z.tuple([z.unknown(), z.unknown()]);
+const redisTransactionResultsSchema = z.array(redisTransactionResultSchema);
+
+type RedisDeadLetterEvidenceDecodeResult =
+  | { readonly status: "ok"; readonly fields: readonly string[] }
+  | { readonly status: "error"; readonly message: string };
+
+function decodeRedisDeadLetterEvidenceEntry(
+  entries: unknown,
+  expectedMessageId: string,
+): RedisDeadLetterEvidenceDecodeResult {
+  const decoded = redisEvidenceEntriesSchema.safeParse(entries);
+  if (!decoded.success) {
+    return {
+      status: "error",
+      message: "Referenced Redis source evidence returned an invalid entry collection",
+    };
+  }
+  const entry = decoded.data[0];
+  if (!entry) {
+    return {
+      status: "error",
+      message: "Referenced Redis source evidence returned an invalid entry collection",
+    };
+  }
+  const [messageId, fields] = entry;
+  if (!REDIS_STREAM_ID_PATTERN.test(expectedMessageId) || messageId !== expectedMessageId) {
+    return {
+      status: "error",
+      message: "Referenced Redis source evidence returned an unexpected message id",
+    };
+  }
+  if (fields.length === 0 || fields.length % 2 !== 0) {
+    return {
+      status: "error",
+      message: "Referenced Redis source evidence returned invalid field pairs",
+    };
+  }
+  return { status: "ok", fields };
+}
+
+type RedisDeadLetterTransactionDecodeResult =
+  | { readonly status: "ok"; readonly id: string }
+  | { readonly status: "error"; readonly cause: Error };
+
+function invalidRedisDeadLetterTransaction(): RedisDeadLetterTransactionDecodeResult {
+  return {
+    status: "error",
+    cause: new Error("Redis dead-letter transaction returned an invalid receipt"),
+  };
+}
+
+function decodeRedisDeadLetterTransactionId(
+  results: unknown,
+  expectedSetCount: number,
+): RedisDeadLetterTransactionDecodeResult {
+  if (!Array.isArray(results) || results.length !== expectedSetCount + 1) {
+    return invalidRedisDeadLetterTransaction();
+  }
+  const decoded = redisTransactionResultsSchema.safeParse(results);
+  if (!decoded.success) return invalidRedisDeadLetterTransaction();
+  for (const result of decoded.data) {
+    if (result[0] !== null) {
+      return {
+        status: "error",
+        cause:
+          result[0] instanceof Error
+            ? result[0]
+            : new Error("Redis dead-letter transaction returned an invalid command error"),
+      };
+    }
+  }
+  for (let index = 0; index < expectedSetCount; index += 1) {
+    const setResult = decoded.data[index];
+    if (setResult?.[1] !== "OK") {
+      return invalidRedisDeadLetterTransaction();
+    }
+  }
+  const xaddResult = decoded.data[expectedSetCount];
+  if (!xaddResult) return invalidRedisDeadLetterTransaction();
+  const id = xaddResult[1];
+  return typeof id === "string" && REDIS_STREAM_ID_PATTERN.test(id)
+    ? { status: "ok", id }
+    : invalidRedisDeadLetterTransaction();
+}
+
 /** Explicit recovery-only helper. Normal delivery APIs never return dead-letter plaintext. */
 export function decryptRedisEventDeadLetterRecord(options: {
   readonly encryptionKey: Uint8Array;
@@ -461,17 +550,25 @@ export class RedisEventDeadLetter implements EventDeadLetter {
         const locator = record.evidence.wire.locator;
         let evidencePlaintext: string;
         if (locator.kind === "redis-stream-entry") {
-          const entries = await this.redis.xrange(
+          if (
+            locator.streamKey !== record.evidence.source.streamKey ||
+            locator.messageId !== record.evidence.source.messageId ||
+            locator.messageId !== record.source.messageId ||
+            record.evidence.source.topic !== record.source.topic
+          ) {
+            throw new Error("Referenced Redis source evidence identity is inconsistent");
+          }
+          const entries = (await this.redis.xrange(
             locator.streamKey,
             locator.messageId,
             locator.messageId,
-          );
-          const fields = entries[0]?.[1];
-          if (!fields) throw new Error("Referenced Redis source evidence is no longer available");
+          )) as unknown;
+          const evidence = decodeRedisDeadLetterEvidenceEntry(entries, locator.messageId);
+          if (evidence.status === "error") throw new Error(evidence.message);
           evidencePlaintext = SuperJSON.stringify({
             version: 1,
             source: record.evidence.source,
-            fields,
+            fields: evidence.fields,
           });
         } else {
           const existingEvidence = await this.redis.get(locator.key);
@@ -539,12 +636,12 @@ export class RedisEventDeadLetter implements EventDeadLetter {
       );
       const results = await transaction.exec();
       if (!results) throw new Error("Redis dead-letter transaction was aborted");
-      for (const [error] of results) {
-        if (error) throw error;
-      }
-      const id = results.at(-1)?.[1];
-      if (typeof id !== "string") throw new Error("Redis dead-letter XADD returned invalid id");
-      return { id };
+      const receipt = decodeRedisDeadLetterTransactionId(
+        results,
+        encodedEvidence === undefined ? 1 : 2,
+      );
+      if (receipt.status === "error") throw receipt.cause;
+      return { id: receipt.id };
     });
   }
 }

@@ -1,6 +1,8 @@
 import {
   createLogger,
   env,
+  formatTaggedErrorForLog,
+  isPanic,
   resolveVcsEnv,
   type CoreConfig,
   type NativeSubagentProfile,
@@ -11,6 +13,7 @@ import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { formatBlockedMessage, redactSecrets } from "./bash-safety/format";
 import { expandTilde } from "@stanley2058/lilac-fs";
 
@@ -23,11 +26,16 @@ import {
 } from "../ssh/ssh-cwd";
 import { sshExecBash } from "../ssh/ssh-exec";
 import {
+  BashOutputCleanupError,
+  BashOutputStreamAndCleanupError,
+  BashOutputStreamError,
   createBashOutputSanitizerTransform,
   readSanitizedStreamTextCapped,
 } from "./bash-output-sanitizer";
 import { loadToolEnv } from "./tool-env";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
+import { projectRuntimeError } from "../runtime/error-format";
+import { preserveToolPanic } from "./tool-result-adapters";
 
 export const BASH_NO_OUTPUT_TIMEOUT_MS = 3 * 60 * 1000;
 const DEFAULT_KILL_SIGNAL = "SIGTERM";
@@ -39,6 +47,21 @@ const DEFAULT_MAX_BASH_OUTPUT_BYTES = 40 * 1024;
 const logger = createLogger({
   module: "tool:bash",
 });
+
+type BashLogValue = string | number | boolean | null | undefined;
+type BashLogFields = Readonly<Record<string, BashLogValue>>;
+
+function logBashInfo(message: string, fields: BashLogFields): void {
+  logger.info(message, fields);
+}
+
+function logBashWarn(message: string, fields: BashLogFields): void {
+  logger.warn(message, fields);
+}
+
+function logBashError(message: string, fields: BashLogFields): void {
+  logger.error(message, fields);
+}
 
 export type BashToolInput = {
   command: string;
@@ -109,9 +132,154 @@ export type BashToolOutput = {
   };
 };
 
-function toErrorMessage(error: unknown) {
-  if (error instanceof Error) return error.message;
-  return String(error);
+class BashAdapterError extends TaggedError("BashAdapterError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BashSpillCleanupError extends TaggedError("BashSpillCleanupError")<{
+  readonly failures: readonly BashAdapterError[];
+  readonly message: string;
+}> {}
+
+export class BashOperationAndCleanupError extends TaggedError("BashOperationAndCleanupError")<{
+  readonly primary: BashAdapterError;
+  readonly cleanup: BashSpillCleanupError;
+  readonly message: string;
+}> {}
+
+export class BashReportedExecutionAndCleanupError extends TaggedError(
+  "BashReportedExecutionAndCleanupError",
+)<{
+  readonly primary: BashExecutionError;
+  readonly cleanup: BashSpillCleanupError;
+  readonly message: string;
+}> {}
+
+export interface BashSpillFileOperations {
+  remove(target: string): Promise<void>;
+}
+
+const DEFAULT_SPILL_FILE_OPERATIONS: BashSpillFileOperations = {
+  remove: (target) => fs.rm(target, { force: true }),
+};
+
+type BashExecutionAttempt =
+  | { readonly status: "ok"; readonly output: BashToolOutput }
+  | { readonly status: "error"; readonly error: BashAdapterError }
+  | { readonly status: "panic"; readonly panic: Panic };
+
+type BashSpillCleanupOutcome = {
+  readonly result: ResultType<void, BashSpillCleanupError>;
+  readonly panic?: Panic;
+};
+
+function settleBashExecution(run: () => Promise<BashToolOutput>): Promise<BashExecutionAttempt> {
+  return Promise.resolve()
+    .then(run)
+    .then(
+      (output) => ({ status: "ok", output }),
+      (caught: unknown) => {
+        if (isPanic(caught)) return { status: "panic", panic: caught };
+        return {
+          status: "error",
+          error: new BashAdapterError({
+            operation: "execute",
+            cause: caught,
+            message: "Bash execution failed",
+          }),
+        };
+      },
+    );
+}
+
+async function cleanupBashSpills(
+  paths: readonly string[],
+  operations: BashSpillFileOperations,
+): Promise<BashSpillCleanupOutcome> {
+  const failures: BashAdapterError[] = [];
+  let deferredPanic: Panic | undefined;
+  for (const target of new Set(paths)) {
+    const attempt = await Promise.resolve()
+      .then(() => operations.remove(target))
+      .then(
+        () => ({ status: "ok" as const }),
+        (caught: unknown) =>
+          isPanic(caught)
+            ? { status: "panic" as const, panic: caught }
+            : { status: "error" as const, cause: caught },
+      );
+    if (attempt.status === "panic") {
+      if (!deferredPanic) deferredPanic = attempt.panic;
+      continue;
+    }
+    if (attempt.status === "error") {
+      failures.push(
+        new BashAdapterError({
+          operation: "remove_temporary_spill",
+          cause: attempt.cause,
+          message: "Failed to remove temporary Bash output spill",
+        }),
+      );
+    }
+  }
+
+  return {
+    result:
+      failures.length === 0
+        ? Result.ok()
+        : Result.err(
+            new BashSpillCleanupError({
+              failures,
+              message: "Bash temporary output cleanup failed",
+            }),
+          ),
+    ...(deferredPanic ? { panic: deferredPanic } : {}),
+  };
+}
+
+function appendCleanupNotice(stderr: string): string {
+  const notice = "Bash temporary output cleanup failed.";
+  return stderr.length > 0 ? `${stderr}\n${notice}` : notice;
+}
+
+function formatBashStreamFailureForLog(reason: unknown): BashLogFields {
+  if (
+    BashOutputStreamError.is(reason) ||
+    BashOutputCleanupError.is(reason) ||
+    BashOutputStreamAndCleanupError.is(reason)
+  ) {
+    return { failureTag: reason._tag, failureMessage: reason.message };
+  }
+  return { failureMessage: "Bash stream operation failed" };
+}
+
+function surfaceBashCleanupFailure(
+  output: BashToolOutput,
+  cleanup: BashSpillCleanupError,
+): BashToolOutput {
+  if (output.executionError) {
+    const combined = new BashReportedExecutionAndCleanupError({
+      primary: output.executionError,
+      cleanup,
+      message: "Bash execution failed and temporary output cleanup also failed",
+    });
+    logger.error("bash execution and cleanup failed", formatTaggedErrorForLog(combined));
+    return { ...output, stderr: appendCleanupNotice(output.stderr) };
+  }
+
+  logger.error("bash cleanup failed", formatTaggedErrorForLog(cleanup));
+  return {
+    ...output,
+    stderr: appendCleanupNotice(output.stderr),
+    exitCode: -1,
+    executionError: {
+      type: "exception",
+      phase: "unknown",
+      message: cleanup.message,
+    },
+  };
 }
 
 function toFailedExecutionError(
@@ -288,11 +456,87 @@ function previewStream(value: string, maxBytes: number): string {
 
 async function overflowStreamBytes(captured: string, overflowPath?: string): Promise<number> {
   if (!overflowPath) return Buffer.byteLength(captured, "utf8");
-  try {
-    return (await fs.stat(overflowPath)).size;
-  } catch {
+  const inspected = await Result.tryPromise({
+    try: () => fs.stat(overflowPath),
+    catch: projectRuntimeError("Opaque Bash overflow stat failure"),
+  });
+  if (inspected.status === "error") {
+    preserveToolPanic(inspected.error);
     return Buffer.byteLength(captured, "utf8");
   }
+  return inspected.value.size;
+}
+
+async function readOverflowTail(
+  overflowPath: string,
+  contentBudget: number,
+): Promise<ResultType<Buffer, BashAdapterError | BashOperationAndCleanupError>> {
+  const opened = await Result.tryPromise({
+    try: () => fs.open(overflowPath, "r"),
+    catch: projectRuntimeError("Opaque Bash overflow open failure"),
+  });
+  if (opened.status === "error") {
+    return Result.err(
+      new BashAdapterError({
+        operation: "open_overflow",
+        cause: preserveToolPanic(opened.error),
+        message: "Failed to open Bash overflow output",
+      }),
+    );
+  }
+
+  const handle = opened.value;
+  const readTail = async () => {
+    const stat = await handle.stat();
+    const readBytes = Math.min(stat.size, Math.max(4096, contentBudget * 4));
+    const buffer = Buffer.alloc(readBytes);
+    await handle.read(buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
+    return buffer;
+  };
+  const read = await Result.tryPromise({
+    try: readTail,
+    catch: projectRuntimeError("Opaque Bash overflow read failure"),
+  });
+  const closed = await Result.tryPromise({
+    try: () => handle.close(),
+    catch: projectRuntimeError("Opaque Bash overflow close failure"),
+  });
+  if (read.status === "error" && isPanic(read.error)) preserveToolPanic(read.error);
+  if (closed.status === "error" && isPanic(closed.error)) preserveToolPanic(closed.error);
+
+  if (read.status === "error") {
+    const readError = new BashAdapterError({
+      operation: "read_overflow",
+      cause: read.error,
+      message: "Failed to read Bash overflow output",
+    });
+    if (closed.status === "ok") return Result.err(readError);
+    const closeError = new BashAdapterError({
+      operation: "close_overflow",
+      cause: closed.error,
+      message: "Failed to close Bash overflow output",
+    });
+    return Result.err(
+      new BashOperationAndCleanupError({
+        primary: readError,
+        cleanup: new BashSpillCleanupError({
+          failures: [closeError],
+          message: "Failed to close Bash overflow output after its read failed",
+        }),
+        message: "Failed to read and close Bash overflow output",
+      }),
+    );
+  }
+  if (closed.status === "error") {
+    return Result.err(
+      new BashAdapterError({
+        operation: "close_overflow",
+        cause: closed.error,
+        message: "Failed to close Bash overflow output",
+      }),
+    );
+  }
+  return Result.ok(read.value);
 }
 
 async function buildOverflowStreamPreview(params: {
@@ -305,25 +549,13 @@ async function buildOverflowStreamPreview(params: {
   const marker = "\n...[output omitted]...\n";
   const contentBudget = Math.max(0, params.maxBytes - Buffer.byteLength(marker, "utf8"));
   const head = takeUtf8Edge(params.captured, Math.ceil(contentBudget / 2), false);
-  let tail = "";
-  try {
-    const handle = await fs.open(params.overflowPath, "r");
-    try {
-      const stat = await handle.stat();
-      const readBytes = Math.min(stat.size, Math.max(4096, contentBudget * 4));
-      const buffer = Buffer.alloc(readBytes);
-      await handle.read(buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
-      const sanitized = redactSecrets(
-        stripAnsiEscapeSequences(buffer.toString("utf8")),
-        params.literalSecrets,
-      );
-      tail = takeUtf8Edge(sanitized, Math.floor(contentBudget / 2), true);
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    return previewStream(params.captured, params.maxBytes);
-  }
+  const read = await readOverflowTail(params.overflowPath, contentBudget);
+  if (read.status === "error") return previewStream(params.captured, params.maxBytes);
+  const sanitized = redactSecrets(
+    stripAnsiEscapeSequences(read.value.toString("utf8")),
+    params.literalSecrets,
+  );
+  const tail = takeUtf8Edge(sanitized, Math.floor(contentBudget / 2), true);
   return `${head}${marker}${tail}`;
 }
 
@@ -480,49 +712,56 @@ async function persistTruncatedOutput(params: {
   stdoutOverflowPath?: string;
   stderrOverflowPath?: string;
 }): Promise<{ uri?: string }> {
-  try {
-    if (!params.artifacts || !params.context || !params.toolCallId) return {};
-    const source = createBashArtifactSource({
-      requestId: params.context.requestId,
-      toolCallId: params.toolCallId,
-      stdout: params.stdout,
-      stderr: params.stderr,
-      stdoutOverflowPath: params.stdoutOverflowPath,
-      stderrOverflowPath: params.stderrOverflowPath,
-    }).pipe(createBashOutputSanitizerTransform(params.literalSecrets));
-    const artifact = await params.artifacts.createFromStream({
-      sessionId: params.context.sessionId,
-      requestId: params.context.requestId,
-      toolCallId: params.toolCallId,
+  if (!params.artifacts || !params.context || !params.toolCallId) return {};
+  const artifacts = params.artifacts;
+  const context = params.context;
+  const toolCallId = params.toolCallId;
+  const source = createBashArtifactSource({
+    requestId: context.requestId,
+    toolCallId,
+    stdout: params.stdout,
+    stderr: params.stderr,
+    stdoutOverflowPath: params.stdoutOverflowPath,
+    stderrOverflowPath: params.stderrOverflowPath,
+  }).pipe(createBashOutputSanitizerTransform(params.literalSecrets));
+  const created = await Result.tryPromise({
+    try: () =>
+      artifacts.createFromStream({
+        sessionId: context.sessionId,
+        requestId: context.requestId,
+        toolCallId,
+        toolName: "bash",
+        source,
+        ttlMs: params.outputConfig.artifactTtlMs,
+        maxBytesPerSession: params.outputConfig.artifactMaxBytesPerSession,
+      }),
+    catch: projectRuntimeError("Opaque Bash artifact persistence failure"),
+  });
+  let result: { uri?: string } = {};
+  if (created.status === "error") {
+    const cause = preserveToolPanic(created.error);
+    logger.warn("tool.artifact.write_failed", {
       toolName: "bash",
-      source,
-      ttlMs: params.outputConfig.artifactTtlMs,
-      maxBytesPerSession: params.outputConfig.artifactMaxBytesPerSession,
+      ...formatTaggedErrorForLog(
+        new BashAdapterError({
+          operation: "persist_artifact",
+          cause,
+          message: "Failed to persist Bash output artifact",
+        }),
+      ),
     });
+  } else {
+    const artifact = created.value;
     if (artifact.status === "error") {
       logger.warn("tool.artifact.write_failed", {
         toolName: "bash",
-        errorTag: artifact.error.name,
+        ...formatTaggedErrorForLog(artifact.error),
       });
-      return {};
+    } else {
+      result = { uri: artifact.value.uri };
     }
-    return { uri: artifact.value.uri };
-  } catch (error) {
-    logger.warn("tool.artifact.write_failed", {
-      toolName: "bash",
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return {};
-  } finally {
-    await Promise.all([
-      params.stdoutOverflowPath
-        ? fs.rm(params.stdoutOverflowPath, { force: true }).catch(() => undefined)
-        : undefined,
-      params.stderrOverflowPath
-        ? fs.rm(params.stderrOverflowPath, { force: true }).catch(() => undefined)
-        : undefined,
-    ]);
   }
+  return result;
 }
 
 function buildBashChildEnv(params: {
@@ -582,6 +821,7 @@ export async function executeBash(
     onActivity,
     controlCapability,
     subagentProfile,
+    spillFileOperations = DEFAULT_SPILL_FILE_OPERATIONS,
   }: {
     context?: {
       requestId: string;
@@ -595,6 +835,7 @@ export async function executeBash(
     onActivity?: () => void;
     controlCapability?: string;
     subagentProfile?: NativeSubagentProfile;
+    spillFileOperations?: BashSpillFileOperations;
   } = {},
 ): Promise<BashToolOutput> {
   const cwdTarget = parseSshCwdTarget(cwd);
@@ -681,17 +922,17 @@ export async function executeBash(
   const killProcessGroupBestEffort = (pid: number, signal: "SIGTERM" | "SIGKILL") => {
     // Best-effort: kill the whole subprocess group (tools cli, ssh, etc.).
     // Requires the child to be spawned as a new process group leader.
-    try {
-      // Negative pid means "process group" on POSIX.
-      process.kill(-pid, signal);
-    } catch {
-      // ignore
-    }
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // ignore
-    }
+    // Negative pid means "process group" on POSIX.
+    const groupKill = Result.try({
+      try: () => process.kill(-pid, signal),
+      catch: projectRuntimeError("Opaque Bash process-group termination failure"),
+    });
+    const processKill = Result.try({
+      try: () => process.kill(pid, signal),
+      catch: projectRuntimeError("Opaque Bash process termination failure"),
+    });
+    if (groupKill.status === "error") preserveToolPanic(groupKill.error);
+    if (processKill.status === "error") preserveToolPanic(processKill.error);
   };
 
   const HARD_KILL_DELAY_MS = 2000;
@@ -699,7 +940,7 @@ export async function executeBash(
   const scheduleHardKill = () => {
     if (hardKillTimer) return;
     hardKillTimer = setTimeout(() => {
-      const pid = (child as { pid?: unknown } | null)?.pid;
+      const pid = child?.pid;
       if (typeof pid === "number" && pid > 0) {
         killProcessGroupBestEffort(pid, "SIGKILL");
       }
@@ -775,7 +1016,7 @@ export async function executeBash(
     abortListener = null;
   };
 
-  try {
+  const runExecution = async (): Promise<BashToolOutput> => {
     resetNoOutputTimer();
     const execResult =
       cwdTarget.kind === "ssh"
@@ -861,7 +1102,7 @@ export async function executeBash(
       const durationMs = execResult.durationMs;
 
       if (termination?.type === "timeout") {
-        logger.warn("bash timeout", {
+        logBashWarn("bash timeout", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
@@ -894,7 +1135,7 @@ export async function executeBash(
       }
 
       if (termination?.type === "aborted" || execResult.aborted) {
-        logger.warn("bash aborted", {
+        logBashWarn("bash aborted", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
@@ -924,7 +1165,7 @@ export async function executeBash(
       }
 
       if (execResult.timedOut) {
-        logger.warn("bash timeout", {
+        logBashWarn("bash timeout", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
@@ -957,7 +1198,7 @@ export async function executeBash(
       }
 
       if (outputTruncated) {
-        logger.warn("bash output truncated", {
+        logBashWarn("bash output truncated", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
@@ -978,7 +1219,7 @@ export async function executeBash(
 
       const ok = exitCode === 0;
       if (ok) {
-        logger.info("bash done", {
+        logBashInfo("bash done", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
@@ -991,7 +1232,7 @@ export async function executeBash(
           requestClient: context?.requestClient,
         });
       } else {
-        logger.warn("bash done (non-zero exit)", {
+        logBashWarn("bash done (non-zero exit)", {
           command: redactedCommand,
           cwd: displayCwd,
           ...remoteLogMeta,
@@ -1056,6 +1297,15 @@ export async function executeBash(
       child.exited,
     ]);
     stopWatchingExecution();
+    if (stdoutResult.status === "rejected" && isPanic(stdoutResult.reason)) {
+      preserveToolPanic(stdoutResult.reason);
+    }
+    if (stderrResult.status === "rejected" && isPanic(stderrResult.reason)) {
+      preserveToolPanic(stderrResult.reason);
+    }
+    if (exitResult.status === "rejected" && isPanic(exitResult.reason)) {
+      preserveToolPanic(exitResult.reason);
+    }
 
     const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value.text : "";
     const stderr = stderrResult.status === "fulfilled" ? stderrResult.value.text : "";
@@ -1141,7 +1391,7 @@ export async function executeBash(
     };
 
     if (termination?.type === "aborted") {
-      logger.warn("bash aborted", {
+      logBashWarn("bash aborted", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
@@ -1171,7 +1421,7 @@ export async function executeBash(
     }
 
     if (termination?.type === "timeout") {
-      logger.warn("bash timeout", {
+      logBashWarn("bash timeout", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
@@ -1204,19 +1454,16 @@ export async function executeBash(
     }
 
     if (stdoutResult.status === "rejected") {
-      logger.error(
-        "bash stdout read failed",
-        {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
-          durationMs,
-          requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
-        },
-        stdoutResult.reason,
-      );
+      logBashError("bash stdout read failed", {
+        command: redactedCommand,
+        cwd: displayCwd,
+        ...remoteLogMeta,
+        durationMs,
+        requestId: context?.requestId,
+        sessionId: context?.sessionId,
+        requestClient: context?.requestClient,
+        ...formatBashStreamFailureForLog(stdoutResult.reason),
+      });
 
       return withLimitedBashOutput(
         {
@@ -1226,7 +1473,7 @@ export async function executeBash(
           executionError: {
             type: "exception",
             phase: "stdout",
-            message: toErrorMessage(stdoutResult.reason),
+            message: "Bash stdout read failed",
           },
         },
         bashLimitOptions,
@@ -1234,19 +1481,16 @@ export async function executeBash(
     }
 
     if (stderrResult.status === "rejected") {
-      logger.error(
-        "bash stderr read failed",
-        {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
-          durationMs,
-          requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
-        },
-        stderrResult.reason,
-      );
+      logBashError("bash stderr read failed", {
+        command: redactedCommand,
+        cwd: displayCwd,
+        ...remoteLogMeta,
+        durationMs,
+        requestId: context?.requestId,
+        sessionId: context?.sessionId,
+        requestClient: context?.requestClient,
+        ...formatBashStreamFailureForLog(stderrResult.reason),
+      });
 
       return withLimitedBashOutput(
         {
@@ -1256,7 +1500,7 @@ export async function executeBash(
           executionError: {
             type: "exception",
             phase: "stderr",
-            message: toErrorMessage(stderrResult.reason),
+            message: "Bash stderr read failed",
           },
         },
         bashLimitOptions,
@@ -1264,19 +1508,16 @@ export async function executeBash(
     }
 
     if (exitResult.status === "rejected") {
-      logger.error(
-        "bash exit status read failed",
-        {
-          command: redactedCommand,
-          cwd: displayCwd,
-          ...remoteLogMeta,
-          durationMs,
-          requestId: context?.requestId,
-          sessionId: context?.sessionId,
-          requestClient: context?.requestClient,
-        },
-        exitResult.reason,
-      );
+      logBashError("bash exit status read failed", {
+        command: redactedCommand,
+        cwd: displayCwd,
+        ...remoteLogMeta,
+        durationMs,
+        requestId: context?.requestId,
+        sessionId: context?.sessionId,
+        requestClient: context?.requestClient,
+        failureMessage: "Bash exit status operation failed",
+      });
 
       return withLimitedBashOutput(
         {
@@ -1286,7 +1527,7 @@ export async function executeBash(
           executionError: {
             type: "exception",
             phase: "unknown",
-            message: toErrorMessage(exitResult.reason),
+            message: "Bash exit status read failed",
           },
         },
         bashLimitOptions,
@@ -1294,7 +1535,7 @@ export async function executeBash(
     }
 
     if (outputTruncated) {
-      logger.warn("bash output truncated", {
+      logBashWarn("bash output truncated", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
@@ -1316,7 +1557,7 @@ export async function executeBash(
     // Always log the outcome (exitCode can be non-zero without executionError).
     const ok = exitCode === 0;
     if (ok) {
-      logger.info("bash done", {
+      logBashInfo("bash done", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
@@ -1329,7 +1570,7 @@ export async function executeBash(
         requestClient: context?.requestClient,
       });
     } else {
-      logger.warn("bash done (non-zero exit)", {
+      logBashWarn("bash done (non-zero exit)", {
         command: redactedCommand,
         cwd: displayCwd,
         ...remoteLogMeta,
@@ -1347,32 +1588,67 @@ export async function executeBash(
       { stdout: safeStdout, stderr: safeStderr, exitCode },
       bashLimitOptions,
     );
-  } catch (err) {
+  };
+  const executed = await settleBashExecution(runExecution);
+  const cleanup = await cleanupBashSpills(
+    [truncatedOutputPaths.stdoutOverflowPath, truncatedOutputPaths.stderrOverflowPath],
+    spillFileOperations,
+  );
+  stopWatchingExecution();
+
+  if (executed.status === "panic") {
+    preserveToolPanic(executed.panic);
+  }
+  if (cleanup.panic) preserveToolPanic(cleanup.panic);
+
+  if (executed.status === "error") {
     const durationMs = Date.now() - startedAt;
-    logger.error(
-      "bash spawn failed",
-      {
-        command: redactedCommand,
-        cwd: displayCwd,
-        ...remoteLogMeta,
+    if (cleanup.result.status === "error") {
+      const combined = new BashOperationAndCleanupError({
+        primary: executed.error,
+        cleanup: cleanup.result.error,
+        message: "Bash execution failed and temporary output cleanup also failed",
+      });
+      logger.error("bash spawn and cleanup failed", {
         durationMs,
         requestId: context?.requestId,
         sessionId: context?.sessionId,
         requestClient: context?.requestClient,
-      },
-      err,
-    );
+        ...formatTaggedErrorForLog(combined),
+      });
+      return {
+        stdout: "",
+        stderr: "Bash execution failed. Bash temporary output cleanup failed.",
+        exitCode: -1,
+        executionError: {
+          type: "exception",
+          phase: "spawn",
+          message: combined.message,
+        },
+      };
+    }
 
-    const executionError = toFailedExecutionError(termination, toErrorMessage(err));
+    logger.error("bash spawn failed", {
+      command: redactedCommand,
+      cwd: displayCwd,
+      ...remoteLogMeta,
+      durationMs,
+      requestId: context?.requestId,
+      sessionId: context?.sessionId,
+      requestClient: context?.requestClient,
+      ...formatTaggedErrorForLog(executed.error),
+    });
+
+    const executionError = toFailedExecutionError(termination, executed.error.message);
     return {
       stdout: "",
       stderr: "",
       exitCode: -1,
       executionError,
     };
-  } finally {
-    await fs.unlink(truncatedOutputPaths.stdoutOverflowPath).catch(() => undefined);
-    await fs.unlink(truncatedOutputPaths.stderrOverflowPath).catch(() => undefined);
-    stopWatchingExecution();
   }
+  if (cleanup.result.status === "error") {
+    return surfaceBashCleanupFailure(executed.output, cleanup.result.error);
+  }
+  return executed.output;
 }

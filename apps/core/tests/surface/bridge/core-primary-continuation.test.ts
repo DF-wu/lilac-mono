@@ -5,7 +5,7 @@ import path from "node:path";
 
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
-import type { Result as ResultType } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import type {
   ClaudeNativeAttemptObservation,
@@ -13,29 +13,65 @@ import type {
   MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
 import {
-  buildCoreLineageManifestV1,
-  createCorePrimaryLineageFreshOnlyV1,
+  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
+  createCorePrimaryLineageFreshOnlyV1 as createCorePrimaryLineageFreshOnlyResultV1,
   type CoreLineageManifestV1,
   type CorePrimaryLineageV1,
 } from "@stanley2058/lilac-event-bus";
 
 import {
-  createCorePrimaryClaudeRuntime,
+  createCorePrimaryClaudeRuntime as createCorePrimaryClaudeRuntimeResult,
   prepareCorePrimaryHistoryView,
   selectCorePrimaryClaudePrefix,
   shouldReplayCorePrimaryHistory,
 } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
+  TranscriptStoreSqliteDriverFailure,
   type CorePrimaryClaudeSessionBinding,
 } from "../../../src/transcript/transcript-store";
 
 const directories: string[] = [];
 
+function createCorePrimaryClaudeRuntime(
+  input: Parameters<typeof createCorePrimaryClaudeRuntimeResult>[0],
+) {
+  const created = createCorePrimaryClaudeRuntimeResult(input);
+  if (created.status === "error") throw created.error;
+  return created.value;
+}
+
 function resultValue<T, E>(result: ResultType<T, E>): T {
   if (result.status === "error") throw result.error;
   return result.value;
+}
+
+function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function getPrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return bindingValue(store.getCorePrimaryClaudeSessionBinding(input));
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return resultValue(buildCoreLineageManifestResultV1(...args));
+}
+
+function createCorePrimaryLineageFreshOnlyV1(
+  ...args: Parameters<typeof createCorePrimaryLineageFreshOnlyResultV1>
+) {
+  return resultValue(createCorePrimaryLineageFreshOnlyResultV1(...args));
 }
 
 function getRequestTranscript(
@@ -100,11 +136,19 @@ function fakeMaterializedRun(
   return {
     agentModel: model,
     continuationModel: model,
+    createUtilityModelResult: () => Result.ok(model),
     createUtilityModel: () => model,
     control: {
       inject: () => false,
       interrupt: async () => false,
+      async interruptResult() {
+        return Result.ok(await this.interrupt());
+      },
       clear: () => {},
+      clearResult() {
+        this.clear();
+        return Result.ok();
+      },
     },
     nativeSession: {
       getObservation: () => observation,
@@ -124,8 +168,15 @@ function fakeMaterializedRun(
             ? { sessionId: start.baseSessionId, cwd: "/workspace", lastModified: 50 }
             : null,
       }),
+      async finalizeResult() {
+        return Result.ok(await this.finalize());
+      },
     },
     dispose: async () => {},
+    async disposeResult() {
+      await this.dispose();
+      return Result.ok();
+    },
   };
 }
 
@@ -502,7 +553,7 @@ describe("Core primary Claude continuation", () => {
       }),
     ).toBe(true);
     expect(store.listSurfaceMessagesForRequest({ requestId: "request-1" })).toEqual([]);
-    const clean = store.getCorePrimaryClaudeSessionBinding({
+    const clean = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -535,7 +586,7 @@ describe("Core primary Claude continuation", () => {
     await cancelledRuntime.prepareModelCall(prepareContext(earlyInput));
     cancelledRuntime.markTerminalFailure(true);
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -686,7 +737,7 @@ describe("Core primary Claude continuation", () => {
     await runtime.prepareModelCall(prepareContext(messages));
     runtime.markTerminalFailure(true);
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: "channel",
@@ -739,9 +790,14 @@ describe("Core primary Claude continuation", () => {
     });
     const terminal = getRequestTranscript(store, { requestId: "promotion-error" });
     if (!terminal) throw new Error("terminal transcript missing");
-    store.promoteCorePrimaryClaudeSessionBinding = () => {
-      throw new Error("simulated promotion database failure");
-    };
+    store.promoteCorePrimaryClaudeSessionBinding = () =>
+      Result.err(
+        new TranscriptStoreSqliteDriverFailure({
+          operation: "promote primary binding",
+          code: "SQLITE_IOERR",
+          message: "simulated promotion database failure",
+        }),
+      );
 
     expect(
       await runtime.finalize({

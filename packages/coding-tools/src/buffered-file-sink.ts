@@ -1,6 +1,21 @@
 import fs, { type FileHandle } from "node:fs/promises";
+import { Panic, Result } from "better-result";
+
+import { adaptCodingToolResultToHost } from "./host-compatibility";
 
 const DEFAULT_BLOCK_BYTES = 64 * 1024;
+
+function signalBufferedFileSinkHost(error: Error): never {
+  return adaptCodingToolResultToHost(Result.err<never, Error>(error));
+}
+
+async function continueBufferedSinkQueue(operation: Promise<unknown>): Promise<void> {
+  try {
+    await operation;
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+  }
+}
 
 /**
  * Concurrent writes are serialized in call order. Termination stops admission
@@ -33,13 +48,15 @@ export class BufferedFileSink {
       await handle.chmod(mode);
       return new BufferedFileSink(handle, Math.floor(blockBytes));
     } catch (error) {
-      await handle.close().catch(() => undefined);
+      await continueBufferedSinkQueue(handle.close());
       throw error;
     }
   }
 
   async write(chunk: Uint8Array | string): Promise<void> {
-    if (!this.acceptingWrites) throw new Error("Cannot write to a closed buffered file sink");
+    if (!this.acceptingWrites) {
+      signalBufferedFileSinkHost(new Error("Cannot write to a closed buffered file sink"));
+    }
     const buffer = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
     if (buffer.byteLength === 0) return;
 
@@ -51,7 +68,7 @@ export class BufferedFileSink {
       }
     });
     // Continue the queue after a failed write without changing that write's returned rejection.
-    this.operationTail = operation.catch(() => undefined);
+    this.operationTail = continueBufferedSinkQueue(operation);
     await operation;
   }
 
@@ -66,21 +83,21 @@ export class BufferedFileSink {
       }
     });
     this.terminalPromise = operation;
-    this.operationTail = operation.catch(() => undefined);
+    this.operationTail = continueBufferedSinkQueue(operation);
     return operation;
   }
 
   async abort(): Promise<void> {
     this.acceptingWrites = false;
     if (this.terminalPromise) {
-      await this.terminalPromise.catch(() => undefined);
+      await continueBufferedSinkQueue(this.terminalPromise);
       return;
     }
 
     const operation = this.operationTail.then(async () => {
       this.pending.length = 0;
       this.pendingBytes = 0;
-      await this.closeHandle().catch(() => undefined);
+      await continueBufferedSinkQueue(this.closeHandle());
     });
     this.terminalPromise = operation;
     this.operationTail = operation;
@@ -92,7 +109,11 @@ export class BufferedFileSink {
     let offset = 0;
     while (offset < byteLength) {
       const chunk = this.pending[0];
-      if (!chunk) throw new Error("Buffered file sink accounting mismatch");
+      if (!chunk) {
+        return signalBufferedFileSinkHost(
+          new Panic({ message: "Buffered file sink accounting mismatch" }),
+        );
+      }
       const consumed = Math.min(chunk.byteLength, byteLength - offset);
       chunk.copy(output, offset, 0, consumed);
       offset += consumed;
@@ -112,7 +133,11 @@ export class BufferedFileSink {
         buffer.byteLength - offset,
         null,
       );
-      if (bytesWritten === 0) throw new Error("Buffered file sink made no write progress");
+      if (bytesWritten === 0) {
+        return signalBufferedFileSinkHost(
+          new Panic({ message: "Buffered file sink made no write progress" }),
+        );
+      }
       offset += bytesWritten;
     }
   }

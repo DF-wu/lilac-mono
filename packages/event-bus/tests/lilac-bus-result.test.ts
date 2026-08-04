@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   createLilacBus,
+  lilacEventTypes,
   type FetchOptions,
   type LilacBus,
   type PublishMessage,
@@ -37,6 +38,66 @@ function rawBusWithFetch(
 }
 
 describe("LilacBus Result APIs", () => {
+  it("returns publish contract and transport failures as owned Results", async () => {
+    const raw = rawBusWithFetch(async () => ({ messages: [] }));
+    const bus = createLilacBus(raw);
+    const missingRequestId = await bus.publish(lilacEventTypes.CmdRequestMessage, {
+      queue: "prompt",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(missingRequestId.status).toBe("error");
+    if (missingRequestId.status === "error") {
+      expect(missingRequestId.error._tag).toBe("EventPublishContractInvalid");
+    }
+
+    raw.publish = async () => {
+      throw new Error("redis unavailable");
+    };
+    const failed = await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+      runId: "run-1",
+      revisionId: "revision-1",
+      state: "running",
+      previousState: "queued",
+      ts: 1,
+    });
+    expect(failed.status).toBe("error");
+    if (failed.status === "error") expect(failed.error._tag).toBe("EventPublishTransportFailed");
+  });
+
+  it("preserves Panic from the raw publish boundary", async () => {
+    const panic = new Panic({ message: "raw publish invariant" });
+    const raw = rawBusWithFetch(async () => ({ messages: [] }));
+    raw.publish = async () => {
+      throw panic;
+    };
+    await expect(
+      createLilacBus(raw).publish(lilacEventTypes.EvtWorkflowRunChanged, {
+        runId: "run-1",
+        revisionId: "revision-1",
+        state: "running",
+        previousState: "queued",
+        ts: 1,
+      }),
+    ).rejects.toBe(panic);
+  });
+
+  it("returns unsupported topic operations as owned Results", async () => {
+    const bus = createLilacBus(rawBusWithFetch(async () => ({ messages: [] })));
+    expect((await bus.getTopicWatermark("evt.adapter")).status).toBe("error");
+    expect((await bus.trimTopicBeforeCheckpoint("evt.adapter", "1-0", 10)).status).toBe("error");
+    expect((await bus.retireTopicConsumerGroup("evt.adapter", "old-group")).status).toBe("error");
+  });
+
+  it("returns raw close rejection as an owned Result", async () => {
+    const raw = rawBusWithFetch(async () => ({ messages: [] }));
+    raw.close = async () => {
+      throw new Error("close failed");
+    };
+    const closed = await createLilacBus(raw).close();
+    expect(closed.status).toBe("error");
+    if (closed.status === "error") expect(closed.error._tag).toBe("EventBusCloseFailed");
+  });
+
   it("keeps acknowledgement out of the public Result handler API", async () => {
     let rawHandler: RawDeliveryHandler | undefined;
     const raw = rawBusWithFetch(

@@ -17,11 +17,18 @@ import {
 } from "./production-syntax.mts";
 import { type SyntacticPolicy, SYNTACTIC_POLICY } from "./syntax-policy.mts";
 
+type FixtureArchitectureManifest = ArchitectureManifest & {
+  readonly approvedExceptionAdapters: readonly [];
+  readonly approvedExceptionAdapterCatalogSha256: string;
+};
+
 function policyWith(overrides: Partial<SyntacticPolicy> = {}): SyntacticPolicy {
   return { ...SYNTACTIC_POLICY, ...overrides };
 }
 
-function manifestWithUnknownFreeModule(status: "advisory" | "enforced"): ArchitectureManifest {
+function manifestWithUnknownFreeModule(
+  status: "advisory" | "enforced",
+): FixtureArchitectureManifest {
   const manifest = manifestWithAdapters([]);
   const workspace = manifest.workspaces[0];
   if (!workspace) throw new Error("fixture workspace missing");
@@ -36,7 +43,7 @@ function manifestWithUnknownFreeModule(status: "advisory" | "enforced"): Archite
   };
 }
 
-function manifestWithPresentationBoundaries(): ArchitectureManifest {
+function manifestWithPresentationBoundaries(): FixtureArchitectureManifest {
   const manifest = manifestWithUnknownFreeModule("enforced");
   const workspace = manifest.workspaces[0];
   if (!workspace) throw new Error("fixture workspace missing");
@@ -87,9 +94,11 @@ function manifestWithPresentationBoundaries(): ArchitectureManifest {
   };
 }
 
-function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): ArchitectureManifest {
+function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): FixtureArchitectureManifest {
   return {
     version: 1,
+    approvedExceptionAdapters: [],
+    approvedExceptionAdapterCatalogSha256: "fixture-catalog-digest",
     workspaces: [
       {
         name: "apps/example",
@@ -127,7 +136,7 @@ function manifestWithAdapters(adapters: readonly ExceptionAdapter[]): Architectu
   };
 }
 
-function manifestWithStage6(status: "advisory" | "enforced"): ArchitectureManifest {
+function manifestWithStage6(status: "advisory" | "enforced"): FixtureArchitectureManifest {
   const manifest = manifestWithAdapters([]);
   const workspace = manifest.workspaces[0];
   if (!workspace) throw new Error("fixture workspace missing");
@@ -404,6 +413,65 @@ describe("production exception syntax", () => {
     ]);
   });
 
+  it("attributes rejection handlers to named and inline callback identities", () => {
+    const code = `
+      function namedRejection(cause: unknown) { return cause; }
+      function outer() {
+        void Promise.resolve().then(undefined, namedRejection);
+        void Promise.resolve().catch((cause) => cause);
+      }
+    `;
+
+    expect(
+      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith()).map(
+        (violation) => violation.symbol,
+      ),
+    ).toEqual(["namedRejection", "outer.catch.<callback@1>"]);
+    expect(
+      findExceptionFlowViolations(
+        code,
+        "apps/example/src/adapter.ts",
+        policyWith(),
+        manifestWithAdapters([
+          adapter("namedRejection", "capture-external"),
+          adapter("outer.catch.<callback@1>", "capture-external"),
+        ]),
+      ),
+    ).toEqual([]);
+    expect(
+      findExceptionFlowViolations(
+        code,
+        "apps/example/src/adapter.ts",
+        policyWith(),
+        manifestWithAdapters([adapter("outer", "capture-external")]),
+      ).map((violation) => violation.symbol),
+    ).toEqual(["namedRejection", "outer.catch.<callback@1>"]);
+  });
+
+  it("disambiguates repeated callback identities instead of allowing one registration to own both", () => {
+    const code = `
+      function repeated() {
+        void Promise.resolve().catch((first) => first);
+        void Promise.resolve().catch((second) => second);
+      }
+    `;
+    const identities = findExceptionFlowViolations(
+      code,
+      "apps/example/src/adapter.ts",
+      policyWith(),
+    ).map((violation) => violation.symbol);
+
+    expect(identities).toEqual(["repeated.catch.<callback@1>@1", "repeated.catch.<callback@1>@2"]);
+    expect(
+      findExceptionFlowViolations(
+        code,
+        "apps/example/src/adapter.ts",
+        policyWith(),
+        manifestWithAdapters([adapter("repeated.catch.<callback@1>@1", "capture-external")]),
+      ).map((violation) => violation.symbol),
+    ).toEqual(["repeated.catch.<callback@1>@2"]);
+  });
+
   it("builds exact class and property-arrow symbol paths", () => {
     const violations = findExceptionFlowViolations(
       `
@@ -424,7 +492,7 @@ describe("production exception syntax", () => {
       "Runner.handlers.fail",
       "Controller.fail",
       "handlers.fail",
-      "outer",
+      "outer.map.<callback@1>",
     ]);
     expect(violations.every((violation) => violation.digest.length === 64)).toBe(true);
   });

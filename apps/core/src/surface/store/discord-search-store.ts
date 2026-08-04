@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createLogger } from "@stanley2058/lilac-utils";
 import {
+  preserveSurfacePanic,
   type SurfaceCacheBurstProvider,
   type SurfaceAdapter,
   type SurfaceBurstCacheInput,
@@ -205,11 +206,11 @@ export class DiscordSearchStore {
     `);
 
     const rowCountRow = this.db
-      .query("SELECT COUNT(1) AS c FROM discord_search_messages")
-      .get() as { c: number };
+      .query<{ c: number }, []>("SELECT COUNT(1) AS c FROM discord_search_messages")
+      .get();
     const ftsCountRow = this.db
-      .query("SELECT COUNT(1) AS c FROM discord_search_messages_fts")
-      .get() as { c: number };
+      .query<{ c: number }, []>("SELECT COUNT(1) AS c FROM discord_search_messages_fts")
+      .get();
 
     const rowCount = typeof rowCountRow?.c === "number" ? rowCountRow.c : 0;
     const ftsCount = typeof ftsCountRow?.c === "number" ? ftsCountRow.c : 0;
@@ -297,8 +298,10 @@ export class DiscordSearchStore {
 
   countMessagesByChannel(channelId: string): number {
     const row = this.db
-      .query("SELECT COUNT(1) AS c FROM discord_search_messages WHERE channel_id = ?")
-      .get(channelId) as { c: number };
+      .query<{ c: number }, [string]>(
+        "SELECT COUNT(1) AS c FROM discord_search_messages WHERE channel_id = ?",
+      )
+      .get(channelId);
     return typeof row?.c === "number" ? row.c : 0;
   }
 
@@ -307,7 +310,7 @@ export class DiscordSearchStore {
     messageId: string;
   }): DiscordSearchIndexedMessage | null {
     const row = this.db
-      .query(
+      .query<RawIndexedRow, [string, string]>(
         `
         SELECT
           channel_id,
@@ -324,16 +327,16 @@ export class DiscordSearchStore {
         WHERE channel_id = ? AND message_id = ?
         `,
       )
-      .get(input.channelId, input.messageId) as RawIndexedRow | null;
+      .get(input.channelId, input.messageId);
 
     return row ? asDiscordSearchIndexedMessage(row) : null;
   }
 
   listMessagesForDiscovery(sinceUpdatedTs?: number): DiscordSearchIndexedMessage[] {
-    const rows = (
+    const rows =
       sinceUpdatedTs === undefined
         ? this.db
-            .query(
+            .query<RawIndexedRow, []>(
               `
             SELECT
               channel_id,
@@ -352,7 +355,7 @@ export class DiscordSearchStore {
             )
             .all()
         : this.db
-            .query(
+            .query<RawIndexedRow, [number]>(
               `
             SELECT
               channel_id,
@@ -370,8 +373,7 @@ export class DiscordSearchStore {
             ORDER BY updated_ts ASC, channel_id ASC, message_id ASC
             `,
             )
-            .all(sinceUpdatedTs)
-    ) as RawIndexedRow[];
+            .all(sinceUpdatedTs);
 
     return rows.map(asDiscordSearchIndexedMessage);
   }
@@ -383,7 +385,7 @@ export class DiscordSearchStore {
     const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 20)));
 
     const rows = this.db
-      .query(
+      .query<RawSearchRow, [string, string, number]>(
         `
         SELECT
           m.channel_id,
@@ -404,7 +406,7 @@ export class DiscordSearchStore {
         LIMIT ?
         `,
       )
-      .all(ftsQuery, input.channelId, limit) as RawSearchRow[];
+      .all(ftsQuery, input.channelId, limit);
 
     return rows.map((row) => ({
       ref: asDiscordMsgRef(row.channel_id, row.message_id),
@@ -535,7 +537,8 @@ export class DiscordSearchService {
       };
       try {
         await this.params.adapter.burstCache(cacheInput);
-      } catch {
+      } catch (cause) {
+        preserveSurfacePanic(cause);
         // ignore cache invalidation errors
       }
     }
@@ -555,6 +558,7 @@ export class DiscordSearchService {
         indexed,
       };
     } catch (e) {
+      preserveSurfacePanic(e);
       this.logger.error("search heal failed", { channelId: input.sessionRef.channelId, limit }, e);
       return {
         attempted: true,

@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { FileSystem, type FsBackend } from "@stanley2058/lilac-fs";
+import { expandTilde, FileSystem, type FsBackend } from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_URI_PREFIX,
@@ -10,7 +10,7 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
 import type { CodingToolArtifactIntegration } from "./artifact-integration";
-import { assertGuardrailBypassAllowed, assertLocalCwd } from "./guardrails";
+import { canonicalPathAllowed, assertGuardrailBypassAllowed, assertLocalCwd } from "./guardrails";
 import {
   createReadFileInstructionClaims,
   loadReadFileInstructions,
@@ -138,6 +138,30 @@ function detectAttachmentMimeType(bytes: Uint8Array): string | undefined {
   return undefined;
 }
 
+function resolveLocalOperationPath(inputPath: string, cwd: string): string {
+  const expanded = expandTilde(inputPath);
+  return path.isAbsolute(expanded)
+    ? path.resolve(expanded)
+    : path.resolve(expandTilde(cwd), expanded);
+}
+
+async function localFilesystemPathAllowed(params: {
+  inputPath: string;
+  cwd: string;
+  denyPaths: readonly string[];
+  operation: string;
+  dangerouslyAllow?: boolean;
+}) {
+  const resolvedPath = resolveLocalOperationPath(params.inputPath, params.cwd);
+  const allowed = await canonicalPathAllowed({
+    targetPath: resolvedPath,
+    denyPaths: params.denyPaths,
+    operation: params.operation,
+    dangerouslyAllow: params.dangerouslyAllow,
+  });
+  return { allowed, resolvedPath };
+}
+
 export function createFilesystemTools(params: {
   fileSystem: FileSystem;
   cwd: string;
@@ -188,6 +212,7 @@ export function createFilesystemTools(params: {
                     maxOutputBytes,
                   },
                 ),
+                { kind: "none" },
               )
             : { ok: false as const };
           if (!artifact.ok) {
@@ -215,6 +240,23 @@ export function createFilesystemTools(params: {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
         const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: input.path,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "read_file",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            success: false as const,
+            resolvedPath: guardedPath.resolvedPath,
+            error: {
+              code: "PERMISSION" as const,
+              message: guardedPath.allowed.error.message,
+            },
+          };
+        }
         const expectedMimeType = readFileDirectAttachmentSupported
           ? ATTACHMENT_MIME_TYPES.get(path.extname(input.path).toLowerCase())
           : undefined;
@@ -350,9 +392,32 @@ export function createFilesystemTools(params: {
     glob: tool({
       description: "Match local filesystem paths with include and negated glob patterns.",
       inputSchema: globInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: effectiveCwd,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "glob",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return input.mode === "detailed"
+            ? {
+                mode: "detailed" as const,
+                truncated: false,
+                entries: [],
+                error: guardedPath.allowed.error.message,
+              }
+            : {
+                mode: "default" as const,
+                truncated: false,
+                paths: [],
+                error: guardedPath.allowed.error.message,
+              };
+        }
         return fileSystem.glob({ ...input, baseDir: operationCwd ?? cwd });
       },
       toModelOutput: ({ output }) =>
@@ -363,9 +428,25 @@ export function createFilesystemTools(params: {
     grep: tool({
       description: "Search local file contents, using literal matching unless regex=true.",
       inputSchema: grepInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: effectiveCwd,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "grep",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            mode: input.mode ?? "default",
+            truncated: false,
+            results: [],
+            error: guardedPath.allowed.error.message,
+          };
+        }
         return fileSystem.grep({ ...input, baseDir: operationCwd ?? cwd });
       },
       toModelOutput: ({ output }) =>
@@ -377,9 +458,27 @@ export function createFilesystemTools(params: {
       description:
         "Replace a snippet in an existing local file. The file must first be read with read_file; by default oldText must match exactly once.",
       inputSchema: editFileInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: input.path,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "edit_file",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            success: false as const,
+            resolvedPath: guardedPath.resolvedPath,
+            error: {
+              code: "PERMISSION" as const,
+              message: guardedPath.allowed.error.message,
+            },
+          };
+        }
         const occurrence = input.replaceAll ? "all" : "first";
         const expectedMatches = input.expectedMatches ?? (input.replaceAll ? "any" : 1);
         return fileSystem.editFile(
@@ -408,9 +507,26 @@ export function createFilesystemTools(params: {
     tools.fuzzy_search = tool({
       description: "Fuzzy-ranked local filename and path search powered by FFF.",
       inputSchema: fuzzySearchInputSchema,
-      execute: ({ cwd: operationCwd, ...input }) => {
+      execute: async ({ cwd: operationCwd, ...input }) => {
         if (operationCwd) assertLocalCwd(operationCwd);
         assertGuardrailBypassAllowed(input.dangerouslyAllow, allowGuardrailBypass);
+        const effectiveCwd = operationCwd ?? cwd;
+        const guardedPath = await localFilesystemPathAllowed({
+          inputPath: effectiveCwd,
+          cwd: effectiveCwd,
+          denyPaths: denyPaths ?? [],
+          operation: "fuzzy_search",
+          dangerouslyAllow: input.dangerouslyAllow,
+        });
+        if (guardedPath.allowed.status === "error") {
+          return {
+            results: [],
+            totalMatched: 0,
+            totalFiles: 0,
+            truncated: false as const,
+            error: guardedPath.allowed.error.message,
+          };
+        }
         return fileSystem.fuzzySearchFiles({ ...input, baseDir: operationCwd ?? cwd });
       },
       toModelOutput: ({ output }) =>

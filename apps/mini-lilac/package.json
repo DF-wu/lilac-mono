@@ -35,7 +35,8 @@
     "typecheck": "bunx tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@opentui/core": "0.4.3"
+    "@opentui/core": "0.4.3",
+    "better-result": "catalog:"
   },
   "devDependencies": {
     "@opentui/solid": "0.4.3",

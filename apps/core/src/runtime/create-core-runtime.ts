@@ -7,8 +7,7 @@ import {
   formatTaggedErrorForLog,
   getCoreConfig,
   isPanic,
-  opaqueErrorMessage,
-  readCoreConfigVersion,
+  readCoreConfigVersionResult,
   resolveDiscordDbPath,
   resolveCoreConfigPath,
   resolveCustomCommandsDir,
@@ -49,6 +48,7 @@ import {
   startBusAgentRunner,
 } from "../surface/bridge/bus-agent-runner";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
+import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
 import { DiscordSearchService, DiscordSearchStore } from "../surface/store/discord-search-store";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
@@ -79,7 +79,7 @@ import { startGithubWebhookServer } from "../github/webhook/github-webhook-serve
 
 import { SqliteTranscriptStore } from "../transcript/transcript-store";
 import { isHeartbeatSessionId } from "../heartbeat/common";
-import { startHeartbeatService } from "../heartbeat/heartbeat-service";
+import { startHeartbeatServiceResult, type HeartbeatService } from "../heartbeat/heartbeat-service";
 
 import { DurableWorkflowStore } from "../workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../workflow/workflow-action-resolver";
@@ -110,6 +110,7 @@ import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plug
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
+import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
 import { SqliteGracefulRestartStore, type GracefulRestartSnapshot } from "./graceful-restart-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import {
@@ -118,21 +119,54 @@ import {
 } from "../artifacts/tool-result-artifact-store";
 import {
   createEmptyMcpConfig,
+  createMcpRegistryResult,
   McpOAuthCallbackService,
   McpOAuthProviderService,
-  McpRegistry,
   readMcpConfigFile,
   rethrowPanic,
   resolveMcpConfigPath,
   type McpOAuthCallbackListenerStatus,
+  type McpRegistryOptionsInvalid,
   type UniversalMcpConfig,
 } from "../mcp";
 
 export type CoreRuntime = {
-  start(): Promise<void>;
+  start(): Promise<CoreRuntimeStartOutcome>;
   stop(priorPanic?: Panic | null): Promise<void>;
-  recordUnhandledRejection(reason: unknown): void;
+  recordUnhandledRejection(reason: Error): void;
 };
+
+class CoreRuntimeExternalFailure extends TaggedError("CoreRuntimeExternalFailure")<{
+  readonly operation: "reload-config" | "start-config-watcher";
+  readonly cause: Error;
+  readonly message: string;
+}> {}
+
+export class CoreRuntimeCreateFailed extends TaggedError("CoreRuntimeCreateFailed")<{
+  readonly operation: "event-bus" | "custom-commands" | "mcp-registry";
+  readonly cause: CoreEventBusSetupError | CustomCommandDiscoveryError | McpRegistryOptionsInvalid;
+  readonly message: string;
+}> {}
+
+export type CoreRuntimeCreateOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<CoreRuntime, CoreRuntimeCreateFailed>;
+    }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+export class CoreRuntimeStartFailed extends TaggedError("CoreRuntimeStartFailed")<{
+  readonly operation: "startup" | "heartbeat";
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type CoreRuntimeStartOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<void, CoreRuntimeStartFailed>;
+    }
+  | { readonly kind: "panic"; readonly panic: Panic };
 
 export type CoreRuntimeOptions = {
   /** Where core tools operate (fs/bash tool root). Default: $LILAC_WORKSPACE_DIR or $DATA_DIR/workspace. */
@@ -223,6 +257,25 @@ export function createCoreRuntimeFatalReporter(
   };
 }
 
+export async function superviseDetachedCoreConfigValidation(params: {
+  readonly validate: () => Promise<void>;
+  readonly reportFatalError: (error: Error) => void;
+}): Promise<void> {
+  const [settled] = await Promise.allSettled([params.validate()]);
+  if (settled.status === "fulfilled") return;
+  if (isPanic(settled.reason)) {
+    params.reportFatalError(settled.reason);
+    return;
+  }
+  if (settled.reason instanceof Error) {
+    params.reportFatalError(settled.reason);
+    return;
+  }
+  params.reportFatalError(
+    new Panic({ message: "Core config validation rejected", cause: settled.reason }),
+  );
+}
+
 function normalizeRouterDoneDefect(cause: unknown): Error {
   if (isPanic(cause)) return cause;
   if (cause instanceof Error) return cause;
@@ -235,22 +288,24 @@ export function superviseCoreRouterDone(params: {
   readonly markUnhealthy: () => void;
   readonly reportFatalError: (error: Error) => void;
 }): Promise<void> {
-  const settled = params.done.then((done) => done, normalizeRouterDoneDefect);
-  return settled.then((outcome) => {
+  return supervise();
+
+  async function supervise(): Promise<void> {
+    const [settled] = await Promise.allSettled([params.done]);
     if (params.isStopping()) return;
     params.markUnhealthy();
-    if (outcome instanceof Error) {
-      params.reportFatalError(outcome);
+    if (settled.status === "rejected") {
+      params.reportFatalError(normalizeRouterDoneDefect(settled.reason));
       return;
     }
-    if (outcome.status === "error") {
-      params.reportFatalError(outcome.error);
+    if (settled.value.status === "error") {
+      params.reportFatalError(settled.value.error);
       return;
     }
     params.reportFatalError(
       new Panic({ message: "Bus request router subscriptions completed unexpectedly" }),
     );
-  });
+  }
 }
 
 export function createCoreEventBusDeliveryOptions(params: {
@@ -298,6 +353,13 @@ export class CoreEventBusSetupAndCleanupFailed extends TaggedError(
 }> {}
 
 type CoreEventBusSetupError = CoreEventBusSetupFailed | CoreEventBusSetupAndCleanupFailed;
+
+export type CoreEventBusSetupOutcome =
+  | {
+      readonly kind: "result";
+      readonly result: ResultType<CoreEventBusResources, CoreEventBusSetupError>;
+    }
+  | { readonly kind: "panic"; readonly panic: Panic };
 
 type CoreEventBusResources = {
   readonly redis: Redis;
@@ -434,7 +496,15 @@ export async function captureCoreEventBusCleanup(
 ): Promise<ResultType<void, CoreEventBusCleanupFailed>> {
   try {
     if (ownership.bus) {
-      await ownership.bus.close();
+      const closed = await ownership.bus.close();
+      if (closed.status === "error") {
+        return Result.err(
+          new CoreEventBusCleanupFailed({
+            cause: closed.error,
+            message: "Core event bus cleanup failed",
+          }),
+        );
+      }
     } else if (ownership.raw) {
       await ownership.raw.close();
     } else {
@@ -479,92 +549,98 @@ export async function setupCoreEventBusResources(params: {
       readonly dataDir: string;
     }) => Promise<ResultType<Uint8Array, CoreDeadLetterKeyError>>;
   };
-}): Promise<ResultType<CoreEventBusResources, CoreEventBusSetupError>> {
+}): Promise<CoreEventBusSetupOutcome> {
   let redis: Redis | null = null;
   let raw: CoreEventBusRaw | null = null;
   let bus: LilacBus | null = null;
   let cleanupAttempted = false;
 
-  try {
-    const redisCreated = (
-      params.dependencies?.captureRedisConstruction ?? captureCoreRedisConstruction
-    )(params.redisUrl);
-    if (redisCreated.status === "error") return Result.err(redisCreated.error);
-    redis = redisCreated.value;
+  const setup = await Result.tryPromise({
+    try: async () => {
+      const redisCreated = (
+        params.dependencies?.captureRedisConstruction ?? captureCoreRedisConstruction
+      )(params.redisUrl);
+      if (redisCreated.status === "error") return Result.err(redisCreated.error);
+      redis = redisCreated.value;
 
-    const workspacePrepared = await captureCoreWorkspacePreparation(params.cwd);
-    if (workspacePrepared.status === "error") {
-      cleanupAttempted = true;
-      return await coreEventBusSetupFailureWithCleanup(workspacePrepared.error, {
+      const workspacePrepared = await captureCoreWorkspacePreparation(params.cwd);
+      if (workspacePrepared.status === "error") {
+        cleanupAttempted = true;
+        return await coreEventBusSetupFailureWithCleanup(workspacePrepared.error, {
+          redis,
+          raw,
+          bus,
+        });
+      }
+
+      const deadLetterKey = await (
+        params.dependencies?.loadDeadLetterKey ?? loadOrCreateCoreDeadLetterKey
+      )({ dataDir: params.dataDir });
+      if (deadLetterKey.status === "error") {
+        const setupError = new CoreEventBusSetupFailed({
+          operation: "load-dead-letter-key",
+          cause: deadLetterKey.error,
+          message: "Core event bus setup failed during load-dead-letter-key",
+        });
+        cleanupAttempted = true;
+        return await coreEventBusSetupFailureWithCleanup(setupError, { redis, raw, bus });
+      }
+
+      const redisConnected = await captureCoreRedisConnection(redis);
+      if (redisConnected.status === "error") {
+        cleanupAttempted = true;
+        return await coreEventBusSetupFailureWithCleanup(redisConnected.error, { redis, raw, bus });
+      }
+
+      const rawCreated = captureCoreRawBusConstruction(redis);
+      if (rawCreated.status === "error") {
+        cleanupAttempted = true;
+        return await coreEventBusSetupFailureWithCleanup(rawCreated.error, { redis, raw, bus });
+      }
+      raw = rawCreated.value;
+
+      const busCreated = captureCoreLilacBusConstruction({
+        redis,
+        raw,
+        deadLetterEncryptionKey: deadLetterKey.value,
+        logger: params.logger,
+        reportFatalError: params.reportFatalError,
+      });
+      if (busCreated.status === "error") {
+        cleanupAttempted = true;
+        return await coreEventBusSetupFailureWithCleanup(busCreated.error, { redis, raw, bus });
+      }
+      bus = busCreated.value;
+
+      return Result.ok({
         redis,
         raw,
         bus,
+        canonicalWorkspaceRoot: workspacePrepared.value,
       });
-    }
+    },
+    catch: projectRuntimeError("Unexpected Core event bus setup rejection"),
+  });
+  if (setup.status === "ok") return { kind: "result", result: setup.value };
 
-    const deadLetterKey = await (
-      params.dependencies?.loadDeadLetterKey ?? loadOrCreateCoreDeadLetterKey
-    )({ dataDir: params.dataDir });
-    if (deadLetterKey.status === "error") {
-      const setupError = new CoreEventBusSetupFailed({
-        operation: "load-dead-letter-key",
-        cause: deadLetterKey.error,
-        message: "Core event bus setup failed during load-dead-letter-key",
-      });
-      cleanupAttempted = true;
-      return await coreEventBusSetupFailureWithCleanup(setupError, { redis, raw, bus });
-    }
-
-    const redisConnected = await captureCoreRedisConnection(redis);
-    if (redisConnected.status === "error") {
-      cleanupAttempted = true;
-      return await coreEventBusSetupFailureWithCleanup(redisConnected.error, { redis, raw, bus });
-    }
-
-    const rawCreated = captureCoreRawBusConstruction(redis);
-    if (rawCreated.status === "error") {
-      cleanupAttempted = true;
-      return await coreEventBusSetupFailureWithCleanup(rawCreated.error, { redis, raw, bus });
-    }
-    raw = rawCreated.value;
-
-    const busCreated = captureCoreLilacBusConstruction({
-      redis,
-      raw,
-      deadLetterEncryptionKey: deadLetterKey.value,
-      logger: params.logger,
-      reportFatalError: params.reportFatalError,
+  const cause = isPanic(setup.error)
+    ? setup.error
+    : new Panic({ message: "Unexpected Core event bus setup rejection" });
+  if (!redis || cleanupAttempted) return { kind: "panic", panic: cause };
+  const ownedRedis = redis;
+  const cleanup = createCoreRuntimeCleanupSupervisor(cause);
+  await cleanup.run("eventBus.setup.close", async () => {
+    adaptCoreEventBusCleanupResultToHost(
+      await captureCoreEventBusCleanup({ redis: ownedRedis, raw, bus }),
+    );
+  });
+  if (cleanup.failures.length > 0) {
+    params.logger.error("event_bus.setup_cleanup_failed", {
+      failureCount: cleanup.failures.length,
     });
-    if (busCreated.status === "error") {
-      cleanupAttempted = true;
-      return await coreEventBusSetupFailureWithCleanup(busCreated.error, { redis, raw, bus });
-    }
-    bus = busCreated.value;
-
-    return Result.ok({
-      redis,
-      raw,
-      bus,
-      canonicalWorkspaceRoot: workspacePrepared.value,
-    });
-  } catch (cause) {
-    if (!redis || cleanupAttempted) throw cause;
-    const ownedRedis = redis;
-    const setupPanic = isPanic(cause) ? cause : null;
-    const cleanup = createCoreRuntimeCleanupSupervisor(setupPanic);
-    await cleanup.run("eventBus.setup.close", async () => {
-      adaptCoreEventBusCleanupResultToHost(
-        await captureCoreEventBusCleanup({ redis: ownedRedis, raw, bus }),
-      );
-    });
-    if (cleanup.failures.length > 0) {
-      params.logger.error("event_bus.setup_cleanup_failed", {
-        failureCount: cleanup.failures.length,
-      });
-    }
-    cleanup.finish();
-    throw cause;
   }
+  cleanup.finish();
+  return { kind: "panic", panic: cause };
 }
 
 export function adaptCoreEventBusSetupResultToStartup(
@@ -594,9 +670,30 @@ export type CoreRuntimeCleanupFailure = {
   readonly panic: boolean;
 };
 
+function logGracefulRestartSnapshotSaved(
+  logger: ReturnType<typeof createLogger>,
+  details: {
+    readonly drainDeadlineMs: number;
+    readonly snapshotTtlMs: number;
+    readonly agentEntries: number;
+    readonly relayEntries: number;
+  },
+): void {
+  logger.info("Saved graceful restart snapshot", details);
+}
+
 export type CoreRuntimeCleanupSupervisor = {
   readonly failures: readonly CoreRuntimeCleanupFailure[];
   run(label: string, cleanup: (() => Promise<void>) | undefined): Promise<void>;
+  runOutcome(
+    label: string,
+    cleanup:
+      | (() => Promise<
+          | { readonly kind: "result"; readonly result: ResultType<void, unknown> }
+          | { readonly kind: "panic"; readonly panic: Panic }
+        >)
+      | undefined,
+  ): Promise<void>;
   finish(): void;
 };
 
@@ -615,8 +712,37 @@ export function createCoreRuntimeCleanupSupervisor(
       if (panic && !cleanupPanic) cleanupPanic = cause;
       failures.push({
         label,
-        error: opaqueErrorMessage(cause, "Opaque cleanup failure"),
+        error: safeRuntimeErrorText(cause, "Opaque cleanup failure"),
         panic,
+      });
+    }
+  }
+
+  async function runOutcome(
+    label: string,
+    cleanup:
+      | (() => Promise<
+          | { readonly kind: "result"; readonly result: ResultType<void, unknown> }
+          | { readonly kind: "panic"; readonly panic: Panic }
+        >)
+      | undefined,
+  ): Promise<void> {
+    if (!cleanup) return;
+    const outcome = await cleanup();
+    if (outcome.kind === "panic") {
+      if (!cleanupPanic) cleanupPanic = outcome.panic;
+      failures.push({
+        label,
+        error: safeRuntimeErrorText(outcome.panic, "Opaque cleanup panic"),
+        panic: true,
+      });
+      return;
+    }
+    if (outcome.result.status === "error") {
+      failures.push({
+        label,
+        error: safeRuntimeErrorText(outcome.result.error, "Opaque cleanup failure"),
+        panic: false,
       });
     }
   }
@@ -625,7 +751,7 @@ export function createCoreRuntimeCleanupSupervisor(
     if (!priorPanic && cleanupPanic) throw cleanupPanic;
   }
 
-  return { failures, run, finish };
+  return { failures, run, runOutcome, finish };
 }
 
 type CoreMcpStartupLogger = {
@@ -695,7 +821,9 @@ function fffCacheDir(): string {
   return path.join(env.dataDir, ".cache", "fff");
 }
 
-export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreRuntime> {
+export async function createCoreRuntime(
+  opts: CoreRuntimeOptions,
+): Promise<CoreRuntimeCreateOutcome> {
   const logger = createLogger({
     logLevel: opts.logLevel,
     module: "core-runtime",
@@ -716,16 +844,19 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   });
 
   const redisUrl = env.redisUrl;
-  let eventBusSetup: ResultType<CoreEventBusResources, CoreEventBusSetupError>;
+  let eventBusSetup: CoreEventBusSetupOutcome;
   if (!redisUrl) {
     logger.error("Missing REDIS_URL env var (required)");
-    eventBusSetup = Result.err(
-      new CoreEventBusSetupFailed({
-        operation: "read-config",
-        cause: undefined,
-        message: "REDIS_URL must be set",
-      }),
-    );
+    eventBusSetup = {
+      kind: "result",
+      result: Result.err(
+        new CoreEventBusSetupFailed({
+          operation: "read-config",
+          cause: undefined,
+          message: "REDIS_URL must be set",
+        }),
+      ),
+    };
   } else {
     eventBusSetup = await setupCoreEventBusResources({
       redisUrl,
@@ -735,14 +866,37 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
       reportFatalError,
     });
   }
-  const eventBusResources = adaptCoreEventBusSetupResultToStartup(eventBusSetup);
+  if (eventBusSetup.kind === "panic") return eventBusSetup;
+  if (eventBusSetup.result.status === "error") {
+    return {
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "event-bus",
+          cause: eventBusSetup.result.error,
+          message: eventBusSetup.result.error.message,
+        }),
+      ),
+    };
+  }
+  const eventBusResources = eventBusSetup.result.value;
   const { redis, raw, bus, canonicalWorkspaceRoot } = eventBusResources;
 
   const customCommandManager = new CustomCommandManager(env.dataDir);
-  const customCommands = adaptCustomCommandInitializationResultToStartup(
-    await customCommandManager.init(),
-    customCommandManager,
-  );
+  const customCommandsInitialized = await customCommandManager.init();
+  if (customCommandsInitialized.status === "error") {
+    return {
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "custom-commands",
+          cause: customCommandsInitialized.error,
+          message: customCommandsInitialized.error.message,
+        }),
+      ),
+    };
+  }
+  const customCommands = customCommandManager;
   const loadedCustomCommands = customCommands.list();
   const customCommandWarnings = customCommands.listWarnings();
   logger.info("custom commands initialized", {
@@ -757,7 +911,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     logger.warn("custom command skipped", { warning });
   }
 
-  const adapter = new DiscordAdapter({ customCommands });
+  const adapter = new DiscordAdapter({ customCommands, reportFatalPanic: reportFatalError });
   const githubAdapter = new GithubAdapter();
   const durableWorkflowStore = new DurableWorkflowStore();
 
@@ -786,7 +940,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   let stopBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopGithubBusToAdapter: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
-  let stopHeartbeat: Awaited<ReturnType<typeof startHeartbeatService>> | null = null;
+  let stopHeartbeat: HeartbeatService | null = null;
   let stopConversationThreadWorker: Awaited<
     ReturnType<typeof startConversationThreadWorker>
   > | null = null;
@@ -809,12 +963,26 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     configBaseDir: path.dirname(mcpConfigPath),
   });
   const mcpOAuthCallback = new McpOAuthCallbackService({ providers: mcpOAuthProviders });
-  const mcpRegistry = new McpRegistry({
+  const mcpRegistryCreated = createMcpRegistryResult({
     configPath: mcpConfigPath,
+    reportFatalError,
     dependencies: {
       createAuthProvider: ({ server }) => mcpOAuthProviders.getProvider(server.id),
     },
   });
+  if (mcpRegistryCreated.status === "error") {
+    return {
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "mcp-registry",
+          cause: mcpRegistryCreated.error,
+          message: mcpRegistryCreated.error.message,
+        }),
+      ),
+    };
+  }
+  const mcpRegistry = mcpRegistryCreated.value;
   let runtimeFullyStarted = false;
   let routerSubscriptionHealthy = true;
   let mcpRegistryInitPromise: Promise<void> | null = null;
@@ -824,19 +992,27 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   let lastCoreConfigValidationError: string | null = null;
 
   async function readCoreConfigParserVersion(configPath: string): Promise<number | "unknown"> {
-    try {
-      const raw = Bun.YAML.parse(await fs.readFile(configPath, "utf8")) as unknown;
-      return readCoreConfigVersion(raw);
-    } catch {
+    const loaded = await Result.tryPromise({
+      try: async (): Promise<number | "unknown"> => {
+        const version = readCoreConfigVersionResult(
+          Bun.YAML.parse(await fs.readFile(configPath, "utf8")),
+        );
+        return version.status === "ok" ? version.value : "unknown";
+      },
+      catch: projectRuntimeError("Core config version read failed"),
+    });
+    if (loaded.status === "error") {
+      if (isPanic(loaded.error)) throw loaded.error;
       return "unknown";
     }
+    return loaded.value;
   }
 
   let toolServer: {
     init(): Promise<void>;
     start(port: number): Promise<void>;
     stop(): Promise<void>;
-    recordUnhandledRejection(reason: unknown): void;
+    recordUnhandledRejection(reason: Error): void;
   } | null = null;
 
   // How long shutdown waits for active runs/relays before forcing snapshot + exit.
@@ -854,27 +1030,31 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   }> {
     const startedAt = Date.now();
     let timer: ReturnType<typeof setTimeout> | null = null;
-    try {
-      const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error(`redis ping timed out after ${REDIS_HEALTH_TIMEOUT_MS}ms`));
-        }, REDIS_HEALTH_TIMEOUT_MS);
-        timer.unref?.();
-      });
-      await Promise.race([redis.ping(), timeout]);
-      if (timer) clearTimeout(timer);
+    const pinged = await Result.tryPromise({
+      try: async () => {
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`redis ping timed out after ${REDIS_HEALTH_TIMEOUT_MS}ms`));
+          }, REDIS_HEALTH_TIMEOUT_MS);
+          timer.unref?.();
+        });
+        await Promise.race([redis.ping(), timeout]);
+      },
+      catch: projectRuntimeError("Redis health probe failed"),
+    });
+    if (timer) clearTimeout(timer);
+    if (pinged.status === "ok") {
       return {
         ok: true,
         durationMs: Date.now() - startedAt,
       };
-    } catch (e) {
-      if (timer) clearTimeout(timer);
-      return {
-        ok: false,
-        durationMs: Date.now() - startedAt,
-        error: errorMessage(e),
-      };
     }
+    if (isPanic(pinged.error)) throw pinged.error;
+    return {
+      ok: false,
+      durationMs: Date.now() - startedAt,
+      error: errorMessage(pinged.error),
+    };
   }
 
   async function getRuntimeHealthReport(): Promise<ToolServerHealthProviderResult> {
@@ -979,8 +1159,12 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   async function validateCoreConfigOnChange(reason: "watch"): Promise<void> {
     const configPath = resolveCoreConfigPath();
 
-    try {
-      const config = await getCoreConfig({ forceReload: true });
+    const loaded = await Result.tryPromise({
+      try: () => getCoreConfig({ forceReload: true }),
+      catch: projectRuntimeError("Core config reload failed"),
+    });
+    if (loaded.status === "ok") {
+      const config = loaded.value;
 
       if (coreConfigValidationHadError) {
         logger.info("core-config hot-reload validation recovered", {
@@ -1000,8 +1184,16 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
       lastCoreConfigValidationError = null;
       await adapter.refreshCoreConfig();
       conversationThreadMaterializer?.markAllDirty();
-    } catch (e) {
-      const msg = errorMessage(e);
+    } else {
+      const e = loaded.error;
+      if (isPanic(e)) throw e;
+      const failure = new CoreRuntimeExternalFailure({
+        operation: "reload-config",
+        cause: e,
+        message: "Core config reload failed",
+      });
+      const logError = formatTaggedErrorForLog(failure);
+      const msg = logError.errorMessage;
       if (!coreConfigValidationHadError || lastCoreConfigValidationError !== msg) {
         const parserVersion = await readCoreConfigParserVersion(configPath);
         logger.warn("core-config hot-reload validation failed", {
@@ -1024,7 +1216,10 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
 
     coreConfigValidationTimer = setTimeout(() => {
       coreConfigValidationTimer = null;
-      void validateCoreConfigOnChange(reason);
+      void superviseDetachedCoreConfigValidation({
+        validate: () => validateCoreConfigOnChange(reason),
+        reportFatalError,
+      });
     }, 200);
   }
 
@@ -1033,32 +1228,49 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     const configDir = path.dirname(configPath);
     const configFileName = path.basename(configPath);
 
-    try {
-      const watchState = {
-        lastContent: await fs.readFile(configPath, "utf8"),
-      };
-      coreConfigWatcher = watch(configDir, (eventType, filename) => {
-        void handleCoreConfigWatchEvent({
-          configPath,
-          configFileName,
-          eventType,
-          filename,
-          state: watchState,
-          logger,
-          scheduleValidation: scheduleCoreConfigValidation,
+    const startedWatcher = await Result.tryPromise({
+      try: async () => {
+        const watchState = {
+          lastContent: await fs.readFile(configPath, "utf8"),
+        };
+        coreConfigWatcher = watch(configDir, (eventType, filename) => {
+          void handleCoreConfigWatchEvent({
+            configPath,
+            configFileName,
+            eventType,
+            filename,
+            state: watchState,
+            logger,
+            scheduleValidation: scheduleCoreConfigValidation,
+          });
         });
-      });
 
-      coreConfigWatcher.on("error", (e: unknown) => {
-        logger.warn("core-config watcher error", { path: configPath }, e);
-      });
+        coreConfigWatcher.on("error", (error: Error) => {
+          logger.warn("core-config watcher error", {
+            path: configPath,
+            error: safeRuntimeErrorText(error, "Opaque core-config watcher failure"),
+          });
+        });
 
-      logger.info("Core config hot-reload validator started", {
+        logger.info("Core config hot-reload validator started", {
+          path: configPath,
+          parserVersion: await readCoreConfigParserVersion(configPath),
+        });
+      },
+      catch: projectRuntimeError("Core config watcher startup failed"),
+    });
+    if (startedWatcher.status === "error") {
+      const e = startedWatcher.error;
+      if (isPanic(e)) throw e;
+      const failure = new CoreRuntimeExternalFailure({
+        operation: "start-config-watcher",
+        cause: e,
+        message: "Core config watcher startup failed",
+      });
+      logger.warn("Core config hot-reload validator disabled", {
         path: configPath,
-        parserVersion: await readCoreConfigParserVersion(configPath),
+        ...formatTaggedErrorForLog(failure),
       });
-    } catch (e) {
-      logger.warn("Core config hot-reload validator disabled", { path: configPath }, e);
       coreConfigWatcher = null;
     }
   }
@@ -1097,625 +1309,682 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     });
   }
 
-  async function start(): Promise<void> {
-    if (started) return;
+  async function start(): Promise<CoreRuntimeStartOutcome> {
+    if (started) return { kind: "result", result: Result.ok(undefined) };
     started = true;
     routerSubscriptionHealthy = true;
     conversationThreadSummarizationStopping = false;
 
-    try {
-      logger.info("Core runtime starting...");
+    const startup = await Result.tryPromise({
+      try: async (): Promise<CoreRuntimeStartOutcome> => {
+        logger.info("Core runtime starting...");
 
-      // Ensure data dir exists before creating sqlite-backed stores.
-      await fs.mkdir(env.dataDir, { recursive: true });
-      const artifactStoreInit = await toolResultArtifacts.init();
-      adaptToolResultArtifactStoreInitToHost(artifactStoreInit);
+        // Ensure data dir exists before creating sqlite-backed stores.
+        await fs.mkdir(env.dataDir, { recursive: true });
+        const artifactStoreInit = await toolResultArtifacts.init();
+        adaptToolResultArtifactStoreInitToHost(artifactStoreInit);
 
-      const mcpStartup = await startCoreMcpServices({
-        configPath: mcpConfigPath,
-        providers: mcpOAuthProviders,
-        registry: mcpRegistry,
-        callback: mcpOAuthCallback,
-        logger,
-      });
-      const registryInitPromise = mcpStartup.registryInit.finally(() => {
-        if (mcpRegistryInitPromise === registryInitPromise) mcpRegistryInitPromise = null;
-      });
-      mcpRegistryInitPromise = registryInitPromise;
-
-      const startupConfig = await getCoreConfig();
-      if (startupConfig.tools.fsBackend === "fff") {
-        void prewarmFffFinders({
-          basePaths: ["/data", "/data/workspace", "/app", cwd],
-          denyPaths: runtimeFsDenyPaths(),
-          cacheDir: fffCacheDir(),
-        }).then((results) => {
-          logger.info("fff finder prewarm completed", {
-            results,
-          });
+        const mcpStartup = await startCoreMcpServices({
+          configPath: mcpConfigPath,
+          providers: mcpOAuthProviders,
+          registry: mcpRegistry,
+          callback: mcpOAuthCallback,
+          logger,
         });
-      }
+        const registryInitPromise = mcpStartup.registryInit.finally(() => {
+          if (mcpRegistryInitPromise === registryInitPromise) mcpRegistryInitPromise = null;
+        });
+        mcpRegistryInitPromise = registryInitPromise;
 
-      await startCoreConfigWatcher();
-
-      gracefulRestartStore = new SqliteGracefulRestartStore(
-        path.join(env.dataDir, "graceful-restart.db"),
-      );
-
-      const discordSearchDbPath = resolveDiscordSearchDbPath();
-      const discordSurfaceDbPath = resolveDiscordDbPath(startupConfig);
-      transcriptStore = new SqliteTranscriptStore(resolveTranscriptDbPath());
-      discordSearchStore = new DiscordSearchStore(discordSearchDbPath);
-      discordSurfaceStore = new DiscordSurfaceStore(discordSurfaceDbPath);
-      conversationThreadStore = new ConversationThreadStore(discordSearchDbPath, {
-        surfaceDbPath: discordSurfaceDbPath,
-        mainAgentUserNames: [startupConfig.surface.discord.botName],
-      });
-      const conversationThreadEntityMapper = createDiscordEntityMapper({
-        cfg: startupConfig,
-        store: discordSurfaceStore,
-      });
-      const getConversationThreadEmbeddingAdapter =
-        createConversationThreadEmbeddingAdapterResolver(() => getCoreConfig());
-      conversationThreadMaterializer = startConversationThreadMaterializer({
-        searchDbPath: discordSearchDbPath,
-        surfaceDbPath: discordSurfaceDbPath,
-      });
-      discordSearchService = new DiscordSearchService({
-        adapter,
-        store: discordSearchStore,
-        onMessagesIndexed(channelId) {
-          conversationThreadMaterializer?.markDirty({ channelId, kind: "topology" });
-        },
-      });
-      const threadService = new ConversationThreadService({
-        store: conversationThreadStore,
-        getConfig: () => getCoreConfig(),
-        getEmbeddingAdapter: getConversationThreadEmbeddingAdapter,
-        entityMapper: conversationThreadEntityMapper,
-      });
-      conversationThreadService = threadService;
-      const captureSummarizationRuntimeOperation = async <T>(
-        operation: ConversationThreadSummarizationRuntimeOperation,
-        effect: () => Promise<T>,
-      ): Promise<ResultType<T, ConversationThreadSummarizationRuntimeError>> => {
-        try {
-          return Result.ok(await effect());
-        } catch (cause) {
-          rethrowPanic(cause);
-          return Result.err(
-            new ConversationThreadSummarizationRuntimeError({
-              operation,
-              cause,
-              message: errorMessage(cause),
-            }),
-          );
+        const startupConfig = await getCoreConfig();
+        if (startupConfig.tools.fsBackend === "fff") {
+          void prewarmFffFinders({
+            basePaths: ["/data", "/data/workspace", "/app", cwd],
+            denyPaths: runtimeFsDenyPaths(),
+            cacheDir: fffCacheDir(),
+          }).then((results) => {
+            logger.info("fff finder prewarm completed", {
+              results,
+            });
+          });
         }
-      };
-      const runInProcessSummarization = (input: ConversationThreadRunSummarizationInput = {}) =>
-        captureSummarizationRuntimeOperation("in-process", () =>
-          threadService.runSummarization(input),
+
+        await startCoreConfigWatcher();
+
+        gracefulRestartStore = new SqliteGracefulRestartStore(
+          path.join(env.dataDir, "graceful-restart.db"),
         );
-      stopConversationThreadSummarizationWorker = startConversationThreadSummarizationWorker({
-        searchDbPath: discordSearchDbPath,
-        surfaceDbPath: discordSurfaceDbPath,
-      });
-      conversationThreadSummarizationRunner = {
-        async runSummarization(input) {
-          if (conversationThreadSummarizationStopping) {
+
+        const discordSearchDbPath = resolveDiscordSearchDbPath();
+        const discordSurfaceDbPath = resolveDiscordDbPath(startupConfig);
+        transcriptStore = new SqliteTranscriptStore(resolveTranscriptDbPath());
+        discordSearchStore = new DiscordSearchStore(discordSearchDbPath);
+        discordSurfaceStore = new DiscordSurfaceStore(discordSurfaceDbPath);
+        conversationThreadStore = new ConversationThreadStore(discordSearchDbPath, {
+          surfaceDbPath: discordSurfaceDbPath,
+          mainAgentUserNames: [startupConfig.surface.discord.botName],
+        });
+        const conversationThreadEntityMapper = createDiscordEntityMapper({
+          cfg: startupConfig,
+          store: discordSurfaceStore,
+        });
+        const getConversationThreadEmbeddingAdapter =
+          createConversationThreadEmbeddingAdapterResolver(() => getCoreConfig());
+        conversationThreadMaterializer = startConversationThreadMaterializer({
+          searchDbPath: discordSearchDbPath,
+          surfaceDbPath: discordSurfaceDbPath,
+        });
+        discordSearchService = new DiscordSearchService({
+          adapter,
+          store: discordSearchStore,
+          onMessagesIndexed(channelId) {
+            conversationThreadMaterializer?.markDirty({ channelId, kind: "topology" });
+          },
+        });
+        const threadService = new ConversationThreadService({
+          store: conversationThreadStore,
+          getConfig: () => getCoreConfig(),
+          getEmbeddingAdapter: getConversationThreadEmbeddingAdapter,
+          entityMapper: conversationThreadEntityMapper,
+        });
+        conversationThreadService = threadService;
+        const captureSummarizationRuntimeOperation = async <T>(
+          operation: ConversationThreadSummarizationRuntimeOperation,
+          effect: () => Promise<T>,
+        ): Promise<ResultType<T, ConversationThreadSummarizationRuntimeError>> => {
+          try {
+            return Result.ok(await effect());
+          } catch (cause) {
+            rethrowPanic(cause);
             return Result.err(
-              new ConversationThreadSummarizationTransportError({
-                operation: "stopped",
-                message: "conversation thread summarization is stopping",
+              new ConversationThreadSummarizationRuntimeError({
+                operation,
+                cause,
+                message: errorMessage(cause),
               }),
             );
           }
-          const trigger = input?.trigger ?? "manual";
-          const flushStartedAt = Date.now();
-          if (trigger === "periodic") {
-            logger.info("conversation thread periodic summarization dispatch started", {
-              limit: input?.limit,
-            });
-          }
-          const flushed = await captureSummarizationRuntimeOperation(
-            "materializer-flush",
-            async () => {
-              await conversationThreadMaterializer?.flush();
-            },
+        };
+        const runInProcessSummarization = (input: ConversationThreadRunSummarizationInput = {}) =>
+          captureSummarizationRuntimeOperation("in-process", () =>
+            threadService.runSummarization(input),
           );
-          if (flushed.status === "error") return Result.err(flushed.error);
-          if (trigger === "periodic") {
-            logger.info("conversation thread periodic summarization materialization flushed", {
-              durationMs: Date.now() - flushStartedAt,
-            });
-          }
-          if (conversationThreadSummarizationStopping) {
-            return Result.err(
-              new ConversationThreadSummarizationTransportError({
-                operation: "stopped",
-                message: "conversation thread summarization is stopping",
-              }),
-            );
-          }
-          if (trigger === "periodic") {
-            const config = await captureSummarizationRuntimeOperation("configuration", () =>
-              getCoreConfig(),
-            );
-            if (config.status === "error") return Result.err(config.error);
-            if (config.value.conversation.thread.summarization.enabled !== true) {
-              logger.info("conversation thread periodic summarization cancelled after flush");
-              return Result.ok({
-                dryRun: false,
-                refreshed: { channels: 0, threads: 0, messages: 0 },
-                eligible: 0,
-                eligibleTotal: 0,
-                eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
-                cleared: 0,
-                summarized: 0,
-                failed: 0,
-                failures: [],
-                threadIds: [],
+        stopConversationThreadSummarizationWorker = startConversationThreadSummarizationWorker({
+          searchDbPath: discordSearchDbPath,
+          surfaceDbPath: discordSurfaceDbPath,
+        });
+        conversationThreadSummarizationRunner = {
+          async runSummarization(input) {
+            if (conversationThreadSummarizationStopping) {
+              return Result.err(
+                new ConversationThreadSummarizationTransportError({
+                  operation: "stopped",
+                  message: "conversation thread summarization is stopping",
+                }),
+              );
+            }
+            const trigger = input?.trigger ?? "manual";
+            const flushStartedAt = Date.now();
+            if (trigger === "periodic") {
+              logger.info("conversation thread periodic summarization dispatch started", {
+                limit: input?.limit,
               });
             }
-          }
-          if (input?.dryRun === true || !stopConversationThreadSummarizationWorker) {
-            return await runInProcessSummarization(input);
-          }
-          return await stopConversationThreadSummarizationWorker.runSummarization(input);
-        },
-      };
-      discoveryService = new DiscoveryService({
-        dbPath: resolveDiscoveryDbPath(),
-        dataDir: env.dataDir,
-        discordSearchStore,
-        transcriptStore,
-        getConfig: () => getCoreConfig(),
-      });
+            const flushed = await captureSummarizationRuntimeOperation(
+              "materializer-flush",
+              async () => {
+                await conversationThreadMaterializer?.flush();
+              },
+            );
+            if (flushed.status === "error") return Result.err(flushed.error);
+            if (trigger === "periodic") {
+              logger.info("conversation thread periodic summarization materialization flushed", {
+                durationMs: Date.now() - flushStartedAt,
+              });
+            }
+            if (conversationThreadSummarizationStopping) {
+              return Result.err(
+                new ConversationThreadSummarizationTransportError({
+                  operation: "stopped",
+                  message: "conversation thread summarization is stopping",
+                }),
+              );
+            }
+            if (trigger === "periodic") {
+              const config = await captureSummarizationRuntimeOperation("configuration", () =>
+                getCoreConfig(),
+              );
+              if (config.status === "error") return Result.err(config.error);
+              if (config.value.conversation.thread.summarization.enabled !== true) {
+                logger.info("conversation thread periodic summarization cancelled after flush");
+                return Result.ok({
+                  dryRun: false,
+                  refreshed: { channels: 0, threads: 0, messages: 0 },
+                  eligible: 0,
+                  eligibleTotal: 0,
+                  eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+                  cleared: 0,
+                  summarized: 0,
+                  failed: 0,
+                  failures: [],
+                  threadIds: [],
+                });
+              }
+            }
+            if (input?.dryRun === true || !stopConversationThreadSummarizationWorker) {
+              return await runInProcessSummarization(input);
+            }
+            return await stopConversationThreadSummarizationWorker.runSummarization(input);
+          },
+        };
+        discoveryService = new DiscoveryService({
+          dbPath: resolveDiscoveryDbPath(),
+          dataDir: env.dataDir,
+          discordSearchStore,
+          transcriptStore,
+          getConfig: () => getCoreConfig(),
+        });
 
-      stopDiscordSearchIndexer = await startDiscordSearchIndexer({
-        adapter,
-        search: discordSearchService,
-        getConfig: () => getCoreConfig(),
-        materializer: conversationThreadMaterializer,
-      });
+        stopDiscordSearchIndexer = await startDiscordSearchIndexer({
+          adapter,
+          search: discordSearchService,
+          getConfig: () => getCoreConfig(),
+          materializer: conversationThreadMaterializer,
+        });
 
-      logger.info("Discord search indexer started", {
-        dbPath: discordSearchDbPath,
-      });
+        logger.info("Discord search indexer started", {
+          dbPath: discordSearchDbPath,
+        });
 
-      // Subscribe to adapter events before connecting, so we don't miss early messages.
-      stopAdapterToBus = await bridgeAdapterToBus({
-        adapter,
-        bus,
-        subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
-        transcriptStore: transcriptStore ?? undefined,
-      });
+        // Subscribe to adapter events before connecting, so we don't miss early messages.
+        stopAdapterToBus = await bridgeAdapterToBus({
+          adapter,
+          bus,
+          subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
+          transcriptStore: transcriptStore ?? undefined,
+        });
 
-      logger.info("bridgeAdapterToBus started", {
-        subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
-      });
+        logger.info("bridgeAdapterToBus started", {
+          subscriptionId: subId(subscriptionPrefix, "adapter-to-bus"),
+        });
 
-      requestMessageCache = await createRequestMessageCache({
-        bus,
-        subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
-      });
+        requestMessageCache = await createRequestMessageCache({
+          bus,
+          subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
+        });
 
-      logger.info("Request message cache started", {
-        subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
-      });
+        logger.info("Request message cache started", {
+          subscriptionId: subId(subscriptionPrefix, "tool-request-cache"),
+        });
 
-      stopWorkflowActionResolver = await startWorkflowActionResolver({
-        bus,
-        store: durableWorkflowStore,
-        subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
-      });
+        stopWorkflowActionResolver = await startWorkflowActionResolver({
+          bus,
+          store: durableWorkflowStore,
+          subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
+        });
 
-      // Subscribe durably before adapter.connect() so replies around startup replay.
-      workflowWaitResolver = new WorkflowWaitResolver({
-        bus,
-        store: durableWorkflowStore,
-        subscriptionId: subId(subscriptionPrefix, "workflow-waits"),
-        confirmLegacyGroupSingleVersionRollout:
-          process.env.LILAC_CONFIRM_SINGLE_VERSION_WORKFLOW_WAIT_RESOLVER === "1",
-      });
-      await workflowWaitResolver.start();
+        // Subscribe durably before adapter.connect() so replies around startup replay.
+        workflowWaitResolver = new WorkflowWaitResolver({
+          bus,
+          store: durableWorkflowStore,
+          subscriptionId: subId(subscriptionPrefix, "workflow-waits"),
+          confirmLegacyGroupSingleVersionRollout:
+            process.env.LILAC_CONFIRM_SINGLE_VERSION_WORKFLOW_WAIT_RESOLVER === "1",
+        });
+        await workflowWaitResolver.start();
 
-      await adapter.connect();
-      await githubAdapter.connect();
+        await adapter.connect();
+        await githubAdapter.connect();
 
-      logger.info("Surface adapter connected", {
-        platform: "discord",
-      });
+        logger.info("Surface adapter connected", {
+          platform: "discord",
+        });
 
-      const workflowAdapters = new Map<"discord" | "github", SurfaceAdapter>([
-        ["discord", adapter],
-        ["github", githubAdapter],
-      ]);
-      workflowProgressProjector = new WorkflowProgressProjector({
-        bus,
-        store: durableWorkflowStore,
-        adapters: workflowAdapters,
-        subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
-      });
-      await workflowProgressProjector.start();
+        const workflowAdapters = new Map<"discord" | "github", SurfaceAdapter>([
+          ["discord", adapter],
+          ["github", githubAdapter],
+        ]);
+        workflowProgressProjector = new WorkflowProgressProjector({
+          bus,
+          store: durableWorkflowStore,
+          adapters: workflowAdapters,
+          subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
+          reportFatalPanic: reportFatalError,
+        });
+        await workflowProgressProjector.start();
 
-      workflowTriggerScheduler = new WorkflowTriggerScheduler({
-        bus,
-        store: durableWorkflowStore,
-        progressCards: workflowProgressProjector,
-        getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
-      });
-      await workflowTriggerScheduler.start();
+        workflowTriggerScheduler = new WorkflowTriggerScheduler({
+          bus,
+          store: durableWorkflowStore,
+          progressCards: workflowProgressProjector,
+          getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
+          reportFatalPanic: reportFatalError,
+        });
+        await workflowTriggerScheduler.start();
 
-      workflowLiveParentBridge = new WorkflowLiveParentBridge({
-        bus,
-        store: durableWorkflowStore,
-        subscriptionId: subId(subscriptionPrefix, "workflow-live-parents"),
-        dataDir: env.dataDir,
-        toolResultArtifacts,
-      });
-      await workflowLiveParentBridge.start();
+        workflowLiveParentBridge = new WorkflowLiveParentBridge({
+          bus,
+          store: durableWorkflowStore,
+          subscriptionId: subId(subscriptionPrefix, "workflow-live-parents"),
+          dataDir: env.dataDir,
+          toolResultArtifacts,
+        });
+        await workflowLiveParentBridge.start();
 
-      workflowSubagentDispatcher = await WorkflowSubagentDispatcher.create({
-        store: durableWorkflowStore,
-        dataDir: env.dataDir,
-        toolResultArtifacts,
-        getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
-        onRunCreated: async (run) => {
-          await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-            runId: run.runId,
-            revisionId: run.revisionId,
-            state: run.state,
-            ts: Date.now(),
+        workflowSubagentDispatcher = await WorkflowSubagentDispatcher.create({
+          store: durableWorkflowStore,
+          dataDir: env.dataDir,
+          toolResultArtifacts,
+          getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
+          onRunCreated: async (run) => {
+            adaptEventPublishResultToHost(
+              await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+                runId: run.runId,
+                revisionId: run.revisionId,
+                state: run.state,
+                ts: Date.now(),
+              }),
+            );
+          },
+          onRunCancelled: async (run, previousState) => {
+            adaptEventPublishResultToHost(
+              await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+                runId: run.runId,
+                revisionId: run.revisionId,
+                state: "cancelled",
+                previousState,
+                detail: run.terminalDetail ?? undefined,
+                ts: Date.now(),
+              }),
+            );
+            adaptEventPublishResultToHost(
+              await bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+                runId: run.runId,
+                revisionId: run.revisionId,
+                state: "cancelled",
+                summary: run.terminalDetail ?? undefined,
+                ts: Date.now(),
+              }),
+            );
+          },
+        });
+
+        stopRouter = await startBusRequestRouter({
+          adapter,
+          bus,
+          subscriptionId: subId(subscriptionPrefix, "router"),
+          customCommands,
+          shouldSuppressAdapterEvent: async ({ evt }) =>
+            shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
+          transcriptStore: transcriptStore ?? undefined,
+        });
+        routerSupervision = superviseCoreRouterDone({
+          done: stopRouter.done,
+          isStopping: () => !started,
+          markUnhealthy: () => {
+            routerSubscriptionHealthy = false;
+            runtimeFullyStarted = false;
+          },
+          reportFatalError,
+        });
+
+        logger.info("Bus request router started", {
+          subscriptionId: subId(subscriptionPrefix, "router"),
+        });
+
+        const conversationThreadToolService: ConversationThreadToolService | undefined =
+          conversationThreadService
+            ? (() => {
+                const service = conversationThreadService;
+                const summarizationRunner = conversationThreadSummarizationRunner;
+                const toolService = createConversationThreadToolService(service);
+                return {
+                  ...toolService,
+                  runSummarization: (input) =>
+                    resolveConversationThreadSummarizationToolOperation(
+                      summarizationRunner
+                        ? summarizationRunner.runSummarization(input)
+                        : captureSummarizationRuntimeOperation("in-process", () =>
+                            service.runSummarization(input),
+                          ),
+                    ),
+                };
+              })()
+            : undefined;
+
+        pluginManager = createCoreToolPluginManager({
+          runtime: {
+            bus,
+            adapter,
+            getConfig: () => getCoreConfig(),
+            discovery: discoveryService ?? undefined,
+            conversationThreads: conversationThreadToolService,
+            discordSearch: discordSearchService ?? undefined,
+            transcriptStore: transcriptStore ?? undefined,
+            toolResultArtifacts,
+            durableWorkflowStore,
+            workflowProgressCards: workflowProgressProjector,
+            mcpRegistry,
+            mcpOAuthProviders,
+            mcpOAuthCallback,
+            mcpConfigPath,
+          },
+          dataDir: env.dataDir,
+        });
+
+        toolServer = createToolServer({
+          pluginManager,
+          reportFatalToolCallDefect: reportFatalError,
+          logger: createLogger({
+            module: "tool-server",
+          }),
+          healthProvider: getRuntimeHealthReport,
+          activeLevel1WorkProvider: () => stopAgentRunner?.getActiveLevel1Work() ?? [],
+          onUnhealthy: opts.onUnhealthy,
+          getConfig: () => getCoreConfig(),
+          requestMessageCache: {
+            get: requestMessageCache.get,
+            getOrigin: requestMessageCache.getOrigin,
+          },
+          canonicalWorkspaceRoot,
+          operatorTokenSha256: process.env.LILAC_OPERATOR_TOKEN_SHA256,
+          authorizeControlRequest: (input) => requestControlAuthority.authorize(input),
+          resolveServerSafetyMode: async (context) => {
+            if (context.serverOwnedRequest && context.requestClient === "github") return "trusted";
+            if (context.requestClient !== "discord" || !context.sessionId) return "restricted";
+            const config = await getCoreConfig();
+            const session = discordSurfaceStore?.getSession(context.sessionId);
+            if (!session) return "restricted";
+            return (
+              config.surface.router.sessionModes[context.sessionId]?.safetyMode ??
+              (session.parent_channel_id
+                ? config.surface.router.sessionModes[session.parent_channel_id]?.safetyMode
+                : undefined) ??
+              "trusted"
+            );
+          },
+        });
+
+        await toolServer.init();
+        await toolServer.start(toolServerPort);
+
+        logger.info("Tool server started", {
+          port: toolServerPort,
+        });
+
+        stopBusToAdapter = await bridgeBusToAdapter({
+          adapter,
+          bus,
+          platform: "discord",
+          subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
+          transcriptStore: transcriptStore ?? undefined,
+        });
+
+        logger.info("bridgeBusToAdapter started", {
+          subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
+        });
+
+        // GitHub surface (webhook ingress + non-streamed comment egress)
+        const ghSecret = await readGithubAppSecret(env.dataDir);
+        if (ghSecret) {
+          stopGithubWebhook = await startGithubWebhookServer({
+            bus,
+            subscriptionId: subId(subscriptionPrefix, "github-webhook"),
+            reportFatalError,
           });
-        },
-        onRunCancelled: async (run, previousState) => {
-          await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
-            runId: run.runId,
-            revisionId: run.revisionId,
-            state: "cancelled",
-            previousState,
-            detail: run.terminalDetail ?? undefined,
-            ts: Date.now(),
+
+          stopGithubBusToAdapter = await bridgeBusToAdapter({
+            adapter: githubAdapter,
+            bus,
+            platform: "github",
+            subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
+            transcriptStore: transcriptStore ?? undefined,
           });
-          await bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
-            runId: run.runId,
-            revisionId: run.revisionId,
-            state: "cancelled",
-            summary: run.terminalDetail ?? undefined,
-            ts: Date.now(),
+
+          logger.info("GitHub surface started", {
+            webhookPath: env.github.webhookPath,
+            webhookPort: env.github.webhookPort,
+            subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
           });
-        },
-      });
+        } else {
+          logger.info("GitHub App secret missing; skipping GitHub surface");
+        }
 
-      stopRouter = await startBusRequestRouter({
-        adapter,
-        bus,
-        subscriptionId: subId(subscriptionPrefix, "router"),
-        customCommands,
-        shouldSuppressAdapterEvent: async ({ evt }) =>
-          shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
-        transcriptStore: transcriptStore ?? undefined,
-      });
-      routerSupervision = superviseCoreRouterDone({
-        done: stopRouter.done,
-        isStopping: () => !started,
-        markUnhealthy: () => {
-          routerSubscriptionHealthy = false;
-          runtimeFullyStarted = false;
-        },
-        reportFatalError,
-      });
+        const restartLoadResult = gracefulRestartStore?.loadAndConsumeCompletedSnapshot();
+        const restartLoad =
+          restartLoadResult?.status === "ok"
+            ? restartLoadResult.value
+            : ({ state: "absent", provenance: "missing-defaulted" } as const);
+        if (restartLoadResult?.status === "error") {
+          logger.warn(
+            "Graceful restart snapshot load failed",
+            formatTaggedErrorForLog(restartLoadResult.error),
+          );
+        }
+        const restartSnapshot = restartLoad.state === "loaded" ? restartLoad.snapshot : null;
 
-      logger.info("Bus request router started", {
-        subscriptionId: subId(subscriptionPrefix, "router"),
-      });
-
-      const conversationThreadToolService: ConversationThreadToolService | undefined =
-        conversationThreadService
-          ? (() => {
-              const service = conversationThreadService;
-              const summarizationRunner = conversationThreadSummarizationRunner;
-              const toolService = createConversationThreadToolService(service);
-              return {
-                ...toolService,
-                runSummarization: (input) =>
-                  resolveConversationThreadSummarizationToolOperation(
-                    summarizationRunner
-                      ? summarizationRunner.runSummarization(input)
-                      : captureSummarizationRuntimeOperation("in-process", () =>
-                          service.runSummarization(input),
-                        ),
-                  ),
-              };
-            })()
+        const initialHeartbeatExternalState = restartSnapshot
+          ? {
+              activeRequestIds: restartSnapshot.agent
+                .filter(
+                  (entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId),
+                )
+                .map((entry) => entry.requestId),
+            }
           : undefined;
 
-      pluginManager = createCoreToolPluginManager({
-        runtime: {
-          bus,
-          adapter,
-          getConfig: () => getCoreConfig(),
-          discovery: discoveryService ?? undefined,
-          conversationThreads: conversationThreadToolService,
-          discordSearch: discordSearchService ?? undefined,
-          transcriptStore: transcriptStore ?? undefined,
-          toolResultArtifacts,
-          durableWorkflowStore,
-          workflowProgressCards: workflowProgressProjector,
-          mcpRegistry,
-          mcpOAuthProviders,
-          mcpOAuthCallback,
-          mcpConfigPath,
-        },
-        dataDir: env.dataDir,
-      });
-
-      toolServer = createToolServer({
-        pluginManager,
-        reportFatalToolCallDefect: reportFatalError,
-        logger: createLogger({
-          module: "tool-server",
-        }),
-        healthProvider: getRuntimeHealthReport,
-        activeLevel1WorkProvider: () => stopAgentRunner?.getActiveLevel1Work() ?? [],
-        onUnhealthy: opts.onUnhealthy,
-        getConfig: () => getCoreConfig(),
-        requestMessageCache: {
-          get: requestMessageCache.get,
-          getOrigin: requestMessageCache.getOrigin,
-        },
-        canonicalWorkspaceRoot,
-        operatorTokenSha256: process.env.LILAC_OPERATOR_TOKEN_SHA256,
-        authorizeControlRequest: (input) => requestControlAuthority.authorize(input),
-        resolveServerSafetyMode: async (context) => {
-          if (context.serverOwnedRequest && context.requestClient === "github") return "trusted";
-          if (context.requestClient !== "discord" || !context.sessionId) return "restricted";
-          const config = await getCoreConfig();
-          const session = discordSurfaceStore?.getSession(context.sessionId);
-          if (!session) return "restricted";
-          return (
-            config.surface.router.sessionModes[context.sessionId]?.safetyMode ??
-            (session.parent_channel_id
-              ? config.surface.router.sessionModes[session.parent_channel_id]?.safetyMode
-              : undefined) ??
-            "trusted"
-          );
-        },
-      });
-
-      await toolServer.init();
-      await toolServer.start(toolServerPort);
-
-      logger.info("Tool server started", {
-        port: toolServerPort,
-      });
-
-      stopBusToAdapter = await bridgeBusToAdapter({
-        adapter,
-        bus,
-        platform: "discord",
-        subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
-        transcriptStore: transcriptStore ?? undefined,
-      });
-
-      logger.info("bridgeBusToAdapter started", {
-        subscriptionId: subId(subscriptionPrefix, "bus-to-adapter"),
-      });
-
-      // GitHub surface (webhook ingress + non-streamed comment egress)
-      const ghSecret = await readGithubAppSecret(env.dataDir);
-      if (ghSecret) {
-        stopGithubWebhook = await startGithubWebhookServer({
-          bus,
-          subscriptionId: subId(subscriptionPrefix, "github-webhook"),
-        });
-
-        stopGithubBusToAdapter = await bridgeBusToAdapter({
-          adapter: githubAdapter,
-          bus,
-          platform: "github",
-          subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
-          transcriptStore: transcriptStore ?? undefined,
-        });
-
-        logger.info("GitHub surface started", {
-          webhookPath: env.github.webhookPath,
-          webhookPort: env.github.webhookPort,
-          subscriptionId: subId(subscriptionPrefix, "bus-to-github"),
-        });
-      } else {
-        logger.info("GitHub App secret missing; skipping GitHub surface");
-      }
-
-      const restartLoadResult = gracefulRestartStore?.loadAndConsumeCompletedSnapshot();
-      const restartLoad =
-        restartLoadResult?.status === "ok"
-          ? restartLoadResult.value
-          : ({ state: "absent", provenance: "missing-defaulted" } as const);
-      if (restartLoadResult?.status === "error") {
-        logger.warn(
-          "Graceful restart snapshot load failed",
-          formatTaggedErrorForLog(restartLoadResult.error),
-        );
-      }
-      const restartSnapshot = restartLoad.state === "loaded" ? restartLoad.snapshot : null;
-
-      const initialHeartbeatExternalState = restartSnapshot
-        ? {
-            activeRequestIds: restartSnapshot.agent
-              .filter((entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId))
-              .map((entry) => entry.requestId),
-          }
-        : undefined;
-
-      if (restartLoad.state === "stale") {
-        logger.warn("Graceful restart snapshot discarded (stale)", {
-          createdAt: restartLoad.createdAt,
-          ageMs: restartLoad.ageMs,
-          deadlineMs: restartLoad.deadlineMs,
-        });
-      }
-
-      const recoverableRootParentRequestIds =
-        restartSnapshot?.agent
-          .filter(
-            (entry) =>
-              entry.kind === "active" &&
-              !isHeartbeatSessionId(entry.sessionId) &&
-              !isWorkflowAgentRecoveryEntry(entry),
-          )
-          .map((entry) => entry.requestId) ?? [];
-      const remainingSnapshotProtectionMs = restartSnapshot
-        ? Math.max(1, restartSnapshot.createdAt + restartSnapshot.deadlineMs - Date.now())
-        : GRACEFUL_SNAPSHOT_TTL_MS;
-      await workflowLiveParentBridge.enableOrphanHandling({
-        protectedParentRequestIds: recoverableRootParentRequestIds,
-        protectionMs: remainingSnapshotProtectionMs,
-      });
-
-      // Start agent runner last so it can't publish replies before relay is online.
-      stopAgentRunner = await startBusAgentRunner({
-        bus,
-        subscriptionId: subId(subscriptionPrefix, "agent-runner"),
-        reportFatalPanic: reportFatalError,
-        pluginManager,
-        customCommands,
-        cwd: canonicalWorkspaceRoot,
-        transcriptStore: transcriptStore ?? undefined,
-        conversationThreads: conversationThreadToolService,
-        toolResultArtifacts,
-        workflowLiveParentBridge,
-        workflowSubagentDispatcher,
-        durableWorkflowStore,
-        issueControlCapability: async (input) => {
-          let origin = requestMessageCache?.getOrigin(input.requestId);
-          for (let attempt = 0; !origin && attempt < 20; attempt += 1) {
-            await Bun.sleep(5);
-            origin = requestMessageCache?.getOrigin(input.requestId);
-          }
-          const originPrincipal =
-            origin?.actorUserId &&
-            origin.sessionId === input.sessionId &&
-            origin.platform === input.requestClient
-              ? { platform: origin.platform, userId: origin.actorUserId }
-              : null;
-          const policy = {
-            kind: "primary",
-            requestId: input.requestId,
-            sessionId: input.sessionId,
-            platform: input.requestClient,
-            principal: input.principal ?? originPrincipal,
-            allowedCallables: null,
-            profile: input.profile,
-            canonicalCwd: input.canonicalCwd,
-            safetyMode: input.safetyMode,
-            expiresAt: input.expiresAt,
-          } as const;
-          return {
-            capability: requestControlAuthority.issue(policy),
-            principal: policy.principal,
-          };
-        },
-        issueHeartbeatCapability: (input) =>
-          requestControlAuthority.issue({
-            kind: "heartbeat",
-            requestId: input.requestId,
-            sessionId: input.sessionId,
-            platform: input.requestClient,
-            principal: null,
-            allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
-            profile: "primary",
-            canonicalCwd: input.canonicalCwd,
-            safetyMode: "trusted",
-            expiresAt: input.expiresAt,
-          }),
-        expireControlCapability: (requestId) => requestControlAuthority.expire(requestId),
-        resolveParentChannelId: (sessionId) => {
-          const session = discordSurfaceStore?.getSession(sessionId);
-          return session ? session.parent_channel_id : undefined;
-        },
-      });
-
-      logger.info("Bus agent runner started", {
-        subscriptionId: subId(subscriptionPrefix, "agent-runner"),
-        cwd: canonicalWorkspaceRoot,
-      });
-
-      if (restartSnapshot) {
-        await restoreGracefulSnapshot(restartSnapshot).catch((e: unknown) => {
-          logger.error("Failed to restore graceful restart snapshot", e);
-        });
-      }
-
-      workflowEngine = new WorkflowEngine({
-        bus,
-        store: durableWorkflowStore,
-        dataDir: env.dataDir,
-        subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
-        validateAgentSelection: async ({ profile, model, reasoning }) => {
-          const cfg = await getCoreConfig();
-          const resolved = resolveAgentRunModel({
-            cfg,
-            runProfile: profile,
-            ...(model ? { requestModelOverride: model } : {}),
-            ...(reasoning ? { reasoningOverride: reasoning } : {}),
+        if (restartLoad.state === "stale") {
+          logger.warn("Graceful restart snapshot discarded (stale)", {
+            createdAt: restartLoad.createdAt,
+            ageMs: restartLoad.ageMs,
+            deadlineMs: restartLoad.deadlineMs,
           });
-          return {
-            model: resolved.head.spec,
-            reasoning: resolved.head.reasoning ?? null,
-            request: toDurableResolvedModelPlan(resolved, cfg.agent.reasoningDisplay),
-          };
-        },
-        resolveAgentFallbacks: async ({ profile, model, reasoning }) => {
-          const cfg = await getCoreConfig();
-          return resolveAgentRunModelFallbacks({
-            cfg,
-            runProfile: profile,
-            ...(model ? { requestModelOverride: model } : {}),
-            ...(reasoning ? { reasoningOverride: reasoning } : {}),
-          }).map((fallback) => toDurableResolvedModelRequest(fallback, cfg.agent.reasoningDisplay));
-        },
-      });
-      await workflowEngine.start();
+        }
 
-      logger.info("Unified workflow engine started", {
-        subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
-      });
-
-      stopHeartbeat = await startHeartbeatService({
-        bus,
-        subscriptionId: subId(subscriptionPrefix, "heartbeat"),
-        initialExternalState: initialHeartbeatExternalState,
-      });
-
-      logger.info("Heartbeat service started", {
-        subscriptionId: subId(subscriptionPrefix, "heartbeat"),
-      });
-
-      if (conversationThreadSummarizationRunner) {
-        stopConversationThreadWorker = startConversationThreadWorker({
-          runner: conversationThreadSummarizationRunner,
-          getConfig: () => getCoreConfig(),
+        const recoverableRootParentRequestIds =
+          restartSnapshot?.agent
+            .filter(
+              (entry) =>
+                entry.kind === "active" &&
+                !isHeartbeatSessionId(entry.sessionId) &&
+                !isWorkflowAgentRecoveryEntry(entry),
+            )
+            .map((entry) => entry.requestId) ?? [];
+        const remainingSnapshotProtectionMs = restartSnapshot
+          ? Math.max(1, restartSnapshot.createdAt + restartSnapshot.deadlineMs - Date.now())
+          : GRACEFUL_SNAPSHOT_TTL_MS;
+        await workflowLiveParentBridge.enableOrphanHandling({
+          protectedParentRequestIds: recoverableRootParentRequestIds,
+          protectionMs: remainingSnapshotProtectionMs,
         });
-        logger.info("Conversation thread worker started");
-      }
 
-      runtimeFullyStarted = routerSubscriptionHealthy;
+        // Start agent runner last so it can't publish replies before relay is online.
+        stopAgentRunner = await startBusAgentRunner({
+          bus,
+          subscriptionId: subId(subscriptionPrefix, "agent-runner"),
+          reportFatalPanic: reportFatalError,
+          pluginManager,
+          customCommands,
+          cwd: canonicalWorkspaceRoot,
+          transcriptStore: transcriptStore ?? undefined,
+          conversationThreads: conversationThreadToolService,
+          toolResultArtifacts,
+          workflowLiveParentBridge,
+          workflowSubagentDispatcher,
+          durableWorkflowStore,
+          issueControlCapability: async (input) => {
+            let origin = requestMessageCache?.getOrigin(input.requestId);
+            for (let attempt = 0; !origin && attempt < 20; attempt += 1) {
+              await Bun.sleep(5);
+              origin = requestMessageCache?.getOrigin(input.requestId);
+            }
+            const originPrincipal =
+              origin?.actorUserId &&
+              origin.sessionId === input.sessionId &&
+              origin.platform === input.requestClient
+                ? { platform: origin.platform, userId: origin.actorUserId }
+                : null;
+            const policy = {
+              kind: "primary",
+              requestId: input.requestId,
+              sessionId: input.sessionId,
+              platform: input.requestClient,
+              principal: input.principal ?? originPrincipal,
+              allowedCallables: null,
+              profile: input.profile,
+              canonicalCwd: input.canonicalCwd,
+              safetyMode: input.safetyMode,
+              expiresAt: input.expiresAt,
+            } as const;
+            return {
+              capability: requestControlAuthority.issue(policy),
+              principal: policy.principal,
+            };
+          },
+          issueHeartbeatCapability: (input) =>
+            requestControlAuthority.issue({
+              kind: "heartbeat",
+              requestId: input.requestId,
+              sessionId: input.sessionId,
+              platform: input.requestClient,
+              principal: null,
+              allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
+              profile: "primary",
+              canonicalCwd: input.canonicalCwd,
+              safetyMode: "trusted",
+              expiresAt: input.expiresAt,
+            }),
+          expireControlCapability: (requestId) => requestControlAuthority.expire(requestId),
+          resolveParentChannelId: (sessionId) => {
+            const session = discordSurfaceStore?.getSession(sessionId);
+            return session ? session.parent_channel_id : undefined;
+          },
+        });
 
-      logger.info(
-        `Core runtime started (tool-server port=${toolServerPort}, subscriptionPrefix=${subscriptionPrefix})`,
-      );
-    } catch (e) {
-      const msg = opaqueErrorMessage(e, "Opaque core runtime startup failure");
-      logger.error(`Core runtime start failed: ${msg}`, { error: msg });
-      if (isPanic(e)) {
-        await stop(e);
-        throw e;
-      }
-      await stop();
-      throw e;
+        logger.info("Bus agent runner started", {
+          subscriptionId: subId(subscriptionPrefix, "agent-runner"),
+          cwd: canonicalWorkspaceRoot,
+        });
+
+        if (restartSnapshot) {
+          const restored = await Result.tryPromise({
+            try: () => restoreGracefulSnapshot(restartSnapshot),
+            catch: projectRuntimeError("Graceful restart snapshot restore failed"),
+          });
+          if (restored.status === "error") {
+            if (isPanic(restored.error)) return { kind: "panic", panic: restored.error };
+            logger.error("Failed to restore graceful restart snapshot", {
+              error: restored.error.message,
+            });
+          }
+        }
+
+        workflowEngine = new WorkflowEngine({
+          bus,
+          store: durableWorkflowStore,
+          dataDir: env.dataDir,
+          subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
+          reportFatalPanic: reportFatalError,
+          validateAgentSelection: async ({ profile, model, reasoning }) => {
+            const cfg = await getCoreConfig();
+            const resolved = resolveAgentRunModel({
+              cfg,
+              runProfile: profile,
+              ...(model ? { requestModelOverride: model } : {}),
+              ...(reasoning ? { reasoningOverride: reasoning } : {}),
+            });
+            return {
+              model: resolved.head.spec,
+              reasoning: resolved.head.reasoning ?? null,
+              request: toDurableResolvedModelPlan(resolved, cfg.agent.reasoningDisplay),
+            };
+          },
+          resolveAgentFallbacks: async ({ profile, model, reasoning }) => {
+            const cfg = await getCoreConfig();
+            return resolveAgentRunModelFallbacks({
+              cfg,
+              runProfile: profile,
+              ...(model ? { requestModelOverride: model } : {}),
+              ...(reasoning ? { reasoningOverride: reasoning } : {}),
+            }).map((fallback) =>
+              toDurableResolvedModelRequest(fallback, cfg.agent.reasoningDisplay),
+            );
+          },
+        });
+        await workflowEngine.start();
+
+        logger.info("Unified workflow engine started", {
+          subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
+        });
+
+        const heartbeatStarted = await startHeartbeatServiceResult({
+          bus,
+          subscriptionId: subId(subscriptionPrefix, "heartbeat"),
+          initialExternalState: initialHeartbeatExternalState,
+        });
+        if (heartbeatStarted.status === "error") {
+          return {
+            kind: "result",
+            result: Result.err(
+              new CoreRuntimeStartFailed({
+                operation: "heartbeat",
+                cause: heartbeatStarted.error,
+                message: "Core runtime heartbeat startup failed",
+              }),
+            ),
+          };
+        }
+        stopHeartbeat = heartbeatStarted.value;
+
+        logger.info("Heartbeat service started", {
+          subscriptionId: subId(subscriptionPrefix, "heartbeat"),
+        });
+
+        if (conversationThreadSummarizationRunner) {
+          stopConversationThreadWorker = startConversationThreadWorker({
+            runner: conversationThreadSummarizationRunner,
+            getConfig: () => getCoreConfig(),
+          });
+          logger.info("Conversation thread worker started");
+        }
+
+        runtimeFullyStarted = routerSubscriptionHealthy;
+
+        logger.info(
+          `Core runtime started (tool-server port=${toolServerPort}, subscriptionPrefix=${subscriptionPrefix})`,
+        );
+        return { kind: "result", result: Result.ok(undefined) };
+      },
+      catch: projectRuntimeError("Core runtime startup failed"),
+    });
+    let outcome: CoreRuntimeStartOutcome;
+    if (startup.status === "ok") {
+      outcome = startup.value;
+    } else if (isPanic(startup.error)) {
+      outcome = { kind: "panic", panic: startup.error };
+    } else {
+      outcome = {
+        kind: "result",
+        result: Result.err(
+          new CoreRuntimeStartFailed({
+            operation: "startup",
+            cause: startup.error,
+            message: startup.error.message,
+          }),
+        ),
+      };
     }
+    if (outcome.kind === "panic") {
+      logger.error("Core runtime start failed with Panic");
+      await stop(outcome.panic);
+      return outcome;
+    }
+    if (outcome.result.status === "ok") return outcome;
+    logger.error("Core runtime start failed", {
+      ...formatTaggedErrorForLog(outcome.result.error),
+    });
+    await stop();
+    return outcome;
   }
 
   async function stop(priorPanic: Panic | null = null): Promise<void> {
@@ -1769,7 +2038,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
       });
       stopGithubWebhook = null;
 
-      await safe("graceful.heartbeat.stop", () => stopHeartbeat?.stop() ?? Promise.resolve());
+      const gracefulHeartbeat = stopHeartbeat;
+      await cleanup.runOutcome(
+        "graceful.heartbeat.stop",
+        gracefulHeartbeat ? () => gracefulHeartbeat.stopOutcome() : undefined,
+      );
       stopHeartbeat = null;
 
       await safe(
@@ -1826,7 +2099,7 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
             return;
           }
 
-          logger.info("Saved graceful restart snapshot", {
+          logGracefulRestartSnapshotSaved(logger, {
             drainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
             snapshotTtlMs: GRACEFUL_SNAPSHOT_TTL_MS,
             agentEntries: agentRecoverables.length,
@@ -1863,7 +2136,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
       () => stopConversationThreadSummarizationWorker?.stop() ?? Promise.resolve(),
     );
     conversationThreadSummarizationRunner = null;
-    await safe("heartbeat.stop", () => stopHeartbeat?.stop() ?? Promise.resolve());
+    const heartbeat = stopHeartbeat;
+    await cleanup.runOutcome(
+      "heartbeat.stop",
+      heartbeat ? () => heartbeat.stopOutcome() : undefined,
+    );
     await safe(
       "workflowTriggerScheduler.stop",
       () => workflowTriggerScheduler?.stop() ?? Promise.resolve(),
@@ -1953,7 +2230,11 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
     runtimeFullyStarted = false;
 
     if (cleanup.failures.length > 0) {
-      logger.error({ stopErrors: cleanup.failures });
+      for (const failure of cleanup.failures) {
+        logger.error(
+          `Core runtime cleanup failed [${failure.label}]${failure.panic ? " (panic)" : ""}: ${failure.error}`,
+        );
+      }
     }
 
     cleanup.finish();
@@ -1961,10 +2242,13 @@ export async function createCoreRuntime(opts: CoreRuntimeOptions): Promise<CoreR
   }
 
   return {
-    start,
-    stop,
-    recordUnhandledRejection(reason: unknown) {
-      toolServer?.recordUnhandledRejection(reason);
-    },
+    kind: "result",
+    result: Result.ok({
+      start,
+      stop,
+      recordUnhandledRejection(reason: Error) {
+        toolServer?.recordUnhandledRejection(reason);
+      },
+    }),
   };
 }

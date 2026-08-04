@@ -1,4 +1,4 @@
-import { workflowStoreValue } from "./workflow-store-test-helpers";
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { MalformedSerialization } from "@stanley2058/lilac-utils";
@@ -12,7 +12,6 @@ import {
   WORKFLOW_RUNTIME_VERSION,
 } from "../../src/workflow/workflow-definition";
 import {
-  normalizeWorkflowResourcePolicy,
   type WorkflowOperation,
   type WorkflowRevision,
   type WorkflowRun,

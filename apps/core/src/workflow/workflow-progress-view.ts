@@ -1,5 +1,6 @@
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
 import type { SurfaceAction, SurfacePlatform } from "../surface/types";
-import { signalDurableWorkflowReadErrorToHost } from "./durable-workflow-store";
 import type {
   DurableWorkflowStore,
   WorkflowOperationProgressSummary,
@@ -50,6 +51,14 @@ export type WorkflowProgressView = {
   manualReconciliationRequired: boolean;
   sensitive: boolean;
 };
+
+export class WorkflowProgressViewFailed extends TaggedError("WorkflowProgressViewFailed")<{
+  readonly message: string;
+}> {}
+
+function workflowProgressViewFailure(message: string): WorkflowProgressViewFailed {
+  return new WorkflowProgressViewFailed({ message });
+}
 
 function schemaContainsSensitive(value: JsonValue): boolean {
   if (value === null || typeof value !== "object") return false;
@@ -171,26 +180,38 @@ function summarizePhases(
   return [...phases.values()];
 }
 
-export async function buildWorkflowProgressView(input: {
+export async function buildWorkflowProgressViewResult(input: {
   store: DurableWorkflowStore;
   runId: string;
   now?: number;
-}): Promise<WorkflowProgressView> {
+}): Promise<ResultType<WorkflowProgressView, WorkflowProgressViewFailed>> {
   const runResult = input.store.getRun(input.runId);
-  if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
+  if (runResult.status === "error") {
+    return Result.err(workflowProgressViewFailure(runResult.error.message));
+  }
   const run = runResult.value;
-  if (!run) throw new Error(`Workflow run not found: ${input.runId}`);
+  if (!run)
+    return Result.err(workflowProgressViewFailure(`Workflow run not found: ${input.runId}`));
   const revisionResult = input.store.getRevision(run.revisionId);
-  if (revisionResult.status === "error") signalDurableWorkflowReadErrorToHost(revisionResult.error);
+  if (revisionResult.status === "error") {
+    return Result.err(workflowProgressViewFailure(revisionResult.error.message));
+  }
   const revision = revisionResult.value;
-  if (!revision) throw new Error(`Workflow revision not found: ${run.revisionId}`);
+  if (!revision) {
+    return Result.err(
+      workflowProgressViewFailure(`Workflow revision not found: ${run.revisionId}`),
+    );
+  }
   const operationSummaries = input.store.summarizeMeaningfulOperations(run.runId);
   const recentOperationsResult = input.store.listRecentMeaningfulOperations(run.runId, 5);
-  if (recentOperationsResult.status === "error")
-    signalDurableWorkflowReadErrorToHost(recentOperationsResult.error);
+  if (recentOperationsResult.status === "error") {
+    return Result.err(workflowProgressViewFailure(recentOperationsResult.error.message));
+  }
   const recentOperations = recentOperationsResult.value;
   const triggerResult = input.store.getTriggerByLastRunId(run.runId);
-  if (triggerResult.status === "error") signalDurableWorkflowReadErrorToHost(triggerResult.error);
+  if (triggerResult.status === "error") {
+    return Result.err(workflowProgressViewFailure(triggerResult.error.message));
+  }
   const trigger = triggerResult.value;
   const sensitive = schemaContainsSensitive(run.inputSchemaSnapshot);
   const progress = emptyCounts();
@@ -203,37 +224,39 @@ export async function buildWorkflowProgressView(input: {
     { runId: run.runId, state: "claimed", matchKind: "sleep", limit: 5 },
   ] satisfies Parameters<DurableWorkflowStore["listWaits"]>[0][]) {
     const listed = input.store.listWaits(options);
-    if (listed.status === "error") signalDurableWorkflowReadErrorToHost(listed.error);
+    if (listed.status === "error") {
+      return Result.err(workflowProgressViewFailure(listed.error.message));
+    }
     waits.push(...listed.value);
   }
-  const renderedWaits = waits
-    .sort((left, right) => left.createdAt - right.createdAt)
-    .map((wait): WorkflowProgressWait => {
-      const operationResult = input.store.getOperation(run.runId, wait.operationId);
-      if (operationResult.status === "error")
-        signalDurableWorkflowReadErrorToHost(operationResult.error);
-      const operation = operationResult.value;
-      let prompt: string;
-      switch (wait.match.kind) {
-        case "reply":
-          prompt = sensitive ? "Waiting for your reply" : (operation?.label ?? "Waiting for reply");
-          break;
-        case "sleep":
-          prompt = sensitive ? "Waiting" : (operation?.label ?? "Waiting");
-          break;
-      }
-      return {
-        kind: wait.match.kind,
-        prompt,
-        dueAt: wait.dueAt,
-        deadlineAt: wait.deadlineAt,
-        requiresReplyToMessage: wait.match.kind === "reply" && wait.match.messageId !== null,
-        isCurrentChannel:
-          wait.match.kind === "reply" &&
-          run.progressTarget?.platform === wait.match.platform &&
-          run.progressTarget.channelId === wait.match.channelId,
-      };
+  const renderedWaits: WorkflowProgressWait[] = [];
+  for (const wait of waits.sort((left, right) => left.createdAt - right.createdAt)) {
+    const operationResult = input.store.getOperation(run.runId, wait.operationId);
+    if (operationResult.status === "error") {
+      return Result.err(workflowProgressViewFailure(operationResult.error.message));
+    }
+    const operation = operationResult.value;
+    let prompt: string;
+    switch (wait.match.kind) {
+      case "reply":
+        prompt = sensitive ? "Waiting for your reply" : (operation?.label ?? "Waiting for reply");
+        break;
+      case "sleep":
+        prompt = sensitive ? "Waiting" : (operation?.label ?? "Waiting");
+        break;
+    }
+    renderedWaits.push({
+      kind: wait.match.kind,
+      prompt,
+      dueAt: wait.dueAt,
+      deadlineAt: wait.deadlineAt,
+      requiresReplyToMessage: wait.match.kind === "reply" && wait.match.messageId !== null,
+      isCurrentChannel:
+        wait.match.kind === "reply" &&
+        run.progressTarget?.platform === wait.match.platform &&
+        run.progressTarget.channelId === wait.match.channelId,
     });
+  }
   const visibleOperations = recentOperations.map(({ label, phase, kind, state }) => ({
     label: sensitive ? null : label,
     phase: sensitive ? null : phase,
@@ -244,7 +267,7 @@ export async function buildWorkflowProgressView(input: {
   const end = run.terminalAt ?? input.now ?? Date.now();
   const manualReconciliationRequired =
     input.store.getManualReconciliationDetail(run.runId) !== null;
-  return {
+  return Result.ok({
     run,
     revision,
     elapsedMs: Math.max(0, end - (run.startedAt ?? run.createdAt)),
@@ -265,7 +288,7 @@ export async function buildWorkflowProgressView(input: {
     availableActions: availableActions({ run, manualReconciliationRequired }),
     manualReconciliationRequired,
     sensitive,
-  };
+  });
 }
 
 function actionLabel(kind: WorkflowSurfaceActionKind): string {

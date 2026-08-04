@@ -6,7 +6,6 @@ import {
   decodeToolPlugin,
   decodeToolPluginInstance,
   isPluginPanic,
-  opaquePluginExceptionMessage,
   safePluginExceptionCause,
   type Level1ToolSpecCapabilitySnapshot,
   type ServerToolCapabilitySnapshot,
@@ -118,25 +117,17 @@ export type ToolPluginManagerOptions<
 type PluginManagerHookExceptionParams = {
   hook: ToolPluginManagerHookError["hook"];
   pluginId?: string;
-  cause: unknown;
+  cause: Error;
 };
 
 export function mapPluginManagerHookException(
-  params: PluginManagerHookExceptionParams & { cause: Panic },
-): never;
-export function mapPluginManagerHookException(
-  params: PluginManagerHookExceptionParams,
-): ToolPluginManagerHookError;
-export function mapPluginManagerHookException(
   params: PluginManagerHookExceptionParams,
 ): ToolPluginManagerHookError {
-  if (isPluginPanic(params.cause)) throw params.cause;
-  const detail = opaquePluginExceptionMessage(params.cause);
   return new ToolPluginManagerHookError({
     hook: params.hook,
     pluginId: params.pluginId,
-    cause: safePluginExceptionCause(params.cause),
-    message: `Plugin manager ${params.hook} failed${params.pluginId ? ` for '${params.pluginId}'` : ""}: ${detail}`,
+    cause: params.cause,
+    message: `Plugin manager ${params.hook} failed${params.pluginId ? ` for '${params.pluginId}'` : ""}: ${params.cause.message}`,
   });
 }
 
@@ -144,12 +135,31 @@ async function captureManagerHook<T>(params: {
   hook: ToolPluginManagerHookError["hook"];
   pluginId?: string;
   run: () => Promise<T> | T;
-}): Promise<ResultType<T, ToolPluginManagerHookError>> {
+}): Promise<ResultType<T, ToolPluginManagerHookError>>;
+async function captureManagerHook<TInput, TOutput, E>(params: {
+  hook: ToolPluginManagerHookError["hook"];
+  pluginId?: string;
+  run: () => Promise<TInput> | TInput;
+  continueWith: (
+    value: Awaited<TInput>,
+  ) => Promise<ResultType<TOutput, E>> | ResultType<TOutput, E>;
+}): Promise<ResultType<TOutput, ToolPluginManagerHookError | E>>;
+async function captureManagerHook<TInput, TOutput = TInput, E = never>(params: {
+  hook: ToolPluginManagerHookError["hook"];
+  pluginId?: string;
+  run: () => Promise<TInput> | TInput;
+  continueWith?: (
+    value: Awaited<TInput>,
+  ) => Promise<ResultType<TOutput, E>> | ResultType<TOutput, E>;
+}): Promise<ResultType<Awaited<TInput> | TOutput, ToolPluginManagerHookError | E>> {
   try {
-    return Result.ok(await params.run());
+    const value = await params.run();
+    return params.continueWith ? await params.continueWith(value) : Result.ok(value);
   } catch (cause) {
     if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapPluginManagerHookException({ ...params, cause }));
+    return Result.err(
+      mapPluginManagerHookException({ ...params, cause: safePluginExceptionCause(cause) }),
+    );
   }
 }
 
@@ -196,6 +206,18 @@ function appendCleanup(
     });
   }
   return combineOperationAndCleanup(error, cleanup);
+}
+
+function cleanupRejectionError<TCause>(pluginId: string, cause: TCause): ToolPluginCapabilityError {
+  const safeCause = safePluginExceptionCause(cause);
+  const message = `Plugin manager adaptLevel2Item failed for '${pluginId}': ${safeCause.message}`;
+  return new ToolPluginCapabilityError({
+    capability: "hook_result",
+    pluginId,
+    issues: [message],
+    cause: safeCause,
+    message,
+  });
 }
 
 export class ToolPluginManager<
@@ -496,22 +518,30 @@ export class ToolPluginManager<
       return Result.ok({ kind: "disabled", pluginId });
     }
 
-    const config = await this.resolvePluginConfig(pluginId);
-    if (config.status === "error") return config;
-    const createContext: ToolPluginCreateContext<TRuntimeContext> = {
-      runtime: this.options.runtime,
-      dataDir: this.options.dataDir,
-      pluginConfig: config.value,
-      source: params.source,
-      pluginDir: params.pluginDir,
-      entrypointPath: params.entrypointPath,
-      logger: this.options.logger,
+    const createWithConfig = <TPluginConfig>(pluginConfig: TPluginConfig) => {
+      const createContext: ToolPluginCreateContext<TRuntimeContext> = {
+        runtime: this.options.runtime,
+        dataDir: this.options.dataDir,
+        pluginConfig,
+        source: params.source,
+        pluginDir: params.pluginDir,
+        entrypointPath: params.entrypointPath,
+        logger: this.options.logger,
+      };
+      return invokeToolPluginCreate({
+        capability: params.plugin,
+        context: createContext,
+        source: params.source,
+      });
     };
-    const created = await invokeToolPluginCreate({
-      capability: params.plugin,
-      context: createContext,
-      source: params.source,
-    });
+    const created = this.options.getPluginConfig
+      ? await captureManagerHook({
+          hook: "getPluginConfig",
+          pluginId,
+          run: () => this.options.getPluginConfig!(pluginId),
+          continueWith: createWithConfig,
+        })
+      : await createWithConfig(undefined);
     if (created.status === "error") {
       if (created.error._tag === "ToolPluginSkipped") {
         return Result.ok({ kind: "skipped", pluginId, reason: created.error.reason });
@@ -766,18 +796,14 @@ export class ToolPluginManager<
         mapPluginManagerHookException({
           hook: "adaptLevel2Item",
           pluginId: params.plugin.pluginId,
-          cause: registered.reason,
+          cause: safePluginExceptionCause(registered.reason),
         }),
       );
     }
 
     const [cleanup] = await Promise.allSettled([this.destroyLoaded([...loaded, params.plugin])]);
     await this.reportCleanupFailureAfterPanic(params.plugin.pluginId, cleanup);
-    return mapPluginManagerHookException({
-      hook: "adaptLevel2Item",
-      pluginId: params.plugin.pluginId,
-      cause: registered.reason,
-    });
+    throw registered.reason;
   }
 
   private async reportCleanupFailureAfterPanic(
@@ -794,10 +820,10 @@ export class ToolPluginManager<
     }
     await Promise.allSettled([
       Promise.resolve().then(() =>
-        Reflect.apply(report, this.options.logger, [
-          "Plugin cleanup failed after operation Panic",
-          { pluginId, detail },
-        ]),
+        report.call(this.options.logger, "Plugin cleanup failed after operation Panic", {
+          pluginId,
+          detail,
+        }),
       ),
     ]);
   }
@@ -812,17 +838,6 @@ export class ToolPluginManager<
     });
     if (resolved.status === "error") return resolved;
     return decodeDisabledPluginIds(resolved.value);
-  }
-
-  private async resolvePluginConfig(
-    pluginId: string,
-  ): Promise<ResultType<unknown, ToolPluginManagerHookError>> {
-    if (!this.options.getPluginConfig) return Result.ok(undefined);
-    return captureManagerHook({
-      hook: "getPluginConfig",
-      pluginId,
-      run: () => this.options.getPluginConfig!(pluginId),
-    });
   }
 
   private async destroyInstance(
@@ -850,20 +865,7 @@ export class ToolPluginManager<
     ]);
     if (settled.status === "rejected") {
       if (!isPluginPanic(settled.reason)) {
-        const mapped = mapPluginManagerHookException({
-          hook: "adaptLevel2Item",
-          pluginId,
-          cause: settled.reason,
-        });
-        state.failures.push(
-          new ToolPluginCapabilityError({
-            capability: "hook_result",
-            pluginId,
-            issues: [mapped.message],
-            cause: mapped.cause,
-            message: mapped.message,
-          }),
-        );
+        state.failures.push(cleanupRejectionError(pluginId, settled.reason));
         return;
       }
       if (state.panic === undefined) state.panic = settled.reason;
@@ -889,20 +891,7 @@ export class ToolPluginManager<
       ]);
       if (settled.status === "rejected") {
         if (!isPluginPanic(settled.reason)) {
-          const mapped = mapPluginManagerHookException({
-            hook: "adaptLevel2Item",
-            pluginId,
-            cause: settled.reason,
-          });
-          state.failures.push(
-            new ToolPluginCapabilityError({
-              capability: "hook_result",
-              pluginId,
-              issues: [mapped.message],
-              cause: mapped.cause,
-              message: mapped.message,
-            }),
-          );
+          state.failures.push(cleanupRejectionError(pluginId, settled.reason));
           continue;
         }
         if (state.panic === undefined) state.panic = settled.reason;
@@ -914,7 +903,7 @@ export class ToolPluginManager<
 
   private finishCleanup(state: CleanupState): ResultType<void, ToolPluginCleanupError> {
     if (state.panic !== undefined) {
-      return mapPluginManagerHookException({ hook: "adaptLevel2Item", cause: state.panic });
+      throw state.panic;
     }
     return state.failures.length === 0 ? Result.ok() : Result.err(cleanupError(state.failures));
   }

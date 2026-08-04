@@ -10,12 +10,14 @@ import {
   type EditFileResult,
   type BundledRemoteRunnerRequest,
 } from "@stanley2058/lilac-fs";
+import { Result } from "better-result";
 
-import { applyHunks, parsePatch } from "../../tools/apply-patch/apply-patch-core";
+import { applyHunks, parsePatchResult } from "../../tools/apply-patch/apply-patch-core";
 import {
   bundledRemoteRunnerErrorMessage,
   rethrowBundledRemoteRunnerPanic,
 } from "./bundled-runner-failure";
+import { opaqueErrorCause } from "./remote-runner-utils";
 
 type ReadTextRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.read_text" }>;
 type ReadBytesRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.read_bytes" }>;
@@ -151,54 +153,63 @@ async function opEdit(input: EditRequest["input"], fsTool: FileSystem): Promise<
   return normalizeEditOutput(editRes);
 }
 
-async function opApplyPatch(
-  input: ApplyPatchRequest["input"],
-  denyPaths: readonly string[],
-): Promise<string> {
-  const hunks = parsePatch(input.patchText);
-  return await applyHunks(process.cwd(), hunks, { denyPaths });
+async function opApplyPatch(input: ApplyPatchRequest["input"], denyPaths: readonly string[]) {
+  const parsed = parsePatchResult(input.patchText);
+  if (parsed.status === "error") return parsed;
+  return Result.ok(await applyHunks(process.cwd(), parsed.value, { denyPaths }));
 }
 
 function readTextFromStdin(): string {
   return fssync.readFileSync(0, "utf8");
 }
 
-async function main(): Promise<void> {
-  try {
-    const parsed = decodeBundledRemoteRunnerRequestJson(readTextFromStdin());
-    if (parsed.status === "error") {
-      fail(parsed.error);
+async function runRequest(): Promise<void> {
+  const parsed = decodeBundledRemoteRunnerRequestJson(readTextFromStdin());
+  if (parsed.status === "error") {
+    fail(parsed.error);
+    return;
+  }
+  const request = parsed.value;
+  const denyPaths = request.denyPaths;
+
+  const fsTool = new FileSystem(process.cwd(), { denyPaths });
+
+  switch (request.op) {
+    case "fs.read_text":
+      ok(await opReadText(request.input, fsTool));
+      return;
+    case "fs.read_bytes":
+      ok(await opReadBytes(request.input, fsTool));
+      return;
+    case "fs.glob":
+      ok(await opGlob(request.input, fsTool));
+      return;
+    case "fs.grep":
+      ok(await opGrep(request.input, fsTool));
+      return;
+    case "fs.edit":
+      ok(await opEdit(request.input, fsTool));
+      return;
+    case "apply_patch": {
+      const applied = await opApplyPatch(request.input, denyPaths);
+      if (applied.status === "error") {
+        fail(applied.error);
+        return;
+      }
+      ok(applied.value);
       return;
     }
-    const request = parsed.value;
-    const denyPaths = request.denyPaths;
-
-    const fsTool = new FileSystem(process.cwd(), { denyPaths });
-
-    switch (request.op) {
-      case "fs.read_text":
-        ok(await opReadText(request.input, fsTool));
-        return;
-      case "fs.read_bytes":
-        ok(await opReadBytes(request.input, fsTool));
-        return;
-      case "fs.glob":
-        ok(await opGlob(request.input, fsTool));
-        return;
-      case "fs.grep":
-        ok(await opGrep(request.input, fsTool));
-        return;
-      case "fs.edit":
-        ok(await opEdit(request.input, fsTool));
-        return;
-      case "apply_patch":
-        ok(await opApplyPatch(request.input, denyPaths));
-        return;
-    }
-  } catch (e) {
-    rethrowBundledRemoteRunnerPanic(e);
-    fail({ message: bundledRemoteRunnerErrorMessage(e) });
   }
+}
+
+async function main(): Promise<void> {
+  const executed = await Result.tryPromise({
+    try: runRequest,
+    catch: opaqueErrorCause("Opaque bundled remote runner failure"),
+  });
+  if (executed.status === "ok") return;
+  const error = rethrowBundledRemoteRunnerPanic(executed.error);
+  fail({ message: bundledRemoteRunnerErrorMessage(error) });
 }
 
 main();

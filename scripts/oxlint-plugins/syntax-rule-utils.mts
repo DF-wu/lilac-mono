@@ -68,7 +68,7 @@ function objectLiteralPath(object: ts.ObjectLiteralExpression): string | undefin
   return undefined;
 }
 
-function functionMemberPath(node: ts.FunctionLikeDeclaration): string | undefined {
+function rawFunctionMemberPath(node: ts.FunctionLikeDeclaration): string | undefined {
   const parent = node.parent;
   if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) return parent.name.text;
   if (ts.isPropertyDeclaration(parent)) return propertyNameText(parent.name);
@@ -79,7 +79,95 @@ function functionMemberPath(node: ts.FunctionLikeDeclaration): string | undefine
       : undefined;
     return property && owner ? `${owner}.${property}` : property;
   }
-  return undefined;
+  if (ts.isCallExpression(parent)) {
+    const argumentIndex = parent.arguments.indexOf(node as ts.Expression);
+    const expression = parent.expression;
+    const called = ts.isIdentifier(expression)
+      ? expression.text
+      : ts.isPropertyAccessExpression(expression)
+        ? expression.name.text
+        : undefined;
+    if (argumentIndex >= 0 && called) return `${called}.<callback@${argumentIndex + 1}>`;
+  }
+  let owner: ts.Node | undefined = parent;
+  while (
+    owner &&
+    (ts.isCallExpression(owner) ||
+      ts.isPropertyAccessExpression(owner) ||
+      ts.isElementAccessExpression(owner) ||
+      ts.isParenthesizedExpression(owner))
+  ) {
+    owner = owner.parent;
+  }
+  if (owner && ts.isVariableDeclaration(owner) && ts.isIdentifier(owner.name)) {
+    return `${owner.name.text}.<callback>`;
+  }
+  return "<callback>";
+}
+
+function rawContainingSymbol(node: ts.Node): string {
+  const segments: string[] = [];
+  let current: ts.Node | undefined = node.parent;
+  while (current) {
+    if (ts.isMethodDeclaration(current) || ts.isGetAccessor(current) || ts.isSetAccessor(current)) {
+      segments.push(propertyNameText(current.name) ?? "<computed-method>");
+    } else if (ts.isConstructorDeclaration(current)) {
+      segments.push("constructor");
+    } else if (ts.isFunctionDeclaration(current) && current.name) {
+      segments.push(current.name.text);
+    } else if (ts.isFunctionExpression(current) || ts.isArrowFunction(current)) {
+      const member = rawFunctionMemberPath(current);
+      if (member) segments.push(member);
+    } else if (ts.isClassDeclaration(current) && current.name) {
+      segments.push(current.name.text);
+    } else if (ts.isClassExpression(current)) {
+      const name = classExpressionName(current);
+      if (name) segments.push(name);
+    }
+    current = current.parent;
+  }
+  return segments.reverse().join(".") || "<module>";
+}
+
+const DISAMBIGUATED_FUNCTION_MEMBERS = new WeakMap<
+  ts.SourceFile,
+  ReadonlyMap<ts.FunctionExpression | ts.ArrowFunction, string>
+>();
+
+function disambiguatedFunctionMembers(
+  sourceFile: ts.SourceFile,
+): ReadonlyMap<ts.FunctionExpression | ts.ArrowFunction, string> {
+  const cached = DISAMBIGUATED_FUNCTION_MEMBERS.get(sourceFile);
+  if (cached) return cached;
+  const groups = new Map<string, (ts.FunctionExpression | ts.ArrowFunction)[]>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+      const key = rawContainingSymbol(node.body);
+      const group = groups.get(key) ?? [];
+      group.push(node);
+      groups.set(key, group);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  const members = new Map<ts.FunctionExpression | ts.ArrowFunction, string>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.forEach((node, index) => {
+      members.set(node, `${rawFunctionMemberPath(node) ?? "<callback>"}@${index + 1}`);
+    });
+  }
+  DISAMBIGUATED_FUNCTION_MEMBERS.set(sourceFile, members);
+  return members;
+}
+
+function functionMemberPath(node: ts.FunctionLikeDeclaration): string | undefined {
+  if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+    return (
+      disambiguatedFunctionMembers(node.getSourceFile()).get(node) ?? rawFunctionMemberPath(node)
+    );
+  }
+  return rawFunctionMemberPath(node);
 }
 
 function classExpressionName(node: ts.ClassExpression): string | undefined {
@@ -143,6 +231,7 @@ export function createFinding<Kind extends string>(
   node: ts.Node,
   kind: Kind,
   message: string,
+  owner: ts.Node = node,
 ): SyntacticFinding<Kind> {
   const identity = sourceIdentity(filePath);
   const location = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
@@ -153,7 +242,7 @@ export function createFinding<Kind extends string>(
     kind,
     message,
     module: identity.module,
-    symbol: containingSymbol(node),
+    symbol: containingSymbol(owner),
     workspace: identity.workspace,
   };
 }

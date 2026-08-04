@@ -1,11 +1,13 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
 import { env } from "./env";
-import { errorMessage, isRecord } from "./runtime-utils";
+import { errorMessage, isPanic, isRecord } from "./runtime-utils";
 import { findWorkspaceRoot } from "./find-root";
 import { createLogger } from "./logging";
-import { parseModelSpecifier } from "./model-capability";
+import { parseModelSpecifierResult } from "./model-capability";
 import {
   formatModelProviderOptionWarning,
   validateConfiguredModelProviderOptions,
@@ -16,24 +18,27 @@ import {
   promptWorkspaceSignature,
 } from "./agent-prompts";
 import {
-  V1CoreConfigParser,
   coreConfigInputSchemaV1,
   coreConfigSchema,
+  decodeCoreConfigV1,
+  decodeCoreConfigV1ToUniversal,
   parseCoreConfigV1,
   parseCoreConfigV1ToUniversal,
+  type CoreConfigV1Invalid,
 } from "./core-config/v1";
 import {
   CURRENT_CORE_CONFIG_VERSION,
   DEFAULT_CORE_CONFIG_VERSION,
   SUPPORTED_CORE_CONFIG_VERSIONS,
-  V2CoreConfigParser,
   coreConfigInputSchemaV2,
+  decodeCoreConfigV2,
+  decodeCoreConfigV2ToUniversal,
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
+  type CoreConfigV2Invalid,
 } from "./core-config/v2";
 import { formatCoreConfigKeyPath } from "./core-config/unknown-keys";
 import type {
-  ConfigParser,
   CoreConfig,
   CoreConfigModelOptionWarning,
   CoreConfigParseOptions,
@@ -47,6 +52,10 @@ export {
   coreConfigInputSchemaV1,
   coreConfigSchema,
   coreConfigInputSchemaV2,
+  decodeCoreConfigV1,
+  decodeCoreConfigV1ToUniversal,
+  decodeCoreConfigV2,
+  decodeCoreConfigV2ToUniversal,
   parseCoreConfigV1,
   parseCoreConfigV1ToUniversal,
   parseCoreConfigV2,
@@ -72,13 +81,6 @@ export type {
   UniversalCoreConfig,
 } from "./core-config/types";
 
-const CORE_CONFIG_PARSERS: ReadonlyMap<CoreConfigVersion, ConfigParser> = new Map<
-  CoreConfigVersion,
-  ConfigParser
->([
-  [1, new V1CoreConfigParser()],
-  [2, new V2CoreConfigParser()],
-]);
 const logger = createLogger({ module: "core-config" });
 
 export function getDiscordUserAliasValue(alias: DiscordUserAliasConfig | undefined): {
@@ -156,26 +158,61 @@ async function ensureDataDirSeeded() {
   await seedCoreConfig({ overwrite: false });
 }
 
-function safeParseYaml(raw: string): unknown {
+export class CoreConfigYamlInvalid extends TaggedError("CoreConfigYamlInvalid")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export function decodeCoreConfigYaml(raw: string): ResultType<unknown, CoreConfigYamlInvalid> {
   try {
-    return Bun.YAML.parse(raw) as unknown;
-  } catch (e) {
-    const msg = errorMessage(e);
-    throw new Error(`Failed to parse core-config.yaml: ${msg}`);
+    return Result.ok(Bun.YAML.parse(raw));
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new CoreConfigYamlInvalid({
+        cause,
+        message: `Failed to parse core-config.yaml: ${errorMessage(cause)}`,
+      }),
+    );
   }
 }
 
-export function readCoreConfigVersion(raw: unknown): CoreConfigVersion {
-  if (!isRecord(raw)) return DEFAULT_CORE_CONFIG_VERSION;
+export class CoreConfigVersionInvalid extends TaggedError("CoreConfigVersionInvalid")<{
+  readonly version: string;
+  readonly message: string;
+}> {}
+
+export class CoreConfigMustBeObject extends TaggedError("CoreConfigMustBeObject")<{
+  readonly message: string;
+}> {}
+
+export function readCoreConfigVersionResult(
+  raw: unknown,
+): ResultType<CoreConfigVersion, CoreConfigVersionInvalid> {
+  if (!isRecord(raw)) return Result.ok(DEFAULT_CORE_CONFIG_VERSION);
 
   const version = raw.configVersion;
-  if (version === undefined || version === null) return DEFAULT_CORE_CONFIG_VERSION;
-
-  if (version === 1 || version === CURRENT_CORE_CONFIG_VERSION) return version;
-
-  throw new Error(
-    `Unsupported core config version: ${String(version)} (supported: ${SUPPORTED_CORE_CONFIG_VERSIONS.join(", ")})`,
+  if (version === undefined || version === null) return Result.ok(DEFAULT_CORE_CONFIG_VERSION);
+  if (version === 1 || version === CURRENT_CORE_CONFIG_VERSION) return Result.ok(version);
+  const versionDescription =
+    typeof version === "string" ||
+    typeof version === "number" ||
+    typeof version === "boolean" ||
+    typeof version === "bigint"
+      ? String(version)
+      : "<non-scalar>";
+  return Result.err(
+    new CoreConfigVersionInvalid({
+      version: versionDescription,
+      message: `Unsupported core config version: ${versionDescription} (supported: ${SUPPORTED_CORE_CONFIG_VERSIONS.join(", ")})`,
+    }),
   );
+}
+
+export function readCoreConfigVersion(raw: unknown): CoreConfigVersion {
+  const result = readCoreConfigVersionResult(raw);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
 }
 
 function reportConfiguredModelOptionWarnings(
@@ -187,7 +224,9 @@ function reportConfiguredModelOptionWarnings(
     const modelSpec = model.includes("/") ? model : cfg.models.def[model]?.model;
     if (!modelSpec?.includes("/")) return;
 
-    const provider = parseModelSpecifier(modelSpec).provider;
+    const parsedModel = parseModelSpecifierResult(modelSpec);
+    if (parsedModel.status === "error") return;
+    const provider = parsedModel.value.provider;
     for (const warning of validateConfiguredModelProviderOptions(provider, options)) {
       report(warning, source);
     }
@@ -216,21 +255,17 @@ function reportConfiguredModelOptionWarnings(
   }
 }
 
-export async function parseCoreConfig(
+export function parseCoreConfigResult(
   raw: unknown,
   options?: CoreConfigParseOptions,
-): Promise<CoreConfig> {
-  const version = readCoreConfigVersion(raw);
-  const parser = CORE_CONFIG_PARSERS.get(version);
-
-  if (!parser) {
-    throw new Error(
-      `Unsupported core config version: ${String(version)} (supported: ${SUPPORTED_CORE_CONFIG_VERSIONS.join(", ")})`,
-    );
-  }
-
+): ResultType<
+  CoreConfig,
+  CoreConfigVersionInvalid | CoreConfigMustBeObject | CoreConfigV1Invalid | CoreConfigV2Invalid
+> {
+  const version = readCoreConfigVersionResult(raw);
+  if (version.status === "error") return Result.err(version.error);
   if (!isRecord(raw)) {
-    throw new Error("Core config must be an object");
+    return Result.err(new CoreConfigMustBeObject({ message: "Core config must be an object" }));
   }
 
   const onUnknownKey =
@@ -238,16 +273,47 @@ export async function parseCoreConfig(
     ((path) => {
       logger.warn("unknown core-config key ignored", {
         path: formatCoreConfigKeyPath(path),
-        parserVersion: version,
+        parserVersion: version.value,
       });
     });
 
-  const cfg = await parser.parse(raw, { onUnknownKey });
+  const parsed =
+    version.value === 1
+      ? decodeCoreConfigV1ToUniversal(raw, { onUnknownKey })
+      : decodeCoreConfigV2ToUniversal(raw, { onUnknownKey });
+  if (parsed.status === "error") return Result.err(parsed.error);
+  const cfg = parsed.value;
   const onUnknownModelOption =
     options?.onUnknownModelOption ??
     ((warning, source) => logger.warn(formatModelProviderOptionWarning(warning, source)));
   reportConfiguredModelOptionWarnings(cfg, onUnknownModelOption);
-  return cfg;
+  return Result.ok(cfg);
+}
+
+export async function parseCoreConfig(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): Promise<CoreConfig> {
+  const result = parseCoreConfigResult(raw, options);
+  if (result.status === "error") throw projectLegacyCoreConfigFailure(result.error);
+  return result.value;
+}
+
+function projectLegacyCoreConfigFailure(
+  error:
+    | CoreConfigVersionInvalid
+    | CoreConfigMustBeObject
+    | CoreConfigV1Invalid
+    | CoreConfigV2Invalid,
+): Error {
+  switch (error._tag) {
+    case "CoreConfigV1Invalid":
+    case "CoreConfigV2Invalid":
+      return error.cause;
+    case "CoreConfigVersionInvalid":
+    case "CoreConfigMustBeObject":
+      return new Error(error.message);
+  }
 }
 
 async function listPromptTemplateNewFiles(promptDir: string): Promise<string[]> {
@@ -302,14 +368,18 @@ export async function getCoreConfig(options?: {
       ) {
         return cached;
       }
-    } catch {
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
       // If stat/signature fails, fall through to re-read to produce a better error.
     }
   }
 
   const raw = await Bun.file(filePath).text();
-  const parsed = safeParseYaml(raw);
-  const cfg = await parseCoreConfig(parsed);
+  const decoded = decodeCoreConfigYaml(raw);
+  if (decoded.status === "error") throw new Error(decoded.error.message);
+  const parsed = parseCoreConfigResult(decoded.value);
+  if (parsed.status === "error") throw projectLegacyCoreConfigFailure(parsed.error);
+  const cfg = parsed.value;
 
   // Always use file-based system prompt (data/prompts/*).
   // This also ensures missing files are created from templates.
@@ -329,14 +399,16 @@ export async function getCoreConfig(options?: {
   try {
     const stat = await Bun.file(filePath).stat();
     cachedMtimeMs = stat.mtimeMs;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     cachedMtimeMs = null;
   }
 
   try {
     const sig = await promptWorkspaceSignature();
     cachedPromptMaxMtimeMs = sig.maxMtimeMs;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     cachedPromptMaxMtimeMs = null;
   }
 
@@ -360,12 +432,28 @@ export function resolveDiscoveryDbPath(): string {
 }
 
 export function resolveDiscordToken(cfg: CoreConfig): string {
+  const result = resolveDiscordTokenResult(cfg);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
+
+export class DiscordTokenMissing extends TaggedError("DiscordTokenMissing")<{
+  readonly environmentVariable: string;
+  readonly message: string;
+}> {}
+
+export function resolveDiscordTokenResult(
+  cfg: CoreConfig,
+): ResultType<string, DiscordTokenMissing> {
   const key = cfg.surface.discord.tokenEnv;
   const value = process.env[key];
   if (!value) {
-    throw new Error(
-      `Discord token missing: env var ${key} is not set (set it or change surface.discord.tokenEnv in core-config.yaml)`,
+    return Result.err(
+      new DiscordTokenMissing({
+        environmentVariable: key,
+        message: `Discord token missing: env var ${key} is not set (set it or change surface.discord.tokenEnv in core-config.yaml)`,
+      }),
     );
   }
-  return value;
+  return Result.ok(value);
 }

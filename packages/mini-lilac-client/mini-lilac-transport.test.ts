@@ -1,7 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import type { UIMessageChunk } from "ai";
+import { Panic } from "better-result";
 
-import { MiniLilacCompactionCancelledError, MiniLilacTransport } from "./mini-lilac-transport";
+import {
+  MiniLilacBoundaryInvalid,
+  MiniLilacCompactionAndCleanupFailed,
+  MiniLilacCompactionCancelledError,
+  MiniLilacExternalOperationFailed,
+  MiniLilacHttpError,
+  MiniLilacRequestCancelled,
+  MiniLilacStreamCleanupFailed,
+  MiniLilacStreamDecodeFailed,
+  MiniLilacTransport,
+} from "./mini-lilac-transport";
 import {
   MINI_LILAC_UNSUPPORTED_UI_MESSAGE_CHUNK_TYPE,
   type MiniLilacStreamCursorChunk,
@@ -23,6 +34,25 @@ function jsonResponse(value: unknown): Response {
 function eventStreamResponse(chunks: readonly unknown[]): Response {
   const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
   return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+}
+
+function openEventStreamResponse(
+  chunks: readonly unknown[],
+  onCancel: () => void | Promise<void>,
+): { readonly response: Response; readonly body: ReadableStream<Uint8Array> } {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(
+        encoder.encode(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")),
+      );
+    },
+    cancel: onCancel,
+  });
+  return {
+    response: new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+    body,
+  };
 }
 
 function cursor(seq: number, runId = "run-1"): MiniLilacStreamCursorChunk {
@@ -175,6 +205,79 @@ describe("MiniLilacTransport", () => {
     }
   });
 
+  it("returns owned boundary and HTTP failures without changing legacy rejections", async () => {
+    const malformed = new MiniLilacTransport({
+      fetch: mockFetch(async () => jsonResponse({ revision: -1, todos: [] })),
+    });
+    const decoded = await malformed.getTodosResult("session-1");
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "ok") throw new Error("expected boundary failure");
+    expect(decoded.error).toBeInstanceOf(MiniLilacBoundaryInvalid);
+    if (decoded.error._tag !== "MiniLilacBoundaryInvalid") {
+      throw new Error("expected boundary error variant");
+    }
+    expect(decoded.error.issues.length).toBeGreaterThan(0);
+    await expect(malformed.getTodos("session-1")).rejects.toBeInstanceOf(
+      decoded.error.cause.constructor,
+    );
+
+    const unavailable = new MiniLilacTransport({
+      fetch: mockFetch(async () => new Response("temporarily unavailable", { status: 503 })),
+    });
+    const requested = await unavailable.getTodosResult("session-1");
+    expect(requested.status).toBe("error");
+    if (requested.status === "ok") throw new Error("expected HTTP failure");
+    expect(requested.error).toBeInstanceOf(MiniLilacHttpError);
+    expect(requested.error).toMatchObject({ status: 503, detail: "temporarily unavailable" });
+    await expect(unavailable.getTodos("session-1")).rejects.toThrow(
+      "MiniLilac request failed (503): temporarily unavailable",
+    );
+  });
+
+  it("returns external and cancellation failures while preserving their original causes", async () => {
+    const networkCause = new Error("network unavailable");
+    const failed = new MiniLilacTransport({
+      fetch: mockFetch(async () => Promise.reject(networkCause)),
+    });
+    const networkResult = await failed.getTodosResult("session-1");
+    expect(networkResult.status).toBe("error");
+    if (networkResult.status === "ok") throw new Error("expected network failure");
+    expect(networkResult.error).toBeInstanceOf(MiniLilacExternalOperationFailed);
+    expect(networkResult.error.cause).toBe(networkCause);
+    await expect(failed.getTodos("session-1")).rejects.toBe(networkCause);
+
+    const controller = new AbortController();
+    const abortCause = new Error("caller detached");
+    controller.abort(abortCause);
+    const cancelled = new MiniLilacTransport({
+      fetch: mockFetch(async (_input, init) => {
+        const signal = init?.signal;
+        return Promise.reject(signal instanceof AbortSignal ? signal.reason : abortCause);
+      }),
+    });
+    const cancellationResult = await cancelled.getTodosResult("session-1", {
+      signal: controller.signal,
+    });
+    expect(cancellationResult.status).toBe("error");
+    if (cancellationResult.status === "ok") throw new Error("expected cancellation");
+    expect(cancellationResult.error).toBeInstanceOf(MiniLilacRequestCancelled);
+    expect(cancellationResult.error.cause).toBe(abortCause);
+    await expect(cancelled.getTodos("session-1", { signal: controller.signal })).rejects.toBe(
+      abortCause,
+    );
+  });
+
+  it("preserves Panic exactly across external Result capture", async () => {
+    const panic = new Panic({ message: "fetch invariant failed" });
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => {
+        throw panic;
+      }),
+    });
+
+    await expect(transport.getTodosResult("session-1")).rejects.toBe(panic);
+  });
+
   it("lists only the server-filtered sessions for an encoded cwd", async () => {
     const calls: FetchCall[] = [];
     const session = {
@@ -296,6 +399,167 @@ describe("MiniLilacTransport", () => {
       if (stream === null) throw new Error("expected active session stream");
       await expect(stream.getReader().read()).rejects.toThrow();
     }
+  });
+
+  it("emits one terminal Err and closes a Result stream for malformed SSE and chunks", async () => {
+    const responses = [
+      new Response('data: {"type":\n\n', {
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+      sseResponse([{ type: "text-delta", id: "answer" }]),
+    ];
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => {
+        const response = responses.shift();
+        if (response === undefined) throw new Error("missing malformed stream fixture");
+        return response;
+      }),
+    });
+
+    for (let index = 0; index < 2; index += 1) {
+      const admitted = await transport.streamSessionResult("session-1");
+      if (admitted.status === "error" || admitted.value === null) {
+        throw new Error("expected admitted Result stream");
+      }
+      const reader = admitted.value.getReader();
+      const terminal = await reader.read();
+      expect(terminal.done).toBe(false);
+      if (terminal.done || terminal.value.status === "ok") {
+        throw new Error("expected terminal stream error");
+      }
+      expect(terminal.value.error).toBeInstanceOf(MiniLilacStreamDecodeFailed);
+      expect((await reader.read()).done).toBe(true);
+    }
+  });
+
+  it("turns a response-body failure into one terminal Err while legacy streams still reject", async () => {
+    const resultSource = erroringSseResponse([{ type: "text-start", id: "text-1" }]);
+    const legacySource = erroringSseResponse([{ type: "text-start", id: "text-1" }]);
+    const responses = [resultSource.response, legacySource.response];
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => {
+        const response = responses.shift();
+        if (response === undefined) throw new Error("missing body failure fixture");
+        return response;
+      }),
+    });
+
+    const admitted = await transport.streamSessionResult("session-1");
+    if (admitted.status === "error" || admitted.value === null) {
+      throw new Error("expected admitted Result stream");
+    }
+    const resultReader = admitted.value.getReader();
+    const first = await resultReader.read();
+    expect(first.value).toMatchObject({
+      status: "ok",
+      value: { type: "text-start", id: "text-1" },
+    });
+    const resultCause = new Error("result body failed");
+    resultSource.fail(resultCause);
+    const terminal = await resultReader.read();
+    if (terminal.done || terminal.value.status === "ok") {
+      throw new Error("expected terminal body failure");
+    }
+    expect(terminal.value.error).toBeInstanceOf(MiniLilacExternalOperationFailed);
+    expect(terminal.value.error.cause).toBe(resultCause);
+    expect((await resultReader.read()).done).toBe(true);
+
+    const legacy = await transport.streamSession("session-1");
+    if (legacy === null) throw new Error("expected legacy stream");
+    const legacyReader = legacy.getReader();
+    await legacyReader.read();
+    const legacyCause = new Error("legacy body failed");
+    legacySource.fail(legacyCause);
+    await expect(legacyReader.read()).rejects.toBe(legacyCause);
+  });
+
+  it("uses only the owned signal reason for stream cancellation", async () => {
+    let fetchCalls = 0;
+    const preAborted = new AbortController();
+    const preAbortReason = new Error("pre-aborted");
+    preAborted.abort(preAbortReason);
+    const preAbortedTransport = new MiniLilacTransport({
+      fetch: mockFetch(async () => {
+        fetchCalls += 1;
+        return sseResponse([]);
+      }),
+    });
+
+    const preAbortedResult = await preAbortedTransport.streamSessionResult("session-1", {
+      signal: preAborted.signal,
+    });
+    expect(preAbortedResult.status).toBe("error");
+    if (preAbortedResult.status === "ok") throw new Error("expected pre-aborted request");
+    expect(preAbortedResult.error).toBeInstanceOf(MiniLilacRequestCancelled);
+    expect(preAbortedResult.error.cause).toBe(preAbortReason);
+    expect(fetchCalls).toBe(0);
+    await expect(
+      preAbortedTransport.streamSession("session-1", { signal: preAborted.signal }),
+    ).rejects.toBe(preAbortReason);
+    expect(fetchCalls).toBe(0);
+
+    const controller = new AbortController();
+    let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        bodyController = streamController;
+      },
+    });
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(
+        async () => new Response(body, { headers: { "Content-Type": "text/event-stream" } }),
+      ),
+    });
+    const admitted = await transport.streamSessionResult("session-1", {
+      signal: controller.signal,
+    });
+    if (admitted.status === "error" || admitted.value === null) {
+      throw new Error("expected admitted cancellation stream");
+    }
+    const reader = admitted.value.getReader();
+    const pending = reader.read();
+    const unrelated = new Error("socket failed concurrently");
+    controller.abort(new Error("caller aborted"));
+    if (bodyController === undefined) throw new Error("expected response body controller");
+    bodyController.error(unrelated);
+    const terminal = await pending;
+    if (terminal.done || terminal.value.status === "ok") {
+      throw new Error("expected terminal concurrent failure");
+    }
+    expect(terminal.value.error).toBeInstanceOf(MiniLilacExternalOperationFailed);
+    expect(terminal.value.error.cause).toBe(unrelated);
+
+    const ownedController = new AbortController();
+    let ownedBodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const ownedBody = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        ownedBodyController = streamController;
+      },
+    });
+    const ownedTransport = new MiniLilacTransport({
+      fetch: mockFetch(
+        async () => new Response(ownedBody, { headers: { "Content-Type": "text/event-stream" } }),
+      ),
+    });
+    const ownedAdmission = await ownedTransport.streamSessionResult("session-1", {
+      signal: ownedController.signal,
+    });
+    if (ownedAdmission.status === "error" || ownedAdmission.value === null) {
+      throw new Error("expected admitted owned cancellation stream");
+    }
+    const ownedReader = ownedAdmission.value.getReader();
+    const ownedPending = ownedReader.read();
+    const ownedReason = new Error("owned cancellation");
+    ownedController.abort(ownedReason);
+    if (ownedBodyController === undefined) throw new Error("expected owned body controller");
+    ownedBodyController.error(ownedReason);
+    const ownedTerminal = await ownedPending;
+    if (ownedTerminal.done || ownedTerminal.value.status === "ok") {
+      throw new Error("expected terminal owned cancellation");
+    }
+    expect(ownedTerminal.value.error).toBeInstanceOf(MiniLilacRequestCancelled);
+    expect(ownedTerminal.value.error.cause).toBe(ownedReason);
+    expect((await ownedReader.read()).done).toBe(true);
   });
 
   it("lists profile-aware skills for an encoded cwd", async () => {
@@ -985,6 +1249,193 @@ describe("MiniLilacTransport", () => {
     await expect(
       transport.compact({ sessionId: "session-1", clientCommandId: "compact-command" }),
     ).rejects.toBeInstanceOf(MiniLilacCompactionCancelledError);
+
+    const result = await transport.compactResult({
+      sessionId: "session-1",
+      clientCommandId: "compact-command",
+    });
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected cancelled compaction");
+    expect(result.error).toBeInstanceOf(MiniLilacCompactionCancelledError);
+  });
+
+  it("preserves Panic thrown by compaction callbacks", async () => {
+    const panic = new Panic({ message: "renderer invariant failed" });
+    let cancelled = false;
+    const source = openEventStreamResponse(
+      [
+        {
+          type: "data-compaction",
+          data: {
+            source: "manual",
+            reason: "manual",
+            phase: "started",
+            messageCountBefore: 4,
+          },
+        },
+      ],
+      () => {
+        cancelled = true;
+      },
+    );
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => source.response),
+    });
+
+    await expect(
+      transport.compactResult(
+        { sessionId: "session-1", clientCommandId: "compact-command" },
+        {
+          onEvent() {
+            throw panic;
+          },
+        },
+      ),
+    ).rejects.toBe(panic);
+    expect(cancelled).toBe(true);
+    expect(source.body.locked).toBe(false);
+  });
+
+  it("returns ordinary compaction callback failures as Err and preserves legacy identity", async () => {
+    const callbackFailure = new Error("observer unavailable");
+    const event = {
+      type: "data-compaction",
+      data: {
+        source: "manual",
+        reason: "manual",
+        phase: "started",
+        messageCountBefore: 4,
+      },
+    };
+    const resultSource = openEventStreamResponse([event], () => {});
+    const legacySource = openEventStreamResponse([event], () => {});
+    const responses = [resultSource.response, legacySource.response];
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => {
+        const response = responses.shift();
+        if (response === undefined) throw new Error("missing callback failure fixture");
+        return response;
+      }),
+    });
+    const options = {
+      onEvent() {
+        throw callbackFailure;
+      },
+    };
+
+    const result = await transport.compactResult(
+      { sessionId: "session-1", clientCommandId: "compact-callback-result" },
+      options,
+    );
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected callback failure");
+    expect(result.error).toBeInstanceOf(MiniLilacExternalOperationFailed);
+    if (result.error._tag !== "MiniLilacExternalOperationFailed") {
+      throw new Error("expected external callback failure");
+    }
+    expect(result.error.cause).toBe(callbackFailure);
+    expect(resultSource.body.locked).toBe(false);
+
+    await expect(
+      transport.compact(
+        { sessionId: "session-1", clientCommandId: "compact-callback-legacy" },
+        options,
+      ),
+    ).rejects.toBe(callbackFailure);
+    expect(legacySource.body.locked).toBe(false);
+  });
+
+  it("returns cleanup-only and combined compaction failures with full reader cleanup", async () => {
+    const cleanupOnlyCause = new Error("cleanup-only detach failed");
+    const cleanupOnly = openEventStreamResponse(
+      [
+        {
+          type: "data-compaction",
+          data: {
+            source: "manual",
+            reason: "manual",
+            phase: "completed",
+            outcome: "compacted",
+            messageCountBefore: 8,
+            messageCountAfter: 3,
+          },
+        },
+      ],
+      () => Promise.reject(cleanupOnlyCause),
+    );
+    const combinedCause = new Error("combined detach failed");
+    const combined = openEventStreamResponse(
+      [
+        {
+          type: "data-compaction",
+          data: {
+            source: "manual",
+            reason: "manual",
+            phase: "failed",
+            messageCountBefore: 8,
+            error: "summary failed",
+          },
+        },
+      ],
+      () => Promise.reject(combinedCause),
+    );
+    const responses = [cleanupOnly.response, combined.response];
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => {
+        const response = responses.shift();
+        if (response === undefined) throw new Error("missing compaction cleanup fixture");
+        return response;
+      }),
+    });
+
+    const cleanupOnlyResult = await transport.compactResult({
+      sessionId: "session-1",
+      clientCommandId: "compact-cleanup-only",
+    });
+    expect(cleanupOnlyResult.status).toBe("error");
+    if (cleanupOnlyResult.status === "ok") throw new Error("expected cleanup-only failure");
+    expect(cleanupOnlyResult.error).toBeInstanceOf(MiniLilacStreamCleanupFailed);
+    expect(cleanupOnly.body.locked).toBe(false);
+
+    const combinedResult = await transport.compactResult({
+      sessionId: "session-1",
+      clientCommandId: "compact-combined",
+    });
+    expect(combinedResult.status).toBe("error");
+    if (combinedResult.status === "ok") throw new Error("expected combined failure");
+    expect(combinedResult.error).toBeInstanceOf(MiniLilacCompactionAndCleanupFailed);
+    expect(combined.body.locked).toBe(false);
+  });
+
+  it("preserves an exact cleanup Panic after releasing the compaction reader", async () => {
+    const cleanupPanic = new Panic({ message: "response cancellation invariant failed" });
+    const source = openEventStreamResponse(
+      [
+        {
+          type: "data-compaction",
+          data: {
+            source: "manual",
+            reason: "manual",
+            phase: "completed",
+            outcome: "compacted",
+            messageCountBefore: 5,
+            messageCountAfter: 2,
+          },
+        },
+      ],
+      () => Promise.reject(cleanupPanic),
+    );
+    const transport = new MiniLilacTransport({
+      fetch: mockFetch(async () => source.response),
+    });
+
+    await expect(
+      transport.compactResult({
+        sessionId: "session-1",
+        clientCommandId: "compact-cleanup-panic",
+      }),
+    ).rejects.toBe(cleanupPanic);
+    expect(source.body.locked).toBe(false);
   });
 
   it("cancels compaction through its own endpoint", async () => {

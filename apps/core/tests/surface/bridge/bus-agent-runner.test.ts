@@ -4,11 +4,12 @@ import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
-  buildCoreLineageManifestV1,
+  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
   createLilacBus,
+  decodeCorePrimaryLineageV1,
+  EventPublishTransportFailed,
   lilacEventTypes,
   outReqTopic,
-  parseCorePrimaryLineageV1,
   type CmdRequestMessageData,
   type CoreLineageManifestV1,
   type CorePrimaryLineageV1,
@@ -27,16 +28,18 @@ import {
 } from "@stanley2058/lilac-utils";
 import { jsonSchema, tool, type ModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   AiSdkPiAgent,
   attachAutoCompaction,
   ToolExpansion,
   buildSyntheticToolCallId,
   hashCanonicalMessagesV1,
+  RetryBackoffAborted,
   type AiSdkPiAgentOptions,
 } from "@stanley2058/lilac-agent";
 import {
+  ClaudeCodeRunExternalFailure,
   materializeClaudeCodeRun,
   type ClaudeNativeAttemptObservation,
   type ClaudeNativeSessionStart,
@@ -66,8 +69,11 @@ import {
   captureBusAgentRunnerOperation,
   createTransientModelRetryController,
   degradeCorePrimaryLineageForMutation,
+  formatBusAgentRunnerDrainFailureForLog,
+  formatClaudeLifecycleLogFields,
   formatAutoCompactionToolDisplay,
   formatUnknownErrorForDisplay,
+  resolveCoreClaudeCompactionSummaryModel,
   buildHeartbeatOverlayForRequest,
   buildAutoInjectedThreadSearchMessages,
   buildDeferredSubagentResultMessages,
@@ -106,6 +112,7 @@ import {
   resolveCoreStableNamedContinuation,
   rethrowBusAgentRunnerPanic,
   signalBusAgentRunnerHostFailure,
+  toIdleRetryDecision,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
   withBlankLineBetweenTextParts,
@@ -123,7 +130,15 @@ import {
   CustomCommandManager,
   type CustomCommandExecutionError,
 } from "../../../src/custom-commands/manager";
-import { createCorePrimaryClaudeRuntime } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+import { createCorePrimaryClaudeRuntime as createCorePrimaryClaudeRuntimeResult } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+
+function createCorePrimaryClaudeRuntime(
+  input: Parameters<typeof createCorePrimaryClaudeRuntimeResult>[0],
+) {
+  const created = createCorePrimaryClaudeRuntimeResult(input);
+  if (created.status === "error") throw created.error;
+  return created.value;
+}
 import {
   createCoreToolPluginManager,
   type BuiltLevel1Toolset,
@@ -131,7 +146,9 @@ import {
 } from "../../../src/plugins";
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
-  computeCorePrimaryClaudeTerminalHead,
+  computeCorePrimaryClaudeTerminalHead as computeCorePrimaryClaudeTerminalHeadResult,
+  type CoreClaudeAttemptMutationError,
+  type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
@@ -176,6 +193,49 @@ import {
 function transcriptResultValue<T, E>(result: ResultType<T, E>): T {
   if (result.status === "error") throw result.error;
   return result.value;
+}
+
+function computeCorePrimaryClaudeTerminalHead(
+  input: Parameters<typeof computeCorePrimaryClaudeTerminalHeadResult>[0],
+) {
+  return transcriptResultValue(computeCorePrimaryClaudeTerminalHeadResult(input));
+}
+
+function attemptMutationValue<T>(result: ResultType<T, CoreClaudeAttemptMutationError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptTransactionConflict":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function getPrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return bindingValue(store.getCorePrimaryClaudeSessionBinding(input));
+}
+
+function promotePrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["promoteCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return attemptMutationValue(store.promoteCorePrimaryClaudeSessionBinding(input));
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return transcriptResultValue(buildCoreLineageManifestResultV1(...args));
 }
 
 function getRequestTranscript(
@@ -356,6 +416,74 @@ function level1TextAndToolCallStep(text: string, call: { toolCallId: string; too
 function level1OfferedToolNames(options: { tools?: ReadonlyArray<{ name: string }> }): string[] {
   return (options.tools ?? []).map((entry) => entry.name);
 }
+
+describe("Claude lifecycle logging", () => {
+  it("redacts lifecycle detail and formats TaggedErrors without exposing causes", () => {
+    class LifecycleFailure extends TaggedError("LifecycleFailure")<{
+      readonly cause: unknown;
+      readonly message: string;
+    }> {}
+
+    const projected = formatClaudeLifecycleLogFields(
+      "candidate-finalization-failed",
+      {
+        requestId: "request-1",
+        detail: "token=sk-detail-secret",
+      },
+      new LifecycleFailure({
+        cause: { authorization: "Bearer cause-secret" },
+        message: "finalization failed token=sk-message-secret",
+      }),
+    );
+
+    expect(projected).toMatchObject({
+      lifecycle: "candidate-finalization-failed",
+      requestId: "request-1",
+      detail: "token=<redacted>",
+      errorTag: "LifecycleFailure",
+      errorMessage: "finalization failed token=<redacted>",
+    });
+    expect(projected).not.toHaveProperty("cause");
+    expect(JSON.stringify(projected)).not.toContain("cause-secret");
+    expect(JSON.stringify(projected)).not.toContain("sk-detail-secret");
+    expect(JSON.stringify(projected)).not.toContain("sk-message-secret");
+  });
+
+  it("serializes drain publication failures to JSONL without raw causes or stacks", () => {
+    const secret = "sk-drain-cause-secret";
+    const cause = new Error(`transport cause ${secret}`);
+    const failure = new EventPublishTransportFailed({
+      cause,
+      eventType: "evt.request.lifecycle.changed",
+      topic: "evt.request",
+      message: `publish failed token=${secret}`,
+    });
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const logger = createLogger({
+      module: "bus-agent-runner-drain-test",
+      outputFormat: "jsonl",
+      stdout: output,
+      stderr: output,
+    });
+
+    logger.error(
+      "drainSessionQueue failed",
+      formatBusAgentRunnerDrainFailureForLog(failure, {
+        sessionId: "session-1",
+        requestId: "request-1",
+      }),
+    );
+
+    const serialized = chunks.join("");
+    expect(serialized).toContain('"errorTag":"EventPublishTransportFailed"');
+    expect(serialized).toContain('"errorMessage":"publish failed token=<redacted>"');
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain("transport cause");
+    expect(serialized).not.toContain('"cause"');
+    expect(serialized).not.toContain('"stack"');
+  });
+});
 
 describe("runner Level 1 catalog selection", () => {
   it("applies persisted initial selection by stable ID and omits unavailable selected rows", () => {
@@ -1524,15 +1652,19 @@ describe("subagent model selection", () => {
       },
     };
 
-    expect(() =>
-      assertWorkflowDispatchPolicy(policy, { profile: "general", depth: 1 }),
-    ).not.toThrow();
-    expect(() =>
-      assertWorkflowDispatchPolicy(
-        { ...policy, reasoning: "medium" },
-        { profile: "general", depth: 1, reasoning: "low" },
-      ),
-    ).toThrow("reasoning does not match the approved operation policy");
+    expect(assertWorkflowDispatchPolicy(policy, { profile: "general", depth: 1 }).status).toBe(
+      "ok",
+    );
+    const mismatch = assertWorkflowDispatchPolicy(
+      { ...policy, reasoning: "medium" },
+      { profile: "general", depth: 1, reasoning: "low" },
+    );
+    expect(mismatch.status).toBe("error");
+    if (mismatch.status === "error") {
+      expect(mismatch.error.message).toContain(
+        "reasoning does not match the approved operation policy",
+      );
+    }
   });
 
   it("accepts only the exact durable stable-named identity", () => {
@@ -1562,38 +1694,62 @@ describe("subagent model selection", () => {
       },
     };
 
-    expect(
-      resolveCoreStableNamedContinuation({
-        runProfile: "general",
-        sessionId: "sub:channel:named:audit",
-        workflowPolicy: policy,
-      }),
-    ).toEqual(policy.stableNamedContinuation);
-    expect(
-      resolveCoreStableNamedContinuation({
-        runProfile: "general",
-        sessionId: "sub:channel:named:generated",
-        workflowPolicy: { ...policy, stableNamedContinuation: undefined },
-      }),
-    ).toBeNull();
-    expect(() =>
-      resolveCoreStableNamedContinuation({
-        runProfile: "general",
-        sessionId: "sub:channel:named:other",
-        workflowPolicy: policy,
-      }),
-    ).toThrow("does not match the child session");
-    expect(() =>
-      resolveCoreStableNamedContinuation({
-        runProfile: "primary",
-        sessionId: "sub:channel:named:audit",
-        workflowPolicy: policy,
-      }),
-    ).toThrow("cannot authorize a primary run");
+    const exact = resolveCoreStableNamedContinuation({
+      runProfile: "general",
+      sessionId: "sub:channel:named:audit",
+      workflowPolicy: policy,
+    });
+    expect(exact.status).toBe("ok");
+    if (exact.status === "ok") expect(exact.value).toEqual(policy.stableNamedContinuation);
+    const absent = resolveCoreStableNamedContinuation({
+      runProfile: "general",
+      sessionId: "sub:channel:named:generated",
+      workflowPolicy: { ...policy, stableNamedContinuation: undefined },
+    });
+    expect(absent.status).toBe("ok");
+    if (absent.status === "ok") expect(absent.value).toBeNull();
+    const mismatchedSession = resolveCoreStableNamedContinuation({
+      runProfile: "general",
+      sessionId: "sub:channel:named:other",
+      workflowPolicy: policy,
+    });
+    expect(mismatchedSession.status).toBe("error");
+    if (mismatchedSession.status === "error") {
+      expect(mismatchedSession.error.message).toContain("does not match the child session");
+    }
+    const primary = resolveCoreStableNamedContinuation({
+      runProfile: "primary",
+      sessionId: "sub:channel:named:audit",
+      workflowPolicy: policy,
+    });
+    expect(primary.status).toBe("error");
+    if (primary.status === "error") {
+      expect(primary.error.message).toContain("cannot authorize a primary run");
+    }
   });
 });
 
 describe("agent run activity", () => {
+  it("fails idle retry when the inner backoff Result is aborted", () => {
+    expect(
+      toIdleRetryDecision(
+        Result.err(
+          new RetryBackoffAborted({
+            cause: new Error("aborted"),
+            message: "Retry backoff was aborted",
+          }),
+        ),
+      ),
+    ).toEqual({ status: "fail", reason: "aborted" });
+  });
+
+  it("fails idle retry when the inner backoff Result exhausts its budget", () => {
+    expect(toIdleRetryDecision(Result.ok(null))).toEqual({
+      status: "fail",
+      reason: "exhausted",
+    });
+  });
+
   it("fails a wait after the configured idle interval", async () => {
     const timedOut: Error[] = [];
     const watchdog = createAgentRunIdleWatchdog({
@@ -1904,6 +2060,8 @@ describe("bus agent runner delivery policy", () => {
     const failure = new BusAgentRunnerOperationFailed({
       operation: "model callback",
       cause: ordinaryCause,
+      failureKind: "other",
+      displayMessage: ordinaryCause.message,
       message: ordinaryCause.message,
     });
     expect(() => signalBusAgentRunnerHostFailure(failure)).toThrow(ordinaryCause);
@@ -2944,7 +3102,7 @@ function corePrimaryTestPluginManager(): CoreToolPluginManager {
     getStatuses: () => [],
     getLevel2Tools: () => [],
     getLevel2ContributionInfo: () => new Map(),
-    buildLevel1Toolset: async () => toolset,
+    buildLevel1ToolsetResult: async () => Result.ok(toolset),
   };
 }
 
@@ -3218,8 +3376,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         return {
           agentModel: model,
           continuationModel: model,
+          createUtilityModelResult: () => Result.ok(model),
           createUtilityModel: () => model,
-          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
           nativeSession: {
             getObservation: observation,
             waitForObservation: async () => observation(),
@@ -3250,8 +3420,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
                     }
                   : null,
             }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
           },
           dispose: async () => {},
+          disposeResult: async () => Result.ok(),
         };
       },
     });
@@ -3332,7 +3506,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         messageId: firstOutput.messageId,
       })?.requestId,
     ).toBe(firstRequestId);
-    const firstBinding = store.getCorePrimaryClaudeSessionBinding({
+    const firstBinding = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3415,7 +3589,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     expect(JSON.stringify(modelPrompts[1])).not.toContain("detail-0");
     expect(JSON.stringify(modelPrompts[1])).not.toContain("related-thread");
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3498,8 +3672,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       return {
         agentModel: model,
         continuationModel: model,
+        createUtilityModelResult: () => Result.ok(model),
         createUtilityModel: () => model,
-        control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+        control: {
+          inject: () => false,
+          interrupt: async () => false,
+          async interruptResult() {
+            return Result.ok(await this.interrupt());
+          },
+          clear: () => {},
+          clearResult() {
+            this.clear();
+            return Result.ok();
+          },
+        },
         nativeSession: {
           getObservation: observation,
           waitForObservation: async () => {
@@ -3540,8 +3726,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
                   : null,
             };
           },
+          async finalizeResult() {
+            return Result.ok(await this.finalize());
+          },
         },
         dispose: async () => {},
+        disposeResult: async () => Result.ok(),
       };
     };
     const runner = await startBusAgentRunner({
@@ -3580,7 +3770,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       corePrimaryLineage: firstManifest,
     });
     await expect(firstLifecycle.terminal).resolves.toBe("resolved");
-    const firstBinding = store.getCorePrimaryClaudeSessionBinding({
+    const firstBinding = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3623,7 +3813,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       terminal: "resolved",
       details: [undefined, undefined],
     });
-    const secondBinding = store.getCorePrimaryClaudeSessionBinding({
+    const secondBinding = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3713,7 +3903,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       state: "cancelled",
     });
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3749,18 +3939,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
 
     const competitorRequestId = "primary-competitor";
     const competitorSessionId = crypto.randomUUID();
-    store.reserveCorePrimaryClaudeSessionAttempt({
-      providerId: "claude-code",
-      requestClient: "discord",
-      lilacSessionId: sessionId,
-      executionScopeHashVersion: 1,
-      executionScopeHash: secondBinding.executionScopeHash,
-      requestId: competitorRequestId,
-      attemptIndex: 0,
-      candidateSessionId: competitorSessionId,
-      sourceSessionId: secondBinding.claudeSessionId,
-      expectedBindingRevision: secondBinding.revision,
-    });
+    attemptMutationValue(
+      store.reserveCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        executionScopeHashVersion: 1,
+        executionScopeHash: secondBinding.executionScopeHash,
+        requestId: competitorRequestId,
+        attemptIndex: 0,
+        candidateSessionId: competitorSessionId,
+        sourceSessionId: secondBinding.claudeSessionId,
+        expectedBindingRevision: secondBinding.revision,
+      }),
+    );
     store.saveRequestTranscript({
       requestId: competitorRequestId,
       sessionId,
@@ -3798,7 +3990,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       lastReasoning: "provider-default",
     });
     expect(
-      store.promoteCorePrimaryClaudeSessionBinding({
+      promotePrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3809,7 +4001,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     releaseFinalization[1]!.resolve(undefined);
     await expect(raceLifecycle.terminal).resolves.toBe("resolved");
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3907,8 +4099,20 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         return {
           agentModel: failingModel,
           continuationModel: failingModel,
+          createUtilityModelResult: () => Result.ok(failingModel),
           createUtilityModel: () => failingModel,
-          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
           nativeSession: {
             getObservation: () => observation,
             waitForObservation: async () => observation,
@@ -3921,8 +4125,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
               sourcePreflight: null,
               sourceFinal: null,
             }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
           },
           dispose: async () => {},
+          disposeResult: async () => Result.ok(),
         };
       },
       createAgent: (options) => {
@@ -3955,7 +4163,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     expect(materializations).toBe(1);
     expect(switchedModels).toEqual([]);
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3971,6 +4179,34 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
 });
 
 describe("Core-primary local compaction replacement", () => {
+  it("falls back from an owned utility-model failure without calling the throwing adapter", () => {
+    const fallbackModel = new MockLanguageModelV4({ modelId: "fallback" });
+    let compatibilityCalls = 0;
+    const reported: ClaudeCodeRunExternalFailure[] = [];
+    const failure = new ClaudeCodeRunExternalFailure({
+      operation: "Claude utility model construction",
+      cause: new Error("construction failed"),
+      message: "Claude utility model construction failed",
+    });
+    const run = {
+      createUtilityModelResult: () => Result.err(failure),
+      createUtilityModel: () => {
+        compatibilityCalls += 1;
+        throw failure;
+      },
+    };
+
+    const model = resolveCoreClaudeCompactionSummaryModel({
+      run,
+      fallback: () => fallbackModel,
+      onFailure: (error) => reported.push(error),
+    });
+
+    expect(model).toBe(fallbackModel);
+    expect(reported).toEqual([failure]);
+    expect(compatibilityCalls).toBe(0);
+  });
+
   it("maps the current boundary and text-lowers retained mixed history in the fresh payload", async () => {
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
     const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
@@ -4086,8 +4322,20 @@ describe("Core-primary local compaction replacement", () => {
         return {
           agentModel: mainModel,
           continuationModel: mainModel,
+          createUtilityModelResult: () => Result.ok(summaryModel),
           createUtilityModel: () => summaryModel,
-          control: { inject: () => false, interrupt: async () => false, clear: () => {} },
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
           nativeSession: {
             getObservation: () => ({
               ...observation,
@@ -4108,9 +4356,16 @@ describe("Core-primary local compaction replacement", () => {
               sourcePreflight: null,
               sourceFinal: null,
             }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
           },
           dispose: async () => {
             if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
+          },
+          async disposeResult() {
+            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
+            return Result.ok();
           },
         };
       },
@@ -4377,7 +4632,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
     expect(synthetic.canonicalMessages).toHaveLength(2);
     expect(synthetic.atoms).toHaveLength(1);
     expect(synthetic.atoms[0]?.kind).toBe("synthetic");
-    expect(() => parseCorePrimaryLineageV1(first, [...sourceMessages, ...injected])).not.toThrow();
+    expect(decodeCorePrimaryLineageV1(first, [...sourceMessages, ...injected]).status).toBe("ok");
   });
 
   it("fails closed for missing, fresh-only, malformed, or unaligned source lineage", () => {

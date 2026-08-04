@@ -3,8 +3,14 @@ import path from "node:path";
 import ts from "typescript-codegen";
 
 import { createFingerprint, createFingerprintIdentity, relativeModulePath } from "./fingerprint.ts";
-import { PERSISTED_CODEC_FIXTURE_CASES } from "./manifest.ts";
+import { APPROVED_EXCEPTION_ADAPTER_CATALOG, PERSISTED_CODEC_FIXTURE_CASES } from "./manifest.ts";
+import {
+  CORE_FATAL_SIGNAL_IDENTITIES,
+  CORE_REVIEWED_PANIC_IDENTITIES,
+  PRECISE_EXCEPTION_IDENTITIES,
+} from "./precise-exception-identities.ts";
 import type {
+  ApprovedExceptionAdapter,
   CompatibilitySink,
   EventCodecRegistryRegistration,
   EventDeliveryApiRegistration,
@@ -26,6 +32,10 @@ import { isProductionFileName } from "./source-policy.ts";
 
 interface NodeIdentity extends SymbolIdentity {
   readonly symbolPath: string;
+}
+
+function symbolIdentityKey(identity: SymbolIdentity): string {
+  return `${identity.module}#${identity.exportName}`;
 }
 
 export interface WorkspacePackageRoot {
@@ -51,13 +61,22 @@ const RESULT_CAPTURE_MEMBERS = new Set(["try", "tryPromise"]);
 const MAX_TYPE_DEPTH = 6;
 const MAX_VISITED_PROPERTIES = 256;
 const MAX_PERSISTED_CODEC_PROPERTIES = 1024;
+const canonicalPathCache = new Map<string, string>();
+const declarationPackageCache = new WeakMap<
+  readonly WorkspacePackageRoot[],
+  Map<string, string | null>
+>();
 
 function normalizedPath(value: string): string {
   return value.split(path.sep).join("/");
 }
 
 function canonicalPath(value: string): string {
-  return normalizedPath(path.resolve(ts.sys.realpath?.(value) ?? value));
+  const cached = canonicalPathCache.get(value);
+  if (cached) return cached;
+  const canonical = normalizedPath(path.resolve(ts.sys.realpath?.(value) ?? value));
+  canonicalPathCache.set(value, canonical);
+  return canonical;
 }
 
 function isProductionSource(sourceFile: ts.SourceFile, workspaceRoot: string): boolean {
@@ -199,19 +218,35 @@ export function declarationPackageName(
   }
 
   const sourceFile = node.getSourceFile().fileName;
+  let packageCache = declarationPackageCache.get(packageRoots);
+  if (!packageCache) {
+    packageCache = new Map();
+    declarationPackageCache.set(packageRoots, packageCache);
+  }
+  const cached = packageCache.get(sourceFile);
+  if (cached !== undefined) return cached ?? undefined;
   const file = canonicalPath(sourceFile);
   const workspacePackage = packageRoots
     .map((candidate) => ({ ...candidate, root: canonicalPath(candidate.root) }))
     .sort((left, right) => right.root.length - left.root.length)
     .find((candidate) => file === candidate.root || file.startsWith(`${candidate.root}/`));
-  if (workspacePackage) return workspacePackage.packageName;
+  if (workspacePackage) {
+    packageCache.set(sourceFile, workspacePackage.packageName);
+    return workspacePackage.packageName;
+  }
 
   const marker = "/node_modules/";
   const index = file.lastIndexOf(marker);
-  if (index < 0) return undefined;
+  if (index < 0) {
+    packageCache.set(sourceFile, null);
+    return undefined;
+  }
   const packagePath = file.slice(index + marker.length).split("/");
-  if (packagePath[0]?.startsWith("@")) return packagePath.slice(0, 2).join("/");
-  return packagePath[0];
+  const packageName = packagePath[0]?.startsWith("@")
+    ? packagePath.slice(0, 2).join("/")
+    : packagePath[0];
+  packageCache.set(sourceFile, packageName ?? null);
+  return packageName;
 }
 
 function packageForSignature(
@@ -221,7 +256,21 @@ function packageForSignature(
   return declarationPackageName(signature?.declaration, packageRoots);
 }
 
-function callablePart(node: ts.Node): string | undefined {
+function objectLiteralPath(object: ts.ObjectLiteralExpression): string | undefined {
+  const parent = object.parent;
+  if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) return parent.name.text;
+  if (ts.isPropertyAssignment(parent)) {
+    const property = parent.name.getText();
+    const owner = ts.isObjectLiteralExpression(parent.parent)
+      ? objectLiteralPath(parent.parent)
+      : undefined;
+    return owner ? `${owner}.${property}` : property;
+  }
+  if (ts.isPropertyDeclaration(parent)) return parent.name.getText();
+  return undefined;
+}
+
+function rawCallablePart(node: ts.Node): string | undefined {
   if (ts.isClassDeclaration(node) || ts.isClassExpression(node))
     return node.name?.text ?? "<class>";
   if (ts.isFunctionDeclaration(node) && node.name) return node.name.text;
@@ -233,10 +282,82 @@ function callablePart(node: ts.Node): string | undefined {
     if (node.name) return node.name.text;
     if (ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name))
       return node.parent.name.text;
-    if (ts.isPropertyAssignment(node.parent)) return node.parent.name.getText();
+    if (ts.isPropertyDeclaration(node.parent)) return node.parent.name.getText();
+    if (ts.isPropertyAssignment(node.parent)) {
+      const property = node.parent.name.getText();
+      const owner = ts.isObjectLiteralExpression(node.parent.parent)
+        ? objectLiteralPath(node.parent.parent)
+        : undefined;
+      return owner ? `${owner}.${property}` : property;
+    }
+    if (ts.isCallExpression(node.parent)) {
+      const argumentIndex = node.parent.arguments.indexOf(node as ts.Expression);
+      const called = expressionName(node.parent.expression);
+      if (argumentIndex >= 0 && called) return `${called}.<callback@${argumentIndex + 1}>`;
+    }
+    let owner: ts.Node | undefined = node.parent;
+    while (
+      owner &&
+      (ts.isCallExpression(owner) ||
+        ts.isPropertyAccessExpression(owner) ||
+        ts.isElementAccessExpression(owner) ||
+        ts.isParenthesizedExpression(owner))
+    ) {
+      owner = owner.parent;
+    }
+    if (owner && ts.isVariableDeclaration(owner) && ts.isIdentifier(owner.name)) {
+      return `${owner.name.text}.<callback>`;
+    }
     return "<callback>";
   }
   return undefined;
+}
+
+const DISAMBIGUATED_CALLABLE_PARTS = new WeakMap<ts.SourceFile, ReadonlyMap<ts.Node, string>>();
+
+function rawSymbolPath(node: ts.Node): string {
+  const parts: string[] = [];
+  for (
+    let current: ts.Node | undefined = node;
+    current && !ts.isSourceFile(current);
+    current = current.parent
+  ) {
+    const part = rawCallablePart(current);
+    if (part) parts.unshift(part);
+  }
+  return parts.join(".") || "<module>";
+}
+
+function disambiguatedCallableParts(sourceFile: ts.SourceFile): ReadonlyMap<ts.Node, string> {
+  const cached = DISAMBIGUATED_CALLABLE_PARTS.get(sourceFile);
+  if (cached) return cached;
+  const groups = new Map<string, (ts.ArrowFunction | ts.FunctionExpression)[]>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      const key = rawSymbolPath(node.body);
+      const group = groups.get(key) ?? [];
+      group.push(node);
+      groups.set(key, group);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  const parts = new Map<ts.Node, string>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.forEach((node, index) => {
+      parts.set(node, `${rawCallablePart(node) ?? "<callback>"}@${index + 1}`);
+    });
+  }
+  DISAMBIGUATED_CALLABLE_PARTS.set(sourceFile, parts);
+  return parts;
+}
+
+function callablePart(node: ts.Node): string | undefined {
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    return disambiguatedCallableParts(node.getSourceFile()).get(node) ?? rawCallablePart(node);
+  }
+  return rawCallablePart(node);
 }
 
 function nodeIdentity(node: ts.Node, workspaceRoot: string): NodeIdentity {
@@ -267,7 +388,11 @@ function nodeIdentity(node: ts.Node, workspaceRoot: string): NodeIdentity {
       container &&
       (ts.isInterfaceDeclaration(container) || ts.isTypeAliasDeclaration(container))
     ) {
-      const member = ts.isMethodSignature(node) ? node.name.getText() : "<call>";
+      const member = ts.isMethodSignature(node)
+        ? node.name.getText()
+        : ts.isFunctionTypeNode(node) && ts.isPropertySignature(node.parent)
+          ? node.parent.name.getText()
+          : "<call>";
       signatureContractPath = `${container.name.text}.${member}`;
     }
   }
@@ -1535,6 +1660,390 @@ function analyzeParameter(
   );
 }
 
+function registeredUnknownInterpreterOwns(
+  workspace: WorkspaceArchitecture,
+  identity: NodeIdentity,
+): boolean {
+  return (
+    workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)) ||
+    workspace.resultDecoders.some(
+      (decoder) => decoder.status === "enforced" && identityOwns(decoder.identity, identity),
+    ) ||
+    workspace.persistedCodecs.some(
+      (codec) => codec.status === "enforced" && identityOwns(codec.identity, identity),
+    ) ||
+    workspace.openProtocolAdapters.some((adapter) => identityOwns(adapter.identity, identity)) ||
+    workspace.capabilityPredicates.some((predicate) =>
+      identityOwns(predicate.identity, identity),
+    ) ||
+    workspace.opaqueUnknown.some((exception) => identityOwns(exception.identity, identity)) ||
+    workspace.exceptionAdapters.some(
+      (adapter) => adapter.direction !== "signal-host" && identityOwns(adapter.identity, identity),
+    )
+  );
+}
+
+function typeDirectlyContainsUnknown(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  location: ts.Node,
+): boolean {
+  if (isUnknown(type)) return true;
+  if (type.isUnionOrIntersection()) {
+    return type.types.some((member) => typeDirectlyContainsUnknown(member, checker, location));
+  }
+  for (const kind of [ts.IndexKind.String, ts.IndexKind.Number]) {
+    const indexed = checker.getIndexTypeOfType(type, kind);
+    if (indexed && isUnknown(indexed)) return true;
+  }
+  return checker
+    .getPropertiesOfType(type)
+    .some((property) =>
+      isUnknown(
+        checker.getTypeOfSymbolAtLocation(
+          property,
+          property.valueDeclaration ?? property.declarations?.[0] ?? location,
+        ),
+      ),
+    );
+}
+
+function analyzeUnknownMemberRead(
+  node: ts.PropertyAccessExpression | ts.ElementAccessExpression | ts.BindingElement,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  if (!isUnknown(checker.getTypeAtLocation(node))) return;
+  const identity = nodeIdentity(node, workspaceRoot);
+  if (registeredUnknownInterpreterOwns(workspace, identity)) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/no-unknown-member-read",
+      node,
+      `Member ${node.getText()} in ${identity.symbolPath} is read as unknown outside a registered boundary interpreter.`,
+      "Move the read into an exact registered decoder, capability check, or external exception adapter and return a closed typed projection.",
+    ),
+  );
+}
+
+function declarationOwnerName(declaration: ts.Declaration | undefined): string | undefined {
+  let current = declaration?.parent;
+  while (current) {
+    if (
+      (ts.isInterfaceDeclaration(current) ||
+        ts.isClassDeclaration(current) ||
+        ts.isModuleDeclaration(current)) &&
+      current.name
+    ) {
+      return current.name.getText().replaceAll(/["']/gu, "");
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function expressionIsIntrinsicCoercer(expression: ts.Expression, checker: ts.TypeChecker): boolean {
+  const signatures = checker.getTypeAtLocation(expression).getCallSignatures();
+  return signatures.some((signature) => {
+    const declaration = signature.declaration;
+    return (
+      isDefaultLibraryDeclaration(declaration) &&
+      ["BooleanConstructor", "NumberConstructor", "StringConstructor"].includes(
+        declarationOwnerName(declaration) ?? "",
+      )
+    );
+  });
+}
+
+type UnknownExtractionIntrinsic = "collection" | "coercer" | "reflection";
+
+interface ResolvedUnknownExtractionIntrinsic {
+  readonly kind: UnknownExtractionIntrinsic;
+  readonly boundSource?: ts.Expression;
+}
+
+function intrinsicFromCallSignatures(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): UnknownExtractionIntrinsic | undefined {
+  for (const signature of checker.getTypeAtLocation(expression).getCallSignatures()) {
+    const declaration = signature.declaration;
+    if (!isDefaultLibraryDeclaration(declaration)) continue;
+    const owner = declarationOwnerName(declaration);
+    const name = declaration && "name" in declaration ? declaration.name : undefined;
+    const callableName = name && ts.isIdentifier(name) ? name.text : undefined;
+    if (owner === "ObjectConstructor" && ["entries", "values"].includes(callableName ?? "")) {
+      return "collection";
+    }
+    if (owner === "Reflect" && ["get", "has"].includes(callableName ?? "")) {
+      return "reflection";
+    }
+    if (["BooleanConstructor", "NumberConstructor", "StringConstructor"].includes(owner ?? "")) {
+      return "coercer";
+    }
+  }
+  return undefined;
+}
+
+function variableInitializer(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): ts.Expression | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (!ts.isIdentifier(unwrapped)) return undefined;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
+  return declaration && ts.isVariableDeclaration(declaration) ? declaration.initializer : undefined;
+}
+
+function applyArgument(
+  expression: ts.Expression,
+  index: number,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Node>,
+): ts.Expression | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (seen.has(unwrapped)) return undefined;
+  seen.add(unwrapped);
+  if (ts.isArrayLiteralExpression(unwrapped)) {
+    const element = unwrapped.elements[index];
+    return element && !ts.isSpreadElement(element) ? element : undefined;
+  }
+  const initializer = variableInitializer(unwrapped, checker);
+  return initializer ? applyArgument(initializer, index, checker, seen) : undefined;
+}
+
+function resolveUnknownExtractionIntrinsic(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Node> = new Set(),
+): ResolvedUnknownExtractionIntrinsic | undefined {
+  const unwrapped = unwrapExpression(expression);
+  if (seen.has(unwrapped)) return undefined;
+  seen.add(unwrapped);
+  const direct = intrinsicFromCallSignatures(unwrapped, checker);
+  if (direct) return { kind: direct };
+  if (
+    ts.isCallExpression(unwrapped) &&
+    ts.isPropertyAccessExpression(unwrapped.expression) &&
+    unwrapped.expression.name.text === "bind"
+  ) {
+    const intrinsic = resolveUnknownExtractionIntrinsic(
+      unwrapped.expression.expression,
+      checker,
+      seen,
+    );
+    if (!intrinsic) return undefined;
+    const boundSource = unwrapped.arguments[1];
+    return {
+      kind: intrinsic.kind,
+      ...(boundSource && !ts.isSpreadElement(boundSource) ? { boundSource } : {}),
+    };
+  }
+  const initializer = variableInitializer(unwrapped, checker);
+  return initializer ? resolveUnknownExtractionIntrinsic(initializer, checker, seen) : undefined;
+}
+
+function intrinsicUnknownExtractionArgument(
+  node: ts.CallExpression,
+  checker: ts.TypeChecker,
+): ts.Expression | undefined {
+  const expression = unwrapExpression(node.expression);
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    (expression.name.text === "call" || expression.name.text === "apply")
+  ) {
+    const intrinsic = resolveUnknownExtractionIntrinsic(expression.expression, checker);
+    if (!intrinsic) return undefined;
+    if (expression.name.text === "call") {
+      const argument = node.arguments[1];
+      return argument && !ts.isSpreadElement(argument) ? argument : undefined;
+    }
+    const argumentsList = node.arguments[1];
+    return argumentsList && !ts.isSpreadElement(argumentsList)
+      ? applyArgument(argumentsList, 0, checker, new Set())
+      : undefined;
+  }
+  const intrinsic = resolveUnknownExtractionIntrinsic(expression, checker);
+  if (intrinsic?.boundSource) return intrinsic.boundSource;
+  const argument = node.arguments[0];
+  if (intrinsic && argument && !ts.isSpreadElement(argument)) return argument;
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    expression.name.text === "map" &&
+    argument &&
+    expressionIsIntrinsicCoercer(argument, checker)
+  ) {
+    return expression.expression;
+  }
+  return undefined;
+}
+
+function expressionHasUnknownProvenance(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Node> = new Set(),
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  if (seen.has(unwrapped)) return false;
+  seen.add(unwrapped);
+  if (typeDirectlyContainsUnknown(checker.getTypeAtLocation(unwrapped), checker, unwrapped)) {
+    return true;
+  }
+  if ((checker.getTypeAtLocation(unwrapped).flags & ts.TypeFlags.Any) === 0) return false;
+  if (ts.isCallExpression(unwrapped)) {
+    const source = intrinsicUnknownExtractionArgument(unwrapped, checker);
+    if (source && expressionHasUnknownProvenance(source, checker, seen)) return true;
+  }
+  const initializer = variableInitializer(unwrapped, checker);
+  return initializer ? expressionHasUnknownProvenance(initializer, checker, seen) : false;
+}
+
+function unknownExtractionSource(
+  node: ts.Node,
+  checker: ts.TypeChecker,
+): ts.Expression | undefined {
+  if (ts.isForOfStatement(node)) {
+    return ts.isCallExpression(node.expression) &&
+      intrinsicUnknownExtractionArgument(node.expression, checker)
+      ? undefined
+      : node.expression;
+  }
+  if (ts.isSpreadElement(node) || ts.isSpreadAssignment(node)) return node.expression;
+  if (ts.isCallExpression(node)) return intrinsicUnknownExtractionArgument(node, checker);
+  return undefined;
+}
+
+function analyzeUnknownExtraction(
+  node: ts.ForOfStatement | ts.SpreadElement | ts.SpreadAssignment | ts.CallExpression,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  const source = unknownExtractionSource(node, checker);
+  if (!source || !expressionHasUnknownProvenance(source, checker)) {
+    return;
+  }
+  const identity = nodeIdentity(node, workspaceRoot);
+  if (registeredUnknownInterpreterOwns(workspace, identity)) return;
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/no-unknown-member-read",
+      node,
+      `Operation ${node.getText()} in ${identity.symbolPath} extracts values from an unknown-bearing collection outside a registered boundary interpreter.`,
+      "Move iteration, reflective access, coercion, or manual assembly into an exact registered decoder and return a closed typed projection.",
+    ),
+  );
+}
+
+function functionInterpretsUnknown(
+  node: ts.SignatureDeclaration,
+  body: ts.ConciseBody,
+  checker: ts.TypeChecker,
+): boolean {
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (found) return;
+    if (current !== node && ts.isFunctionLike(current)) return;
+    if (
+      (ts.isForOfStatement(current) ||
+        ts.isSpreadElement(current) ||
+        ts.isSpreadAssignment(current) ||
+        ts.isCallExpression(current)) &&
+      unknownExtractionSource(current, checker)
+    ) {
+      const source = unknownExtractionSource(current, checker);
+      if (source && expressionHasUnknownProvenance(source, checker)) {
+        found = true;
+        return;
+      }
+    }
+    if (
+      ts.isTypeOfExpression(current) &&
+      isUnknown(checker.getTypeAtLocation(current.expression))
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      ts.isBinaryExpression(current) &&
+      current.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
+      isUnknown(checker.getTypeAtLocation(current.left))
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) &&
+      isUnknown(checker.getTypeAtLocation(current))
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(body);
+  return found;
+}
+
+function analyzeCustomDecoder(
+  node: ts.SignatureDeclaration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  diagnostics: ArchitectureDiagnostic[],
+  reported: Set<string>,
+): void {
+  if (
+    !ts.isFunctionDeclaration(node) &&
+    !ts.isMethodDeclaration(node) &&
+    !ts.isConstructorDeclaration(node) &&
+    !ts.isGetAccessorDeclaration(node) &&
+    !ts.isSetAccessorDeclaration(node) &&
+    !ts.isFunctionExpression(node) &&
+    !ts.isArrowFunction(node)
+  ) {
+    return;
+  }
+  if (!node.body) return;
+  const identity = nodeIdentity(node, workspaceRoot);
+  const callableName = identity.symbolPath.split(".").at(-1) ?? identity.symbolPath;
+  const decoderName = /^(?:decode|normalize|parse|project|read[A-Z])/u.test(callableName);
+  if (
+    !node.parameters.some((parameter) =>
+      typeDirectlyContainsUnknown(checker.getTypeAtLocation(parameter), checker, parameter),
+    )
+  ) {
+    return;
+  }
+  const signature = checker.getSignatureFromDeclaration(node);
+  if (!signature) return;
+  const returnType = checker.getReturnTypeOfSignature(signature);
+  if (!isStructured(returnType) || typeContainsUnknown(returnType, checker, node)) return;
+  if (!decoderName && !functionInterpretsUnknown(node, node.body, checker)) return;
+  if (registeredUnknownInterpreterOwns(workspace, identity)) return;
+  const key = `${identity.module}#${identity.symbolPath}`;
+  if (reported.has(key)) return;
+  reported.add(key);
+  diagnostics.push(
+    makeDiagnostic(
+      workspace,
+      workspaceRoot,
+      "architecture/no-unregistered-custom-decoder",
+      node,
+      `Custom decoder ${identity.symbolPath} converts an unknown-bearing input to a structured output without registered boundary provenance.`,
+      "Register the exact decoder at its trust boundary or type the input if decoding already happened upstream.",
+    ),
+  );
+}
+
 function analyzeAssertion(
   node: ts.AsExpression | ts.TypeAssertion,
   checker: ts.TypeChecker,
@@ -2642,11 +3151,12 @@ function typeNodeIsExactExternalProtocol(
       seenSymbols,
     );
   }
-  if (!ts.isTypeReferenceNode(node) || node.typeArguments?.length) return false;
+  if (!ts.isTypeReferenceNode(node)) return false;
   const located = checker.getSymbolAtLocation(node.typeName);
   if (!located) return false;
   const symbol = canonicalSymbol(located, checker);
   if (symbolIsExternalProtocol(symbol, packageName, exportName, checker, packageRoots)) return true;
+  if (node.typeArguments?.length) return false;
   if (seenSymbols.has(symbol)) return false;
   seenSymbols.add(symbol);
   const aliases = symbol.declarations?.filter(ts.isTypeAliasDeclaration) ?? [];
@@ -2752,10 +3262,24 @@ function isClosedLocalDiscriminatedUnion(
   packageRoots: readonly WorkspacePackageRoot[],
   location: ts.Node,
 ): boolean {
+  if (!type.isUnion() || type.types.length < 2) {
+    return false;
+  }
+  const aliasDeclarations = type.aliasSymbol?.declarations ?? [];
+  const hasLocalAlias =
+    aliasDeclarations.length > 0 &&
+    aliasDeclarations.every((declaration) => isProjectDeclaration(declaration, packageRoots));
+  const hasLocalDiscriminants = type.types.every((member) => {
+    const property = checker.getPropertyOfType(member, discriminant);
+    const declarations = property?.declarations ?? [];
+    return (
+      declarations.length > 0 &&
+      declarations.every((declaration) => isProjectDeclaration(declaration, packageRoots))
+    );
+  });
   if (
-    !type.isUnion() ||
-    type.types.length < 2 ||
-    !typeIsProjectOwned(type, checker, packageRoots)
+    !typeIsProjectOwned(type, checker, packageRoots) &&
+    !(hasLocalAlias && hasLocalDiscriminants)
   ) {
     return false;
   }
@@ -2892,34 +3416,59 @@ function registeredNodes<T extends ts.Node>(
       ? workspaceRoot
       : packageRoots.find(({ packageName }) => packageName === identity.package)?.root;
   if (!identityRoot) return [];
-  const sourceFile = program
-    .getSourceFiles()
-    .find(
-      (candidate) =>
-        !candidate.isDeclarationFile &&
-        relativeModulePath(identityRoot, candidate) === identity.module,
-    );
-  if (!sourceFile) return [];
-  const matches: T[] = [];
-  const visit = (node: ts.Node): void => {
-    if (predicate(node)) {
-      const variableMatch =
-        ts.isVariableDeclaration(node) &&
-        ts.isIdentifier(node.name) &&
-        relativeModulePath(identityRoot, node.getSourceFile()) === identity.module &&
-        node.name.text === identity.exportName;
-      const nestedFunctionType = ts.isFunctionTypeNode(node) && ts.isParameter(node.parent);
-      if (
-        variableMatch ||
-        (!nestedFunctionType && identityMatches(identity, nodeIdentity(node, identityRoot)))
-      ) {
-        matches.push(node);
+  const candidates = registeredDeclarationIndex(program, identityRoot)
+    .get(identity.module)
+    ?.get(identity.exportName);
+  return (candidates ?? []).filter(predicate);
+}
+
+type ModuleDeclarationIndex = ReadonlyMap<string, ReadonlyMap<string, readonly ts.Node[]>>;
+
+const PROGRAM_DECLARATION_INDEXES = new WeakMap<ts.Program, Map<string, ModuleDeclarationIndex>>();
+
+function isRegisteredDeclarationCandidate(node: ts.Node): boolean {
+  return (
+    ts.isVariableDeclaration(node) ||
+    ts.isClassDeclaration(node) ||
+    (ts.isFunctionLike(node) && (functionHasImplementation(node) || ts.isMethodSignature(node)))
+  );
+}
+
+function registeredDeclarationIndex(
+  program: ts.Program,
+  identityRoot: string,
+): ModuleDeclarationIndex {
+  const canonicalRoot = canonicalPath(identityRoot);
+  const programIndexes = PROGRAM_DECLARATION_INDEXES.get(program) ?? new Map();
+  PROGRAM_DECLARATION_INDEXES.set(program, programIndexes);
+  const cached = programIndexes.get(canonicalRoot);
+  if (cached) return cached;
+
+  const modules = new Map<string, Map<string, ts.Node[]>>();
+  for (const sourceFile of program.getSourceFiles()) {
+    if (sourceFile.isDeclarationFile) continue;
+    const module = relativeModulePath(identityRoot, sourceFile);
+    if (module.startsWith("../")) continue;
+    const identities = new Map<string, ts.Node[]>();
+    const visit = (node: ts.Node): void => {
+      if (isRegisteredDeclarationCandidate(node)) {
+        const exportName =
+          ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
+            ? node.name.text
+            : nodeIdentity(node, identityRoot).symbolPath;
+        if (exportName !== "<module>") {
+          const declarations = identities.get(exportName) ?? [];
+          declarations.push(node);
+          identities.set(exportName, declarations);
+        }
       }
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sourceFile);
-  return matches;
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    modules.set(module, identities);
+  }
+  programIndexes.set(canonicalRoot, modules);
+  return modules;
 }
 
 function requireOneRegisteredNode<T extends ts.Node>(
@@ -4701,6 +5250,599 @@ function assertOpenProtocolAdaptersResolve(
   }
 }
 
+function assertOperationalResultApisResolve(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+): void {
+  if (workspace.status !== "migrated") return;
+  for (const api of workspace.operationalResultApis) {
+    const matches: ts.SignatureDeclaration[] = [];
+    const sourceFile = program
+      .getSourceFiles()
+      .find(
+        (candidate) =>
+          !candidate.isDeclarationFile &&
+          relativeModulePath(workspaceRoot, candidate) === api.module,
+      );
+    if (sourceFile) {
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isFunctionLike(node) &&
+          (functionHasImplementation(node) || ts.isMethodSignature(node)) &&
+          identityMatches(api, nodeIdentity(node, workspaceRoot))
+        ) {
+          matches.push(node);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sourceFile);
+    }
+    if (matches.length !== 1) {
+      throw new Error(
+        `Operational Result API ${workspace.name}/${api.module}#${api.exportName} must resolve to exactly one callable implementation; found ${matches.length}.`,
+      );
+    }
+  }
+}
+
+function isImplementedCallable(node: ts.Node): node is ts.SignatureDeclaration {
+  return ts.isFunctionLike(node) && functionHasImplementation(node);
+}
+
+const LANGUAGE_EXCEPTION_CAPTURE = "language exception capture";
+const LANGUAGE_HOST_FAILURE_SIGNAL = "language host failure signal";
+
+function callableBody(node: ts.SignatureDeclaration): ts.ConciseBody | undefined {
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return node.body;
+  if (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isConstructorDeclaration(node)
+  ) {
+    return node.body;
+  }
+  return undefined;
+}
+
+function isErrorCallbackPropertyName(name: string): boolean {
+  return /^(?:catch|on.*(?:error|failure|reject))$/iu.test(name);
+}
+
+function callableIsErrorCallback(node: ts.SignatureDeclaration, checker: ts.TypeChecker): boolean {
+  if (
+    ts.isMethodDeclaration(node) &&
+    ts.isObjectLiteralExpression(node.parent) &&
+    isErrorCallbackPropertyName(node.name.getText().replaceAll(/["']/gu, ""))
+  ) {
+    return true;
+  }
+  const parent = node.parent;
+  if (ts.isPropertyAssignment(parent)) {
+    const name = propertyStringValue(parent, checker);
+    if (name && isErrorCallbackPropertyName(name)) return true;
+  }
+  if (
+    ts.isCallExpression(parent) &&
+    ((expressionName(parent.expression) === "catch" &&
+      parent.arguments.includes(node as ts.Expression)) ||
+      (expressionName(parent.expression) === "then" && parent.arguments[1] === node) ||
+      (expressionName(parent.expression) === "addEventListener" &&
+        ts.isStringLiteral(parent.arguments[0]) &&
+        parent.arguments[0].text === "error" &&
+        parent.arguments[1] === node))
+  ) {
+    return true;
+  }
+
+  const name =
+    node.name ??
+    (ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)
+      ? node.parent.name
+      : undefined);
+  if (!name || !ts.isIdentifier(name)) return false;
+  const symbol = checker.getSymbolAtLocation(name);
+  if (!symbol) return false;
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (found) return;
+    if (ts.isIdentifier(current) && current !== name) {
+      const candidate = checker.getSymbolAtLocation(current);
+      if (candidate && canonicalSymbol(candidate, checker) === canonicalSymbol(symbol, checker)) {
+        const currentParent = current.parent;
+        if (
+          (ts.isPropertyAssignment(currentParent) &&
+            (() => {
+              const propertyName = propertyStringValue(currentParent, checker);
+              return propertyName !== undefined && isErrorCallbackPropertyName(propertyName);
+            })()) ||
+          (ts.isCallExpression(currentParent) &&
+            ((expressionName(currentParent.expression) === "catch" &&
+              currentParent.arguments.includes(current)) ||
+              (expressionName(currentParent.expression) === "then" &&
+                currentParent.arguments[1] === current) ||
+              (expressionName(currentParent.expression) === "addEventListener" &&
+                ts.isStringLiteral(currentParent.arguments[0]) &&
+                currentParent.arguments[0].text === "error" &&
+                currentParent.arguments[1] === current)))
+        ) {
+          found = true;
+          return;
+        }
+      }
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node.getSourceFile());
+  return found;
+}
+
+function callableHasExceptionRelationship(
+  node: ts.SignatureDeclaration,
+  direction: "capture-external" | "signal-host" | "observe-panic",
+  checker: ts.TypeChecker,
+  workspaceRoot: string,
+  signalAdapterKeys: ReadonlySet<string>,
+): boolean {
+  const body = callableBody(node);
+  if (!body) return false;
+  const callableKey = symbolIdentityKey(nodeIdentity(node, workspaceRoot));
+  if (direction === "capture-external" && callableIsErrorCallback(node, checker)) return true;
+  if (direction === "observe-panic" && /\bPanic\.is\s*\(/u.test(body.getText())) return true;
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (found) return;
+    if (current !== body && ts.isFunctionLike(current)) return;
+    if (direction === "capture-external" && ts.isCatchClause(current)) {
+      found = true;
+      return;
+    }
+    if (ts.isThrowStatement(current)) {
+      found = direction === "signal-host";
+      if (found) return;
+    }
+    if (ts.isCallExpression(current)) {
+      const called = expressionName(current.expression) ?? "";
+      if (
+        direction === "signal-host" &&
+        (called.startsWith("reject") ||
+          ["error", "throwIfAborted", "reportFatalPanic"].includes(called))
+      ) {
+        found = true;
+        return;
+      }
+      if (direction === "signal-host") {
+        const calledDeclaration = checker.getResolvedSignature(current)?.declaration;
+        if (calledDeclaration && isImplementedCallable(calledDeclaration)) {
+          const calledKey = symbolIdentityKey(nodeIdentity(calledDeclaration, workspaceRoot));
+          if (calledKey !== callableKey && signalAdapterKeys.has(calledKey)) {
+            found = true;
+            return;
+          }
+        }
+      }
+      if (
+        direction === "observe-panic" &&
+        (/(?:panic|rethrow|preserve)/iu.test(called) ||
+          (ts.isPropertyAccessExpression(current.expression) &&
+            current.expression.name.text === "is" &&
+            /(?:^|\.)Panic$/u.test(current.expression.expression.getText())))
+      ) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(body);
+  return found;
+}
+
+function importDeclarationPackage(declaration: ts.Declaration): string | undefined {
+  let current: ts.Node | undefined = declaration;
+  while (current && !ts.isImportDeclaration(current)) current = current.parent;
+  return current && ts.isStringLiteral(current.moduleSpecifier)
+    ? current.moduleSpecifier.text
+    : undefined;
+}
+
+function declarationReferencesPackage(declaration: ts.Declaration, packageName: string): boolean {
+  const imported = importDeclarationPackage(declaration);
+  if (imported === packageName || imported?.startsWith(`${packageName}/`)) return true;
+  const normalized = normalizedPath(declaration.getSourceFile().fileName);
+  return normalized.includes(`/node_modules/${packageName}/`);
+}
+
+function callableReferencesExternalApi(
+  node: ts.SignatureDeclaration,
+  adapter: WorkspaceArchitecture["exceptionAdapters"][number],
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const body = callableBody(node);
+  if (!body) return false;
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (found || (current !== body && ts.isFunctionLike(current))) return;
+    if (ts.isIdentifier(current)) {
+      const symbol = checker.getSymbolAtLocation(current);
+      if (
+        symbol?.declarations?.some(
+          (declaration) =>
+            declarationReferencesPackage(declaration, adapter.externalApi.package) ||
+            declarationPackageName(declaration, packageRoots) === adapter.externalApi.package,
+        )
+      ) {
+        found = true;
+        return;
+      }
+    }
+    if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
+      const declaration = checker.getResolvedSignature(current)?.declaration;
+      if (
+        declaration &&
+        (declarationReferencesPackage(declaration, adapter.externalApi.package) ||
+          declarationPackageName(declaration, packageRoots) === adapter.externalApi.package)
+      ) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(body);
+  return found;
+}
+
+function callableReferencesPlatformApi(
+  node: ts.SignatureDeclaration,
+  packageName: string,
+  checker: ts.TypeChecker,
+): boolean {
+  if (packageName !== "Intl") return false;
+  const body = callableBody(node);
+  if (!body) return false;
+  let found = false;
+  const visit = (current: ts.Node): void => {
+    if (found || (current !== body && ts.isFunctionLike(current))) return;
+    if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
+      const declaration = checker.getResolvedSignature(current)?.declaration;
+      if (
+        isDefaultLibraryDeclaration(declaration) &&
+        /DateTimeFormat/u.test(declarationOwnerName(declaration) ?? "")
+      ) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(body);
+  return found;
+}
+
+function hasRecognizableExceptionExternalApi(
+  adapter: WorkspaceArchitecture["exceptionAdapters"][number],
+  approval: ApprovedExceptionAdapter,
+  declaration: ts.SignatureDeclaration,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  workspacePackageName: string,
+  workspaceRoot: string,
+  signalAdapterKeys: ReadonlySet<string>,
+): boolean {
+  const { package: packageName, exportName } = adapter.externalApi;
+  switch (approval.relationship) {
+    case "language-runtime":
+      if (
+        packageName === "global" &&
+        (exportName === LANGUAGE_EXCEPTION_CAPTURE || exportName === LANGUAGE_HOST_FAILURE_SIGNAL)
+      ) {
+        return callableHasExceptionRelationship(
+          declaration,
+          adapter.direction,
+          checker,
+          workspaceRoot,
+          signalAdapterKeys,
+        );
+      }
+      if (packageName === "global") return exportName.trim().length > 0;
+      return callableReferencesPlatformApi(declaration, packageName, checker);
+    case "panic-brand":
+      return (
+        packageName === "better-result" &&
+        exportName === "Panic.is" &&
+        adapter.direction === "observe-panic"
+      );
+    case "host-contract":
+      return adapter.direction === "signal-host";
+    case "injected-external-effect":
+      return adapter.direction === "capture-external";
+    case "external-rejection":
+      return (
+        adapter.direction === "capture-external" && callableIsErrorCallback(declaration, checker)
+      );
+    case "external-package":
+      if (packageName === workspacePackageName) return false;
+      return callableReferencesExternalApi(declaration, adapter, checker, packageRoots);
+  }
+}
+
+function exceptionAdapterCatalogKey(
+  workspace: string,
+  identity: SymbolIdentity,
+  direction: WorkspaceArchitecture["exceptionAdapters"][number]["direction"],
+): string {
+  return `${workspace}/${symbolIdentityKey(identity)}@${direction}`;
+}
+
+function adapterMatchesApproval(
+  adapter: WorkspaceArchitecture["exceptionAdapters"][number],
+  approval: ApprovedExceptionAdapter,
+): boolean {
+  return (
+    symbolIdentityKey(adapter.identity) === symbolIdentityKey(approval.callable) &&
+    adapter.category === approval.category &&
+    adapter.externalApi.package === approval.externalApi.package &&
+    adapter.externalApi.exportName === approval.externalApi.exportName &&
+    adapter.direction === approval.mode &&
+    adapter.reason === approval.reason
+  );
+}
+
+export function assertEveryExceptionAdapterResolves(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  approvedExceptionAdapters: readonly ApprovedExceptionAdapter[] = APPROVED_EXCEPTION_ADAPTER_CATALOG,
+  packageRoots: readonly WorkspacePackageRoot[] = [],
+): void {
+  const approvals = new Map(
+    approvedExceptionAdapters
+      .filter((approval) => approval.workspace === workspace.name)
+      .map((approval) => [
+        exceptionAdapterCatalogKey(approval.workspace, approval.callable, approval.mode),
+        approval,
+      ]),
+  );
+  const signalAdapterKeys = new Set(
+    workspace.exceptionAdapters
+      .filter((adapter) => adapter.direction === "signal-host")
+      .map((adapter) => symbolIdentityKey(adapter.identity)),
+  );
+  const failures: string[] = [];
+  for (const adapter of workspace.exceptionAdapters) {
+    const key = `${adapter.identity.module}#${adapter.identity.exportName}`;
+    const catalogKey = exceptionAdapterCatalogKey(
+      workspace.name,
+      adapter.identity,
+      adapter.direction,
+    );
+    const approval = approvals.get(catalogKey);
+    if (!approval || !adapterMatchesApproval(adapter, approval)) {
+      failures.push(
+        `Exception adapter ${workspace.name}/${key} is not an exact member of the approved global catalog.`,
+      );
+      continue;
+    }
+    if (adapter.identity.exportName === "<module>") {
+      failures.push(
+        `Exception adapter ${workspace.name}/${key} is not an exact callable identity.`,
+      );
+      continue;
+    }
+    const declarations = registeredNodes(
+      adapter.identity,
+      workspaceRoot,
+      program,
+      isImplementedCallable,
+    );
+    if (declarations.length !== 1) {
+      failures.push(
+        `Exception adapter ${workspace.name}/${key} does not resolve to production code as exactly one callable; found ${declarations.length}.`,
+      );
+      continue;
+    }
+    const declaration = declarations[0];
+    if (
+      !declaration ||
+      !hasRecognizableExceptionExternalApi(
+        adapter,
+        approval,
+        declaration,
+        checker,
+        packageRoots,
+        workspace.packageName,
+        workspaceRoot,
+        signalAdapterKeys,
+      )
+    ) {
+      failures.push(
+        `Exception adapter ${workspace.name}/${key} has no recognizable externalApi or host relationship.`,
+      );
+      continue;
+    }
+    if (
+      !callableHasExceptionRelationship(
+        declaration,
+        adapter.direction,
+        checker,
+        workspaceRoot,
+        signalAdapterKeys,
+      )
+    ) {
+      failures.push(
+        `Exception adapter ${workspace.name}/${key} has no smallest-callable ${adapter.direction} relationship.`,
+      );
+    }
+  }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+}
+
+function moduleHasHostSignal(sourceFile: ts.SourceFile): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found || ts.isFunctionLike(node)) return;
+    if (ts.isThrowStatement(node)) {
+      found = true;
+      return;
+    }
+    if (ts.isCallExpression(node)) {
+      const called = expressionName(node.expression) ?? "";
+      if (["reject", "error", "exit", "abort"].includes(called)) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return found;
+}
+
+export function assertCoreFinalExceptionAdaptersResolve(
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  exceptionIdentities: readonly (readonly [
+    module: string,
+    exportName: string,
+    mode: "capture" | "signal" | "both",
+  ])[] = PRECISE_EXCEPTION_IDENTITIES["apps/core"],
+  captureIdentities: readonly (readonly [module: string, exportName: string])[] = [],
+  panicIdentities: readonly (readonly [
+    module: string,
+    exportName: string,
+  ])[] = CORE_REVIEWED_PANIC_IDENTITIES,
+  fatalSignalIdentities: readonly (readonly [
+    module: string,
+    exportName: string,
+  ])[] = CORE_FATAL_SIGNAL_IDENTITIES,
+): void {
+  if (workspace.name !== "apps/core") return;
+  type ExpectedCoreExceptionAdapter = {
+    readonly module: string;
+    readonly exportName: string;
+    readonly direction: "capture-external" | "signal-host" | "observe-panic";
+  };
+  const expected: ExpectedCoreExceptionAdapter[] = [];
+  for (const [module, exportName, mode] of exceptionIdentities) {
+    const signalDirection = exportName.startsWith("preserve")
+      ? ("observe-panic" as const)
+      : ("signal-host" as const);
+    switch (mode) {
+      case "capture":
+        expected.push({ module, exportName, direction: "capture-external" });
+        break;
+      case "signal":
+        expected.push({ module, exportName, direction: signalDirection });
+        break;
+      case "both":
+        expected.push({ module, exportName, direction: "capture-external" });
+        expected.push({ module, exportName, direction: signalDirection });
+        break;
+    }
+  }
+  for (const [module, exportName] of captureIdentities) {
+    expected.push({ module, exportName, direction: "capture-external" });
+  }
+  for (const [module, exportName] of panicIdentities) {
+    expected.push({ module, exportName, direction: "observe-panic" });
+  }
+  for (const [module, exportName] of fatalSignalIdentities) {
+    expected.push({ module, exportName, direction: "signal-host" });
+  }
+
+  const resolved = new Map<string, readonly (ts.SignatureDeclaration | ts.SourceFile)[]>();
+  const signalAdapterKeys = new Set(
+    workspace.exceptionAdapters
+      .filter((adapter) => adapter.direction === "signal-host")
+      .map((adapter) => symbolIdentityKey(adapter.identity)),
+  );
+  for (const registration of expected) {
+    const key = `${registration.module}#${registration.exportName}`;
+    const adapter = workspace.exceptionAdapters.find(
+      (candidate) =>
+        symbolIdentityKey(candidate.identity) === key &&
+        candidate.direction === registration.direction,
+    );
+    if (!adapter) {
+      throw new Error(`Core final exception adapter ${key} lacks ${registration.direction}.`);
+    }
+    const isFatalSignal = fatalSignalIdentities.some(
+      ([module, exportName]) =>
+        module === registration.module && exportName === registration.exportName,
+    );
+    const expectedCategory =
+      registration.direction === "observe-panic" || isFatalSignal
+        ? "defect-supervisor"
+        : "compatibility";
+    const expectedApi =
+      registration.direction === "capture-external"
+        ? { package: "global", exportName: LANGUAGE_EXCEPTION_CAPTURE }
+        : registration.direction === "signal-host" && !isFatalSignal
+          ? { package: "global", exportName: LANGUAGE_HOST_FAILURE_SIGNAL }
+          : registration.direction === "observe-panic"
+            ? { package: "better-result", exportName: "Panic.is" }
+            : { package: "@stanley2058/lilac-core", exportName: "fatal Panic reporter" };
+    if (
+      adapter.category !== expectedCategory ||
+      adapter.externalApi.package !== expectedApi.package ||
+      adapter.externalApi.exportName !== expectedApi.exportName
+    ) {
+      throw new Error(
+        `Core final exception adapter ${key} has fabricated or mismatched ${registration.direction} metadata.`,
+      );
+    }
+
+    let declarations = resolved.get(key);
+    if (!declarations) {
+      if (registration.exportName === "<module>") {
+        const sourceFile = program
+          .getSourceFiles()
+          .find(
+            (candidate) =>
+              !candidate.isDeclarationFile &&
+              relativeModulePath(workspaceRoot, candidate) === registration.module,
+          );
+        declarations = sourceFile ? [sourceFile] : [];
+      } else {
+        declarations = registeredNodes(
+          { module: registration.module, exportName: registration.exportName },
+          workspaceRoot,
+          program,
+          isImplementedCallable,
+        );
+      }
+      if (declarations.length === 0) {
+        throw new Error(`Core final exception adapter ${key} does not resolve to production code.`);
+      }
+      resolved.set(key, declarations);
+    }
+
+    const validRelationship = declarations.some((declaration) =>
+      ts.isSourceFile(declaration)
+        ? registration.direction === "signal-host" && moduleHasHostSignal(declaration)
+        : callableHasExceptionRelationship(
+            declaration,
+            registration.direction,
+            checker,
+            workspaceRoot,
+            signalAdapterKeys,
+          ),
+    );
+    if (!validRelationship) {
+      throw new Error(
+        `Core final exception adapter ${key} has no smallest-callable ${registration.direction} relationship.`,
+      );
+    }
+  }
+}
+
 function analyzeOpenProtocolAdapter(
   node: ts.SignatureDeclaration,
   checker: ts.TypeChecker,
@@ -4839,9 +5981,20 @@ export function analyzeWorkspace(
       })),
     scanAllProductionModules: false,
   },
+  approvedExceptionAdapters: readonly ApprovedExceptionAdapter[] = APPROVED_EXCEPTION_ADAPTER_CATALOG,
 ): readonly ArchitectureDiagnostic[] {
   assertOpenProtocolAdaptersResolve(workspace, workspaceRoot, program);
+  assertOperationalResultApisResolve(workspace, workspaceRoot, program);
   const checker = program.getTypeChecker();
+  assertEveryExceptionAdapterResolves(
+    workspace,
+    workspaceRoot,
+    program,
+    checker,
+    approvedExceptionAdapters,
+    packageRoots,
+  );
+  assertCoreFinalExceptionAdaptersResolve(workspace, workspaceRoot, program, checker);
   const diagnostics: ArchitectureDiagnostic[] = [];
   assertPersistenceInfrastructureCallsResolve(
     workspace,
@@ -4869,6 +6022,7 @@ export function analyzeWorkspace(
   );
   const reportedPredicates = new Set<string>();
   const reportedContracts = new Set<string>();
+  const reportedCustomDecoders = new Set<string>();
   const reportedMaps = new Set<string>();
 
   for (const sourceFile of program.getSourceFiles()) {
@@ -4896,6 +6050,36 @@ export function analyzeWorkspace(
       }
       if (activeRules.has("architecture/no-domain-unknown") && ts.isParameter(node)) {
         analyzeParameter(node, checker, workspace, workspaceRoot, diagnostics);
+      }
+      if (
+        activeRules.has("architecture/no-unknown-member-read") &&
+        (ts.isPropertyAccessExpression(node) ||
+          ts.isElementAccessExpression(node) ||
+          ts.isBindingElement(node))
+      ) {
+        analyzeUnknownMemberRead(node, checker, workspace, workspaceRoot, diagnostics);
+      }
+      if (
+        activeRules.has("architecture/no-unknown-member-read") &&
+        (ts.isForOfStatement(node) ||
+          ts.isSpreadElement(node) ||
+          ts.isSpreadAssignment(node) ||
+          ts.isCallExpression(node))
+      ) {
+        analyzeUnknownExtraction(node, checker, workspace, workspaceRoot, diagnostics);
+      }
+      if (
+        activeRules.has("architecture/no-unregistered-custom-decoder") &&
+        ts.isFunctionLike(node)
+      ) {
+        analyzeCustomDecoder(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          diagnostics,
+          reportedCustomDecoders,
+        );
       }
       if (
         activeRules.has("architecture/no-unknown-assertion") &&

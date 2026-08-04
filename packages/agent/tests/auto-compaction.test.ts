@@ -13,6 +13,7 @@ import {
 } from "../auto-compaction";
 import { AiSdkPiAgent } from "../ai-sdk-pi-agent";
 import {
+  compactWithOpenAIResponses,
   hasMatchingOpenAIServerCompaction,
   materializeOpenAIServerCompaction,
   readOpenAIServerCompactionArtifact,
@@ -2304,6 +2305,76 @@ describe("auto-compaction internals", () => {
 
     expect(fallback).toEqual(local);
     expect(reportedFailures).toEqual([serverFailure]);
+  });
+
+  it("keeps the portable local fallback when generated native metadata is invalid", async () => {
+    const messages: ModelMessage[] = [
+      { role: "user", content: `old request ${"a".repeat(6_000)}` },
+      { role: "assistant", content: `old response ${"b".repeat(6_000)}` },
+      { role: "user", content: "latest request remains verbatim" },
+    ];
+    const options = {
+      messages,
+      contextLimit: 10_000,
+      outputLimit: 1_000,
+      thresholdFraction: 0.25,
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+    } as const;
+    const local = await compactMessages({
+      ...options,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+    });
+    const nativeModel = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            {
+              type: "custom",
+              kind: "openai.compaction",
+              providerMetadata: {
+                openai: {
+                  type: "compaction",
+                  itemId: "cmp_invalid_metadata",
+                  encryptedContent: "encrypted-native-state",
+                },
+              },
+            },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const reportedFailures: unknown[] = [];
+    const fallback = await compactMessages({
+      ...options,
+      currentModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      serverCompaction: async (request) =>
+        compactWithOpenAIResponses({
+          model: nativeModel,
+          replayKey: "",
+          portableSummary: request.portableSummary,
+          messages: request.messages,
+          system: request.context?.system ?? "system",
+          abortSignal: request.abortSignal,
+        }),
+      onServerCompactionError: (error) => reportedFailures.push(error),
+    });
+
+    expect(fallback).toEqual(local);
+    expect(fallback.summary).toBe(local.summary);
+    expect(reportedFailures).toHaveLength(1);
+    const reported = reportedFailures[0];
+    expect(reported).toBeInstanceOf(Error);
+    if (!(reported instanceof Error)) throw new Error("Expected native compaction failure.");
+    expect(reported.cause).toMatchObject({
+      _tag: "OpenAIServerCompactionOutputInvalid",
+      reason: "generated-artifact",
+    });
   });
 
   it("propagates an abort from server compaction instead of falling back", async () => {

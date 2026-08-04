@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { ActivityType, ApplicationCommandOptionType, MessageType, type Message } from "discord.js";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic } from "better-result";
 
 import {
   DiscordAdapter,
@@ -9,11 +10,13 @@ import {
   hasExplicitDiscordUserMentionInContent,
   isExplicitDiscordUserMention,
   isRoutableDiscordUserMessage,
-  resolveDiscordSurfaceEditTarget,
+  resolveDiscordSurfaceEditTargetResult,
   resolveOutputNotificationEnabled,
   resolveEffectiveSessionModelOverride,
+  type DiscordAdapterOptions,
 } from "../../../src/surface/discord/discord-adapter";
 import { SurfaceMessageNotFoundError } from "../../../src/surface/adapter";
+import type { AdapterEvent } from "../../../src/surface/events";
 
 function testConfigWithStatusMessage(statusMessage?: string): CoreConfig {
   const discord = {
@@ -27,6 +30,12 @@ function testConfigWithStatusMessage(statusMessage?: string): CoreConfig {
     },
   });
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
+function createTestDiscordAdapter(
+  options: Omit<DiscordAdapterOptions, "reportFatalPanic"> = {},
+): DiscordAdapter {
+  return new DiscordAdapter({ ...options, reportFatalPanic: () => {} });
 }
 
 function makeMessage(input: { bot: boolean; system: boolean; type: MessageType }): Message {
@@ -260,62 +269,69 @@ describe("resolveOutputNotificationEnabled", () => {
   });
 });
 
-describe("resolveDiscordSurfaceEditTarget", () => {
+describe("resolveDiscordSurfaceEditTargetResult", () => {
   it("uses plain content for non-embed bot messages", () => {
     expect(
-      resolveDiscordSurfaceEditTarget({
+      resolveDiscordSurfaceEditTargetResult({
         authorId: "bot",
         selfUserId: "bot",
         embedCount: 0,
       }),
-    ).toBe("content");
+    ).toMatchObject({ status: "ok", value: "content" });
   });
 
   it("uses embed description for single-embed bot messages", () => {
     expect(
-      resolveDiscordSurfaceEditTarget({
+      resolveDiscordSurfaceEditTargetResult({
         authorId: "bot",
         selfUserId: "bot",
         embedCount: 1,
       }),
-    ).toBe("embed_description");
+    ).toMatchObject({ status: "ok", value: "embed_description" });
   });
 
   it("prefers content when single-embed bot messages also have visible content", () => {
     expect(
-      resolveDiscordSurfaceEditTarget({
+      resolveDiscordSurfaceEditTargetResult({
         authorId: "bot",
         selfUserId: "bot",
         embedCount: 1,
         content: "visible content",
       }),
-    ).toBe("content");
+    ).toMatchObject({ status: "ok", value: "content" });
   });
 
-  it("rejects non-bot-authored messages", () => {
-    expect(() =>
-      resolveDiscordSurfaceEditTarget({
-        authorId: "user",
-        selfUserId: "bot",
-        embedCount: 1,
-      }),
-    ).toThrow("authored by the Lilac Discord bot");
+  it("exposes non-bot authorship as a typed validation error", () => {
+    const result = resolveDiscordSurfaceEditTargetResult({
+      authorId: "user",
+      selfUserId: "bot",
+      embedCount: 1,
+    });
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("DiscordSurfaceEditUnsupported");
+      expect(result.error.reason).toBe("not-author");
+    }
   });
 
-  it("rejects multi-embed messages", () => {
-    expect(() =>
-      resolveDiscordSurfaceEditTarget({
-        authorId: "bot",
-        selfUserId: "bot",
-        embedCount: 2,
-      }),
-    ).toThrow("single embed");
+  it("returns a typed failure for multi-embed messages", () => {
+    const result = resolveDiscordSurfaceEditTargetResult({
+      authorId: "bot",
+      selfUserId: "bot",
+      embedCount: 2,
+    });
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error.reason).toBe("multiple-embeds");
+      expect(result.error.message).toContain("single embed");
+    }
   });
 });
 
 describe("DiscordAdapter.getHealthSnapshot", () => {
   it("samples current gateway ping state from discord.js shards", () => {
-    const adapter = new DiscordAdapter();
+    const adapter = createTestDiscordAdapter();
     const adapterWithClient = adapter as unknown as {
       client: {
         ws: {
@@ -342,11 +358,83 @@ describe("DiscordAdapter.getHealthSnapshot", () => {
   });
 });
 
+describe("DiscordAdapter.disconnect", () => {
+  it("runs store cleanup before rethrowing the original client Panic", async () => {
+    const adapter = createTestDiscordAdapter();
+    const panic = new Panic({ message: "discord destroy invariant failed" });
+    let storeClosed = false;
+    const state = adapter as unknown as {
+      client: { destroy(): Promise<void> } | null;
+      store: { close(): void } | null;
+    };
+    state.client = {
+      async destroy() {
+        throw panic;
+      },
+    };
+    state.store = {
+      close() {
+        storeClosed = true;
+      },
+    };
+
+    await expect(adapter.disconnect()).rejects.toBe(panic);
+    expect(storeClosed).toBe(true);
+  });
+});
+
+describe("DiscordAdapter detached event supervision", () => {
+  const event: AdapterEvent = {
+    type: "adapter.request.cancel",
+    platform: "discord",
+    ts: 1,
+    requestId: "request-1",
+    sessionId: "channel-1",
+  };
+
+  it("reports the exact handler Panic to the owned fatal boundary", async () => {
+    const panic = new Panic({ message: "surface handler invariant failed" });
+    let resolveReported!: (reported: Panic) => void;
+    const reported = new Promise<Panic>((resolve) => {
+      resolveReported = resolve;
+    });
+    const adapter = new DiscordAdapter({ reportFatalPanic: resolveReported });
+    await adapter.subscribe(async () => {
+      throw panic;
+    });
+
+    (adapter as unknown as { emit(evt: AdapterEvent): void }).emit(event);
+
+    await expect(reported).resolves.toBe(panic);
+  });
+
+  it("keeps ordinary detached handler failures best-effort", async () => {
+    const reported: Panic[] = [];
+    let resolveHandled!: () => void;
+    const handled = new Promise<void>((resolve) => {
+      resolveHandled = resolve;
+    });
+    const adapter = new DiscordAdapter({
+      reportFatalPanic: (panic) => reported.push(panic),
+    });
+    await adapter.subscribe(async () => {
+      throw new Error("ordinary handler failure");
+    });
+    await adapter.subscribe(() => resolveHandled());
+
+    (adapter as unknown as { emit(evt: AdapterEvent): void }).emit(event);
+    await handled;
+    await Promise.resolve();
+
+    expect(reported).toEqual([]);
+  });
+});
+
 describe("DiscordAdapter.refreshCoreConfig", () => {
   it("applies, changes, and clears configured presence", async () => {
     let cfg = testConfigWithStatusMessage("reading threads");
     const presenceCalls: unknown[] = [];
-    const adapter = new DiscordAdapter({
+    const adapter = createTestDiscordAdapter({
       getConfig: async () => cfg,
     });
     (
@@ -417,7 +505,7 @@ describe("DiscordAdapter.editMsg", () => {
       },
     } as unknown as Message;
 
-    const adapter = new DiscordAdapter();
+    const adapter = createTestDiscordAdapter();
     (adapter as unknown as { client: unknown }).client = {
       user: { id: "bot" },
       channels: {
@@ -461,7 +549,7 @@ describe("DiscordAdapter.editMsg", () => {
       },
     } as unknown as Message;
 
-    const adapter = new DiscordAdapter();
+    const adapter = createTestDiscordAdapter();
     (adapter as unknown as { client: unknown }).client = {
       user: { id: "bot" },
       channels: {
@@ -490,7 +578,7 @@ describe("DiscordAdapter.editMsg", () => {
       edit: async () => undefined,
     } as unknown as Message;
 
-    const adapter = new DiscordAdapter();
+    const adapter = createTestDiscordAdapter();
     (adapter as unknown as { client: unknown }).client = {
       user: { id: "bot" },
       channels: {
@@ -528,7 +616,7 @@ describe("DiscordAdapter.editMsg", () => {
       },
     } as unknown as Message;
 
-    const adapter = new DiscordAdapter();
+    const adapter = createTestDiscordAdapter();
     (adapter as unknown as { client: unknown }).client = {
       user: { id: "bot" },
       channels: {

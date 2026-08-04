@@ -1,9 +1,12 @@
 import {
+  type EventPublishContractInvalid,
+  type EventPublishTransportFailed,
   lilacEventTypes,
   type AdapterPlatform,
   type LilacBus,
   type LilacDataForType,
 } from "@stanley2058/lilac-event-bus";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 export const AGENT_OUTPUT_FLUSH_INTERVAL_MS = 40;
 export const AGENT_OUTPUT_FLUSH_BYTES = 4 * 1024;
@@ -18,6 +21,36 @@ type ActivityData = LilacDataForType<typeof lilacEventTypes.EvtAgentOutputActivi
 type PendingOutput =
   | { type: "text"; data: TextData; bytes: number }
   | { type: "reasoning"; data: ReasoningData; bytes: number };
+
+type EventPublishError = EventPublishContractInvalid | EventPublishTransportFailed;
+
+export class AgentOutputPublishFailed extends TaggedError("AgentOutputPublishFailed")<{
+  readonly label: string;
+  readonly eventType: string;
+  readonly errorTag: EventPublishError["_tag"];
+  readonly message: string;
+}> {}
+
+function toAgentOutputPublishResult(
+  label: string,
+  published: ResultType<object, EventPublishError>,
+): ResultType<void, AgentOutputPublishFailed> {
+  if (published.status === "ok") return Result.ok(undefined);
+  return Result.err(
+    new AgentOutputPublishFailed({
+      label,
+      eventType: published.error.eventType,
+      errorTag: published.error._tag,
+      message: published.error.message,
+    }),
+  );
+}
+
+export function adaptAgentOutputPublishResultToHost(
+  result: ResultType<void, AgentOutputPublishFailed>,
+): void {
+  if (result.status === "error") throw result.error;
+}
 
 export type AgentOutputFlushScheduler = (callback: () => void, delayMs: number) => () => void;
 
@@ -37,21 +70,46 @@ export function createAgentOutputPublisher(params: {
     router_session_mode?: "mention" | "active";
   };
   scheduleFlush?: AgentOutputFlushScheduler;
-  onError?: (label: string, error: unknown) => void;
+  onError?: (label: string, error: AgentOutputPublishFailed) => void;
+  reportFatalPanic: (panic: Panic) => void;
 }) {
   const scheduleFlush = params.scheduleFlush ?? defaultScheduleFlush;
   let pending: PendingOutput | null = null;
   let cancelScheduledFlush: (() => void) | null = null;
-  let publicationTail = Promise.resolve();
+  let publicationTail: Promise<ResultType<void, never>> = Promise.resolve(Result.ok(undefined));
+  let reportedPanic: Panic | null = null;
 
-  const enqueue = (label: string, publish: () => Promise<unknown>): Promise<void> => {
-    const publication = publicationTail.then(async () => {
-      await publish();
-    });
-    publicationTail = publication.catch((error: unknown) => {
-      params.onError?.(label, error);
-    });
+  const enqueue = (
+    label: string,
+    publish: () => Promise<ResultType<void, AgentOutputPublishFailed>>,
+  ): Promise<ResultType<void, AgentOutputPublishFailed>> => {
+    const previous = publicationTail;
+    const run = async (): Promise<ResultType<void, AgentOutputPublishFailed>> => {
+      await previous;
+      return publish();
+    };
+    const publication = run();
+    const settle = async (): Promise<ResultType<void, never>> => {
+      const result = await publication;
+      if (result.status === "error") params.onError?.(label, result.error);
+      return Result.ok(undefined);
+    };
+    const settlement = settle();
+    publicationTail = settlement;
+    const superviseSettlement = (cause: unknown): void => {
+      if (!Panic.is(cause) || reportedPanic) return;
+      reportedPanic = cause;
+      params.reportFatalPanic(cause);
+    };
+    void settlement.then(undefined, superviseSettlement);
     return publication;
+  };
+
+  const enqueueForHost = async (
+    label: string,
+    publish: () => Promise<ResultType<void, AgentOutputPublishFailed>>,
+  ): Promise<void> => {
+    adaptAgentOutputPublishResultToHost(await enqueue(label, publish));
   };
 
   const clearScheduledFlush = (): void => {
@@ -67,17 +125,23 @@ export function createAgentOutputPublisher(params: {
 
     if (output.type === "text") {
       void enqueue("text delta", async () => {
-        await params.bus.publish(lilacEventTypes.EvtAgentOutputDeltaText, output.data, {
-          headers: params.headers,
-        });
+        return toAgentOutputPublishResult(
+          "text delta",
+          await params.bus.publish(lilacEventTypes.EvtAgentOutputDeltaText, output.data, {
+            headers: params.headers,
+          }),
+        );
       });
       return;
     }
 
     void enqueue("reasoning snapshot", async () => {
-      await params.bus.publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, output.data, {
-        headers: params.headers,
-      });
+      return toAgentOutputPublishResult(
+        "reasoning snapshot",
+        await params.bus.publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, output.data, {
+          headers: params.headers,
+        }),
+      );
     });
   };
 
@@ -139,46 +203,61 @@ export function createAgentOutputPublisher(params: {
 
   const publishTextReset = (data: TextResetData): Promise<void> => {
     flushPending();
-    return enqueue("text reset", async () => {
-      await params.bus.publish(lilacEventTypes.EvtAgentOutputTextReset, data, {
-        headers: params.headers,
-      });
+    return enqueueForHost("text reset", async () => {
+      return toAgentOutputPublishResult(
+        "text reset",
+        await params.bus.publish(lilacEventTypes.EvtAgentOutputTextReset, data, {
+          headers: params.headers,
+        }),
+      );
     });
   };
 
   const publishReasoningBoundary = (data: ReasoningData): Promise<void> => {
     flushPending();
-    return enqueue("reasoning boundary", async () => {
-      await params.bus.publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, data, {
-        headers: params.headers,
-      });
+    return enqueueForHost("reasoning boundary", async () => {
+      return toAgentOutputPublishResult(
+        "reasoning boundary",
+        await params.bus.publish(lilacEventTypes.EvtAgentOutputDeltaReasoning, data, {
+          headers: params.headers,
+        }),
+      );
     });
   };
 
   const publishToolCall = (data: ToolCallData): Promise<void> => {
     flushPending();
-    return enqueue("tool status", async () => {
-      await params.bus.publish(lilacEventTypes.EvtAgentOutputToolCall, data, {
-        headers: params.headers,
-      });
+    return enqueueForHost("tool status", async () => {
+      return toAgentOutputPublishResult(
+        "tool status",
+        await params.bus.publish(lilacEventTypes.EvtAgentOutputToolCall, data, {
+          headers: params.headers,
+        }),
+      );
     });
   };
 
   const publishActivity = (data: ActivityData): Promise<void> => {
     flushPending();
-    return enqueue("activity", async () => {
-      await params.bus.publish(lilacEventTypes.EvtAgentOutputActivity, data, {
-        headers: params.headers,
-      });
+    return enqueueForHost("activity", async () => {
+      return toAgentOutputPublishResult(
+        "activity",
+        await params.bus.publish(lilacEventTypes.EvtAgentOutputActivity, data, {
+          headers: params.headers,
+        }),
+      );
     });
   };
 
   const publishResponseText = (data: ResponseTextData): Promise<void> => {
     flushPending();
-    return enqueue("final response", async () => {
-      await params.bus.publish(lilacEventTypes.EvtAgentOutputResponseText, data, {
-        headers: params.headers,
-      });
+    return enqueueForHost("final response", async () => {
+      return toAgentOutputPublishResult(
+        "final response",
+        await params.bus.publish(lilacEventTypes.EvtAgentOutputResponseText, data, {
+          headers: params.headers,
+        }),
+      );
     });
   };
 

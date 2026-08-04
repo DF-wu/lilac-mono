@@ -1,6 +1,7 @@
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
+import type { Root, RootContent } from "mdast";
 
 export type UnsafeZoneReason = "marker" | "link" | "image" | "html" | "fence-line";
 
@@ -67,17 +68,6 @@ export interface MarkdownInlineCodeRange {
   closeStart: number;
   end: number;
   marker: string;
-}
-
-interface MarkdownNode {
-  type?: unknown;
-  value?: unknown;
-  lang?: unknown;
-  children?: unknown;
-  position?: {
-    start?: { offset?: number };
-    end?: { offset?: number };
-  };
 }
 
 function lineEndIndex(text: string, start: number): number {
@@ -156,13 +146,11 @@ function collectAstUnsafeZones(
   zones: UnsafeZone[],
   formattingRanges: MarkdownFormattingRange[],
   inlineCodeRanges: MarkdownInlineCodeRange[],
-  node: unknown,
+  node: Root | RootContent,
 ): void {
-  if (typeof node !== "object" || node === null) return;
-  const current = node as MarkdownNode;
-  const type = typeof current.type === "string" ? current.type : "";
-  const start = current.position?.start?.offset;
-  const end = current.position?.end?.offset;
+  const type = node.type;
+  const start = node.position?.start.offset;
+  const end = node.position?.end.offset;
 
   if (typeof start === "number" && typeof end === "number" && end > start) {
     switch (type) {
@@ -205,8 +193,8 @@ function collectAstUnsafeZones(
     }
   }
 
-  if (Array.isArray(current.children)) {
-    for (const child of current.children) {
+  if ("children" in node) {
+    for (const child of node.children) {
       collectAstUnsafeZones(raw, zones, formattingRanges, inlineCodeRanges, child);
     }
   }

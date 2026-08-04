@@ -114,17 +114,19 @@ export function decodeToolResultArtifactMetadata(
     );
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(input.serialized);
-  } catch {
-    return Result.err(
+  const serialized = input.serialized;
+  const parsedJson = Result.try({
+    try: () => JSON.parse(serialized),
+    catch: () =>
       new ToolResultArtifactMetadataMalformed({
         issueCode: "malformed-serialization",
         message: "Tool result artifact metadata is not valid JSON",
       }),
-    );
+  });
+  if (parsedJson.status === "error") {
+    return Result.err(parsedJson.error);
   }
+  const parsed: unknown = parsedJson.value;
 
   const versioned = envelopeVersionSchema.safeParse(parsed);
   if (versioned.success && versioned.data.version !== TOOL_RESULT_ARTIFACT_METADATA_VERSION) {

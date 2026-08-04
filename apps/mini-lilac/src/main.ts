@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import path from "node:path";
 
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+
 export const HELP_TEXT = `mini-lilac - local coding-agent clients and server
 
 Usage:
@@ -23,6 +25,12 @@ export type MiniLilacCommandRunners = {
   readonly server: (args: readonly string[]) => Promise<void>;
 };
 
+export class MiniLilacCommandFailed extends TaggedError("MiniLilacCommandFailed")<{
+  readonly command: "cli" | "server" | "tui";
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
 export function ensureServerDataDir(
   env: Record<string, string | undefined>,
   homeDirectory = homedir(),
@@ -44,37 +52,58 @@ const defaultRunners: MiniLilacCommandRunners = {
   },
 };
 
+async function captureCommand<T>(
+  command: "cli" | "server" | "tui",
+  operation: () => Promise<T>,
+): Promise<ResultType<T, MiniLilacCommandFailed>> {
+  try {
+    return Result.ok(await operation());
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    const message = cause instanceof Error ? cause.message : "Mini Lilac command failed";
+    return Result.err(new MiniLilacCommandFailed({ command, cause, message }));
+  }
+}
+
 export async function runMiniLilac(
   args: readonly string[],
   runners: MiniLilacCommandRunners = defaultRunners,
   writeOutput: (text: string) => void = (text) => process.stdout.write(text),
-): Promise<number> {
+): Promise<ResultType<number, MiniLilacCommandFailed>> {
   const [command, ...commandArgs] = args;
 
   if (command === "--help" || command === "-h" || command === "help") {
-    writeOutput(HELP_TEXT);
-    return 0;
+    const output = await captureCommand("cli", async () => writeOutput(HELP_TEXT));
+    return output.status === "ok" ? Result.ok(0) : Result.err(output.error);
   }
   if (command === "server") {
-    await runners.server(commandArgs);
-    return 0;
+    const server = await captureCommand("server", () => runners.server(commandArgs));
+    return server.status === "ok" ? Result.ok(0) : Result.err(server.error);
   }
   if (command === "history-recovery") {
-    await runners.server([command, ...commandArgs]);
-    return 0;
+    const server = await captureCommand("server", () => runners.server([command, ...commandArgs]));
+    return server.status === "ok" ? Result.ok(0) : Result.err(server.error);
   }
-  if (command === "tui") return runners.tui(commandArgs);
-  return runners.tui(args);
+  if (command === "tui") return captureCommand("tui", () => runners.tui(commandArgs));
+  return captureCommand("tui", () => runners.tui(args));
 }
 
-if (import.meta.main) {
-  runMiniLilac(process.argv.slice(2))
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`${message}\n`);
-      process.exitCode = 1;
-    });
+export async function runMiniLilacMain(
+  args: readonly string[],
+  runners: MiniLilacCommandRunners = defaultRunners,
+  writeOutput: (text: string) => void = (text) => process.stdout.write(text),
+  writeError: (text: string) => void = (text) => process.stderr.write(text),
+  setExitCode: (code: number) => void = (code) => {
+    process.exitCode = code;
+  },
+): Promise<void> {
+  const result = await runMiniLilac(args, runners, writeOutput);
+  if (result.status === "error") {
+    writeError(`${result.error.message}\n`);
+    setExitCode(1);
+    return;
+  }
+  setExitCode(result.value);
 }
+
+if (import.meta.main) await runMiniLilacMain(process.argv.slice(2));

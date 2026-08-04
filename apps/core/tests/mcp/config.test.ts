@@ -14,6 +14,7 @@ import {
   readMcpConfigFile,
   resolveMcpConfigPath,
   serializeMcpConfigYaml,
+  serializeMcpConfigYamlResult,
   writeMcpConfigFileAtomic,
   type McpConfigFileDependencies,
   type McpServerDefinition,
@@ -190,6 +191,35 @@ servers:
       client: { type: dynamic }
 `);
     expect(configurableRedirect.ok).toBe(false);
+  });
+
+  it("rejects invalid emitted shapes while preserving earlier serialization errors", () => {
+    const unsupported = serializeMcpConfigYamlResult({
+      configVersion: 2,
+      servers: { expected: stdioServer("different") },
+    });
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "error") {
+      expect(unsupported.error).toMatchObject({ reason: "unsupported-version" });
+    }
+
+    const invalid = serializeMcpConfigYamlResult({
+      configVersion: 1,
+      servers: { "../invalid": stdioServer("../invalid") },
+    });
+    expect(invalid.status).toBe("error");
+    if (invalid.status === "error") {
+      expect(invalid.error).toMatchObject({ reason: "invalid-output" });
+    }
+
+    const mismatched = serializeMcpConfigYamlResult({
+      configVersion: 1,
+      servers: { expected: stdioServer("different") },
+    });
+    expect(mismatched.status).toBe("error");
+    if (mismatched.status === "error") {
+      expect(mismatched.error).toMatchObject({ reason: "id-mismatch" });
+    }
   });
 });
 

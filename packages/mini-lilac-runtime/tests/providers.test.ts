@@ -3,14 +3,21 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/prom
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
+
 import {
   createAiProviderRegistry,
+  createAiProviderRegistryResult,
+  decodeProviderAuth,
   loadProviderAuth,
+  loadProviderAuthResult,
   loadProviderConfig,
   loadProviderRegistry,
+  loadProviderRegistryResult,
   providerConfigSchema,
   reasoningProviderOptions,
   writeProviderAuth,
+  writeProviderAuthResult,
   type ProviderAuth,
   type ProviderConfig,
 } from "../src/providers";
@@ -52,6 +59,11 @@ async function loadTestRegistry(
   providerAuth: ProviderAuth,
   oauth: typeof oauthTokens | null,
 ) {
+  const runtimeConfig = await writeRegistryFixture(providerConfig, providerAuth);
+  return loadProviderRegistry(runtimeConfig, { readCodexTokens: async () => oauth });
+}
+
+async function writeRegistryFixture(providerConfig: ProviderConfig, providerAuth: ProviderAuth) {
   const directory = await tempDirectory();
   const providerConfigFile = path.join(directory, "providers.yaml");
   const providerAuthFile = path.join(directory, "auth.json");
@@ -81,8 +93,7 @@ async function loadTestRegistry(
       },
     }),
   );
-  const runtimeConfig = await loadRuntimeConfig(runtimeConfigFile);
-  return loadProviderRegistry(runtimeConfig, { readCodexTokens: async () => oauth });
+  return loadRuntimeConfig(runtimeConfigFile);
 }
 
 describe("reasoningProviderOptions", () => {
@@ -169,6 +180,41 @@ describe("reasoningProviderOptions", () => {
 });
 
 describe("provider configuration", () => {
+  it("returns typed auth failures and keeps rejected secrets out of serialization", async () => {
+    const rejected = decodeProviderAuth(
+      { local: { type: "api-key", key: "do-not-print", unexpected: true } },
+      "auth.json",
+    );
+    expect(rejected.status).toBe("error");
+    if (rejected.status === "error") {
+      expect(rejected.error._tag).toBe("ProviderAuthInvalid");
+      expect(JSON.stringify(rejected.error)).not.toContain("do-not-print");
+    }
+
+    const directory = await tempDirectory();
+    const authFile = path.join(directory, "auth.json");
+    const written = await writeProviderAuthResult(authFile, {
+      local: { type: "api-key", key: "do-not-print", unexpected: true },
+    });
+    expect(written.status).toBe("error");
+    expect(await readdir(directory)).toEqual([]);
+    const missing = await loadProviderAuthResult(authFile);
+    expect(missing.status).toBe("error");
+
+    const malformedSecret = "malformed-auth-secret";
+    await Bun.write(authFile, `{"local":{"type":"api-key","key":"${malformedSecret}"}`);
+    await chmod(authFile, 0o600);
+    const malformed = await loadProviderAuthResult(authFile);
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "error") {
+      expect(JSON.stringify(malformed.error)).not.toContain(malformedSecret);
+      expect(JSON.stringify(formatTaggedErrorForLog(malformed.error))).not.toContain(
+        malformedSecret,
+      );
+      expect(Object.hasOwn(malformed.error, "cause")).toBe(false);
+    }
+  });
+
   it("loads versioned provider YAML and private auth JSON", async () => {
     const directory = await tempDirectory();
     const configFile = path.join(directory, "providers.yaml");
@@ -325,6 +371,9 @@ describe("provider configuration", () => {
         extra: { type: "api-key", key: "unused" },
       }),
     ).toThrow("unconfigured provider");
+    const missing = createAiProviderRegistryResult(config, {});
+    expect(missing.status).toBe("error");
+    if (missing.status === "error") expect(missing.error._tag).toBe("ProviderCredentialsInvalid");
   });
 
   it("supersedes standard OpenAI with Codex OAuth without changing its model namespace", async () => {
@@ -356,9 +405,81 @@ describe("provider configuration", () => {
     const fallback = await loadTestRegistry(providerConfig, providerAuth, null);
     expect(fallback.supersededProviderIds).toEqual([]);
     expect(fallback.registry.languageModel("openai/gpt-5").modelId).toBe("gpt-5");
+    expect(JSON.stringify(fallback)).not.toContain("openai-api-key");
 
     const superseded = await loadTestRegistry(providerConfig, providerAuth, oauthTokens);
     expect(superseded.supersededProviderIds).toEqual(["openai"]);
+  });
+
+  it("exposes provider registry startup failures as values", async () => {
+    const directory = await tempDirectory();
+    const result = await loadProviderRegistryResult({
+      configVersion: 1,
+      configFile: path.join(directory, "config.yaml"),
+      providerConfigFile: path.join(directory, "missing-providers.yaml"),
+      providerAuthFile: path.join(directory, "missing-auth.json"),
+      server: { host: "127.0.0.1", port: 8090 },
+      agent: {
+        systemPrompt: "test",
+        defaultProfile: "coding",
+        idleTimeoutMs: 900_000,
+        compaction: { model: "inherit", earlyCompactionPoint: 0.8 },
+        subagents: { enabled: true, maxDepth: 1 },
+        profiles: {
+          coding: {
+            subagentOnly: false,
+            tools: ["*"],
+            execution: true,
+            workspaceWrites: true,
+            delegation: true,
+          },
+        },
+      },
+    });
+    expect(result.status).toBe("error");
+  });
+
+  it("redacts credential-store rejection causes from JSON and log projections", async () => {
+    const credentialSecret = "credential-store-token-secret";
+    const runtimeConfig = await writeRegistryFixture(config, auth);
+    const result = await loadProviderRegistryResult(runtimeConfig, {
+      readCodexTokens: async () => {
+        throw new Error(`token=${credentialSecret}`);
+      },
+    });
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ProviderCodexTokensReadFailed");
+      expect(JSON.stringify(result.error)).not.toContain(credentialSecret);
+      expect(JSON.stringify(formatTaggedErrorForLog(result.error))).not.toContain(credentialSecret);
+      expect(Object.hasOwn(result.error, "cause")).toBe(false);
+    }
+  });
+
+  it("redacts provider-construction rejection causes from JSON and log projections", async () => {
+    const providerSecret = "provider-construction-secret";
+    const runtimeConfig = await writeRegistryFixture(
+      {
+        configVersion: 1,
+        providers: { openai: { type: "openai", catalog: "models-dev" } },
+      },
+      {},
+    );
+    const result = await loadProviderRegistryResult(runtimeConfig, {
+      readCodexTokens: async () => oauthTokens,
+      createCodexOAuthProvider: () => {
+        throw new Error(`authorization=Bearer ${providerSecret}`);
+      },
+    });
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ProviderRegistryCreationFailed");
+      expect(JSON.stringify(result.error)).not.toContain(providerSecret);
+      expect(JSON.stringify(formatTaggedErrorForLog(result.error))).not.toContain(providerSecret);
+      expect(Object.hasOwn(result.error, "cause")).toBe(false);
+    }
   });
 
   it("never supersedes custom-baseUrl OpenAI and still requires its API key", async () => {

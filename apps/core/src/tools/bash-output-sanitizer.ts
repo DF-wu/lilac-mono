@@ -3,9 +3,13 @@ import fs from "node:fs/promises";
 import { Transform, type TransformCallback } from "node:stream";
 
 import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
+import { isPanic } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 
+import { projectRuntimeError } from "../runtime/error-format";
 import { normalizeLiteralSecrets, REDACTION_PLACEHOLDER } from "./bash-literal-redactor";
 import { redactSecrets } from "./bash-safety/format";
+import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 type AnsiState = "plain" | "escape" | "csi" | "osc" | "osc-escape";
 const MAX_PATTERN_REDACTION_BUFFER_CHARS = 64 * 1024;
@@ -313,30 +317,128 @@ export type StreamOutputBudget = {
   onExceeded(): void;
 };
 
-function isResponseBodyInit(value: unknown): value is BodyInit {
-  return (
-    typeof value === "string" ||
-    value instanceof Blob ||
-    value instanceof ArrayBuffer ||
-    ArrayBuffer.isView(value) ||
-    value instanceof FormData ||
-    value instanceof URLSearchParams ||
-    value instanceof ReadableStream
-  );
+export class BashOutputStreamError extends TaggedError("BashOutputStreamError")<{
+  readonly operation: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class BashOutputStreamAndCleanupError extends TaggedError(
+  "BashOutputStreamAndCleanupError",
+)<{
+  readonly primary: BashOutputStreamError;
+  readonly cleanup: BashOutputCleanupError;
+  readonly message: string;
+}> {}
+
+export class BashOutputCleanupError extends TaggedError("BashOutputCleanupError")<{
+  readonly failures: readonly BashOutputStreamError[];
+  readonly message: string;
+}> {}
+
+export type BashOutputReadError =
+  | BashOutputStreamError
+  | BashOutputCleanupError
+  | BashOutputStreamAndCleanupError;
+type BashOutputSource = BodyInit | number | undefined;
+
+interface BashOverflowSink {
+  write(chunk: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort(): Promise<void>;
 }
 
-export async function readSanitizedStreamTextCapped(
-  stream: unknown,
+export interface BashOutputOverflowOperations {
+  open(target: string): Promise<BashOverflowSink>;
+  remove(target: string): Promise<void>;
+}
+
+const DEFAULT_OVERFLOW_OPERATIONS: BashOutputOverflowOperations = {
+  open: (target) => BufferedFileSink.open(target, { flags: "wx", mode: 0o600 }),
+  remove: (target) => fs.rm(target, { force: true }),
+};
+
+type BashOutputCleanupAttempt =
+  | { readonly status: "ok" }
+  | { readonly status: "error"; readonly cause: unknown }
+  | { readonly status: "panic"; readonly panic: Panic };
+
+function settleBashOutputCleanup(run: () => Promise<void>): Promise<BashOutputCleanupAttempt> {
+  return Promise.resolve()
+    .then(run)
+    .then(
+      () => ({ status: "ok" }),
+      (caught: unknown) =>
+        isPanic(caught) ? { status: "panic", panic: caught } : { status: "error", cause: caught },
+    );
+}
+
+function captureBashOutputOperation<T>(params: {
+  readonly operation: string;
+  readonly run: () => Awaited<T>;
+}): ResultType<T, BashOutputStreamError> {
+  const captured = Result.try({
+    try: params.run,
+    catch: projectRuntimeError(`Opaque Bash output ${params.operation} failure`),
+  });
+  if (captured.status === "error") {
+    const cause = preserveToolPanic(captured.error);
+    return Result.err(
+      new BashOutputStreamError({
+        operation: params.operation,
+        cause,
+        message: `Bash output failed while ${params.operation}`,
+      }),
+    );
+  }
+  return Result.ok(captured.value);
+}
+
+async function captureBashOutputPromise<T>(params: {
+  readonly operation: string;
+  readonly run: () => Promise<T>;
+}): Promise<ResultType<T, BashOutputStreamError>> {
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: projectRuntimeError(`Opaque Bash output ${params.operation} failure`),
+  });
+  if (captured.status === "error") {
+    const cause = preserveToolPanic(captured.error);
+    return Result.err(
+      new BashOutputStreamError({
+        operation: params.operation,
+        cause,
+        message: `Bash output failed while ${params.operation}`,
+      }),
+    );
+  }
+  return Result.ok(captured.value);
+}
+
+function combineBashOutputAndCleanup(
+  primary: BashOutputStreamError,
+  cleanup: BashOutputCleanupError,
+): BashOutputStreamAndCleanupError {
+  return new BashOutputStreamAndCleanupError({
+    primary,
+    cleanup,
+    message: `${primary.message}; cleanup also failed: ${cleanup.message}`,
+  });
+}
+
+export async function readSanitizedStreamTextCappedResult(
+  stream: BashOutputSource,
   maxChars: number,
   options?: {
     overflowFilePath?: string;
     literalSecrets?: readonly string[];
     onActivity?: () => void;
     outputBudget?: StreamOutputBudget;
+    overflowOperations?: BashOutputOverflowOperations;
   },
-): Promise<SanitizedStreamTextResult> {
+): Promise<ResultType<SanitizedStreamTextResult, BashOutputReadError>> {
   if (!stream || typeof stream === "number") {
-    return { text: "", totalChars: 0, totalBytes: 0, capped: false };
+    return Result.ok({ text: "", totalChars: 0, totalBytes: 0, capped: false });
   }
 
   const sanitizer = createBashOutputSanitizer(options?.literalSecrets ?? []);
@@ -346,41 +448,88 @@ export async function readSanitizedStreamTextCapped(
   let capped = false;
   let overflowWriteFailed = false;
   let overflowFilePath: string | undefined;
-  let overflowSink: BufferedFileSink | undefined;
+  let overflowSink: BashOverflowSink | undefined;
   let overflowFileCreated = false;
   const bufferedRawChunks: Buffer[] = [];
   let bufferedRawBytes = 0;
   const rawBufferLimit = getPreOverflowRawByteLimit(maxChars);
+  const overflowOperations = options?.overflowOperations ?? DEFAULT_OVERFLOW_OPERATIONS;
+  const cleanupFailures: BashOutputStreamError[] = [];
+  let overflowOperationError: BashOutputStreamError | undefined;
 
-  const failOverflow = async () => {
+  const recordCleanupAttempt = async (operation: string, run: () => Promise<void>) => {
+    const attempt = await settleBashOutputCleanup(run);
+    if (attempt.status === "error") {
+      cleanupFailures.push(
+        new BashOutputStreamError({
+          operation,
+          cause: attempt.cause,
+          message: `Bash output failed while ${operation}`,
+        }),
+      );
+    }
+    return attempt.status === "panic" ? attempt.panic : undefined;
+  };
+
+  const failOverflow = async (params?: {
+    primary?: BashOutputStreamError;
+    cleanup?: BashOutputStreamError;
+    panic?: unknown;
+  }) => {
+    if (params?.primary && !overflowOperationError) overflowOperationError = params.primary;
+    if (params?.cleanup) cleanupFailures.push(params.cleanup);
     overflowWriteFailed = true;
     overflowFilePath = undefined;
     const sink = overflowSink;
     overflowSink = undefined;
-    await sink?.abort();
+    let deferredPanic: Panic | undefined;
+    if (params?.panic && isPanic(params.panic)) deferredPanic = params.panic;
+    if (sink) {
+      const abortPanic = await recordCleanupAttempt("aborting overflow output", () => sink.abort());
+      if (!deferredPanic) deferredPanic = abortPanic;
+    }
     if (overflowFileCreated && options?.overflowFilePath) {
-      await fs.rm(options.overflowFilePath, { force: true }).catch(() => undefined);
+      const removePanic = await recordCleanupAttempt("removing incomplete overflow output", () =>
+        overflowOperations.remove(options.overflowFilePath!),
+      );
+      if (!deferredPanic) deferredPanic = removePanic;
     }
     overflowFileCreated = false;
     bufferedRawChunks.length = 0;
     bufferedRawBytes = 0;
+    if (deferredPanic) preserveToolPanic(deferredPanic);
   };
 
   const writeOverflowChunk = async (chunk: Uint8Array) => {
     if (chunk.byteLength === 0 || overflowWriteFailed || !options?.overflowFilePath) return;
-    try {
-      if (!overflowSink) {
-        overflowSink = await BufferedFileSink.open(options.overflowFilePath, {
-          flags: "wx",
-          mode: 0o600,
-        });
-        overflowFileCreated = true;
+    if (!overflowSink) {
+      const opened = await captureBashOutputPromise({
+        operation: "opening overflow output",
+        run: () => overflowOperations.open(options.overflowFilePath!),
+      });
+      if (opened.status === "error") {
+        await failOverflow({ primary: opened.error });
+        return;
       }
-      await overflowSink.write(chunk);
-      overflowFilePath = options.overflowFilePath;
-    } catch {
-      await failOverflow();
+      overflowSink = opened.value;
+      overflowFileCreated = true;
     }
+    const written = await settleBashOutputCleanup(() => overflowSink!.write(chunk));
+    if (written.status === "error") {
+      await failOverflow({
+        primary: new BashOutputStreamError({
+          operation: "writing overflow output",
+          cause: written.cause,
+          message: "Bash output failed while writing overflow output",
+        }),
+      });
+      return;
+    }
+    if (written.status === "panic") {
+      await failOverflow({ panic: written.panic });
+      return;
+    }
+    overflowFilePath = options.overflowFilePath;
   };
 
   const flushBufferedRaw = async () => {
@@ -431,54 +580,141 @@ export async function readSanitizedStreamTextCapped(
     text = previousText + chunk.slice(0, sliceEnd);
   };
 
-  const maybeReadable = stream as { getReader?: unknown };
-  if (typeof maybeReadable.getReader === "function") {
-    const reader = (stream as ReadableStream<Uint8Array>).getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value && value.byteLength > 0) {
-          options?.onActivity?.();
-          if (options?.outputBudget) {
-            options.outputBudget.consumedBytes += value.byteLength;
-            if (options.outputBudget.consumedBytes > options.outputBudget.maxBytes) {
-              if (!options.outputBudget.exceeded) {
-                options.outputBudget.exceeded = true;
-                options.outputBudget.onExceeded();
-              }
-              throw new Error(
-                `Bash output exceeded the ${options.outputBudget.maxBytes}-byte cumulative budget`,
-              );
-            }
-          }
-          await retainRawChunk(value);
-          await consumeSanitizedText(sanitizer.write(value));
-          if (capped && !overflowSink) await flushBufferedRaw();
-        }
+  if (stream instanceof ReadableStream) {
+    const acquired = captureBashOutputOperation({
+      operation: "acquiring the stream reader",
+      run: () => stream.getReader(),
+    });
+    if (acquired.status === "error") return acquired;
+    const reader = acquired.value;
+    let primaryError: BashOutputStreamError | undefined;
+    while (true) {
+      const read = await captureBashOutputPromise({
+        operation: "reading the output stream",
+        run: () => reader.read(),
+      });
+      if (read.status === "error") {
+        primaryError = read.error;
+        break;
       }
-      await consumeSanitizedText(sanitizer.end());
+      const { done, value } = read.value;
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        const activity = options?.onActivity
+          ? captureBashOutputOperation({
+              operation: "reporting output activity",
+              run: options.onActivity,
+            })
+          : Result.ok();
+        if (activity.status === "error") {
+          primaryError = activity.error;
+          break;
+        }
+        if (options?.outputBudget) {
+          options.outputBudget.consumedBytes += value.byteLength;
+          if (options.outputBudget.consumedBytes > options.outputBudget.maxBytes) {
+            if (!options.outputBudget.exceeded) {
+              options.outputBudget.exceeded = true;
+              const exceeded = captureBashOutputOperation({
+                operation: "reporting the exceeded output budget",
+                run: options.outputBudget.onExceeded,
+              });
+              if (exceeded.status === "error") {
+                primaryError = exceeded.error;
+                break;
+              }
+            }
+            primaryError = new BashOutputStreamError({
+              operation: "enforcing the cumulative output budget",
+              cause: new RangeError("Bash cumulative output budget exceeded"),
+              message: `Bash output exceeded the ${options.outputBudget.maxBytes}-byte cumulative budget`,
+            });
+            break;
+          }
+        }
+        await retainRawChunk(value);
+        const sanitized = captureBashOutputOperation({
+          operation: "sanitizing output",
+          run: () => sanitizer.write(value),
+        });
+        if (sanitized.status === "error") {
+          primaryError = sanitized.error;
+          break;
+        }
+        await consumeSanitizedText(sanitized.value);
+        if (capped && !overflowSink) await flushBufferedRaw();
+      }
+    }
+    if (!primaryError) {
+      const ended = captureBashOutputOperation({
+        operation: "finishing output sanitization",
+        run: () => sanitizer.end(),
+      });
+      if (ended.status === "error") primaryError = ended.error;
+      else await consumeSanitizedText(ended.value);
       if (capped && !overflowSink) await flushBufferedRaw();
       if (overflowSink) {
-        try {
-          await overflowSink.close();
-        } catch {
-          await failOverflow();
+        const closed = await settleBashOutputCleanup(() => overflowSink!.close());
+        if (closed.status === "error") {
+          await failOverflow({
+            cleanup: new BashOutputStreamError({
+              operation: "closing overflow output",
+              cause: closed.cause,
+              message: "Bash output failed while closing overflow output",
+            }),
+          });
+        } else if (closed.status === "panic") {
+          await failOverflow({ panic: closed.panic });
         }
       }
-    } catch (error) {
+    } else {
       await failOverflow();
-      throw error;
-    } finally {
-      reader.releaseLock();
     }
+
+    const released = captureBashOutputOperation({
+      operation: "releasing the stream reader",
+      run: () => reader.releaseLock(),
+    });
+    if (released.status === "error") cleanupFailures.push(released.error);
+
+    const cleanupError =
+      cleanupFailures.length > 0
+        ? new BashOutputCleanupError({
+            failures: cleanupFailures,
+            message: "Bash output temporary spill cleanup failed",
+          })
+        : undefined;
+    const operationError = primaryError ?? overflowOperationError;
+    if (operationError && cleanupError) {
+      return Result.err(combineBashOutputAndCleanup(operationError, cleanupError));
+    }
+    if (primaryError) return Result.err(primaryError);
+    if (cleanupError) return Result.err(cleanupError);
   } else {
-    const response = new Response(isResponseBodyInit(stream) ? stream : String(stream));
-    if (!response.body) return { text: "", totalChars: 0, totalBytes: 0, capped: false };
-    return await readSanitizedStreamTextCapped(response.body, maxChars, options);
+    const response = new Response(stream);
+    if (!response.body) {
+      return Result.ok({ text: "", totalChars: 0, totalBytes: 0, capped: false });
+    }
+    return await readSanitizedStreamTextCappedResult(response.body, maxChars, options);
   }
 
-  return { text, totalChars, totalBytes, capped, overflowFilePath };
+  return Result.ok({ text, totalChars, totalBytes, capped, overflowFilePath });
+}
+
+export async function readSanitizedStreamTextCapped(
+  stream: BashOutputSource,
+  maxChars: number,
+  options?: {
+    overflowFilePath?: string;
+    literalSecrets?: readonly string[];
+    onActivity?: () => void;
+    outputBudget?: StreamOutputBudget;
+    overflowOperations?: BashOutputOverflowOperations;
+  },
+): Promise<SanitizedStreamTextResult> {
+  return adaptToolResultToHost(
+    await readSanitizedStreamTextCappedResult(stream, maxChars, options),
+  );
 }
 
 export function createBashOutputSanitizerTransform(literalSecrets: readonly string[]): Transform {
@@ -486,18 +722,20 @@ export function createBashOutputSanitizerTransform(literalSecrets: readonly stri
 
   return new Transform({
     transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback) {
-      try {
-        callback(null, sanitizer.write(chunk));
-      } catch (error) {
-        callback(error instanceof Error ? error : new Error(String(error)));
-      }
+      const transformed = captureBashOutputOperation({
+        operation: "sanitizing a transform chunk",
+        run: () => sanitizer.write(chunk),
+      });
+      if (transformed.status === "error") callback(transformed.error);
+      else callback(null, transformed.value);
     },
     flush(callback: TransformCallback) {
-      try {
-        callback(null, sanitizer.end());
-      } catch (error) {
-        callback(error instanceof Error ? error : new Error(String(error)));
-      }
+      const flushed = captureBashOutputOperation({
+        operation: "flushing the sanitizer transform",
+        run: () => sanitizer.end(),
+      });
+      if (flushed.status === "error") callback(flushed.error);
+      else callback(null, flushed.value);
     },
   });
 }

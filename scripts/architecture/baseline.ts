@@ -22,8 +22,10 @@ export function applyBaselines(
   zeroBaselineScopes: ReadonlyMap<string, readonly ZeroBaselineScope[]> = new Map(),
 ): BaselineEvaluation {
   const byFingerprint = new Map(findings.map((finding) => [finding.fingerprint, finding]));
-  const baselineFingerprints = new Set<string>();
+  const baselineKeys = new Set<string>();
   const stale: ArchitectureDiagnostic[] = [];
+  const baselineKey = (workspace: string, fingerprint: string): string =>
+    `${workspace}\0${fingerprint}`;
 
   for (const [group, baseline] of [
     ["boundary-validation", boundaryValidation],
@@ -33,6 +35,21 @@ export function applyBaselines(
       for (const rule of ARCHITECTURE_RULES) {
         if (RULE_GROUPS[rule] !== group) continue;
         for (const entry of rules[rule] ?? []) {
+          const fingerprintFinding = byFingerprint.get(entry.fingerprint);
+          if (fingerprintFinding && fingerprintFinding.workspace !== workspace) {
+            stale.push({
+              rule,
+              severity: "error",
+              workspace,
+              message: `Baseline partition ${workspace} cannot suppress a finding owned by ${fingerprintFinding.workspace}.`,
+              suggestion:
+                "Move the entry to its exact workspace partition or remove it; baseline ownership is workspace-bound.",
+              identity: entry.identity,
+              fingerprint: `partition-mismatch:${workspace}:${entry.fingerprint}`,
+              location: entry.location,
+            });
+            continue;
+          }
           const symbol = entry.identity.slice(
             entry.identity.indexOf("#") + 1,
             entry.identity.indexOf("[") < 0 ? undefined : entry.identity.indexOf("["),
@@ -69,8 +86,8 @@ export function applyBaselines(
             });
             continue;
           }
-          baselineFingerprints.add(entry.fingerprint);
-          if (byFingerprint.has(entry.fingerprint)) continue;
+          baselineKeys.add(baselineKey(workspace, entry.fingerprint));
+          if (fingerprintFinding) continue;
           stale.push({
             rule,
             severity: "warning",
@@ -88,12 +105,14 @@ export function applyBaselines(
 
   return {
     diagnostics: [
-      ...findings.filter((finding) => !baselineFingerprints.has(finding.fingerprint)),
+      ...findings.filter(
+        (finding) => !baselineKeys.has(baselineKey(finding.workspace, finding.fingerprint)),
+      ),
       ...stale,
     ],
-    matched:
-      findings.length -
-      findings.filter((finding) => !baselineFingerprints.has(finding.fingerprint)).length,
+    matched: findings.filter((finding) =>
+      baselineKeys.has(baselineKey(finding.workspace, finding.fingerprint)),
+    ).length,
   };
 }
 
@@ -131,6 +150,10 @@ export function stage0BaselineReason(finding: ArchitectureDiagnostic): string {
       return "Existing structured assertion from unknown awaiting complete runtime validation.";
     case "architecture/no-rich-unknown-predicate":
       return "Existing rich unknown predicate awaiting schema decoding or exact capability registration.";
+    case "architecture/no-unknown-member-read":
+      return "Existing unknown member read awaiting ownership by an exact boundary decoder.";
+    case "architecture/no-unregistered-custom-decoder":
+      return "Existing custom decoder awaiting exact boundary ownership registration.";
     case "architecture/closed-union-exhaustiveness":
       return "Existing closed-union control flow awaiting exhaustive handling without a silent default.";
     case "architecture/closed-union-map-exhaustiveness":

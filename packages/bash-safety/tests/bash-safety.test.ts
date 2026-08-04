@@ -26,6 +26,13 @@ describe("analyzeBashCommand", () => {
     expect(analyzeBashCommand("xargs -I{} rm -rf {}")).not.toBeNull();
   });
 
+  it("falls back to text analysis when shell parsing fails", () => {
+    expect(analyzeBashCommand("git reset --hard &&")?.reason).toContain(
+      "destroys all uncommitted changes",
+    );
+    expect(analyzeBashCommand("echo ok &&")).toBeNull();
+  });
+
   it("blocks static protected-path access but does not claim process isolation", () => {
     const options = {
       cwd: "/data/workspace",

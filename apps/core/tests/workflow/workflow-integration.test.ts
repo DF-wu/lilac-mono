@@ -38,6 +38,18 @@ import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store"
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
+
+function createWorkflowProgressProjectorForTest(
+  input: Omit<ConstructorParameters<typeof WorkflowProgressProjector>[0], "reportFatalPanic">,
+) {
+  return new WorkflowProgressProjector({
+    ...input,
+    reportFatalPanic: (panic) => {
+      throw panic;
+    },
+  });
+}
+
 class LiveRawBus implements RawBus {
   subscribe = subscribeForTest;
   private sequence = 0;
@@ -191,7 +203,7 @@ describe("unified workflow integration", () => {
     const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
     const bus = createLilacBus(new LiveRawBus());
     const adapter = new WorkflowCardAdapter();
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -398,7 +410,7 @@ describe("unified workflow integration", () => {
       authenticatedPrincipal: { platform: "discord" as const, userId: "user-1" },
       toolCallId: "restart-tool-1",
     };
-    const firstProjector = new WorkflowProgressProjector({
+    const firstProjector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -463,7 +475,7 @@ describe("unified workflow integration", () => {
       await tool.destroy();
       store.close();
       store = new DurableWorkflowStore(dbPath);
-      restartedProjector = new WorkflowProgressProjector({
+      restartedProjector = createWorkflowProgressProjectorForTest({
         bus,
         store,
         adapters: new Map([["discord", adapter]]),

@@ -3,6 +3,8 @@ import path from "node:path";
 
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
+import { projectRuntimeError } from "../runtime/error-format";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 import type { JsonValue } from "./workflow-domain";
 import {
   decodeWorkflowValueArtifact,
@@ -136,24 +138,26 @@ function rethrowWorkflowArtifactPanic(cause: unknown): void {
   if (Panic.is(cause)) throw cause;
 }
 
-function captureIo<T>(input: {
+async function captureIo<T>(input: {
   readonly artifactId: string;
   readonly operation: WorkflowArtifactIoOperation;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, WorkflowArtifactIoFailed>> {
-  return Result.tryPromise({
+  const captured = await Result.tryPromise({
     try: input.run,
-    catch: (cause) => {
-      rethrowWorkflowArtifactPanic(cause);
-      const failure = projectFilesystemFailure(cause);
-      return new WorkflowArtifactIoFailed({
-        artifactId: input.artifactId,
-        operation: input.operation,
-        code: failure.code,
-        message: `Workflow value artifact I/O failed during ${input.operation}`,
-      });
-    },
+    catch: projectRuntimeError(`Opaque workflow artifact ${input.operation} failure`),
   });
+  if (captured.status === "ok") return Result.ok(captured.value);
+  const cause = preserveToolPanic(captured.error);
+  const failure = projectFilesystemFailure(cause);
+  return Result.err(
+    new WorkflowArtifactIoFailed({
+      artifactId: input.artifactId,
+      operation: input.operation,
+      code: failure.code,
+      message: `Workflow value artifact I/O failed during ${input.operation}`,
+    }),
+  );
 }
 
 async function lstatOrMissing(input: {

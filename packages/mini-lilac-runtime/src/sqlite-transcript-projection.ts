@@ -2,6 +2,8 @@ import {
   miniLilacUIMessageDataPartSchema,
   miniLilacUIMessageMetadataSchema,
 } from "@stanley2058/mini-lilac-client";
+import { isRecord } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 const jsonValueSchema = z.json();
@@ -40,9 +42,23 @@ export type MiniLilacPersistedSuperJsonValue =
   | Set<MiniLilacPersistedSuperJsonValue>
   | { readonly [key: string]: MiniLilacPersistedSuperJsonValue };
 
-export function validateMiniLilacPersistedSuperJsonValue(value: unknown): boolean {
-  const seen = new WeakSet<object>();
-  const validate = (candidate: unknown): boolean => {
+export class MiniLilacPersistedSuperJsonValueInvalid extends TaggedError(
+  "MiniLilacPersistedSuperJsonValueInvalid",
+)<{
+  readonly message: string;
+}> {}
+
+export function validateMiniLilacPersistedSuperJsonValue(
+  value: unknown,
+): ResultType<MiniLilacPersistedSuperJsonValue, MiniLilacPersistedSuperJsonValueInvalid> {
+  const seen = new Map<object, MiniLilacPersistedSuperJsonValue>();
+  const invalid = (): MiniLilacPersistedSuperJsonValueInvalid =>
+    new MiniLilacPersistedSuperJsonValueInvalid({
+      message: "Expected a recursively valid SuperJSON value",
+    });
+  const decode = (
+    candidate: unknown,
+  ): ResultType<MiniLilacPersistedSuperJsonValue, MiniLilacPersistedSuperJsonValueInvalid> => {
     if (
       candidate === null ||
       candidate === undefined ||
@@ -51,36 +67,79 @@ export function validateMiniLilacPersistedSuperJsonValue(value: unknown): boolea
       typeof candidate === "string" ||
       typeof candidate === "bigint"
     ) {
-      return true;
+      return Result.ok(candidate);
     }
-    if (typeof candidate !== "object") return false;
+    if (typeof candidate !== "object") return Result.err(invalid());
     if (
-      candidate instanceof Date ||
       candidate instanceof RegExp ||
       candidate instanceof URL ||
       candidate instanceof Uint8Array ||
       candidate instanceof ArrayBuffer
     ) {
-      return !(candidate instanceof Date) || !Number.isNaN(candidate.getTime());
+      return Result.ok(candidate);
     }
-    if (seen.has(candidate)) return true;
-    seen.add(candidate);
-    if (Array.isArray(candidate)) return candidate.every(validate);
+    if (candidate instanceof Date) {
+      return Number.isNaN(candidate.getTime()) ? Result.err(invalid()) : Result.ok(candidate);
+    }
+    const existing = seen.get(candidate);
+    if (existing !== undefined) return Result.ok(existing);
+    if (Array.isArray(candidate)) {
+      const decodedValues: MiniLilacPersistedSuperJsonValue[] = [];
+      seen.set(candidate, decodedValues);
+      for (const nested of candidate) {
+        const decoded = decode(nested);
+        if (decoded.status === "error") return Result.err(decoded.error);
+        decodedValues.push(decoded.value);
+      }
+      return Result.ok(decodedValues);
+    }
     if (candidate instanceof Map) {
-      return [...candidate].every(([key, nestedValue]) => validate(key) && validate(nestedValue));
+      const decodedMap = new Map<
+        MiniLilacPersistedSuperJsonValue,
+        MiniLilacPersistedSuperJsonValue
+      >();
+      seen.set(candidate, decodedMap);
+      for (const [key, nestedValue] of candidate) {
+        const decodedKey = decode(key);
+        if (decodedKey.status === "error") return Result.err(decodedKey.error);
+        const decodedValue = decode(nestedValue);
+        if (decodedValue.status === "error") return Result.err(decodedValue.error);
+        decodedMap.set(decodedKey.value, decodedValue.value);
+      }
+      return Result.ok(decodedMap);
     }
-    if (candidate instanceof Set) return [...candidate].every(validate);
+    if (candidate instanceof Set) {
+      const decodedSet = new Set<MiniLilacPersistedSuperJsonValue>();
+      seen.set(candidate, decodedSet);
+      for (const nested of candidate) {
+        const decoded = decode(nested);
+        if (decoded.status === "error") return Result.err(decoded.error);
+        decodedSet.add(decoded.value);
+      }
+      return Result.ok(decodedSet);
+    }
     const prototype = Object.getPrototypeOf(candidate);
-    return (
-      (prototype === Object.prototype || prototype === null) &&
-      Object.values(candidate).every(validate)
-    );
+    if ((prototype !== Object.prototype && prototype !== null) || !isRecord(candidate)) {
+      return Result.err(invalid());
+    }
+    const decodedRecord: Record<string, MiniLilacPersistedSuperJsonValue> = {};
+    seen.set(candidate, decodedRecord);
+    for (const [key, nested] of Object.entries(candidate)) {
+      const decoded = decode(nested);
+      if (decoded.status === "error") return Result.err(decoded.error);
+      decodedRecord[key] = decoded.value;
+    }
+    return Result.ok(decodedRecord);
   };
-  return validate(value);
+  return decode(value);
+}
+
+function acceptsMiniLilacPersistedSuperJsonValue(value: unknown): boolean {
+  return validateMiniLilacPersistedSuperJsonValue(value).status === "ok";
 }
 
 export const superJsonValueSchema: z.ZodType<MiniLilacPersistedSuperJsonValue> =
-  z.custom<MiniLilacPersistedSuperJsonValue>(validateMiniLilacPersistedSuperJsonValue, {
+  z.custom<MiniLilacPersistedSuperJsonValue>(acceptsMiniLilacPersistedSuperJsonValue, {
     message: "Expected a recursively valid SuperJSON value",
   });
 

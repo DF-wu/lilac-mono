@@ -7,7 +7,13 @@ import {
   type EventDeliveryStopFailed,
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
-import { createLogger, getCoreConfig, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  getCoreConfig,
+  isPanic,
+  opaqueErrorCause,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
@@ -17,6 +23,7 @@ import {
   isHeartbeatSessionId,
   resolveHeartbeatModelOverride,
 } from "./common";
+import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
 import { computeNextCronAtMs } from "../workflow/cron";
 
 function consumerId(prefix: string): string {
@@ -37,57 +44,100 @@ type HeartbeatLifecycleSubscription = {
 
 const DEFAULT_HEARTBEAT_CRON = "*/30 * * * *";
 
-export class HeartbeatLifecycleRequestIdMissing extends TaggedError(
-  "HeartbeatLifecycleRequestIdMissing",
-)<{
+export class HeartbeatLifecycleEventInvalid extends TaggedError("HeartbeatLifecycleEventInvalid")<{
+  readonly missingHeaders: readonly ("request_id" | "session_id")[];
   readonly message: string;
 }> {}
 
-export class HeartbeatLifecycleSessionIdMissing extends TaggedError(
-  "HeartbeatLifecycleSessionIdMissing",
+export class HeartbeatLifecycleDependencyUnavailable extends TaggedError(
+  "HeartbeatLifecycleDependencyUnavailable",
 )<{
+  readonly dependency: string;
+  readonly cause: unknown;
   readonly message: string;
 }> {}
 
 export type HeartbeatLifecycleDeliveryError =
-  | HeartbeatLifecycleRequestIdMissing
-  | HeartbeatLifecycleSessionIdMissing;
+  | HeartbeatLifecycleEventInvalid
+  | HeartbeatLifecycleDependencyUnavailable;
+
+class HeartbeatConfigReloadError extends TaggedError("HeartbeatConfigReloadError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class HeartbeatCronInvalidError extends TaggedError("HeartbeatCronInvalidError")<{
+  readonly cron: string;
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class HeartbeatServiceStopFailed extends TaggedError("HeartbeatServiceStopFailed")<{
+  readonly phase: "lifecycle" | "tick";
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+type HeartbeatServiceStartError = HeartbeatConfigReloadError | EventDeliveryStartFailed;
+type HeartbeatServiceStopError =
+  | EventDeliveryStopFailed
+  | EventDeliveryDoneError
+  | HeartbeatServiceStopFailed;
+
+export type HeartbeatService = {
+  tick(reason: HeartbeatWakeReason): Promise<void>;
+  stopOutcome(): Promise<
+    | { readonly kind: "result"; readonly result: ResultType<void, HeartbeatServiceStopError> }
+    | { readonly kind: "panic"; readonly panic: import("better-result").Panic }
+  >;
+};
+
+async function reloadHeartbeatCoreConfig(): Promise<
+  ResultType<CoreConfig, HeartbeatConfigReloadError>
+> {
+  try {
+    return Result.ok(await getCoreConfig());
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    return Result.err(
+      new HeartbeatConfigReloadError({
+        cause: opaqueErrorCause(caught, "Opaque core-config reload failure"),
+        message: "Core config reload failed",
+      }),
+    );
+  }
+}
+
+function computeHeartbeatCronAtMs(
+  cron: string,
+  currentMs: number,
+): ResultType<number, HeartbeatCronInvalidError> {
+  try {
+    return Result.ok(computeNextCronAtMs({ expr: cron }, currentMs));
+  } catch (caught) {
+    if (isPanic(caught)) throw caught;
+    return Result.err(
+      new HeartbeatCronInvalidError({
+        cron,
+        cause: opaqueErrorCause(caught, "Opaque heartbeat cron failure"),
+        message: "Heartbeat cron is invalid",
+      }),
+    );
+  }
+}
 
 export function applyHeartbeatLifecycleDeliveryPolicy(
   error: HeartbeatLifecycleDeliveryError,
 ): DeliveryDisposition {
   switch (error._tag) {
-    case "HeartbeatLifecycleRequestIdMissing":
-    case "HeartbeatLifecycleSessionIdMissing":
+    case "HeartbeatLifecycleEventInvalid":
+      return "dead-letter";
+    case "HeartbeatLifecycleDependencyUnavailable":
       return "park-pending";
   }
 }
 
-function subscriptionLifecycleError(
-  phase: "start" | "stop" | "done",
-  error: EventDeliveryStartFailed | EventDeliveryStopFailed | EventDeliveryDoneError,
-): Error {
-  return new Error(`Heartbeat lifecycle subscription ${phase} failed: ${error.message}`, {
-    cause: error,
-  });
-}
-
-function adaptHeartbeatLifecycleStartResultToHost(
-  started: ResultType<HeartbeatLifecycleSubscription, EventDeliveryStartFailed>,
-): HeartbeatLifecycleSubscription {
-  if (started.status === "ok") return started.value;
-  throw subscriptionLifecycleError("start", started.error);
-}
-
-function adaptHeartbeatLifecycleStopResultToHost(
-  stopped: ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>,
-): void {
-  if (stopped.status === "ok") return;
-  const phase = stopped.error._tag === "EventDeliveryStopFailed" ? "stop" : "done";
-  throw subscriptionLifecycleError(phase, stopped.error);
-}
-
-export async function startHeartbeatService(params: {
+export async function startHeartbeatServiceResult(params: {
   bus: LilacBus;
   subscriptionId: string;
   config?: CoreConfig;
@@ -99,7 +149,7 @@ export async function startHeartbeatService(params: {
   };
   now?: () => number;
   timers?: HeartbeatTimers;
-}) {
+}): Promise<ResultType<HeartbeatService, HeartbeatServiceStartError>> {
   const logger = createLogger({ module: "heartbeat-service" });
   const now = params.now ?? (() => Date.now());
   const timers: HeartbeatTimers = params.timers ?? {
@@ -107,7 +157,14 @@ export async function startHeartbeatService(params: {
     clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
   };
 
-  let cfg = params.config ?? (await getCoreConfig());
+  let cfg: CoreConfig;
+  if (params.config) {
+    cfg = params.config;
+  } else {
+    const loaded = await reloadHeartbeatCoreConfig();
+    if (loaded.status === "error") return Result.err(loaded.error);
+    cfg = loaded.value;
+  }
   let coreConfigReloadHadError = false;
   let lastCoreConfigReloadError: string | null = null;
 
@@ -124,21 +181,20 @@ export async function startHeartbeatService(params: {
   async function reloadCoreConfigIfNeeded(): Promise<void> {
     if (params.config) return;
 
-    try {
-      cfg = await getCoreConfig();
-
+    const reloaded = await reloadHeartbeatCoreConfig();
+    if (reloaded.status === "ok") {
+      cfg = reloaded.value;
       if (coreConfigReloadHadError) {
         logger.info("core-config reload recovered", { path: "core-config.yaml" });
       }
-
       coreConfigReloadHadError = false;
       lastCoreConfigReloadError = null;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    } else {
+      const message = reloaded.error.message;
       if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
         logger.warn("core-config reload failed; using last known config", {
           path: "core-config.yaml",
-          error: message,
+          outcome: "retaining-last-known-config",
         });
       }
 
@@ -155,16 +211,21 @@ export async function startHeartbeatService(params: {
 
   function resolveNextScheduledWakeAtMs(baseNowMs: number): number {
     const currentMs = Math.min(Number.MAX_SAFE_INTEGER, baseNowMs + 1);
-
-    try {
-      return computeNextCronAtMs({ expr: cfg.surface.heartbeat.cron }, currentMs);
-    } catch (error) {
-      logger.warn("invalid heartbeat cron; falling back to */30 * * * *", {
-        cron: cfg.surface.heartbeat.cron,
-        error: error instanceof Error ? error.message : String(error),
+    const scheduled = computeHeartbeatCronAtMs(cfg.surface.heartbeat.cron, currentMs);
+    if (scheduled.status === "ok") return scheduled.value;
+    logger.warn("invalid heartbeat cron; falling back to */30 * * * *", {
+      cron: cfg.surface.heartbeat.cron,
+      outcome: "using-default-cron",
+    });
+    const fallback = computeHeartbeatCronAtMs(DEFAULT_HEARTBEAT_CRON, currentMs);
+    if (fallback.status === "error") {
+      logger.error("default heartbeat cron unexpectedly failed; using a 30-minute delay", {
+        cron: DEFAULT_HEARTBEAT_CRON,
+        outcome: "using-fixed-delay",
       });
-      return computeNextCronAtMs({ expr: DEFAULT_HEARTBEAT_CRON }, currentMs);
+      return Math.min(Number.MAX_SAFE_INTEGER, currentMs + 30 * 60 * 1000);
     }
+    return fallback.value;
   }
 
   function clearScheduledWakeTimer(): void {
@@ -224,17 +285,20 @@ export async function startHeartbeatService(params: {
     };
 
     outstandingHeartbeatRequestIds.add(requestId);
+    let published = false;
     try {
-      await params.bus.publish(lilacEventTypes.CmdRequestMessage, data, {
-        headers: {
-          request_id: requestId,
-          session_id: HEARTBEAT_SESSION_ID,
-          request_client: "unknown",
-        },
-      });
-    } catch (error) {
-      outstandingHeartbeatRequestIds.delete(requestId);
-      throw error;
+      adaptEventPublishResultToHost(
+        await params.bus.publish(lilacEventTypes.CmdRequestMessage, data, {
+          headers: {
+            request_id: requestId,
+            session_id: HEARTBEAT_SESSION_ID,
+            request_client: "unknown",
+          },
+        }),
+      );
+      published = true;
+    } finally {
+      if (!published) outstandingHeartbeatRequestIds.delete(requestId);
     }
 
     logger.info("heartbeat request published", {
@@ -325,17 +389,14 @@ export async function startHeartbeatService(params: {
 
         const requestId = msg.headers?.request_id;
         const sessionId = msg.headers?.session_id;
-        if (!requestId) {
+        if (!requestId || !sessionId) {
+          const missingHeaders: Array<"request_id" | "session_id"> = [];
+          if (!requestId) missingHeaders.push("request_id");
+          if (!sessionId) missingHeaders.push("session_id");
           return Result.err(
-            new HeartbeatLifecycleRequestIdMissing({
-              message: "evt.request.lifecycle.changed missing required headers.request_id",
-            }),
-          );
-        }
-        if (!sessionId) {
-          return Result.err(
-            new HeartbeatLifecycleSessionIdMissing({
-              message: "evt.request.lifecycle.changed missing required headers.session_id",
+            new HeartbeatLifecycleEventInvalid({
+              missingHeaders,
+              message: `evt.request.lifecycle.changed missing required headers: ${missingHeaders.join(", ")}`,
             }),
           );
         }
@@ -380,9 +441,9 @@ export async function startHeartbeatService(params: {
     );
   }
 
-  const lifecycleSub = adaptHeartbeatLifecycleStartResultToHost(
-    await startHeartbeatLifecycleResult(),
-  );
+  const lifecycleStarted = await startHeartbeatLifecycleResult();
+  if (lifecycleStarted.status === "error") return Result.err(lifecycleStarted.error);
+  const lifecycleSub = lifecycleStarted.value;
 
   async function stopHeartbeatLifecycleResult(): Promise<
     ResultType<void, EventDeliveryStopFailed | EventDeliveryDoneError>
@@ -397,19 +458,63 @@ export async function startHeartbeatService(params: {
 
   ensureScheduledWake(now());
 
-  return {
-    tick,
-    stop: async () => {
-      if (stopped) return;
-      stopped = true;
+  const stopOutcome = async (): Promise<
+    | { readonly kind: "result"; readonly result: ResultType<void, HeartbeatServiceStopError> }
+    | { readonly kind: "panic"; readonly panic: import("better-result").Panic }
+  > => {
+    if (stopped) return { kind: "result", result: Result.ok(undefined) };
+    stopped = true;
 
-      clearRetryTimer();
-      clearScheduledWakeTimer();
+    clearRetryTimer();
+    clearScheduledWakeTimer();
 
-      adaptHeartbeatLifecycleStopResultToHost(await stopHeartbeatLifecycleResult());
-      await activeTick;
-      activeExternalRequestIds.clear();
-      outstandingHeartbeatRequestIds.clear();
-    },
+    const [lifecycleStop, tickSettled] = await Promise.allSettled([
+      stopHeartbeatLifecycleResult(),
+      activeTick,
+    ]);
+    activeExternalRequestIds.clear();
+    outstandingHeartbeatRequestIds.clear();
+    if (lifecycleStop.status === "rejected") {
+      if (isPanic(lifecycleStop.reason)) return { kind: "panic", panic: lifecycleStop.reason };
+    }
+    if (tickSettled.status === "rejected" && isPanic(tickSettled.reason)) {
+      return { kind: "panic", panic: tickSettled.reason };
+    }
+    if (lifecycleStop.status === "rejected") {
+      return {
+        kind: "result",
+        result: Result.err(
+          new HeartbeatServiceStopFailed({
+            phase: "lifecycle",
+            cause: opaqueErrorCause(
+              lifecycleStop.reason,
+              "Opaque heartbeat lifecycle stop failure",
+            ),
+            message: "Heartbeat lifecycle stop failed",
+          }),
+        ),
+      };
+    }
+    if (lifecycleStop.value.status === "error") {
+      return { kind: "result", result: Result.err(lifecycleStop.value.error) };
+    }
+    if (tickSettled.status === "rejected") {
+      return {
+        kind: "result",
+        result: Result.err(
+          new HeartbeatServiceStopFailed({
+            phase: "tick",
+            cause: opaqueErrorCause(tickSettled.reason, "Opaque heartbeat tick failure"),
+            message: "Heartbeat tick failed while stopping",
+          }),
+        ),
+      };
+    }
+    return { kind: "result", result: Result.ok(undefined) };
   };
+
+  return Result.ok({
+    tick,
+    stopOutcome,
+  });
 }

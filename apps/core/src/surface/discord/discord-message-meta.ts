@@ -1,9 +1,17 @@
-import { ActivityType, MessageType, type Message, type Presence } from "discord.js";
+import {
+  ActivityType,
+  type Attachment,
+  type Embed,
+  type Message,
+  type MessageSnapshot,
+  MessageType,
+  type Presence,
+} from "discord.js";
+import { z } from "zod";
 
 import type { SurfaceSessionParticipant, SurfaceSessionParticipantActivity } from "../types";
 import {
   buildDiscordTaggedTextFromContentAndEmbeds,
-  normalizeDiscordEmbeds,
   type DiscordEmbedTextMeta,
 } from "./discord-embed-text";
 
@@ -128,83 +136,50 @@ export function getReplyReference(msg: Message): {
   };
 }
 
-function toDiscordAttachmentMeta(x: unknown): DiscordAttachmentMeta | null {
-  if (!x || typeof x !== "object") return null;
-  const o = x as Record<string, unknown>;
-
-  const url = typeof o.url === "string" ? o.url : null;
-  if (!url) return null;
-
-  let filename: string | undefined;
-  if (typeof o.name === "string") {
-    filename = o.name;
-  } else if (typeof o.filename === "string") {
-    filename = o.filename;
-  }
-
-  let mimeType: string | undefined;
-  if (typeof o.contentType === "string") {
-    mimeType = o.contentType;
-  } else if (typeof o.mimeType === "string") {
-    mimeType = o.mimeType;
-  }
-
-  const size = typeof o.size === "number" ? o.size : undefined;
-
+function toDiscordAttachmentMeta(attachment: Attachment): DiscordAttachmentMeta {
   return {
-    url,
-    ...(filename ? { filename } : {}),
-    ...(mimeType ? { mimeType } : {}),
-    ...(size !== undefined ? { size } : {}),
+    url: attachment.url,
+    filename: attachment.name,
+    ...(attachment.contentType ? { mimeType: attachment.contentType } : {}),
+    size: attachment.size,
   };
 }
 
-export function collectDiscordAttachmentMeta(input: unknown): DiscordAttachmentMeta[] {
-  const out: DiscordAttachmentMeta[] = [];
-
-  if (!input) return out;
-
-  if (Array.isArray(input)) {
-    for (const item of input) {
-      const normalized = toDiscordAttachmentMeta(item);
-      if (normalized) out.push(normalized);
-    }
-    return out;
-  }
-
-  if (typeof input === "object") {
-    const maybeValues = (input as { values?: unknown }).values;
-    if (typeof maybeValues === "function") {
-      for (const item of (maybeValues as () => Iterable<unknown>).call(input)) {
-        const normalized = toDiscordAttachmentMeta(item);
-        if (normalized) out.push(normalized);
-      }
-    }
-  }
-
-  return out;
+export function collectDiscordAttachmentMeta(input: Iterable<Attachment>): DiscordAttachmentMeta[] {
+  return [...input].map(toDiscordAttachmentMeta);
 }
 
-function getSnapshotEmbeds(snapshot: Record<string, unknown>): DiscordEmbedTextMeta[] {
-  return normalizeDiscordEmbeds(snapshot.embeds);
+function projectDiscordEmbed(embed: Embed): DiscordEmbedTextMeta {
+  return {
+    ...(embed.title ? { title: embed.title } : {}),
+    ...(embed.description ? { description: embed.description } : {}),
+    ...(embed.fields.length > 0
+      ? {
+          fields: embed.fields.map((field) => ({ name: field.name, value: field.value })),
+        }
+      : {}),
+    ...(embed.image?.url ? { imageUrl: embed.image.url } : {}),
+    ...(embed.footer?.text ? { footer: embed.footer.text } : {}),
+  };
 }
 
-function normalizeFlagsNumber(v: unknown): number | undefined {
-  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
-  if (typeof v === "bigint") {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : undefined;
-  }
-  if (!v || typeof v !== "object") return undefined;
+function getSnapshotEmbeds(snapshot: MessageSnapshot): DiscordEmbedTextMeta[] {
+  return snapshot.embeds.map(projectDiscordEmbed);
+}
 
-  const bitfield = (v as Record<string, unknown>).bitfield;
+const discordFlagsSchema = z.union([
+  z.number().finite(),
+  z.bigint(),
+  z.object({ bitfield: z.union([z.number().finite(), z.bigint()]) }).passthrough(),
+]);
+
+function normalizeFlagsNumber(input: unknown): number | undefined {
+  const parsed = discordFlagsSchema.safeParse(input);
+  if (!parsed.success) return undefined;
+  const bitfield = typeof parsed.data === "object" ? parsed.data.bitfield : parsed.data;
   if (typeof bitfield === "number") return Number.isFinite(bitfield) ? bitfield : undefined;
-  if (typeof bitfield === "bigint") {
-    const n = Number(bitfield);
-    return Number.isFinite(n) ? n : undefined;
-  }
-
-  return undefined;
+  const number = Number(bitfield);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 export function getForwardSnapshotPayload(msg: Message): {
@@ -222,22 +197,14 @@ export function getForwardSnapshotPayload(msg: Message): {
   const snapshots = msg.messageSnapshots;
   if (!snapshots || snapshots.size === 0) return null;
 
-  let firstSnapshot: unknown;
-  for (const snapshot of snapshots.values()) {
-    firstSnapshot = snapshot;
-    break;
-  }
-  if (!firstSnapshot || typeof firstSnapshot !== "object") return null;
+  const snapshot = snapshots.first();
+  if (!snapshot) return null;
 
-  const snapshot = firstSnapshot as Record<string, unknown>;
-
-  const content = typeof snapshot.content === "string" ? snapshot.content : "";
+  const content = snapshot.content;
   const embeds = getSnapshotEmbeds(snapshot);
-  const attachments = collectDiscordAttachmentMeta(snapshot.attachments);
-  const timestamp =
-    typeof snapshot.createdTimestamp === "number" ? snapshot.createdTimestamp : undefined;
-  const editedTimestamp =
-    typeof snapshot.editedTimestamp === "number" ? snapshot.editedTimestamp : undefined;
+  const attachments = collectDiscordAttachmentMeta(snapshot.attachments.values());
+  const timestamp = snapshot.createdTimestamp;
+  const editedTimestamp = snapshot.editedTimestamp ?? undefined;
   const flags = normalizeFlagsNumber(snapshot.flags);
 
   return {
@@ -274,7 +241,7 @@ export function buildForwardMessageSnapshots(
 }
 
 export function getMessageEmbeds(msg: Message): DiscordEmbedTextMeta[] {
-  return normalizeDiscordEmbeds(msg.embeds);
+  return msg.embeds.map(projectDiscordEmbed);
 }
 
 function joinNonEmptyTextBlocks(blocks: readonly string[]): string {
@@ -310,7 +277,7 @@ export function isDiscordChatLikeMessage(msg: Message): boolean {
 }
 
 export function getDiscordMessageTypeName(msg: Message): string {
-  const name = (MessageType as unknown as Record<number, unknown>)[msg.type];
+  const name = MessageType[msg.type];
   return typeof name === "string" && name.length > 0 ? name : String(msg.type);
 }
 

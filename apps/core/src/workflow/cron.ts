@@ -1,4 +1,9 @@
 import { CronExpressionParser } from "cron-parser";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
+
+import { projectRuntimeError } from "../runtime/error-format";
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 
 export type CronScheduleInput = {
   expr: string;
@@ -8,35 +13,32 @@ export type CronScheduleInput = {
   skipMissed?: boolean;
 };
 
-function ensureFiveFieldCron(expr: string): string {
+export class WorkflowCronInvalid extends TaggedError("WorkflowCronInvalid")<{
+  readonly expression: string;
+  readonly message: string;
+}> {}
+
+function ensureFiveFieldCron(expr: string): ResultType<string, WorkflowCronInvalid> {
   const trimmed = expr.trim();
   const parts = trimmed.split(/\s+/g).filter(Boolean);
   if (parts.length !== 5) {
-    throw new Error(`Invalid cron expression '${expr}'. Expected 5 fields (minute precision).`);
+    return Result.err(
+      new WorkflowCronInvalid({
+        expression: expr,
+        message: `Invalid cron expression '${expr}'. Expected 5 fields (minute precision).`,
+      }),
+    );
   }
-  return trimmed;
-}
-
-function toDate(value: unknown): Date {
-  if (value instanceof Date) return value;
-  if (value && typeof value === "object") {
-    const v = value as { toDate?: unknown };
-    if (typeof v.toDate === "function") {
-      const d = (v.toDate as () => unknown)();
-      if (d instanceof Date) return d;
-    }
-  }
-
-  const d = new Date(String(value));
-  if (!Number.isFinite(d.getTime())) {
-    throw new Error("Failed to convert cron next() result to Date");
-  }
-  return d;
+  return Result.ok(trimmed);
 }
 
 /** Compute the next cron run timestamp (ms since epoch). */
-export function computeNextCronAtMs(input: CronScheduleInput, nowMs: number): number {
+export function computeNextCronAtMsResult(
+  input: CronScheduleInput,
+  nowMs: number,
+): ResultType<number, WorkflowCronInvalid> {
   const expr = ensureFiveFieldCron(input.expr);
+  if (expr.status === "error") return Result.err(expr.error);
   const tz = input.tz ?? "UTC";
 
   const startAtMs =
@@ -50,8 +52,23 @@ export function computeNextCronAtMs(input: CronScheduleInput, nowMs: number): nu
   // schedules can fire exactly at baseMs.
   const currentDate = new Date(baseMs - 1);
 
-  const it = CronExpressionParser.parse(expr, { currentDate, tz });
+  const captured = Result.try({
+    try: () =>
+      CronExpressionParser.parse(expr.value, { currentDate, tz }).next().toDate().getTime(),
+    catch: projectRuntimeError("Opaque workflow cron failure"),
+  });
+  if (captured.status === "error") {
+    const cause = preserveToolPanic(captured.error);
+    return Result.err(
+      new WorkflowCronInvalid({
+        expression: input.expr,
+        message: opaqueErrorMessage(cause, "Invalid workflow cron expression"),
+      }),
+    );
+  }
+  return Result.ok(captured.value);
+}
 
-  const next = toDate(it.next());
-  return next.getTime();
+export function computeNextCronAtMs(input: CronScheduleInput, nowMs: number): number {
+  return adaptToolResultToHost(computeNextCronAtMsResult(input, nowMs));
 }

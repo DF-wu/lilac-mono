@@ -8,7 +8,7 @@ import {
   lilacEventTypes,
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
 import { DurableWorkflowStore, type WorkflowActionOutboxEntry } from "./durable-workflow-store";
@@ -169,26 +169,39 @@ async function captureWorkflowActionOutboxPublication(
   outboxId: string,
   event: DecodedWorkflowActionOutboxEvent,
 ): Promise<ResultType<void, WorkflowActionOutboxPublishFailed>> {
-  try {
-    switch (event.type) {
-      case lilacEventTypes.EvtWorkflowRunChanged:
-        await bus.publish(event.type, event.data, { headers: { workflow_outbox_id: outboxId } });
-        break;
-      case lilacEventTypes.EvtWorkflowProgressRequested:
-        await bus.publish(event.type, event.data, { headers: { workflow_outbox_id: outboxId } });
-        break;
+  switch (event.type) {
+    case lilacEventTypes.EvtWorkflowRunChanged: {
+      const published = await bus.publish(event.type, event.data, {
+        headers: { workflow_outbox_id: outboxId },
+      });
+      if (published.status === "error") {
+        return Result.err(
+          new WorkflowActionOutboxPublishFailed({
+            outboxId,
+            cause: published.error,
+            message: "Workflow action outbox publication failed",
+          }),
+        );
+      }
+      break;
     }
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new WorkflowActionOutboxPublishFailed({
-        outboxId,
-        cause,
-        message: "Workflow action outbox publication failed",
-      }),
-    );
+    case lilacEventTypes.EvtWorkflowProgressRequested: {
+      const published = await bus.publish(event.type, event.data, {
+        headers: { workflow_outbox_id: outboxId },
+      });
+      if (published.status === "error") {
+        return Result.err(
+          new WorkflowActionOutboxPublishFailed({
+            outboxId,
+            cause: published.error,
+            message: "Workflow action outbox publication failed",
+          }),
+        );
+      }
+      break;
+    }
   }
+  return Result.ok(undefined);
 }
 
 function adaptWorkflowActionSubscriptionStartResultToHost(
@@ -259,7 +272,7 @@ export async function startWorkflowActionResolver(input: {
           });
           logger.warn("Workflow action outbox publication failed", {
             outboxId: entry.outboxId,
-            error: completed.error.message,
+            ...formatTaggedErrorForLog(completed.error),
           });
         }
       }

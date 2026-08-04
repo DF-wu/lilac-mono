@@ -17,6 +17,8 @@ import { z } from "zod";
 
 import {
   BASH_NO_OUTPUT_TIMEOUT_MS,
+  applyPatchResult,
+  createBatchToolResult,
   createCodingToolset,
   createEditFileInputSchema,
   createGrepInputSchema,
@@ -320,6 +322,112 @@ describe("coding tools", () => {
       stderr: "",
       exitCode: 0,
     });
+  });
+
+  it("settles streaming Bash for hostile rejections and terminates on Panic", async () => {
+    const artifacts = createToolResultArtifactStore(path.join(cwd, "stream-settlement-artifacts"));
+    await artifacts.init();
+    const hostileTarget: object = Object.create(null);
+    const hostileProxy = new Proxy(hostileTarget, {
+      get() {
+        throw new Error("proxy get trap must stay contained");
+      },
+      getPrototypeOf() {
+        throw new Error("proxy prototype trap must stay contained");
+      },
+    });
+    const hostileString = {
+      [Symbol.toPrimitive]() {
+        throw new Error("String coercion must stay contained");
+      },
+      toString() {
+        throw new Error("toString must stay contained");
+      },
+    };
+    const hostileCauses: readonly unknown[] = [Object.create(null), hostileProxy, hostileString];
+
+    for (const [index, cause] of hostileCauses.entries()) {
+      const failingArtifacts: ToolResultArtifactStore = {
+        ...artifacts,
+        async createFromStream() {
+          throw cause;
+        },
+      };
+      const execution = executable(
+        createCodingToolset({
+          cwd,
+          bashStreamOutput: true,
+          bashMaxOutputBytes: 32,
+          artifactIntegration: {
+            artifacts: failingArtifacts,
+            scopeId: "scope-hostile-stream",
+            requestId: `request-hostile-stream-${index}`,
+            maxSpoolBytes: 1024 * 1024,
+          },
+        }),
+        "bash",
+      ).execute({ command: "printf '%0100d' 0" }, options(`bash-hostile-stream-${index}`));
+      if (!isAsyncIterable(execution)) throw new Error("expected streaming Bash output");
+      const consume = async () => {
+        const iterator = execution[Symbol.asyncIterator]();
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) return next.value;
+        }
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("streaming Bash completion hung")), 5_000);
+      });
+      try {
+        await expect(Promise.race([consume(), timeout])).resolves.toMatchObject({
+          exitCode: 0,
+          truncation: {
+            completeOutputRetained: false,
+            retentionStatus: "artifact-write-failed",
+          },
+        });
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+
+    const panic = new Panic({ message: "streaming artifact invariant failed" });
+    const panickingArtifacts: ToolResultArtifactStore = {
+      ...artifacts,
+      async createFromStream() {
+        throw panic;
+      },
+    };
+    const panickingExecution = executable(
+      createCodingToolset({
+        cwd,
+        bashStreamOutput: true,
+        bashMaxOutputBytes: 32,
+        artifactIntegration: {
+          artifacts: panickingArtifacts,
+          scopeId: "scope-panic-stream",
+          requestId: "request-panic-stream",
+          maxSpoolBytes: 1024 * 1024,
+        },
+      }),
+      "bash",
+    ).execute({ command: "printf '%0100d' 0" }, options("bash-panic-stream"));
+    if (!isAsyncIterable(panickingExecution)) throw new Error("expected streaming Bash output");
+    const consumePanic = async () => {
+      for await (const _update of panickingExecution) {
+        // Consume until the terminal rejection.
+      }
+    };
+    let panicTimer: ReturnType<typeof setTimeout> | undefined;
+    const panicTimeout = new Promise<never>((_resolve, reject) => {
+      panicTimer = setTimeout(() => reject(new Error("streaming Bash Panic hung")), 5_000);
+    });
+    try {
+      await expect(Promise.race([consumePanic(), panicTimeout])).rejects.toBe(panic);
+    } finally {
+      if (panicTimer !== undefined) clearTimeout(panicTimer);
+    }
   });
 
   it("retains sanitized complete Bash output behind a bounded head/tail preview", async () => {
@@ -1429,9 +1537,123 @@ describe("coding tools", () => {
           options("patch-abort", abortSignal),
         ),
       ),
-    ).rejects.toThrow("apply_patch aborted");
+    ).rejects.toMatchObject({
+      _tag: "PatchAbortedAfterCommit",
+      retrySafe: false,
+      message: expect.stringContaining("apply_patch aborted"),
+      committedMutations: expect.arrayContaining([
+        { type: "file-written", path: path.join(cwd, "first.txt") },
+      ]),
+    });
     expect(await readFile(path.join(cwd, "first.txt"), "utf8")).toBe("first");
     expect(Bun.file(path.join(cwd, "later.txt")).size).toBe(0);
+  });
+
+  it("applyPatchResult distinguishes cancellation before mutation from cancellation after commit", async () => {
+    const preCommitController = new AbortController();
+    preCommitController.abort();
+    const beforeCommit = await applyPatchResult({
+      cwd,
+      denyPaths: [],
+      patchText: ["*** Begin Patch", "*** Add File: never.txt", "+never", "*** End Patch"].join(
+        "\n",
+      ),
+      abortSignal: preCommitController.signal,
+    });
+    expect(beforeCommit).toMatchObject({ status: "error", error: { _tag: "PatchAborted" } });
+    expect(Bun.file(path.join(cwd, "never.txt")).size).toBe(0);
+
+    const postCommitController = new AbortController();
+    let abortedReads = 0;
+    const abortSignal = new Proxy(postCommitController.signal, {
+      get(target, property) {
+        if (property === "aborted") {
+          abortedReads++;
+          if (abortedReads === 6) postCommitController.abort();
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const afterCommit = await applyPatchResult({
+      cwd,
+      denyPaths: [],
+      patchText: [
+        "*** Begin Patch",
+        "*** Add File: committed.txt",
+        "+committed",
+        "*** Add File: not-started.txt",
+        "+not started",
+        "*** End Patch",
+      ].join("\n"),
+      abortSignal,
+    });
+    expect(afterCommit).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "PatchAbortedAfterCommit",
+        retrySafe: false,
+        committedMutations: expect.arrayContaining([
+          { type: "file-written", path: path.join(cwd, "committed.txt") },
+        ]),
+      },
+    });
+    expect(await readFile(path.join(cwd, "committed.txt"), "utf8")).toBe("committed");
+    expect(Bun.file(path.join(cwd, "not-started.txt")).size).toBe(0);
+  });
+
+  it("a filesystem-root deny path blocks every local coding-tool path", async () => {
+    await writeFile(path.join(cwd, "blocked.txt"), "blocked\n");
+    const filesystemRoot = path.parse(cwd).root;
+    const tools = createCodingToolset({ cwd, denyPaths: [filesystemRoot] });
+
+    const read = await executable(tools, "read_file").execute(
+      { path: "blocked.txt" },
+      options("root-deny-read"),
+    );
+    expect(read).toMatchObject({ success: false, error: { code: "PERMISSION" } });
+
+    const glob = await executable(tools, "glob").execute(
+      { patterns: ["**/*"] },
+      options("root-deny-glob"),
+    );
+    expect(glob).toMatchObject({ paths: [], error: expect.stringContaining("Access denied") });
+
+    const grep = await executable(tools, "grep").execute(
+      { pattern: "blocked" },
+      options("root-deny-grep"),
+    );
+    expect(grep).toMatchObject({ results: [], error: expect.stringContaining("Access denied") });
+
+    const edit = await executable(tools, "edit_file").execute(
+      { path: "blocked.txt", oldText: "blocked", newText: "changed" },
+      options("root-deny-edit"),
+    );
+    expect(edit).toMatchObject({ success: false, error: { code: "PERMISSION" } });
+
+    const bash = await executable(tools, "bash").execute(
+      { command: "true" },
+      options("root-deny-bash"),
+    );
+    expect(bash).toMatchObject({ executionError: { type: "blocked" } });
+
+    await expect(
+      Promise.resolve(
+        executable(tools, "apply_patch").execute(
+          {
+            patchText: [
+              "*** Begin Patch",
+              "*** Add File: root-denied.txt",
+              "+denied",
+              "*** End Patch",
+            ].join("\n"),
+          },
+          options("root-deny-patch"),
+        ),
+      ),
+    ).rejects.toThrow("Access denied");
+    expect(await readFile(path.join(cwd, "blocked.txt"), "utf8")).toBe("blocked\n");
+    expect(Bun.file(path.join(cwd, "root-denied.txt")).size).toBe(0);
   });
 
   it("batch expands every enabled tool including delegation and rejects edit overlap", async () => {
@@ -1521,6 +1743,103 @@ describe("coding tools", () => {
         ),
       ),
     ).rejects.toThrow("at most 8");
+  });
+
+  it("preserves Panic identity from batch child validation", async () => {
+    const panic = new Panic({ message: "batch schema invariant failed" });
+    const panickingSchema = z.unknown().transform((): Record<string, never> => {
+      throw panic;
+    });
+    const tools = createCodingToolset({
+      cwd,
+      extraTools: {
+        panicking: tool({ inputSchema: panickingSchema, execute: () => "unused" }),
+      },
+    });
+
+    await expect(
+      executable(tools, "batch").execute(
+        { tool_calls: [{ tool: "panicking", parameters: {} }] },
+        options("batch-validation-panic"),
+      ),
+    ).rejects.toBe(panic);
+  });
+
+  it("projects hostile batch validation causes without invoking object coercion", async () => {
+    const nullPrototypeCause: unknown = Object.create(null);
+    const hostileTarget: object = Object.create(null);
+    const hostileCause: unknown = new Proxy(hostileTarget, {
+      get() {
+        throw new Error("proxy get trap must stay contained");
+      },
+      getPrototypeOf() {
+        throw new Error("proxy prototype trap must stay contained");
+      },
+    });
+
+    for (const [index, cause] of [nullPrototypeCause, hostileCause].entries()) {
+      const hostileSchema = z.unknown().transform((): Record<string, never> => {
+        throw cause;
+      });
+      const tools = createCodingToolset({
+        cwd,
+        extraTools: {
+          hostile: tool({ inputSchema: hostileSchema, execute: () => "unused" }),
+        },
+      });
+
+      const expansion = await executable(tools, "batch").execute(
+        { tool_calls: [{ tool: "hostile", parameters: {} }] },
+        options(`batch-hostile-validation-${index}`),
+      );
+
+      expect(isToolExpansion(expansion)).toBe(true);
+      if (!isToolExpansion(expansion)) throw new Error("expected ToolExpansion");
+      expect(expansion.children[0]).toMatchObject({
+        invalid: true,
+        error: expect.stringContaining("Batch child input validation failed"),
+      });
+    }
+  });
+
+  it("projects hostile synchronous edit-target failures before rejecting the batch", async () => {
+    const hostileTarget: object = Object.create(null);
+    const hostileCause: unknown = new Proxy(hostileTarget, {
+      get() {
+        throw new Error("proxy get trap must stay contained");
+      },
+      getPrototypeOf() {
+        throw new Error("proxy prototype trap must stay contained");
+      },
+    });
+    const childTool = tool({
+      inputSchema: z.object({ path: z.string() }),
+      execute: () => "unused",
+    });
+    const batch = createBatchToolResult({
+      cwd,
+      getTools: () => ({ hostile_edit: childTool }),
+      getToolSpecs: () =>
+        new Map([
+          [
+            "hostile_edit",
+            {
+              name: "hostile_edit",
+              editTargets: () => {
+                throw hostileCause;
+              },
+            },
+          ],
+        ]),
+    });
+    if (batch.status === "error") throw batch.error;
+
+    await expect(
+      executable(batch.value, "batch").execute(
+        { tool_calls: [{ tool: "hostile_edit", parameters: { path: "file.txt" } }] },
+        options("batch-hostile-edit-targets"),
+      ),
+    ).rejects.toThrow("Batch edit-target resolution failed");
   });
 
   it("keeps filtered tools out of a read-only profile and its batch", async () => {

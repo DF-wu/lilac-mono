@@ -1,9 +1,9 @@
 import path from "node:path";
 
 import {
-  collectApplyPatchTouchedPaths as collectSharedApplyPatchTouchedPaths,
-  collectEditFileTouchedPaths as collectSharedEditFileTouchedPaths,
-  createBatchTool,
+  collectApplyPatchTouchedPathsResult as collectSharedApplyPatchTouchedPathsResult,
+  collectEditFileTouchedPathsResult as collectSharedEditFileTouchedPathsResult,
+  createBatchToolResult,
 } from "@stanley2058/lilac-coding-tools/batch";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
@@ -15,6 +15,7 @@ import {
   formatBatchChildValidationError,
   formatBatchPreflightMissingFieldError,
 } from "./batch-error-message";
+import { adaptToolResultToHost } from "./tool-result-adapters";
 
 function normalizeRemotePath(base: string, targetPath: string): string {
   const input = targetPath.trim();
@@ -57,17 +58,19 @@ export function collectApplyPatchTouchedPaths(params: {
   patchText: string;
   cwd: string;
 }): Set<string> {
-  return collectSharedApplyPatchTouchedPaths({
+  const collected = collectSharedApplyPatchTouchedPathsResult({
     ...params,
     resolvePathKey: resolveTouchedPathKey,
   });
+  return adaptToolResultToHost(collected);
 }
 
 export function collectEditFileTouchedPaths(params: { path: string; cwd: string }): Set<string> {
-  return collectSharedEditFileTouchedPaths({
+  const collected = collectSharedEditFileTouchedPathsResult({
     ...params,
     resolvePathKey: resolveTouchedPathKey,
   });
+  return adaptToolResultToHost(collected);
 }
 
 export function batchTool(params: {
@@ -82,7 +85,7 @@ export function batchTool(params: {
   editingMode?: EditingToolMode | "none";
   maxCalls?: number;
 }) {
-  return createBatchTool({
+  const created = createBatchToolResult({
     cwd: params.defaultCwd,
     getTools: params.getTools,
     getToolSpecs: params.getToolSpecs,
@@ -95,4 +98,5 @@ export function batchTool(params: {
       missingEditField: formatBatchPreflightMissingFieldError,
     },
   });
+  return adaptToolResultToHost(created);
 }

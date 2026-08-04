@@ -1,7 +1,7 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { expandTilde } from "@stanley2058/lilac-fs";
+import { captureFilesystemOperation, expandTilde } from "@stanley2058/lilac-fs";
 import { z } from "zod";
 
 const INSTRUCTION_FILENAMES = ["AGENTS.md"] as const;
@@ -91,21 +91,18 @@ function isPathWithin(candidatePath: string, parentDir: string): boolean {
 }
 
 async function pathExists(candidatePath: string): Promise<boolean> {
-  try {
-    await stat(candidatePath);
-    return true;
-  } catch {
-    return false;
-  }
+  const checked = await captureFilesystemOperation("inspect instruction path", () =>
+    stat(candidatePath),
+  );
+  return checked.status === "ok";
 }
 
 async function canonicalPath(candidatePath: string): Promise<string> {
   const absolute = path.resolve(expandTilde(candidatePath));
-  try {
-    return await realpath(absolute);
-  } catch {
-    return absolute;
-  }
+  const canonicalized = await captureFilesystemOperation("canonicalize instruction path", () =>
+    realpath(absolute),
+  );
+  return canonicalized.status === "ok" ? canonicalized.value : absolute;
 }
 
 async function canonicalPaths(paths: Iterable<string>): Promise<Set<string>> {
@@ -130,14 +127,14 @@ async function findGitRoot(startDirectory: string): Promise<string | null> {
 }
 
 async function readInstructionFile(filePath: string): Promise<string | null> {
-  try {
-    const content = (await readFile(filePath, "utf8")).trim();
-    if (!content) return null;
-    if (content.length <= MAX_INSTRUCTION_CHARS) return content;
-    return `${content.slice(0, MAX_INSTRUCTION_CHARS)}\n... (truncated)`;
-  } catch {
-    return null;
-  }
+  const read = await captureFilesystemOperation("read instruction file", () =>
+    readFile(filePath, "utf8"),
+  );
+  if (read.status === "error") return null;
+  const content = read.value.trim();
+  if (!content) return null;
+  if (content.length <= MAX_INSTRUCTION_CHARS) return content;
+  return `${content.slice(0, MAX_INSTRUCTION_CHARS)}\n... (truncated)`;
 }
 
 function parseInstructionPathsFromText(text: string): string[] {
@@ -151,7 +148,7 @@ function parseInstructionPathsFromText(text: string): string[] {
   return paths;
 }
 
-function collectPreviouslyLoadedInstructionPaths(messages: readonly unknown[]): Set<string> {
+export function decodePreviouslyLoadedInstructionPaths(messages: readonly unknown[]): Set<string> {
   const paths = new Set<string>();
 
   for (const message of messages) {
@@ -280,7 +277,7 @@ export async function loadReadFileInstructions(params: {
   if (!boundaryDirectory || !isPathWithin(targetAbsolute, boundaryDirectory)) return null;
 
   const alreadyLoaded = await canonicalPaths([
-    ...collectPreviouslyLoadedInstructionPaths(params.messages),
+    ...decodePreviouslyLoadedInstructionPaths(params.messages),
     ...(params.preloadedInstructionPaths ?? []),
   ]);
 

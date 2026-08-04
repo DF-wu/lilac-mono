@@ -13,8 +13,16 @@ import {
 } from "../../src/runtime/core-dead-letter-key";
 import {
   CoreEventBusSetupFailed,
-  setupCoreEventBusResources,
+  setupCoreEventBusResources as setupCoreEventBusResourcesOutcome,
 } from "../../src/runtime/create-core-runtime";
+
+async function setupCoreEventBusResources(
+  params: Parameters<typeof setupCoreEventBusResourcesOutcome>[0],
+) {
+  const outcome = await setupCoreEventBusResourcesOutcome(params);
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.result;
+}
 
 const temporaryRoots: string[] = [];
 

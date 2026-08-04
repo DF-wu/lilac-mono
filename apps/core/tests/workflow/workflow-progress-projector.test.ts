@@ -1,4 +1,4 @@
-import { workflowStoreValue } from "./workflow-store-test-helpers";
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { Database } from "bun:sqlite";
 import { describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
@@ -33,10 +33,24 @@ import type {
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { startWorkflowActionResolver } from "../../src/workflow/workflow-action-resolver";
 import { sha256 } from "../../src/workflow/workflow-definition";
-import { normalizeWorkflowResourcePolicy } from "../../src/workflow/workflow-domain";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
+
+type WorkflowProgressProjectorTestInput = Omit<
+  ConstructorParameters<typeof WorkflowProgressProjector>[0],
+  "reportFatalPanic"
+> &
+  Partial<Pick<ConstructorParameters<typeof WorkflowProgressProjector>[0], "reportFatalPanic">>;
+
+function createWorkflowProgressProjectorForTest(input: WorkflowProgressProjectorTestInput) {
+  return new WorkflowProgressProjector({
+    reportFatalPanic: (panic) => {
+      throw panic;
+    },
+    ...input,
+  });
+}
 class CapturingRawBus implements RawBus {
   readonly subscribe = subscribeForTest;
   readonly publishedOutboxIds: string[] = [];
@@ -95,6 +109,7 @@ class ProjectionAdapter implements SurfaceAdapter {
   failNextSend = false;
   failNextRead = false;
   failNextEditNotFound = false;
+  editFailure: Error | null = null;
   constructor(readonly platform: "discord" | "github" = "discord") {}
   async connect() {}
   async disconnect() {}
@@ -151,6 +166,7 @@ class ProjectionAdapter implements SurfaceAdapter {
     return [...this.messages.values()];
   }
   async editMsg(ref: MsgRef, content: ContentOpts) {
+    if (this.editFailure) throw this.editFailure;
     if (this.failNextEditNotFound) {
       this.failNextEditNotFound = false;
       this.messages.delete(ref.messageId);
@@ -293,7 +309,7 @@ describe("WorkflowProgressProjector", () => {
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -323,7 +339,7 @@ describe("WorkflowProgressProjector", () => {
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -370,7 +386,7 @@ describe("WorkflowProgressProjector", () => {
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -404,7 +420,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const raw = new CapturingRawBus();
     const bus = createLilacBus(raw);
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -442,7 +458,7 @@ describe("WorkflowProgressProjector", () => {
     let store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    let projector = new WorkflowProgressProjector({
+    let projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -459,7 +475,7 @@ describe("WorkflowProgressProjector", () => {
       store.close();
       adapter.messages.delete(firstRef.messageId);
       store = new DurableWorkflowStore(dbPath);
-      projector = new WorkflowProgressProjector({
+      projector = createWorkflowProgressProjectorForTest({
         bus,
         store,
         adapters: new Map([["discord", adapter]]),
@@ -485,7 +501,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
     let now = 20;
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -550,7 +566,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
     let now = 100;
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -597,7 +613,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
     let now = 20;
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -665,7 +681,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const raw = new CapturingRawBus();
     const bus = createLilacBus(raw);
-    const initialProjector = new WorkflowProgressProjector({
+    const initialProjector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -696,7 +712,7 @@ describe("WorkflowProgressProjector", () => {
       expect(raw.publishedOutboxIds).toHaveLength(2);
       await resolver.stop();
       resolver = null;
-      const projecting = new WorkflowProgressProjector({
+      const projecting = createWorkflowProgressProjectorForTest({
         bus,
         store,
         adapters: new Map([["discord", adapter]]),
@@ -716,7 +732,7 @@ describe("WorkflowProgressProjector", () => {
         subscriptionId: "outbox-resolver-second",
         now: () => 40,
       });
-      const restartedProjector = new WorkflowProgressProjector({
+      const restartedProjector = createWorkflowProgressProjectorForTest({
         bus,
         store,
         adapters: new Map([["discord", adapter]]),
@@ -741,7 +757,7 @@ describe("WorkflowProgressProjector", () => {
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -795,7 +811,7 @@ describe("WorkflowProgressProjector", () => {
     });
     const adapter = new ProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -833,7 +849,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const raw = new CapturingRawBus();
     const bus = createLilacBus(raw);
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -864,6 +880,12 @@ describe("WorkflowProgressProjector", () => {
         now: () => 30,
       });
       expect(workflowStoreValue(store.listPendingActionOutboxEvents(10000))).toHaveLength(2);
+      expect(raw.publishedOutboxIds).toEqual([]);
+      expect(
+        workflowStoreValue(store.listPendingActionOutboxEvents(10000)).every(
+          (entry) => entry.publishedAt === null,
+        ),
+      ).toBe(true);
       expect(workflowStoreValue(store.listPendingActionOutboxEvents(10000))[0]).toMatchObject({
         attemptCount: 1,
         lastError: "Workflow action outbox publication failed",
@@ -883,7 +905,7 @@ describe("WorkflowProgressProjector", () => {
     const adapter = new ProjectionAdapter();
     const raw = new CapturingRawBus();
     const bus = createLilacBus(raw);
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),
@@ -921,13 +943,95 @@ describe("WorkflowProgressProjector", () => {
       rmSync(dbPath, { force: true });
     }
   });
+  it("reports projection timer Panic to the fatal supervisor", async () => {
+    const dbPath = tempDbPath("workflow-projection-timer-panic");
+    const store = new DurableWorkflowStore(dbPath);
+    const bus = createLilacBus(new CapturingRawBus());
+    const panic = new Panic({ message: "projection timer defect" });
+    const firstReport = Promise.withResolvers<void>();
+    const secondAttempt = Promise.withResolvers<void>();
+    const reported: Panic[] = [];
+    let attempts = 0;
+    const getRun = spyOn(store, "getRun").mockImplementation(() => {
+      attempts += 1;
+      if (attempts === 2) secondAttempt.resolve();
+      throw panic;
+    });
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      adapters: new Map(),
+      subscriptionId: "projection-timer-panic",
+      coalesceMs: 0,
+      minEditIntervalMs: 0,
+      reportFatalPanic: (fatalPanic) => {
+        reported.push(fatalPanic);
+        firstReport.resolve();
+      },
+    });
+    try {
+      projector.requestProjection("run-panic");
+      await firstReport.promise;
+      projector.requestProjection("run-panic");
+      await secondAttempt.promise;
+      await Promise.resolve();
+      expect(reported).toEqual([panic]);
+    } finally {
+      getRun.mockRestore();
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("reports detached action outbox projection Panic to the fatal supervisor", async () => {
+    const dbPath = tempDbPath("workflow-projection-outbox-panic");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter();
+    const bus = createLilacBus(new CapturingRawBus());
+    const panic = new Panic({ message: "projection outbox defect" });
+    const reported = Promise.withResolvers<Panic>();
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      adapters: new Map([["discord", adapter]]),
+      subscriptionId: "projection-outbox-panic",
+      now: () => 20,
+      retryIntervalMs: 1,
+      reportFatalPanic: reported.resolve,
+    });
+    try {
+      createInvocation(store);
+      const messageRef = await projector.ensureInitialCard("run-1");
+      await projector.start();
+      expect(
+        appliedSurfaceActionStatus(
+          store.applySurfaceAction({
+            tokenSha256: sha256(actionToken(adapter, "Pause")),
+            platform: "discord",
+            userId: "user-1",
+            messageRef,
+            now: 21,
+          }),
+        ),
+      ).toBe("applied");
+      adapter.editFailure = panic;
+
+      await expect(reported.promise).resolves.toBe(panic);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
   it("adapts action and projector subscription lifecycle Result failures", async () => {
     const dbPath = tempDbPath("workflow-subscription-result-adapters");
     const store = new DurableWorkflowStore(dbPath);
     const startFailureRaw = new CapturingRawBus();
     Reflect.deleteProperty(startFailureRaw, "subscribe");
     const startFailureBus = createLilacBus(startFailureRaw);
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus: startFailureBus,
       store,
       adapters: new Map(),
@@ -949,7 +1053,7 @@ describe("WorkflowProgressProjector", () => {
         store,
         subscriptionId: "action-stop-result-failure",
       });
-      const stoppingProjector = new WorkflowProgressProjector({
+      const stoppingProjector = createWorkflowProgressProjectorForTest({
         bus: stopFailureBus,
         store,
         adapters: new Map(),
@@ -1008,7 +1112,7 @@ describe("WorkflowProgressProjector", () => {
     const store = new DurableWorkflowStore(dbPath);
     const adapter = new BlockingProjectionAdapter();
     const bus = createLilacBus(new CapturingRawBus());
-    const projector = new WorkflowProgressProjector({
+    const projector = createWorkflowProgressProjectorForTest({
       bus,
       store,
       adapters: new Map([["discord", adapter]]),

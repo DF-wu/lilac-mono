@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
 
+import { Panic } from "better-result";
+import { z } from "zod";
+
 import {
   decodeBundledRemoteRunnerRequestJson,
   decodeRemoteFsDaemonRequest,
   decodeRemoteGlobResponseJson,
   decodeRemoteReadTextResponseJson,
+  decodeRemoteRunnerResponseJson,
 } from "../src/remote-runner-protocol";
 
 describe("remote runner request protocol", () => {
@@ -136,5 +140,30 @@ describe("remote runner response protocol", () => {
     expect(unknownVariant.status === "error" ? unknownVariant.error._tag : "ok").toBe(
       "RemoteRunnerResponsePayloadError",
     );
+  });
+
+  it("does not classify downstream decoder defects as malformed JSON", () => {
+    const defect = new Error("decoder defect");
+    const panic = new Panic({ message: "decoder panic" });
+    const response = JSON.stringify({ ok: true, value: {} });
+
+    expect(() =>
+      decodeRemoteRunnerResponseJson(
+        "fixture",
+        response,
+        z.unknown().transform(() => {
+          throw defect;
+        }),
+      ),
+    ).toThrow(defect);
+    expect(() =>
+      decodeRemoteRunnerResponseJson(
+        "fixture",
+        response,
+        z.unknown().transform(() => {
+          throw panic;
+        }),
+      ),
+    ).toThrow(panic);
   });
 });

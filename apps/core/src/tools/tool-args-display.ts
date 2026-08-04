@@ -7,31 +7,35 @@ import {
   type Level1ToolSpec,
 } from "@stanley2058/lilac-plugin-runtime";
 import { isRecord } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
+import { projectRuntimeError } from "../runtime/error-format";
 import { formatRemoteDisplayPath, parseSshCwdTarget } from "../ssh/ssh-cwd";
 import { bashInputSchema } from "./bash";
+import { preserveToolPanic } from "./tool-result-adapters";
 
 function safeValidateSync(
   schema: FlexibleSchema<unknown> | z.ZodType<unknown> | undefined,
   value: unknown,
 ): unknown | undefined {
-  try {
-    const candidate: unknown = schema;
-    if (isRecord(candidate) && typeof candidate["safeParse"] === "function") {
-      const result: unknown = candidate["safeParse"](value);
-      return isRecord(result) && result["success"] === true ? result["data"] : undefined;
-    }
+  const validated = Result.try({
+    try: () => {
+      if (schema instanceof z.ZodType) {
+        const result = schema.safeParse(value);
+        return result.success ? result.data : undefined;
+      }
 
-    const validate = asSchema(schema).validate;
-    if (!validate) return undefined;
-
-    const result = validate(value);
-    if ("then" in result) return undefined;
-
-    return result.success ? result.value : undefined;
-  } catch {
-    return undefined;
-  }
+      const validate = asSchema(schema).validate;
+      if (!validate) return undefined;
+      const result = validate(value);
+      if ("then" in result) return undefined;
+      return result.success ? result.value : undefined;
+    },
+    catch: projectRuntimeError("Opaque tool argument validation failure"),
+  });
+  if (validated.status === "ok") return validated.value;
+  preserveToolPanic(validated.error);
+  return undefined;
 }
 
 function truncateEnd(input: string, maxLen: number): string {
@@ -87,7 +91,7 @@ function parseApplyPatchPathsFromPatchText(patchText: string): string[] {
   return out;
 }
 
-export type ToolArgsFormatter = (args: unknown) => string;
+export type ToolArgsFormatter = NonNullable<Level1ToolSpec<unknown>["formatArgs"]>;
 
 const DISPLAY_MAX_LEN = 30;
 const PATH_HEAD_LEN = 14;
@@ -270,11 +274,7 @@ export const BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS: Record<string, ToolArgsFormatt
 
 export function formatToolArgsForDisplay(toolName: string, args: unknown): string {
   const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];
-  try {
-    return f ? f(args) : "";
-  } catch {
-    return "";
-  }
+  return f ? f(args) : "";
 }
 
 export function formatToolArgsForDisplayWithSpecs(
@@ -301,9 +301,5 @@ export function formatToolArgsForDisplayWithSpecs(
 
   const f = BUILTIN_LEVEL1_TOOL_ARGS_FORMATTERS[toolName];
   if (!f) return "";
-  try {
-    return f(args);
-  } catch {
-    return "";
-  }
+  return f(args);
 }

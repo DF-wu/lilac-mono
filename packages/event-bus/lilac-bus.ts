@@ -19,12 +19,17 @@ import {
 } from "./event-dead-letter";
 import {
   applyEventDeliveryPolicy,
+  EventBusCloseFailed,
   EventContractInvalid,
   type EventDeliveryDoneError,
   EventDeliveryStartFailed,
   type EventDeliveryStopFailed,
   EventFetchContractInvalid,
   EventFetchTransportFailed,
+  EventPublishContractInvalid,
+  EventPublishTransportFailed,
+  EventTopicOperationFailed,
+  EventTopicOperationUnsupported,
   type DeliveryDisposition,
   type EventDeliveryContext,
   type EventDeliveryFatalReporter,
@@ -77,52 +82,62 @@ export type CreateLilacBusOptions = {
 
 const KNOWN_EVENT_TYPES = new Set<string>(Object.values(lilacEventTypes));
 
-function assertRequestId(headers: LilacEnvelopeHeaders | undefined, label: string): string {
+function requireRequestId(
+  headers: LilacEnvelopeHeaders | undefined,
+  eventType: LilacEventType,
+): ResultType<string, EventPublishContractInvalid> {
   const requestId = headers?.request_id;
   if (!requestId) {
-    throw new Error(`${label} requires headers.request_id`);
+    return Result.err(
+      new EventPublishContractInvalid({
+        eventType,
+        message: `publish(${eventType}) requires headers.request_id`,
+      }),
+    );
   }
-  return requestId;
+  return Result.ok(requestId);
 }
 
 function getTopicForType<TType extends LilacEventType>(
   type: TType,
   headers: LilacEnvelopeHeaders | undefined,
-): LilacTopicForType<TType>;
-function getTopicForType(
-  type: LilacEventType,
-  headers: LilacEnvelopeHeaders | undefined,
-): LilacTopic {
+): ResultType<LilacTopicForType<TType>, EventPublishContractInvalid> {
   const codec = lilacEventCodecRegistry[type];
-  const requestId = codec.requiresRequestId
-    ? assertRequestId(headers, `publish(${type})`)
-    : (headers?.request_id ?? "");
-  return codec.resolveTopic(requestId);
+  if (!codec.requiresRequestId) return Result.ok(codec.resolveTopic());
+  const requestId = requireRequestId(headers, type);
+  if (requestId.status === "error") return Result.err(requestId.error);
+  return Result.ok(codec.resolveTopic(requestId.value));
 }
 
 function getKeyForType<TType extends LilacEventType>(
   type: TType,
   headers: LilacEnvelopeHeaders | undefined,
   data: LilacDataForType<TType>,
-): string | undefined;
-function getKeyForType(
-  type: LilacEventType,
-  headers: LilacEnvelopeHeaders | undefined,
-  data: LilacDataForType<LilacEventType>,
-): string | undefined {
+): ResultType<string | undefined, EventPublishContractInvalid> {
   switch (lilacEventCodecRegistry[type].keySource) {
-    case "request_id":
-      return assertRequestId(headers, `publish(${type})`);
+    case "request_id": {
+      const requestId = requireRequestId(headers, type);
+      if (requestId.status === "error") return Result.err(requestId.error);
+      return Result.ok(requestId.value);
+    }
     case "messageId":
-      return "messageId" in data && typeof data.messageId === "string" ? data.messageId : undefined;
+      return Result.ok(
+        "messageId" in data && typeof data.messageId === "string" ? data.messageId : undefined,
+      );
     case "actionId":
-      return "actionId" in data && typeof data.actionId === "string" ? data.actionId : undefined;
+      return Result.ok(
+        "actionId" in data && typeof data.actionId === "string" ? data.actionId : undefined,
+      );
     case "barrierId":
-      return "barrierId" in data && typeof data.barrierId === "string" ? data.barrierId : undefined;
+      return Result.ok(
+        "barrierId" in data && typeof data.barrierId === "string" ? data.barrierId : undefined,
+      );
     case "runId":
-      return "runId" in data && typeof data.runId === "string" ? data.runId : undefined;
+      return Result.ok("runId" in data && typeof data.runId === "string" ? data.runId : undefined);
     case "agentId":
-      return "agentId" in data && typeof data.agentId === "string" ? data.agentId : undefined;
+      return Result.ok(
+        "agentId" in data && typeof data.agentId === "string" ? data.agentId : undefined,
+      );
   }
 }
 
@@ -245,7 +260,12 @@ export interface LilacBus {
       /** Best-effort retention hint. */
       retention?: { maxLenApprox?: number };
     },
-  ): Promise<{ id: string; cursor: Cursor; topic: LilacTopicForType<TType> }>;
+  ): Promise<
+    ResultType<
+      { id: string; cursor: Cursor; topic: LilacTopicForType<TType> },
+      EventPublishContractInvalid | EventPublishTransportFailed
+    >
+  >;
 
   subscribeTopic<TTopic extends LilacTopic, TError extends AnyTaggedError>(
     topic: TTopic,
@@ -280,24 +300,28 @@ export interface LilacBus {
   >;
 
   /** Return the latest durable cursor currently present on a topic. */
-  getTopicWatermark(topic: LilacTopic): Promise<Cursor | null>;
+  getTopicWatermark(
+    topic: LilacTopic,
+  ): Promise<ResultType<Cursor | null, EventTopicOperationUnsupported | EventTopicOperationFailed>>;
 
   /** Reclaim a processed prefix while retaining a safety margin behind all durable frontiers. */
   trimTopicBeforeCheckpoint(
     topic: LilacTopic,
     checkpoint: Cursor,
     safetyMargin: number,
-  ): Promise<number>;
+  ): Promise<ResultType<number, EventTopicOperationUnsupported | EventTopicOperationFailed>>;
 
   /** Remove a retired durable consumer group after checking for registered old-version consumers. */
   retireTopicConsumerGroup(
     topic: LilacTopic,
     group: string,
     confirmSingleVersionRollout?: boolean,
-  ): Promise<"absent" | "destroyed">;
+  ): Promise<
+    ResultType<"absent" | "destroyed", EventTopicOperationUnsupported | EventTopicOperationFailed>
+  >;
 
   /** Close the underlying transport. */
-  close(): Promise<void>;
+  close(): Promise<ResultType<void, EventBusCloseFailed>>;
 }
 
 /** Wrap a `RawBus` with the Lilac typed event spec. */
@@ -313,27 +337,50 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
         retention?: { maxLenApprox?: number };
       },
     ) => {
-      const topic = options?.topic ?? getTopicForType(type, options?.headers);
-      const key = options?.key ?? getKeyForType(type, options?.headers, data);
+      let topic = options?.topic;
+      if (topic === undefined) {
+        const resolvedTopic = getTopicForType(type, options?.headers);
+        if (resolvedTopic.status === "error") return Result.err(resolvedTopic.error);
+        topic = resolvedTopic.value;
+      }
+      let key = options?.key;
+      if (key === undefined) {
+        const resolvedKey = getKeyForType(type, options?.headers, data);
+        if (resolvedKey.status === "error") return Result.err(resolvedKey.error);
+        key = resolvedKey.value;
+      }
 
-      const res = await raw.publish(
-        {
-          topic,
-          type,
-          key,
-          headers: options?.headers,
-          data,
-        },
-        {
-          topic,
-          type,
-          key,
-          headers: options?.headers,
-          retention: options?.retention,
-        },
-      );
+      let res: Awaited<ReturnType<RawBus["publish"]>>;
+      try {
+        res = await raw.publish(
+          {
+            topic,
+            type,
+            key,
+            headers: options?.headers,
+            data,
+          },
+          {
+            topic,
+            type,
+            key,
+            headers: options?.headers,
+            retention: options?.retention,
+          },
+        );
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventPublishTransportFailed({
+            cause,
+            eventType: type,
+            topic,
+            message: "Event publish failed",
+          }),
+        );
+      }
 
-      return { ...res, topic };
+      return Result.ok({ ...res, topic });
     },
 
     subscribeTopic: async <TTopic extends LilacTopic, TError extends AnyTaggedError>(
@@ -459,23 +506,92 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
 
     getTopicWatermark: async (topic) => {
       if (!raw.watermark) {
-        throw new Error("The configured event bus does not expose durable topic watermarks");
+        return Result.err(
+          new EventTopicOperationUnsupported({
+            operation: "watermark",
+            topic,
+            message: "The configured event bus does not expose durable topic watermarks",
+          }),
+        );
       }
-      return await raw.watermark(topic);
+      try {
+        return Result.ok(await raw.watermark(topic));
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventTopicOperationFailed({
+            cause,
+            operation: "watermark",
+            topic,
+            message: "Event topic watermark read failed",
+          }),
+        );
+      }
     },
 
     trimTopicBeforeCheckpoint: async (topic, checkpoint, safetyMargin) => {
-      return (await raw.trimBeforeCheckpoint?.(topic, checkpoint, safetyMargin)) ?? 0;
+      if (!raw.trimBeforeCheckpoint) {
+        return Result.err(
+          new EventTopicOperationUnsupported({
+            operation: "trim",
+            topic,
+            message: "The configured event bus does not expose checkpoint trimming",
+          }),
+        );
+      }
+      try {
+        return Result.ok(await raw.trimBeforeCheckpoint(topic, checkpoint, safetyMargin));
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventTopicOperationFailed({
+            cause,
+            operation: "trim",
+            topic,
+            message: "Event topic checkpoint trim failed",
+          }),
+        );
+      }
     },
 
     retireTopicConsumerGroup: async (topic, group, confirmSingleVersionRollout = false) => {
-      return (
-        (await raw.retireConsumerGroup?.(topic, group, confirmSingleVersionRollout)) ?? "absent"
-      );
+      if (!raw.retireConsumerGroup) {
+        return Result.err(
+          new EventTopicOperationUnsupported({
+            operation: "retire-consumer-group",
+            topic,
+            message: "The configured event bus does not expose consumer-group retirement",
+          }),
+        );
+      }
+      try {
+        return Result.ok(await raw.retireConsumerGroup(topic, group, confirmSingleVersionRollout));
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventTopicOperationFailed({
+            cause,
+            operation: "retire-consumer-group",
+            topic,
+            message: "Event topic consumer-group retirement failed",
+          }),
+        );
+      }
     },
 
     close: async () => {
-      await raw.close();
+      try {
+        await raw.close();
+        return Result.ok(undefined);
+      } catch (cause) {
+        if (Panic.is(cause)) throw cause;
+        return Result.err(
+          new EventBusCloseFailed({
+            cause,
+            message: "Event bus close failed",
+          }),
+        );
+      }
     },
   };
 

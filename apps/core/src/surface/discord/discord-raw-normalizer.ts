@@ -36,14 +36,11 @@ export type NormalizedDiscordRaw = {
 };
 
 const recordSchema = z.record(z.string(), z.unknown());
-const maybeStringSchema = z.preprocess(
-  (value) => (typeof value === "string" && value.length > 0 ? value : undefined),
-  z.string().optional(),
-);
-const maybeFiniteNumberSchema = z.preprocess(
-  (value) => (typeof value === "number" && Number.isFinite(value) ? value : undefined),
-  z.number().optional(),
-);
+const maybeStringSchema = z.union([z.string().min(1), z.unknown().transform(() => undefined)]);
+const maybeFiniteNumberSchema = z.union([
+  z.number().finite(),
+  z.unknown().transform(() => undefined),
+]);
 const discordReferenceSchema = z
   .object({
     messageId: maybeStringSchema,
@@ -85,48 +82,6 @@ const discordRawSchema = z
   })
   .passthrough();
 
-function parseRecord(value: unknown): Record<string, unknown> | null {
-  const parsed = recordSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
-}
-
-function normalizeDiscordAttachment(input: unknown): DiscordAttachmentMeta | null {
-  const parsed = discordAttachmentSchema.safeParse(input);
-  if (!parsed.success) return null;
-
-  const attachment = parsed.data;
-  const filename = attachment.filename ?? attachment.name;
-  const mimeType = attachment.mimeType ?? attachment.contentType;
-
-  return {
-    url: attachment.url,
-    ...(filename ? { filename } : {}),
-    ...(mimeType ? { mimeType } : {}),
-    ...(attachment.size !== undefined ? { size: attachment.size } : {}),
-  };
-}
-
-function normalizeDiscordAttachments(input: unknown): DiscordAttachmentMeta[] {
-  if (!Array.isArray(input)) return [];
-
-  const out: DiscordAttachmentMeta[] = [];
-  for (const item of input) {
-    const attachment = normalizeDiscordAttachment(item);
-    if (attachment) out.push(attachment);
-  }
-  return out;
-}
-
-function firstForwardSnapshotMessage(input: unknown): Record<string, unknown> | null {
-  if (!Array.isArray(input) || input.length === 0) return null;
-
-  const first = parseRecord(input[0]);
-  if (!first) return null;
-
-  const nestedMessage = parseRecord(first.message);
-  return nestedMessage ?? first;
-}
-
 function normalizeReference(
   reference: z.infer<typeof discordReferenceSchema> | undefined,
 ): NormalizedDiscordReference | undefined {
@@ -142,6 +97,48 @@ function normalizeReference(
 }
 
 export function normalizeDiscordRaw(raw: unknown): NormalizedDiscordRaw | null {
+  function parseRecord(value: unknown): Record<string, unknown> | null {
+    const parsedRecord = recordSchema.safeParse(value);
+    return parsedRecord.success ? parsedRecord.data : null;
+  }
+
+  function normalizeDiscordAttachment(input: unknown): DiscordAttachmentMeta | null {
+    const parsedAttachment = discordAttachmentSchema.safeParse(input);
+    if (!parsedAttachment.success) return null;
+
+    const attachment = parsedAttachment.data;
+    const filename = attachment.filename ?? attachment.name;
+    const mimeType = attachment.mimeType ?? attachment.contentType;
+
+    return {
+      url: attachment.url,
+      ...(filename ? { filename } : {}),
+      ...(mimeType ? { mimeType } : {}),
+      ...(attachment.size !== undefined ? { size: attachment.size } : {}),
+    };
+  }
+
+  function normalizeDiscordAttachments(input: unknown): DiscordAttachmentMeta[] {
+    if (!Array.isArray(input)) return [];
+
+    const out: DiscordAttachmentMeta[] = [];
+    for (const item of input) {
+      const attachment = normalizeDiscordAttachment(item);
+      if (attachment) out.push(attachment);
+    }
+    return out;
+  }
+
+  function firstForwardSnapshotMessage(input: unknown): Record<string, unknown> | null {
+    if (!Array.isArray(input) || input.length === 0) return null;
+
+    const first = parseRecord(input[0]);
+    if (!first) return null;
+
+    const nestedMessage = parseRecord(first.message);
+    return nestedMessage ?? first;
+  }
+
   const parsed = discordRawSchema.safeParse(raw);
   if (!parsed.success) return null;
 

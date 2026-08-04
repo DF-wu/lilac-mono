@@ -1,11 +1,68 @@
 import { describe, expect, it } from "bun:test";
+import { Panic } from "better-result";
+import { ZodError } from "zod";
 
-import { WEBFETCH_MAX_RESPONSE_BYTES, executeWebfetch, webfetchInputSchema } from "../src/webfetch";
+import {
+  WEBFETCH_MAX_RESPONSE_BYTES,
+  createWebfetchTool,
+  decodeWebfetchInput,
+  executeWebfetch,
+  executeWebfetchResult,
+  webfetchInputSchema,
+  webfetchOutputSchema,
+} from "../src/webfetch";
+import {
+  MiniLilacStoreOperationRejected as ExportedMiniLilacStoreOperationRejected,
+  WorkspaceHistoryCleanupFailed as ExportedWorkspaceHistoryCleanupFailed,
+  WorkspaceHistoryOperationAndCleanupFailed as ExportedWorkspaceHistoryOperationAndCleanupFailed,
+  createWorkspaceHistoryStore as exportedCreateWorkspaceHistoryStore,
+  decodeStoredHistoryNavigationResult as exportedDecodeStoredHistoryNavigationResult,
+  executeWebfetch as exportedExecuteWebfetch,
+  executeWebfetchResult as exportedExecuteWebfetchResult,
+} from "../src/index";
+import {
+  MiniLilacStoreOperationRejected,
+  decodeStoredHistoryNavigationResult,
+} from "../src/sqlite-store";
+import {
+  WorkspaceHistoryCleanupFailed,
+  WorkspaceHistoryOperationAndCleanupFailed,
+  createWorkspaceHistoryStore,
+} from "../src/workspace-history-store";
 
 const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }] as const;
 
+function decodedInput(rawInput: unknown) {
+  const decoded = decodeWebfetchInput(rawInput);
+  expect(decoded.status).toBe("ok");
+  if (decoded.status === "error") throw decoded.error;
+  return decoded.value;
+}
+
+async function executeOk(
+  rawInput: unknown,
+  options: Parameters<typeof executeWebfetchResult>[1] = {},
+  dependencies: Parameters<typeof executeWebfetchResult>[2] = {},
+) {
+  const result = await executeWebfetchResult(decodedInput(rawInput), options, dependencies);
+  expect(result.status).toBe("ok");
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+async function executeError(
+  rawInput: unknown,
+  options: Parameters<typeof executeWebfetchResult>[1] = {},
+  dependencies: Parameters<typeof executeWebfetchResult>[2] = {},
+) {
+  const result = await executeWebfetchResult(decodedInput(rawInput), options, dependencies);
+  expect(result.status).toBe("error");
+  if (result.status === "ok") throw new Error("expected webfetch failure");
+  return result.error;
+}
+
 describe("Mini Lilac webfetch", () => {
-  it("applies bounded defaults and rejects non-HTTP URLs and credentials", () => {
+  it("applies bounded defaults and rejects non-HTTP URLs and credentials", async () => {
     expect(webfetchInputSchema.parse({ url: "https://example.com" })).toEqual({
       url: "https://example.com",
       format: "markdown",
@@ -24,6 +81,15 @@ describe("Mini Lilac webfetch", () => {
     expect(() =>
       webfetchInputSchema.parse({ url: `https://example.com/${"x".repeat(2_048)}` }),
     ).toThrow();
+    expect(decodeWebfetchInput({ url: "file:///etc/passwd" })).toMatchObject({
+      status: "error",
+      error: { _tag: "WebfetchInputInvalid", message: "Invalid webfetch input" },
+    });
+    expect(await executeWebfetchResult({ url: "file:///etc/passwd" })).toMatchObject({
+      status: "error",
+      error: { _tag: "WebfetchInputInvalid", message: "Invalid webfetch input" },
+    });
+    await expect(executeWebfetch({ url: "file:///etc/passwd" })).rejects.toBeInstanceOf(ZodError);
   });
 
   it("blocks local, private, mapped, metadata, and mixed DNS destinations before fetching", async () => {
@@ -41,38 +107,35 @@ describe("Mini Lilac webfetch", () => {
       "https://metadata.google.internal/",
       "https://service.internal/",
     ]) {
-      await expect(
-        executeWebfetch({ url }, {}, { fetch: fetchImpl, lookup: publicLookup }),
-      ).rejects.toThrow(/blocked/u);
+      const error = await executeError({ url }, {}, { fetch: fetchImpl, lookup: publicLookup });
+      expect(error.message).toMatch(/blocked/u);
     }
 
-    await expect(
-      executeWebfetch(
-        { url: "https://public.example.com" },
-        {},
-        {
-          fetch: fetchImpl,
-          lookup: async () => [
-            { address: "93.184.216.34", family: 4 },
-            { address: "10.0.0.1", family: 4 },
-          ],
-        },
-      ),
-    ).rejects.toThrow("blocked destination");
+    const mixedDnsError = await executeError(
+      { url: "https://public.example.com" },
+      {},
+      {
+        fetch: fetchImpl,
+        lookup: async () => [
+          { address: "93.184.216.34", family: 4 },
+          { address: "10.0.0.1", family: 4 },
+        ],
+      },
+    );
+    expect(mixedDnsError.message).toContain("blocked destination");
     expect(fetches).toBe(0);
   });
 
   it("refuses inherited proxies and retries validated addresses after connection failures", async () => {
-    await expect(
-      executeWebfetch(
-        { url: "https://public.example.com" },
-        {},
-        { environment: { HTTPS_PROXY: "http://proxy.example.com" } },
-      ),
-    ).rejects.toThrow("proxy routing bypasses destination pinning");
+    const proxyError = await executeError(
+      { url: "https://public.example.com" },
+      {},
+      { environment: { HTTPS_PROXY: "http://proxy.example.com" } },
+    );
+    expect(proxyError.message).toContain("proxy routing bypasses destination pinning");
 
     const requested: string[] = [];
-    const result = await executeWebfetch(
+    const result = await executeOk(
       { url: "https://public.example.com", format: "text" },
       {},
       {
@@ -93,8 +156,38 @@ describe("Mini Lilac webfetch", () => {
     expect(result.content).toBe("fallback worked");
   });
 
+  it("preserves the throwing compatibility API success shape", async () => {
+    expect(exportedExecuteWebfetch).toBe(executeWebfetch);
+    expect(exportedExecuteWebfetchResult).toBe(executeWebfetchResult);
+    const output = await executeWebfetch(
+      { url: "https://public.example.com/compatibility", format: "text" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () =>
+          new Response("compatibility output", { headers: { "content-type": "text/plain" } }),
+      },
+    );
+    expect(output).toMatchObject({
+      requestedUrl: "https://public.example.com/compatibility",
+      content: "compatibility output",
+      status: 200,
+      format: "text",
+    });
+  });
+
+  it("exports the completed runtime Result and cleanup surface", () => {
+    expect(exportedDecodeStoredHistoryNavigationResult).toBe(decodeStoredHistoryNavigationResult);
+    expect(ExportedMiniLilacStoreOperationRejected).toBe(MiniLilacStoreOperationRejected);
+    expect(exportedCreateWorkspaceHistoryStore).toBe(createWorkspaceHistoryStore);
+    expect(ExportedWorkspaceHistoryCleanupFailed).toBe(WorkspaceHistoryCleanupFailed);
+    expect(ExportedWorkspaceHistoryOperationAndCleanupFailed).toBe(
+      WorkspaceHistoryOperationAndCleanupFailed,
+    );
+  });
+
   it("converts bounded HTML to Markdown without active content", async () => {
-    const result = await executeWebfetch(
+    const result = await executeOk(
       {
         url: "https://public.example.com/article#section",
         maxCharacters: 100,
@@ -124,9 +217,26 @@ describe("Mini Lilac webfetch", () => {
     expect(result.truncated).toBe(false);
   });
 
+  it("stops HTML parsing at the structural depth limit", async () => {
+    const html = `${"<div>".repeat(257)}content${"</div>".repeat(257)}`;
+    const error = await executeError(
+      { url: "https://public.example.com/deep" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () =>
+          new Response(html, { status: 200, headers: { "content-type": "text/html" } }),
+      },
+    );
+    expect(error).toMatchObject({
+      _tag: "WebfetchResponseRejected",
+      message: "webfetch HTML exceeds parser limits",
+    });
+  });
+
   it("revalidates relative redirects and blocks HTTPS downgrades", async () => {
     const requested: string[] = [];
-    const result = await executeWebfetch(
+    const result = await executeOk(
       { url: "https://public.example.com/start", format: "text" },
       {},
       {
@@ -147,38 +257,36 @@ describe("Mini Lilac webfetch", () => {
     expect(result.url).toBe("https://public.example.com/final");
     expect(result.redirects).toBe(1);
 
-    await expect(
-      executeWebfetch(
-        { url: "https://public.example.com/start" },
-        {},
-        {
-          lookup: publicLookup,
-          fetch: async () =>
-            new Response(null, {
-              status: 302,
-              headers: { location: "http://public.example.com/final" },
-            }),
-        },
-      ),
-    ).rejects.toThrow("HTTPS to HTTP");
+    const downgradeError = await executeError(
+      { url: "https://public.example.com/start" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () =>
+          new Response(null, {
+            status: 302,
+            headers: { location: "http://public.example.com/final" },
+          }),
+      },
+    );
+    expect(downgradeError.message).toContain("HTTPS to HTTP");
 
     let privateRedirectFetches = 0;
-    await expect(
-      executeWebfetch(
-        { url: "https://public.example.com/start" },
-        {},
-        {
-          lookup: publicLookup,
-          fetch: async () => {
-            privateRedirectFetches += 1;
-            return new Response(null, {
-              status: 302,
-              headers: { location: "https://127.0.0.1/private" },
-            });
-          },
+    const privateRedirectError = await executeError(
+      { url: "https://public.example.com/start" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () => {
+          privateRedirectFetches += 1;
+          return new Response(null, {
+            status: 302,
+            headers: { location: "https://127.0.0.1/private" },
+          });
         },
-      ),
-    ).rejects.toThrow("blocked address");
+      },
+    );
+    expect(privateRedirectError.message).toContain("blocked address");
     expect(privateRedirectFetches).toBe(1);
   });
 
@@ -189,8 +297,8 @@ describe("Mini Lilac webfetch", () => {
     const started = new Promise<void>((resolve) => {
       responseStarted = resolve;
     });
-    const pending = executeWebfetch(
-      { url: "https://public.example.com/stalled" },
+    const pending = executeWebfetchResult(
+      decodedInput({ url: "https://public.example.com/stalled" }),
       { abortSignal: abortController.signal },
       {
         lookup: publicLookup,
@@ -211,50 +319,83 @@ describe("Mini Lilac webfetch", () => {
     // test-wait-justification: lets response-body consumption attach before aborting the in-flight fetch
     await Bun.sleep(0);
     abortController.abort(new Error("cancelled by test"));
-    await expect(pending).rejects.toThrow("cancelled by test");
+    const result = await pending;
+    expect(result).toMatchObject({
+      status: "error",
+      error: { _tag: "WebfetchCancelled", message: "webfetch request was cancelled" },
+    });
     expect(bodyCancelled).toBe(true);
+
+    const legacyAbortController = new AbortController();
+    const legacyReason = new DOMException("legacy cancellation", "AbortError");
+    let legacyBodyCancelled = false;
+    let legacyResponseStarted: (() => void) | undefined;
+    const legacyStarted = new Promise<void>((resolve) => {
+      legacyResponseStarted = resolve;
+    });
+    const legacyPending = executeWebfetch(
+      { url: "https://public.example.com/legacy-stalled" },
+      { abortSignal: legacyAbortController.signal },
+      {
+        lookup: publicLookup,
+        fetch: async () => {
+          legacyResponseStarted?.();
+          return new Response(
+            new ReadableStream({
+              cancel() {
+                legacyBodyCancelled = true;
+              },
+            }),
+            { headers: { "content-type": "text/plain" } },
+          );
+        },
+      },
+    );
+    await legacyStarted;
+    // test-wait-justification: lets legacy response-body consumption attach before aborting it
+    await Bun.sleep(0);
+    legacyAbortController.abort(legacyReason);
+    await expect(legacyPending).rejects.toBe(legacyReason);
+    expect(legacyBodyCancelled).toBe(true);
   });
 
   it("rejects unsupported content and oversized responses, and reports output truncation", async () => {
-    await expect(
-      executeWebfetch(
-        { url: "https://public.example.com/file" },
-        {},
-        {
-          lookup: publicLookup,
-          fetch: async () =>
-            new Response("pdf", { headers: { "content-type": "application/pdf" } }),
-        },
-      ),
-    ).rejects.toThrow("does not support Content-Type");
+    const unsupportedError = await executeError(
+      { url: "https://public.example.com/file" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () => new Response("pdf", { headers: { "content-type": "application/pdf" } }),
+      },
+    );
+    expect(unsupportedError.message).toContain("does not support Content-Type");
 
     let oversizedCancelled = false;
-    await expect(
-      executeWebfetch(
-        { url: "https://public.example.com/large" },
-        {},
-        {
-          lookup: publicLookup,
-          fetch: async () =>
-            new Response(
-              new ReadableStream({
-                cancel() {
-                  oversizedCancelled = true;
-                },
-              }),
-              {
-                headers: {
-                  "content-type": "text/plain",
-                  "content-length": String(WEBFETCH_MAX_RESPONSE_BYTES + 1),
-                },
+    const oversizedError = await executeError(
+      { url: "https://public.example.com/large" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () =>
+          new Response(
+            new ReadableStream({
+              cancel() {
+                oversizedCancelled = true;
               },
-            ),
-        },
-      ),
-    ).rejects.toThrow("exceeds");
+            }),
+            {
+              headers: {
+                "content-type": "text/plain",
+                "content-length": String(WEBFETCH_MAX_RESPONSE_BYTES + 1),
+              },
+            },
+          ),
+      },
+    );
+    expect(oversizedError.message).toContain("exceeds");
     expect(oversizedCancelled).toBe(true);
 
-    const truncated = await executeWebfetch(
+    const truncated = await executeOk(
       { url: "https://public.example.com/text", format: "text", maxCharacters: 4 },
       {},
       {
@@ -264,5 +405,142 @@ describe("Mini Lilac webfetch", () => {
     );
     expect(truncated.content).toBe("abcd");
     expect(truncated.truncated).toBe(true);
+  });
+
+  it("preserves Panic and reports cleanup failures without exposing dependency payloads", async () => {
+    const panic = new Panic({ message: "fetch invariant" });
+    await expect(
+      executeWebfetch(
+        decodedInput({ url: "https://public.example.com" }),
+        {},
+        {
+          lookup: publicLookup,
+          fetch: async () => {
+            throw panic;
+          },
+        },
+      ),
+    ).rejects.toBe(panic);
+
+    const secret = "dependency-secret";
+    const redacted = await executeError(
+      { url: "https://public.example.com" },
+      {},
+      {
+        lookup: async () => {
+          throw new Error(secret);
+        },
+        fetch: async () => new Response("unexpected"),
+      },
+    );
+    expect(redacted).toMatchObject({
+      _tag: "WebfetchExternalOperationFailed",
+      operation: "DNS lookup",
+    });
+    expect(JSON.stringify(redacted)).not.toContain(secret);
+    const legacyLookupError = new TypeError(secret);
+    await expect(
+      executeWebfetch(
+        { url: "https://public.example.com" },
+        {},
+        {
+          lookup: async () => {
+            throw legacyLookupError;
+          },
+          fetch: async () => new Response("unexpected"),
+        },
+      ),
+    ).rejects.toBe(legacyLookupError);
+
+    const legacyConnectError = new TypeError("connection refused");
+    await expect(
+      executeWebfetch(
+        { url: "https://public.example.com" },
+        {},
+        {
+          lookup: publicLookup,
+          fetch: async () => {
+            throw legacyConnectError;
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: "webfetch could not connect to 'public.example.com'",
+      cause: legacyConnectError,
+    });
+
+    const cleanupError = await executeError(
+      { url: "https://public.example.com/file" },
+      {},
+      {
+        lookup: publicLookup,
+        fetch: async () =>
+          new Response(
+            new ReadableStream({
+              cancel() {
+                throw new Error("cleanup-secret");
+              },
+            }),
+            { headers: { "content-type": "application/pdf" } },
+          ),
+      },
+    );
+    expect(cleanupError).toMatchObject({
+      _tag: "WebfetchOperationAndCleanupFailed",
+      primary: { _tag: "WebfetchResponseRejected" },
+      cleanup: { _tag: "WebfetchCleanupFailed", operations: ["cancel response body"] },
+    });
+    expect(JSON.stringify(cleanupError)).not.toContain("cleanup-secret");
+
+    const legacyCleanupError = new TypeError("legacy cleanup failure");
+    await expect(
+      executeWebfetch(
+        { url: "https://public.example.com/legacy-cleanup" },
+        {},
+        {
+          lookup: publicLookup,
+          fetch: async () =>
+            new Response(
+              new ReadableStream({
+                cancel() {
+                  throw legacyCleanupError;
+                },
+              }),
+              { headers: { "content-type": "application/pdf" } },
+            ),
+        },
+      ),
+    ).rejects.toBe(legacyCleanupError);
+
+    const cleanupPanic = new Panic({ message: "cleanup invariant" });
+    await expect(
+      executeWebfetch(
+        decodedInput({ url: "https://public.example.com/panic-cleanup" }),
+        {},
+        {
+          lookup: publicLookup,
+          fetch: async () =>
+            new Response(
+              new ReadableStream({
+                cancel() {
+                  throw cleanupPanic;
+                },
+              }),
+              { headers: { "content-type": "application/pdf" } },
+            ),
+        },
+      ),
+    ).rejects.toBe(cleanupPanic);
+  });
+
+  it("keeps the AI SDK tool compatibility adapter installed", () => {
+    const tool = createWebfetchTool({
+      lookup: publicLookup,
+      fetch: async () => new Response("tool result", { headers: { "content-type": "text/plain" } }),
+    }).webfetch;
+    if (!tool || tool.type === "provider" || !tool.execute)
+      throw new Error("missing webfetch tool");
+    expect(tool.execute).toBeFunction();
+    expect(tool.outputSchema).toBe(webfetchOutputSchema);
   });
 });

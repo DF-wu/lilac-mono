@@ -227,6 +227,52 @@ describe("plugin hook adapters", () => {
     expect(asyncResult.error.message).toContain("async hook");
   });
 
+  it("maps editTargets iterator failure and preserves iterator Panic identity", async () => {
+    const throwingIterable = (failure: Error): Iterable<string> => ({
+      [Symbol.iterator]() {
+        return {
+          next(): IteratorResult<string> {
+            throw failure;
+          },
+        };
+      },
+    });
+    const ordinary = level1({
+      editTargets() {
+        return throwingIterable(new Error("iterator failed"));
+      },
+    });
+    const ordinaryResult = await invokeLevel1EditTargets({
+      ...context,
+      spec: ordinary,
+      args: {},
+      cwd: "/",
+    });
+    expect(ordinaryResult.status).toBe("error");
+    if (ordinaryResult.status === "ok") throw new Error("expected iterator failure");
+    expect(ordinaryResult.error._tag).toBe("ToolPluginHookError");
+    if (ordinaryResult.error._tag !== "ToolPluginHookError") {
+      throw new Error("expected hook error");
+    }
+    expect(ordinaryResult.error.hook).toBe("level1.editTargets");
+    expect(ordinaryResult.error.message).toContain("iterator failed");
+
+    const panic = new Panic({ message: "iterator invariant" });
+    const panicking = level1({
+      editTargets() {
+        return throwingIterable(panic);
+      },
+    });
+    let caught: unknown;
+    try {
+      await invokeLevel1EditTargets({ ...context, spec: panicking, args: {}, cwd: "/" });
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBe(panic);
+    expect(Panic.is(caught)).toBe(true);
+  });
+
   it("contains hostile Level 2 list getters and thrown values", async () => {
     const hostile = new Proxy(
       {},

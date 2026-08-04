@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -122,6 +122,36 @@ describe("remote fs daemon socket transport", () => {
       caught = cause;
     }
 
+    expect(caught).toBe(panic);
+  });
+
+  it("projects startup-lock error codes and preserves Panic from hostile code inspection", async () => {
+    runtimeDir = await mkdtemp(path.join(tmpdir(), "lilac-remote-fs-lock-"));
+    process.env.LILAC_REMOTE_FS_RUNNER_DIR = runtimeDir;
+    await mkdir(path.join(runtimeDir, "startup.lock"));
+
+    const existing = new Error("already exists");
+    Object.defineProperty(existing, "code", { value: "EEXIST" });
+    const lockResult = await tryAcquireStartupLock(async () => {
+      throw existing;
+    });
+    expect(lockResult).toEqual(Result.ok(false));
+
+    const panic = new Panic({ message: "error-code getter invariant" });
+    const hostile = new Error("hostile code");
+    Object.defineProperty(hostile, "code", {
+      get() {
+        throw panic;
+      },
+    });
+    let caught: unknown;
+    try {
+      await tryAcquireStartupLock(async () => {
+        throw hostile;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
     expect(caught).toBe(panic);
   });
 

@@ -1,6 +1,5 @@
 import type { ModelMessage } from "ai";
-import type { CoreConfig } from "@stanley2058/lilac-utils";
-import { resolveHeartbeatPromptPaths } from "@stanley2058/lilac-utils";
+import { isPanic, resolveHeartbeatPromptPaths, type CoreConfig } from "@stanley2058/lilac-utils";
 
 import { matchesMagicToken } from "../shared/magic-token";
 
@@ -232,7 +231,8 @@ function createQuietHoursFormatter(timezone: string | undefined): Intl.DateTimeF
       hour12: false,
       ...(timezone ? { timeZone: timezone } : {}),
     });
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return new Intl.DateTimeFormat("en-GB", {
       hour: "2-digit",
       minute: "2-digit",

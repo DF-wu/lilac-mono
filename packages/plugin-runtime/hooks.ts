@@ -49,28 +49,21 @@ export type HookContext = {
 
 export function mapPluginHookException(
   context: HookContext,
-  cause: unknown,
+  cause: Error,
+  skipReason?: string,
 ): ToolPluginInvocationError {
-  if (isPluginPanic(cause)) throw cause;
-  let isSkip = false;
-  try {
-    isSkip = cause instanceof ToolPluginSkipError;
-  } catch {
-    isSkip = false;
-  }
-  if (isSkip) {
-    const reason = opaquePluginExceptionMessage(cause);
+  if (skipReason !== undefined) {
     return new ToolPluginSkipped({
       pluginId: context.pluginId,
       source: context.source,
-      reason,
-      message: `Plugin '${context.pluginId}' skipped: ${reason}`,
+      reason: skipReason,
+      message: `Plugin '${context.pluginId}' skipped: ${skipReason}`,
     });
   }
   return new ToolPluginHookError({
     ...context,
-    cause: safePluginExceptionCause(cause),
-    message: `Plugin '${context.pluginId}' ${context.hook} failed: ${opaquePluginExceptionMessage(cause)}`,
+    cause,
+    message: `Plugin '${context.pluginId}' ${context.hook} failed: ${cause.message}`,
   });
 }
 
@@ -100,27 +93,61 @@ function resolveServerToolCapability(params: {
   return decodeServerTool(params.pluginId, params.tool);
 }
 
-function captureSyncHook(
+function captureSyncHook<T>(
   context: HookContext,
-  run: () => unknown,
-): ResultType<unknown, ToolPluginInvocationError> {
+  run: () => T,
+): ResultType<T, ToolPluginInvocationError>;
+function captureSyncHook<TInput, TOutput, E>(
+  context: HookContext,
+  run: () => TInput,
+  decode: (value: TInput) => ResultType<TOutput, E>,
+): ResultType<TOutput, ToolPluginInvocationError | E>;
+function captureSyncHook<TInput, TOutput = TInput, E = never>(
+  context: HookContext,
+  run: () => TInput,
+  decode?: (value: TInput) => ResultType<TOutput, E>,
+): ResultType<TInput | TOutput, ToolPluginInvocationError | E> {
   try {
-    return Result.ok(run());
+    const value = run();
+    return decode ? decode(value) : Result.ok(value);
   } catch (cause) {
     if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapPluginHookException(context, cause));
+    let skipReason: string | undefined;
+    try {
+      if (cause instanceof ToolPluginSkipError) skipReason = opaquePluginExceptionMessage(cause);
+    } catch {
+      skipReason = undefined;
+    }
+    return Result.err(mapPluginHookException(context, safePluginExceptionCause(cause), skipReason));
   }
 }
 
 async function captureAsyncHook<T>(
   context: HookContext,
   run: () => Promise<T> | T,
-): Promise<ResultType<T, ToolPluginInvocationError>> {
+): Promise<ResultType<T, ToolPluginInvocationError>>;
+async function captureAsyncHook<TInput, TOutput, E>(
+  context: HookContext,
+  run: () => Promise<TInput> | TInput,
+  decode: (value: Awaited<TInput>) => ResultType<TOutput, E>,
+): Promise<ResultType<TOutput, ToolPluginInvocationError | E>>;
+async function captureAsyncHook<TInput, TOutput = Awaited<TInput>, E = never>(
+  context: HookContext,
+  run: () => Promise<TInput> | TInput,
+  decode?: (value: Awaited<TInput>) => ResultType<TOutput, E>,
+): Promise<ResultType<Awaited<TInput> | TOutput, ToolPluginInvocationError | E>> {
   try {
-    return Result.ok(await run());
+    const value = await run();
+    return decode ? decode(value) : Result.ok(value);
   } catch (cause) {
     if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapPluginHookException(context, cause));
+    let skipReason: string | undefined;
+    try {
+      if (cause instanceof ToolPluginSkipError) skipReason = opaquePluginExceptionMessage(cause);
+    } catch {
+      skipReason = undefined;
+    }
+    return Result.err(mapPluginHookException(context, safePluginExceptionCause(cause), skipReason));
   }
 }
 
@@ -141,7 +168,7 @@ export async function invokeToolPluginCreate<TRuntimeContext>(params: {
     hook: "plugin.create",
   } satisfies HookContext;
   return captureAsyncHook(hookContext, () =>
-    Reflect.apply(params.capability.create, params.capability.plugin, [params.context]),
+    params.capability.create.call(params.capability.plugin, params.context),
   );
 }
 
@@ -157,7 +184,7 @@ export async function invokeToolPluginInstanceInit<TRuntimeContext>(params: {
     hook: "instance.init",
   } satisfies HookContext;
   const invoked = await captureAsyncHook(context, () =>
-    Reflect.apply(params.capability.init!, params.capability.instance, []),
+    params.capability.init!.call(params.capability.instance),
   );
   if (invoked.status === "error") return invoked;
   return decodeVoidHookResult(params.pluginId, invoked.value);
@@ -175,7 +202,7 @@ export async function invokeToolPluginInstanceDestroy<TRuntimeContext>(params: {
     hook: "instance.destroy",
   } satisfies HookContext;
   const invoked = await captureAsyncHook(context, () =>
-    Reflect.apply(params.capability.destroy!, params.capability.instance, []),
+    params.capability.destroy!.call(params.capability.instance),
   );
   if (invoked.status === "error") return invoked;
   return decodeVoidHookResult(params.pluginId, invoked.value);
@@ -197,7 +224,7 @@ export function invokeLevel1CreateTool<TRuntimeContext>(params: {
       hook: "level1.createTool",
       itemId: capability.value.name,
     },
-    () => Reflect.apply(capability.value.createTool, params.spec, [params.context]),
+    () => capability.value.createTool.call(params.spec, params.context),
   );
 }
 
@@ -210,25 +237,24 @@ export function invokeLevel1IsEnabled<TRuntimeContext>(params: {
 }): ResultType<boolean, ToolPluginInvocationError | ToolPluginCapabilityError> {
   const capability = resolveLevel1Capability(params);
   if (capability.status === "error") return capability;
-  const invoked = captureSyncHook(
+  return captureSyncHook(
     {
       pluginId: params.pluginId,
       source: params.source,
       hook: "level1.isEnabled",
       itemId: capability.value.name,
     },
-    () => Reflect.apply(capability.value.isEnabled, params.spec, [params.context]),
+    () => capability.value.isEnabled.call(params.spec, params.context),
+    (value) => decodeBooleanHookResult(params.pluginId, value),
   );
-  if (invoked.status === "error") return invoked;
-  return decodeBooleanHookResult(params.pluginId, invoked.value);
 }
 
-export async function invokeLevel1EditTargets(params: {
+export async function invokeLevel1EditTargets<TArgs>(params: {
   pluginId: string;
   source: PluginSource;
   spec: Level1ToolSpec<unknown>;
   capability?: Level1ToolSpecCapabilitySnapshot<unknown>;
-  args: unknown;
+  args: TArgs;
   cwd: string;
 }): Promise<
   ResultType<readonly string[] | undefined, ToolPluginInvocationError | ToolPluginCapabilityError>
@@ -242,36 +268,38 @@ export async function invokeLevel1EditTargets(params: {
     hook: "level1.editTargets",
     itemId: capability.value.name,
   } satisfies HookContext;
-  const invoked = await captureAsyncHook(context, () =>
-    Reflect.apply(capability.value.editTargets!, params.spec, [params.args, { cwd: params.cwd }]),
+  return captureAsyncHook(
+    context,
+    () => capability.value.editTargets!.call(params.spec, params.args, { cwd: params.cwd }),
+    (value) =>
+      captureSyncHook(
+        context,
+        () => Array.from(value),
+        (collected) => decodeStringArrayHookResult(params.pluginId, collected),
+      ),
   );
-  if (invoked.status === "error") return invoked;
-  const collected = captureSyncHook(context, () => Array.from(invoked.value));
-  if (collected.status === "error") return collected;
-  return decodeStringArrayHookResult(params.pluginId, collected.value);
 }
 
-export function invokeLevel1FormatArgs(params: {
+export function invokeLevel1FormatArgs<TArgs>(params: {
   pluginId: string;
   source: PluginSource;
   spec: Level1ToolSpec<unknown>;
   capability?: Level1ToolSpecCapabilitySnapshot<unknown>;
-  args: unknown;
+  args: TArgs;
 }): ResultType<string | undefined, ToolPluginInvocationError | ToolPluginCapabilityError> {
   const capability = resolveLevel1Capability(params);
   if (capability.status === "error") return capability;
   if (capability.value.formatArgs === undefined) return Result.ok(undefined);
-  const invoked = captureSyncHook(
+  return captureSyncHook(
     {
       pluginId: params.pluginId,
       source: params.source,
       hook: "level1.formatArgs",
       itemId: capability.value.name,
     },
-    () => Reflect.apply(capability.value.formatArgs!, params.spec, [params.args]),
+    () => capability.value.formatArgs!.call(params.spec, params.args),
+    (value) => decodeStringHookResult(params.pluginId, value),
   );
-  if (invoked.status === "error") return invoked;
-  return decodeStringHookResult(params.pluginId, invoked.value);
 }
 
 export function invokeLevel1SummarizeFailure(params: {
@@ -287,17 +315,16 @@ export function invokeLevel1SummarizeFailure(params: {
   const capability = resolveLevel1Capability(params);
   if (capability.status === "error") return capability;
   if (capability.value.summarizeFailure === undefined) return Result.ok(undefined);
-  const invoked = captureSyncHook(
+  return captureSyncHook(
     {
       pluginId: params.pluginId,
       source: params.source,
       hook: "level1.summarizeFailure",
       itemId: capability.value.name,
     },
-    () => Reflect.apply(capability.value.summarizeFailure!, params.spec, [params.value]),
+    () => capability.value.summarizeFailure!.call(params.spec, params.value),
+    (value) => decodeLevel1ToolFailureSummary(params.pluginId, value),
   );
-  if (invoked.status === "error") return invoked;
-  return decodeLevel1ToolFailureSummary(params.pluginId, invoked.value);
 }
 
 async function invokeLevel2VoidHook(params: {
@@ -316,7 +343,7 @@ async function invokeLevel2VoidHook(params: {
     hook: params.hook,
     itemId: capability.value.id,
   } satisfies HookContext;
-  const invoked = await captureAsyncHook(context, () => Reflect.apply(method, params.tool, []));
+  const invoked = await captureAsyncHook(context, () => method.call(params.tool));
   if (invoked.status === "error") return invoked;
   return decodeVoidHookResult(params.pluginId, invoked.value);
 }
@@ -356,7 +383,7 @@ export async function invokeLevel2List(params: {
       hook: "level2.list",
       itemId: capability.value.id,
     },
-    () => Reflect.apply(capability.value.list, params.tool, []),
+    () => capability.value.list.call(params.tool),
   );
   if (invoked.status === "error") return invoked;
   return decodeServerToolListResult(params.pluginId, invoked.value);
@@ -380,11 +407,6 @@ export function invokeLevel2Call(params: {
       hook: "level2.call",
       itemId: capability.value.id,
     },
-    () =>
-      Reflect.apply(capability.value.call, params.tool, [
-        params.callableId,
-        params.input,
-        params.opts,
-      ]),
+    () => capability.value.call.call(params.tool, params.callableId, params.input, params.opts),
   );
 }

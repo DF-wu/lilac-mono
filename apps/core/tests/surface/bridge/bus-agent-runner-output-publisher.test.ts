@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 import {
   createLilacBus,
   lilacEventTypes,
@@ -13,6 +13,7 @@ import {
 import {
   AGENT_OUTPUT_FLUSH_BYTES,
   AGENT_OUTPUT_FLUSH_INTERVAL_MS,
+  AgentOutputPublishFailed,
   createAgentOutputPublisher,
   type AgentOutputFlushScheduler,
 } from "../../../src/surface/bridge/bus-agent-runner/output-publisher";
@@ -86,7 +87,8 @@ function createManualScheduler() {
 function createPublisher(
   raw: ReturnType<typeof createRecordingRawBus>,
   scheduleFlush?: AgentOutputFlushScheduler,
-  onError?: (label: string, error: unknown) => void,
+  onError?: (label: string, error: AgentOutputPublishFailed) => void,
+  reportFatalPanic: (panic: Panic) => void = () => undefined,
 ) {
   return createAgentOutputPublisher({
     bus: createLilacBus(raw),
@@ -97,6 +99,7 @@ function createPublisher(
     },
     scheduleFlush,
     onError,
+    reportFatalPanic,
   });
 }
 
@@ -258,11 +261,17 @@ describe("request-local agent output publisher", () => {
   });
 
   it("continues ordered publication after a best-effort failure", async () => {
-    const errors: string[] = [];
+    const errors: AgentOutputPublishFailed[] = [];
+    const fatalPanics: Panic[] = [];
     const raw = createRecordingRawBus({
       failTypes: new Set([lilacEventTypes.EvtAgentOutputDeltaText]),
     });
-    const publisher = createPublisher(raw, undefined, (label) => errors.push(label));
+    const publisher = createPublisher(
+      raw,
+      undefined,
+      (_label, error) => errors.push(error),
+      (panic) => fatalPanics.push(panic),
+    );
 
     publisher.publishText("lost transport write");
     await publisher.publishToolCall({
@@ -271,8 +280,77 @@ describe("request-local agent output publisher", () => {
       display: "grep",
     });
 
-    expect(errors).toEqual(["text delta"]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      _tag: "AgentOutputPublishFailed",
+      label: "text delta",
+      errorTag: "EventPublishTransportFailed",
+      eventType: lilacEventTypes.EvtAgentOutputDeltaText,
+    });
+    expect(fatalPanics).toEqual([]);
     expect(raw.messages).toHaveLength(1);
     expect(raw.messages[0]?.type).toBe(lilacEventTypes.EvtAgentOutputToolCall);
+  });
+
+  it("reports a timer-triggered publication Panic to the fatal supervisor", async () => {
+    const panic = new Panic({ message: "timer publication invariant failed" });
+    const fatalPanicReported = deferred<Panic>();
+    const scheduler = createManualScheduler();
+    const raw = createRecordingRawBus({
+      beforePublish: async () => {
+        throw panic;
+      },
+    });
+    const publisher = createPublisher(
+      raw,
+      scheduler.schedule,
+      undefined,
+      fatalPanicReported.resolve,
+    );
+
+    publisher.publishText("timer flush");
+    scheduler.runNext();
+
+    expect(await fatalPanicReported.promise).toBe(panic);
+    await expect(publisher.drain()).rejects.toBe(panic);
+  });
+
+  it("reports a byte-triggered publication Panic to the fatal supervisor", async () => {
+    const panic = new Panic({ message: "byte publication invariant failed" });
+    const fatalPanicReported = deferred<Panic>();
+    const raw = createRecordingRawBus({
+      beforePublish: async () => {
+        throw panic;
+      },
+    });
+    const publisher = createPublisher(raw, undefined, undefined, fatalPanicReported.resolve);
+
+    publisher.publishText("x".repeat(AGENT_OUTPUT_FLUSH_BYTES));
+
+    expect(await fatalPanicReported.promise).toBe(panic);
+    await expect(publisher.drain()).rejects.toBe(panic);
+  });
+
+  it("reports a detached publish-error handler Panic to the fatal supervisor", async () => {
+    const panic = new Panic({ message: "publish error handler invariant failed" });
+    const fatalPanicReported = deferred<Panic>();
+    const scheduler = createManualScheduler();
+    const raw = createRecordingRawBus({
+      failTypes: new Set([lilacEventTypes.EvtAgentOutputDeltaText]),
+    });
+    const publisher = createPublisher(
+      raw,
+      scheduler.schedule,
+      () => {
+        throw panic;
+      },
+      fatalPanicReported.resolve,
+    );
+
+    publisher.publishText("failed timer flush");
+    scheduler.runNext();
+
+    expect(await fatalPanicReported.promise).toBe(panic);
+    await expect(publisher.drain()).rejects.toBe(panic);
   });
 });

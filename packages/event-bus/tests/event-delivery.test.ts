@@ -95,10 +95,176 @@ async function publishRequest(
     { queue: "prompt", messages: [{ role: "user", content: "deliver" }] },
     { headers: { request_id: requestId } },
   );
-  return published.id;
+  if (published.status === "error") throw published.error;
+  return published.value.id;
+}
+
+function deadLetterRecordFixture(): EventDeadLetterRecordV1 {
+  const topic = "cmd.request";
+  const cursor = "1-0";
+  return {
+    version: 1,
+    deadLetterId: "dead-letter-1",
+    recordedAt: 1,
+    source: { topic, cursor, messageId: cursor, mode: "work" },
+    reason: {
+      kind: "contract-invalid",
+      diagnostic: "event_bus.contract_invalid",
+      stage: "payload",
+      issues: ["invalid payload"],
+    },
+    evidence: {
+      source: {
+        transport: "redis-streams",
+        streamKey: "event-bus:cmd.request",
+        topic,
+        messageId: cursor,
+      },
+      wire: {
+        kind: "bounded-complete",
+        fields: ["type", "cmd.request.message"],
+      },
+    },
+  };
+}
+
+function referencedDeadLetterRecordFixture(): EventDeadLetterRecordV1 {
+  const record = deadLetterRecordFixture();
+  return {
+    ...record,
+    evidence: {
+      source: record.evidence.source,
+      wire: {
+        kind: "controlled-reference",
+        locator: {
+          kind: "redis-stream-entry",
+          streamKey: record.evidence.source.streamKey,
+          messageId: record.source.messageId,
+        },
+        preview: { fields: [], omittedValueCount: 0 },
+      },
+    },
+  };
 }
 
 describe("result-based event delivery", () => {
+  it("rejects malformed XRANGE evidence before starting a dead-letter transaction", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    let xrangeResponse: unknown = [];
+    let transactionCalls = 0;
+    Reflect.set(redis, "xrange", async () => xrangeResponse);
+    Reflect.set(redis, "multi", () => {
+      transactionCalls += 1;
+      throw new Error("unexpected dead-letter transaction");
+    });
+    const deadLetter = createRedisEventDeadLetter({
+      redis,
+      encryptionKey: TEST_DEAD_LETTER_KEY,
+    });
+    const malformedResponses: readonly unknown[] = [
+      [],
+      [
+        ["1-0", ["type", "cmd.request.message"]],
+        ["1-0", ["type", "cmd.request.message"]],
+      ],
+      [["2-0", ["type", "cmd.request.message"]]],
+      [["1-0"]],
+      [["1-0", "not-fields"]],
+      [["1-0", ["type"]]],
+      [["1-0", ["type", 42]]],
+    ];
+
+    for (const malformed of malformedResponses) {
+      xrangeResponse = malformed;
+      const accepted = await deadLetter.accept(referencedDeadLetterRecordFixture());
+      expect(accepted.status).toBe("error");
+      if (accepted.status === "error") {
+        expect(accepted.error._tag).toBe("EventDeadLetterAcceptFailed");
+      }
+    }
+    expect(transactionCalls).toBe(0);
+    redis.disconnect();
+  });
+
+  it("rejects inconsistent source evidence identity before XRANGE or transaction", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    let xrangeCalls = 0;
+    let transactionCalls = 0;
+    Reflect.set(redis, "xrange", async () => {
+      xrangeCalls += 1;
+      return [["1-0", ["type", "cmd.request.message"]]];
+    });
+    Reflect.set(redis, "multi", () => {
+      transactionCalls += 1;
+      throw new Error("unexpected dead-letter transaction");
+    });
+    const deadLetter = createRedisEventDeadLetter({
+      redis,
+      encryptionKey: TEST_DEAD_LETTER_KEY,
+    });
+    const record = referencedDeadLetterRecordFixture();
+    const inconsistent: EventDeadLetterRecordV1 = {
+      ...record,
+      source: { ...record.source, messageId: "2-0" },
+    };
+
+    const accepted = await deadLetter.accept(inconsistent);
+    expect(accepted.status).toBe("error");
+    expect(xrangeCalls).toBe(0);
+    expect(transactionCalls).toBe(0);
+    redis.disconnect();
+  });
+
+  it("rejects truncated, bad SET, extra, and malformed XADD dead-letter transaction receipts", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    let receipts: unknown = null;
+    const transaction = {
+      set: () => transaction,
+      xadd: () => transaction,
+      exec: async () => receipts,
+    };
+    Reflect.set(redis, "multi", () => transaction);
+    const deadLetter = createRedisEventDeadLetter({
+      redis,
+      encryptionKey: TEST_DEAD_LETTER_KEY,
+    });
+    const malformedReceipts: readonly unknown[] = [
+      [[null, "OK"]],
+      [
+        [null, "NOT_OK"],
+        [null, "1-0"],
+      ],
+      [
+        [null, "OK"],
+        [null, "OK"],
+        [null, "1-0"],
+      ],
+      [
+        [null, "OK"],
+        [null, "invalid-id"],
+      ],
+    ];
+
+    for (const malformed of malformedReceipts) {
+      receipts = malformed;
+      const accepted = await deadLetter.accept(deadLetterRecordFixture());
+      expect(accepted.status).toBe("error");
+      if (accepted.status === "error") {
+        expect(accepted.error._tag).toBe("EventDeadLetterAcceptFailed");
+      }
+    }
+
+    Reflect.set(redis, "xrange", async () => [["1-0", ["type", "cmd.request.message"]]]);
+    const referenced = referencedDeadLetterRecordFixture();
+    receipts = [
+      [null, "OK"],
+      [null, "1-0"],
+    ];
+    const truncatedReferenced = await deadLetter.accept(referenced);
+    expect(truncatedReferenced.status).toBe("error");
+    redis.disconnect();
+  });
+
   it("validates Redis dead-letter configuration as a Result before constructor signaling", () => {
     expect(
       validateRedisEventDeadLetterConfig({
@@ -240,6 +406,91 @@ describe("result-based event delivery", () => {
       expect(pending[0]).toBe(id);
     } finally {
       await started.value.stop();
+      await redis.del(streamKey);
+      await bus.close();
+      await redis.quit();
+    }
+  });
+
+  it("does not transact or acknowledge when Redis dead-letter XRANGE evidence is malformed", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const originalDuplicate = redis.duplicate.bind(redis);
+    const originalXrange = redis.xrange.bind(redis);
+    const originalMulti = redis.multi.bind(redis);
+    let xackCalls = 0;
+    let transactionCalls = 0;
+    Reflect.set(redis, "duplicate", () => {
+      const duplicate = originalDuplicate();
+      Reflect.set(duplicate, "xack", async () => {
+        xackCalls += 1;
+        return 1;
+      });
+      return duplicate;
+    });
+    Reflect.set(redis, "xrange", async () => [["0-0", ["type", "unknown.event"]]]);
+    Reflect.set(redis, "multi", () => {
+      transactionCalls += 1;
+      return originalMulti();
+    });
+
+    const keyPrefix = `test:lilac-delivery:${randomId("dead-evidence-invalid")}`;
+    const streamKey = `${keyPrefix}:cmd.request`;
+    const group = "dead-evidence-invalid";
+    const acceptance =
+      Promise.withResolvers<ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>>();
+    const redisDeadLetter = createRedisEventDeadLetter({
+      redis,
+      encryptionKey: TEST_DEAD_LETTER_KEY,
+      keyPrefix: `${keyPrefix}:dead`,
+    });
+    const deadLetter: EventDeadLetter = {
+      async accept(record) {
+        const accepted = await redisDeadLetter.accept(record);
+        acceptance.resolve(accepted);
+        return accepted;
+      },
+    };
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    const bus = createLilacBus(raw, { deadLetter });
+    const started = await bus.subscribeTopic(
+      "cmd.request",
+      {
+        mode: "work",
+        subscriptionId: group,
+        consumerId: "consumer",
+        offset: { type: "begin" },
+        batch: { maxWaitMs: 50 },
+      },
+      async () => Result.ok(undefined),
+      () => "commit",
+    );
+    if (started.status === "error") throw started.error;
+    let stopped = false;
+    try {
+      const messageId = await redis.xadd(
+        streamKey,
+        "*",
+        "type",
+        "unknown.event",
+        "ts",
+        "1",
+        "data",
+        "x".repeat(2_000),
+      );
+      if (typeof messageId !== "string") throw new Error("Redis did not return a message id");
+      const accepted = await acceptance.promise;
+      expect(accepted.status).toBe("error");
+      const stopResult = await started.value.stop();
+      stopped = true;
+      expect(stopResult.status).toBe("ok");
+      expect(transactionCalls).toBe(0);
+      expect(xackCalls).toBe(0);
+      expect(await pendingIds(redis, streamKey, group)).toEqual([messageId]);
+    } finally {
+      if (!stopped) await started.value.stop().catch(() => undefined);
+      Reflect.set(redis, "duplicate", originalDuplicate);
+      Reflect.set(redis, "xrange", originalXrange);
+      Reflect.set(redis, "multi", originalMulti);
       await redis.del(streamKey);
       await bus.close();
       await redis.quit();
@@ -707,6 +958,49 @@ describe("result-based event delivery", () => {
       expect(await pendingIds(redis, streamKey, group)).toEqual([id]);
       await raw.flushPendingTrims();
       expect(await redis.xlen(streamKey)).toBe(1);
+    } finally {
+      await started.value.stop();
+      Reflect.set(redis, "duplicate", originalDuplicate);
+      await redis.del(streamKey);
+      await bus.close();
+      await redis.quit();
+    }
+  });
+
+  it("treats a malformed XACK response as an ack transport failure", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const originalDuplicate = redis.duplicate.bind(redis);
+    Reflect.set(redis, "duplicate", () => {
+      const duplicate = originalDuplicate();
+      Reflect.set(duplicate, "xack", async () => "1");
+      return duplicate;
+    });
+    const keyPrefix = `test:lilac-delivery:${randomId("xack-malformed")}`;
+    const streamKey = `${keyPrefix}:cmd.request`;
+    const group = "xack-malformed";
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    const bus = createLilacBus(raw);
+    const started = await bus.subscribeTopic(
+      "cmd.request",
+      {
+        mode: "work",
+        subscriptionId: group,
+        consumerId: "consumer",
+        offset: { type: "begin" },
+        batch: { maxWaitMs: 50 },
+      },
+      async () => Result.ok(undefined),
+      () => "commit",
+    );
+    if (started.status === "error") throw started.error;
+    try {
+      const id = await publishRequest(bus, randomId("request"));
+      const done = await started.value.done;
+      expect(done.status).toBe("error");
+      if (done.status === "error" && done.error._tag === "EventDeliveryTransportFailed") {
+        expect(done.error.operation).toBe("ack");
+      }
+      expect(await pendingIds(redis, streamKey, group)).toEqual([id]);
     } finally {
       await started.value.stop();
       Reflect.set(redis, "duplicate", originalDuplicate);

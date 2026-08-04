@@ -51,3 +51,8 @@ export interface OpaqueContract {
   accept(value: unknown): void;
   reject(value: unknown): void;
 }
+
+export type OpaqueFunctionContract = {
+  readonly accept: (value: unknown) => void;
+  readonly reject: (value: unknown) => void;
+};

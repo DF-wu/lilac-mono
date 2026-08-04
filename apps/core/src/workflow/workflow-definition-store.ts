@@ -1,10 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { errorCode, isPanic, opaqueErrorMessage } from "@stanley2058/lilac-utils";
+
+import { projectRuntimeError } from "../runtime/error-format";
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 
 import {
   MAX_WORKFLOW_SOURCE_BYTES,
   sha256,
-  validateWorkflowSource,
+  validateWorkflowSourceUnchecked,
   workflowDefinitionNameSchema,
   type ValidatedWorkflowDefinition,
 } from "./workflow-definition";
@@ -21,84 +26,152 @@ export type ResolvedWorkflowDefinition = {
   validation: ValidatedWorkflowDefinition;
 };
 
+type WorkflowDefinitionStoreOperation =
+  | "create"
+  | "get"
+  | "save"
+  | "list"
+  | "create-snapshot"
+  | "read-snapshot";
+
+export class WorkflowDefinitionStoreFailed extends TaggedError("WorkflowDefinitionStoreFailed")<{
+  readonly operation: WorkflowDefinitionStoreOperation;
+  readonly message: string;
+}> {}
+
+async function captureWorkflowDefinitionStoreOperation<T>(
+  operation: WorkflowDefinitionStoreOperation,
+  effect: () => Promise<ResultType<T, WorkflowDefinitionStoreFailed>>,
+): Promise<ResultType<T, WorkflowDefinitionStoreFailed>> {
+  const [settled] = await Promise.allSettled([effect()]);
+  if (settled.status === "rejected") {
+    if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
+    return Result.err(
+      new WorkflowDefinitionStoreFailed({
+        operation,
+        message: opaqueErrorMessage(settled.reason, `Workflow definition ${operation} failed`),
+      }),
+    );
+  }
+  return settled.value;
+}
+
+function storeFailure(
+  operation: WorkflowDefinitionStoreOperation,
+  message: string,
+): WorkflowDefinitionStoreFailed {
+  return new WorkflowDefinitionStoreFailed({ operation, message });
+}
+
 function isContained(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
 }
 
 async function lstatOrNull(target: string) {
-  try {
-    return await fs.lstat(target);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-    throw error;
-  }
+  const [stat] = await Promise.allSettled([fs.lstat(target)]);
+  if (stat.status === "fulfilled") return stat.value;
+  if (isPanic(stat.reason)) preserveToolPanic(stat.reason);
+  if (errorCode(stat.reason) === "ENOENT") return null;
+  return adaptToolResultToHost(
+    Result.err(projectRuntimeError(stat.reason, `Could not inspect workflow path: ${target}`)),
+  );
 }
 
 async function ensureDirectoryWithoutSymlinks(
   root: string,
   segments: readonly string[],
-): Promise<string> {
+  operation: WorkflowDefinitionStoreOperation,
+): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
   let current = root;
   for (const segment of segments) {
     current = path.join(current, segment);
     const existing = await lstatOrNull(current);
-    if (existing?.isSymbolicLink())
-      throw new Error(`Workflow path cannot contain symlinks: ${current}`);
-    if (existing && !existing.isDirectory())
-      throw new Error(`Workflow path component is not a directory: ${current}`);
+    if (existing?.isSymbolicLink()) {
+      return Result.err(
+        storeFailure(operation, `Workflow path cannot contain symlinks: ${current}`),
+      );
+    }
+    if (existing && !existing.isDirectory()) {
+      return Result.err(
+        storeFailure(operation, `Workflow path component is not a directory: ${current}`),
+      );
+    }
     if (!existing) await fs.mkdir(current, { mode: 0o700 });
   }
   const canonical = await fs.realpath(current);
-  if (!isContained(root, canonical))
-    throw new Error(`Workflow root escapes canonical containment: ${canonical}`);
-  return canonical;
+  if (!isContained(root, canonical)) {
+    return Result.err(
+      storeFailure(operation, `Workflow root escapes canonical containment: ${canonical}`),
+    );
+  }
+  return Result.ok(canonical);
 }
 
 async function assertDirectorySegmentsWithoutSymlinks(
   root: string,
   segments: readonly string[],
-): Promise<string> {
+  operation: WorkflowDefinitionStoreOperation,
+): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
   let current = root;
   for (const segment of segments) {
     current = path.join(current, segment);
     const existing = await lstatOrNull(current);
-    if (!existing) return path.join(root, ...segments);
+    if (!existing) return Result.ok(path.join(root, ...segments));
     if (existing.isSymbolicLink()) {
-      throw new Error(`Workflow path cannot contain symlinks: ${current}`);
+      return Result.err(
+        storeFailure(operation, `Workflow path cannot contain symlinks: ${current}`),
+      );
     }
     if (!existing.isDirectory()) {
-      throw new Error(`Workflow path component is not a directory: ${current}`);
+      return Result.err(
+        storeFailure(operation, `Workflow path component is not a directory: ${current}`),
+      );
     }
   }
-  return current;
+  return Result.ok(current);
 }
 
-async function canonicalDirectory(target: string): Promise<string> {
+async function canonicalDirectory(
+  target: string,
+  operation: WorkflowDefinitionStoreOperation,
+): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
   await fs.mkdir(target, { recursive: true, mode: 0o700 });
   const stats = await fs.lstat(target);
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
-    throw new Error(`Workflow base must be a real directory: ${target}`);
+    return Result.err(storeFailure(operation, `Workflow base must be a real directory: ${target}`));
   }
-  return await fs.realpath(target);
+  return Result.ok(await fs.realpath(target));
 }
 
 async function readBoundedRegularFile(
   filePath: string,
-): Promise<{ source: string; canonicalPath: string }> {
+  operation: WorkflowDefinitionStoreOperation,
+): Promise<ResultType<{ source: string; canonicalPath: string }, WorkflowDefinitionStoreFailed>> {
   const stats = await fs.lstat(filePath);
-  if (stats.isSymbolicLink())
-    throw new Error(`Workflow definition cannot be a symlink: ${filePath}`);
-  if (!stats.isFile()) throw new Error(`Workflow definition is not a regular file: ${filePath}`);
+  if (stats.isSymbolicLink()) {
+    return Result.err(
+      storeFailure(operation, `Workflow definition cannot be a symlink: ${filePath}`),
+    );
+  }
+  if (!stats.isFile()) {
+    return Result.err(
+      storeFailure(operation, `Workflow definition is not a regular file: ${filePath}`),
+    );
+  }
   if (stats.size > MAX_WORKFLOW_SOURCE_BYTES) {
-    throw new Error(`Workflow source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`);
+    return Result.err(
+      storeFailure(operation, `Workflow source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`),
+    );
   }
   const canonicalPath = await fs.realpath(filePath);
   const source = await fs.readFile(canonicalPath, "utf8");
   if (Buffer.byteLength(source, "utf8") > MAX_WORKFLOW_SOURCE_BYTES) {
-    throw new Error(`Workflow source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`);
+    return Result.err(
+      storeFailure(operation, `Workflow source exceeds ${MAX_WORKFLOW_SOURCE_BYTES} bytes`),
+    );
   }
-  return { source, canonicalPath };
+  return Result.ok({ source, canonicalPath });
 }
 
 export class WorkflowDefinitionStore {
@@ -113,132 +186,216 @@ export class WorkflowDefinitionStore {
     this.canonicalProjectId = `project:${sha256(canonicalWorkspaceRoot)}`;
   }
 
-  static async create(params: {
+  static async createResult(params: {
     workspaceRoot: string;
     dataDir: string;
-  }): Promise<WorkflowDefinitionStore> {
-    const workspaceStats = await fs.lstat(params.workspaceRoot);
-    if (workspaceStats.isSymbolicLink() || !workspaceStats.isDirectory()) {
-      throw new Error(`Workspace root must be a real directory: ${params.workspaceRoot}`);
-    }
-    const canonicalWorkspaceRoot = await fs.realpath(params.workspaceRoot);
-    const canonicalDataDir = await canonicalDirectory(params.dataDir);
-    return new WorkflowDefinitionStore(canonicalWorkspaceRoot, canonicalDataDir);
+  }): Promise<ResultType<WorkflowDefinitionStore, WorkflowDefinitionStoreFailed>> {
+    return captureWorkflowDefinitionStoreOperation("create", async () => {
+      const workspaceStats = await fs.lstat(params.workspaceRoot);
+      if (workspaceStats.isSymbolicLink() || !workspaceStats.isDirectory()) {
+        return Result.err(
+          storeFailure(
+            "create",
+            `Workspace root must be a real directory: ${params.workspaceRoot}`,
+          ),
+        );
+      }
+      const canonicalWorkspaceRoot = await fs.realpath(params.workspaceRoot);
+      const canonicalDataDir = await canonicalDirectory(params.dataDir, "create");
+      if (canonicalDataDir.status === "error") return Result.err(canonicalDataDir.error);
+      return Result.ok(new WorkflowDefinitionStore(canonicalWorkspaceRoot, canonicalDataDir.value));
+    });
   }
 
-  private async scopeRoot(scope: WorkflowScope, create: boolean): Promise<string> {
+  private async scopeRoot(
+    scope: WorkflowScope,
+    create: boolean,
+    operation: WorkflowDefinitionStoreOperation,
+  ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
     if (scope === "project") {
       if (create) {
-        return await ensureDirectoryWithoutSymlinks(this.canonicalWorkspaceRoot, [
-          ".lilac",
-          "workflows",
-        ]);
+        return await ensureDirectoryWithoutSymlinks(
+          this.canonicalWorkspaceRoot,
+          [".lilac", "workflows"],
+          operation,
+        );
       }
-      return await assertDirectorySegmentsWithoutSymlinks(this.canonicalWorkspaceRoot, [
-        ".lilac",
-        "workflows",
-      ]);
+      return await assertDirectorySegmentsWithoutSymlinks(
+        this.canonicalWorkspaceRoot,
+        [".lilac", "workflows"],
+        operation,
+      );
     }
-    if (create) return await ensureDirectoryWithoutSymlinks(this.canonicalDataDir, ["workflows"]);
-    return await assertDirectorySegmentsWithoutSymlinks(this.canonicalDataDir, ["workflows"]);
+    if (create) {
+      return await ensureDirectoryWithoutSymlinks(this.canonicalDataDir, ["workflows"], operation);
+    }
+    return await assertDirectorySegmentsWithoutSymlinks(
+      this.canonicalDataDir,
+      ["workflows"],
+      operation,
+    );
   }
 
-  private async definitionPath(scope: WorkflowScope, nameInput: string, createRoot: boolean) {
-    const name = workflowDefinitionNameSchema.parse(nameInput);
-    const root = await this.scopeRoot(scope, createRoot);
+  private async definitionPath(
+    scope: WorkflowScope,
+    nameInput: string,
+    createRoot: boolean,
+    operation: WorkflowDefinitionStoreOperation,
+  ): Promise<
+    ResultType<{ name: string; root: string; candidate: string }, WorkflowDefinitionStoreFailed>
+  > {
+    const parsedName = workflowDefinitionNameSchema.safeParse(nameInput);
+    if (!parsedName.success) {
+      return Result.err(
+        storeFailure(operation, parsedName.error.issues[0]?.message ?? "Workflow name is invalid"),
+      );
+    }
+    const name = parsedName.data;
+    const rootResult = await this.scopeRoot(scope, createRoot, operation);
+    if (rootResult.status === "error") return Result.err(rootResult.error);
+    const root = rootResult.value;
     const candidate = path.join(root, `${name}.js`);
     if (!isContained(root, candidate) || path.dirname(candidate) !== root) {
-      throw new Error(`Workflow definition escapes scope root: ${name}`);
+      return Result.err(storeFailure(operation, `Workflow definition escapes scope root: ${name}`));
     }
-    return { name, root, candidate };
+    return Result.ok({ name, root, candidate });
   }
 
-  private async validateSource(input: {
-    name: string;
-    source: string;
-  }): Promise<ValidatedWorkflowDefinition> {
-    return validateWorkflowSource(input);
+  private async validateSource(
+    input: {
+      name: string;
+      source: string;
+    },
+    operation: WorkflowDefinitionStoreOperation,
+  ): Promise<ResultType<ValidatedWorkflowDefinition, WorkflowDefinitionStoreFailed>> {
+    const validated = validateWorkflowSourceUnchecked(input);
+    return validated.status === "error"
+      ? Result.err(storeFailure(operation, validated.error.message))
+      : Result.ok(validated.value);
   }
 
-  async get(params: {
+  private async getUnchecked(params: {
     scope: WorkflowDefinitionScope;
     name: string;
-  }): Promise<ResolvedWorkflowDefinition> {
+  }): Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>> {
+    const parsedScope = workflowScopeSchema.safeParse(params.scope);
+    if (params.scope !== "auto" && !parsedScope.success) {
+      return Result.err(storeFailure("get", "Workflow scope is invalid"));
+    }
     const scopes: readonly WorkflowScope[] =
-      params.scope === "auto" ? ["project", "personal"] : [workflowScopeSchema.parse(params.scope)];
+      params.scope === "auto" ? ["project", "personal"] : [parsedScope.data!];
     for (const scope of scopes) {
-      const location = await this.definitionPath(scope, params.name, false);
+      const locationResult = await this.definitionPath(scope, params.name, false, "get");
+      if (locationResult.status === "error") return Result.err(locationResult.error);
+      const location = locationResult.value;
       const rootStats = await lstatOrNull(location.root);
       if (!rootStats) continue;
       if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
-        throw new Error(`Workflow scope root must be a real directory: ${location.root}`);
+        return Result.err(
+          storeFailure("get", `Workflow scope root must be a real directory: ${location.root}`),
+        );
       }
       const root = await fs.realpath(location.root);
       const fileStats = await lstatOrNull(location.candidate);
       if (!fileStats) continue;
-      const { source, canonicalPath } = await readBoundedRegularFile(location.candidate);
+      const file = await readBoundedRegularFile(location.candidate, "get");
+      if (file.status === "error") return Result.err(file.error);
+      const { source, canonicalPath } = file.value;
       if (!isContained(root, canonicalPath) || path.dirname(canonicalPath) !== root) {
-        throw new Error(`Workflow definition escapes canonical scope root: ${canonicalPath}`);
+        return Result.err(
+          storeFailure("get", `Workflow definition escapes canonical scope root: ${canonicalPath}`),
+        );
       }
-      return {
+      const validation = await this.validateSource({ name: location.name, source }, "get");
+      if (validation.status === "error") return Result.err(validation.error);
+      return Result.ok({
         scope,
         name: location.name,
         normalizedPath: `${location.name}.js`,
         canonicalPath,
         source,
-        validation: await this.validateSource({
-          name: location.name,
-          source,
-        }),
-      };
+        validation: validation.value,
+      });
     }
-    throw new Error(`Workflow definition not found: ${params.name} (scope=${params.scope})`);
+    return Result.err(
+      storeFailure("get", `Workflow definition not found: ${params.name} (scope=${params.scope})`),
+    );
   }
 
-  async save(params: {
+  async getResult(params: {
+    scope: WorkflowDefinitionScope;
+    name: string;
+  }): Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>> {
+    return captureWorkflowDefinitionStoreOperation("get", () => this.getUnchecked(params));
+  }
+
+  private async saveUnchecked(params: {
     scope: WorkflowScope;
     name: string;
     source: string;
     expectedSha256?: string;
-  }): Promise<ResolvedWorkflowDefinition> {
-    const scope = workflowScopeSchema.parse(params.scope);
-    const location = await this.definitionPath(scope, params.name, true);
-    const validation = await this.validateSource({
-      name: location.name,
-      source: params.source,
-    });
+  }): Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>> {
+    const parsedScope = workflowScopeSchema.safeParse(params.scope);
+    if (!parsedScope.success) return Result.err(storeFailure("save", "Workflow scope is invalid"));
+    const scope = parsedScope.data;
+    const locationResult = await this.definitionPath(scope, params.name, true, "save");
+    if (locationResult.status === "error") return Result.err(locationResult.error);
+    const location = locationResult.value;
+    const validation = await this.validateSource(
+      {
+        name: location.name,
+        source: params.source,
+      },
+      "save",
+    );
+    if (validation.status === "error") return Result.err(validation.error);
     const lockPath = path.join(location.root, `.${location.name}.save.lock`);
-    let lock;
-    try {
-      lock = await fs.open(lockPath, "wx", 0o600);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        throw new Error(`Another save is already in progress for workflow: ${location.name}`);
-      }
-      throw error;
+    const [openedLock] = await Promise.allSettled([fs.open(lockPath, "wx", 0o600)]);
+    if (openedLock.status === "rejected") {
+      if (isPanic(openedLock.reason)) preserveToolPanic(openedLock.reason);
+      return Result.err(
+        storeFailure(
+          "save",
+          `Could not acquire the save lock for workflow ${location.name}: ${opaqueErrorMessage(openedLock.reason, "opaque lock failure")}`,
+        ),
+      );
     }
+    const lock = openedLock.value;
     try {
       const existingStats = await lstatOrNull(location.candidate);
       if (existingStats) {
-        const existing = await readBoundedRegularFile(location.candidate);
+        const existingResult = await readBoundedRegularFile(location.candidate, "save");
+        if (existingResult.status === "error") return Result.err(existingResult.error);
+        const existing = existingResult.value;
         if (!isContained(location.root, existing.canonicalPath)) {
-          throw new Error(
-            `Workflow definition escapes canonical scope root: ${existing.canonicalPath}`,
+          return Result.err(
+            storeFailure(
+              "save",
+              `Workflow definition escapes canonical scope root: ${existing.canonicalPath}`,
+            ),
           );
         }
         const currentSha256 = sha256(existing.source);
         if (!params.expectedSha256) {
-          throw new Error(
-            `Workflow already exists; expectedSha256 is required (current ${currentSha256})`,
+          return Result.err(
+            storeFailure(
+              "save",
+              `Workflow already exists; expectedSha256 is required (current ${currentSha256})`,
+            ),
           );
         }
         if (params.expectedSha256 !== currentSha256) {
-          throw new Error(
-            `Workflow optimistic hash mismatch: expected ${params.expectedSha256}, current ${currentSha256}`,
+          return Result.err(
+            storeFailure(
+              "save",
+              `Workflow optimistic hash mismatch: expected ${params.expectedSha256}, current ${currentSha256}`,
+            ),
           );
         }
       } else if (params.expectedSha256 !== undefined) {
-        throw new Error("Workflow does not exist, but expectedSha256 was provided");
+        return Result.err(
+          storeFailure("save", "Workflow does not exist, but expectedSha256 was provided"),
+        );
       }
 
       const tempPath = path.join(location.root, `.${location.name}.${crypto.randomUUID()}.tmp`);
@@ -250,47 +407,75 @@ export class WorkflowDefinitionStore {
       } finally {
         await handle.close();
       }
-      try {
-        await fs.rename(tempPath, location.candidate);
-        if (scope === "personal") await fs.chmod(location.candidate, 0o600);
-      } catch (error) {
+      const [renamed] = await Promise.allSettled([
+        fs.rename(tempPath, location.candidate).then(async () => {
+          if (scope === "personal") await fs.chmod(location.candidate, 0o600);
+        }),
+      ]);
+      if (renamed.status === "rejected") {
+        if (isPanic(renamed.reason)) preserveToolPanic(renamed.reason);
         await fs.rm(tempPath, { force: true });
-        throw error;
+        return Result.err(
+          storeFailure(
+            "save",
+            `Could not commit workflow ${location.name}: ${opaqueErrorMessage(renamed.reason, "opaque save failure")}`,
+          ),
+        );
       }
 
-      const { canonicalPath } = await readBoundedRegularFile(location.candidate);
+      const saved = await readBoundedRegularFile(location.candidate, "save");
+      if (saved.status === "error") return Result.err(saved.error);
+      const { canonicalPath } = saved.value;
       if (!isContained(location.root, canonicalPath)) {
-        throw new Error(`Saved workflow escapes canonical scope root: ${canonicalPath}`);
+        return Result.err(
+          storeFailure("save", `Saved workflow escapes canonical scope root: ${canonicalPath}`),
+        );
       }
-      return {
+      return Result.ok({
         scope,
         name: location.name,
         normalizedPath: `${location.name}.js`,
         canonicalPath,
         source: params.source,
-        validation,
-      };
+        validation: validation.value,
+      });
     } finally {
       await lock.close();
       await fs.rm(lockPath, { force: true });
     }
   }
 
-  async list(params: { scope: WorkflowDefinitionScope }): Promise<
-    Array<
-      | (Omit<ResolvedWorkflowDefinition, "source"> & { valid: true })
-      | {
-          scope: WorkflowScope;
-          name: string;
-          normalizedPath: string;
-          canonicalPath: string;
-          valid: false;
-          error: string;
-        }
+  async saveResult(params: {
+    scope: WorkflowScope;
+    name: string;
+    source: string;
+    expectedSha256?: string;
+  }): Promise<ResultType<ResolvedWorkflowDefinition, WorkflowDefinitionStoreFailed>> {
+    return captureWorkflowDefinitionStoreOperation("save", () => this.saveUnchecked(params));
+  }
+
+  private async listUnchecked(params: { scope: WorkflowDefinitionScope }): Promise<
+    ResultType<
+      Array<
+        | (Omit<ResolvedWorkflowDefinition, "source"> & { valid: true })
+        | {
+            scope: WorkflowScope;
+            name: string;
+            normalizedPath: string;
+            canonicalPath: string;
+            valid: false;
+            error: string;
+          }
+      >,
+      WorkflowDefinitionStoreFailed
     >
   > {
+    const parsedScope = workflowScopeSchema.safeParse(params.scope);
+    if (params.scope !== "auto" && !parsedScope.success) {
+      return Result.err(storeFailure("list", "Workflow scope is invalid"));
+    }
     const scopes: readonly WorkflowScope[] =
-      params.scope === "auto" ? ["project", "personal"] : [workflowScopeSchema.parse(params.scope)];
+      params.scope === "auto" ? ["project", "personal"] : [parsedScope.data!];
     const seen = new Set<string>();
     const results: Array<
       | (Omit<ResolvedWorkflowDefinition, "source"> & { valid: true })
@@ -304,11 +489,15 @@ export class WorkflowDefinitionStore {
         }
     > = [];
     for (const scope of scopes) {
-      const rootCandidate = await this.scopeRoot(scope, false);
+      const rootResult = await this.scopeRoot(scope, false, "list");
+      if (rootResult.status === "error") return Result.err(rootResult.error);
+      const rootCandidate = rootResult.value;
       const rootStats = await lstatOrNull(rootCandidate);
       if (!rootStats) continue;
       if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) {
-        throw new Error(`Workflow scope root must be a real directory: ${rootCandidate}`);
+        return Result.err(
+          storeFailure("list", `Workflow scope root must be a real directory: ${rootCandidate}`),
+        );
       }
       const entries = await fs.readdir(rootCandidate, { withFileTypes: true });
       for (const entry of entries.sort((left, right) => compareCodeUnits(left.name, right.name))) {
@@ -317,60 +506,101 @@ export class WorkflowDefinitionStore {
         if (!workflowDefinitionNameSchema.safeParse(name).success || seen.has(name)) continue;
         seen.add(name);
         const candidate = path.join(rootCandidate, entry.name);
-        try {
-          const resolved = await this.get({ scope, name });
+        const resolved = await this.getResult({ scope, name });
+        if (resolved.status === "ok") {
           results.push({
             scope,
             name,
-            normalizedPath: resolved.normalizedPath,
-            canonicalPath: resolved.canonicalPath,
-            validation: resolved.validation,
+            normalizedPath: resolved.value.normalizedPath,
+            canonicalPath: resolved.value.canonicalPath,
+            validation: resolved.value.validation,
             valid: true,
           });
-        } catch (error) {
+        } else {
           results.push({
             scope,
             name,
             normalizedPath: entry.name,
             canonicalPath: candidate,
             valid: false,
-            error: error instanceof Error ? error.message : String(error),
+            error: resolved.error.message,
           });
         }
       }
     }
-    return results;
+    return Result.ok(results);
   }
 
-  async createSnapshot(
+  async listResult(params: {
+    scope: WorkflowDefinitionScope;
+  }): Promise<
+    ResultType<
+      Awaited<ReturnType<WorkflowDefinitionStore["listUnchecked"]>> extends ResultType<
+        infer TValue,
+        WorkflowDefinitionStoreFailed
+      >
+        ? TValue
+        : never,
+      WorkflowDefinitionStoreFailed
+    >
+  > {
+    return captureWorkflowDefinitionStoreOperation("list", () => this.listUnchecked(params));
+  }
+
+  private async createSnapshotUnchecked(
     source: string,
     sourceSha256: string,
-  ): Promise<{ artifactId: string; path: string }> {
-    if (sha256(source) !== sourceSha256) throw new Error("Snapshot source hash mismatch");
-    const root = await ensureDirectoryWithoutSymlinks(this.canonicalDataDir, [
-      "workflow-snapshots",
-    ]);
+  ): Promise<ResultType<{ artifactId: string; path: string }, WorkflowDefinitionStoreFailed>> {
+    if (sha256(source) !== sourceSha256) {
+      return Result.err(storeFailure("create-snapshot", "Snapshot source hash mismatch"));
+    }
+    const rootResult = await ensureDirectoryWithoutSymlinks(
+      this.canonicalDataDir,
+      ["workflow-snapshots"],
+      "create-snapshot",
+    );
+    if (rootResult.status === "error") return Result.err(rootResult.error);
+    const root = rootResult.value;
     const snapshotPath = path.join(root, `${sourceSha256}.js`);
     const existing = await lstatOrNull(snapshotPath);
     if (existing) {
-      const stored = await readBoundedRegularFile(snapshotPath);
+      const storedResult = await readBoundedRegularFile(snapshotPath, "create-snapshot");
+      if (storedResult.status === "error") return Result.err(storedResult.error);
+      const stored = storedResult.value;
       if (!isContained(root, stored.canonicalPath) || sha256(stored.source) !== sourceSha256) {
-        throw new Error(`Workflow snapshot hash collision or containment failure: ${sourceSha256}`);
+        return Result.err(
+          storeFailure(
+            "create-snapshot",
+            `Workflow snapshot hash collision or containment failure: ${sourceSha256}`,
+          ),
+        );
       }
-      return { artifactId: `workflow-source:${sourceSha256}`, path: stored.canonicalPath };
+      return Result.ok({
+        artifactId: `workflow-source:${sourceSha256}`,
+        path: stored.canonicalPath,
+      });
     }
-    let handle;
-    try {
-      handle = await fs.open(snapshotPath, "wx", 0o600);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EEXIST") {
-        const stored = await readBoundedRegularFile(snapshotPath);
+    const [opened] = await Promise.allSettled([fs.open(snapshotPath, "wx", 0o600)]);
+    if (opened.status === "rejected") {
+      if (isPanic(opened.reason)) preserveToolPanic(opened.reason);
+      const storedResult = await readBoundedRegularFile(snapshotPath, "create-snapshot");
+      if (storedResult.status === "ok") {
+        const stored = storedResult.value;
         if (isContained(root, stored.canonicalPath) && sha256(stored.source) === sourceSha256) {
-          return { artifactId: `workflow-source:${sourceSha256}`, path: stored.canonicalPath };
+          return Result.ok({
+            artifactId: `workflow-source:${sourceSha256}`,
+            path: stored.canonicalPath,
+          });
         }
       }
-      throw error;
+      return Result.err(
+        storeFailure(
+          "create-snapshot",
+          `Could not create workflow snapshot: ${opaqueErrorMessage(opened.reason, "opaque snapshot failure")}`,
+        ),
+      );
     }
+    const handle = opened.value;
     try {
       await handle.writeFile(source, "utf8");
       await handle.sync();
@@ -378,27 +608,65 @@ export class WorkflowDefinitionStore {
       await handle.close();
     }
     await fs.chmod(snapshotPath, 0o600);
-    return {
+    return Result.ok({
       artifactId: `workflow-source:${sourceSha256}`,
       path: await fs.realpath(snapshotPath),
-    };
+    });
   }
 
-  async readSnapshot(sourceSha256: string): Promise<string> {
-    if (!/^[a-f0-9]{64}$/u.test(sourceSha256)) throw new Error("Invalid workflow source hash");
-    const root = await this.scopeRootForSnapshots();
+  async createSnapshotResult(
+    source: string,
+    sourceSha256: string,
+  ): Promise<ResultType<{ artifactId: string; path: string }, WorkflowDefinitionStoreFailed>> {
+    return captureWorkflowDefinitionStoreOperation("create-snapshot", () =>
+      this.createSnapshotUnchecked(source, sourceSha256),
+    );
+  }
+
+  private async readSnapshotUnchecked(
+    sourceSha256: string,
+  ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
+    if (!/^[a-f0-9]{64}$/u.test(sourceSha256)) {
+      return Result.err(storeFailure("read-snapshot", "Invalid workflow source hash"));
+    }
+    const rootResult = await this.scopeRootForSnapshots("read-snapshot");
+    if (rootResult.status === "error") return Result.err(rootResult.error);
+    const root = rootResult.value;
     const snapshotPath = path.join(root, `${sourceSha256}.js`);
-    const stored = await readBoundedRegularFile(snapshotPath);
+    const storedResult = await readBoundedRegularFile(snapshotPath, "read-snapshot");
+    if (storedResult.status === "error") return Result.err(storedResult.error);
+    const stored = storedResult.value;
     if (!isContained(root, stored.canonicalPath) || path.dirname(stored.canonicalPath) !== root) {
-      throw new Error(`Workflow snapshot escapes canonical root: ${stored.canonicalPath}`);
+      return Result.err(
+        storeFailure(
+          "read-snapshot",
+          `Workflow snapshot escapes canonical root: ${stored.canonicalPath}`,
+        ),
+      );
     }
     if (sha256(stored.source) !== sourceSha256) {
-      throw new Error(`Workflow snapshot hash mismatch: ${sourceSha256}`);
+      return Result.err(
+        storeFailure("read-snapshot", `Workflow snapshot hash mismatch: ${sourceSha256}`),
+      );
     }
-    return stored.source;
+    return Result.ok(stored.source);
   }
 
-  private async scopeRootForSnapshots(): Promise<string> {
-    return await ensureDirectoryWithoutSymlinks(this.canonicalDataDir, ["workflow-snapshots"]);
+  async readSnapshotResult(
+    sourceSha256: string,
+  ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
+    return captureWorkflowDefinitionStoreOperation("read-snapshot", () =>
+      this.readSnapshotUnchecked(sourceSha256),
+    );
+  }
+
+  private async scopeRootForSnapshots(
+    operation: WorkflowDefinitionStoreOperation,
+  ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
+    return await ensureDirectoryWithoutSymlinks(
+      this.canonicalDataDir,
+      ["workflow-snapshots"],
+      operation,
+    );
   }
 }

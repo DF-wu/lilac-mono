@@ -11,6 +11,7 @@ import superjson from "superjson";
 import { z } from "zod";
 
 import { MINI_LILAC_DATABASE_SCHEMA_VERSION, MiniLilacSqliteStore } from "../src/sqlite-store";
+import { validateMiniLilacPersistedSuperJsonValue } from "../src/sqlite-transcript-projection";
 
 const temporaryDirectories: string[] = [];
 
@@ -232,6 +233,16 @@ function seedLegacyTranscripts(
 }
 
 describe("MiniLilacSqliteStore transcript schema", () => {
+  it("returns an owned Result for invalid SuperJSON projection values", () => {
+    expect(validateMiniLilacPersistedSuperJsonValue({ nested: new Date("invalid") })).toMatchObject(
+      {
+        status: "error",
+        error: { _tag: "MiniLilacPersistedSuperJsonValueInvalid" },
+      },
+    );
+    expect(validateMiniLilacPersistedSuperJsonValue({ nested: new Date(0) }).status).toBe("ok");
+  });
+
   it("migrates v2 chains and divergent checkpoints while preserving durable state", async () => {
     const { databasePath } = await createV2Database();
     seedLegacyTranscripts(databasePath);

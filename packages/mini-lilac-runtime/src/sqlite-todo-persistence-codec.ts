@@ -18,6 +18,7 @@ import {
 import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
+  MiniLilacHistoryRecordMissing,
   MiniLilacSqliteDriverFailure,
   classifyMiniLilacSqliteDriverFailure,
 } from "./sqlite-persistence-errors";
@@ -149,10 +150,21 @@ export function decodeMiniLilacTodos(
 export function readMiniLilacTodos(
   database: Database,
   sessionId: string,
-): ResultType<MiniLilacTodoState, PersistedDataError | MiniLilacSqliteDriverFailure> {
+): ResultType<
+  MiniLilacTodoState,
+  PersistedDataError | MiniLilacSqliteDriverFailure | MiniLilacHistoryRecordMissing
+> {
   try {
     const session = database.query("SELECT 1 FROM sessions WHERE id = ?").get(sessionId);
-    if (!session) throw new Error(`Session '${sessionId}' was not found`);
+    if (!session) {
+      return Result.err(
+        new MiniLilacHistoryRecordMissing({
+          recordKind: "session",
+          recordId: sessionId,
+          message: `Session '${sessionId}' was not found`,
+        }),
+      );
+    }
     const row = database
       .query("SELECT revision, todos_json FROM session_todos WHERE session_id = ?")
       .get(sessionId);

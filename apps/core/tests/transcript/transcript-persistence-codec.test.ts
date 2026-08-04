@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import SuperJSON from "superjson";
 import type { ModelMessage } from "ai";
+import { Panic } from "better-result";
 
 import {
   coreLineageManifestRowCodecCases,
@@ -18,6 +19,7 @@ import {
   transcriptCompactionContextCodecCases,
   transcriptProviderStateCodecCases,
   transcriptRowCodecCases,
+  transcriptStoreRowFixtures,
 } from "../../src/transcript/transcript-persistence-codec";
 import { SqliteTranscriptStore } from "../../src/transcript/transcript-store";
 import {
@@ -45,10 +47,30 @@ function expectCatalog(
 }
 
 describe("transcript persistence codecs", () => {
+  it("preserves Panic thrown while decoding serialized data", () => {
+    const panic = new Panic({ message: "serialized transcript invariant failed" });
+    const originalParse = globalThis.JSON.parse;
+    globalThis.JSON.parse = () => {
+      throw panic;
+    };
+    try {
+      expect(() =>
+        decodeTranscriptMessages({
+          raw: "[]",
+          schemaVersion: 5,
+          recordId: "panic-transcript",
+        }),
+      ).toThrow(panic);
+    } finally {
+      globalThis.JSON.parse = originalParse;
+    }
+  });
+
   it("covers current, legacy, missing, unsupported, malformed, and corrupt transcript values", () => {
     expectCatalog(transcriptCompactionContextCodecCases, decodeTranscriptCompactionContext);
     expectCatalog(transcriptProviderStateCodecCases, decodeTranscriptProviderState);
     expectCatalog(transcriptRowCodecCases, decodeTranscriptRow);
+    expectCatalog(transcriptStoreRowFixtures, decodeTranscriptRow);
     expectCatalog(coreSurfaceProjectionRowCodecCases, decodeCoreSurfaceProjectionRow);
     expectCatalog(coreLineageManifestRowCodecCases, decodeCoreLineageManifestRow);
   });

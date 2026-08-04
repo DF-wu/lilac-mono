@@ -2,6 +2,7 @@ import type { ModelMessage } from "ai";
 import { createLogger } from "@stanley2058/lilac-utils";
 
 import type { TranscriptSnapshot, TranscriptStore } from "../../../transcript/transcript-store";
+import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "../bridge-log";
 
 const logger = createLogger({ module: "request-composition:checkpoint" });
 
@@ -42,11 +43,10 @@ export function selectNewestReachableCheckpoint<T>(input: {
       messageId,
     });
     if (resolved.status === "error") {
-      logger.warn("compaction checkpoint transcript read failed", {
-        table: "table" in resolved.error ? resolved.error.table : "request_transcripts",
-        field: "field" in resolved.error ? resolved.error.field : "row",
-        issueCode: "issueCode" in resolved.error ? resolved.error.issueCode : "sqlite-driver",
-      });
+      logger.warn(
+        "compaction checkpoint transcript read failed",
+        formatBridgeTaggedErrorForLog(resolved.error),
+      );
       resolvedSnapshotsBySurfaceMessageId.set(messageId, null);
       return null;
     }
@@ -79,14 +79,17 @@ export function selectNewestReachableCheckpoint<T>(input: {
   if (frontierIndex < 0) return emptySelection(original, resolvedSnapshotsBySurfaceMessageId);
 
   const descendants = original.slice(frontierIndex + 1);
-  logger.info("compaction checkpoint applied", {
-    currentRequestId: input.currentRequestId,
-    checkpointRequestId: checkpoint.requestId,
-    checkpointMessageCount: checkpoint.messages.length,
-    discardedSurfaceCount: frontierIndex + 1,
-    descendantSurfaceCount: descendants.length,
-    formatVersion: checkpoint.contextMeta?.formatVersion,
-  });
+  logger.info(
+    "compaction checkpoint applied",
+    formatBridgeLogContext({
+      currentRequestId: input.currentRequestId,
+      checkpointRequestId: checkpoint.requestId,
+      checkpointMessageCount: checkpoint.messages.length,
+      discardedSurfaceCount: frontierIndex + 1,
+      descendantSurfaceCount: descendants.length,
+      formatVersion: checkpoint.contextMeta?.formatVersion,
+    }),
+  );
 
   return {
     checkpoint,

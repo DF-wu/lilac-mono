@@ -11,7 +11,7 @@
 
 ## Current Stage
 
-Stages 0 through 6 complete. Next: Stage 7, Package-By-Package Internal API Migration.
+Stages 0 through 7 complete. Stage 8, Close Ratchets And Simplify Governance, is active.
 
 ## Stage 0
 
@@ -131,6 +131,45 @@ Stages 0 through 6 complete. Next: Stage 7, Package-By-Package Internal API Migr
 - [x] Run independent Stage 6 review and resolve all blocking findings.
 - [x] Run focused and full repository validation, then commit Stage 6 separately.
 
+## Stage 7
+
+- [x] Migrate `packages/bash-safety` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/fs` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/utils` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/event-bus` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/tool-results` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/plugin-runtime` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/claude-code-bridge` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/agent` to zero hard-rule boundary and failure debt, including fallible streams and
+  exact cancellation/rejection handling.
+- [x] Migrate `packages/coding-tools` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/remote-fs-runner` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/mini-lilac-client` to zero hard-rule boundary and failure debt.
+- [x] Migrate `packages/mini-lilac-runtime` to zero hard-rule boundary and failure debt.
+- [x] Migrate `apps/core` to zero hard-rule boundary and failure debt.
+- [x] Migrate `apps/tool-bridge` to zero hard-rule boundary and failure debt.
+- [x] Migrate `apps/acp-controller` to zero hard-rule boundary and failure debt.
+- [x] Migrate `apps/mini-lilac-server` to zero hard-rule boundary and failure debt.
+- [x] Migrate `apps/mini-lilac-tui` to zero hard-rule boundary and failure debt.
+- [x] Migrate `apps/mini-lilac` to zero hard-rule boundary and failure debt.
+- [x] Delete each zeroed package baseline, mark every active workspace migrated, and verify remaining
+  `unknown`, predicates, assertions, exceptions, and Panic sites are exact registered boundaries.
+- [x] Run independent Stage 7 review and resolve all blocking findings.
+- [x] Run focused and full repository validation, then commit Stage 7 separately.
+
+## Stage 8
+
+- [ ] Delete obsolete zeroed migration baseline machinery and prohibit unapproved recreation.
+- [ ] Promote stale-baseline diagnostics to errors and remove advisory checks that did not prove useful.
+- [ ] Consolidate permanent Result, boundary, Panic, adapter, and persistence guidance.
+- [ ] Remove temporary Stage 7 migration notes and status machinery that no longer serves the final gate.
+- [ ] Document the final boundary architecture briefly in `PROJECT.md`.
+- [ ] Verify every permanent rule and exception mechanism has focused actionable diagnostics and tests.
+- [ ] Measure final CI cost and retain the checker program/index caching without weakening diagnostics.
+- [ ] Run independent Stage 8 review and resolve all blocking findings.
+- [ ] Run the complete repository validation suite and inspect the final active-tree inventory.
+- [ ] Commit Stage 8 separately with a conventional commit.
+
 ## Later Stages
 
 - [x] Stage 1: `better-result` foundation and pilot migrations.
@@ -139,7 +178,7 @@ Stages 0 through 6 complete. Next: Stage 7, Package-By-Package Internal API Migr
 - [x] Stage 4: typed event-bus codec and delivery registry.
 - [x] Stage 5: TUI tool-observation projection.
 - [x] Stage 6: versioned persistence codecs and transaction Results.
-- [ ] Stage 7: package-by-package internal API migration.
+- [x] Stage 7: package-by-package internal API migration.
 - [ ] Stage 8: close ratchets and simplify governance.
 
 ## Deferred Findings
@@ -230,3 +269,14 @@ Stages 0 through 6 complete. Next: Stage 7, Package-By-Package Internal API Migr
   architecture, and 40 lint-rule tests, plus `bun run typecheck`, `bun run lint:fix`, `bun run fmt`,
   `bun run lint`, `bun run fmt:check`, and `git diff --check`. The syntax ratchet contains 2,280 reviewed
   findings with zero errors.
+- 2026-08-04: Stage 7 migrated all 18 workspaces to package-wide hard boundary and failure rules, removed
+  all semantic and syntax baselines, and closed registration bypasses with a digest-bound catalog of
+  1,032 exact adapters. Reviews drove Result-native internal APIs, complete unknown projections, exact
+  Panic supervision, fallible stream terminals, hostile-value-safe logging, and descriptor-bound
+  workspace-history publication. The architecture runner was reduced from about 156 seconds to about
+  51 seconds without caching diagnostics or weakening rules.
+- 2026-08-04: Final Stage 7 validation passed 1,882 Core tests, 466 Mini runtime tests, all other workspace
+  tests, 100 architecture tests, 43 lint-rule tests, root/workspace typechecks, Core remote-runner,
+  tool-bridge and ACP builds, lint, formatting, and `git diff --check`. Semantic inventory is empty,
+  syntax reports zero findings, all baselines are empty, and independent acceptance found no remaining
+  blocker, high, or medium issues.

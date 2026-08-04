@@ -19,12 +19,48 @@ import {
 
 import {
   applyHeartbeatLifecycleDeliveryPolicy,
-  HeartbeatLifecycleRequestIdMissing,
-  HeartbeatLifecycleSessionIdMissing,
-  startHeartbeatService,
+  HeartbeatLifecycleDependencyUnavailable,
+  HeartbeatLifecycleEventInvalid,
+  startHeartbeatServiceResult,
 } from "../../src/heartbeat/heartbeat-service";
 import { getHeartbeatQuietState } from "../../src/heartbeat/common";
 import { startResultForTest, stopResultForTest } from "../helpers/result-raw-bus";
+
+async function startHeartbeatService(params: Parameters<typeof startHeartbeatServiceResult>[0]) {
+  const started = await startHeartbeatServiceResult(params);
+  if (started.status === "error") {
+    if (started.error._tag === "EventDeliveryStartFailed") {
+      throw new Error(`Heartbeat lifecycle subscription start failed: ${started.error.message}`, {
+        cause: started.error,
+      });
+    }
+    throw started.error;
+  }
+  return {
+    ...started.value,
+    async stop(): Promise<void> {
+      const stopped = await started.value.stopOutcome();
+      if (stopped.kind === "panic") throw stopped.panic;
+      if (stopped.result.status === "error") {
+        switch (stopped.result.error._tag) {
+          case "HeartbeatServiceStopFailed":
+            throw stopped.result.error;
+          case "EventDeliveryStopFailed":
+            throw new Error(
+              `Heartbeat lifecycle subscription stop failed: ${stopped.result.error.message}`,
+              { cause: stopped.result.error },
+            );
+          case "EventDeliveryStopped":
+          case "EventDeliveryTransportFailed":
+            throw new Error(
+              `Heartbeat lifecycle subscription done failed: ${stopped.result.error.message}`,
+              { cause: stopped.result.error },
+            );
+        }
+      }
+    },
+  };
+}
 
 function createInMemoryRawBus(options?: {
   onDeliveryAction?: (message: Message<unknown>, action: RawDeliveryAction) => void;
@@ -33,6 +69,8 @@ function createInMemoryRawBus(options?: {
   stopFailure?: EventDeliveryStopFailed;
   doneFailure?: EventDeliveryDoneError;
   stopPanic?: Panic;
+  publishFailure?: Error | null;
+  publishEffect?: () => Promise<void>;
 }): RawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
   const deliverySubs = new Set<{
@@ -43,6 +81,8 @@ function createInMemoryRawBus(options?: {
 
   return {
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      if (options?.publishEffect) await options.publishEffect();
+      if (options?.publishFailure) throw options.publishFailure;
       const id = `${Date.now()}-${Math.random()}`;
       const stored: Message<unknown> = {
         topic: opts.topic,
@@ -186,26 +226,32 @@ describe("heartbeat service", () => {
     expect(quietState.label).toBe("outside");
   });
 
-  it("parks every owned lifecycle identifier error", () => {
+  it("dead-letters invalid lifecycle events and parks transient dependency failures", () => {
     expect(
       applyHeartbeatLifecycleDeliveryPolicy(
-        new HeartbeatLifecycleRequestIdMissing({ message: "request ID missing" }),
+        new HeartbeatLifecycleEventInvalid({
+          missingHeaders: ["request_id", "session_id"],
+          message: "required identifiers missing",
+        }),
       ),
-    ).toBe("park-pending");
+    ).toBe("dead-letter");
     expect(
       applyHeartbeatLifecycleDeliveryPolicy(
-        new HeartbeatLifecycleSessionIdMissing({ message: "session ID missing" }),
+        new HeartbeatLifecycleDependencyUnavailable({
+          dependency: "heartbeat lifecycle state",
+          cause: new Error("temporarily unavailable"),
+          message: "lifecycle dependency unavailable",
+        }),
       ),
     ).toBe("park-pending");
   });
 
-  it("commits unrelated and valid events while parking a lifecycle event without a session ID", async () => {
+  it("commits unrelated and valid events while dead-lettering lifecycle events without IDs", async () => {
     const actions: RawDeliveryAction[] = [];
-    const bus = createLilacBus(
-      createInMemoryRawBus({
-        onDeliveryAction: (_message, action) => actions.push(action),
-      }),
-    );
+    const rawBus = createInMemoryRawBus({
+      onDeliveryAction: (_message, action) => actions.push(action),
+    });
+    const bus = createLilacBus(rawBus);
     const service = await startHeartbeatService({
       bus,
       subscriptionId: "hb-delivery-policy",
@@ -230,12 +276,41 @@ describe("heartbeat service", () => {
       { state: "running" },
       { headers: { request_id: "missing-session" } },
     );
+    await rawBus.publish(
+      {
+        topic: "evt.request",
+        type: lilacEventTypes.EvtRequestLifecycleChanged,
+        data: { state: "running" },
+        headers: { session_id: "missing-request" },
+      },
+      {
+        topic: "evt.request",
+        type: lilacEventTypes.EvtRequestLifecycleChanged,
+      },
+    );
 
     expect(actions.map((action) => action.disposition)).toEqual([
       "commit",
       "commit",
-      "park-pending",
+      "dead-letter",
+      "dead-letter",
     ]);
+    const missingSessionAction = actions[2];
+    expect(missingSessionAction?.disposition).toBe("dead-letter");
+    if (missingSessionAction?.disposition === "dead-letter") {
+      expect(missingSessionAction.record.reason).toMatchObject({
+        kind: "handler-error",
+        errorTag: "HeartbeatLifecycleEventInvalid",
+      });
+    }
+    const missingRequestAction = actions[3];
+    expect(missingRequestAction?.disposition).toBe("dead-letter");
+    if (missingRequestAction?.disposition === "dead-letter") {
+      expect(missingRequestAction.record.reason).toMatchObject({
+        kind: "contract-invalid",
+        stage: "headers",
+      });
+    }
 
     await service.stop();
   });
@@ -437,6 +512,72 @@ describe("heartbeat service", () => {
 
     await service.stop();
     await stopResultForTest(sub.stop());
+  });
+
+  it("releases the outstanding heartbeat request after publish Err and Panic", async () => {
+    const rawOptions: { publishFailure: Error | null } = {
+      publishFailure: new Error("heartbeat transport unavailable"),
+    };
+    const bus = createLilacBus(createInMemoryRawBus(rawOptions));
+    const service = await startHeartbeatService({
+      bus,
+      subscriptionId: "hb-publish-failure",
+      config: createHeartbeatConfig(),
+      now: () => Date.UTC(2026, 2, 11, 10, 0, 0),
+    });
+
+    await expect(service.tick("interval")).rejects.toMatchObject({
+      _tag: "EventPublishTransportFailed",
+    });
+
+    const panic = new Panic({ message: "heartbeat publish invariant failed" });
+    rawOptions.publishFailure = panic;
+    await expect(service.tick("retry")).rejects.toBe(panic);
+
+    rawOptions.publishFailure = null;
+    await service.tick("retry");
+    const fetched = await bus.fetchTopic("cmd.request", { offset: { type: "begin" }, limit: 10 });
+    expect(fetched.status).toBe("ok");
+    if (fetched.status === "ok") expect(fetched.value.messages).toHaveLength(1);
+
+    await service.stop();
+  });
+
+  it("preserves an in-flight heartbeat Panic over an ordinary lifecycle cleanup Err", async () => {
+    const publishStarted = Promise.withResolvers<void>();
+    const releasePublish = Promise.withResolvers<void>();
+    const panic = new Panic({ message: "heartbeat publish invariant failed during shutdown" });
+    const stopFailure = new EventDeliveryStopFailed({
+      cause: undefined,
+      topic: "evt.request",
+      message: "ordinary lifecycle cleanup failure",
+    });
+    const bus = createLilacBus(
+      createInMemoryRawBus({
+        stopFailure,
+        publishEffect: async () => {
+          publishStarted.resolve();
+          await releasePublish.promise;
+          throw panic;
+        },
+      }),
+    );
+    const service = await startHeartbeatService({
+      bus,
+      subscriptionId: "hb-shutdown-panic",
+      config: createHeartbeatConfig(),
+      now: () => Date.UTC(2026, 2, 11, 10, 0, 0),
+    });
+
+    const tick = service.tick("interval");
+    await publishStarted.promise;
+    const stopping = service.stop();
+    const settled = Promise.allSettled([tick, stopping]);
+    releasePublish.resolve();
+
+    const [tickResult, stopResult] = await settled;
+    expect(tickResult).toEqual({ status: "rejected", reason: panic });
+    expect(stopResult).toEqual({ status: "rejected", reason: panic });
   });
 
   it("includes configured default output session in the heartbeat prompt", async () => {

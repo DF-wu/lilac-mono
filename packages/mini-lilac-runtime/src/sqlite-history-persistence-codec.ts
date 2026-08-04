@@ -375,6 +375,14 @@ export type MiniLilacStructuralHistoryRecord =
     };
 
 export type MiniLilacStructuralHistoryRecordKind = MiniLilacStructuralHistoryRecord["kind"];
+export type MiniLilacStructuralHistoryValueByKind = {
+  [K in MiniLilacStructuralHistoryRecordKind]: Extract<
+    MiniLilacStructuralHistoryRecord,
+    { readonly kind: K }
+  >["value"];
+};
+export type MiniLilacStructuralHistoryValueFor<K extends MiniLilacStructuralHistoryRecordKind> =
+  MiniLilacStructuralHistoryValueByKind[K];
 export type MiniLilacStructuralHistoryRowCodecInput = {
   readonly kind: MiniLilacStructuralHistoryRecordKind;
   readonly row: unknown;
@@ -775,6 +783,46 @@ export function decodeMiniLilacStructuralHistoryRow(
       });
     }
   }
+}
+
+export function decodeMiniLilacStructuralHistoryRows<
+  K extends MiniLilacStructuralHistoryRecordKind,
+>(input: {
+  readonly kind: K;
+  readonly rows: readonly unknown[];
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<
+  DecodedPersistedValue<readonly MiniLilacStructuralHistoryValueFor<K>[]>,
+  PersistedDataError
+> {
+  const values: MiniLilacStructuralHistoryValueFor<K>[] = [];
+  let provenance: DecodedPersistedValue<unknown>["provenance"] = "current";
+  for (const [index, row] of input.rows.entries()) {
+    const recordId = `${input.recordId}:${index}`;
+    const decoded = decodeMiniLilacStructuralHistoryRow({
+      kind: input.kind,
+      row,
+      schemaVersion: input.schemaVersion,
+      recordId,
+    });
+    if (decoded.status === "error") return Result.err(decoded.error);
+    if (decoded.value.value === null || decoded.value.value.kind !== input.kind) {
+      return Result.err(
+        corrupt({
+          kind: input.kind,
+          version: input.schemaVersion,
+          issueCode: "missing-required-field",
+          recordId,
+        }),
+      );
+    }
+    if (decoded.value.provenance === "migrated") provenance = "migrated";
+    // The discriminant comparison above preserves this generic correlation,
+    // which TypeScript cannot retain through Extract over a generic key.
+    values.push(decoded.value.value.value as MiniLilacStructuralHistoryValueFor<K>);
+  }
+  return Result.ok({ value: values, provenance });
 }
 
 const fixtureStateRow = {

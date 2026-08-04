@@ -250,6 +250,30 @@ describe("Core-owned MCP OAuth", () => {
     expect(explicit.status).toBe("authorization_required");
   });
 
+  it("returns owned Results for missing providers and invalid callback state", async () => {
+    const dataDir = await createDataDir();
+    const providers = new McpOAuthProviderService({ dataDir });
+
+    const missing = await providers.startAuthorizationResult("missing");
+    expect(missing.status).toBe("error");
+    if (missing.status === "error") {
+      expect(missing.error).toMatchObject({
+        _tag: "McpOAuthProviderError",
+        serverId: "missing",
+        operation: "start",
+      });
+    }
+
+    providers.reconcile(oauthConfig());
+    const provider = providers.getProvider("docs");
+    if (!provider) throw new Error("Expected OAuth provider");
+    const invalidCallback = await provider.completeAuthorizationResult("code", "wrong-state");
+    expect(invalidCallback.status).toBe("error");
+    if (invalidCallback.status === "error") {
+      expect(invalidCallback.error.operation).toBe("complete");
+    }
+  });
+
   it("treats a zero dynamic client secret expiration as non-expiring", async () => {
     const dataDir = await createDataDir();
     const providers = new McpOAuthProviderService({ dataDir });

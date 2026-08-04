@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Panic } from "better-result";
 
 import {
   decodeWorkflowPersistenceRow,
@@ -85,5 +86,43 @@ describe("workflow persistence row codec catalog", () => {
     );
     expect(corrupt.status).toBe("error");
     if (corrupt.status === "error") expect(corrupt.error._tag).toBe("CorruptPersistedFields");
+  });
+
+  it("decodes legacy rows without rewriting the persisted input", () => {
+    const input = structuredClone(workflowPersistenceRowCodecCases.legacy.input);
+    const before = JSON.stringify(input);
+    const decoded = decodeWorkflowPersistenceRow(input);
+
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "ok") expect(decoded.value.provenance).toBe("migrated");
+    expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it("rejects JSON comments and trailing commas as malformed serialization", () => {
+    for (const argsJson of ['{"value":1,}', '{/* comment */"value":1}']) {
+      const current = workflowPersistenceRowCodecCases.current.input;
+      const decoded = decodeWorkflowPersistenceRow({
+        ...current,
+        row: { ...current.row, args_json: argsJson },
+      });
+      expect(decoded.status).toBe("error");
+      if (decoded.status === "error") {
+        expect(decoded.error._tag).toBe("MalformedSerialization");
+      }
+    }
+  });
+
+  it("preserves Panic identity from the strict JSON adapter", () => {
+    const panic = new Panic({ message: "strict JSON parser defect" });
+    const parse = spyOn(JSON, "parse").mockImplementationOnce(() => {
+      throw panic;
+    });
+    try {
+      expect(() =>
+        decodeWorkflowPersistenceRow(workflowPersistenceRowCodecCases.current.input),
+      ).toThrow(panic);
+    } finally {
+      parse.mockRestore();
+    }
   });
 });

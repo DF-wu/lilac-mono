@@ -2,15 +2,12 @@ import fs from "node:fs/promises";
 
 import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
 import type { BundledRemoteRunnerRequest, RemoteFsRequest } from "@stanley2058/lilac-fs";
-import {
-  createLogger,
-  formatTaggedErrorForLog,
-  isPanic,
-  opaqueErrorCause,
-} from "@stanley2058/lilac-utils";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
+import { projectRuntimeError } from "../runtime/error-format";
 import { requireConfiguredSshHost } from "./ssh-config";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 
 const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
 const DEFAULT_SSH_STDIN_MODE: SshBashStdinMode = "error";
@@ -159,126 +156,157 @@ type OverflowCapture = {
 
 type SshStreamReadChunk = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>;
 
-function rethrowSshPanic(cause: unknown): unknown {
-  if (isPanic(cause)) throw cause;
-  return opaqueErrorCause(cause, "Opaque SSH adapter failure");
+type SshOverflowSettled<T> =
+  | { readonly status: "result"; readonly result: ResultType<T, SshOverflowOperationError> }
+  | { readonly status: "panic"; readonly panic: Panic };
+
+type SshOverflowCleanupOutcome = {
+  readonly result: ResultType<void, SshOverflowCleanupError>;
+  readonly panic?: Panic;
+};
+
+function rethrowSshPanic(cause: Error | Panic): Error {
+  return preserveToolPanic(cause);
+}
+
+function captureSshOperation<T, E extends Error>(params: {
+  readonly run: () => Awaited<T>;
+  readonly fallback: string;
+  readonly mapError: (cause: Error) => E;
+}): ResultType<T, E> {
+  const captured = Result.try({
+    try: params.run,
+    catch: projectRuntimeError(params.fallback),
+  });
+  if (captured.status === "error") {
+    return Result.err(params.mapError(rethrowSshPanic(captured.error)));
+  }
+  return Result.ok(captured.value);
+}
+
+async function captureSshPromise<T, E extends Error>(params: {
+  readonly run: () => Promise<T>;
+  readonly fallback: string;
+  readonly mapError: (cause: Error) => E;
+}): Promise<ResultType<T, E>> {
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: projectRuntimeError(params.fallback),
+  });
+  if (captured.status === "error") {
+    return Result.err(params.mapError(rethrowSshPanic(captured.error)));
+  }
+  return Result.ok(captured.value);
 }
 
 export function serializeRemoteRunnerRequestJson(
   request: BundledRemoteRunnerRequest | RemoteFsRequest,
 ): ResultType<string, SshRequestSerializationError> {
-  let serialized: string | undefined;
-  try {
-    serialized = JSON.stringify(request);
-  } catch (caught) {
-    const cause = rethrowSshPanic(caught);
-    return Result.err(
+  return captureSshOperation({
+    run: () => JSON.stringify(request),
+    fallback: "Opaque SSH adapter failure",
+    mapError: (cause) =>
       new SshRequestSerializationError({
         cause,
         message: "Remote runner request could not be serialized as JSON",
       }),
-    );
-  }
-  if (serialized !== undefined) return Result.ok(serialized);
-  return Result.err(
-    new SshRequestSerializationError({
-      cause: new TypeError("JSON.stringify returned undefined for a remote runner request"),
-      message: "Remote runner request could not be serialized as JSON",
-    }),
+  }).andThen((serialized) =>
+    serialized !== undefined
+      ? Result.ok(serialized)
+      : Result.err(
+          new SshRequestSerializationError({
+            cause: new TypeError("JSON.stringify returned undefined for a remote runner request"),
+            message: "Remote runner request could not be serialized as JSON",
+          }),
+        ),
   );
 }
 
 function acquireStreamReader(
   stream: ReadableStream<Uint8Array>,
 ): ResultType<ReadableStreamDefaultReader<Uint8Array>, SshStreamReadError> {
-  return Result.try({
-    try: () => stream.getReader(),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshStreamReadError({
+  return captureSshOperation({
+    run: () => stream.getReader(),
+    fallback: "Opaque SSH stream reader acquisition failure",
+    mapError: (cause) =>
+      new SshStreamReadError({
         operation: "acquire_reader",
         cause,
         message: "Failed to acquire the SSH output stream reader",
-      });
-    },
+      }),
   });
 }
 
 function readStreamChunk(
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): Promise<ResultType<SshStreamReadChunk, SshStreamReadError>> {
-  return Result.tryPromise({
-    try: () => reader.read(),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshStreamReadError({
+  return captureSshPromise({
+    run: () => reader.read(),
+    fallback: "Opaque SSH stream read failure",
+    mapError: (cause) =>
+      new SshStreamReadError({
         operation: "read_chunk",
         cause,
         message: "Failed to read SSH output",
-      });
-    },
+      }),
   });
 }
 
 function releaseStreamReader(
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): ResultType<void, SshStreamCleanupError> {
-  return Result.try({
-    try: () => reader.releaseLock(),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshStreamCleanupError({
+  return captureSshOperation({
+    run: () => reader.releaseLock(),
+    fallback: "Opaque SSH stream reader release failure",
+    mapError: (cause) =>
+      new SshStreamCleanupError({
         operation: "release_reader",
         cause,
         message: "Failed to release the SSH output stream reader",
-      });
-    },
+      }),
   });
 }
 
 function reportStreamActivity(onActivity: () => void): ResultType<void, SshStreamReadError> {
-  return Result.try({
-    try: onActivity,
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshStreamReadError({
+  return captureSshOperation({
+    run: onActivity,
+    fallback: "Opaque SSH output activity callback failure",
+    mapError: (cause) =>
+      new SshStreamReadError({
         operation: "report_activity",
         cause,
         message: "SSH output activity callback failed",
-      });
-    },
+      }),
   });
 }
 
 function readResponseBody(
   body: XMLHttpRequestBodyInit,
 ): Promise<ResultType<Buffer, SshStreamReadError>> {
-  return Result.tryPromise({
-    try: async () => Buffer.from(await new Response(body).arrayBuffer()),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshStreamReadError({
+  return captureSshPromise({
+    run: async () => Buffer.from(await new Response(body).arrayBuffer()),
+    fallback: "Opaque SSH output body read failure",
+    mapError: (cause) =>
+      new SshStreamReadError({
         operation: "read_body",
         cause,
         message: "Failed to read the SSH output body",
-      });
-    },
+      }),
   });
 }
 
 function openOverflowSink(
   target: string,
 ): Promise<ResultType<BufferedFileSink, SshOverflowOperationError>> {
-  return Result.tryPromise({
-    try: () => BufferedFileSink.open(target, { flags: "wx", mode: 0o600 }),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshOverflowOperationError({
+  return captureSshPromise({
+    run: () => BufferedFileSink.open(target, { flags: "wx", mode: 0o600 }),
+    fallback: "Opaque SSH overflow output open failure",
+    mapError: (cause) =>
+      new SshOverflowOperationError({
         operation: "open",
         cause,
         message: "Failed to open SSH overflow output",
-      });
-    },
+      }),
   });
 }
 
@@ -286,88 +314,120 @@ function writeOverflowSink(
   sink: BufferedFileSink,
   chunk: Uint8Array,
 ): Promise<ResultType<void, SshOverflowOperationError>> {
-  return Result.tryPromise({
-    try: () => sink.write(chunk),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshOverflowOperationError({
+  return captureSshPromise({
+    run: () => sink.write(chunk),
+    fallback: "Opaque SSH overflow output write failure",
+    mapError: (cause) =>
+      new SshOverflowOperationError({
         operation: "write",
         cause,
         message: "Failed to write SSH overflow output",
-      });
-    },
+      }),
   });
 }
 
 function closeOverflowSink(
   sink: BufferedFileSink,
 ): Promise<ResultType<void, SshOverflowOperationError>> {
-  return Result.tryPromise({
-    try: () => sink.close(),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshOverflowOperationError({
+  return captureSshPromise({
+    run: () => sink.close(),
+    fallback: "Opaque SSH overflow output close failure",
+    mapError: (cause) =>
+      new SshOverflowOperationError({
         operation: "close",
         cause,
         message: "Failed to close SSH overflow output",
-      });
-    },
+      }),
   });
 }
 
 function abortOverflowSink(
   sink: BufferedFileSink,
 ): Promise<ResultType<void, SshOverflowOperationError>> {
-  return Result.tryPromise({
-    try: () => sink.abort(),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshOverflowOperationError({
+  return captureSshPromise({
+    run: () => sink.abort(),
+    fallback: "Opaque SSH overflow output abort failure",
+    mapError: (cause) =>
+      new SshOverflowOperationError({
         operation: "abort",
         cause,
         message: "Failed to abort SSH overflow output",
-      });
-    },
+      }),
   });
 }
 
 function removeOverflowFile(target: string): Promise<ResultType<void, SshOverflowOperationError>> {
-  return Result.tryPromise({
-    try: () => fs.rm(target, { force: true }),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshOverflowOperationError({
+  return captureSshPromise({
+    run: () => fs.rm(target, { force: true }),
+    fallback: "Opaque SSH overflow output removal failure",
+    mapError: (cause) =>
+      new SshOverflowOperationError({
         operation: "remove",
         cause,
         message: "Failed to remove incomplete SSH overflow output",
-      });
-    },
+      }),
   });
+}
+
+async function settleOverflowOperation<T>(
+  run: () => Promise<ResultType<T, SshOverflowOperationError>>,
+): Promise<SshOverflowSettled<T>> {
+  const settled = await Result.tryPromise({
+    try: run,
+    catch: projectRuntimeError("Opaque SSH overflow Result rejection"),
+  });
+  if (settled.status === "ok") return { status: "result", result: settled.value };
+  if (isPanic(settled.error)) return { status: "panic", panic: settled.error };
+  return {
+    status: "panic",
+    panic: new Panic({ message: "SSH overflow Result API rejected with an ordinary error" }),
+  };
+}
+
+async function cleanupOverflowCaptureOutcome(
+  capture: OverflowCapture,
+): Promise<SshOverflowCleanupOutcome> {
+  const failures: SshOverflowOperationError[] = [];
+  let deferredPanic: Panic | undefined;
+  const sink = capture.sink;
+  capture.sink = undefined;
+  if (sink) {
+    const aborted = await settleOverflowOperation(() => abortOverflowSink(sink));
+    if (aborted.status === "panic") deferredPanic = aborted.panic;
+    else if (aborted.result.status === "error") failures.push(aborted.result.error);
+  }
+  if (capture.fileCreated) {
+    const removed = await settleOverflowOperation(() => removeOverflowFile(capture.target));
+    if (removed.status === "panic") deferredPanic ??= removed.panic;
+    else if (removed.result.status === "error") failures.push(removed.result.error);
+  }
+  capture.fileCreated = false;
+  capture.bufferedRawChunks.length = 0;
+  return {
+    result:
+      failures.length === 0
+        ? Result.ok()
+        : Result.err(
+            new SshOverflowCleanupError({
+              failures,
+              message: "Failed to clean up incomplete SSH overflow output",
+            }),
+          ),
+    ...(deferredPanic ? { panic: deferredPanic } : {}),
+  };
 }
 
 async function cleanupOverflowCapture(
   capture: OverflowCapture,
 ): Promise<ResultType<void, SshOverflowCleanupError>> {
-  const failures: SshOverflowOperationError[] = [];
-  const sink = capture.sink;
-  capture.sink = undefined;
-  if (sink) {
-    const aborted = await abortOverflowSink(sink);
-    if (aborted.status === "error") failures.push(aborted.error);
-  }
-  if (capture.fileCreated) {
-    const removed = await removeOverflowFile(capture.target);
-    if (removed.status === "error") failures.push(removed.error);
-  }
-  capture.fileCreated = false;
-  capture.bufferedRawChunks.length = 0;
-  if (failures.length === 0) return Result.ok();
-  return Result.err(
-    new SshOverflowCleanupError({
-      failures,
-      message: "Failed to clean up incomplete SSH overflow output",
-    }),
-  );
+  const outcome = await cleanupOverflowCaptureOutcome(capture);
+  if (outcome.panic) preserveToolPanic(outcome.panic);
+  return outcome.result;
+}
+
+async function propagateOverflowPanic(capture: OverflowCapture, panic: Panic): Promise<never> {
+  await cleanupOverflowCaptureOutcome(capture);
+  return preserveToolPanic(panic);
 }
 
 async function disableOverflowCapture(
@@ -387,13 +447,18 @@ async function writeOverflowChunk(
   chunk: Uint8Array,
 ): Promise<ResultType<void, SshOverflowOperationError>> {
   if (chunk.byteLength === 0 || capture.disabled) return Result.ok();
-  if (!capture.sink) {
-    const opened = await openOverflowSink(capture.target);
-    if (opened.status === "error") return Result.err(opened.error);
-    capture.sink = opened.value;
+  let sink = capture.sink;
+  if (!sink) {
+    const opened = await settleOverflowOperation(() => openOverflowSink(capture.target));
+    if (opened.status === "panic") return propagateOverflowPanic(capture, opened.panic);
+    if (opened.result.status === "error") return Result.err(opened.result.error);
+    sink = opened.result.value;
+    capture.sink = sink;
     capture.fileCreated = true;
   }
-  return writeOverflowSink(capture.sink, chunk);
+  const written = await settleOverflowOperation(() => writeOverflowSink(sink, chunk));
+  if (written.status === "panic") return propagateOverflowPanic(capture, written.panic);
+  return written.result;
 }
 
 async function activateOverflowCapture(
@@ -494,9 +559,12 @@ async function readReadableStreamTextCapped(
           }
         }
         if (overflowCapture?.sink) {
-          const closed = await closeOverflowSink(overflowCapture.sink);
-          if (closed.status === "error") {
-            await disableOverflowCapture(overflowCapture, closed.error);
+          const overflowSink = overflowCapture.sink;
+          const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
+          if (closed.status === "panic") {
+            await propagateOverflowPanic(overflowCapture, closed.panic);
+          } else if (closed.result.status === "error") {
+            await disableOverflowCapture(overflowCapture, closed.result.error);
           } else {
             overflowCapture.sink = undefined;
             overflowFilePath = overflowCapture.target;
@@ -571,9 +639,12 @@ async function readBodyTextCapped(
     if (written.status === "error") {
       await disableOverflowCapture(capture, written.error);
     } else if (capture.sink) {
-      const closed = await closeOverflowSink(capture.sink);
-      if (closed.status === "error") {
-        await disableOverflowCapture(capture, closed.error);
+      const overflowSink = capture.sink;
+      const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
+      if (closed.status === "panic") {
+        await propagateOverflowPanic(capture, closed.panic);
+      } else if (closed.result.status === "error") {
+        await disableOverflowCapture(capture, closed.result.error);
       } else {
         capture.sink = undefined;
         retainedOverflowPath = overflowFilePath;
@@ -689,21 +760,20 @@ function signalSshProcess(
   target: "group" | "process",
 ): ResultType<void, SshProcessSignalError> {
   const signalPid = target === "group" ? -pid : pid;
-  const signaled = Result.try({
-    try: () => process.kill(signalPid, signal),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshProcessSignalError({
+  return captureSshOperation({
+    run: () => {
+      process.kill(signalPid, signal);
+    },
+    fallback: `Opaque SSH ${target} signal failure`,
+    mapError: (cause) =>
+      new SshProcessSignalError({
         target,
         pid,
         signal,
         cause,
         message: `Failed to signal SSH ${target}`,
-      });
-    },
+      }),
   });
-  if (signaled.status === "error") return Result.err(signaled.error);
-  return Result.ok();
 }
 
 function killProcessGroupBestEffort(
@@ -731,15 +801,14 @@ function observeBestEffortProcessCleanup(cleanup: ResultType<void, SshProcessCle
 }
 
 function waitForSshExit(exit: Promise<number>): Promise<ResultType<number, SshExitWaitError>> {
-  return Result.tryPromise({
-    try: () => exit,
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshExitWaitError({
+  return captureSshPromise({
+    run: () => exit,
+    fallback: "Opaque SSH subprocess exit wait failure",
+    mapError: (cause) =>
+      new SshExitWaitError({
         cause,
         message: "Failed while waiting for the SSH subprocess to exit",
-      });
-    },
+      }),
   });
 }
 
@@ -1005,8 +1074,8 @@ echo '{"ok":false,"error":"Remote host has neither bun nor node in PATH"}'
 exit 0
 `;
 
-  const executed = await Result.tryPromise({
-    try: () =>
+  const executed = await captureSshPromise({
+    run: () =>
       sshExecBash({
         host: params.host,
         cmd: script,
@@ -1016,10 +1085,9 @@ exit 0
         maxOutputChars: params.maxOutputChars,
         onActivity: params.onActivity,
       }),
-    catch: (caught) => {
-      const cause = rethrowSshPanic(caught);
-      return new SshExecutionAdapterError({ cause, message: "SSH execution adapter failed" });
-    },
+    fallback: "Opaque SSH execution adapter failure",
+    mapError: (cause) =>
+      new SshExecutionAdapterError({ cause, message: "SSH execution adapter failed" }),
   });
   if (executed.status === "error") return Result.err(executed.error);
   const res = executed.value;

@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 
 import {
-  composeRecentChannelMessages,
-  composeRequestMessages,
-  composeSingleMessage,
+  composeRecentChannelMessages as composeRecentChannelMessagesResult,
+  composeRequestMessages as composeRequestMessagesResult,
+  composeSingleMessage as composeSingleMessageResult,
 } from "../../../src/surface/bridge/request-composition";
 import type { ModelMessage } from "ai";
 import { Result } from "better-result";
@@ -26,6 +26,26 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
+
+async function composeRecentChannelMessages(
+  ...args: Parameters<typeof composeRecentChannelMessagesResult>
+) {
+  const composed = await composeRecentChannelMessagesResult(...args);
+  if (composed.status === "error") throw composed.error;
+  return composed.value;
+}
+
+async function composeRequestMessages(...args: Parameters<typeof composeRequestMessagesResult>) {
+  const composed = await composeRequestMessagesResult(...args);
+  if (composed.status === "error") throw composed.error;
+  return composed.value;
+}
+
+async function composeSingleMessage(...args: Parameters<typeof composeSingleMessageResult>) {
+  const composed = await composeSingleMessageResult(...args);
+  if (composed.status === "error") throw composed.error;
+  return composed.value;
+}
 
 function transcriptStoreFor(
   resolve: (

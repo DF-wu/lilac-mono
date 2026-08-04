@@ -1,19 +1,12 @@
-import { Panic } from "better-result";
+import { Panic, Result, type Panic as PanicType } from "better-result";
 
-export function rethrowBundledRemoteRunnerPanic(error: unknown): void {
-  let panic = false;
-  try {
-    panic = Panic.is(error);
-  } catch {
-    return;
-  }
-  if (panic) throw error;
+import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
+
+export function rethrowBundledRemoteRunnerPanic(error: Error | PanicType): Error {
+  if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
+  return error;
 }
 
-export function bundledRemoteRunnerErrorMessage(error: unknown): string {
-  try {
-    return error instanceof Error ? error.message : String(error);
-  } catch {
-    return "Opaque bundled remote runner failure";
-  }
+export function bundledRemoteRunnerErrorMessage(error: Error): string {
+  return error.message;
 }

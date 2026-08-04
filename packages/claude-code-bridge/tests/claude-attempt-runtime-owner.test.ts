@@ -2,12 +2,18 @@ import { describe, expect, it } from "bun:test";
 import type { PrepareModelCallContext } from "@stanley2058/lilac-agent";
 import type { ModelMessage } from "ai";
 import { createClaudeCode } from "ai-sdk-provider-claude-code";
+import { Result } from "better-result";
 
 import {
   ClaudeAttemptRuntimeOwner,
   type ClaudeAttemptRuntimeCandidate,
 } from "../claude-attempt-runtime-owner";
-import type { ClaudeNativeAttemptObservation, MaterializedClaudeCodeRun } from "../claude-code-run";
+import {
+  ClaudeCodeRunCleanupFailed,
+  ClaudeCodeRunInvalidConfiguration,
+  type ClaudeNativeAttemptObservation,
+  type MaterializedClaudeCodeRun,
+} from "../claude-code-run";
 
 const model = createClaudeCode()("sonnet");
 
@@ -58,6 +64,7 @@ function fakeRun(options: {
   readonly sourceSessionId?: string | null;
   readonly withNativeLifecycle?: boolean;
   readonly initialUsage?: { readonly tokens: number; readonly maxTokens: number } | null;
+  readonly cleanupFails?: boolean;
 }) {
   let observation = nativeObservation(
     options.sessionId === undefined ? "candidate-session" : options.sessionId,
@@ -69,10 +76,13 @@ function fakeRun(options: {
   const run: MaterializedClaudeCodeRun = {
     agentModel: createClaudeCode()("sonnet"),
     continuationModel: createClaudeCode()("sonnet"),
+    createUtilityModelResult: () => Result.ok(createClaudeCode()("sonnet")),
     createUtilityModel: () => createClaudeCode()("sonnet"),
     control: {
       inject: () => false,
+      interruptResult: async () => Result.ok(false),
       interrupt: async () => false,
+      clearResult: () => Result.ok(),
       clear: () => undefined,
     },
     ...(options.withNativeLifecycle === false
@@ -86,6 +96,12 @@ function fakeRun(options: {
               return next;
             },
             recordWarning: () => undefined,
+            finalizeResult: async () =>
+              Result.err(
+                new ClaudeCodeRunInvalidConfiguration({
+                  message: "not finalized by the process-local owner",
+                }),
+              ),
             finalize: async () => {
               throw new Error("not finalized by the process-local owner");
             },
@@ -93,6 +109,17 @@ function fakeRun(options: {
         }),
     dispose: async () => {
       disposeCalls += 1;
+    },
+    disposeResult: async () => {
+      disposeCalls += 1;
+      return options.cleanupFails
+        ? Result.err(
+            new ClaudeCodeRunCleanupFailed({
+              failures: [],
+              message: "test cleanup failed",
+            }),
+          )
+        : Result.ok();
     },
   };
   return {
@@ -127,6 +154,47 @@ function candidate(
 }
 
 describe("ClaudeAttemptRuntimeOwner", () => {
+  it("returns owned Result errors for invalid estimates and candidate factory rejection", async () => {
+    const owner = new ClaudeAttemptRuntimeOwner({
+      factoryInputs: null,
+      createCandidate: async () => {
+        throw new Error("factory unavailable");
+      },
+    });
+
+    const estimate = owner.getNativeInputEstimateFloorResult({
+      unsynchronizedSuffixAndOverlayEstimate: Number.NaN,
+    });
+    expect(estimate.status).toBe("error");
+    if (estimate.status === "error") {
+      expect(estimate.error._tag).toBe("ClaudeAttemptRuntimeInvalidInput");
+    }
+
+    const prepared = await owner.prepareResult(prepareContext([]));
+    expect(prepared.status).toBe("error");
+    if (prepared.status === "error") {
+      expect(prepared.error._tag).toBe("ClaudeAttemptRuntimeCandidateFailed");
+    }
+  });
+
+  it("preserves candidate validation and cleanup failures together", async () => {
+    const fake = fakeRun({ withNativeLifecycle: false, cleanupFails: true });
+    const owner = new ClaudeAttemptRuntimeOwner({
+      factoryInputs: null,
+      createCandidate: async () => candidate(fake.run),
+    });
+
+    const prepared = await owner.prepareResult(prepareContext([]));
+    expect(prepared.status).toBe("error");
+    if (prepared.status === "error") {
+      expect(prepared.error._tag).toBe("ClaudeAttemptRuntimeOperationAndCleanupFailed");
+      if (prepared.error._tag === "ClaudeAttemptRuntimeOperationAndCleanupFailed") {
+        expect(prepared.error.operationError._tag).toBe("ClaudeAttemptRuntimeCandidateFailed");
+        expect(prepared.error.cleanupError._tag).toBe("ClaudeAttemptRuntimeCleanupFailed");
+      }
+    }
+  });
+
   it("materializes lazily once and selects a provider-tools runtime", async () => {
     const fake = fakeRun({});
     let factoryCalls = 0;

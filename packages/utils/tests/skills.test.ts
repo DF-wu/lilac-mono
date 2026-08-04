@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { discoverSkills, parseSkillMarkdown } from "../skills";
+import { discoverSkills, parseSkillMarkdown, parseSkillMarkdownResult } from "../skills";
 import { formatAvailableSkillsSection, type DiscoveredSkill } from "../skills";
 
 async function mkdirp(p: string) {
@@ -18,6 +18,17 @@ describe("skills discovery", () => {
       await fs.rm(tmpRoot, { recursive: true, force: true });
       tmpRoot = null;
     }
+  });
+
+  it("keeps parseSkillMarkdown failures as plain Errors", () => {
+    let caught: unknown;
+    try {
+      parseSkillMarkdown("missing frontmatter");
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    if (caught instanceof Error) expect(caught.constructor).toBe(Error);
   });
 
   it("prefers data/skills over .claude/skills on name collision", async () => {
@@ -340,6 +351,15 @@ describe("skills prompt formatting", () => {
 });
 
 describe("bundled skills", () => {
+  it("reports malformed markdown as a typed error", () => {
+    const result = parseSkillMarkdownResult("not frontmatter");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("SkillMarkdownInvalid");
+      expect(result.error.issue).toBe("missing-frontmatter");
+    }
+  });
+
   it("includes a strong built-in coding-agent skill", async () => {
     const raw = await Bun.file(
       path.join(import.meta.dir, "..", "builtin-skills", "coding-agent", "SKILL.md"),

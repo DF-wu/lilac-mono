@@ -1,4 +1,4 @@
-import { workflowStoreValue } from "./workflow-store-test-helpers";
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -40,16 +40,27 @@ import {
 import type { WorkflowRequestPolicy } from "../../src/workflow/workflow-request-authority";
 import { canonicalJsonSha256, sha256 } from "../../src/workflow/workflow-definition";
 import {
-  normalizeWorkflowResourcePolicy,
   WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
   type WorkflowCompletionTarget,
 } from "../../src/workflow/workflow-domain";
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
 import { readWorkflowValueArtifact } from "../../src/workflow/workflow-artifact-store";
 import {
-  compileWorkflowSource,
-  parseWorkflowCallSiteManifest,
+  compileWorkflowSourceResult,
+  parseWorkflowCallSiteManifestUnchecked,
 } from "../../src/workflow/workflow-source-compiler";
+
+function compileWorkflowSource(source: string, sourceSha256: string): string {
+  const result = compileWorkflowSourceResult(source, sourceSha256);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function parseWorkflowCallSiteManifest(source: string) {
+  const result = parseWorkflowCallSiteManifestUnchecked(source);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 const HASH_A = "a".repeat(64);
 class HandoffInterceptStore extends DurableWorkflowStore {
   beforeHandoff: (() => void) | null = null;
@@ -113,6 +124,12 @@ class CapturingRawBus implements RawBus {
   async watermark(topic: string) {
     return this.history.filter((message) => message.topic === topic).at(-1)?.id ?? null;
   }
+  async trimBeforeCheckpoint() {
+    return 0;
+  }
+  async retireConsumerGroup() {
+    return "absent" as const;
+  }
   async close() {}
 }
 class LiveCapturingRawBus implements RawBus {
@@ -146,6 +163,12 @@ class LiveCapturingRawBus implements RawBus {
   async fetch(_topic: string, _options: FetchOptions) {
     return { messages: [] };
   }
+  async trimBeforeCheckpoint() {
+    return 0;
+  }
+  async retireConsumerGroup() {
+    return "absent" as const;
+  }
   async close() {
     this.subscriptions.clear();
   }
@@ -163,6 +186,46 @@ class FailingWorkflowRunPublishRawBus extends LiveCapturingRawBus {
       throw new Error("workflow run publication failed");
     }
     return await super.publish(message, options);
+  }
+}
+class DeferredInterruptFailureRawBus extends LiveCapturingRawBus {
+  readonly interruptStarted = Promise.withResolvers<void>();
+  readonly releaseInterrupt = Promise.withResolvers<void>();
+  requestSubscriptionStops = 0;
+  interruptDispatchEpoch: string | undefined;
+  override async publish<TData>(
+    message: Omit<Message<TData>, "id" | "ts">,
+    options: PublishOptions,
+  ) {
+    if (message.type === lilacEventTypes.CmdRequestMessage) {
+      const data = message.data;
+      if (
+        typeof data === "object" &&
+        data !== null &&
+        "queue" in data &&
+        data.queue === "interrupt"
+      ) {
+        this.interruptDispatchEpoch = message.headers?.workflow_dispatch_epoch;
+        this.interruptStarted.resolve();
+        await this.releaseInterrupt.promise;
+        throw new Error("interrupt publication unavailable");
+      }
+    }
+    return await super.publish(message, options);
+  }
+  override async openTestSubscription(
+    topic: string,
+    options: SubscriptionOptions,
+    handler: TestRawMessageHandler,
+  ) {
+    const subscription = await super.openTestSubscription(topic, options, handler);
+    if (topic === "evt.workflow") return subscription;
+    return {
+      stop: async () => {
+        this.requestSubscriptionStops += 1;
+        return await subscription.stop();
+      },
+    };
   }
 }
 function createTrustedRun(
@@ -329,6 +392,47 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
+  it("preserves compiler Panic without terminalizing the claimed run", async () => {
+    const dbPath = join(tmpdir(), `workflow-compiler-panic-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const panic = new Panic({ message: "workflow compiler defect" });
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "compiler-panic",
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: () => {
+        throw panic;
+      },
+    });
+    try {
+      await expect(engine.start()).rejects.toBe(panic);
+      expect(workflowStoreValue(store.getRun("run-1"))).toMatchObject({
+        state: "running",
+        terminalAt: null,
+        terminalDetail: null,
+      });
+      expect(
+        raw.messages.some(
+          (message) =>
+            message.type === lilacEventTypes.EvtWorkflowRunChanged &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "state" in message.data &&
+            message.data.state === "failed",
+        ),
+      ).toBe(false);
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
   it("returns timer failures as values and preserves Panic", async () => {
     const failed = await runWorkflowTimerTick(async () => {
       throw new Error("timer operation failed");
@@ -423,12 +527,14 @@ describe("WorkflowEngine", () => {
     });
     const triggerTick = async (): Promise<void> => {
       const scanned = store.observeNextQueuedScan();
-      await bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-        runId: "run-1",
-        revisionId: "revision-1",
-        reason: "operation_changed",
-        ts: now,
-      });
+      await startResultForTest(
+        bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+          runId: "run-1",
+          revisionId: "revision-1",
+          reason: "operation_changed",
+          ts: now,
+        }),
+      );
       await scanned;
     };
     try {
@@ -469,14 +575,19 @@ describe("WorkflowEngine", () => {
     try {
       await engine.start();
       const scan = store.observeNextQueuedScan(new Error("wake tick failed"));
-      await expect(
-        bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
-          runId: "missing-run",
-          revisionId: "missing-revision",
-          reason: "operation_changed",
-          ts: 1,
-        }),
-      ).rejects.toThrow("wake tick failed");
+      const published = await bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+        runId: "missing-run",
+        revisionId: "missing-revision",
+        reason: "operation_changed",
+        ts: 1,
+      });
+      expect(published.status).toBe("error");
+      if (published.status === "error") {
+        expect(published.error).toMatchObject({
+          _tag: "EventPublishTransportFailed",
+          cause: expect.objectContaining({ message: "wake tick failed" }),
+        });
+      }
       await scan;
     } finally {
       await expect(engine.stop()).rejects.toThrow(
@@ -528,7 +639,7 @@ describe("WorkflowEngine", () => {
       await engine.start();
       await raw.durableFailurePublishAttempted.promise;
       expect(workflowStoreValue(store.getRun("run-1"))?.terminalDetail).toBe(
-        "workflow run publication failed",
+        "Event publish failed",
       );
       expect(raw.runPublishFailures).toBe(2);
     } finally {
@@ -1305,14 +1416,7 @@ describe("WorkflowEngine", () => {
     try {
       await engine.start();
       await waitFor(() =>
-        raw.messages.some(
-          (message) =>
-            message.type === lilacEventTypes.CmdRequestMessage &&
-            typeof message.data === "object" &&
-            message.data !== null &&
-            "queue" in message.data &&
-            message.data.queue === "prompt",
-        ),
+        raw.messages.some((message) => message.type === lilacEventTypes.CmdRequestMessage),
       );
       const command = raw.messages.find(
         (message) => message.type === lilacEventTypes.CmdRequestMessage,
@@ -2186,6 +2290,57 @@ describe("WorkflowEngine", () => {
         ),
       ).toBe(true);
     } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+  it("awaits abort cancellation publication failure before request subscription cleanup", async () => {
+    const dbPath = join(
+      tmpdir(),
+      `workflow-engine-abort-publication-${crypto.randomUUID()}.sqlite`,
+    );
+    const store = new DurableWorkflowStore(dbPath);
+    const raw = new DeferredInterruptFailureRawBus();
+    const bus = createLilacBus(raw);
+    createApprovedRun(store);
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      dataDir: dirname(dbPath),
+      subscriptionId: "test-workflow-abort-publication",
+      pollMs: 5,
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: compileTestWorkflow,
+    });
+    try {
+      await engine.start();
+      await waitFor(() =>
+        raw.messages.some(
+          (message) =>
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "queue" in message.data &&
+            message.data.queue === "prompt",
+        ),
+      );
+      expect(
+        store.cancelRunAndChildren({ runId: "run-1", now: 10, detail: "test cancellation" })?.state,
+      ).toBe("cancelled");
+      await raw.interruptStarted.promise;
+      expect(raw.requestSubscriptionStops).toBe(0);
+      expect(raw.interruptDispatchEpoch).toBeUndefined();
+
+      raw.releaseInterrupt.resolve();
+      await waitFor(() => raw.requestSubscriptionStops === 2);
+      expect(workflowStoreValue(store.getRun("run-1"))).toMatchObject({ state: "cancelled" });
+      expect(workflowStoreValue(store.listOperations("run-1"))[0]).toMatchObject({
+        state: "cancelled",
+      });
+    } finally {
+      raw.releaseInterrupt.resolve();
       await engine.stop();
       await bus.close();
       store.close();

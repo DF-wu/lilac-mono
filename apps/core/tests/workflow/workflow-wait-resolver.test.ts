@@ -1,4 +1,4 @@
-import { workflowStoreValue } from "./workflow-store-test-helpers";
+import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
@@ -21,10 +21,7 @@ import {
 } from "../helpers/result-raw-bus";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { canonicalJsonSha256, sha256 } from "../../src/workflow/workflow-definition";
-import {
-  normalizeWorkflowResourcePolicy,
-  type WorkflowWait,
-} from "../../src/workflow/workflow-domain";
+import { type WorkflowWait } from "../../src/workflow/workflow-domain";
 import { shouldSuppressRouterForWorkflowReply } from "../../src/workflow/workflow-router-suppression";
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
 class IdleRawBus implements RawBus {
@@ -663,7 +660,7 @@ describe("WorkflowWaitResolver", () => {
         });
       }
       await resolver.start();
-      const first = await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+      const firstResult = await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
         platform: "discord",
         channelId: "channel-1",
         messageId: "reply-1",
@@ -672,7 +669,7 @@ describe("WorkflowWaitResolver", () => {
         ts: 10,
         raw: { discord: { replyToMessageId: "anchor-1" } },
       });
-      const second = await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+      const secondResult = await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
         platform: "discord",
         channelId: "channel-2",
         messageId: "reply-2",
@@ -681,6 +678,10 @@ describe("WorkflowWaitResolver", () => {
         ts: 10,
         raw: { discord: { replyToMessageId: "anchor-2" } },
       });
+      if (firstResult.status === "error") throw firstResult.error;
+      if (secondResult.status === "error") throw secondResult.error;
+      const first = firstResult.value;
+      const second = secondResult.value;
       expect(raw.wakeupFailures).toBe(1);
       expect(workflowStoreValue(store.getWait("run-1", "wait-1"))?.state).toBe("resolved");
       expect(workflowStoreValue(store.getWait("run-2", "wait-2"))?.state).toBe("resolved");

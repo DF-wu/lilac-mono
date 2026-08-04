@@ -8,6 +8,7 @@ import { getPreferredGithubAuthoritativeActorOrNull } from "../../src/github/git
 import {
   clearGithubUserTokenSecret,
   readGithubUserTokenSecret,
+  readGithubUserTokenSecretResult,
   resolveGithubUserTokenSecretPath,
   writeGithubUserTokenSecret,
 } from "../../src/github/github-user-token";
@@ -87,6 +88,16 @@ describe("github user token secret", () => {
     );
 
     await expect(getGithubEnvForBash({ dataDir })).resolves.toEqual({});
+
+    const read = await readGithubUserTokenSecretResult(dataDir);
+    expect(read.status).toBe("error");
+    if (read.status === "error") {
+      expect(read.error).toMatchObject({
+        _tag: "GithubUserTokenSecretReadError",
+        secretPath: resolveGithubUserTokenSecretPath(dataDir),
+      });
+      expect(read.error.message).not.toContain("abc");
+    }
   });
 
   it("rejects empty host when writing", async () => {

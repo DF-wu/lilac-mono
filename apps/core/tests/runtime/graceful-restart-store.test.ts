@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { buildCoreLineageManifestV1 } from "@stanley2058/lilac-event-bus";
+import { buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1 } from "@stanley2058/lilac-event-bus";
+import type { Result as ResultType } from "better-result";
 import {
   CorruptPersistedFields,
   MalformedSerialization,
@@ -23,6 +24,15 @@ import {
 } from "../../src/runtime/graceful-restart-store";
 
 const tempDirs: string[] = [];
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return resultValue(buildCoreLineageManifestResultV1(...args));
+}
 
 afterEach(async () => {
   while (tempDirs.length > 0) {

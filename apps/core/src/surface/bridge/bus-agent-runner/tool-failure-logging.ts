@@ -193,10 +193,9 @@ function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
   return { ok: true };
 }
 
-export const BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS: Record<
-  string,
-  (result: unknown) => ToolFailureSummary
-> = {
+export type ToolFailureSummarizer = (result: unknown) => ToolFailureSummary;
+
+export const BUILTIN_LEVEL1_TOOL_FAILURE_SUMMARIZERS: Record<string, ToolFailureSummarizer> = {
   bash: summarizeBashFailure,
   read_file: (result) => summarizeReadOrEditFailure(result, "read_file"),
   edit_file: (result) => summarizeReadOrEditFailure(result, "edit_file"),

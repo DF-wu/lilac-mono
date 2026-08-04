@@ -7,7 +7,7 @@ import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result } from "better-result";
 
-import { createCoreToolPluginManager } from "../../src/plugins";
+import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
 import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
@@ -21,6 +21,20 @@ import {
   mcpToolDefinition,
   stdioDefinition,
 } from "../mcp/fixtures/registry-fixture";
+
+function createCoreToolPluginManager(
+  params: Parameters<typeof createCoreToolPluginManagerResult>[0],
+) {
+  const manager = createCoreToolPluginManagerResult(params);
+  return {
+    ...manager,
+    async buildLevel1Toolset(buildParams: Parameters<typeof manager.buildLevel1ToolsetResult>[0]) {
+      const built = await manager.buildLevel1ToolsetResult(buildParams);
+      if (built.status === "error") throw new Error(built.error.message, { cause: built.error });
+      return built.value;
+    },
+  };
+}
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -735,18 +749,20 @@ export default {
     const initialized = await manager.init();
     expect(initialized.status).toBe("ok");
 
-    try {
-      await manager.buildLevel1Toolset({
-        cwd: dataDir,
-        runProfile: "primary",
-        editingToolMode: "none",
-        subagentDepth: 0,
-        subagentConfig: cfg.agent.subagents!,
-      });
-      throw new Error("expected hostile metadata failure");
-    } catch (cause) {
-      expect(cause).toBeInstanceOf(Error);
-      expect(cause instanceof Error ? cause.message : "").toContain("level1.executableMetadata");
+    const built = await manager.buildLevel1ToolsetResult({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents!,
+    });
+    expect(built.status).toBe("error");
+    if (built.status === "error") {
+      expect(built.error._tag).toBe("Level1ToolsetBuildFailed");
+      if (built.error._tag === "Level1ToolsetBuildFailed") {
+        expect(built.error.operation).toBe("level1.executableMetadata");
+        expect(built.error.message).toContain("level1.executableMetadata");
+      }
     }
   });
 
@@ -922,6 +938,9 @@ export default {
     factory.enqueue("shared", client);
     const registry = new McpRegistry({
       configPath: path.join(dataDir, "mcp-config.yaml"),
+      reportFatalError: (error) => {
+        throw error;
+      },
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("shared")])),
         createClient: factory.create,

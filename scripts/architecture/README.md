@@ -102,3 +102,7 @@ plain value, exact `better-result#Panic.is` observation, an exact registered dri
 unknown-defect rethrow. Codec, adapter, and consumer identities must also be listed in
 `operationalResultApis`. Enforced consumers require a zero-baseline scope that owns the registered symbol
 and descendants in both semantic and syntax ratchets. See `STAGE6.md` for activation and fixture details.
+
+Stage 7 adds the fail-closed package migration preflight, explicit status registry, permanent package-wide
+semantic and syntax rule sets, unknown-member/custom-decoder provenance checks, and inventory isolation
+for exact registration zones. See `STAGE7.md` for the per-package integration procedure.

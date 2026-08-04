@@ -56,6 +56,7 @@ function manager(params: {
   dataDir: string;
   builtinPlugins?: readonly LilacToolPlugin<Runtime, Level1ToolSpec<Runtime>, ServerTool>[];
   getDisabledPluginIds?: () => Promise<readonly string[]> | readonly string[];
+  getPluginConfig?: (pluginId: string) => Promise<unknown> | unknown;
   getLevel1RegistrationKey?: (
     spec: Level1ToolSpec<Runtime>,
     context: { pluginId: string; source: "builtin" | "external" },
@@ -67,6 +68,7 @@ function manager(params: {
     dataDir: params.dataDir,
     builtinPlugins: params.builtinPlugins,
     getDisabledPluginIds: params.getDisabledPluginIds,
+    getPluginConfig: params.getPluginConfig,
     getLevel1RegistrationKey: params.getLevel1RegistrationKey,
     logger: params.logger,
     adaptLevel1Item: (item) => item,
@@ -249,6 +251,47 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
     expect(failed.status).toBe("error");
     if (failed.status === "ok") throw new Error("expected builtin failure");
     expect(failed.error._tag).toBe("ToolPluginHookError");
+  });
+
+  it("maps getPluginConfig failure and preserves Panic from its create continuation", async () => {
+    const ordinary = manager({
+      dataDir: "/tmp/plugin-runtime-config-failure-unused",
+      builtinPlugins: [{ meta: { id: "config-failure" }, create: () => ({}) }],
+      getPluginConfig() {
+        throw new Error("config unavailable");
+      },
+    });
+    const ordinaryResult = await ordinary.init();
+    expect(ordinaryResult.status).toBe("error");
+    if (ordinaryResult.status === "ok") throw new Error("expected config failure");
+    expect(ordinaryResult.error._tag).toBe("ToolPluginManagerHookError");
+    if (ordinaryResult.error._tag !== "ToolPluginManagerHookError") {
+      throw new Error("expected manager hook error");
+    }
+    expect(ordinaryResult.error.hook).toBe("getPluginConfig");
+    expect(ordinaryResult.error.message).toContain("config unavailable");
+
+    const panic = new Panic({ message: "create continuation invariant" });
+    const panicking = manager({
+      dataDir: "/tmp/plugin-runtime-config-panic-unused",
+      builtinPlugins: [
+        {
+          meta: { id: "config-panic" },
+          create() {
+            throw panic;
+          },
+        },
+      ],
+      getPluginConfig: () => ({ enabled: true }),
+    });
+    let caught: unknown;
+    try {
+      await panicking.init();
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBe(panic);
+    expect(Panic.is(caught)).toBe(true);
   });
 
   it("aggregates every Level 2 and instance cleanup failure", async () => {

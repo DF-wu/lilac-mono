@@ -132,14 +132,19 @@ function decodeConversationThreadCallableId(
   }
 }
 
+function adaptConversationThreadResultToToolHost<TValue>(
+  result: ResultType<TValue, { readonly message: string }>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
 export async function resolveConversationThreadSummarizationToolOperation(
   operation: Promise<
     ResultType<ConversationThreadRunSummarizationResult, { readonly message: string }>
   >,
 ): Promise<ConversationThreadRunSummarizationResult> {
-  const result = await operation;
-  if (result.status === "error") throw new Error(result.error.message);
-  return result.value;
+  return adaptConversationThreadResultToToolHost(await operation);
 }
 
 export class ConversationThread implements ServerTool {
@@ -203,12 +208,11 @@ export class ConversationThread implements ServerTool {
   }
 
   async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
-    const decodedCallableId = decodeConversationThreadCallableId(callableId);
-    if (decodedCallableId.status === "error") {
-      throw new Error(decodedCallableId.error.message);
-    }
+    const decodedCallableId = adaptConversationThreadResultToToolHost(
+      decodeConversationThreadCallableId(callableId),
+    );
 
-    switch (decodedCallableId.value) {
+    switch (decodedCallableId) {
       case CONVERSATION_THREAD_CALLABLE_IDS.search: {
         const input = parseToolInput({ callableId, input: rawInput, schema: searchInputSchema });
         return await this.params.service.search(input);

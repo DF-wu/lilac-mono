@@ -2,13 +2,15 @@ import path from "node:path";
 
 import { FileSystem, expandTilde, type FsBackend } from "@stanley2058/lilac-fs";
 import type { ToolSet } from "ai";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { createApplyPatchTool } from "./apply-patch";
 import type { CodingToolArtifactIntegration } from "./artifact-integration";
 import { createBashTool } from "./bash";
-import { createBatchTool } from "./batch";
+import { createBatchToolResult, type BatchRejected } from "./batch";
 import { createFilesystemTools } from "./filesystem";
-import { assertLocalCwd } from "./guardrails";
+import { validateLocalCwd, type CodingToolGuardrailViolation } from "./guardrails";
+import { adaptCodingToolResultToHost } from "./host-compatibility";
 
 export * from "./apply-patch";
 export * from "./artifact-integration";
@@ -54,19 +56,37 @@ export type CodingToolsetOptions = {
   maxInlineMediaBytesPerPart?: number;
 };
 
+export class CodingToolsetInvalidOptions extends TaggedError("CodingToolsetInvalidOptions")<{
+  readonly message: string;
+}> {}
+
+export type CreateCodingToolsetError =
+  | CodingToolsetInvalidOptions
+  | CodingToolGuardrailViolation
+  | BatchRejected;
+
 /**
  * Create the local, legacy-edit coding toolset.
  *
  * Runtime adapters can use the exported schema factories to expose hashline editing or SSH while
  * retaining their own read state, remote transport, and path policy.
  */
-export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
-  assertLocalCwd(options.cwd);
+export function createCodingToolsetResult(
+  options: CodingToolsetOptions,
+): ResultType<ToolSet, CreateCodingToolsetError> {
+  const localCwd = validateLocalCwd(options.cwd);
+  if (localCwd.status === "error") return Result.err(localCwd.error);
   if (options.artifactIntegration?.scopeId.trim().length === 0) {
-    throw new Error("artifactIntegration.scopeId must not be empty");
+    return Result.err(
+      new CodingToolsetInvalidOptions({ message: "artifactIntegration.scopeId must not be empty" }),
+    );
   }
   if (options.artifactIntegration?.requestId.trim().length === 0) {
-    throw new Error("artifactIntegration.requestId must not be empty");
+    return Result.err(
+      new CodingToolsetInvalidOptions({
+        message: "artifactIntegration.requestId must not be empty",
+      }),
+    );
   }
   const cwd = path.resolve(expandTilde(options.cwd));
   const fsBackend = options.fsBackend ?? "node-rg";
@@ -122,8 +142,14 @@ export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
         Object.entries(tools).filter(([name]) => !options.batchExcludedTools?.includes(name)),
       );
     if (Object.keys(getBatchTools()).length > 0) {
-      Object.assign(tools, createBatchTool({ cwd, getTools: getBatchTools }));
+      const batch = createBatchToolResult({ cwd, getTools: getBatchTools });
+      if (batch.status === "error") return Result.err(batch.error);
+      Object.assign(tools, batch.value);
     }
   }
-  return tools;
+  return Result.ok(tools);
+}
+
+export function createCodingToolset(options: CodingToolsetOptions): ToolSet {
+  return adaptCodingToolResultToHost(createCodingToolsetResult(options));
 }

@@ -1,4 +1,5 @@
 import SuperJSON from "superjson";
+import { createHash } from "node:crypto";
 import {
   modelMessageSchema,
   type FilePart,
@@ -36,6 +37,8 @@ import {
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
+
 export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 5 as const;
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
@@ -61,6 +64,20 @@ const compactionCheckpointMetaSchema = z.strictObject({
   type: z.literal("compaction"),
   formatVersion: z.literal(COMPACTION_CHECKPOINT_FORMAT_VERSION),
 });
+const uuidSchema = z.uuid();
+const positiveIntegerSchema = z.number().int().positive();
+const nonNegativeFiniteSchema = z.number().finite().nonnegative();
+const nullablePositiveIntegerSchema = positiveIntegerSchema.nullable();
+const nullableNonNegativeIntegerSchema = nonNegativeIntegerSchema.nullable();
+const nullableNonNegativeFiniteSchema = nonNegativeFiniteSchema.nullable();
+const nullableUuidSchema = uuidSchema.nullable();
+const coreClaudeAttemptStateSchema = z.enum([
+  "active",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "uncertain",
+]);
 
 export type CompactionCheckpointMeta = z.output<typeof compactionCheckpointMetaSchema>;
 
@@ -199,6 +216,148 @@ export type DecodedCoreSurfaceProjectionRow = {
   readonly createdAt: number;
 };
 
+export type DecodedCoreOwnedBlobRow = {
+  readonly sha256: string;
+  readonly mediaType: string;
+  readonly filename: string;
+  readonly byteLength: number;
+  readonly bytes: Uint8Array;
+  readonly createdAt: number;
+};
+
+export type DecodedCoreNamedClaudeBindingRow = {
+  readonly bindingProtocolVersion: 1;
+  readonly providerId: string;
+  readonly providerFamily: "claude-code";
+  readonly requestClient: AdapterPlatform;
+  readonly lilacSessionId: string;
+  readonly terminalRequestId: string;
+  readonly canonicalHashVersion: 1;
+  readonly canonicalHeadHash: string;
+  readonly canonicalMessageCount: number;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly claudeSessionId: string;
+  readonly nativeCwd: string;
+  readonly nativeLastModified: number;
+  readonly nativeContextTokens: number;
+  readonly nativeContextMaxTokens: number;
+  readonly lastModelSpecifier: string;
+  readonly lastReasoning: string;
+  readonly revision: number;
+  readonly updatedAt: number;
+};
+
+export type DecodedCoreNamedClaudeAttemptRow = {
+  readonly product: "core-named";
+  readonly providerId: string;
+  readonly requestClient: AdapterPlatform;
+  readonly lilacSessionId: string;
+  readonly sourceTerminalRequestId: string | null;
+  readonly sourceCanonicalHeadHash: string | null;
+  readonly sourceCanonicalMessageCount: number | null;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly requestId: string;
+  readonly attemptIndex: number;
+  readonly candidateSessionId: string;
+  readonly sourceSessionId: string | null;
+  readonly expectedBindingRevision: number | null;
+  readonly state: z.output<typeof coreClaudeAttemptStateSchema>;
+  readonly terminalRequestId: string | null;
+  readonly terminalCanonicalHeadHash: string | null;
+  readonly terminalCanonicalMessageCount: number | null;
+  readonly nativeCwd: string | null;
+  readonly nativeLastModified: number | null;
+  readonly nativeContextTokens: number | null;
+  readonly nativeContextMaxTokens: number | null;
+  readonly lastModelSpecifier: string | null;
+  readonly lastReasoning: string | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+};
+
+export type DecodedCorePrimaryClaudeBindingRow = {
+  readonly bindingProtocolVersion: 1;
+  readonly providerId: string;
+  readonly providerFamily: "claude-code";
+  readonly requestClient: "discord";
+  readonly lilacSessionId: string;
+  readonly terminalRequestId: string;
+  readonly lineageVersion: 1;
+  readonly atomCount: number;
+  readonly prefixDigest: string;
+  readonly canonicalMessageCount: number;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly claudeSessionId: string;
+  readonly nativeCwd: string;
+  readonly nativeLastModified: number;
+  readonly nativeContextTokens: number;
+  readonly nativeContextMaxTokens: number;
+  readonly lastModelSpecifier: string;
+  readonly lastReasoning: string;
+  readonly revision: number;
+  readonly updatedAt: number;
+};
+
+export type DecodedCorePrimaryClaudeAttemptRow = {
+  readonly product: "core-primary";
+  readonly providerId: string;
+  readonly requestClient: "discord";
+  readonly lilacSessionId: string;
+  readonly sourceLineageVersion: 1 | null;
+  readonly sourceAtomCount: number | null;
+  readonly sourcePrefixDigest: string | null;
+  readonly sourceCanonicalMessageCount: number | null;
+  readonly executionScopeHashVersion: 1;
+  readonly executionScopeHash: string;
+  readonly requestId: string;
+  readonly attemptIndex: number;
+  readonly candidateSessionId: string;
+  readonly sourceSessionId: string | null;
+  readonly expectedBindingRevision: number | null;
+  readonly state: z.output<typeof coreClaudeAttemptStateSchema>;
+  readonly terminalRequestId: string | null;
+  readonly terminalLineageVersion: 1 | null;
+  readonly terminalAtomCount: number | null;
+  readonly terminalPrefixDigest: string | null;
+  readonly terminalCanonicalMessageCount: number | null;
+  readonly nativeCwd: string | null;
+  readonly nativeLastModified: number | null;
+  readonly nativeContextTokens: number | null;
+  readonly nativeContextMaxTokens: number | null;
+  readonly lastModelSpecifier: string | null;
+  readonly lastReasoning: string | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+};
+
+export type DecodedTranscriptMigrationVersionRow = { readonly version: number };
+export type DecodedTranscriptForeignKeyFailureRow = {
+  readonly table: string;
+  readonly rowid: number | null;
+  readonly parent: string;
+  readonly fkid: number;
+};
+export type DecodedTranscriptCountRow = { readonly count: number };
+export type DecodedTranscriptBlobMetricsRow = {
+  readonly ownedBytes: number;
+  readonly unreferencedCount: number;
+  readonly unreferencedBytes: number;
+};
+
+export type TranscriptStorePersistedRowKind =
+  | "migration-version"
+  | "foreign-key-failure"
+  | "count"
+  | "blob-metrics"
+  | "owned-blob"
+  | "named-binding"
+  | "named-attempt"
+  | "primary-binding"
+  | "primary-attempt";
+
 export type PersistedCoreLineageManifestRow = {
   readonly request_id: string;
   readonly lineage_version: number;
@@ -228,6 +387,145 @@ type DecodedSchemaVersion = {
   readonly version: 1 | 2 | 3 | 4 | 5;
   readonly provenance: "current" | "migrated";
 };
+
+const transcriptMigrationVersionRowSchema = z.strictObject({
+  version: nonNegativeIntegerSchema,
+});
+const transcriptForeignKeyFailureRowSchema = z.strictObject({
+  table: z.string(),
+  rowid: z.number().int().nullable(),
+  parent: z.string(),
+  fkid: z.number().int(),
+});
+const transcriptCountRowSchema = z.strictObject({ count: nonNegativeIntegerSchema });
+const transcriptBlobMetricsRowSchema = z.strictObject({
+  owned_bytes: nonNegativeIntegerSchema,
+  unreferenced_count: nonNegativeIntegerSchema,
+  unreferenced_bytes: nonNegativeIntegerSchema,
+});
+const coreOwnedBlobRowSchema = z.strictObject({
+  sha256: sha256HexSchema,
+  media_type: z.string().min(1),
+  filename: z.string().min(1),
+  byte_length: nonNegativeIntegerSchema,
+  bytes: z.instanceof(Uint8Array),
+  created_ts: nonNegativeIntegerSchema,
+});
+const coreNamedClaudeBindingRowSchema = z.strictObject({
+  request_client: adapterPlatformSchema,
+  session_id: z.string().min(1),
+  provider_id: z.string().min(1),
+  binding_protocol_version: z.literal(1),
+  provider_family: z.literal("claude-code"),
+  terminal_request_id: z.string().min(1),
+  canonical_hash_version: z.literal(1),
+  canonical_head_hash: sha256HexSchema,
+  canonical_message_count: nonNegativeIntegerSchema,
+  execution_scope_hash_version: z.literal(1),
+  execution_scope_hash: z.string().min(1),
+  claude_session_id: uuidSchema,
+  native_cwd: z.string(),
+  native_last_modified: nonNegativeFiniteSchema,
+  native_context_tokens: nonNegativeIntegerSchema,
+  native_context_max_tokens: positiveIntegerSchema,
+  last_model_specifier: z.string(),
+  last_reasoning: z.string(),
+  revision: positiveIntegerSchema,
+  updated_ts: nonNegativeIntegerSchema,
+});
+const coreNamedClaudeAttemptRowSchema = z.strictObject({
+  product: z.literal("core-named"),
+  request_client: adapterPlatformSchema,
+  session_id: z.string().min(1),
+  provider_id: z.string().min(1),
+  source_terminal_request_id: z.string().min(1).nullable(),
+  source_canonical_head_hash: sha256HexSchema.nullable(),
+  source_canonical_message_count: nullableNonNegativeIntegerSchema,
+  execution_scope_hash_version: z.literal(1),
+  execution_scope_hash: z.string().min(1),
+  request_id: z.string().min(1),
+  attempt_index: nonNegativeIntegerSchema,
+  candidate_session_id: uuidSchema,
+  source_session_id: nullableUuidSchema,
+  expected_binding_revision: nullablePositiveIntegerSchema,
+  state: coreClaudeAttemptStateSchema,
+  terminal_request_id: z.string().min(1).nullable(),
+  terminal_canonical_head_hash: sha256HexSchema.nullable(),
+  terminal_canonical_message_count: nullableNonNegativeIntegerSchema,
+  native_cwd: z.string().nullable(),
+  native_last_modified: nullableNonNegativeFiniteSchema,
+  native_context_tokens: nullableNonNegativeIntegerSchema,
+  native_context_max_tokens: nullablePositiveIntegerSchema,
+  last_model_specifier: z.string().nullable(),
+  last_reasoning: z.string().nullable(),
+  created_ts: nonNegativeIntegerSchema,
+  updated_ts: nonNegativeIntegerSchema,
+});
+const corePrimaryClaudeBindingRowSchema = z.strictObject({
+  request_client: z.literal("discord"),
+  session_id: z.string().min(1),
+  provider_id: z.string().min(1),
+  binding_protocol_version: z.literal(1),
+  provider_family: z.literal("claude-code"),
+  terminal_request_id: z.string().min(1),
+  lineage_version: z.literal(1),
+  atom_count: positiveIntegerSchema,
+  prefix_digest: sha256HexSchema,
+  canonical_message_count: positiveIntegerSchema,
+  execution_scope_hash_version: z.literal(1),
+  execution_scope_hash: z.string().min(1),
+  claude_session_id: uuidSchema,
+  native_cwd: z.string(),
+  native_last_modified: nonNegativeFiniteSchema,
+  native_context_tokens: nonNegativeIntegerSchema,
+  native_context_max_tokens: positiveIntegerSchema,
+  last_model_specifier: z.string(),
+  last_reasoning: z.string(),
+  revision: positiveIntegerSchema,
+  updated_ts: nonNegativeIntegerSchema,
+});
+const corePrimaryClaudeAttemptRowSchema = z.strictObject({
+  product: z.literal("core-primary"),
+  request_client: z.literal("discord"),
+  session_id: z.string().min(1),
+  provider_id: z.string().min(1),
+  source_lineage_version: z.literal(1).nullable(),
+  source_atom_count: nullablePositiveIntegerSchema,
+  source_prefix_digest: sha256HexSchema.nullable(),
+  source_canonical_message_count: nullablePositiveIntegerSchema,
+  execution_scope_hash_version: z.literal(1),
+  execution_scope_hash: z.string().min(1),
+  request_id: z.string().min(1),
+  attempt_index: nonNegativeIntegerSchema,
+  candidate_session_id: uuidSchema,
+  source_session_id: nullableUuidSchema,
+  expected_binding_revision: nullablePositiveIntegerSchema,
+  state: coreClaudeAttemptStateSchema,
+  terminal_request_id: z.string().min(1).nullable(),
+  terminal_lineage_version: z.literal(1).nullable(),
+  terminal_atom_count: nullablePositiveIntegerSchema,
+  terminal_prefix_digest: sha256HexSchema.nullable(),
+  terminal_canonical_message_count: nullablePositiveIntegerSchema,
+  native_cwd: z.string().nullable(),
+  native_last_modified: nullableNonNegativeFiniteSchema,
+  native_context_tokens: nullableNonNegativeIntegerSchema,
+  native_context_max_tokens: nullablePositiveIntegerSchema,
+  last_model_specifier: z.string().nullable(),
+  last_reasoning: z.string().nullable(),
+  created_ts: nonNegativeIntegerSchema,
+  updated_ts: nonNegativeIntegerSchema,
+});
+
+type DecodedTranscriptStoreRow =
+  | DecodedTranscriptMigrationVersionRow
+  | DecodedTranscriptForeignKeyFailureRow
+  | DecodedTranscriptCountRow
+  | DecodedTranscriptBlobMetricsRow
+  | DecodedCoreOwnedBlobRow
+  | DecodedCoreNamedClaudeBindingRow
+  | DecodedCoreNamedClaudeAttemptRow
+  | DecodedCorePrimaryClaudeBindingRow
+  | DecodedCorePrimaryClaudeAttemptRow;
 
 function context(input: {
   readonly table: string;
@@ -310,29 +608,30 @@ function decodeSerialized(input: {
   readonly version: number;
   readonly recordId: string;
 }): ResultType<unknown, MalformedSerialization> {
-  try {
-    const json: unknown = globalThis.JSON.parse(input.raw);
-    const isSuperJsonEnvelope =
-      isRecord(json) &&
-      "json" in json &&
-      Object.keys(json).every((key) => key === "json" || key === "meta");
-    if (!isSuperJsonEnvelope) return Result.ok(json);
-    const deserialized: unknown = SuperJSON.parse(input.raw);
-    return Result.ok(deserialized);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MalformedSerialization(
-        context({
-          table: input.table,
-          field: input.field,
-          version: input.version,
-          issueCode: "malformed-json",
-          recordId: input.recordId,
-        }),
-      ),
-    );
-  }
+  const decoded = Result.try({
+    try: () => {
+      const json: unknown = globalThis.JSON.parse(input.raw);
+      const isSuperJsonEnvelope =
+        isRecord(json) &&
+        "json" in json &&
+        Object.keys(json).every((key) => key === "json" || key === "meta");
+      return isSuperJsonEnvelope ? SuperJSON.parse<unknown>(input.raw) : json;
+    },
+    catch: (cause) => cause,
+  });
+  if (decoded.status === "ok") return Result.ok(decoded.value);
+  if (Panic.is(decoded.error)) return adaptToolResultToHost(Result.err(decoded.error));
+  return Result.err(
+    new MalformedSerialization(
+      context({
+        table: input.table,
+        field: input.field,
+        version: input.version,
+        issueCode: "malformed-json",
+        recordId: input.recordId,
+      }),
+    ),
+  );
 }
 
 function decodeNormalizedMessagesValue(
@@ -494,9 +793,273 @@ function aggregateProvenance(
 }
 
 export function decodeTranscriptRow(input: {
+  readonly storeKind: "migration-version";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedTranscriptMigrationVersionRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "foreign-key-failure";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedTranscriptForeignKeyFailureRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "count";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedTranscriptCountRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "blob-metrics";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedTranscriptBlobMetricsRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "owned-blob";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedCoreOwnedBlobRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "named-binding";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedCoreNamedClaudeBindingRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "named-attempt";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedCoreNamedClaudeAttemptRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "primary-binding";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedCorePrimaryClaudeBindingRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
+  readonly storeKind: "primary-attempt";
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedCorePrimaryClaudeAttemptRow>, PersistedDataError>;
+export function decodeTranscriptRow(input: {
   readonly row: PersistedTranscriptRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedTranscriptRow>, PersistedDataError> {
+}): ResultType<DecodedPersistedValue<DecodedTranscriptRow>, PersistedDataError>;
+export function decodeTranscriptRow(
+  input:
+    | { readonly row: PersistedTranscriptRow; readonly schemaVersion: number }
+    | {
+        readonly storeKind: TranscriptStorePersistedRowKind;
+        readonly row: unknown;
+        readonly schemaVersion: number;
+        readonly recordId: string;
+      },
+): ResultType<
+  DecodedPersistedValue<DecodedTranscriptRow | DecodedTranscriptStoreRow>,
+  PersistedDataError
+> {
+  if ("storeKind" in input) {
+    const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, input.recordId);
+    if (version.status === "error") return Result.err(version.error);
+    const invalidRow = () =>
+      Result.err(
+        corrupt({
+          table: TRANSCRIPT_TABLE,
+          field: input.storeKind,
+          version: version.value.version,
+          issueCode: "invalid-transcript-row",
+          recordId: input.recordId,
+        }),
+      );
+    switch (input.storeKind) {
+      case "migration-version": {
+        const decoded = transcriptMigrationVersionRowSchema.safeParse(input.row);
+        return decoded.success
+          ? Result.ok({ value: decoded.data, provenance: version.value.provenance })
+          : invalidRow();
+      }
+      case "foreign-key-failure": {
+        const decoded = transcriptForeignKeyFailureRowSchema.safeParse(input.row);
+        return decoded.success
+          ? Result.ok({ value: decoded.data, provenance: version.value.provenance })
+          : invalidRow();
+      }
+      case "count": {
+        const decoded = transcriptCountRowSchema.safeParse(input.row);
+        return decoded.success
+          ? Result.ok({ value: decoded.data, provenance: version.value.provenance })
+          : invalidRow();
+      }
+      case "blob-metrics": {
+        const decoded = transcriptBlobMetricsRowSchema.safeParse(input.row);
+        return decoded.success
+          ? Result.ok({
+              value: {
+                ownedBytes: decoded.data.owned_bytes,
+                unreferencedCount: decoded.data.unreferenced_count,
+                unreferencedBytes: decoded.data.unreferenced_bytes,
+              },
+              provenance: version.value.provenance,
+            })
+          : invalidRow();
+      }
+      case "owned-blob": {
+        const decoded = coreOwnedBlobRowSchema.safeParse(input.row);
+        if (!decoded.success) return invalidRow();
+        if (decoded.data.bytes.byteLength !== decoded.data.byte_length) return invalidRow();
+        const digest = createHash("sha256").update(decoded.data.bytes).digest("hex");
+        if (digest !== decoded.data.sha256) return invalidRow();
+        return Result.ok({
+          value: {
+            sha256: decoded.data.sha256,
+            mediaType: decoded.data.media_type,
+            filename: decoded.data.filename,
+            byteLength: decoded.data.byte_length,
+            bytes: new Uint8Array(decoded.data.bytes),
+            createdAt: decoded.data.created_ts,
+          },
+          provenance: version.value.provenance,
+        });
+      }
+      case "named-binding": {
+        const decoded = coreNamedClaudeBindingRowSchema.safeParse(input.row);
+        if (!decoded.success) return invalidRow();
+        return Result.ok({
+          value: {
+            bindingProtocolVersion: decoded.data.binding_protocol_version,
+            providerId: decoded.data.provider_id,
+            providerFamily: decoded.data.provider_family,
+            requestClient: decoded.data.request_client,
+            lilacSessionId: decoded.data.session_id,
+            terminalRequestId: decoded.data.terminal_request_id,
+            canonicalHashVersion: decoded.data.canonical_hash_version,
+            canonicalHeadHash: decoded.data.canonical_head_hash,
+            canonicalMessageCount: decoded.data.canonical_message_count,
+            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+            executionScopeHash: decoded.data.execution_scope_hash,
+            claudeSessionId: decoded.data.claude_session_id,
+            nativeCwd: decoded.data.native_cwd,
+            nativeLastModified: decoded.data.native_last_modified,
+            nativeContextTokens: decoded.data.native_context_tokens,
+            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+            lastModelSpecifier: decoded.data.last_model_specifier,
+            lastReasoning: decoded.data.last_reasoning,
+            revision: decoded.data.revision,
+            updatedAt: decoded.data.updated_ts,
+          },
+          provenance: version.value.provenance,
+        });
+      }
+      case "named-attempt": {
+        const decoded = coreNamedClaudeAttemptRowSchema.safeParse(input.row);
+        if (!decoded.success) return invalidRow();
+        return Result.ok({
+          value: {
+            product: decoded.data.product,
+            providerId: decoded.data.provider_id,
+            requestClient: decoded.data.request_client,
+            lilacSessionId: decoded.data.session_id,
+            sourceTerminalRequestId: decoded.data.source_terminal_request_id,
+            sourceCanonicalHeadHash: decoded.data.source_canonical_head_hash,
+            sourceCanonicalMessageCount: decoded.data.source_canonical_message_count,
+            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+            executionScopeHash: decoded.data.execution_scope_hash,
+            requestId: decoded.data.request_id,
+            attemptIndex: decoded.data.attempt_index,
+            candidateSessionId: decoded.data.candidate_session_id,
+            sourceSessionId: decoded.data.source_session_id,
+            expectedBindingRevision: decoded.data.expected_binding_revision,
+            state: decoded.data.state,
+            terminalRequestId: decoded.data.terminal_request_id,
+            terminalCanonicalHeadHash: decoded.data.terminal_canonical_head_hash,
+            terminalCanonicalMessageCount: decoded.data.terminal_canonical_message_count,
+            nativeCwd: decoded.data.native_cwd,
+            nativeLastModified: decoded.data.native_last_modified,
+            nativeContextTokens: decoded.data.native_context_tokens,
+            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+            lastModelSpecifier: decoded.data.last_model_specifier,
+            lastReasoning: decoded.data.last_reasoning,
+            createdAt: decoded.data.created_ts,
+            updatedAt: decoded.data.updated_ts,
+          },
+          provenance: version.value.provenance,
+        });
+      }
+      case "primary-binding": {
+        const decoded = corePrimaryClaudeBindingRowSchema.safeParse(input.row);
+        if (!decoded.success) return invalidRow();
+        return Result.ok({
+          value: {
+            bindingProtocolVersion: decoded.data.binding_protocol_version,
+            providerId: decoded.data.provider_id,
+            providerFamily: decoded.data.provider_family,
+            requestClient: decoded.data.request_client,
+            lilacSessionId: decoded.data.session_id,
+            terminalRequestId: decoded.data.terminal_request_id,
+            lineageVersion: decoded.data.lineage_version,
+            atomCount: decoded.data.atom_count,
+            prefixDigest: decoded.data.prefix_digest,
+            canonicalMessageCount: decoded.data.canonical_message_count,
+            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+            executionScopeHash: decoded.data.execution_scope_hash,
+            claudeSessionId: decoded.data.claude_session_id,
+            nativeCwd: decoded.data.native_cwd,
+            nativeLastModified: decoded.data.native_last_modified,
+            nativeContextTokens: decoded.data.native_context_tokens,
+            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+            lastModelSpecifier: decoded.data.last_model_specifier,
+            lastReasoning: decoded.data.last_reasoning,
+            revision: decoded.data.revision,
+            updatedAt: decoded.data.updated_ts,
+          },
+          provenance: version.value.provenance,
+        });
+      }
+      case "primary-attempt": {
+        const decoded = corePrimaryClaudeAttemptRowSchema.safeParse(input.row);
+        if (!decoded.success) return invalidRow();
+        return Result.ok({
+          value: {
+            product: decoded.data.product,
+            providerId: decoded.data.provider_id,
+            requestClient: decoded.data.request_client,
+            lilacSessionId: decoded.data.session_id,
+            sourceLineageVersion: decoded.data.source_lineage_version,
+            sourceAtomCount: decoded.data.source_atom_count,
+            sourcePrefixDigest: decoded.data.source_prefix_digest,
+            sourceCanonicalMessageCount: decoded.data.source_canonical_message_count,
+            executionScopeHashVersion: decoded.data.execution_scope_hash_version,
+            executionScopeHash: decoded.data.execution_scope_hash,
+            requestId: decoded.data.request_id,
+            attemptIndex: decoded.data.attempt_index,
+            candidateSessionId: decoded.data.candidate_session_id,
+            sourceSessionId: decoded.data.source_session_id,
+            expectedBindingRevision: decoded.data.expected_binding_revision,
+            state: decoded.data.state,
+            terminalRequestId: decoded.data.terminal_request_id,
+            terminalLineageVersion: decoded.data.terminal_lineage_version,
+            terminalAtomCount: decoded.data.terminal_atom_count,
+            terminalPrefixDigest: decoded.data.terminal_prefix_digest,
+            terminalCanonicalMessageCount: decoded.data.terminal_canonical_message_count,
+            nativeCwd: decoded.data.native_cwd,
+            nativeLastModified: decoded.data.native_last_modified,
+            nativeContextTokens: decoded.data.native_context_tokens,
+            nativeContextMaxTokens: decoded.data.native_context_max_tokens,
+            lastModelSpecifier: decoded.data.last_model_specifier,
+            lastReasoning: decoded.data.last_reasoning,
+            createdAt: decoded.data.created_ts,
+            updatedAt: decoded.data.updated_ts,
+          },
+          provenance: version.value.provenance,
+        });
+      }
+    }
+  }
   const recordId =
     typeof input.row.request_id === "string" ? input.row.request_id : "unknown-record";
   const version = decodeSchemaVersion(input.schemaVersion, TRANSCRIPT_TABLE, recordId);
@@ -882,6 +1445,61 @@ export const transcriptRowCodecCases = {
     input: {
       row: { ...fixtureTranscriptRow, transcript_digest: "00".repeat(32) },
       schemaVersion: 5,
+    },
+    outcome: "error",
+  },
+} as const;
+
+const fixtureNamedBindingRow = {
+  request_client: "discord",
+  session_id: "session",
+  provider_id: "claude-code",
+  binding_protocol_version: 1,
+  provider_family: "claude-code",
+  terminal_request_id: "request",
+  canonical_hash_version: 1,
+  canonical_head_hash: "11".repeat(32),
+  canonical_message_count: 1,
+  execution_scope_hash_version: 1,
+  execution_scope_hash: "scope",
+  claude_session_id: "00000000-0000-4000-8000-000000000001",
+  native_cwd: "/workspace",
+  native_last_modified: 1,
+  native_context_tokens: 1,
+  native_context_max_tokens: 2,
+  last_model_specifier: "claude",
+  last_reasoning: "medium",
+  revision: 1,
+  updated_ts: 1,
+} as const;
+
+export const transcriptStoreRowFixtures = {
+  current: {
+    input: {
+      storeKind: "named-binding",
+      row: fixtureNamedBindingRow,
+      schemaVersion: 5,
+      recordId: "current-binding",
+    },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: {
+      storeKind: "named-binding",
+      row: fixtureNamedBindingRow,
+      schemaVersion: 4,
+      recordId: "legacy-binding",
+    },
+    outcome: "ok",
+    provenance: "migrated",
+  },
+  corrupt: {
+    input: {
+      storeKind: "named-binding",
+      row: { ...fixtureNamedBindingRow, provider_family: "future-provider" },
+      schemaVersion: 5,
+      recordId: "corrupt-binding",
     },
     outcome: "error",
   },

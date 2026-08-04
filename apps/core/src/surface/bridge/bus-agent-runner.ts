@@ -3,13 +3,20 @@
 import {
   type CallWarning,
   type FinishReason,
+  type LanguageModel,
   type LanguageModelUsage,
   type ModelMessage,
   type ToolContent,
   type ToolSet,
   type UserContent,
 } from "ai";
-import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import {
+  Result,
+  TaggedError,
+  type AnyTaggedError,
+  type Panic,
+  type Result as ResultType,
+} from "better-result";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
 import type {
   ConfiguredModelChainEntry,
@@ -17,6 +24,7 @@ import type {
   CustomCommandResult,
   DurableResolvedModelRequest,
   ModelCapabilityInfo,
+  ModelResolutionFailed,
   ModelReasoningEffort,
   ResolvedModelPlan,
   ResolvedModelRef,
@@ -27,7 +35,7 @@ import {
   deriveSubagentIdleTimeoutMs,
   env,
   extractAiErrorLogDetails,
-  findWorkspaceRoot,
+  findWorkspaceRootResult,
   formatAvailableSkillsSection,
   getCoreConfig,
   isPanic,
@@ -38,19 +46,19 @@ import {
   resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
-  fromDurableResolvedModelPlan,
+  fromDurableResolvedModelPlanResult,
   claudeCodeExecutableSettings,
-  resolveModelChain,
-  resolveModelPlan,
+  resolveModelChainResult,
+  resolveModelPlanResult,
   resolveNativeSubagentProfile,
   withModelPlanReasoning,
 } from "@stanley2058/lilac-utils";
 import {
   corePrimaryLineageV1Schema,
   createCorePrimaryLineageFreshOnlyV1,
+  decodeCorePrimaryLineageV1,
   extendCoreLineagePrefixDigestV1,
   lilacEventTypes,
-  parseCorePrimaryLineageV1,
   type AdapterPlatform,
   type CoreLineageManifestV1,
   type CorePrimaryLineageV1,
@@ -70,7 +78,7 @@ import {
   buildSafeRecoveryCheckpoint,
   buildSyntheticToolCallId,
   classifyHistoryProviderFamily,
-  compactWithOpenAIResponses,
+  compactWithOpenAIResponsesResult,
   createAgentRunIdleWatchdog,
   createRetryBackoffBudget,
   hasMatchingOpenAIServerCompaction,
@@ -80,6 +88,9 @@ import {
   type AiSdkPiAgentOptions,
   type AiSdkPiAgentEvent,
   type HistoryProviderState,
+  type RetryBackoffAborted,
+  type RetryBackoffAttempt,
+  type RetryBackoffDelayFailed,
   type TransformMessagesContext,
   type PrepareFullModelView,
 } from "@stanley2058/lilac-agent";
@@ -125,6 +136,7 @@ import type {
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
+import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
@@ -145,6 +157,8 @@ import {
   ANTHROPIC_PROMPT_CACHE_PROVIDER_OPTIONS,
   shouldEnableAnthropicPromptCache,
   toOpenAIPromptCacheKey,
+  withOpenAIPromptCacheKey,
+  withOpenAIServerCompaction,
   withProviderOptionsOnLastUserMessage,
   withReasoningDisplayDefaultForAnthropicModels,
   withReasoningSummaryDefaultForOpenAIModels,
@@ -159,15 +173,22 @@ import {
   parseSessionConfigIdFromRaw,
   parseSubagentMetaFromRaw,
   parseWorkflowRequestHintFromRaw,
+  preserveAgentRunnerRaw,
   requestRawReferencesMessage,
   type AgentRunProfile,
+  type AgentRunnerRaw,
   type ParsedSubagentMeta,
 } from "./bus-agent-runner/raw";
-import { createAgentOutputPublisher } from "./bus-agent-runner/output-publisher";
+import {
+  type AgentOutputPublishFailed,
+  createAgentOutputPublisher,
+} from "./bus-agent-runner/output-publisher";
 import { latestUserText, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
 import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
 import {
   materializeClaudeCodeRun,
+  materializeClaudeCodeRunResult,
+  type ClaudeCodeRunExternalFailure,
   type ClaudeCodeRunControl,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
@@ -197,7 +218,7 @@ import type {
   CustomCommandManager,
 } from "../../custom-commands/manager";
 import {
-  createCoreNamedClaudeRuntime,
+  createCoreNamedClaudeRuntime as createCoreNamedClaudeRuntimeResult,
   hashCoreNamedExecutionScope,
   prepareCoreNamedHistoryView,
   shouldReplayCoreNamedHistory,
@@ -205,7 +226,7 @@ import {
   type CoreNamedClaudeRuntime,
 } from "./bus-agent-runner/core-named-continuation";
 import {
-  createCorePrimaryClaudeRuntime,
+  createCorePrimaryClaudeRuntime as createCorePrimaryClaudeRuntimeResult,
   prepareCorePrimaryHistoryView,
   shouldReplayCorePrimaryHistory,
   supportsCorePrimaryContinuationStore,
@@ -240,20 +261,40 @@ export {
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
 
+export class CoreStableNamedContinuationInvalid extends TaggedError(
+  "CoreStableNamedContinuationInvalid",
+)<{
+  readonly reason: "primary-run" | "session-mismatch";
+  readonly message: string;
+}> {}
+
 export function resolveCoreStableNamedContinuation(input: {
   readonly runProfile: AgentRunProfile;
   readonly sessionId: string;
   readonly workflowPolicy: WorkflowRequestPolicy | null;
-}): NonNullable<WorkflowRequestPolicy["stableNamedContinuation"]> | null {
+}): ResultType<
+  NonNullable<WorkflowRequestPolicy["stableNamedContinuation"]> | null,
+  CoreStableNamedContinuationInvalid
+> {
   const identity = input.workflowPolicy?.stableNamedContinuation;
-  if (!identity) return null;
+  if (!identity) return Result.ok(null);
   if (input.runProfile === "primary") {
-    throw new Error("Stable named continuation cannot authorize a primary run");
+    return Result.err(
+      new CoreStableNamedContinuationInvalid({
+        reason: "primary-run",
+        message: "Stable named continuation cannot authorize a primary run",
+      }),
+    );
   }
   if (identity.sessionId !== input.sessionId) {
-    throw new Error("Stable named continuation identity does not match the child session");
+    return Result.err(
+      new CoreStableNamedContinuationInvalid({
+        reason: "session-mismatch",
+        message: "Stable named continuation identity does not match the child session",
+      }),
+    );
   }
-  return identity;
+  return Result.ok(identity);
 }
 
 export function shouldUsePersistentCoreClaudeRuntime(input: {
@@ -301,6 +342,9 @@ export class BusAgentRunnerIntakeFailed extends TaggedError("BusAgentRunnerIntak
 export class BusAgentRunnerOperationFailed extends TaggedError("BusAgentRunnerOperationFailed")<{
   readonly operation: string;
   readonly cause: unknown;
+  readonly failureKind: "idle-timeout" | "pre-agent-cancelled" | "restart-draining" | "other";
+  readonly displayMessage: string;
+  readonly details?: ReturnType<typeof extractAiErrorLogDetails>;
   readonly message: string;
 }> {}
 
@@ -313,20 +357,54 @@ export async function captureBusAgentRunnerOperation<T>(
     return Result.ok(await run());
   } catch (cause) {
     rethrowBusAgentRunnerPanic(cause, beforePanicRethrow);
+    const projection = projectBusAgentRunnerError(cause, `${operation} failed`);
+    let failureKind: BusAgentRunnerOperationFailed["failureKind"] = "other";
+    if (cause instanceof AgentIdleTimeoutError) failureKind = "idle-timeout";
+    if (cause instanceof PreAgentRunCancelledError) failureKind = "pre-agent-cancelled";
+    if (cause instanceof RestartDrainingAbort) failureKind = "restart-draining";
     return Result.err(
       new BusAgentRunnerOperationFailed({
         operation,
         cause,
-        message: opaqueErrorMessage(cause, `${operation} failed`),
+        failureKind,
+        displayMessage: formatUnknownErrorForDisplay(cause),
+        details: projection.details,
+        message: projection.message,
       }),
     );
   }
+}
+
+export function toIdleRetryDecision(
+  backoff: ResultType<RetryBackoffAttempt | null, RetryBackoffAborted | RetryBackoffDelayFailed>,
+):
+  | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
+  | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" } {
+  if (backoff.status === "error") {
+    switch (backoff.error._tag) {
+      case "RetryBackoffAborted":
+        return { status: "fail", reason: "aborted" };
+      case "RetryBackoffDelayFailed":
+        return { status: "fail", reason: "delay-failed" };
+    }
+  }
+  return backoff.value === null
+    ? { status: "fail", reason: "exhausted" }
+    : { status: "retry", attempt: backoff.value };
 }
 
 export function signalBusAgentRunnerHostFailure(
   failure: Error | BusAgentRunnerOperationFailed,
 ): never {
   throw failure instanceof BusAgentRunnerOperationFailed ? failure.cause : failure;
+}
+
+function adaptModelResolutionToBusRunnerHost<T>(result: ResultType<T, ModelResolutionFailed>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "ModelResolutionFailed":
+      throw result.error;
+  }
 }
 
 type BusAgentRunnerErrorProjection = {
@@ -338,9 +416,11 @@ export function projectBusAgentRunnerError(
   cause: unknown,
   fallback = "Agent runner operation failed",
 ): BusAgentRunnerErrorProjection {
-  const message = opaqueErrorMessage(cause, fallback);
+  const projectedCause =
+    isRecord(cause) && cause["loaded"] === false && "error" in cause ? cause["error"] : cause;
+  const message = opaqueErrorMessage(projectedCause, fallback);
   try {
-    const details = extractAiErrorLogDetails(cause);
+    const details = extractAiErrorLogDetails(projectedCause);
     return details ? { message, details } : { message };
   } catch {
     return { message };
@@ -359,6 +439,23 @@ export function busAgentRunnerDeliveryDisposition(
       return "dead-letter";
     case "BusAgentRunnerIntakeFailed":
       return "park-pending";
+  }
+}
+
+export function resolveCoreClaudeCompactionSummaryModel(input: {
+  readonly run: Pick<MaterializedClaudeCodeRun, "createUtilityModelResult"> | null;
+  readonly fallback: () => LanguageModel;
+  readonly onFailure: (error: ClaudeCodeRunExternalFailure) => void;
+}): LanguageModel {
+  if (input.run === null) return input.fallback();
+
+  const created = input.run.createUtilityModelResult();
+  if (created.status === "ok") return created.value;
+
+  switch (created.error._tag) {
+    case "ClaudeCodeRunExternalFailure":
+      input.onFailure(created.error);
+      return input.fallback();
   }
 }
 
@@ -702,19 +799,23 @@ function getSubagentOkFromResult(result: unknown): boolean | null {
   return typeof v === "boolean" ? v : null;
 }
 
-function isDeferredSubagentAcceptedResult(result: unknown): result is {
+function decodeDeferredSubagentAcceptedResult(result: unknown): {
   ok: true;
   mode: "deferred";
   status: "accepted";
   sessionName: string;
-} {
-  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
-  return (
-    (result as Record<string, unknown>)["ok"] === true &&
-    (result as Record<string, unknown>)["mode"] === "deferred" &&
-    (result as Record<string, unknown>)["status"] === "accepted" &&
-    typeof (result as Record<string, unknown>)["sessionName"] === "string"
-  );
+} | null {
+  if (!isRecord(result)) return null;
+  const sessionName = result["sessionName"];
+  if (
+    result["ok"] !== true ||
+    result["mode"] !== "deferred" ||
+    result["status"] !== "accepted" ||
+    typeof sessionName !== "string"
+  ) {
+    return null;
+  }
+  return { ok: true, mode: "deferred", status: "accepted", sessionName };
 }
 
 function buildSubagentResultToolCallId(seed: string): string {
@@ -1055,7 +1156,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   cfg: CoreConfig;
   conversationThreads?: ConversationThreadToolService;
   requestId: string;
-  raw?: unknown;
+  raw?: AgentRunnerRaw;
   previousMessages?: readonly ModelMessage[];
   userMessages: readonly ModelMessage[];
   publishToolStatus: (update: {
@@ -1066,7 +1167,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     error?: string;
   }) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
-  onError: (message: string, error: unknown) => void;
+  onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
 }): Promise<ModelMessage[]> {
   const autoInject = params.cfg.conversation.thread.autoInject;
   if (!autoInject.enabled) return [];
@@ -1100,7 +1201,10 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     try {
       await params.publishToolStatus(update);
     } catch (error) {
-      params.onError("auto-injected thread search status publish failed; continuing", error);
+      params.onError(
+        "auto-injected thread search status publish failed; continuing",
+        projectBusAgentRunnerError(error),
+      );
     }
   };
 
@@ -1133,13 +1237,26 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         });
       }
 
-      params.onError("auto-injected thread search failed; continuing with partial metadata", {
-        searchIndex,
-        error: result.reason,
-      });
+      params.onError(
+        "auto-injected thread search failed; continuing with partial metadata",
+        projectBusAgentRunnerError(result.reason, `Search ${searchIndex} failed`),
+      );
       return [];
     });
-    if (fulfilledSearches === 0) throw new Error("all auto-injected thread searches failed");
+    if (fulfilledSearches === 0) {
+      const failure = projectBusAgentRunnerError(
+        new Error("all auto-injected thread searches failed"),
+      );
+      await publishToolStatusBestEffort({
+        toolCallId,
+        status: "end",
+        display,
+        ok: false,
+        error: failure.message,
+      });
+      params.onError("auto-injected thread search failed; continuing without metadata", failure);
+      return [];
+    }
     const entries = selectAutoInjectedThreadSearchEntries(candidateGroups, autoInject.limit);
 
     await publishToolStatusBestEffort({
@@ -1160,19 +1277,22 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         entries,
       });
     } catch (error) {
-      params.onError("auto-injected thread search append log failed; continuing", error);
+      params.onError(
+        "auto-injected thread search append log failed; continuing",
+        projectBusAgentRunnerError(error),
+      );
     }
     return buildAutoInjectedThreadSearchMessages({ toolCallId, entries });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const projected = projectBusAgentRunnerError(error);
     await publishToolStatusBestEffort({
       toolCallId,
       status: "end",
       display,
       ok: false,
-      error: message,
+      error: projected.message,
     });
-    params.onError("auto-injected thread search failed; continuing without metadata", error);
+    params.onError("auto-injected thread search failed; continuing without metadata", projected);
     return [];
   }
 }
@@ -1395,10 +1515,14 @@ function persistHeartbeatSurfaceHandoffs(params: {
       modelLabel: params.modelLabel,
     });
     if (saved.status === "error") {
-      params.logger.warn("heartbeat handoff transcript persistence failed", {
-        requestId: handoffRequestId,
-        errorTag: saved.error.name,
-      });
+      params.logger.warn(
+        "heartbeat handoff transcript persistence failed",
+        formatBridgeLogContext({
+          requestId: handoffRequestId,
+          errorTag: saved.error.name,
+          errorMessage: saved.error.message,
+        }),
+      );
       continue;
     }
     params.transcriptStore.linkSurfaceMessagesToRequest({
@@ -1419,7 +1543,7 @@ type Enqueued = {
   messages: ModelMessage[];
   corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
-  raw?: unknown;
+  raw?: AgentRunnerRaw;
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
@@ -1437,7 +1561,7 @@ export type AgentRunnerRecoveryEntry = {
   messages: ModelMessage[];
   corePrimaryLineage?: CorePrimaryLineageV1;
   modelOverride?: string;
-  raw?: unknown;
+  raw?: AgentRunnerRaw;
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
@@ -1450,6 +1574,17 @@ export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): b
     entry.requestId.startsWith("wfr:") ||
     entry.sessionId.startsWith("workflow:")
   );
+}
+
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
+  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  if (created.status === "ok") return created.value;
+  return {
+    state: "fresh-only",
+    lineageVersion: 1,
+    currentCanonicalStart: 0,
+    reason: "lineage-fallback-construction-failed",
+  };
 }
 
 export function validateCorePrimaryLineageAtRunnerIntake(input: {
@@ -1466,53 +1601,40 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
     input.messages.findLastIndex((message) => message.role === "user"),
   );
   if (input.corePrimaryLineage === undefined) {
-    return createCorePrimaryLineageFreshOnlyV1("missing-manifest", fallbackCurrentCanonicalStart);
+    return createFreshOnlyLineage("missing-manifest", fallbackCurrentCanonicalStart);
   }
-  try {
-    const lineage = parseCorePrimaryLineageV1(input.corePrimaryLineage, input.messages);
-    if (lineage.state !== "complete") return lineage;
-    if (!input.sessionId)
-      return createCorePrimaryLineageFreshOnlyV1(
-        "missing-lineage-scope",
-        lineage.currentCanonicalStart,
-      );
-    if (!input.transcriptStore?.validateCorePrimaryLineageReferences)
-      return createCorePrimaryLineageFreshOnlyV1(
-        "lineage-store-unavailable",
-        lineage.currentCanonicalStart,
-      );
-    const invalidReason = input.transcriptStore.validateCorePrimaryLineageReferences({
-      manifest: lineage,
-      requestClient: input.requestClient,
-      sessionId: input.sessionId,
-      surfaceId: `discord:${input.sessionId}`,
-    });
-    if (invalidReason.status === "error") {
-      return createCorePrimaryLineageFreshOnlyV1(
-        "lineage-store-unavailable",
-        lineage.currentCanonicalStart,
-      );
-    }
-    if (invalidReason.value) {
-      return createCorePrimaryLineageFreshOnlyV1(
-        invalidReason.value,
-        lineage.currentCanonicalStart,
-      );
-    }
-    return lineage;
-  } catch {
-    return createCorePrimaryLineageFreshOnlyV1(
-      "malformed-or-unaligned-manifest",
-      fallbackCurrentCanonicalStart,
-    );
+  const decoded = decodeCorePrimaryLineageV1(input.corePrimaryLineage, input.messages);
+  if (decoded.status === "error") {
+    return createFreshOnlyLineage("malformed-or-unaligned-manifest", fallbackCurrentCanonicalStart);
   }
+  const lineage = decoded.value;
+  if (lineage.state !== "complete") return lineage;
+  if (!input.sessionId) {
+    return createFreshOnlyLineage("missing-lineage-scope", lineage.currentCanonicalStart);
+  }
+  if (!input.transcriptStore?.validateCorePrimaryLineageReferences) {
+    return createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart);
+  }
+  const invalidReason = input.transcriptStore.validateCorePrimaryLineageReferences({
+    manifest: lineage,
+    requestClient: input.requestClient,
+    sessionId: input.sessionId,
+    surfaceId: `discord:${input.sessionId}`,
+  });
+  if (invalidReason.status === "error") {
+    return createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart);
+  }
+  if (invalidReason.value) {
+    return createFreshOnlyLineage(invalidReason.value, lineage.currentCanonicalStart);
+  }
+  return lineage;
 }
 
 export function degradeCorePrimaryLineageForMutation(
   reason: string,
   currentCanonicalStart = 0,
 ): CorePrimaryLineageV1 {
-  return createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  return createFreshOnlyLineage(reason, currentCanonicalStart);
 }
 
 const AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE = "conversation-thread-auto-inject";
@@ -1535,44 +1657,44 @@ export function appendAutoInjectedThreadSearchLineage(input: {
       fallbackCurrentCanonicalStart,
     );
 
-  try {
-    const lineage = parseCorePrimaryLineageV1(input.lineage, input.canonicalMessages);
-    if (lineage.state !== "complete" || input.injectedMessages.length === 0) return failClosed();
-    const previous = lineage.segments.at(-1);
-    if (!previous || previous.canonicalEnd !== input.canonicalMessages.length) return failClosed();
+  const decoded = decodeCorePrimaryLineageV1(input.lineage, input.canonicalMessages);
+  if (decoded.status === "error") return failClosed();
+  const lineage = decoded.value;
+  if (lineage.state !== "complete" || input.injectedMessages.length === 0) return failClosed();
+  const previous = lineage.segments.at(-1);
+  if (!previous || previous.canonicalEnd !== input.canonicalMessages.length) return failClosed();
 
-    const atom = {
-      kind: "synthetic" as const,
-      source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
-      messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
-    };
-    const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
-    const candidate = {
-      ...lineage,
-      segments: [
-        ...lineage.segments,
-        {
-          atoms: [atom],
-          canonicalMessages: [...input.injectedMessages],
-          canonicalStart: previous.canonicalEnd,
-          canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
-          cumulativeAtomCount,
-          cumulativePrefixDigest: extendCoreLineagePrefixDigestV1(
-            previous.cumulativePrefixDigest,
-            cumulativeAtomCount,
-            atom,
-          ),
-        },
-      ],
-    };
-    const parsed = parseCorePrimaryLineageV1(candidate, [
-      ...input.canonicalMessages,
-      ...input.injectedMessages,
-    ]);
-    return parsed.state === "complete" ? parsed : failClosed();
-  } catch {
-    return failClosed();
-  }
+  const atom = {
+    kind: "synthetic" as const,
+    source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
+    messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
+  };
+  const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
+  const extended = extendCoreLineagePrefixDigestV1(
+    previous.cumulativePrefixDigest,
+    cumulativeAtomCount,
+    atom,
+  );
+  if (extended.status === "error") return failClosed();
+  const candidate = {
+    ...lineage,
+    segments: [
+      ...lineage.segments,
+      {
+        atoms: [atom],
+        canonicalMessages: [...input.injectedMessages],
+        canonicalStart: previous.canonicalEnd,
+        canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
+        cumulativeAtomCount,
+        cumulativePrefixDigest: extended.value,
+      },
+    ],
+  };
+  const parsed = decodeCorePrimaryLineageV1(candidate, [
+    ...input.canonicalMessages,
+    ...input.injectedMessages,
+  ]);
+  return parsed.status === "ok" && parsed.value.state === "complete" ? parsed.value : failClosed();
 }
 
 export function mapCorePrimaryCompactionCurrentCanonicalStart(input: {
@@ -1742,14 +1864,21 @@ async function publishAbsorbedQueuedPromptCancelled(input: {
 }
 
 async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
+  const workspaceRoot = findWorkspaceRootResult();
+  if (workspaceRoot.status === "error") {
+    switch (workspaceRoot.error._tag) {
+      case "WorkspaceRootNotFound":
+        return null;
+    }
+  }
   try {
-    const workspaceRoot = findWorkspaceRoot();
     const { skills } = await discoverSkills({
-      workspaceRoot,
+      workspaceRoot: workspaceRoot.value,
       dataDir: env.dataDir,
     });
     return formatAvailableSkillsSection(skills);
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     // Best-effort: never fail a run due to skill discovery.
     return null;
   }
@@ -1801,33 +1930,54 @@ export function shouldCancelRunPolicyRequest(params: {
   return Boolean(state?.running);
 }
 
-export function resolveAgentRunModel(params: {
+export class AgentRunModelSelectionInvalid extends TaggedError("AgentRunModelSelectionInvalid")<{
+  readonly reason: "alias-not-selectable" | "alias-required";
+  readonly modelOverride: string;
+  readonly message: string;
+}> {}
+
+type AgentRunModelResolutionError = AgentRunModelSelectionInvalid | ModelResolutionFailed;
+
+export function resolveAgentRunModelResult(params: {
   cfg: CoreConfig;
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
   resolvedModelRequest?: DurableResolvedModelRequest;
-}): ResolvedModelPlan {
+}): ResultType<ResolvedModelPlan, AgentRunModelResolutionError> {
   const subagentProfileConfig =
     params.runProfile === "primary"
       ? null
       : resolveNativeSubagentProfile(params.cfg, params.runProfile);
 
   if (params.resolvedModelRequest) {
-    const plan = fromDurableResolvedModelPlan(params.resolvedModelRequest);
-    return params.reasoningOverride ? withModelPlanReasoning(plan, params.reasoningOverride) : plan;
+    const plan = fromDurableResolvedModelPlanResult(params.resolvedModelRequest);
+    if (plan.status === "error") return plan;
+    return Result.ok(
+      params.reasoningOverride
+        ? withModelPlanReasoning(plan.value, params.reasoningOverride)
+        : plan.value,
+    );
   }
 
   if (params.runProfile !== "primary" && params.requestModelOverride) {
     const selectedPreset = params.cfg.models.def[params.requestModelOverride];
     if (!selectedPreset || params.requestModelOverride.includes("/")) {
-      throw new Error(
-        `Subagent model override must be a models.def alias (got '${params.requestModelOverride}')`,
+      return Result.err(
+        new AgentRunModelSelectionInvalid({
+          reason: "alias-required",
+          modelOverride: params.requestModelOverride,
+          message: `Subagent model override must be a models.def alias (got '${params.requestModelOverride}')`,
+        }),
       );
     }
     if (selectedPreset.agentCanSelect !== true) {
-      throw new Error(
-        `Subagent model alias '${params.requestModelOverride}' is not available for agent selection`,
+      return Result.err(
+        new AgentRunModelSelectionInvalid({
+          reason: "alias-not-selectable",
+          modelOverride: params.requestModelOverride,
+          message: `Subagent model alias '${params.requestModelOverride}' is not available for agent selection`,
+        }),
       );
     }
   }
@@ -1842,17 +1992,23 @@ export function resolveAgentRunModel(params: {
   };
 
   if (params.requestModelOverride) {
-    const head = resolveModelPlan(params.cfg, {
+    const resolved = resolveModelPlanResult(params.cfg, {
       head: { model: params.requestModelOverride },
       fallback: [],
       headSource: "cmd.request.message.modelOverride",
       fallbackSource: "cmd.request.message.modelOverride.fallback",
-    }).head;
-    return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
+    });
+    if (resolved.status === "error") return resolved;
+    const fallbacks = resolveAgentRunModelFallbacksResult(params);
+    if (fallbacks.status === "error") return fallbacks;
+    return Result.ok({
+      head: applyHeadReasoning(resolved.value.head),
+      fallbacks: fallbacks.value,
+    });
   }
 
   if (subagentProfileConfig?.model) {
-    const head = resolveModelPlan(params.cfg, {
+    const resolved = resolveModelPlanResult(params.cfg, {
       head: {
         model: subagentProfileConfig.model,
         reasoning: subagentProfileConfig.reasoning,
@@ -1861,18 +2017,42 @@ export function resolveAgentRunModel(params: {
       fallback: [],
       headSource: `agent.subagents.profiles.${params.runProfile}.model`,
       fallbackSource: `agent.subagents.profiles.${params.runProfile}.fallback`,
-    }).head;
-    return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
+    });
+    if (resolved.status === "error") return resolved;
+    const fallbacks = resolveAgentRunModelFallbacksResult(params);
+    if (fallbacks.status === "error") return fallbacks;
+    return Result.ok({
+      head: applyHeadReasoning(resolved.value.head),
+      fallbacks: fallbacks.value,
+    });
   }
 
   const slot = subagentProfileConfig?.modelSlot ?? "main";
-  const head = resolveModelPlan(params.cfg, {
+  const resolved = resolveModelPlanResult(params.cfg, {
     head: params.cfg.models[slot],
     fallback: [],
     headSource: `models.${slot}.model`,
     fallbackSource: `models.${slot}.fallback`,
-  }).head;
-  return { head: applyHeadReasoning(head), fallbacks: resolveAgentRunModelFallbacks(params) };
+  });
+  if (resolved.status === "error") return resolved;
+  const fallbacks = resolveAgentRunModelFallbacksResult(params);
+  if (fallbacks.status === "error") return fallbacks;
+  return Result.ok({
+    head: applyHeadReasoning(resolved.value.head),
+    fallbacks: fallbacks.value,
+  });
+}
+
+export function resolveAgentRunModel(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+  reasoningOverride?: ModelReasoningEffort;
+  resolvedModelRequest?: DurableResolvedModelRequest;
+}): ResolvedModelPlan {
+  const resolved = resolveAgentRunModelResult(params);
+  if (resolved.status === "error") return signalBusAgentRunnerHostFailure(resolved.error);
+  return resolved.value;
 }
 
 type AgentRunFallbackSource = {
@@ -1948,15 +2128,21 @@ function resolveAgentRunFallbackSource(params: {
   };
 }
 
-export function resolveAgentRunModelFallbacks(params: {
+export function resolveAgentRunModelFallbacksResult(params: {
   cfg: CoreConfig;
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
-}): readonly ResolvedModelRef[] {
+}): ResultType<readonly ResolvedModelRef[], ModelResolutionFailed> {
   const fallbackSource = resolveAgentRunFallbackSource(params);
-  if (!fallbackSource) return [];
-  let fallbacks = resolveModelChain(params.cfg, fallbackSource.entries, fallbackSource.source);
+  if (!fallbackSource) return Result.ok([]);
+  const resolved = resolveModelChainResult(
+    params.cfg,
+    fallbackSource.entries,
+    fallbackSource.source,
+  );
+  if (resolved.status === "error") return resolved;
+  let fallbacks = resolved.value;
   if (fallbackSource.profileReasoning) {
     fallbacks = fallbacks.map((candidate, index) => {
       const configured = fallbackSource.entries[index];
@@ -1965,9 +2151,20 @@ export function resolveAgentRunModelFallbacks(params: {
         : { ...candidate, reasoning: fallbackSource.profileReasoning };
     });
   }
-  return params.reasoningOverride
-    ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
-    : fallbacks;
+  return Result.ok(
+    params.reasoningOverride
+      ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
+      : fallbacks,
+  );
+}
+
+export function resolveAgentRunModelFallbacks(params: {
+  cfg: CoreConfig;
+  runProfile: AgentRunProfile;
+  requestModelOverride?: string;
+  reasoningOverride?: ModelReasoningEffort;
+}): readonly ResolvedModelRef[] {
+  return adaptModelResolutionToBusRunnerHost(resolveAgentRunModelFallbacksResult(params));
 }
 
 export function selectNextNativeModelFallback(params: {
@@ -1993,16 +2190,32 @@ export function selectNextNativeModelFallback(params: {
   return null;
 }
 
+export class WorkflowDispatchPolicyMismatch extends TaggedError("WorkflowDispatchPolicyMismatch")<{
+  readonly field: "profile" | "reasoning";
+  readonly message: string;
+}> {}
+
 export function assertWorkflowDispatchPolicy(
   workflowPolicy: WorkflowRequestPolicy,
   subagentMeta: ParsedSubagentMeta,
-): void {
+): ResultType<void, WorkflowDispatchPolicyMismatch> {
   if (workflowPolicy.profile !== subagentMeta.profile) {
-    throw new Error("Workflow request profile envelope does not match the runner profile");
+    return Result.err(
+      new WorkflowDispatchPolicyMismatch({
+        field: "profile",
+        message: "Workflow request profile envelope does not match the runner profile",
+      }),
+    );
   }
   if ((workflowPolicy.reasoning ?? null) !== (subagentMeta.reasoning ?? null)) {
-    throw new Error("Workflow request reasoning does not match the approved operation policy");
+    return Result.err(
+      new WorkflowDispatchPolicyMismatch({
+        field: "reasoning",
+        message: "Workflow request reasoning does not match the approved operation policy",
+      }),
+    );
   }
+  return Result.ok(undefined);
 }
 
 type Level1ToolAuthorityTarget = Pick<AiSdkPiAgent<ToolSet>, "setTools" | "setActiveTools">;
@@ -2067,7 +2280,7 @@ type SessionQueue = {
     messages: ModelMessage[];
     corePrimaryLineage?: CorePrimaryLineageV1;
     modelOverride?: string;
-    raw?: unknown;
+    raw?: AgentRunnerRaw;
     resolvedModelSpec: string | null;
     resolvedReasoning: ModelReasoningEffort | undefined;
     resolvedProviderFamily: HistoryProviderState["lastFamily"] | null;
@@ -2133,6 +2346,25 @@ export type AgentRunnerActiveWork = {
   }[];
 };
 
+export function formatClaudeLifecycleLogFields(
+  event: string,
+  detail: Readonly<Record<string, string | number | boolean | null | undefined>>,
+  error?: AnyTaggedError,
+): Readonly<Record<string, string | number | boolean | null | undefined>> {
+  const context = formatBridgeLogContext({ lifecycle: event, ...detail });
+  return error ? formatBridgeTaggedErrorForLog(error, context) : context;
+}
+
+export function formatBusAgentRunnerDrainFailureForLog(
+  error: unknown,
+  context: Readonly<Record<string, string | undefined>>,
+): Readonly<Record<string, string | number | boolean | null | undefined>> {
+  return formatBridgeTaggedErrorForLog(error, context, {
+    errorTag: "BusAgentRunnerDrainFailed",
+    errorMessage: "Agent runner session queue drain failed",
+  });
+}
+
 export async function startBusAgentRunner(params: {
   bus: LilacBus;
   subscriptionId: string;
@@ -2197,10 +2429,10 @@ export async function startBusAgentRunner(params: {
     if (loaded.status === "error") {
       const message = loaded.error.message;
       if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
-        logger.warn("core-config reload failed; using last known config", {
-          path: "core-config.yaml",
-          error: message,
-        });
+        logger.warn(
+          "core-config reload failed; using last known config",
+          formatBridgeTaggedErrorForLog(loaded.error, { path: "core-config.yaml" }),
+        );
       }
       coreConfigReloadHadError = true;
       lastCoreConfigReloadError = message;
@@ -2225,9 +2457,16 @@ export async function startBusAgentRunner(params: {
   const forcedRecoveryByRequestId = new Map<string, AgentRunnerRecoveryEntry>();
   let draining = false;
   let terminalPanic: Panic | null = null;
+  let terminalPanicReported = false;
   let activeDrainOperation: Promise<void> | null = null;
   let terminalCleanupOperations: readonly BusAgentRunnerTerminalCleanupOperation[] = [];
   let terminalCleanupCompletion: Promise<void> | null = null;
+  const reportFatalPanic = (panic: Panic): void => {
+    terminalPanic ??= panic;
+    if (terminalPanicReported) return;
+    terminalPanicReported = true;
+    params.reportFatalPanic(panic);
+  };
 
   function startSessionQueueDrain(
     sessionId: string,
@@ -2235,8 +2474,11 @@ export async function startBusAgentRunner(params: {
     requestId?: string,
   ): void {
     const superviseDetachedDrain = (error: unknown): void => {
-      rethrowBusAgentRunnerPanic(error, params.reportFatalPanic);
-      logger.error("drainSessionQueue failed", { sessionId, requestId }, error);
+      rethrowBusAgentRunnerPanic(error, reportFatalPanic);
+      logger.error(
+        "drainSessionQueue failed",
+        formatBusAgentRunnerDrainFailureForLog(error, { sessionId, requestId }),
+      );
     };
     const observeSupervisedDrainRejection = (): void => undefined;
     const operation = drainSessionQueue(sessionId, state).catch(superviseDetachedDrain);
@@ -2313,7 +2555,8 @@ export async function startBusAgentRunner(params: {
         // If reload fails, keep using the last known good config.
         await reloadCoreConfigIfNeeded();
 
-        const intakeRunProfile = parseSubagentMetaFromRaw(msg.data.raw).profile;
+        const raw = preserveAgentRunnerRaw(msg.data.raw);
+        const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
         const entry: Enqueued = {
           requestId,
           sessionId,
@@ -2331,7 +2574,7 @@ export async function startBusAgentRunner(params: {
             transcriptStore: params.transcriptStore,
           }),
           modelOverride: msg.data.modelOverride,
-          raw: msg.data.raw,
+          raw,
         };
 
         const requestControl = parseRequestControlFromRaw(entry.raw);
@@ -2595,20 +2838,20 @@ export async function startBusAgentRunner(params: {
               activeRun.resolvedModelSpec !== null &&
               activeRun.resolvedProviderFamily !== null
             ) {
-              try {
-                const requested = resolveAgentRunModel({
-                  cfg,
-                  runProfile: "primary",
-                  requestModelOverride: incomingOverride,
-                }).head;
+              const requestedPlan = resolveAgentRunModelResult({
+                cfg,
+                runProfile: "primary",
+                requestModelOverride: incomingOverride,
+              });
+              if (requestedPlan.status === "error") {
+                incompatible = true;
+              } else {
                 incompatible = shouldQueueIncompatibleActiveRuntimeModel({
                   activeSpec: activeRun.resolvedModelSpec,
                   activeReasoning: activeRun.resolvedReasoning,
                   activeFamily: activeRun.resolvedProviderFamily,
-                  requested,
+                  requested: requestedPlan.value.head,
                 });
-              } catch {
-                incompatible = true;
               }
             }
             if (incompatible) {
@@ -2781,12 +3024,10 @@ export async function startBusAgentRunner(params: {
     if (done.status === "error") throw done.error;
   });
   const superviseSubscriptionDone = (cause: unknown): void => {
-    rethrowBusAgentRunnerPanic(cause, (panic) => {
-      terminalPanic ??= panic;
-      params.reportFatalPanic(panic);
-    });
+    rethrowBusAgentRunnerPanic(cause, reportFatalPanic);
+    const error = projectBusAgentRunnerError(cause, "cmd.request subscription stopped");
     logger.error("cmd.request subscription stopped", {
-      error: cause instanceof Error ? cause.message : String(cause),
+      error: error.message,
     });
   };
   const observeSupervisedSubscriptionDoneRejection = (): void => undefined;
@@ -3054,27 +3295,34 @@ export async function startBusAgentRunner(params: {
       ...(workflowDispatchEpoch ? { workflow_dispatch_epoch: workflowDispatchEpoch } : {}),
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
     };
-    const reportOutputPublisherError = (label: string, cause: unknown): void => {
-      const error = projectBusAgentRunnerError(cause, `Failed to publish ${label}`);
-      logger.error(`failed to publish ${label}`, {
-        requestId: headers.request_id,
-        sessionId: headers.session_id,
-        error: error.message,
-      });
+    const reportOutputPublisherError = (label: string, cause: AgentOutputPublishFailed): void => {
+      logger.error(
+        `failed to publish ${label}`,
+        formatBridgeTaggedErrorForLog(cause, {
+          requestId: headers.request_id,
+          sessionId: headers.session_id,
+        }),
+      );
     };
     const outputPublisher = createAgentOutputPublisher({
       bus,
       headers,
       onError: reportOutputPublisherError,
+      reportFatalPanic,
     });
     const publishAuxiliaryOutput = async (
       operation: string,
-      fields: Readonly<Record<string, unknown>>,
       publish: () => Promise<void>,
     ): Promise<void> => {
       const published = await captureBusAgentRunnerOperation(operation, publish);
       if (published.status === "ok") return;
-      logger.error(operation, { ...fields, error: published.error.message });
+      logger.error(
+        operation,
+        formatBridgeTaggedErrorForLog(published.error, {
+          requestId: headers.request_id,
+          sessionId: headers.session_id,
+        }),
+      );
     };
     let auxiliaryOutputTail = Promise.resolve();
     const publishCurrentLifecycle = async (input: {
@@ -3140,8 +3388,10 @@ export async function startBusAgentRunner(params: {
       const retryResult = await captureBusAgentRunnerOperation("idle retry backoff", () =>
         idleRetryBudget.next(abortSignal),
       );
-      if (retryResult.status === "error" || !retryResult.value) return "fail" as const;
-      const retry = retryResult.value;
+      if (retryResult.status === "error") return "fail" as const;
+      const decision = toIdleRetryDecision(retryResult.value);
+      if (decision.status === "fail") return "fail" as const;
+      const retry = decision.attempt;
       logger.warn("agent idle timeout; retrying", {
         requestId: headers.request_id,
         sessionId: headers.session_id,
@@ -3168,23 +3418,26 @@ export async function startBusAgentRunner(params: {
             },
           })
         : null;
-    const waitForRun = async <T>(promise: Promise<T>): Promise<T> => {
+    const waitForRun = async <T>(
+      promise: Promise<T>,
+    ): Promise<ResultType<T, BusAgentRunnerOperationFailed>> => {
       let tracked: Promise<T>;
       tracked = promise.finally(() => {
         if (activeRunOperation === tracked) activeRunOperation = null;
       });
       activeRunOperation = tracked;
-      if (!runIdleWatchdog) return await tracked;
+      if (!runIdleWatchdog) {
+        return await captureBusAgentRunnerOperation("agent run wait", () => tracked);
+      }
 
       while (true) {
         const waited = await captureBusAgentRunnerOperation("agent idle watchdog wait", () =>
           runIdleWatchdog.waitFor(tracked),
         );
-        if (waited.status === "ok") return waited.value;
-        const cause = waited.error.cause;
+        if (waited.status === "ok") return Result.ok(waited.value);
         const recovery = idleRecoveryPromise;
-        if (!(cause instanceof AgentIdleTimeoutError) || !recovery) {
-          return signalBusAgentRunnerHostFailure(waited.error);
+        if (waited.error.failureKind !== "idle-timeout" || !recovery) {
+          return Result.err(waited.error);
         }
         const result = await recovery;
         if (idleRecoveryPromise === recovery) idleRecoveryPromise = null;
@@ -3195,10 +3448,15 @@ export async function startBusAgentRunner(params: {
             (result.reason === "cancel" || result.reason === "interrupt")
           )
         ) {
-          return signalBusAgentRunnerHostFailure(waited.error);
+          return Result.err(waited.error);
         }
         runIdleWatchdog.restart();
       }
+    };
+    const waitForRunAtHost = async <T>(promise: Promise<T>): Promise<T> => {
+      const waited = await waitForRun(promise);
+      if (waited.status === "error") return signalBusAgentRunnerHostFailure(waited.error);
+      return waited.value;
     };
     const getActiveRunOperation = (): Promise<unknown> | null => activeRunOperation;
     const waitForPreAgent = <T>(promise: Promise<T>): Promise<T> =>
@@ -3393,12 +3651,21 @@ export async function startBusAgentRunner(params: {
             }, WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS);
             workflowClaimTimer.unref?.();
           }
-          if (workflowPolicy) assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
-          const stableNamedContinuation = resolveCoreStableNamedContinuation({
+          if (workflowPolicy) {
+            const validatedPolicy = assertWorkflowDispatchPolicy(workflowPolicy, subagentMeta);
+            if (validatedPolicy.status === "error") {
+              return signalBusAgentRunnerHostFailure(validatedPolicy.error);
+            }
+          }
+          const resolvedStableNamedContinuation = resolveCoreStableNamedContinuation({
             runProfile,
             sessionId: next.sessionId,
             workflowPolicy,
           });
+          if (resolvedStableNamedContinuation.status === "error") {
+            return signalBusAgentRunnerHostFailure(resolvedStableNamedContinuation.error);
+          }
+          const stableNamedContinuation = resolvedStableNamedContinuation.value;
           const maxSubagentDepth = subagents.maxDepth;
           if (subagentMeta.depth > maxSubagentDepth) {
             const detail = `subagent depth ${subagentMeta.depth} exceeds maxDepth=${maxSubagentDepth}`;
@@ -3435,7 +3702,14 @@ export async function startBusAgentRunner(params: {
             state: "running",
             detail: lifecycleDetail,
           });
-          await bus.publish(lilacEventTypes.EvtRequestReply, {}, { headers });
+          const replyPublished = await bus.publish(
+            lilacEventTypes.EvtRequestReply,
+            {},
+            { headers },
+          );
+          if (replyPublished.status === "error") {
+            return signalBusAgentRunnerHostFailure(replyPublished.error);
+          }
 
           if (parsedCustomCommand) {
             if (runProfile === "primary" && next.requestClient === "discord") {
@@ -3477,7 +3751,7 @@ export async function startBusAgentRunner(params: {
               runIdleWatchdog?.start();
               try {
                 const executed = await waitForPreAgent(
-                  waitForRun(
+                  waitForRunAtHost(
                     params.customCommands.execute({
                       command,
                       args: parsedCustomCommand.args,
@@ -3578,11 +3852,15 @@ export async function startBusAgentRunner(params: {
                   modelLabel: resolvedModelLabel,
                 });
                 if (persisted.status === "error") {
-                  logger.error("failed to persist transcript after custom command error", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    errorTag: persisted.error.name,
-                  });
+                  logger.error(
+                    "failed to persist transcript after custom command error",
+                    formatBridgeLogContext({
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      errorTag: persisted.error.name,
+                      errorMessage: persisted.error.message,
+                    }),
+                  );
                 }
               }
 
@@ -3593,12 +3871,15 @@ export async function startBusAgentRunner(params: {
               });
               await outputPublisher.publishResponseText({ finalText });
 
-              logger.warn("custom command failed", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                commandName: parsedCustomCommand.name,
-                error: customError,
-              });
+              logger.warn(
+                "custom command failed",
+                formatBridgeLogContext({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  commandName: parsedCustomCommand.name,
+                  errorMessage: customError,
+                }),
+              );
               return;
             }
           }
@@ -3617,13 +3898,17 @@ export async function startBusAgentRunner(params: {
               new Error("Workflow request model does not match the approved operation policy"),
             );
           }
-          const modelPlan = resolveAgentRunModel({
+          const resolvedModelPlan = resolveAgentRunModelResult({
             cfg,
             runProfile,
             requestModelOverride,
             reasoningOverride: subagentMeta.reasoning,
             resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
           });
+          if (resolvedModelPlan.status === "error") {
+            return signalBusAgentRunnerHostFailure(resolvedModelPlan.error);
+          }
+          const modelPlan = resolvedModelPlan.value;
           const initialResolvedModel = modelPlan.head;
           resolvedModelLabel = initialResolvedModel.modelId;
           resolvedProviderFamily = classifyHistoryProviderFamily({
@@ -3741,19 +4026,22 @@ export async function startBusAgentRunner(params: {
             resolved: ResolvedModelRef,
             editingToolMode: ReturnType<typeof resolveEditingToolMode>,
           ): string => {
-            const baseSystemPrompt = buildSystemPromptForProfile({
+            const profilePrompt = {
               baseSystemPrompt: cfg.agent.systemPrompt,
-              profile: runProfile,
-              profileConfig:
-                runProfile === "primary"
-                  ? undefined
-                  : resolveNativeSubagentProfile(cfg, runProfile),
               activeEditingTool: runProfile === "explore" ? null : editingToolMode,
               exploreOverlay: subagents.profiles.explore.promptOverlay,
               generalOverlay: subagents.profiles.general.promptOverlay,
               selfOverlay: subagents.profiles.self.promptOverlay,
               skillsSection,
-            });
+            };
+            const baseSystemPrompt =
+              runProfile === "primary"
+                ? buildSystemPromptForProfile({ ...profilePrompt, profile: "primary" })
+                : buildSystemPromptForProfile({
+                    ...profilePrompt,
+                    profile: runProfile,
+                    profileConfig: resolveNativeSubagentProfile(cfg, runProfile),
+                  });
             let prompt = appendConfiguredAliasPromptBlock({
               baseSystemPrompt,
               cfg,
@@ -3803,17 +4091,21 @@ export async function startBusAgentRunner(params: {
                 });
               }
             } else if (loadedTranscript.status === "error") {
-              logger.warn("failed to load subagent continuation transcript", {
-                requestId: next.requestId,
-                sessionId: next.sessionId,
-                error: loadedTranscript.error.message,
-              });
+              logger.warn(
+                "failed to load subagent continuation transcript",
+                formatBridgeTaggedErrorForLog(loadedTranscript.error, {
+                  requestId: next.requestId,
+                  sessionId: next.sessionId,
+                }),
+              );
             } else if (loadedTranscript.value?.status === "error") {
-              logger.warn("failed to decode subagent continuation transcript", {
-                requestId: next.requestId,
-                sessionId: next.sessionId,
-                errorTag: loadedTranscript.value.error.name,
-              });
+              logger.warn(
+                "failed to decode subagent continuation transcript",
+                formatBridgeTaggedErrorForLog(loadedTranscript.value.error, {
+                  requestId: next.requestId,
+                  sessionId: next.sessionId,
+                }),
+              );
             }
           }
 
@@ -3840,8 +4132,8 @@ export async function startBusAgentRunner(params: {
                 bindingCostEstimateReason = "model_cost_missing";
               }
             } else {
-              if (capability.error.cause instanceof PreAgentRunCancelledError) {
-                return signalBusAgentRunnerHostFailure(capability.error.cause);
+              if (capability.error.failureKind === "pre-agent-cancelled") {
+                return Result.err(capability.error);
               }
               bindingCostEstimateReason = `capability_resolve_failed:${capability.error.message}`;
             }
@@ -3873,38 +4165,16 @@ export async function startBusAgentRunner(params: {
                 modelId: resolved.modelId,
                 providerOptions: providerOptionsWithOpenAIReasoningSummary,
               });
-            const providerOptionsWithPromptCacheKey = (() => {
-              if (resolved.provider !== "openai" && resolved.provider !== "codex") {
-                return providerOptionsWithReasoningDisplay;
-              }
-              const base = providerOptionsWithReasoningDisplay ?? {};
-              const existingOpenAI = (base["openai"] ?? {}) as Record<string, unknown>;
-              return {
-                ...base,
-                openai: {
-                  ...existingOpenAI,
-                  promptCacheKey: toOpenAIPromptCacheKey(sessionId),
-                },
-              };
-            })();
-            const providerOptionsWithServerCompaction = (() => {
-              if (!resolved.openaiServerCompaction) return providerOptionsWithPromptCacheKey;
-              const base = providerOptionsWithPromptCacheKey ?? {};
-              const existingOpenAI = base.openai ?? {};
-              const include = Array.isArray(existingOpenAI.include)
-                ? existingOpenAI.include.filter(
-                    (value): value is string => typeof value === "string",
+            const providerOptionsWithPromptCacheKey =
+              resolved.provider === "openai" || resolved.provider === "codex"
+                ? withOpenAIPromptCacheKey(
+                    providerOptionsWithReasoningDisplay,
+                    toOpenAIPromptCacheKey(sessionId),
                   )
-                : [];
-              return {
-                ...base,
-                openai: {
-                  ...existingOpenAI,
-                  store: false,
-                  include: [...new Set([...include, "reasoning.encrypted_content"])],
-                },
-              };
-            })();
+                : providerOptionsWithReasoningDisplay;
+            const providerOptionsWithServerCompaction = resolved.openaiServerCompaction
+              ? withOpenAIServerCompaction(providerOptionsWithPromptCacheKey)
+              : providerOptionsWithPromptCacheKey;
             const providerOptionsForAgent = anthropicModel
               ? withStableAnthropicUpstreamOrder(
                   resolved.provider,
@@ -3924,8 +4194,8 @@ export async function startBusAgentRunner(params: {
               provider: resolved.provider,
               providerOptions: providerOptionsForAgent,
             });
-            const toolset = await waitForPreAgent(
-              params.pluginManager.buildLevel1Toolset({
+            const builtToolset = await waitForPreAgent(
+              params.pluginManager.buildLevel1ToolsetResult({
                 cwd: executionCwd,
                 runProfile,
                 editingToolMode: runProfile === "explore" ? "none" : editingToolMode,
@@ -3961,19 +4231,15 @@ export async function startBusAgentRunner(params: {
                   },
                 },
                 reportToolStatus: (update) => {
-                  void publishAuxiliaryOutput(
-                    "failed to publish batch tool status",
-                    {
-                      requestId: headers.request_id,
-                      sessionId: headers.session_id,
-                      toolCallId: update.toolCallId,
-                    },
-                    () => outputPublisher.publishToolCall(update),
+                  void publishAuxiliaryOutput("failed to publish batch tool status", () =>
+                    outputPublisher.publishToolCall(update),
                   );
                 },
               }),
             );
-            return {
+            if (builtToolset.status === "error") return Result.err(builtToolset.error);
+            const toolset = builtToolset.value;
+            return Result.ok({
               resolved,
               capabilityInfo,
               costEstimateStatus: bindingCostEstimateStatus,
@@ -3985,32 +4251,39 @@ export async function startBusAgentRunner(params: {
               experimentalDownload,
               toolset,
               activeToolNames: selectedLevel1ToolNames(toolset, listSelectedCatalogIds()),
-            };
+            });
           };
 
-          let activeBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
+          const initialBinding = await waitForPreAgent(buildModelBinding(initialResolvedModel));
+          if (initialBinding.status === "error") {
+            return signalBusAgentRunnerHostFailure(initialBinding.error);
+          }
+          let activeBinding = initialBinding.value;
           modelCapabilityInfo = activeBinding.capabilityInfo;
           costEstimateStatus = activeBinding.costEstimateStatus;
           costEstimateReason = activeBinding.costEstimateReason;
 
-          logger.info("agent run starting", {
-            requestId: next.requestId,
-            sessionId: next.sessionId,
-            requestClient: next.requestClient,
-            runProfile,
-            subagentDepth: subagentMeta.depth,
-            sessionConfigId,
-            safetyMode,
-            requestModelOverride,
-            model: activeBinding.resolved.spec,
-            responseCommentary: activeBinding.resolved.responseCommentary === true,
-            editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
-            fallbackCount: modelPlan.fallbacks.length,
-            isRecoveryResume: Boolean(next.recovery),
-            messageCount: next.messages.length,
-            recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
-            queuedForSession: state.queue.length,
-          });
+          logger.info(
+            "agent run starting",
+            formatBridgeLogContext({
+              requestId: next.requestId,
+              sessionId: next.sessionId,
+              requestClient: next.requestClient,
+              runProfile,
+              subagentDepth: subagentMeta.depth,
+              sessionConfigId,
+              safetyMode,
+              requestModelOverride,
+              model: activeBinding.resolved.spec,
+              responseCommentary: activeBinding.resolved.responseCommentary === true,
+              editingToolMode: runProfile === "explore" ? "none" : activeBinding.editingToolMode,
+              fallbackCount: modelPlan.fallbacks.length,
+              isRecoveryResume: Boolean(next.recovery),
+              messageCount: next.messages.length,
+              recoveryCheckpointMessageCount: next.recovery?.checkpointMessages.length ?? 0,
+              queuedForSession: state.queue.length,
+            }),
+          );
 
           let agent: AiSdkPiAgent<ToolSet> | null = null;
           let activeModelIndex = 0;
@@ -4035,7 +4308,11 @@ export async function startBusAgentRunner(params: {
             });
             if (!nextFallback) return { ok: false as const, reason: "model fallback exhausted" };
 
-            const nextBinding = await buildModelBinding(nextFallback.candidate);
+            const builtNextBinding = await buildModelBinding(nextFallback.candidate);
+            if (builtNextBinding.status === "error") {
+              return signalBusAgentRunnerHostFailure(builtNextBinding.error);
+            }
+            const nextBinding = builtNextBinding.value;
             nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
             agent.setModel(
               nextBinding.resolved.model,
@@ -4103,13 +4380,16 @@ export async function startBusAgentRunner(params: {
               errorContext.abortSignal?.aborted !== true
             ) {
               disabledServerCompactionReplayKeys.add(activeNativeServerCompactionReplayKey);
-              logger.warn("OpenAI server compaction replay failed; retrying portable summary", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                modelSpec: activeBinding.resolved.spec,
-                ...projectedError.details,
-                error: projectedError.message,
-              });
+              logger.warn(
+                "OpenAI server compaction replay failed; retrying portable summary",
+                formatBridgeLogContext({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  modelSpec: activeBinding.resolved.spec,
+                  ...projectedError.details,
+                  error: projectedError.message,
+                }),
+              );
               activeNativeServerCompactionReplayKey = null;
               return "retry" as const;
             }
@@ -4119,9 +4399,9 @@ export async function startBusAgentRunner(params: {
             const claudeCodeToolMapping = completeLevel1ToolMapping(activeBinding.toolset);
             const continuationStore = params.transcriptStore;
             const materializeClaude = async (
-              nativeSession?: Parameters<typeof materializeClaudeCodeRun>[0]["nativeSession"],
+              nativeSession?: Parameters<typeof materializeClaudeCodeRunResult>[0]["nativeSession"],
             ) => {
-              const run = await (params.materializeClaudeCodeRun ?? materializeClaudeCodeRun)({
+              const options = {
                 modelId: activeBinding.resolved.modelId,
                 cwd: executionCwd,
                 tools: claudeCodeToolMapping.tools,
@@ -4138,7 +4418,22 @@ export async function startBusAgentRunner(params: {
                   }
                   return await activeAgent.executeExternalToolCall(request);
                 },
-              });
+              } satisfies Parameters<typeof materializeClaudeCodeRunResult>[0];
+              const materialized = params.materializeClaudeCodeRun
+                ? Result.ok(await params.materializeClaudeCodeRun(options))
+                : await materializeClaudeCodeRunResult(options);
+              if (materialized.status === "error") {
+                switch (materialized.error._tag) {
+                  case "ClaudeCodeRunInvalidConfiguration":
+                  case "ClaudeNativeSessionPreflightError":
+                  case "ClaudeCodeRunExternalFailure":
+                  case "ClaudeCodeBuiltInToolUnsupported":
+                  case "ClaudeCodeToolBridgeConfigurationFailed":
+                  case "ClaudeCodeRunOperationAndCleanupFailed":
+                    throw materialized.error;
+                }
+              }
+              const run = materialized.value;
               if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
               return run;
             };
@@ -4211,7 +4506,7 @@ export async function startBusAgentRunner(params: {
                 next.requestClient === "discord" &&
                 supportsCorePrimaryContinuationStore(continuationStore)
               ) {
-                corePrimaryClaudeRuntime = createCorePrimaryClaudeRuntime({
+                const createdPrimaryRuntime = createCorePrimaryClaudeRuntimeResult({
                   store: continuationStore,
                   sessionId: next.sessionId,
                   requestId: next.requestId,
@@ -4222,8 +4517,8 @@ export async function startBusAgentRunner(params: {
                   executionCwd,
                   getLineage: () => state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
                   materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
-                  onDiagnostic: (event, detail) => {
-                    const fields = { lifecycle: event, ...detail };
+                  onDiagnostic: (event, detail, error) => {
+                    const fields = formatClaudeLifecycleLogFields(event, detail, error);
                     if (
                       event === "native-source-invalid" ||
                       event === "candidate-observability-lost" ||
@@ -4241,11 +4536,15 @@ export async function startBusAgentRunner(params: {
                     }
                   },
                 });
+                if (createdPrimaryRuntime.status === "error") {
+                  return signalBusAgentRunnerHostFailure(createdPrimaryRuntime.error);
+                }
+                corePrimaryClaudeRuntime = createdPrimaryRuntime.value;
               } else if (
                 stableNamedContinuation !== null &&
                 supportsCoreNamedContinuationStore(continuationStore)
               ) {
-                coreNamedClaudeRuntime = createCoreNamedClaudeRuntime({
+                const createdNamedRuntime = createCoreNamedClaudeRuntimeResult({
                   store: continuationStore,
                   requestClient: stableNamedContinuation.requestClient,
                   sessionId: next.sessionId,
@@ -4258,8 +4557,8 @@ export async function startBusAgentRunner(params: {
                   sourceTranscript: seededSessionTranscript,
                   getCurrentTurnMessages: () => initialMessages,
                   materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
-                  onDiagnostic: (event, detail) => {
-                    const fields = { lifecycle: event, ...detail };
+                  onDiagnostic: (event, detail, error) => {
+                    const fields = formatClaudeLifecycleLogFields(event, detail, error);
                     if (
                       event === "native-source-invalid" ||
                       event === "candidate-observability-lost" ||
@@ -4277,6 +4576,10 @@ export async function startBusAgentRunner(params: {
                     }
                   },
                 });
+                if (createdNamedRuntime.status === "error") {
+                  return signalBusAgentRunnerHostFailure(createdNamedRuntime.error);
+                }
+                coreNamedClaudeRuntime = createdNamedRuntime.value;
               } else {
                 claudeCodeRun = await waitForPreAgent(materializeClaude());
               }
@@ -4494,15 +4797,8 @@ export async function startBusAgentRunner(params: {
             error?: string;
           }) => {
             const publishOne = async () => {
-              await publishAuxiliaryOutput(
-                "failed to publish auto-compaction tool status",
-                {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: update.toolCallId,
-                  status: update.status,
-                },
-                () => outputPublisher.publishToolCall(update),
+              await publishAuxiliaryOutput("failed to publish auto-compaction tool status", () =>
+                outputPublisher.publishToolCall(update),
               );
             };
 
@@ -4510,25 +4806,45 @@ export async function startBusAgentRunner(params: {
           };
           const reportServerCompactionError = (cause: unknown): void => {
             const error = projectBusAgentRunnerError(cause, "OpenAI server compaction failed");
-            logger.warn("OpenAI server compaction failed; using portable summary", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              modelSpec: activeBinding.resolved.spec,
-              ...error.details,
-              error: error.message,
-            });
+            logger.warn(
+              "OpenAI server compaction failed; using portable summary",
+              formatBridgeLogContext({
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                modelSpec: activeBinding.resolved.spec,
+                ...error.details,
+                error: error.message,
+              }),
+            );
           };
+          const resolveClaudeCompactionSummaryModel = (): LanguageModel =>
+            resolveCoreClaudeCompactionSummaryModel({
+              run:
+                claudeCodeRun ??
+                coreNamedClaudeRuntime?.currentRun() ??
+                corePrimaryClaudeRuntime?.currentRun() ??
+                null,
+              fallback: () => activeBinding.resolved.model,
+              onFailure: (error) => {
+                logger.warn(
+                  "Claude utility model construction failed; using model fallback",
+                  formatBridgeTaggedErrorForLog(error, {
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    modelSpec: activeBinding.resolved.spec,
+                    operation: error.operation,
+                  }),
+                );
+              },
+            });
 
           unsubscribeCompaction = await waitForPreAgent(
             attachAutoCompaction(agent, {
               model: activeBinding.resolved.spec,
               summaryModel:
-                claudeCodeRun?.createUtilityModel ??
-                coreNamedClaudeRuntime?.currentRun()?.createUtilityModel ??
-                corePrimaryClaudeRuntime?.currentRun()?.createUtilityModel ??
-                (activeBinding.resolved.provider === "claude-code"
-                  ? () => activeBinding.resolved.model
-                  : "current"),
+                activeBinding.resolved.provider === "claude-code"
+                  ? resolveClaudeCompactionSummaryModel
+                  : "current",
               modelCapability,
               thresholdInputSource:
                 activeBinding.resolved.provider === "claude-code" ? "transcript-estimate" : "usage",
@@ -4577,7 +4893,7 @@ export async function startBusAgentRunner(params: {
                     new Error("OpenAI server compaction is disabled for the active model"),
                   );
                 }
-                return await compactWithOpenAIResponses({
+                const compacted = await compactWithOpenAIResponsesResult({
                   model: agent.state.model,
                   replayKey: `${activeBinding.resolved.provider}:${activeBinding.resolved.spec}`,
                   portableSummary,
@@ -4588,6 +4904,15 @@ export async function startBusAgentRunner(params: {
                   reasoning: agent.state.reasoning,
                   abortSignal,
                 });
+                if (compacted.status === "error") {
+                  switch (compacted.error._tag) {
+                    case "OpenAIServerCompactionAborted":
+                    case "OpenAIServerCompactionRequestFailed":
+                    case "OpenAIServerCompactionOutputInvalid":
+                      throw compacted.error;
+                  }
+                }
+                return compacted.value;
               },
               serverCompactionEnabled: () => {
                 if (!activeBinding.resolved.openaiServerCompaction) return false;
@@ -4746,9 +5071,14 @@ export async function startBusAgentRunner(params: {
           const drainDeferredCompletions = async (input: {
             modelInputMessages: readonly ModelMessage[];
             abortSignal?: AbortSignal;
-          }): Promise<{ append: ModelMessage[]; forceNextTurn: boolean }> => {
+          }): Promise<
+            ResultType<
+              { append: ModelMessage[]; forceNextTurn: boolean },
+              BusAgentRunnerOperationFailed
+            >
+          > => {
             if (!liveParentSession) {
-              return { append: [], forceNextTurn: false };
+              return Result.ok({ append: [], forceNextTurn: false });
             }
 
             const pendingIdentities = liveParentSession.listPendingIdentities();
@@ -4760,28 +5090,34 @@ export async function startBusAgentRunner(params: {
             if (consumedBeforeMaterialization.length > 0) {
               await liveParentSession.acknowledge(consumedBeforeMaterialization);
             }
-            if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
+            if (input.abortSignal?.aborted) {
+              return Result.ok({ append: [], forceNextTurn: false });
+            }
 
             const queried = await captureBusAgentRunnerOperation(
               "workflow subagent completion query",
               () => liveParentSession.listPendingSettledAsync(),
             );
             if (queried.status === "error") {
-              logger.warn("workflow subagent completion query failed; delivery remains pending", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                error: queried.error.message,
-              });
-              return { append: [], forceNextTurn: false };
+              logger.warn(
+                "workflow subagent completion query failed; delivery remains pending",
+                formatBridgeTaggedErrorForLog(queried.error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
+              return Result.err(queried.error);
             }
             const settled = queried.value;
 
-            if (input.abortSignal?.aborted) return { append: [], forceNextTurn: false };
+            if (input.abortSignal?.aborted) {
+              return Result.ok({ append: [], forceNextTurn: false });
+            }
 
             const completions: WorkflowLiveParentCompletion[] = [];
             for (const result of settled) {
               let completion: WorkflowLiveParentCompletion | null = null;
-              let materializationError: BusAgentRunnerOperationFailed | undefined;
+              let materializationError: BusAgentRunnerErrorProjection | undefined;
               if (result.loaded) {
                 const normalized = await captureBusAgentRunnerOperation(
                   "workflow subagent completion materialization",
@@ -4798,18 +5134,16 @@ export async function startBusAgentRunner(params: {
                     finalText: normalized.value,
                   };
                 } else {
-                  materializationError = normalized.error;
+                  materializationError = {
+                    message: normalized.error.message,
+                    details: normalized.error.details,
+                  };
                 }
               } else {
-                const projected = projectBusAgentRunnerError(
-                  result.error,
+                materializationError = projectBusAgentRunnerError(
+                  result,
                   "Workflow subagent completion load failed",
                 );
-                materializationError = new BusAgentRunnerOperationFailed({
-                  operation: "workflow subagent completion load",
-                  cause: result.error,
-                  message: projected.message,
-                });
               }
 
               if (completion) {
@@ -4827,14 +5161,17 @@ export async function startBusAgentRunner(params: {
                 identity.runId,
                 errorMessage,
               );
-              logger.warn("workflow subagent completion materialization failed", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                runId: identity.runId,
-                attempts,
-                maxAttempts: SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS,
-                error: errorMessage,
-              });
+              logger.warn(
+                "workflow subagent completion materialization failed",
+                formatBridgeLogContext({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  runId: identity.runId,
+                  attempts,
+                  maxAttempts: SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS,
+                  errorMessage,
+                }),
+              );
               if (attempts === null || attempts < SUBAGENT_RESULT_MATERIALIZATION_ATTEMPTS)
                 continue;
               if (!liveParentSession.isPending(identity.runId)) continue;
@@ -4877,10 +5214,10 @@ export async function startBusAgentRunner(params: {
               if (published.status === "ok") {
                 publishedDeferredCompletionRunIds.add(completion.runId);
               } else {
-                logger.warn("workflow subagent completion publish failed", {
-                  runId: completion.runId,
-                  error: published.error.message,
-                });
+                logger.warn(
+                  "workflow subagent completion publish failed",
+                  formatBridgeTaggedErrorForLog(published.error, { runId: completion.runId }),
+                );
               }
             }
 
@@ -4907,7 +5244,16 @@ export async function startBusAgentRunner(params: {
               if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
             }
 
-            return { append: finalPlan.append, forceNextTurn: finalPlan.forceNextTurn };
+            return Result.ok({
+              append: finalPlan.append,
+              forceNextTurn: finalPlan.forceNextTurn,
+            });
+          };
+          const adaptDeferredDrainToHost = (
+            drained: Awaited<ReturnType<typeof drainDeferredCompletions>>,
+          ): { append: ModelMessage[]; forceNextTurn: boolean } => {
+            if (drained.status === "error") return { append: [], forceNextTurn: false };
+            return drained.value;
           };
           let pendingSilentTurnStartIndex: number | null = null;
           const removePendingSilentTurn = () => {
@@ -4944,10 +5290,11 @@ export async function startBusAgentRunner(params: {
             removePendingSilentTurn();
 
             lastBoundaryModelInputMessages = context.modelInputMessages;
-            return await drainDeferredCompletions({
+            const drained = await drainDeferredCompletions({
               modelInputMessages: context.modelInputMessages,
               abortSignal: context.abortSignal,
             });
+            return adaptDeferredDrainToHost(drained);
           });
 
           state.agent = agent;
@@ -5073,12 +5420,14 @@ export async function startBusAgentRunner(params: {
                 filePath,
               });
             } else {
-              logger.warn("context dump failed", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                filePath,
-                error: dumped.error.message,
-              });
+              logger.warn(
+                "context dump failed",
+                formatBridgeTaggedErrorForLog(dumped.error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  filePath,
+                }),
+              );
             }
           };
 
@@ -5171,24 +5520,27 @@ export async function startBusAgentRunner(params: {
                 roundEstimatedCostCount += 1;
               }
 
-              logger.info("agent.round.stats", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                round: turnEndCount,
-                finishReason: event.finishReason,
-                inputTokens: event.usage.inputTokens,
-                outputTokens: event.usage.outputTokens,
-                totalTokens: event.usage.totalTokens,
-                cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
-                cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
-                estimatedCostUsd: roundEstimatedCostUsd,
-                estimatedCostUsdTotal: roundEstimatedCostUsdTotal,
-                modelSpec: activeBinding.resolved.spec,
-                costEstimateStatus:
-                  roundEstimatedCostUsd !== undefined ? "estimated" : costEstimateStatus,
-                costEstimateReason:
-                  roundEstimatedCostUsd === undefined ? costEstimateReason : undefined,
-              });
+              logger.info(
+                "agent.round.stats",
+                formatBridgeLogContext({
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  round: turnEndCount,
+                  finishReason: event.finishReason,
+                  inputTokens: event.usage.inputTokens,
+                  outputTokens: event.usage.outputTokens,
+                  totalTokens: event.usage.totalTokens,
+                  cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
+                  cacheWriteTokens: event.usage.inputTokenDetails.cacheWriteTokens,
+                  estimatedCostUsd: roundEstimatedCostUsd,
+                  estimatedCostUsdTotal: roundEstimatedCostUsdTotal,
+                  modelSpec: activeBinding.resolved.spec,
+                  costEstimateStatus:
+                    roundEstimatedCostUsd !== undefined ? "estimated" : costEstimateStatus,
+                  costEstimateReason:
+                    roundEstimatedCostUsd === undefined ? costEstimateReason : undefined,
+                }),
+              );
 
               // Fire-and-forget debug dump; do not block the run.
               void dumpContextAfterTurn(event);
@@ -5256,14 +5608,11 @@ export async function startBusAgentRunner(params: {
               if (retryAttemptHadReasoning) {
                 reasoningChunkState.chunks.clear();
                 reasoningChunkState.seq += 1;
-                void publishAuxiliaryOutput(
-                  "failed to clear reasoning after model retry",
-                  { requestId: headers.request_id, sessionId: headers.session_id },
-                  () =>
-                    outputPublisher.publishReasoningBoundary({
-                      delta: "",
-                      seq: reasoningChunkState.seq,
-                    }),
+                void publishAuxiliaryOutput("failed to clear reasoning after model retry", () =>
+                  outputPublisher.publishReasoningBoundary({
+                    delta: "",
+                    seq: reasoningChunkState.seq,
+                  }),
                 );
               }
               retryAttemptHadReasoning = false;
@@ -5370,10 +5719,8 @@ export async function startBusAgentRunner(params: {
               retryAttemptHadReasoning = true;
               consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
 
-              void publishAuxiliaryOutput(
-                "failed to publish reasoning start",
-                { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                () => outputPublisher.publishReasoningBoundary({ delta: "" }),
+              void publishAuxiliaryOutput("failed to publish reasoning start", () =>
+                outputPublisher.publishReasoningBoundary({ delta: "" }),
               );
             }
 
@@ -5390,10 +5737,8 @@ export async function startBusAgentRunner(params: {
                 delta,
               });
               if (update.publishStart) {
-                void publishAuxiliaryOutput(
-                  "failed to publish implicit reasoning start",
-                  { requestId: headers.request_id, sessionId: headers.session_id, chunkId },
-                  () => outputPublisher.publishReasoningBoundary({ delta: "" }),
+                void publishAuxiliaryOutput("failed to publish implicit reasoning start", () =>
+                  outputPublisher.publishReasoningBoundary({ delta: "" }),
                 );
               }
 
@@ -5421,20 +5766,12 @@ export async function startBusAgentRunner(params: {
               });
 
               if (event.toolName !== "batch") {
-                void publishAuxiliaryOutput(
-                  "failed to publish tool start",
-                  {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
+                void publishAuxiliaryOutput("failed to publish tool start", () =>
+                  outputPublisher.publishToolCall({
                     toolCallId: event.toolCallId,
-                    toolName: event.toolName,
-                  },
-                  () =>
-                    outputPublisher.publishToolCall({
-                      toolCallId: event.toolCallId,
-                      status: "start",
-                      display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
-                    }),
+                    status: "start",
+                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                  }),
                 );
               }
             }
@@ -5451,7 +5788,7 @@ export async function startBusAgentRunner(params: {
               });
               const deferredAccepted =
                 event.toolName === "subagent_delegate" &&
-                isDeferredSubagentAcceptedResult(event.result);
+                decodeDeferredSubagentAcceptedResult(event.result) !== null;
 
               let ok: boolean;
               switch (event.toolName) {
@@ -5469,35 +5806,41 @@ export async function startBusAgentRunner(params: {
               const toolFailureError = toolFailure.error ?? "tool failed";
 
               if (!ok) {
-                logger.warn("tool call failed", {
+                logger.warn(
+                  "tool call failed",
+                  formatBridgeLogContext({
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    toolCallId: event.toolCallId,
+                    toolName: event.toolName,
+                    durationMs: toolDurationMs,
+                    failureKind: toolFailure.failureKind ?? "soft",
+                    error: interruptedForRestart ? "server restarted" : toolFailureError,
+                    argsPreview: formatToolLogPreview({
+                      toolName: event.toolName,
+                      value: event.args,
+                    }),
+                    resultPreview: formatToolLogPreview({
+                      toolName: event.toolName,
+                      value: event.result,
+                    }),
+                  }),
+                );
+              }
+
+              logger.debug(
+                "tool finished",
+                formatBridgeLogContext({
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                   toolCallId: event.toolCallId,
                   toolName: event.toolName,
+                  ok,
+                  deferredAccepted,
                   durationMs: toolDurationMs,
-                  failureKind: toolFailure.failureKind ?? "soft",
-                  error: interruptedForRestart ? "server restarted" : toolFailureError,
-                  argsPreview: formatToolLogPreview({
-                    toolName: event.toolName,
-                    value: event.args,
-                  }),
-                  resultPreview: formatToolLogPreview({
-                    toolName: event.toolName,
-                    value: event.result,
-                  }),
-                });
-              }
-
-              logger.debug("tool finished", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                toolCallId: event.toolCallId,
-                toolName: event.toolName,
-                ok,
-                deferredAccepted,
-                durationMs: toolDurationMs,
-                failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
-              });
+                  failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
+                }),
+              );
 
               if (event.toolName === "batch" || deferredAccepted) {
                 return;
@@ -5507,22 +5850,14 @@ export async function startBusAgentRunner(params: {
               if (!ok) {
                 publishedToolError = interruptedForRestart ? "server restarted" : toolFailureError;
               }
-              void publishAuxiliaryOutput(
-                "failed to publish tool end",
-                {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
+              void publishAuxiliaryOutput("failed to publish tool end", () =>
+                outputPublisher.publishToolCall({
                   toolCallId: event.toolCallId,
-                  toolName: event.toolName,
-                },
-                () =>
-                  outputPublisher.publishToolCall({
-                    toolCallId: event.toolCallId,
-                    status: "end",
-                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
-                    ok,
-                    error: publishedToolError,
-                  }),
+                  status: "end",
+                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                  ok,
+                  error: publishedToolError,
+                }),
               );
             }
 
@@ -5561,8 +5896,10 @@ export async function startBusAgentRunner(params: {
             const mergedInitial = mergeQueuedForSameRequest(next, state.queue);
             if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
             const control = parseRequestControlFromRaw(next.raw);
-            const reportAutoInjectedThreadSearchError = (message: string, cause: unknown): void => {
-              const error = projectBusAgentRunnerError(cause, message);
+            const reportAutoInjectedThreadSearchError = (
+              message: string,
+              error: BusAgentRunnerErrorProjection,
+            ): void => {
               logger.warn(message, {
                 requestId: headers.request_id,
                 sessionId: headers.session_id,
@@ -5640,16 +5977,16 @@ export async function startBusAgentRunner(params: {
           runIdleWatchdog?.start();
 
           if (parsedCustomCommand) {
-            await waitForRun(agent.continue());
+            await waitForRunAtHost(agent.continue());
           } else if (initialMessagesEndWithInjectedTool) {
             agent.appendMessages(initialMessages);
-            await waitForRun(agent.continue());
+            await waitForRunAtHost(agent.continue());
           } else {
-            await waitForRun(agent.prompt(initialMessages));
+            await waitForRunAtHost(agent.prompt(initialMessages));
           }
 
           while (true) {
-            await waitForRun(agent.waitForIdle());
+            await waitForRunAtHost(agent.waitForIdle());
 
             if (restartAbortRequestIds.delete(headers.request_id)) {
               return signalBusAgentRunnerHostFailure(new RestartDrainingAbort());
@@ -5659,15 +5996,16 @@ export async function startBusAgentRunner(params: {
             const deferredWaitState = liveParentSession?.snapshot();
 
             if (liveParentSession && deferredWaitState?.hasPendingCompletions) {
-              const decision = await drainDeferredCompletions({
+              const drained = await drainDeferredCompletions({
                 modelInputMessages: lastBoundaryModelInputMessages,
               });
+              const decision = adaptDeferredDrainToHost(drained);
               if (decision.append.length > 0) agent.appendMessages(decision.append);
               if (cancelledByRequestId.has(headers.request_id)) break;
               if (decision.append.length > 0 || decision.forceNextTurn) {
-                await waitForRun(agent.continue());
+                await waitForRunAtHost(agent.continue());
               } else if (liveParentSession.snapshot().hasPendingCompletions) {
-                await waitForRun(
+                await waitForRunAtHost(
                   waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
                 );
               }
@@ -5679,7 +6017,7 @@ export async function startBusAgentRunner(params: {
             }
             if (!liveParentSession) break;
 
-            await waitForRun(
+            await waitForRunAtHost(
               waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion),
             );
             if (agent.state.isStreaming) {
@@ -5822,11 +6160,15 @@ export async function startBusAgentRunner(params: {
                 if (savedTranscript.status === "error") {
                   coreNamedClaudeRuntime?.markTerminalFailure(false);
                   corePrimaryClaudeRuntime?.markTerminalFailure(false);
-                  logger.error("failed to persist transcript", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    errorTag: savedTranscript.error.name,
-                  });
+                  logger.error(
+                    "failed to persist transcript",
+                    formatBridgeLogContext({
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      errorTag: savedTranscript.error.name,
+                      errorMessage: savedTranscript.error.message,
+                    }),
+                  );
                   return;
                 }
                 if (coreNamedClaudeRuntime && !isCancelled) {
@@ -5857,11 +6199,14 @@ export async function startBusAgentRunner(params: {
                   });
                   const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
                   isCancelled ||= cancelledDuringFinalization;
-                  logger.info("Core named Claude binding promotion", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    promoted,
-                  });
+                  logger.info(
+                    "Core named Claude binding promotion",
+                    formatBridgeLogContext({
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      promoted,
+                    }),
+                  );
                 }
                 if (corePrimaryClaudeRuntime && !isCancelled && canPublishCorePrimaryClaude) {
                   if (!providerState) {
@@ -5899,33 +6244,41 @@ export async function startBusAgentRunner(params: {
                   });
                   const cancelledDuringFinalization = cancelledByRequestId.has(headers.request_id);
                   isCancelled ||= cancelledDuringFinalization;
-                  logger.info("Core primary Claude binding promotion", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    promoted,
-                  });
+                  logger.info(
+                    "Core primary Claude binding promotion",
+                    formatBridgeLogContext({
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      promoted,
+                    }),
+                  );
                 } else if (corePrimaryClaudeRuntime && !isCancelled) {
                   corePrimaryClaudeRuntime.markTerminalFailure(false);
                 }
                 if (isCompactionCheckpoint) {
-                  logger.info("compaction checkpoint persisted", {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    messageCount: persistedMessages.length,
-                    compactionCount: completedCompactionCount,
-                    formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
-                  });
+                  logger.info(
+                    "compaction checkpoint persisted",
+                    formatBridgeLogContext({
+                      requestId: headers.request_id,
+                      sessionId: headers.session_id,
+                      messageCount: persistedMessages.length,
+                      compactionCount: completedCompactionCount,
+                      formatVersion: COMPACTION_CHECKPOINT_FORMAT_VERSION,
+                    }),
+                  );
                 }
               },
             );
             if (persistedTranscript.status === "error") {
               coreNamedClaudeRuntime?.markTerminalFailure(false);
               corePrimaryClaudeRuntime?.markTerminalFailure(false);
-              logger.error("failed to persist transcript", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                error: persistedTranscript.error.message,
-              });
+              logger.error(
+                "failed to persist transcript",
+                formatBridgeTaggedErrorForLog(persistedTranscript.error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
             }
           }
           if (corePrimaryClaudeRuntime && shouldSkipSurfaceReply) {
@@ -5965,11 +6318,13 @@ export async function startBusAgentRunner(params: {
                 }),
             );
             if (persistedHandoffs.status === "error") {
-              logger.error("failed to persist heartbeat handoff transcripts", {
-                requestId: headers.request_id,
-                sessionId: headers.session_id,
-                error: persistedHandoffs.error.message,
-              });
+              logger.error(
+                "failed to persist heartbeat handoff transcripts",
+                formatBridgeTaggedErrorForLog(persistedHandoffs.error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                }),
+              );
             }
           }
 
@@ -6036,43 +6391,50 @@ export async function startBusAgentRunner(params: {
               : undefined,
           });
 
-          logger.info(statsLine, {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            turns: turnEndCount,
-            estimatedCostUsd: estimatedCostUsdTotal,
-            costEstimateStatus: resolvedCostEstimateStatus,
-            costEstimateReason: resolvedCostEstimateReason,
-            estimatedCostTurnCoverage:
-              turnEndCount > 0 ? roundEstimatedCostCount / turnEndCount : undefined,
-          });
+          logger.info(
+            "agent run stats",
+            formatBridgeLogContext({
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              statsLine,
+              turns: turnEndCount,
+              estimatedCostUsd: estimatedCostUsdTotal,
+              costEstimateStatus: resolvedCostEstimateStatus,
+              costEstimateReason: resolvedCostEstimateReason,
+              estimatedCostTurnCoverage:
+                turnEndCount > 0 ? roundEstimatedCostCount / turnEndCount : undefined,
+            }),
+          );
 
-          logger.info("agent run resolved", {
-            requestId: headers.request_id,
-            sessionId: headers.session_id,
-            model: activeBinding.resolved.spec,
-            durationMs: Date.now() - runStartedAt,
-            finalTextChars: finalText.length,
-            turns: turnEndCount,
-            estimatedCostUsd: estimatedCostUsdTotal,
-            costEstimateStatus: resolvedCostEstimateStatus,
-            costEstimateReason: resolvedCostEstimateReason,
-          });
+          logger.info(
+            "agent run resolved",
+            formatBridgeLogContext({
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              model: activeBinding.resolved.spec,
+              durationMs: Date.now() - runStartedAt,
+              finalTextChars: finalText.length,
+              turns: turnEndCount,
+              estimatedCostUsd: estimatedCostUsdTotal,
+              costEstimateStatus: resolvedCostEstimateStatus,
+              costEstimateReason: resolvedCostEstimateReason,
+            }),
+          );
         },
         (panic) => {
           terminalPanic = panic;
         },
       );
       if (runResult.status === "error") {
-        const e = runResult.error.cause;
+        const failure = runResult.error;
         const failedCoreNamedRuntime = getCoreNamedClaudeRuntime();
         const failedCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
         runIdleWatchdog?.stop();
 
-        if (e instanceof RestartDrainingAbort) {
+        if (failure.failureKind === "restart-draining") {
           failedCoreNamedRuntime?.markUncertain();
           failedCorePrimaryRuntime?.markUncertain();
-        } else if (e instanceof PreAgentRunCancelledError) {
+        } else if (failure.failureKind === "pre-agent-cancelled") {
           failedCoreNamedRuntime?.markTerminalFailure(true);
           failedCorePrimaryRuntime?.markTerminalFailure(true);
         } else {
@@ -6084,12 +6446,10 @@ export async function startBusAgentRunner(params: {
           const { toolCallId, display } = activeCustomCommandTool;
           activeCustomCommandTool = null;
           let customCommandError: string;
-          if (e instanceof PreAgentRunCancelledError) {
+          if (failure.failureKind === "pre-agent-cancelled") {
             customCommandError = "cancelled by interrupt";
-          } else if (e instanceof Error) {
-            customCommandError = e.message;
           } else {
-            customCommandError = projectBusAgentRunnerError(e).message;
+            customCommandError = failure.displayMessage;
           }
           await captureBusAgentRunnerOperation("custom command failure status publish", () =>
             outputPublisher.publishToolCall({
@@ -6104,7 +6464,8 @@ export async function startBusAgentRunner(params: {
 
         const timedOutOperation = getActiveRunOperation();
         if (
-          (e instanceof AgentIdleTimeoutError || e instanceof PreAgentRunCancelledError) &&
+          (failure.failureKind === "idle-timeout" ||
+            failure.failureKind === "pre-agent-cancelled") &&
           timedOutOperation
         ) {
           const observeTimedOutOperation = captureBusAgentRunnerOperation(
@@ -6119,16 +6480,19 @@ export async function startBusAgentRunner(params: {
             Bun.sleep(AGENT_TIMEOUT_ABORT_GRACE_MS).then(() => false),
           ]);
           if (!settled) {
-            logger.warn("agent operation did not settle after cancellation grace period", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              reason: e instanceof AgentIdleTimeoutError ? "idle_timeout" : "cancelled",
-              abortGraceMs: AGENT_TIMEOUT_ABORT_GRACE_MS,
-            });
+            logger.warn(
+              "agent operation did not settle after cancellation grace period",
+              formatBridgeLogContext({
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                reason: failure.failureKind === "idle-timeout" ? "idle_timeout" : "cancelled",
+                abortGraceMs: AGENT_TIMEOUT_ABORT_GRACE_MS,
+              }),
+            );
           }
         }
 
-        if (e instanceof RestartDrainingAbort) {
+        if (failure.failureKind === "restart-draining") {
           preserveWorkflowClaim = true;
           if (workflowHint) {
             params.durableWorkflowStore?.releaseWorkflowRequestClaim(
@@ -6145,7 +6509,7 @@ export async function startBusAgentRunner(params: {
           return;
         }
 
-        if (e instanceof PreAgentRunCancelledError) {
+        if (failure.failureKind === "pre-agent-cancelled") {
           if (liveParentSession) {
             await captureBusAgentRunnerOperation("cancel deferred subagents", () =>
               liveParentSession.cancelAll("parent request cancelled"),
@@ -6161,7 +6525,7 @@ export async function startBusAgentRunner(params: {
           return;
         }
 
-        const rawMsg = formatUnknownErrorForDisplay(e);
+        const rawMsg = failure.displayMessage;
         const msg = maybeAppendWarningSummaryToUnclearError(
           rawMsg,
           summarizeCallWarnings(streamWarnings),
@@ -6212,17 +6576,23 @@ export async function startBusAgentRunner(params: {
             },
           );
           if (persistedFailure.status === "error") {
-            logger.error("failed to persist transcript after error", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              error: persistedFailure.error.message,
-            });
+            logger.error(
+              "failed to persist transcript after error",
+              formatBridgeTaggedErrorForLog(persistedFailure.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
           } else if (persistedFailure.value.status === "error") {
-            logger.error("failed to persist transcript after error", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              errorTag: persistedFailure.value.error.name,
-            });
+            logger.error(
+              "failed to persist transcript after error",
+              formatBridgeLogContext({
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                errorTag: persistedFailure.value.error.name,
+                errorMessage: persistedFailure.value.error.message,
+              }),
+            );
           }
         }
 
@@ -6232,11 +6602,13 @@ export async function startBusAgentRunner(params: {
             () => liveParentSession.cancelAll(`parent run failed: ${msg}`),
           );
           if (cancelledSubagents.status === "error") {
-            logger.warn("failed to cancel deferred subagents after parent failure", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              error: cancelledSubagents.error.message,
-            });
+            logger.warn(
+              "failed to cancel deferred subagents after parent failure",
+              formatBridgeTaggedErrorForLog(cancelledSubagents.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
           }
         }
 
@@ -6263,11 +6635,13 @@ export async function startBusAgentRunner(params: {
             },
           );
           if (persistedFailureHandoffs.status === "error") {
-            logger.error("failed to persist heartbeat handoff transcripts after error", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              error: persistedFailureHandoffs.error.message,
-            });
+            logger.error(
+              "failed to persist heartbeat handoff transcripts after error",
+              formatBridgeTaggedErrorForLog(persistedFailureHandoffs.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
           }
         }
         await publishCurrentLifecycle({
@@ -6284,15 +6658,21 @@ export async function startBusAgentRunner(params: {
         });
         await outputPublisher.publishResponseText({ finalText: `Error: ${msg}` });
 
-        const projectedError = projectBusAgentRunnerError(e, "Agent run failed");
-        logger.error("agent run failed", {
-          requestId: headers.request_id,
-          sessionId: headers.session_id,
-          durationMs: Date.now() - runStartedAt,
-          model: resolvedModelLabel,
-          ...projectedError.details,
-          error: projectedError.message,
-        });
+        const projectedError: BusAgentRunnerErrorProjection = {
+          message: failure.message,
+          details: failure.details,
+        };
+        logger.error(
+          "agent run failed",
+          formatBridgeLogContext({
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            durationMs: Date.now() - runStartedAt,
+            model: resolvedModelLabel,
+            ...projectedError.details,
+            errorMessage: projectedError.message,
+          }),
+        );
       }
     } finally {
       const cleanupCoreNamedRuntime = getCoreNamedClaudeRuntime();
@@ -6389,11 +6769,13 @@ export async function startBusAgentRunner(params: {
             () => runtime.retireAtRunEnd(),
           );
           if (retired.status === "error") {
-            logger.warn("failed to retire Core named Claude runtime", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              error: retired.error.message,
-            });
+            logger.warn(
+              "failed to retire Core named Claude runtime",
+              formatBridgeTaggedErrorForLog(retired.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
           }
         }
         if (cleanupCorePrimaryRuntime) {
@@ -6403,11 +6785,13 @@ export async function startBusAgentRunner(params: {
             () => runtime.retireAtRunEnd(),
           );
           if (retired.status === "error") {
-            logger.warn("failed to retire Core primary Claude runtime", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              error: retired.error.message,
-            });
+            logger.warn(
+              "failed to retire Core primary Claude runtime",
+              formatBridgeTaggedErrorForLog(retired.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
           }
         }
         if (cleanupClaudeCodeRun) {
@@ -6416,11 +6800,13 @@ export async function startBusAgentRunner(params: {
             run.dispose(),
           );
           if (disposed.status === "error") {
-            logger.warn("failed to dispose Claude Code run resources", {
-              requestId: headers.request_id,
-              sessionId: headers.session_id,
-              error: disposed.error.message,
-            });
+            logger.warn(
+              "failed to dispose Claude Code run resources",
+              formatBridgeTaggedErrorForLog(disposed.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
           }
         }
         await liveParentSession?.close();
@@ -6511,11 +6897,12 @@ async function publishLifecycle(params: {
   state: RequestLifecycleState;
   detail?: string;
 }) {
-  await params.bus.publish(
+  const published = await params.bus.publish(
     lilacEventTypes.EvtRequestLifecycleChanged,
     { state: params.state, detail: params.detail, ts: Date.now() },
     { headers: params.headers },
   );
+  if (published.status === "error") signalBusAgentRunnerHostFailure(published.error);
 }
 
 function mergeQueuedForSameRequest(first: Enqueued, queue: Enqueued[]): ModelMessage[] {

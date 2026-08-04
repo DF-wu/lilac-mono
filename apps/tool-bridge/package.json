@@ -23,6 +23,7 @@
     "@stanley2058/lilac-utils": "workspace:*",
     "@stanley2058/simple-module-logger": "^0.0.4",
     "@toon-format/toon": "^2.1.0",
+    "better-result": "catalog:",
     "zod": "^4.3.6"
   }
 }

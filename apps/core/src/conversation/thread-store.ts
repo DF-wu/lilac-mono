@@ -9,7 +9,7 @@ import {
   type PersistedDataError,
   type PersistedDataIssueCode,
 } from "@stanley2058/lilac-utils";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
   ConversationThreadEmbeddingFacet,
@@ -28,6 +28,7 @@ import { splitByDiscordWindowOldestToNewest } from "../surface/discord/merge-win
 import { parseLeadingContinueDirective } from "../surface/bridge/bus-request-router/common";
 import { configureSqliteConnection } from "../shared/sqlite";
 import type { DiscordSearchIndexedMessage } from "../surface/store/discord-search-store";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
 const SEARCH_LIMIT_MAX = 50;
 const THREAD_DISCOVERY_GAP_MS = 60 * 60 * 1000;
@@ -244,21 +245,33 @@ export type ConversationThreadPersistenceDiagnostic = {
 export class ConversationThreadSqliteDriverFailure extends TaggedError(
   "ConversationThreadSqliteDriverFailure",
 )<{
-  readonly operation: "upsert-summary";
+  readonly operation:
+    | "attach-surface-db"
+    | "inspect-surface-db"
+    | "load-vector-extension"
+    | "upsert-summary";
   readonly code: string;
   readonly message: string;
 }> {}
 
 function classifyConversationThreadSqliteDriverFailure(
   cause: Error,
+  operation: ConversationThreadSqliteDriverFailure["operation"] = "upsert-summary",
 ): ConversationThreadSqliteDriverFailure | undefined {
   const sqliteError = classifyBunSqliteError(cause);
   if (sqliteError === undefined) return undefined;
   return new ConversationThreadSqliteDriverFailure({
-    operation: "upsert-summary",
+    operation,
     code: sqliteError.code,
     message: "Conversation thread summary SQLite write failed",
   });
+}
+
+function signalConversationThreadStoreDefect(cause: unknown): never {
+  if (cause instanceof Error) return adaptToolResultToHost(Result.err(cause));
+  return adaptToolResultToHost(
+    Result.err(new Panic({ message: "Conversation thread store defect", cause })),
+  );
 }
 
 function stableHash(input: string): string {
@@ -652,47 +665,73 @@ export class ConversationThreadStore {
   }
 
   private loadVectorExtension(): void {
-    try {
-      sqliteVec.load(this.db);
+    const loaded = Result.try({
+      try: () => sqliteVec.load(this.db),
+      catch: (cause) => cause,
+    });
+    if (loaded.status === "ok") {
       this.vectorLoaded = true;
       this.vectorLoadError = null;
-    } catch (e) {
+    } else {
+      if (!(loaded.error instanceof Error))
+        return signalConversationThreadStoreDefect(loaded.error);
+      const sqliteFailure = classifyConversationThreadSqliteDriverFailure(
+        loaded.error,
+        "load-vector-extension",
+      );
+      if (!sqliteFailure) return signalConversationThreadStoreDefect(loaded.error);
       this.vectorLoaded = false;
-      this.vectorLoadError = e instanceof Error ? e.message : String(e);
+      this.vectorLoadError = sqliteFailure.message;
     }
   }
 
   private attachSurfaceDb(): boolean {
     const surfaceDbPath = this.surfaceDbPath;
     if (!surfaceDbPath || surfaceDbPath === this.searchDbPath) return false;
-    try {
-      this.db.run(`ATTACH DATABASE ${sqlString(surfaceDbPath)} AS surface`);
-      if (!this.hasRequiredSurfaceTables()) {
-        this.db.run("DETACH DATABASE surface");
-        return false;
-      }
-      return true;
-    } catch {
-      return false;
+    const attached = Result.try({
+      try: () => {
+        this.db.run(`ATTACH DATABASE ${sqlString(surfaceDbPath)} AS surface`);
+        if (!this.hasRequiredSurfaceTables()) {
+          this.db.run("DETACH DATABASE surface");
+          return false;
+        }
+        return true;
+      },
+      catch: (cause) => cause,
+    });
+    if (attached.status === "ok") return attached.value;
+    if (!(attached.error instanceof Error))
+      return signalConversationThreadStoreDefect(attached.error);
+    if (!classifyConversationThreadSqliteDriverFailure(attached.error, "attach-surface-db")) {
+      return signalConversationThreadStoreDefect(attached.error);
     }
+    return false;
   }
 
   private hasRequiredSurfaceTables(): boolean {
-    try {
-      const rows = this.db
-        .query(
-          `
+    const checked = Result.try({
+      try: () => {
+        const rows = this.db
+          .query(
+            `
           SELECT name
           FROM surface.sqlite_master
           WHERE type = 'table'
             AND name IN ('discord_sessions', 'discord_message_relations')
           `,
-        )
-        .all() as Array<{ name: string }>;
-      return rows.length === 2;
-    } catch {
-      return false;
+          )
+          .all() as Array<{ name: string }>;
+        return rows.length === 2;
+      },
+      catch: (cause) => cause,
+    });
+    if (checked.status === "ok") return checked.value;
+    if (!(checked.error instanceof Error))
+      return signalConversationThreadStoreDefect(checked.error);
+    if (!classifyConversationThreadSqliteDriverFailure(checked.error, "inspect-surface-db")) {
+      return signalConversationThreadStoreDefect(checked.error);
     }
+    return false;
   }
 
   private ensureSurfaceDb(): boolean {
@@ -1029,6 +1068,7 @@ export class ConversationThreadStore {
         })) {
           if (!this.hasMainAgentMessage(group)) continue;
           const threadId = this.upsertInferredThread(group);
+          if (!threadId) continue;
           activeThreadIds.add(threadId);
           threadCount += 1;
         }
@@ -1101,9 +1141,9 @@ export class ConversationThreadStore {
     return messages.some((message) => isMainAgentMessageRow(message, this.mainAgentUserNames));
   }
 
-  private upsertInferredThread(messages: readonly IndexedMessageRow[]): string {
+  private upsertInferredThread(messages: readonly IndexedMessageRow[]): string | null {
     const first = messages[0];
-    if (!first) throw new Error("cannot upsert empty thread");
+    if (!first) return null;
     return this.upsertThread({
       threadId: `discord:channel:${first.channel_id}:${first.message_id}`,
       kind: "inferred_channel_thread",
@@ -1117,10 +1157,10 @@ export class ConversationThreadStore {
     kind: ConversationThreadKind;
     parentChannelId: string | null;
     messages: readonly IndexedMessageRow[];
-  }): string {
+  }): string | null {
     const first = input.messages[0];
     const last = input.messages.at(-1);
-    if (!first || !last) throw new Error("cannot upsert empty thread");
+    if (!first || !last) return null;
 
     const now = Date.now();
     const updatedAt = Math.max(...input.messages.map((message) => message.updated_ts));
@@ -1235,8 +1275,10 @@ export class ConversationThreadStore {
 
   getThread(threadId: string): ConversationThreadRow | null {
     return this.db
-      .query("SELECT * FROM conversation_threads WHERE thread_id = ?")
-      .get(threadId) as ConversationThreadRow | null;
+      .query<ConversationThreadRow, [string]>(
+        "SELECT * FROM conversation_threads WHERE thread_id = ?",
+      )
+      .get(threadId);
   }
 
   getSummary(threadId: string): ResultType<ConversationThreadSummary | null, PersistedDataError> {
@@ -1301,7 +1343,7 @@ export class ConversationThreadStore {
 
   countThreadMessages(threadId: string): number {
     const row = this.db
-      .query(
+      .query<{ c: number }, [string]>(
         `
         SELECT COUNT(1) AS c
         FROM conversation_thread_messages tm
@@ -1312,7 +1354,7 @@ export class ConversationThreadStore {
           AND m.deleted = 0
         `,
       )
-      .get(threadId) as { c: number };
+      .get(threadId);
     return typeof row?.c === "number" ? row.c : 0;
   }
 

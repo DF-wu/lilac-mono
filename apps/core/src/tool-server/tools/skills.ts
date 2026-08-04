@@ -1,16 +1,33 @@
 import fs from "node:fs/promises";
 import { z } from "zod";
 import { Fzf } from "fzf";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ServerTool } from "../types";
+import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 import {
   discoverSkills,
-  parseSkillMarkdown,
+  parseSkillMarkdownResult,
   type DiscoveredSkill,
   env,
-  findWorkspaceRoot,
+  findWorkspaceRootResult,
 } from "@stanley2058/lilac-utils";
 import { zodObjectToCliLines } from "./zod-cli";
+
+class SkillsToolFailure extends TaggedError("SkillsToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptSkillsResultToToolHost<TValue>(
+  result: ResultType<TValue, SkillsToolFailure>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalSkillsFailureToToolHost(message: string): never {
+  return adaptSkillsResultToToolHost(Result.err(new SkillsToolFailure({ message })));
+}
 
 const listInputSchema = z.object({
   query: z
@@ -105,7 +122,9 @@ function scoreAndFilter(
 function requireSkillByName(skills: DiscoveredSkill[], name: string): DiscoveredSkill {
   const found = skills.find((s) => s.name === name);
   if (!found) {
-    throw new Error(`Skill not found: '${name}'. Use skills.list to see available skills.`);
+    return signalSkillsFailureToToolHost(
+      `Skill not found: '${name}'. Use skills.list to see available skills.`,
+    );
   }
   return found;
 }
@@ -153,7 +172,14 @@ export class Skills implements ServerTool {
   }
 
   async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
-    const workspaceRoot = findWorkspaceRoot();
+    const workspaceRootResult = findWorkspaceRootResult();
+    if (workspaceRootResult.status === "error") {
+      switch (workspaceRootResult.error._tag) {
+        case "WorkspaceRootNotFound":
+          return signalSkillsFailureToToolHost(workspaceRootResult.error.message);
+      }
+    }
+    const workspaceRoot = workspaceRootResult.value;
 
     const { skills, warnings } = await discoverSkills({
       workspaceRoot,
@@ -161,7 +187,7 @@ export class Skills implements ServerTool {
     });
 
     if (callableId === "skills.list") {
-      const input = listInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: listInputSchema });
 
       let filtered = skills;
       if (input.sources && input.sources.length > 0) {
@@ -183,11 +209,18 @@ export class Skills implements ServerTool {
     }
 
     if (callableId === "skills.brief" || callableId === "skills.full") {
-      const input = readInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: readInputSchema });
       const found = requireSkillByName(skills, input.name);
 
       const raw = await Bun.file(found.location).text();
-      const parsed = parseSkillMarkdown(raw);
+      const parsedResult = parseSkillMarkdownResult(raw);
+      if (parsedResult.status === "error") {
+        switch (parsedResult.error._tag) {
+          case "SkillMarkdownInvalid":
+            return signalSkillsFailureToToolHost(parsedResult.error.message);
+        }
+      }
+      const parsed = parsedResult.value;
 
       // Keep returned frontmatter stable + minimal-ish.
       const frontmatter = parsed.frontmatter;
@@ -209,6 +242,6 @@ export class Skills implements ServerTool {
       };
     }
 
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return signalSkillsFailureToToolHost(`Invalid callable ID '${callableId}'`);
   }
 }

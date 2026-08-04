@@ -144,10 +144,11 @@ function enqueueMutation<T, E>(
 ): Promise<ResultType<T, E>> {
   const previous = mutationQueues.get(configPath) ?? Promise.resolve();
   const result = previous.then(operation);
-  const settled = result.then(
-    () => undefined,
-    () => undefined,
-  );
+  const observed = Result.tryPromise({
+    try: () => result,
+    catch: () => new Error("MCP configuration mutation queue operation rejected"),
+  });
+  const settled = observed.then(() => undefined);
   mutationQueues.set(configPath, settled);
 
   return result.finally(() => {

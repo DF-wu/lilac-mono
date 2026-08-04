@@ -6,6 +6,7 @@ import { CorruptPersistedFields, MalformedSerialization } from "@stanley2058/lil
 import {
   decodeMiniLilacMigrationRunRow,
   decodeMiniLilacStructuralHistoryRow,
+  decodeMiniLilacStructuralHistoryRows,
   miniLilacStructuralHistoryRowCodecCases,
   type MiniLilacStructuralHistoryRecordKind,
 } from "../src/sqlite-history-persistence-codec";
@@ -157,6 +158,34 @@ describe("Mini Lilac structural history persistence codec", () => {
       if (decoded.status === "ok" && "provenance" in fixture) {
         expect(decoded.value.provenance).toBe(fixture.provenance);
       }
+    }
+  });
+
+  it("decodes SQLite row collections before they enter store orchestration", () => {
+    const decoded = decodeMiniLilacStructuralHistoryRows({
+      kind: "operation",
+      rows: [rows.operation, { ...rows.operation, id: "operation-2" }],
+      schemaVersion: 8,
+      recordId: "recovery-operation",
+    });
+    expect(decoded).toMatchObject({
+      status: "ok",
+      value: {
+        provenance: "current",
+        value: [{ id: "operation-1" }, { id: "operation-2" }],
+      },
+    });
+
+    const corrupt = decodeMiniLilacStructuralHistoryRows({
+      kind: "operation",
+      rows: [rows.operation, { ...rows.operation, filesystem_mode: "skip", skip_reason: null }],
+      schemaVersion: 8,
+      recordId: "recovery-operation",
+    });
+    expect(corrupt.status).toBe("error");
+    if (corrupt.status === "error") {
+      expect(corrupt.error).toBeInstanceOf(CorruptPersistedFields);
+      expect(corrupt.error.recordId).toBe("recovery-operation:1");
     }
   });
 

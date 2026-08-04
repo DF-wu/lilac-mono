@@ -1,7 +1,19 @@
 import { tavily, type TavilyClient } from "@tavily/core";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { normalizeBaseUrl, withAbortSignal } from "./shared";
 import type { WebSearchDepth, WebSearchInput, WebSearchProvider, WebSearchResult } from "./types";
+
+class TavilyProviderConfigurationInvalid extends TaggedError("TavilyProviderConfigurationInvalid")<{
+  readonly message: string;
+}> {}
+
+function adaptTavilyProviderResultToHost<TValue>(
+  result: ResultType<TValue, TavilyProviderConfigurationInvalid>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
 
 function clampTavilyMaxResults(value: number): number {
   return Math.min(20, Math.max(1, value));
@@ -38,12 +50,14 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
     return typeof this.config.apiKey === "string" && this.config.apiKey.length > 0;
   }
 
-  private getClient(): TavilyClient {
-    if (this.client) return this.client;
+  private getClient(): ResultType<TavilyClient, TavilyProviderConfigurationInvalid> {
+    if (this.client) return Result.ok(this.client);
 
     const apiKey = this.config.apiKey;
     if (!apiKey) {
-      throw new Error("TAVILY_API_KEY is not configured.");
+      return Result.err(
+        new TavilyProviderConfigurationInvalid({ message: "TAVILY_API_KEY is not configured." }),
+      );
     }
 
     const apiBaseUrlRaw = this.config.apiBaseUrl?.trim();
@@ -52,7 +66,7 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
       apiKey,
       apiBaseURL,
     });
-    return this.client;
+    return Result.ok(this.client);
   }
 
   async search(
@@ -61,7 +75,7 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
       signal?: AbortSignal;
     },
   ): Promise<readonly WebSearchResult[]> {
-    const client = this.getClient();
+    const client = adaptTavilyProviderResultToHost(this.getClient());
 
     const { results } = await withAbortSignal(opts?.signal, () =>
       client.search(input.query, {

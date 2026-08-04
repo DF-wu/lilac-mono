@@ -3,9 +3,8 @@ import {
   formatTaggedErrorForLog,
   getCoreConfig,
   isPanic,
-  opaqueErrorMessage,
 } from "@stanley2058/lilac-utils";
-import type { Panic } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { createConversationThreadEmbeddingAdapterResolver } from "./thread-embedding";
 import { createSerialJobQueue } from "./thread-job-queue";
@@ -39,42 +38,63 @@ export type ThreadSummarizationWorkerCleanupFailure =
       readonly panic: Panic;
     };
 
+export class ThreadSummarizationWorkerOperationFailed extends TaggedError(
+  "ThreadSummarizationWorkerOperationFailed",
+)<{ readonly message: string }> {}
+
+export function captureThreadSummarizationWorkerOperationFailure(
+  cause: unknown,
+): ThreadSummarizationWorkerOperationFailed | Panic {
+  if (isPanic(cause)) return cause;
+  if (ThreadSummarizationWorkerOperationFailed.is(cause)) return cause;
+  return new Panic({
+    message: "Conversation thread summarization worker defect",
+    cause,
+  });
+}
+
+export function captureThreadSummarizationWorkerCleanupFailure(
+  cause: unknown,
+): ThreadSummarizationWorkerOperationFailed | Panic {
+  if (isPanic(cause)) return cause;
+  return new ThreadSummarizationWorkerOperationFailed({
+    message: "Conversation thread summarization worker cleanup failed",
+  });
+}
+
 export async function runThreadSummarizationWorkerOperation(params: {
   readonly run: () => Promise<void>;
   readonly cleanups: readonly ThreadSummarizationWorkerCleanup[];
   readonly onCleanupFailure: (failure: ThreadSummarizationWorkerCleanupFailure) => void;
-}): Promise<void> {
-  let operation: { readonly status: "ok" } | { readonly status: "error"; readonly cause: unknown };
-  try {
-    await params.run();
-    operation = { status: "ok" };
-  } catch (cause) {
-    operation = { status: "error", cause };
-  }
-  const operationPanic =
-    operation.status === "error" && isPanic(operation.cause) ? operation.cause : null;
+}): Promise<ResultType<void, ThreadSummarizationWorkerOperationFailed | Panic>> {
+  const operation = await Result.tryPromise({
+    try: params.run,
+    catch: captureThreadSummarizationWorkerOperationFailure,
+  });
   let cleanupPanic: Panic | null = null;
 
   for (const cleanup of params.cleanups) {
-    try {
-      cleanup.close();
-    } catch (cause) {
-      if (isPanic(cause)) {
-        cleanupPanic ??= cause;
-        params.onCleanupFailure({ cleanup, kind: "panic", panic: cause });
+    const closed = Result.try({
+      try: cleanup.close,
+      catch: captureThreadSummarizationWorkerCleanupFailure,
+    });
+    if (closed.status === "error") {
+      if (Panic.is(closed.error)) {
+        cleanupPanic ??= closed.error;
+        params.onCleanupFailure({ cleanup, kind: "panic", panic: closed.error });
       } else {
         params.onCleanupFailure({
           cleanup,
           kind: "ordinary",
-          message: opaqueErrorMessage(cause, "Opaque worker cleanup failure"),
+          message: closed.error.message,
         });
       }
     }
   }
 
-  if (operationPanic) throw operationPanic;
-  if (cleanupPanic) throw cleanupPanic;
-  if (operation.status === "error") throw operation.cause;
+  if (operation.status === "error") return Result.err(operation.error);
+  if (cleanupPanic) return Result.err(cleanupPanic);
+  return Result.ok(undefined);
 }
 
 function respond(response: ThreadSummarizationWorkerResponse): void {
@@ -85,80 +105,78 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
   const startedAt = Date.now();
   let store: ConversationThreadStore | null = null;
   let surfaceStore: DiscordSurfaceStore | null = null;
-  try {
-    await runThreadSummarizationWorkerOperation({
-      async run() {
-        logger.debug("conversation thread summarization worker job started", {
-          jobId: request.id,
-          dryRun: request.input.dryRun === true,
-          force: request.input.force === true,
-          clear: request.input.clear === true,
-          threadId: request.input.threadId,
-          beforeTs: request.input.beforeTs,
-          afterTs: request.input.afterTs,
-          queuedJobs: jobQueue.depth,
-        });
-        const cfg = await getCoreConfig({ forceReload: true });
-        const getEmbeddingAdapter = createConversationThreadEmbeddingAdapterResolver(() =>
-          getCoreConfig(),
-        );
+  const operation = await runThreadSummarizationWorkerOperation({
+    async run() {
+      logger.debug("conversation thread summarization worker job started", {
+        jobId: request.id,
+        dryRun: request.input.dryRun === true,
+        force: request.input.force === true,
+        clear: request.input.clear === true,
+        threadId: request.input.threadId,
+        beforeTs: request.input.beforeTs,
+        afterTs: request.input.afterTs,
+        queuedJobs: jobQueue.depth,
+      });
+      const cfg = await getCoreConfig({ forceReload: true });
+      const getEmbeddingAdapter = createConversationThreadEmbeddingAdapterResolver(() =>
+        getCoreConfig(),
+      );
 
-        store = new ConversationThreadStore(request.searchDbPath, {
-          surfaceDbPath: request.surfaceDbPath,
-          mainAgentUserNames: [cfg.surface.discord.botName],
-        });
-        const entityMapper = request.surfaceDbPath
-          ? (() => {
-              surfaceStore = new DiscordSurfaceStore(request.surfaceDbPath);
-              return createDiscordEntityMapper({ cfg, store: surfaceStore });
-            })()
-          : undefined;
-        const service = new ConversationThreadService({
-          store,
-          getConfig: () => getCoreConfig(),
-          getEmbeddingAdapter,
-          entityMapper,
-        });
-        const result = await service.runSummarization({ ...request.input, jobId: request.id });
-        logger.debug("conversation thread summarization worker job completed", {
-          jobId: request.id,
-          durationMs: Date.now() - startedAt,
-          eligible: result.eligible,
-          cleared: result.cleared,
-          summarized: result.summarized,
-          failed: result.failed,
-        });
-        respond({ id: request.id, ok: true, result });
-      },
-      cleanups: [
-        { label: "thread-store", close: () => store?.close() },
-        { label: "surface-store", close: () => surfaceStore?.close() },
-      ],
-      onCleanupFailure(failure) {
-        if (failure.kind === "panic") {
-          logger.error("conversation thread summarization worker cleanup panicked", {
-            jobId: request.id,
-            cleanup: failure.cleanup.label,
-            ...formatTaggedErrorForLog(failure.panic),
-          });
-          return;
-        }
-        logger.error("conversation thread summarization worker cleanup failed", {
+      store = new ConversationThreadStore(request.searchDbPath, {
+        surfaceDbPath: request.surfaceDbPath,
+        mainAgentUserNames: [cfg.surface.discord.botName],
+      });
+      const entityMapper = request.surfaceDbPath
+        ? (() => {
+            surfaceStore = new DiscordSurfaceStore(request.surfaceDbPath);
+            return createDiscordEntityMapper({ cfg, store: surfaceStore });
+          })()
+        : undefined;
+      const service = new ConversationThreadService({
+        store,
+        getConfig: () => getCoreConfig(),
+        getEmbeddingAdapter,
+        entityMapper,
+      });
+      const result = await service.runSummarization({ ...request.input, jobId: request.id });
+      logger.debug("conversation thread summarization worker job completed", {
+        jobId: request.id,
+        durationMs: Date.now() - startedAt,
+        eligible: result.eligible,
+        cleared: result.cleared,
+        summarized: result.summarized,
+        failed: result.failed,
+      });
+      respond({ id: request.id, ok: true, result });
+    },
+    cleanups: [
+      { label: "thread-store", close: () => store?.close() },
+      { label: "surface-store", close: () => surfaceStore?.close() },
+    ],
+    onCleanupFailure(failure) {
+      if (failure.kind === "panic") {
+        logger.error("conversation thread summarization worker cleanup panicked", {
           jobId: request.id,
           cleanup: failure.cleanup.label,
-          errorMessage: failure.message,
+          ...formatTaggedErrorForLog(failure.panic),
         });
-      },
+        return;
+      }
+      logger.error("conversation thread summarization worker cleanup failed", {
+        jobId: request.id,
+        cleanup: failure.cleanup.label,
+        errorMessage: failure.message,
+      });
+    },
+  });
+  if (operation.status === "error") {
+    if (Panic.is(operation.error)) throw operation.error;
+    logger.error("conversation thread summarization worker job failed", {
+      jobId: request.id,
+      durationMs: Date.now() - startedAt,
+      ...formatTaggedErrorForLog(operation.error),
     });
-  } catch (error) {
-    if (isPanic(error)) throw error;
-    const message = opaqueErrorMessage(error, "Opaque worker operation failure");
-    logger.error(
-      "conversation thread summarization worker job failed",
-      { jobId: request.id, durationMs: Date.now() - startedAt },
-      error,
-    );
-    respond({ id: request.id, ok: false, error: message });
+    respond({ id: request.id, ok: false, error: operation.error.message });
   }
 }
 

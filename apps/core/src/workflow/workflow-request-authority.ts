@@ -73,11 +73,10 @@ export const workflowRequestPolicySchema = z.strictObject({
 export type WorkflowRequestPolicy = z.infer<typeof workflowRequestPolicySchema>;
 
 export function workflowRequestPolicyIdentityProjection(policy: WorkflowRequestPolicy) {
+  const { fallbacks: _fallbacks, ...resolvedModelRequest } = policy.resolvedModelRequest;
   return {
     ...policy,
-    resolvedModelRequest: workflowResolvedModelRequestBaseSchema
-      .strip()
-      .parse(policy.resolvedModelRequest),
+    resolvedModelRequest,
   };
 }
 

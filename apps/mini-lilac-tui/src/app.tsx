@@ -33,7 +33,9 @@ import {
   createWorkingIndicatorQueue,
 } from "@stanley2058/lilac-utils/working-indicators";
 import {
-  miniLilacReasoningSchema,
+  MINI_LILAC_REASONING_LEVELS,
+  type MiniLilacRequestError,
+  type MiniLilacStreamError,
   type MiniLilacModelSummary,
   type MiniLilacProfileSummary,
   type MiniLilacReasoning,
@@ -59,6 +61,12 @@ import {
   type DraftFile,
   type DraftPastedText,
 } from "./input-state";
+import { decodeDraftExtmarkData, type DraftExtmarkData } from "./opentui-boundary";
+import {
+  readTerminalStream,
+  releaseTerminalStreamLock,
+  type TerminalStreamReadFailed,
+} from "./terminal-stream-adapter";
 import {
   COMMAND_PALETTE_ITEMS,
   filterPaletteItems,
@@ -92,6 +100,7 @@ import {
   type TranscriptTone,
 } from "./render";
 import { ChunkRenderer, renderInitialMessages } from "./render-boundary";
+import type { ExistingSessionLoadError } from "./startup";
 import {
   formatSessionTitle,
   formatTokenUsage,
@@ -146,8 +155,10 @@ export interface MiniLilacAppProps {
   readonly initialTodos: MiniLilacTodoState;
   readonly theme?: ThemeColors;
   readonly onBindingsChange?: (bindings: SessionBindings) => void;
-  readonly onNewSession: (bindings: SessionBindings) => Promise<void>;
-  readonly onSessionSelect: (sessionId: string) => Promise<void>;
+  readonly onNewSession: (bindings: SessionBindings) => void;
+  readonly onSessionSelect: (
+    sessionId: string,
+  ) => Promise<import("better-result").Result<void, ExistingSessionLoadError>>;
   readonly onExit: () => void;
 }
 
@@ -155,12 +166,6 @@ interface PaletteState {
   readonly kind: PaletteKind;
   readonly selected: number;
   readonly query: string;
-}
-
-interface DraftExtmarkData {
-  readonly kind: "mini-lilac-draft";
-  readonly id: string;
-  readonly generation: number;
 }
 
 interface SubagentView {
@@ -1133,91 +1138,12 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     let bufferedOutput: ReturnType<typeof createBufferedChunkOutput> | undefined;
     let latestEntries: readonly TranscriptEntry[] = [initialEntry];
     let positionedAtBottom = false;
-    try {
-      while (generation === subagentOpenGeneration) {
-        bufferedOutput?.dispose();
-        bufferedOutput = undefined;
-        const [messages, snapshot] = await Promise.all([
-          props.transport.getMessages(subagent.sessionId, { signal: abortController.signal }),
-          props.transport.getSession(subagent.sessionId, { signal: abortController.signal }),
-        ]);
-        const canonicalEntries = renderInitialMessages(messages, { cwd: props.cwd });
-        latestEntries = canonicalEntries;
-        setSubagentView((current) =>
-          generation === subagentOpenGeneration &&
-          current !== undefined &&
-          current.subagent.sessionId === subagent.sessionId
-            ? { ...current, entries: canonicalEntries, loading: snapshot.activeRunId !== null }
-            : current,
-        );
-        if (!positionedAtBottom) {
-          positionedAtBottom = true;
-          setTimeout(() => {
-            if (
-              generation === subagentOpenGeneration &&
-              subagentView()?.subagent.sessionId === subagent.sessionId
-            ) {
-              transcript?.scrollTo(transcript.scrollHeight);
-            }
-          }, 0);
-        }
-        if (snapshot.activeRunId === null) return;
-        bufferedOutput = createBufferedChunkOutput(
-          `subagent:${subagent.sessionId}`,
-          canonicalEntries,
-          (entries) => {
-            latestEntries = entries;
-            setSubagentView((current) => {
-              if (
-                generation !== subagentOpenGeneration ||
-                current === undefined ||
-                current.subagent.sessionId !== subagent.sessionId
-              ) {
-                return current;
-              }
-              return { ...current, entries };
-            });
-          },
-        );
-        const renderer = new ChunkRenderer(
-          bufferedOutput.output,
-          {
-            onSnapshot: () => {},
-            onTranscriptReset: () => {},
-          },
-          { cwd: props.cwd },
-        );
-        const streamProjection = new UIMessageChunkProjectionState({ cwd: props.cwd });
-        const stream = await props.transport.streamSession(subagent.sessionId, {
-          signal: abortController.signal,
-        });
-        if (stream === null) continue;
-        const reader = stream.getReader();
-        while (generation === subagentOpenGeneration) {
-          const result = await reader.read();
-          if (result.done) break;
-          const projected = projectMiniLilacStreamChunk(result.value, streamProjection);
-          switch (projected.kind) {
-            case "finish":
-              renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });
-              continue;
-            case "renderer":
-              renderer.handleProjected(projected.chunk);
-              continue;
-            case "cursor":
-            case "steering":
-            case "steering-committed":
-              continue;
-          }
-          const exhaustive: never = projected;
-          return exhaustive;
-        }
-      }
-    } catch (error) {
+    const fail = (
+      error: MiniLilacRequestError | MiniLilacStreamError | TerminalStreamReadFailed,
+    ) => {
       const bufferedEntries = bufferedOutput?.snapshot();
       bufferedOutput?.dispose();
       if (abortController.signal.aborted) return;
-      const message = error instanceof Error ? error.message : String(error);
       setSubagentView((current) =>
         generation === subagentOpenGeneration &&
         current !== undefined &&
@@ -1225,19 +1151,124 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
           ? {
               ...current,
               loading: false,
-              error: message,
+              error: error.message,
               entries: [
                 ...(bufferedEntries ?? latestEntries),
                 {
                   id: `subagent:${subagent.sessionId}:error`,
                   kind: "error",
                   tone: "danger",
-                  text: message,
+                  text: error.message,
                 },
               ],
             }
           : current,
       );
+    };
+    while (generation === subagentOpenGeneration) {
+      bufferedOutput?.dispose();
+      bufferedOutput = undefined;
+      const [messagesResult, snapshotResult] = await Promise.all([
+        props.transport.getMessagesResult(subagent.sessionId, { signal: abortController.signal }),
+        props.transport.getSessionResult(subagent.sessionId, { signal: abortController.signal }),
+      ]);
+      if (messagesResult.status === "error") {
+        fail(messagesResult.error);
+        return;
+      }
+      if (snapshotResult.status === "error") {
+        fail(snapshotResult.error);
+        return;
+      }
+      const messages = messagesResult.value;
+      const snapshot = snapshotResult.value;
+      const canonicalEntries = renderInitialMessages(messages, { cwd: props.cwd });
+      latestEntries = canonicalEntries;
+      setSubagentView((current) =>
+        generation === subagentOpenGeneration &&
+        current !== undefined &&
+        current.subagent.sessionId === subagent.sessionId
+          ? { ...current, entries: canonicalEntries, loading: snapshot.activeRunId !== null }
+          : current,
+      );
+      if (!positionedAtBottom) {
+        positionedAtBottom = true;
+        setTimeout(() => {
+          if (
+            generation === subagentOpenGeneration &&
+            subagentView()?.subagent.sessionId === subagent.sessionId
+          ) {
+            transcript?.scrollTo(transcript.scrollHeight);
+          }
+        }, 0);
+      }
+      if (snapshot.activeRunId === null) return;
+      bufferedOutput = createBufferedChunkOutput(
+        `subagent:${subagent.sessionId}`,
+        canonicalEntries,
+        (entries) => {
+          latestEntries = entries;
+          setSubagentView((current) => {
+            if (
+              generation !== subagentOpenGeneration ||
+              current === undefined ||
+              current.subagent.sessionId !== subagent.sessionId
+            ) {
+              return current;
+            }
+            return { ...current, entries };
+          });
+        },
+      );
+      const renderer = new ChunkRenderer(
+        bufferedOutput.output,
+        {
+          onSnapshot: () => {},
+          onTranscriptReset: () => {},
+        },
+        { cwd: props.cwd },
+      );
+      const streamProjection = new UIMessageChunkProjectionState({ cwd: props.cwd });
+      const streamResult = await props.transport.streamSessionResult(subagent.sessionId, {
+        signal: abortController.signal,
+      });
+      if (streamResult.status === "error") {
+        fail(streamResult.error);
+        return;
+      }
+      const stream = streamResult.value;
+      if (stream === null) continue;
+      const reader = stream.getReader();
+      while (generation === subagentOpenGeneration) {
+        const read = await readTerminalStream(reader);
+        if (read.status === "error") {
+          fail(read.error);
+          releaseTerminalStreamLock(reader);
+          return;
+        }
+        if (read.value.done) break;
+        if (read.value.value.status === "error") {
+          fail(read.value.value.error);
+          releaseTerminalStreamLock(reader);
+          return;
+        }
+        const projected = projectMiniLilacStreamChunk(read.value.value.value, streamProjection);
+        switch (projected.kind) {
+          case "finish":
+            renderer.handleProjected({ kind: "rendered", chunk: projected.chunk });
+            continue;
+          case "renderer":
+            renderer.handleProjected(projected.chunk);
+            continue;
+          case "cursor":
+          case "steering":
+          case "steering-committed":
+            continue;
+        }
+        const exhaustive: never = projected;
+        return exhaustive;
+      }
+      releaseTerminalStreamLock(reader);
     }
   }
 
@@ -1272,51 +1303,46 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   async function openSessionPalette(): Promise<void> {
     closePalette();
     showNotice("loading sessions");
-    try {
-      const sessions = (await props.transport.listSessions(props.cwd)).filter(
-        (candidate) => candidate.id !== props.sessionId,
-      );
-      if (sessions.length === 0) {
-        showNotice("no other sessions in this directory");
-        return;
-      }
-      setAvailableSessions(sessions);
-      openPalette("sessions");
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : String(error));
+    const listed = await props.transport.listSessionsResult(props.cwd);
+    if (listed.status === "error") {
+      showNotice(listed.error.message);
+      return;
     }
+    const sessions = listed.value.filter((candidate) => candidate.id !== props.sessionId);
+    if (sessions.length === 0) {
+      showNotice("no other sessions in this directory");
+      return;
+    }
+    setAvailableSessions(sessions);
+    openPalette("sessions");
   }
 
   async function startNewSession(): Promise<void> {
     closePalette();
     setBindingBusy(true);
-    try {
-      await props.onNewSession(bindings());
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : String(error));
-      setBindingBusy(false);
-    }
+    props.onNewSession(bindings());
   }
 
   async function openSkillsPalette(): Promise<void> {
     closePalette();
     showNotice("loading skills");
     const requestedProfile = bindings().profile;
-    try {
-      const skills = await props.transport.listSkills(props.cwd, requestedProfile);
-      if (bindings().profile !== requestedProfile) {
-        showNotice("profile changed; reopen skills");
-        return;
-      }
-      if (skills.length === 0) {
-        showNotice("no skills available for this profile");
-        return;
-      }
-      setAvailableSkills(skills);
-      openPalette("skills");
-    } catch (error) {
-      showNotice(error instanceof Error ? error.message : String(error));
+    const listed = await props.transport.listSkillsResult(props.cwd, requestedProfile);
+    if (listed.status === "error") {
+      showNotice(listed.error.message);
+      return;
     }
+    const skills = listed.value;
+    if (bindings().profile !== requestedProfile) {
+      showNotice("profile changed; reopen skills");
+      return;
+    }
+    if (skills.length === 0) {
+      showNotice("no skills available for this profile");
+      return;
+    }
+    setAvailableSkills(skills);
+    openPalette("skills");
   }
 
   function openTodoPalette(): void {
@@ -1373,10 +1399,9 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     if (current.kind === "todos") return;
     if (current.kind === "sessions") {
       setBindingBusy(true);
-      try {
-        await props.onSessionSelect(item.id);
-      } catch (error) {
-        showNotice(error instanceof Error ? error.message : String(error));
+      const selected = await props.onSessionSelect(item.id);
+      if (selected.status === "error") {
+        showNotice(selected.error.message);
         setBindingBusy(false);
       }
       return;
@@ -1390,7 +1415,12 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
       return;
     }
     if (current.kind === "reasoning") {
-      await applyBindings({ reasoning: miniLilacReasoningSchema.parse(item.id) });
+      const reasoning = MINI_LILAC_REASONING_LEVELS.find((candidate) => candidate === item.id);
+      if (reasoning === undefined) {
+        showNotice("unsupported reasoning level");
+        return;
+      }
+      await applyBindings({ reasoning });
       return;
     }
 
@@ -1463,8 +1493,8 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
   function syncExtmarkedDraftParts(): void {
     if (composer === undefined || draftPartTypeId === 0) return;
     const extmarks = composer.extmarks.getAll().flatMap((extmark) => {
-      const data: unknown = extmark.data;
-      if (!isDraftExtmarkData(data)) return [];
+      const data = decodeDraftExtmarkData(extmark.data);
+      if (data === undefined) return [];
       return [{ extmark, data }];
     });
     if (extmarks.some(({ data }) => data.generation !== draftExtmarkGeneration)) {
@@ -1559,15 +1589,15 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
 
   async function pasteClipboardImage(): Promise<void> {
     const generation = draftGeneration;
-    try {
-      const image = await readClipboardImage();
-      if (image !== undefined && generation === draftGeneration) {
-        attachImage(image.bytes, image.mediaType);
-      }
-    } catch (error) {
-      if (error instanceof ClipboardImageTooLargeError && generation === draftGeneration) {
+    const read = await readClipboardImage();
+    if (read.status === "error") {
+      if (ClipboardImageTooLargeError.is(read.error) && generation === draftGeneration) {
         showNotice("image exceeds 10 MB");
       }
+      return;
+    }
+    if (read.value !== undefined && generation === draftGeneration) {
+      attachImage(read.value.bytes, read.value.mediaType);
     }
   }
 
@@ -2222,15 +2252,5 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
         </box>
       </box>
     </box>
-  );
-}
-
-function isDraftExtmarkData(value: unknown): value is DraftExtmarkData {
-  if (typeof value !== "object" || value === null) return false;
-  if (!("kind" in value) || !("id" in value) || !("generation" in value)) return false;
-  return (
-    value.kind === "mini-lilac-draft" &&
-    typeof value.id === "string" &&
-    typeof value.generation === "number"
   );
 }

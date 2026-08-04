@@ -195,7 +195,7 @@ function toolCallErrorOutput(callableId: string, error: Error | string): string 
   return error;
 }
 
-function isToolInputValidationCause(value: unknown): boolean {
+function isToolInputValidationCause<TValue>(value: TValue): boolean {
   try {
     return (
       value instanceof ToolInputValidationError ||
@@ -206,13 +206,20 @@ function isToolInputValidationCause(value: unknown): boolean {
   }
 }
 
-function frameworkErrorLogProjection(error: unknown): Readonly<Record<string, string>> {
+function frameworkErrorLogProjection<TError>(error: TError): Readonly<Record<string, string>> {
   try {
     if (TaggedError.is(error)) return formatTaggedErrorForLog(error);
     return { errorMessage: opaquePluginExceptionMessage(error) };
   } catch {
     return { errorMessage: "Unknown framework error" };
   }
+}
+
+function toolServerTaggedErrorLogProjection(
+  error: ToolPluginManagerError | ToolPluginCleanupError | ToolSafetyModeResolutionError,
+  context: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  return { ...context, ...formatTaggedErrorForLog(error) };
 }
 
 function headerStr(header: string | undefined): string | undefined {
@@ -283,6 +290,18 @@ function authenticateRequestContext(
 }
 
 type SafetyMode = "trusted" | "restricted";
+
+type ToolCallSuccess = {
+  readonly kind: "success";
+  toResponse(): { readonly isError: false; readonly output: unknown };
+};
+
+function projectToolCallSuccess<TOutput>(output: TOutput): ToolCallSuccess {
+  return {
+    kind: "success",
+    toResponse: () => ({ isError: false, output }),
+  };
+}
 
 const RESTRICTED_LEVEL2_ALLOWED = new Set([
   "fetch",
@@ -563,11 +582,10 @@ export function createToolServer(options: ToolServerOptions) {
     error: ToolPluginManagerError | ToolPluginCleanupError,
     context: Readonly<Record<string, unknown>> = {},
   ): void {
-    logger.error("tool plugin operation failed", {
-      operation,
-      ...context,
-      ...formatTaggedErrorForLog(error),
-    });
+    logger.error(
+      "tool plugin operation failed",
+      toolServerTaggedErrorLogProjection(error, { operation, ...context }),
+    );
   }
 
   function pluginCallCompatibilityError(
@@ -694,7 +712,7 @@ export function createToolServer(options: ToolServerOptions) {
   ): Promise<ResultType<TValue, ToolSafetyModeResolutionError>> {
     return Result.tryPromise({
       try: provider,
-      catch: (cause) => {
+      catch: <TCause>(cause: TCause) => {
         if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
         return new ToolSafetyModeResolutionError({
           source,
@@ -711,7 +729,7 @@ export function createToolServer(options: ToolServerOptions) {
   ): Promise<ResultType<Awaited<TValue>, ToolRequestAuthenticationError>> {
     return Result.tryPromise({
       try: () => Promise.resolve(run()),
-      catch: (cause) => {
+      catch: <TCause>(cause: TCause) => {
         if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
         return new ToolRequestAuthenticationError({
           cause: safePluginExceptionCause(cause),
@@ -749,9 +767,10 @@ export function createToolServer(options: ToolServerOptions) {
     if (result.error.source === "server-provider") {
       return adaptSafetyModeResultToElysia(result);
     }
-    logger.warn("failed to resolve tool request safety mode", {
-      ...formatTaggedErrorForLog(result.error),
-    });
+    logger.warn(
+      "failed to resolve tool request safety mode",
+      toolServerTaggedErrorLogProjection(result.error),
+    );
     return "restricted";
   }
 
@@ -1206,18 +1225,17 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         )
         .then((output) => {
-          if (output.status === "ok") {
-            return { kind: "success" as const, output: output.value };
-          }
+          const success = output.map(projectToolCallSuccess);
+          if (success.status === "ok") return success.value;
           if (body.callableId !== "mcp.add") {
-            logPluginError("level2.call", output.error, {
+            logPluginError("level2.call", success.error, {
               toolId: capturedToolId,
               callableId: body.callableId,
             });
           }
           return {
             kind: "error" as const,
-            error: pluginCallCompatibilityError(output.error),
+            error: pluginCallCompatibilityError(success.error),
           };
         })
         .finally(() => {
@@ -1286,7 +1304,7 @@ export function createToolServer(options: ToolServerOptions) {
         timeoutMs,
         ok: true,
       });
-      return { isError: false, output: result.output };
+      return result.toResponse();
     },
     {
       body: BridgeFnRequest,

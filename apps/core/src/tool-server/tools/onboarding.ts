@@ -4,11 +4,13 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { createHash } from "node:crypto";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   env,
+  errorMessage,
   ensurePromptWorkspace,
-  findWorkspaceRoot,
+  findWorkspaceRootResult,
   getCoreConfig,
   resolveCoreConfigPath,
   resolvePromptDir,
@@ -16,6 +18,7 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import type { ServerTool } from "../types";
+import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
 import { chromium } from "playwright";
 
@@ -33,6 +36,32 @@ import {
   writeGithubUserTokenSecret,
 } from "../../github/github-user-token";
 
+class OnboardingToolFailure extends TaggedError("OnboardingToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptOnboardingResultToToolHost<TValue>(
+  result: ResultType<TValue, OnboardingToolFailure>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalOnboardingFailureToToolHost(message: string): never {
+  return adaptOnboardingResultToToolHost(Result.err(new OnboardingToolFailure({ message })));
+}
+
+function requireWorkspaceRoot(): string {
+  const root = findWorkspaceRootResult();
+  if (root.status === "error") {
+    switch (root.error._tag) {
+      case "WorkspaceRootNotFound":
+        return signalOnboardingFailureToToolHost(root.error.message);
+    }
+  }
+  return root.value;
+}
+
 const githubBashEnvDocs = {
   onlyWhenConfigured:
     "Injected only when GitHub outbound auth is configured (user token and/or app auth).",
@@ -45,6 +74,15 @@ const githubBashEnvDocs = {
   forceAppHint:
     "To force app auth in a command, set GH_TOKEN=$LILAC_GITHUB_APP_TOKEN (and GH_HOST=$LILAC_GITHUB_APP_HOST when present).",
 } as const;
+
+const githubInstallationRepositoriesSchema = z.object({
+  repositories: z.array(z.object({}).loose()),
+});
+
+export function decodeGithubInstallationRepositoriesCount(value: unknown): number | undefined {
+  const decoded = githubInstallationRepositoriesSchema.safeParse(value);
+  return decoded.success ? decoded.data.repositories.length : undefined;
+}
 
 const bootstrapInputSchema = z.object({
   dataDir: z.string().optional().describe("Override DATA_DIR for this call"),
@@ -257,7 +295,9 @@ async function ensurePlaywrightChromiumInstalled(options: {
   }
 
   if (options.withDeps && !isRootUser()) {
-    throw new Error("Playwright --with-deps requires root. Re-run as root or omit withDeps.");
+    return signalOnboardingFailureToToolHost(
+      "Playwright --with-deps requires root. Re-run as root or omit withDeps.",
+    );
   }
 
   if (options.withDeps) {
@@ -268,7 +308,9 @@ async function ensurePlaywrightChromiumInstalled(options: {
 
   const nowExists = await Bun.file(pwPath).exists();
   if (!nowExists) {
-    throw new Error(`Playwright install completed, but chromium still missing at ${pwPath}`);
+    return signalOnboardingFailureToToolHost(
+      `Playwright install completed, but chromium still missing at ${pwPath}`,
+    );
   }
 
   return { installed: true, executablePath: pwPath };
@@ -437,7 +479,7 @@ async function runCommand(params: {
 async function downloadToFile(url: string, filePath: string): Promise<void> {
   const res = await fetch(url);
   if (!res.ok) {
-    throw new Error(`Download failed (${res.status}): ${url}`);
+    return signalOnboardingFailureToToolHost(`Download failed (${res.status}): ${url}`);
   }
   await Bun.write(filePath, res);
 }
@@ -495,13 +537,31 @@ const githubReleaseSchema = z.object({
 
 type GithubRelease = z.infer<typeof githubReleaseSchema>;
 
+export class GithubReleaseResponseInvalid extends TaggedError("GithubReleaseResponseInvalid")<{
+  readonly message: string;
+}> {}
+
+export function decodeGithubReleaseResponse(
+  value: unknown,
+): ResultType<GithubRelease, GithubReleaseResponseInvalid> {
+  const decoded = githubReleaseSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new GithubReleaseResponseInvalid({ message: "GitHub returned an invalid release response" }),
+  );
+}
+
 async function fetchGithubLatestRelease(repo: string): Promise<GithubRelease> {
   const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`);
   if (!res.ok) {
-    throw new Error(`GitHub releases/latest failed (${res.status} ${res.statusText}) for ${repo}`);
+    return signalOnboardingFailureToToolHost(
+      `GitHub releases/latest failed (${res.status} ${res.statusText}) for ${repo}`,
+    );
   }
   const raw: unknown = await res.json();
-  return githubReleaseSchema.parse(raw);
+  const decoded = decodeGithubReleaseResponse(raw);
+  if (decoded.status === "ok") return decoded.value;
+  return signalOnboardingFailureToToolHost(`${decoded.error.message} for ${repo}`);
 }
 
 function stripLeadingV(tag: string): string {
@@ -547,7 +607,9 @@ async function installGithubTarGzBinary(params: {
 
   const tarBin = Bun.which("tar");
   if (!tarBin) {
-    throw new Error("Missing dependency: tar (required to extract GitHub releases)");
+    return signalOnboardingFailureToToolHost(
+      "Missing dependency: tar (required to extract GitHub releases)",
+    );
   }
 
   const release = await fetchGithubLatestRelease(params.repo);
@@ -559,12 +621,14 @@ async function installGithubTarGzBinary(params: {
 
   const tarAsset = release.assets.find((a) => a.name === tarName);
   if (!tarAsset) {
-    throw new Error(`Asset not found in ${params.repo} ${release.tag_name}: ${tarName}`);
+    return signalOnboardingFailureToToolHost(
+      `Asset not found in ${params.repo} ${release.tag_name}: ${tarName}`,
+    );
   }
 
   const checksumAsset = release.assets.find((a) => a.name === checksumName);
   if (!checksumAsset) {
-    throw new Error(
+    return signalOnboardingFailureToToolHost(
       `Checksums asset not found in ${params.repo} ${release.tag_name}: ${checksumName}`,
     );
   }
@@ -584,12 +648,14 @@ async function installGithubTarGzBinary(params: {
   const byName = parseChecksumsText(checksumRaw);
   const expected = byName.get(tarName);
   if (!expected) {
-    throw new Error(`No checksum entry for ${tarName} in ${checksumName}`);
+    return signalOnboardingFailureToToolHost(`No checksum entry for ${tarName} in ${checksumName}`);
   }
 
   const got = await sha256Hex(tarPath);
   if (got.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error(`Checksum mismatch for ${tarName}: expected ${expected}, got ${got}`);
+    return signalOnboardingFailureToToolHost(
+      `Checksum mismatch for ${tarName}: expected ${expected}, got ${got}`,
+    );
   }
 
   const extractDir = path.join(
@@ -602,12 +668,12 @@ async function installGithubTarGzBinary(params: {
     cmd: [tarBin, "-xzf", tarPath, "-C", extractDir],
   });
   if (untar.code !== 0) {
-    throw new Error(`tar failed: ${untar.stderr || untar.stdout}`);
+    return signalOnboardingFailureToToolHost(`tar failed: ${untar.stderr || untar.stdout}`);
   }
 
   const extracted = await params.findExtractedPath(extractDir);
   if (!extracted) {
-    throw new Error(`Failed to locate extracted binary from ${tarName}`);
+    return signalOnboardingFailureToToolHost(`Failed to locate extracted binary from ${tarName}`);
   }
 
   await fs.mkdir(path.dirname(params.destPath), { recursive: true });
@@ -775,7 +841,7 @@ export class Onboarding implements ServerTool {
 
   async call(callableId: string, rawInput: Record<string, unknown>) {
     if (callableId === "onboarding.vcs_env") {
-      const input = vcsEnvInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: vcsEnvInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
       const paths = resolveVcsPaths(dataDir);
 
@@ -789,7 +855,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.gnupg") {
-      const input = gnupgInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: gnupgInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
       const paths = resolveVcsPaths(dataDir);
       await ensureVcsDirs(paths);
@@ -797,7 +863,9 @@ export class Onboarding implements ServerTool {
 
       const gpgBin = Bun.which("gpg");
       if (!gpgBin) {
-        throw new Error("Missing dependency: gpg (install gnupg). Required for commit signing.");
+        return signalOnboardingFailureToToolHost(
+          "Missing dependency: gpg (install gnupg). Required for commit signing.",
+        );
       }
 
       if (input.mode === "clear") {
@@ -861,7 +929,9 @@ export class Onboarding implements ServerTool {
           env: vcsEnv,
         });
         if (gen.code !== 0) {
-          throw new Error(gen.stderr || gen.stdout || "gpg key generation failed");
+          return signalOnboardingFailureToToolHost(
+            gen.stderr || gen.stdout || "gpg key generation failed",
+          );
         }
 
         const after = await runGpg({
@@ -870,7 +940,9 @@ export class Onboarding implements ServerTool {
         });
         const fingerprint = after.code === 0 ? parseFirstGpgFingerprint(after.stdout) : null;
         if (!fingerprint) {
-          throw new Error("gpg key generation succeeded, but no secret key fingerprint was found");
+          return signalOnboardingFailureToToolHost(
+            "gpg key generation succeeded, but no secret key fingerprint was found",
+          );
         }
 
         return {
@@ -885,7 +957,7 @@ export class Onboarding implements ServerTool {
       if (input.mode === "export_public") {
         const fingerprint = input.fingerprint ?? existingFpr;
         if (!fingerprint) {
-          throw new Error("No secret key found to export");
+          return signalOnboardingFailureToToolHost("No secret key found to export");
         }
 
         const exp = await runGpg({
@@ -893,7 +965,7 @@ export class Onboarding implements ServerTool {
           env: vcsEnv,
         });
         if (exp.code !== 0) {
-          throw new Error(exp.stderr || exp.stdout || "gpg export failed");
+          return signalOnboardingFailureToToolHost(exp.stderr || exp.stdout || "gpg export failed");
         }
 
         return {
@@ -909,7 +981,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.git_identity") {
-      const input = gitIdentityInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: gitIdentityInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
       const paths = resolveVcsPaths(dataDir);
       await ensureVcsDirs(paths);
@@ -962,8 +1034,10 @@ export class Onboarding implements ServerTool {
       }
 
       if (input.mode === "configure") {
-        if (!input.userName) throw new Error("Missing required input: userName");
-        if (!input.userEmail) throw new Error("Missing required input: userEmail");
+        if (!input.userName)
+          return signalOnboardingFailureToToolHost("Missing required input: userName");
+        if (!input.userEmail)
+          return signalOnboardingFailureToToolHost("Missing required input: userEmail");
 
         const set = async (key: string, value: string) => {
           const res = await runGit({
@@ -971,7 +1045,9 @@ export class Onboarding implements ServerTool {
             env: vcsEnv,
           });
           if (res.code !== 0) {
-            throw new Error(res.stderr || res.stdout || `git config failed: ${key}`);
+            return signalOnboardingFailureToToolHost(
+              res.stderr || res.stdout || `git config failed: ${key}`,
+            );
           }
         };
 
@@ -981,7 +1057,7 @@ export class Onboarding implements ServerTool {
         if (input.enableSigning) {
           const signingKey = input.signingKey;
           if (!signingKey) {
-            throw new Error(
+            return signalOnboardingFailureToToolHost(
               "Missing required input: signingKey (required when enableSigning=true)",
             );
           }
@@ -1006,13 +1082,13 @@ export class Onboarding implements ServerTool {
 
         const init = await runGit({ args: ["init"], cwd: repoDir, env: vcsEnv });
         if (init.code !== 0) {
-          throw new Error(init.stderr || init.stdout || "git init failed");
+          return signalOnboardingFailureToToolHost(init.stderr || init.stdout || "git init failed");
         }
 
         await fs.writeFile(path.join(repoDir, "README.md"), "test\n", "utf8");
         const add = await runGit({ args: ["add", "README.md"], cwd: repoDir, env: vcsEnv });
         if (add.code !== 0) {
-          throw new Error(add.stderr || add.stdout || "git add failed");
+          return signalOnboardingFailureToToolHost(add.stderr || add.stdout || "git add failed");
         }
 
         const commit = await runGit({
@@ -1038,7 +1114,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.bootstrap") {
-      const input = bootstrapInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: bootstrapInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
 
       const ensuredDirs: string[] = [];
@@ -1068,7 +1144,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.playwright") {
-      const input = playwrightInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: playwrightInputSchema });
 
       const systemPath = await findSystemChromiumExecutable();
       if (systemPath) {
@@ -1098,7 +1174,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.defaults") {
-      const input = defaultsInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: defaultsInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
 
       const paths = resolveDefaultInstallPaths(dataDir);
@@ -1119,15 +1195,15 @@ export class Onboarding implements ServerTool {
         try {
           steps.push({ id, ...(await fn()) });
         } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          if (input.strict) throw e;
+          const msg = errorMessage(e);
+          if (input.strict) return signalOnboardingFailureToToolHost(msg);
           steps.push({ id, status: "failed", error: msg });
         }
       };
 
       await runStep("skills.mcporter", async () => {
         const src = path.join(
-          findWorkspaceRoot(),
+          requireWorkspaceRoot(),
           "packages",
           "utils",
           "skill-templates",
@@ -1148,7 +1224,7 @@ export class Onboarding implements ServerTool {
 
       await runStep("skills.gog", async () => {
         const src = path.join(
-          findWorkspaceRoot(),
+          requireWorkspaceRoot(),
           "packages",
           "utils",
           "skill-templates",
@@ -1179,7 +1255,9 @@ export class Onboarding implements ServerTool {
           env: installEnv,
         });
         if (res.code !== 0) {
-          throw new Error(res.stderr || res.stdout || "bun install failed");
+          return signalOnboardingFailureToToolHost(
+            res.stderr || res.stdout || "bun install failed",
+          );
         }
 
         const installed = await Bun.file(dest).exists();
@@ -1205,7 +1283,9 @@ export class Onboarding implements ServerTool {
           env: installEnv,
         });
         if (res.code !== 0) {
-          throw new Error(res.stderr || res.stdout || "bun install failed");
+          return signalOnboardingFailureToToolHost(
+            res.stderr || res.stdout || "bun install failed",
+          );
         }
 
         const installed = await Bun.file(dest).exists();
@@ -1243,7 +1323,9 @@ export class Onboarding implements ServerTool {
           env: installEnv,
         });
         if (res.code !== 0) {
-          throw new Error(res.stderr || res.stdout || "`skills add` failed");
+          return signalOnboardingFailureToToolHost(
+            res.stderr || res.stdout || "`skills add` failed",
+          );
         }
 
         const installedNow = await hasAnySkillMdUnder(opencodeSkillsDir);
@@ -1305,7 +1387,11 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.github_user_token") {
-      const input = githubUserTokenInputSchema.parse(rawInput);
+      const input = parseToolInput({
+        callableId,
+        input: rawInput,
+        schema: githubUserTokenInputSchema,
+      });
       const dataDir = input.dataDir ?? env.dataDir;
 
       const normalizeHost = (h: string | undefined) =>
@@ -1346,12 +1432,12 @@ export class Onboarding implements ServerTool {
 
       if (input.mode === "configure") {
         if (!input.token) {
-          throw new Error("Missing required input: token");
+          return signalOnboardingFailureToToolHost("Missing required input: token");
         }
 
         const token = input.token.trim();
         if (!token) {
-          throw new Error("Input token is empty");
+          return signalOnboardingFailureToToolHost("Input token is empty");
         }
 
         const host = normalizeHost(input.host);
@@ -1385,7 +1471,7 @@ export class Onboarding implements ServerTool {
       if (input.mode === "test") {
         const secret = await readGithubUserTokenSecret(dataDir);
         if (!secret) {
-          throw new Error(
+          return signalOnboardingFailureToToolHost(
             "GitHub user token not configured (run onboarding.github_user_token mode=configure)",
           );
         }
@@ -1399,7 +1485,7 @@ export class Onboarding implements ServerTool {
           token: secret.token,
         });
         if (!login) {
-          throw new Error(
+          return signalOnboardingFailureToToolHost(
             `GitHub API test failed at ${apiBaseUrl}/user (invalid token or permissions)`,
           );
         }
@@ -1429,7 +1515,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.github_app") {
-      const input = githubAppInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: githubAppInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
 
       const normalizeHost = (h: string | undefined) =>
@@ -1472,10 +1558,10 @@ export class Onboarding implements ServerTool {
 
       if (input.mode === "configure") {
         if (!input.appId) {
-          throw new Error("Missing required input: appId");
+          return signalOnboardingFailureToToolHost("Missing required input: appId");
         }
         if (!input.installationId) {
-          throw new Error("Missing required input: installationId");
+          return signalOnboardingFailureToToolHost("Missing required input: installationId");
         }
 
         let privateKeyPem = input.privateKeyPem ?? null;
@@ -1483,7 +1569,9 @@ export class Onboarding implements ServerTool {
           privateKeyPem = await Bun.file(input.privateKeyPath).text();
         }
         if (!privateKeyPem) {
-          throw new Error("Missing required input: privateKeyPem or privateKeyPath");
+          return signalOnboardingFailureToToolHost(
+            "Missing required input: privateKeyPem or privateKeyPath",
+          );
         }
 
         const host = normalizeHost(input.host);
@@ -1523,17 +1611,13 @@ export class Onboarding implements ServerTool {
           },
         });
         if (!res.ok) {
-          throw new Error(
+          return signalOnboardingFailureToToolHost(
             `GitHub API test failed (${res.status} ${res.statusText}) at ${t.apiBaseUrl}`,
           );
         }
 
-        const body: unknown = await res.json().catch(() => null as unknown);
-        const repoCount = (() => {
-          if (!body || typeof body !== "object") return undefined;
-          const repos = (body as Record<string, unknown>)["repositories"];
-          return Array.isArray(repos) ? repos.length : undefined;
-        })();
+        const body: unknown = await res.json().catch(() => null);
+        const repoCount = decodeGithubInstallationRepositoriesCount(body);
 
         return {
           ok: true as const,
@@ -1556,13 +1640,19 @@ export class Onboarding implements ServerTool {
         method: "POST",
       });
       if (!res.ok) {
-        throw new Error(`POST /reload failed: ${res.status} ${res.statusText}`);
+        return signalOnboardingFailureToToolHost(
+          `POST /reload failed: ${res.status} ${res.statusText}`,
+        );
       }
       return { ok: true as const };
     }
 
     if (callableId === "onboarding.reload_config") {
-      const input = reloadConfigInputSchema.parse(rawInput);
+      const input = parseToolInput({
+        callableId,
+        input: rawInput,
+        schema: reloadConfigInputSchema,
+      });
 
       if (input.mode === "restart") {
         return scheduleRestart();
@@ -1587,7 +1677,7 @@ export class Onboarding implements ServerTool {
     }
 
     if (callableId === "onboarding.all") {
-      const input = allInputSchema.parse(rawInput);
+      const input = parseToolInput({ callableId, input: rawInput, schema: allInputSchema });
       const dataDir = input.dataDir ?? env.dataDir;
 
       const bootstrap = (await this.call("onboarding.bootstrap", {
@@ -1623,6 +1713,6 @@ export class Onboarding implements ServerTool {
       };
     }
 
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return signalOnboardingFailureToToolHost(`Invalid callable ID '${callableId}'`);
   }
 }

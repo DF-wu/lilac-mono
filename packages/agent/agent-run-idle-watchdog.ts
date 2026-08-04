@@ -66,7 +66,7 @@ export function createAgentRunIdleWatchdog(params: {
     timeoutPromise = new Promise<never>((_, reject) => {
       rejectTimeout = reject;
     });
-    void timeoutPromise.catch(() => undefined);
+    void timeoutPromise.then(undefined, () => undefined);
   };
   renewTimeoutPromise();
 

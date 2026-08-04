@@ -1,6 +1,7 @@
 import { ZodError } from "zod";
 import type { ZodType } from "zod";
 import { errorMessage as toErrorMessage, isRecord } from "@stanley2058/lilac-utils";
+import { Result, type Result as ResultType } from "better-result";
 
 type ToolValidationErrorParams = {
   callableId: string;
@@ -10,7 +11,6 @@ type ToolValidationErrorParams = {
 
 export class ToolInputValidationError extends Error {
   readonly callableId: string;
-  readonly input: unknown;
   override readonly cause: ZodError;
 
   constructor(params: { callableId: string; input: unknown; cause: ZodError }) {
@@ -23,8 +23,8 @@ export class ToolInputValidationError extends Error {
     );
     this.name = "ToolInputValidationError";
     this.callableId = params.callableId;
-    this.input = params.input;
     this.cause = params.cause;
+    Object.defineProperty(this, "cause", { enumerable: false });
   }
 }
 
@@ -79,22 +79,48 @@ export function formatToolValidationError(params: ToolValidationErrorParams): st
   ].join("\n");
 }
 
+export function decodeToolInput<T>(params: {
+  callableId: string;
+  input: unknown;
+  schema: ZodType<T>;
+}): ResultType<T, ToolInputValidationError> {
+  const decoded = params.schema.safeParse(params.input);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new ToolInputValidationError({
+      callableId: params.callableId,
+      input: params.input,
+      cause: decoded.error,
+    }),
+  );
+}
+
+export function adaptToolInputResultToServerToolHost<T>(
+  result: ResultType<T, ToolInputValidationError>,
+): T {
+  if (result.status === "ok") return result.value;
+  throw result.error;
+}
+
+export function adaptToolInputResultToZodHost<T>(
+  result: ResultType<T, ToolInputValidationError>,
+): T {
+  if (result.status === "ok") return result.value;
+  throw result.error.cause;
+}
+
 export function parseToolInput<T>(params: {
   callableId: string;
   input: unknown;
   schema: ZodType<T>;
 }): T {
-  try {
-    return params.schema.parse(params.input);
-  } catch (error) {
-    if (error instanceof ZodError) {
-      throw new ToolInputValidationError({
-        callableId: params.callableId,
-        input: params.input,
-        cause: error,
-      });
-    }
+  return adaptToolInputResultToServerToolHost(decodeToolInput(params));
+}
 
-    throw error;
-  }
+export function parseToolInputPreservingZodError<T>(params: {
+  callableId: string;
+  input: unknown;
+  schema: ZodType<T>;
+}): T {
+  return adaptToolInputResultToZodHost(decodeToolInput(params));
 }

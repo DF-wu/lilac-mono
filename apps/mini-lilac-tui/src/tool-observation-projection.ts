@@ -1,6 +1,6 @@
 import { posix } from "node:path";
 
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
@@ -9,6 +9,8 @@ import {
   miniLilacTodoWriteInputSchema,
   miniLilacWebfetchUrlSchema,
 } from "@stanley2058/mini-lilac-client";
+
+import { captureTuiOperation } from "./failure-adapter";
 
 export const canonicalTuiToolNames = MINI_LILAC_TOOL_NAMES;
 
@@ -649,19 +651,18 @@ export function safeToolPayloadPreview<T>(value: T, max = 120): string {
   return "<unavailable>";
 }
 
-function observationPayload(observation: ToolObservation): unknown {
-  switch (observation.lifecycle) {
-    case "pending":
-      return undefined;
-    case "active":
-    case "approval":
-    case "error":
-    case "denied":
-    case "cancelled":
-      return observation.input;
-    case "success":
-      return observation.output;
-  }
+function malformedError<T>(
+  observation: ToolObservation & { readonly toolName: KnownToolName },
+  field: "input" | "output" | "partial",
+  value: T,
+): KnownToolObservationMalformed {
+  return new KnownToolObservationMalformed({
+    toolName: observation.toolName,
+    lifecycle: observation.lifecycle,
+    field,
+    payloadPreview: safeToolPayloadPreview(value),
+    message: `Malformed ${observation.toolName} ${field}`,
+  });
 }
 
 function malformed<T>(
@@ -669,15 +670,7 @@ function malformed<T>(
   field: "input" | "output" | "partial",
   value: T,
 ): ResultType<never, KnownToolObservationMalformed> {
-  return Result.err(
-    new KnownToolObservationMalformed({
-      toolName: observation.toolName,
-      lifecycle: observation.lifecycle,
-      field,
-      payloadPreview: safeToolPayloadPreview(value),
-      message: `Malformed ${observation.toolName} ${field}`,
-    }),
-  );
+  return Result.err(malformedError(observation, field, value));
 }
 
 function stateFromObservation(observation: ToolObservation): ToolProjectionState {
@@ -712,31 +705,35 @@ function parseInput<T>(
 ): ResultType<T | undefined, KnownToolObservationMalformed> {
   if (field === "input" && observation.lifecycle === "pending") return Result.ok(undefined);
   let value: unknown;
-  try {
-    switch (field) {
-      case "input":
-        value = observation.lifecycle === "pending" ? undefined : observation.input;
-        break;
-      case "output":
-        value = observation.lifecycle === "success" ? observation.output : undefined;
-        break;
-      case "partial":
-        value =
-          observation.lifecycle === "active" ||
-          observation.lifecycle === "success" ||
-          observation.lifecycle === "error" ||
-          observation.lifecycle === "cancelled"
-            ? observation.partial
-            : undefined;
-        break;
-    }
-    if (optional && value === undefined) return Result.ok(undefined);
-    const parsed = schema.safeParse(value);
-    return parsed.success ? Result.ok(parsed.data) : malformed(observation, field, value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const attempted = captureTuiOperation(
+    () => {
+      switch (field) {
+        case "input":
+          value = observation.lifecycle === "pending" ? undefined : observation.input;
+          break;
+        case "output":
+          value = observation.lifecycle === "success" ? observation.output : undefined;
+          break;
+        case "partial":
+          value =
+            observation.lifecycle === "active" ||
+            observation.lifecycle === "success" ||
+            observation.lifecycle === "error" ||
+            observation.lifecycle === "cancelled"
+              ? observation.partial
+              : undefined;
+          break;
+      }
+      return optional && value === undefined ? undefined : schema.safeParse(value);
+    },
+    () => malformedError(observation, field, value),
+  );
+  if (attempted.status === "error") return Result.err(attempted.error);
+  if (attempted.value === undefined) return Result.ok(undefined);
+  if (!attempted.value.success) {
     return malformed(observation, field, value);
   }
+  return Result.ok(attempted.value.data);
 }
 
 function executionErrorText(error: BashExecutionError | undefined): string | undefined {
@@ -1046,12 +1043,11 @@ export const knownToolCodecRegistry = toolObservationCodecRegistry;
 export function decodeKnownToolObservation(
   observation: ToolObservation & { readonly toolName: KnownToolName },
 ): ResultType<DecodedKnownToolObservation, KnownToolObservationMalformed> {
-  try {
-    return toolObservationCodecRegistry[observation.toolName](observation);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return malformed(observation, "input", undefined);
-  }
+  const decoded = captureTuiOperation(
+    () => toolObservationCodecRegistry[observation.toolName](observation),
+    () => malformedError(observation, "input", undefined),
+  );
+  return decoded.status === "error" ? Result.err(decoded.error) : decoded.value;
 }
 
 function humanizeToolName(name: string): string {
@@ -1557,11 +1553,26 @@ export function projectToolObservation(
     const toolName = previewText(observation.toolName, 80) || "Unknown Tool";
     const state = stateFromObservation(observation);
     const summary = humanizeToolName(toolName) || "Unknown Tool";
+    let payloadPreview = "undefined";
+    switch (observation.lifecycle) {
+      case "pending":
+        break;
+      case "active":
+      case "approval":
+      case "error":
+      case "denied":
+      case "cancelled":
+        payloadPreview = safeToolPayloadPreview(observation.input);
+        break;
+      case "success":
+        payloadPreview = safeToolPayloadPreview(observation.output);
+        break;
+    }
     return {
       kind: "unknown-tool",
       toolName,
       ...projectionBase(observation.lifecycle, state, summary),
-      payloadPreview: safeToolPayloadPreview(observationPayload(observation)),
+      payloadPreview,
     };
   }
 

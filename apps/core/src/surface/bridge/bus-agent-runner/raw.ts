@@ -11,6 +11,12 @@ const CUSTOM_COMMAND_SOURCES = ["text", "discord-slash"] as const;
 
 export type SubagentProfile = (typeof SUBAGENT_PROFILES)[number];
 export type AgentRunProfile = "primary" | SubagentProfile;
+export type AgentRunnerRaw = {} | null;
+
+export function preserveAgentRunnerRaw(raw: unknown): AgentRunnerRaw | undefined {
+  if (raw === undefined || raw === null) return raw;
+  return raw;
+}
 
 export type ParsedSubagentMeta = {
   profile: AgentRunProfile;
@@ -22,29 +28,41 @@ const nonEmptyStringSchema = z
   .string()
   .transform((value) => value.trim())
   .pipe(z.string().min(1));
+function normalizeOptionalNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
 const optionalNonEmptyStringSchema = z.preprocess(
-  (value) => (typeof value === "string" && value.trim().length > 0 ? value : undefined),
+  normalizeOptionalNonEmptyString,
   nonEmptyStringSchema.optional(),
 );
-const sessionModeSchema = z.preprocess(
-  (value) => (value === "mention" || value === "active" ? value : undefined),
-  z.enum(SESSION_MODES).optional(),
-);
-const stringArraySchema = z.preprocess(
-  (value) => (Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : []),
-  z.array(z.string()),
-);
-const booleanTrueSchema = z.preprocess((value) => value === true, z.boolean());
-const optionalStringSchema = z.preprocess(
-  (value) => (typeof value === "string" ? value : undefined),
-  z.string().optional(),
-);
+function normalizeSessionMode(value: unknown): "mention" | "active" | undefined {
+  return value === "mention" || value === "active" ? value : undefined;
+}
+const sessionModeSchema = z.preprocess(normalizeSessionMode, z.enum(SESSION_MODES).optional());
+function normalizeStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+}
+const stringArraySchema = z.preprocess(normalizeStringArray, z.array(z.string()));
+function normalizeBooleanTrue(value: unknown): boolean {
+  return value === true;
+}
+const booleanTrueSchema = z.preprocess(normalizeBooleanTrue, z.boolean());
+function normalizeOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+const optionalStringSchema = z.preprocess(normalizeOptionalString, z.string().optional());
+function normalizeSubagentProfile(value: unknown): SubagentProfile | undefined {
+  return isSubagentProfile(value) ? value : undefined;
+}
 const subagentProfileSchema = z.preprocess(
-  (value) => (isSubagentProfile(value) ? value : undefined),
+  normalizeSubagentProfile,
   z.enum(SUBAGENT_PROFILES).optional(),
 );
+function normalizeOptionalFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
 const optionalFiniteNumberSchema = z.preprocess(
-  (value) => (typeof value === "number" && Number.isFinite(value) ? value : undefined),
+  normalizeOptionalFiniteNumber,
   z.number().optional(),
 );
 
@@ -52,8 +70,12 @@ function isModelReasoningEffort(value: unknown): value is ModelReasoningEffort {
   return typeof value === "string" && MODEL_REASONING_EFFORTS.some((effort) => effort === value);
 }
 
+function normalizeModelReasoningEffort(value: unknown): ModelReasoningEffort | undefined {
+  return isModelReasoningEffort(value) ? value : undefined;
+}
+
 const modelReasoningEffortSchema = z.preprocess(
-  (value) => (isModelReasoningEffort(value) ? value : undefined),
+  normalizeModelReasoningEffort,
   z.enum(MODEL_REASONING_EFFORTS).optional(),
 );
 

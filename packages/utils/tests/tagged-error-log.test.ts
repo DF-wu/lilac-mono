@@ -1,11 +1,27 @@
 import { describe, expect, it } from "bun:test";
 import { TaggedError } from "better-result";
 
-import { formatTaggedErrorForLog } from "../index";
+import { formatTaggedErrorForLog, redactErrorTextForLog } from "../index";
 
 const ExternalFailure = TaggedError("ExternalFailure");
 
 describe("formatTaggedErrorForLog", () => {
+  it("redacts standalone canonical provider and AWS credential formats", () => {
+    const credentials = [
+      "ghp_abcdefghijklmnopqrstuvwxyz123456",
+      "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+      "sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+      "xoxb-1234567890-abcdefghijklmnopqrstuvwxyz",
+      "AKIAIOSFODNN7EXAMPLE",
+      "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      `IQoJ${"A".repeat(96)}`,
+    ] as const;
+
+    for (const credential of credentials) {
+      expect(redactErrorTextForLog(credential)).toBe("<redacted>");
+    }
+  });
+
   it("shows that raw TaggedError serialization exposes its cause", () => {
     const cause = new Error("database password=cause-secret");
     const error = new ExternalFailure({

@@ -1,9 +1,14 @@
 import type { ModelMessage, ToolContent } from "ai";
+import { Result, TaggedError } from "better-result";
 
 import type { ToolResultOutput } from "./tool-result-output-normalizer";
 
 type ContentOutput = Extract<ToolResultOutput, { type: "content" }>;
 type ContentItem = ContentOutput["value"][number];
+
+class ToolResultDataUrlDecodeFailed extends TaggedError("ToolResultDataUrlDecodeFailed")<{
+  readonly message: string;
+}> {}
 
 function decodedBase64Bytes(data: string): number {
   let padding = 0;
@@ -25,11 +30,13 @@ function inlineDataUrl(value: string | URL): { bytes: number; mediaType: string 
   if (metadata.toLowerCase().split(";").includes("base64")) {
     return { bytes: decodedBase64Bytes(payload), mediaType };
   }
-  try {
-    return { bytes: Buffer.byteLength(decodeURIComponent(payload), "utf8"), mediaType };
-  } catch {
-    return { bytes: Buffer.byteLength(payload, "utf8"), mediaType };
-  }
+  const decoded = Result.try({
+    try: () => decodeURIComponent(payload),
+    catch: () =>
+      new ToolResultDataUrlDecodeFailed({ message: "Inline data URL payload is malformed" }),
+  });
+  const decodedPayload = decoded.status === "ok" ? decoded.value : payload;
+  return { bytes: Buffer.byteLength(decodedPayload, "utf8"), mediaType };
 }
 
 function inlineMedia(

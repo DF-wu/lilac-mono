@@ -115,15 +115,15 @@ function toInlineText(node: PhrasingContent): string {
       return node.alt ?? "";
     case "html":
       return node.value;
-    default: {
-      if ("children" in node && Array.isArray(node.children)) {
-        return node.children.map((child) => toInlineText(child)).join("");
-      }
-      if ("value" in node && typeof node.value === "string") {
-        return node.value;
-      }
+    case "delete":
+    case "emphasis":
+    case "link":
+    case "linkReference":
+    case "strong":
+      return node.children.map((child) => toInlineText(child)).join("");
+    case "footnoteReference":
+    case "imageReference":
       return "";
-    }
   }
 }
 

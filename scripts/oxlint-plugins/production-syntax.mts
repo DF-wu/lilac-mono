@@ -423,6 +423,44 @@ function possibleThenRejectionArgument(call: ts.CallExpression): ts.Expression |
   return undefined;
 }
 
+function collectNamedCallbackBodies(sourceFile: ts.SourceFile): ReadonlyMap<string, ts.Node> {
+  const bodies = new Map<string, ts.Node>();
+  const duplicates = new Set<string>();
+  const add = (name: string, body: ts.Node): void => {
+    if (bodies.has(name)) {
+      bodies.delete(name);
+      duplicates.add(name);
+      return;
+    }
+    if (!duplicates.has(name)) bodies.set(name, body);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name && node.body) {
+      add(node.name.text, node.body);
+    } else if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+    ) {
+      add(node.name.text, node.initializer.body);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return bodies;
+}
+
+function rejectionCallbackOwner(
+  callback: ts.Expression,
+  namedCallbackBodies: ReadonlyMap<string, ts.Node>,
+): ts.Node {
+  const unwrapped = unwrappedExpression(callback);
+  if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) return unwrapped.body;
+  if (ts.isIdentifier(unwrapped)) return namedCallbackBodies.get(unwrapped.text) ?? callback;
+  return callback;
+}
+
 function usedExecutorRejectCalls(
   node: ts.NewExpression,
   provenance: PromiseProvenance,
@@ -564,10 +602,16 @@ export function findExceptionFlowViolations(
   if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
   const sourceFile = sourceFileOf(sourceText, filePath);
   const provenance = collectPromiseProvenance(sourceFile);
+  const namedCallbackBodies = collectNamedCallbackBodies(sourceFile);
   const streamControllers = collectStreamControllers(sourceFile);
   const findings: SyntacticFinding<ExceptionFlowKind>[] = [];
-  const add = (node: ts.Node, kind: ExceptionFlowKind, message: string): void => {
-    const finding = createFinding(sourceFile, filePath, node, kind, message);
+  const add = (
+    node: ts.Node,
+    kind: ExceptionFlowKind,
+    message: string,
+    owner: ts.Node = node,
+  ): void => {
+    const finding = createFinding(sourceFile, filePath, node, kind, message, owner);
     if (!adapterAllows(finding, manifest)) findings.push(finding);
   };
   const visit = (node: ts.Node): void => {
@@ -597,10 +641,14 @@ export function findExceptionFlowViolations(
       } else {
         const parts = propertyAccessParts(node.expression);
         if (parts && parts[1] === "catch") {
+          const callback = node.arguments[0];
           add(
             node,
             "promise-catch",
             "Capture rejection in an exactly registered external-to-result adapter instead of .catch",
+            callback && !ts.isSpreadElement(callback)
+              ? rejectionCallbackOwner(callback, namedCallbackBodies)
+              : node,
           );
         } else if (parts && parts[1] === "then") {
           const rejection = possibleThenRejectionArgument(node);
@@ -609,6 +657,7 @@ export function findExceptionFlowViolations(
               rejection,
               "rejection-callback",
               "Capture rejection in a named Result-returning adapter before composition",
+              rejectionCallbackOwner(rejection, namedCallbackBodies),
             );
           }
         } else if (isExplicitHostErrorSignal(node, streamControllers)) {

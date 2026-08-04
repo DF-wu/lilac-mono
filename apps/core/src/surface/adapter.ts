@@ -1,3 +1,5 @@
+import { Panic } from "better-result";
+
 import type {
   AdapterCapabilities,
   ContentOpts,
@@ -11,6 +13,24 @@ import type {
   SurfaceSession,
 } from "./types";
 import type { AdapterEvent } from "./events";
+
+export function preserveSurfacePanic(cause: unknown): void {
+  if (Panic.is(cause)) throw cause;
+}
+
+export function surfaceExternalFallback<T>(fallback: T): (cause: unknown) => T {
+  return (cause) => {
+    preserveSurfacePanic(cause);
+    return fallback;
+  };
+}
+
+/** Compatibility edge for the legacy Promise-based surface contract. */
+export function signalSurfaceFailure<T>(error: Error): Promise<T> {
+  const deferred = Promise.withResolvers<T>();
+  deferred.reject(error);
+  return deferred.promise;
+}
 
 export type SurfaceToolStatusUpdate = {
   toolCallId: string;
@@ -143,13 +163,11 @@ export interface SurfaceAuthoritativeSelfMessageProvider {
 export function hasAuthoritativeSelfMessageProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & SurfaceAuthoritativeSelfMessageProvider {
-  const maybe = adapter as unknown as {
-    resolveAuthoritativeSelfMessageVerifier?: unknown;
-    isAuthoritativelySelfAuthored?: unknown;
-  };
   return (
-    typeof maybe.resolveAuthoritativeSelfMessageVerifier === "function" &&
-    typeof maybe.isAuthoritativelySelfAuthored === "function"
+    "resolveAuthoritativeSelfMessageVerifier" in adapter &&
+    typeof adapter.resolveAuthoritativeSelfMessageVerifier === "function" &&
+    "isAuthoritativelySelfAuthored" in adapter &&
+    typeof adapter.isAuthoritativelySelfAuthored === "function"
   );
 }
 
@@ -165,13 +183,11 @@ export interface SurfaceReplyChainPlannerProvider {
 export function hasReplyChainPlannerProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & SurfaceReplyChainPlannerProvider {
-  const maybe = adapter as unknown as {
-    planReplyChain?: unknown;
-    planMergeBlockEndingAt?: unknown;
-  };
-
   return (
-    typeof maybe.planReplyChain === "function" && typeof maybe.planMergeBlockEndingAt === "function"
+    "planReplyChain" in adapter &&
+    typeof adapter.planReplyChain === "function" &&
+    "planMergeBlockEndingAt" in adapter &&
+    typeof adapter.planMergeBlockEndingAt === "function"
   );
 }
 
@@ -192,6 +208,5 @@ export interface SurfaceCacheBurstProvider {
 export function hasCacheBurstProvider(
   adapter: SurfaceAdapter,
 ): adapter is SurfaceAdapter & SurfaceCacheBurstProvider {
-  const maybe = adapter as unknown as { burstCache?: unknown };
-  return typeof maybe.burstCache === "function";
+  return "burstCache" in adapter && typeof adapter.burstCache === "function";
 }

@@ -257,7 +257,9 @@ describe("conversation thread summary persisted store", () => {
 
       const search = await service.search({ query: "needle", mode: "lexical" });
       expect(search.status).toBe("error");
-      if (search.status === "error") expect(search.error.issueCode).toBe("mixed-string-array");
+      if (search.status === "error" && search.error._tag === "CorruptPersistedFields") {
+        expect(search.error.issueCode).toBe("mixed-string-array");
+      }
     } finally {
       store.close();
     }

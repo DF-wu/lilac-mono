@@ -2,8 +2,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-import { findWorkspaceRoot } from "./find-root";
-import { isRecord } from "./runtime-utils";
+import { z } from "zod";
+
+import { findWorkspaceRootResult } from "./find-root";
+import { isPanic } from "./runtime-utils";
 
 const DEFAULT_BUILD_VERSION = "dev";
 const DEFAULT_BUILD_COMMIT = "dev";
@@ -16,6 +18,18 @@ export type BuildInfo = {
   dirty?: boolean;
   builtAt?: string;
 };
+
+const buildInfoSchema = z.object({
+  version: z.string(),
+  commit: z.string(),
+  dirty: z.union([z.boolean(), z.string()]).optional(),
+  builtAt: z.string().optional(),
+});
+
+export function decodeBuildInfo(value: unknown): z.output<typeof buildInfoSchema> | undefined {
+  const parsed = buildInfoSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
 
 type ResolveBuildInfoParams = {
   cwd?: string;
@@ -39,11 +53,8 @@ function parseBooleanish(value: string | undefined): boolean | undefined {
 }
 
 function findWorkspaceRootSafe(startDir: string): string | undefined {
-  try {
-    return findWorkspaceRoot(startDir);
-  } catch {
-    return undefined;
-  }
+  const result = findWorkspaceRootResult(startDir);
+  return result.status === "ok" ? result.value : undefined;
 }
 
 function readBuildInfoFile(cwd: string): BuildInfo | null {
@@ -55,18 +66,15 @@ function readBuildInfoFile(cwd: string): BuildInfo | null {
     if (!fs.existsSync(buildInfoPath)) return null;
 
     const raw = fs.readFileSync(buildInfoPath, "utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) return null;
+    const parsed = decodeBuildInfo(JSON.parse(raw));
+    if (!parsed) return null;
 
-    const version = readNonEmpty(typeof parsed.version === "string" ? parsed.version : undefined);
-    const commit = readNonEmpty(typeof parsed.commit === "string" ? parsed.commit : undefined);
+    const version = readNonEmpty(parsed.version);
+    const commit = readNonEmpty(parsed.commit);
     if (!version || !commit) return null;
 
-    const dirty =
-      typeof parsed.dirty === "boolean"
-        ? parsed.dirty
-        : parseBooleanish(typeof parsed.dirty === "string" ? parsed.dirty : undefined);
-    const builtAt = readNonEmpty(typeof parsed.builtAt === "string" ? parsed.builtAt : undefined);
+    const dirty = typeof parsed.dirty === "boolean" ? parsed.dirty : parseBooleanish(parsed.dirty);
+    const builtAt = readNonEmpty(parsed.builtAt);
 
     return {
       version,
@@ -74,7 +82,8 @@ function readBuildInfoFile(cwd: string): BuildInfo | null {
       dirty,
       builtAt,
     };
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return null;
   }
 }
@@ -87,7 +96,8 @@ function getBuildInfoFileCacheKey(cwd: string): string {
     const buildInfoPath = path.join(workspaceRoot, BUILD_INFO_PATH);
     const stats = fs.statSync(buildInfoPath);
     return `${buildInfoPath}:${stats.size}:${stats.mtimeMs}`;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return "missing-build-info";
   }
 }
@@ -118,7 +128,8 @@ function readGitBuildInfo(cwd: string): Pick<BuildInfo, "commit" | "dirty"> | nu
       commit,
       dirty: dirtyOutput.length > 0,
     };
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return null;
   }
 }

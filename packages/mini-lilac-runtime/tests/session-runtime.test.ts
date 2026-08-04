@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   chmod,
@@ -38,7 +38,7 @@ import {
 } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { getCodexAuthStoragePath, ModelCapability } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
 
 import type { RuntimeConfig } from "../src/config";
@@ -49,12 +49,17 @@ import {
   type ProviderConfig,
 } from "../src/providers";
 import {
+  MiniLilacSessionOperationRejected,
   SessionService,
   type MiniLilacRuntimeChunk,
   type SessionServiceOptions,
 } from "../src/session-service";
 import { MiniLilacSkillCatalog } from "../src/skills";
-import { MiniLilacDatabaseVersionError, MiniLilacSqliteStore } from "../src/sqlite-store";
+import {
+  MiniLilacDatabaseVersionError,
+  MiniLilacSqliteStore,
+  MiniLilacStoreOperationRejected,
+} from "../src/sqlite-store";
 import {
   WorkspaceHistoryStore,
   type LockedWorkspaceHistoryStore,
@@ -2852,6 +2857,63 @@ describe("SessionService", () => {
     service.close();
   });
 
+  it("returns owned session failures without misclassifying them as SQLite failures", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-result-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "sessions.sqlite"),
+      modelResolver: () => new MockLanguageModelV4({}),
+      attachCompaction: async () => () => {},
+    });
+
+    const created = await service.createSessionResult({
+      id: "sub:reserved",
+      cwd: directory,
+      model: "test/mock",
+    });
+
+    expect(created.status).toBe("error");
+    if (created.status === "error") {
+      expect(created.error).toBeInstanceOf(MiniLilacSessionOperationRejected);
+      expect(created.error).toMatchObject({
+        _tag: "MiniLilacSessionOperationRejected",
+        operation: "createSession",
+      });
+    }
+    const externalFailure = await service.createSessionResult({
+      cwd: path.join(directory, "missing"),
+      model: "test/mock",
+    });
+    expect(externalFailure).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacSessionExternalFailure",
+        operation: "createSession",
+      },
+    });
+    expect(service.closeResult()).toMatchObject({ status: "ok" });
+  });
+
+  it("preserves Panic through the session Result boundary", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-session-panic-"));
+    temporaryDirectories.push(directory);
+    const panic = new Panic({ message: "model resolver invariant" });
+    const service = new SessionService({
+      config: config(),
+      databasePath: path.join(directory, "sessions.sqlite"),
+      modelResolver: () => {
+        throw panic;
+      },
+      attachCompaction: async () => () => {},
+    });
+
+    await expect(service.createSessionResult({ cwd: directory, model: "test/mock" })).rejects.toBe(
+      panic,
+    );
+    service.close();
+  });
+
   it("cancels and awaits an active root before closing during shutdown", async () => {
     let rootStarted = () => {};
     const startedRoot = new Promise<void>((resolve) => {
@@ -2887,6 +2949,17 @@ describe("SessionService", () => {
     expect(() => service.startPrompt(session.id, userMessage("too late"))).toThrow(
       "not accepting admissions",
     );
+    const rejectedAdmission = await service.startPromptResult(
+      session.id,
+      userMessage("still too late"),
+    );
+    expect(rejectedAdmission).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "MiniLilacSessionOperationRejected",
+        operation: "admission",
+      },
+    });
     await shutdown;
     await completion;
 
@@ -3841,6 +3914,68 @@ describe("SessionService", () => {
 
     expect(titleModel.doStreamCalls).toHaveLength(1);
     expect(settledTitle).toBe("Keep this useful fallback");
+  });
+
+  it("reports an exact title-generation Panic to the fatal supervisor", async () => {
+    const runtimeConfig = config();
+    runtimeConfig.agent.titleModel = "test/title";
+    const rootModel = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const panic = new Panic({ message: "title model invariant" });
+    const reported: Panic[] = [];
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-title-panic-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: (specifier) => {
+        if (specifier === "test/title") throw panic;
+        return rootModel;
+      },
+      reportFatalPanic: (reportedPanic) => reported.push(reportedPanic),
+    });
+    const session = await service.createSession({ cwd: directory, model: "test/mock" });
+
+    await collect((await service.startPrompt(session.id, userMessage("Keep the fallback"))).stream);
+    await service.waitForTrackedTasks();
+    const settledTitle = service.getSnapshot(session.id).title;
+    service.close();
+
+    expect(reported).toEqual([panic]);
+    expect(settledTitle).toBe("Keep the fallback");
+  });
+
+  it("keeps ordinary title-generation failure best-effort", async () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => undefined);
+    const runtimeConfig = config();
+    runtimeConfig.agent.titleModel = "test/title";
+    const rootModel = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
+    const reported: Panic[] = [];
+    const directory = await mkdtemp(path.join(tmpdir(), "mini-lilac-title-failure-"));
+    temporaryDirectories.push(directory);
+    const service = new SessionService({
+      config: runtimeConfig,
+      databasePath: path.join(directory, "runtime.sqlite"),
+      modelResolver: (specifier) => {
+        if (specifier === "test/title") throw new Error("title provider unavailable");
+        return rootModel;
+      },
+      reportFatalPanic: (panic) => reported.push(panic),
+    });
+
+    try {
+      const session = await service.createSession({ cwd: directory, model: "test/mock" });
+      await collect(
+        (await service.startPrompt(session.id, userMessage("Keep ordinary fallback"))).stream,
+      );
+      await service.waitForTrackedTasks();
+
+      expect(reported).toEqual([]);
+      expect(service.getSnapshot(session.id).title).toBe("Keep ordinary fallback");
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+      service.close();
+    }
   });
 
   it("bounds generated titles by protocol-safe UTF-16 length", async () => {
@@ -6777,10 +6912,14 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("wait"));
     // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
-    const saveCommandResult = service.store.saveCommandResult.bind(service.store);
-    service.store.saveCommandResult = () => {
-      throw new Error("command result write failed");
-    };
+    const saveCommandResult = service.store.saveCommandResultResult.bind(service.store);
+    service.store.saveCommandResultResult = () =>
+      Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "saveCommandResult",
+          message: "command result write failed",
+        }),
+      );
 
     const request = {
       sessionId: session.id,
@@ -6793,7 +6932,7 @@ describe("SessionService", () => {
     await expect(service.steer(request)).rejects.toThrow("is pending");
     expect(service.getSnapshot(session.id).queuedSteeringCount).toBe(1);
 
-    service.store.saveCommandResult = saveCommandResult;
+    service.store.saveCommandResultResult = saveCommandResult;
     await service.cancel({
       sessionId: session.id,
       runId: started.runId,
@@ -6819,12 +6958,16 @@ describe("SessionService", () => {
     const started = await service.startPrompt(session.id, userMessage("wait"));
     // test-wait-justification: fault injection must occur after the gated run has entered its asynchronous model turn.
     await Bun.sleep(0);
-    const markCommandSideEffectStarted = service.store.markCommandSideEffectStarted.bind(
+    const markCommandSideEffectStarted = service.store.markCommandSideEffectStartedResult.bind(
       service.store,
     );
-    service.store.markCommandSideEffectStarted = () => {
-      throw new Error("side-effect marker failed");
-    };
+    service.store.markCommandSideEffectStartedResult = () =>
+      Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "markCommandSideEffectStarted",
+          message: "side-effect marker failed",
+        }),
+      );
 
     await expect(
       service.steer({
@@ -6840,7 +6983,7 @@ describe("SessionService", () => {
         .get(),
     ).toEqual({ count: 0 });
 
-    service.store.markCommandSideEffectStarted = markCommandSideEffectStarted;
+    service.store.markCommandSideEffectStartedResult = markCommandSideEffectStarted;
     await service.cancel({
       sessionId: session.id,
       runId: started.runId,
@@ -8450,7 +8593,9 @@ describe("SessionService", () => {
     expect(model.doStreamCalls).toHaveLength(0);
     expect(service.store.getRun(started.runId)).toMatchObject({
       status: "error",
-      error: "Cannot append an ephemeral overlay after an assistant message",
+      error: expect.stringContaining(
+        "Cannot append an ephemeral overlay after an assistant message",
+      ),
     });
     service.close();
   });

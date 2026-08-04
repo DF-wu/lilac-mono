@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { z } from "zod";
 
 import { loadToolPluginModule } from "../loader";
 
@@ -59,7 +60,10 @@ export default fixture;
 
     const plugin = loaded.value;
     expect(Object.is(plugin, fixture)).toBe(true);
-    expect(Reflect.get(plugin, "label")).toBe("Complete:0");
+    const initialExtension = z.object({ label: z.string(), extra: z.number() }).safeParse(plugin);
+    expect(initialExtension.success).toBe(true);
+    if (!initialExtension.success) throw new Error(initialExtension.error.message);
+    expect(initialExtension.data.label).toBe("Complete:0");
     expect(typeof Object.getOwnPropertyDescriptor(plugin, "label")?.get).toBe("function");
     expect(
       await plugin.create({
@@ -70,7 +74,10 @@ export default fixture;
       }),
     ).toEqual({});
     expect(plugin.meta.name).toBe("Mutated");
-    expect(Reflect.get(plugin, "extra")).toBe(1);
+    const updatedExtension = z.object({ extra: z.number() }).safeParse(plugin);
+    expect(updatedExtension.success).toBe(true);
+    if (!updatedExtension.success) throw new Error(updatedExtension.error.message);
+    expect(updatedExtension.data.extra).toBe(1);
   });
 
   it("returns typed capability errors for malformed and partial dynamic modules", async () => {

@@ -29,10 +29,7 @@ import type {
 } from "@stanley2058/mini-lilac-client";
 import {
   miniLilacControlResultSchema,
-  miniLilacCompactResultSchema,
   miniLilacCompactionEventSchema,
-  miniLilacHistoryFilesystemResultSchema,
-  miniLilacMessagesSchema,
   miniLilacOutputRollbackSchema,
   miniLilacProviderMetadataSchema,
   miniLilacRedoResultSchema,
@@ -42,11 +39,9 @@ import {
   miniLilacSteeringChunkSchema,
   miniLilacSubagentStatusSchema,
   miniLilacTodoChunkSchema,
-  miniLilacTodosSchema,
   miniLilacTranscriptResetSchema,
   miniLilacUIMessageMetadataSchema,
   miniLilacUndoResultSchema,
-  miniLilacUserUIMessageSchema,
 } from "@stanley2058/mini-lilac-client";
 import type { ModelMessage } from "ai";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
@@ -56,9 +51,10 @@ import { z } from "zod";
 import {
   decodeMiniLilacMigrationRunRow,
   decodeMiniLilacStructuralHistoryRow,
+  decodeMiniLilacStructuralHistoryRows,
   type MiniLilacMigrationRunRowProjection,
-  type MiniLilacStructuralHistoryRecord,
   type MiniLilacStructuralHistoryRecordKind,
+  type MiniLilacStructuralHistoryValueFor,
 } from "./sqlite-history-persistence-codec";
 import {
   decodeMiniLilacDatabaseVersion,
@@ -93,6 +89,15 @@ export { MiniLilacSqliteDriverFailure } from "./sqlite-persistence-errors";
 
 const sessionStatusSchema = miniLilacSessionStatusSchema;
 const runStatusSchema = z.enum(["active", "completed", "cancelled", "error"]);
+const reasoningSchema = z.enum([
+  "provider-default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
 export const MINI_LILAC_DATABASE_SCHEMA_VERSION = 8;
 export const MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
 export const MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 100;
@@ -140,6 +145,22 @@ export type MiniLilacPersistenceError =
   | PersistedDataError
   | MiniLilacSqliteDriverFailure
   | MiniLilacHistoryRecordMissing;
+export class MiniLilacStoreOperationRejected extends TaggedError(
+  "MiniLilacStoreOperationRejected",
+)<{
+  readonly operation: string;
+  readonly message: string;
+}> {}
+export type MiniLilacStoreOperationError =
+  | MiniLilacPersistenceError
+  | MiniLilacStoreOperationRejected;
+
+function rejectMiniLilacStoreOperation(
+  operation: string,
+  message: string,
+): MiniLilacStoreOperationRejected {
+  return new MiniLilacStoreOperationRejected({ operation, message });
+}
 export type MiniLilacPersistenceDiagnostic = {
   readonly table: string;
   readonly field: string;
@@ -159,14 +180,6 @@ export type MiniLilacSqliteStoreOptions = {
   readonly onPersistenceDiagnostic?: (diagnostic: MiniLilacPersistenceDiagnostic) => void;
   readonly onCleanupDefect?: (report: MiniLilacCleanupDefectReport) => void;
 };
-type MiniLilacStructuralHistoryRecordFor<K extends MiniLilacStructuralHistoryRecordKind> = Extract<
-  MiniLilacStructuralHistoryRecord,
-  { readonly kind: K }
->;
-type MiniLilacStructuralHistoryValueByKind = {
-  [K in MiniLilacStructuralHistoryRecordKind]: MiniLilacStructuralHistoryRecordFor<K>["value"];
-};
-
 type MiniLilacSchemaInitializationError =
   | MiniLilacDatabaseVersionError
   | MiniLilacPersistenceError
@@ -176,7 +189,14 @@ type MiniLilacSchemaInitializationError =
 type MiniLilacCleanupOutcome =
   | { readonly status: "ok" }
   | { readonly status: "expected-error"; readonly error: MiniLilacSqliteDriverFailure }
-  | { readonly status: "defect"; readonly cause: unknown };
+  | {
+      readonly status: "defect";
+      readonly report: (
+        reporter: (report: MiniLilacCleanupDefectReport) => void,
+        operation: MiniLilacCleanupDefectReport["operation"],
+      ) => void;
+      readonly rethrow: () => never;
+    };
 type MiniLilacCaughtDefect =
   | { readonly kind: "panic"; readonly cause: Panic }
   | { readonly kind: "error"; readonly cause: Error }
@@ -191,7 +211,14 @@ function captureMiniLilacCleanup(
       ? { status: "ok" }
       : { status: "expected-error", error: result.error };
   } catch (cause) {
-    return { status: "defect", cause };
+    return {
+      status: "defect",
+      report: (reporter, operation) =>
+        reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cause }),
+      rethrow: () => {
+        throw cause;
+      },
+    };
   }
 }
 
@@ -223,7 +250,7 @@ function throwPrimaryAfterCleanup(
       reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cleanup.error });
       break;
     case "defect":
-      reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cleanup.cause });
+      cleanup.report(reporter, operation);
       break;
   }
   throw primary.cause;
@@ -258,7 +285,7 @@ const sessionRowSchema = z.object({
   cwd: z.string(),
   model: z.string(),
   profile: z.string(),
-  reasoning: z.string(),
+  reasoning: reasoningSchema,
   title: z.string(),
   input_tokens: z.number().int().nonnegative().nullable(),
   input_tokens_estimated: z.number().int().min(0).max(1),
@@ -358,24 +385,6 @@ const workspaceHistoryOwnerSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("history-operation"), operationId: z.string().min(1) }),
   z.strictObject({ kind: z.literal("pending-run-finalization"), runId: z.string().min(1) }),
 ]);
-const historyWorkspaceOutcomeSchema = z.discriminatedUnion("workspaceStatus", [
-  z.strictObject({
-    workspaceSnapshotId: z.string().min(1),
-    workspaceStatus: z.literal("captured"),
-    workspaceUnavailableReason: z.null(),
-  }),
-  z.strictObject({
-    workspaceSnapshotId: z.null(),
-    workspaceStatus: z.literal("unavailable"),
-    workspaceUnavailableReason: z.enum([
-      "git-unavailable",
-      "capture-failed",
-      "non-git-workspace",
-      "platform-unsupported",
-    ]),
-  }),
-]);
-
 const workspaceSnapshotAvailabilityUpdateSchema = z.discriminatedUnion("availability", [
   z.strictObject({
     snapshotId: z.string().min(1),
@@ -427,87 +436,6 @@ const miniMainClaudeAttemptRowSchema = z.object({
   created_at: z.string(),
   updated_at: z.string(),
 });
-const miniNamedClaudeBindingRowSchema = miniMainClaudeBindingRowSchema;
-const miniNamedClaudeAttemptRowSchema = miniMainClaudeAttemptRowSchema;
-const miniMainClaudeStateLookupSchema = z.strictObject({
-  sessionId: z.string().min(1),
-  historyStateId: z.string().min(1),
-  providerId: z.string().min(1),
-});
-const miniNamedSessionIdSchema = z
-  .string()
-  .min(1)
-  .refine(
-    (value) => value.startsWith("sub:") && value.lastIndexOf(":named:") > "sub:".length,
-    "Expected a named delegated Mini session ID",
-  );
-const reserveMiniMainClaudeSessionAttemptSchema = z.strictObject({
-  providerId: z.string().min(1),
-  requestClient: z.string().min(1),
-  lilacSessionId: z.string().min(1),
-  sourceHistoryStateId: z.string().min(1),
-  executionScopeHashVersion: z.literal(1),
-  executionScopeHash: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-  candidateSessionId: z.string().uuid(),
-  sourceSessionId: z.string().uuid().nullable(),
-  expectedBindingRevision: z.number().int().positive().nullable(),
-});
-const miniMainClaudeSessionAttemptKeySchema = z.strictObject({
-  providerId: z.string().min(1),
-  lilacSessionId: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-});
-const recordMiniMainClaudeSessionAttemptOutcomeSchema =
-  miniMainClaudeSessionAttemptKeySchema.extend({
-    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
-  });
-const promoteMiniMainClaudeSessionBindingSchema = z.strictObject({
-  providerId: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-  nativeCwd: z.string().min(1),
-  nativeLastModified: z.number().finite().nonnegative(),
-  nativeContextTokens: z.number().int().nonnegative(),
-  nativeContextMaxTokens: z.number().int().positive(),
-  lastModelSpecifier: z.string().min(1),
-  lastReasoning: z.string().min(1),
-});
-const miniNamedClaudeStateLookupSchema = z.strictObject({
-  sessionId: miniNamedSessionIdSchema,
-  providerId: z.string().min(1),
-});
-const reserveMiniNamedClaudeSessionAttemptSchema = z.strictObject({
-  providerId: z.string().min(1),
-  requestClient: z.string().min(1),
-  lilacSessionId: miniNamedSessionIdSchema,
-  sourceHistoryStateId: z.string().min(1),
-  executionScopeHashVersion: z.literal(1),
-  executionScopeHash: z.string().min(1),
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-  candidateSessionId: z.string().uuid(),
-  sourceSessionId: z.string().uuid().nullable(),
-  expectedBindingRevision: z.number().int().positive().nullable(),
-});
-const miniNamedClaudeSessionAttemptKeySchema = z.strictObject({
-  providerId: z.string().min(1),
-  lilacSessionId: miniNamedSessionIdSchema,
-  requestId: z.string().min(1),
-  attemptIndex: z.number().int().nonnegative(),
-});
-const recordMiniNamedClaudeSessionAttemptOutcomeSchema =
-  miniNamedClaudeSessionAttemptKeySchema.extend({
-    state: miniMainClaudeAttemptStateSchema.exclude(["active"]),
-  });
-const promoteMiniNamedClaudeSessionBindingSchema = promoteMiniMainClaudeSessionBindingSchema.extend(
-  {
-    canonicalMessageCount: z.number().int().nonnegative(),
-    canonicalHeadHash: z.string().min(1),
-  },
-);
 const migrationSessionRowSchema = z.object({
   id: z.string(),
   active_run_id: z.string().nullable(),
@@ -538,6 +466,272 @@ const migrationRunRowSchema = z.object({
   status: runStatusSchema,
   parent_run_id: z.string().nullable(),
 });
+const migrationHistorySessionRowSchema = z.object({
+  id: z.string(),
+  workspace_id: z.string(),
+  active_run_id: z.string().nullable(),
+  status: sessionStatusSchema,
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+const idRowSchema = z.object({ id: z.string() });
+const countRowSchema = z.object({ count: z.number().int().nonnegative() });
+const positionRowSchema = z.object({ position: z.number().int().nonnegative() });
+const depthRowSchema = z.object({ depth: z.number().int().positive() });
+const rootPromptSourceRowSchema = z.object({ from_state_id: z.string().min(1) });
+const historyOperationOwnerRowSchema = z.object({ id: z.string(), session_id: z.string() });
+const pendingFinalizationOwnerRowSchema = z.object({
+  run_id: z.string(),
+  session_id: z.string(),
+});
+const claudeAttemptOwnerRowSchema = z.object({
+  session_id: z.string(),
+  provider_id: z.string(),
+});
+const rootRunParentRowSchema = z.object({ parent_run_id: z.null() });
+const interruptedClaudeAttemptRowSchema = z.object({
+  product: z.enum(["main", "named"]),
+  request_id: z.string(),
+  session_id: z.string(),
+  provider_id: z.string(),
+  request_client: z.string(),
+  source_history_state_id: z.string(),
+  expected_binding_revision: z.number().int().positive().nullable(),
+  model: z.string(),
+  reasoning: z.string(),
+});
+
+const miniLilacStoreRowCodecRegistry = {
+  session: {
+    schema: sessionRowSchema,
+    versions: [8],
+    table: "sessions",
+  },
+  run: {
+    schema: runRowSchema,
+    versions: [8],
+    table: "runs",
+  },
+  "transcript-node": {
+    schema: transcriptNodeRowSchema,
+    versions: [3, 4, 5, 6, 7, 8],
+    table: "transcript_nodes",
+  },
+  "transcript-node-id": {
+    schema: transcriptNodeRowSchema.pick({ id: true }),
+    versions: [3, 4, 5, 6, 7, 8],
+    table: "transcript_nodes",
+  },
+  "transcript-head": {
+    schema: transcriptHeadRowSchema,
+    versions: [3, 4, 5, 6, 7, 8],
+    table: "session_transcript_heads",
+  },
+  "legacy-positioned-json": {
+    schema: legacyPositionedJsonRowSchema,
+    versions: [2],
+    table: "model_transcript",
+  },
+  "legacy-checkpoint": {
+    schema: legacyCheckpointRowSchema,
+    versions: [2],
+    table: "user_checkpoints",
+  },
+  command: {
+    schema: commandRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "commands",
+  },
+  "claude-binding": {
+    schema: miniMainClaudeBindingRowSchema,
+    versions: [7, 8],
+    table: "mini_main_claude_bindings",
+  },
+  "claude-attempt": {
+    schema: miniMainClaudeAttemptRowSchema,
+    versions: [7, 8],
+    table: "mini_main_claude_attempts",
+  },
+  "migration-session": {
+    schema: migrationSessionRowSchema,
+    versions: [4],
+    table: "sessions",
+  },
+  "migration-history-session": {
+    schema: migrationHistorySessionRowSchema,
+    versions: [4],
+    table: "sessions",
+  },
+  "migration-checkpoint": {
+    schema: migrationCheckpointRowSchema,
+    versions: [4],
+    table: "user_checkpoints",
+  },
+  "migration-run": {
+    schema: migrationRunRowSchema,
+    versions: [4],
+    table: "runs",
+  },
+  id: {
+    schema: idRowSchema,
+    versions: [2, 3, 4, 5, 6, 7, 8],
+    table: "sqlite-query",
+  },
+  count: {
+    schema: countRowSchema,
+    versions: [4, 5, 6, 7, 8],
+    table: "sqlite-query",
+  },
+  position: {
+    schema: positionRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "history_redo_stack",
+  },
+  depth: {
+    schema: depthRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "transcript_nodes",
+  },
+  "root-prompt-source": {
+    schema: rootPromptSourceRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "history_transitions",
+  },
+  "history-operation-owner": {
+    schema: historyOperationOwnerRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "history_operations",
+  },
+  "pending-finalization-owner": {
+    schema: pendingFinalizationOwnerRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "pending_run_finalizations",
+  },
+  "claude-attempt-owner": {
+    schema: claudeAttemptOwnerRowSchema,
+    versions: [7, 8],
+    table: "mini_claude_attempts",
+  },
+  "root-run-parent": {
+    schema: rootRunParentRowSchema,
+    versions: [5, 6, 7, 8],
+    table: "runs",
+  },
+  "interrupted-claude-attempt": {
+    schema: interruptedClaudeAttemptRowSchema,
+    versions: [7, 8],
+    table: "mini_claude_attempts",
+  },
+} as const;
+
+type MiniLilacStoreRowKind = keyof typeof miniLilacStoreRowCodecRegistry;
+type MiniLilacStoreRowValueByKind = {
+  [K in MiniLilacStoreRowKind]: z.output<(typeof miniLilacStoreRowCodecRegistry)[K]["schema"]>;
+};
+
+export function decodeMiniLilacStoreRow<K extends MiniLilacStoreRowKind>(input: {
+  readonly kind: K;
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<MiniLilacStoreRowValueByKind[K] | null>, PersistedDataError> {
+  const codec = miniLilacStoreRowCodecRegistry[input.kind];
+  if (!codec.versions.some((version) => version === input.schemaVersion)) {
+    return Result.err(
+      new UnsupportedVersion({
+        table: codec.table,
+        field: "row",
+        version: input.schemaVersion,
+        issueCode: "unsupported-version",
+        recordId: input.recordId,
+        message: `Unsupported Mini Lilac ${input.kind} row version`,
+      }),
+    );
+  }
+  if (input.row === null || input.row === undefined) {
+    return Result.ok({ value: null, provenance: "missing-defaulted" });
+  }
+  const decoded = codec.schema.safeParse(input.row);
+  if (!decoded.success) {
+    return Result.err(
+      new CorruptPersistedFields({
+        table: codec.table,
+        field: "row",
+        version: input.schemaVersion,
+        issueCode: "invalid-row-field",
+        recordId: input.recordId,
+        message: `Stored Mini Lilac ${input.kind} row is invalid`,
+      }),
+    );
+  }
+  // The registry key selects this schema; TypeScript cannot retain that
+  // correlation through indexed access to the heterogeneous schema map.
+  const value = decoded.data as MiniLilacStoreRowValueByKind[K];
+  return Result.ok({
+    value,
+    provenance: input.schemaVersion === MINI_LILAC_DATABASE_SCHEMA_VERSION ? "current" : "migrated",
+  });
+}
+
+export function decodeMiniLilacStoreRows<K extends MiniLilacStoreRowKind>(input: {
+  readonly kind: K;
+  readonly rows: readonly unknown[];
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<
+  DecodedPersistedValue<readonly MiniLilacStoreRowValueByKind[K][]>,
+  PersistedDataError
+> {
+  const values: MiniLilacStoreRowValueByKind[K][] = [];
+  for (const [index, row] of input.rows.entries()) {
+    const decoded = decodeMiniLilacStoreRow({
+      kind: input.kind,
+      row,
+      schemaVersion: input.schemaVersion,
+      recordId: `${input.recordId}:${index}`,
+    });
+    if (decoded.status === "error") return Result.err(decoded.error);
+    if (decoded.value.value === null) {
+      return Result.err(
+        new CorruptPersistedFields({
+          table: miniLilacStoreRowCodecRegistry[input.kind].table,
+          field: "row",
+          version: input.schemaVersion,
+          issueCode: "missing-required-field",
+          recordId: `${input.recordId}:${index}`,
+          message: `Mini Lilac ${input.kind} row is missing`,
+        }),
+      );
+    }
+    values.push(decoded.value.value);
+  }
+  return Result.ok({
+    value: values,
+    provenance: input.schemaVersion === MINI_LILAC_DATABASE_SCHEMA_VERSION ? "current" : "migrated",
+  });
+}
+
+function decodeRequiredMiniLilacStoreRow<K extends MiniLilacStoreRowKind>(input: {
+  readonly kind: K;
+  readonly row: unknown;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<
+  MiniLilacStoreRowValueByKind[K],
+  PersistedDataError | MiniLilacHistoryRecordMissing
+> {
+  const decoded = decodeMiniLilacStoreRow(input);
+  if (decoded.status === "error") return Result.err(decoded.error);
+  if (decoded.value.value !== null) return Result.ok(decoded.value.value);
+  return Result.err(
+    new MiniLilacHistoryRecordMissing({
+      recordKind: input.kind,
+      recordId: input.recordId.slice(0, 128),
+      message: `Mini Lilac ${input.kind} record was not found`,
+    }),
+  );
+}
+
 export const storedHistoryCommandErrorSchema = z.strictObject({
   type: z.literal("history-command-error"),
   code: z.literal("history-recovery-abandoned"),
@@ -550,6 +744,19 @@ export const storedHistoryNavigationResultSchema = z.union([
   storedUndoHistoryResultSchema,
   storedRedoHistoryResultSchema,
 ]);
+
+export function decodeStoredHistoryNavigationResult(
+  value: unknown,
+): ResultType<StoredHistoryNavigationResult, MiniLilacStoreOperationRejected> {
+  const decoded = storedHistoryNavigationResultSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new MiniLilacStoreOperationRejected({
+      operation: "decodeStoredHistoryNavigationResult",
+      message: "Stored history navigation result is invalid",
+    }),
+  );
+}
 const providerMetadataFields = {
   providerMetadata: miniLilacProviderMetadataSchema.optional(),
 };
@@ -595,9 +802,7 @@ const standardChunkSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("custom"),
-    kind: z.custom<`${string}.${string}`>(
-      (value): value is `${string}.${string}` => typeof value === "string" && value.includes("."),
-    ),
+    kind: z.templateLiteral([z.string(), ".", z.string()]),
     ...providerMetadataFields,
   }),
   z.strictObject({
@@ -711,22 +916,40 @@ const standardChunkSchema = z.discriminatedUnion("type", [
 export type StoredUIMessageChunk = z.infer<typeof standardChunkSchema>;
 export type StoredRunChunk = { seq: number; chunk: StoredUIMessageChunk };
 
-export function parseStoredUIMessageChunk(value: unknown): StoredUIMessageChunk {
-  return standardChunkSchema.parse(value);
+export function decodeStoredUIMessageChunk(
+  value: unknown,
+): ResultType<StoredUIMessageChunk, MiniLilacStoreOperationRejected> {
+  const decoded = standardChunkSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new MiniLilacStoreOperationRejected({
+      operation: "decodeStoredUIMessageChunk",
+      message: "Stored UI message chunk is invalid",
+    }),
+  );
 }
 
-const modelMessagesSchema = z.custom<ModelMessage[]>(
-  (value) =>
-    Array.isArray(value) &&
-    value.every(
-      (message) =>
-        typeof message === "object" &&
-        message !== null &&
-        "role" in message &&
-        ["system", "user", "assistant", "tool"].includes(String(message.role)),
-    ),
-  "Invalid canonical model transcript",
-);
+function decodeStoredSessionSnapshot(
+  value: unknown,
+): ResultType<MiniLilacSessionSnapshot | undefined, PersistedDataError> {
+  if (value === undefined) return Result.ok(undefined);
+  const decoded = miniLilacSessionSnapshotSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new CorruptPersistedFields({
+      table: "commands",
+      field: "command_result",
+      version: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      issueCode: "invalid-row-field",
+      recordId: "session-snapshot-command",
+      message: "Stored session snapshot command result is invalid",
+    }),
+  );
+}
+
+export function parseStoredUIMessageChunk(value: unknown): StoredUIMessageChunk {
+  return storeResultToLegacy(decodeStoredUIMessageChunk(value));
+}
 
 export type MiniLilacRunStatus = z.infer<typeof runStatusSchema>;
 
@@ -1267,6 +1490,28 @@ function serialize(value: unknown): string {
   return superjson.stringify(value);
 }
 
+function serializeStoreValueResult(
+  value: unknown,
+  operation: string,
+): ResultType<string, MiniLilacStoreOperationRejected> {
+  try {
+    return Result.ok(serialize(value));
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation,
+        message: "Store value is not serializable",
+      }),
+    );
+  }
+}
+
+function storeResultToLegacy<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
 function canonicalJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalJsonValue);
   if (value !== null && typeof value === "object") {
@@ -1289,15 +1534,164 @@ function storedProviderStateFlag(providerState: HistoryProviderState | null): nu
   return 0;
 }
 
-function canonicalCommandPayload(payload: unknown): { json: string; fingerprint: string } {
-  const normalized: unknown = JSON.parse(JSON.stringify(payload));
-  const json = JSON.stringify(canonicalJsonValue(z.json().parse(normalized)));
+function canonicalCommandPayloadResult(
+  payload: unknown,
+): ResultType<
+  { readonly json: string; readonly fingerprint: string },
+  MiniLilacStoreOperationRejected
+> {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(payload);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation: "canonicalCommandPayload",
+        message: "Command payload is not serializable JSON",
+      }),
+    );
+  }
+  if (serialized === undefined) {
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation: "canonicalCommandPayload",
+        message: "Command payload is not serializable JSON",
+      }),
+    );
+  }
+  const parsedJson: unknown = JSON.parse(serialized);
+  const jsonValue = z.json().safeParse(parsedJson);
+  if (!jsonValue.success) {
+    return Result.err(
+      new MiniLilacStoreOperationRejected({
+        operation: "canonicalCommandPayload",
+        message: "Command payload is not valid JSON",
+      }),
+    );
+  }
+  const json = JSON.stringify(canonicalJsonValue(jsonValue.data));
   const fingerprint = new Bun.CryptoHasher("sha256").update(json).digest("hex");
-  return { json, fingerprint };
+  return Result.ok({ json, fingerprint });
+}
+
+function decodeCanonicalStoredCommandRequest(request: StoredCommandRequest): ResultType<
+  {
+    readonly kind: string;
+    readonly runId: string | null;
+    readonly json: string;
+    readonly fingerprint: string;
+  },
+  MiniLilacStoreOperationRejected
+> {
+  const payload = canonicalCommandPayloadResult(request.payload);
+  if (payload.status === "error") return Result.err(payload.error);
+  return Result.ok({ kind: request.kind, runId: request.runId, ...payload.value });
+}
+
+function decodeCanonicalRootPromptCommand(
+  input: AdmitStoredRootPromptHistory,
+): ResultType<
+  { readonly json: string; readonly fingerprint: string },
+  MiniLilacStoreOperationRejected
+> {
+  return canonicalCommandPayloadResult(input.commandPayload);
+}
+
+function serializeOptionalTerminalResult(
+  input: { readonly terminalResult?: unknown },
+  operation: string,
+): ResultType<string | null, MiniLilacStoreOperationRejected> {
+  if (input.terminalResult === undefined) return Result.ok(null);
+  return serializeStoreValueResult(input.terminalResult, operation);
 }
 
 function canonicalValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(canonicalJsonValue(left)) === JSON.stringify(canonicalJsonValue(right));
+}
+
+function validateSteeringHistoryBoundaryInput(
+  input: CommitStoredSteeringBoundary,
+): ResultType<
+  { readonly firstUiPosition: number; readonly firstModelPosition: number },
+  MiniLilacStoreOperationRejected
+> {
+  if (input.entries.length === 0) {
+    return Result.err(
+      rejectMiniLilacStoreOperation(
+        "commitSteeringHistoryBoundary",
+        "A steering boundary requires at least one entry",
+      ),
+    );
+  }
+  for (const [index, entry] of input.entries.entries()) {
+    if (entry.modelMessage.role !== "user") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Every steering entry requires one canonical model user message",
+        ),
+      );
+    }
+    if (!Number.isInteger(entry.replayAfterSeq) || entry.replayAfterSeq < 0) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Every steering entry requires a non-negative replay sequence",
+        ),
+      );
+    }
+    if (index < input.entries.length - 1 !== (entry.intermediateStateId !== undefined)) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Every non-final steering entry requires exactly one intermediate state ID",
+        ),
+      );
+    }
+  }
+  const firstUiPosition = input.uiMessages.length - input.entries.length;
+  if (firstUiPosition < 0) {
+    return Result.err(
+      rejectMiniLilacStoreOperation(
+        "commitSteeringHistoryBoundary",
+        "Steering UI messages do not contain every entry",
+      ),
+    );
+  }
+  const firstModelPosition = input.mergedModelMessages.length - input.entries.length;
+  if (firstModelPosition < 0) {
+    return Result.err(
+      rejectMiniLilacStoreOperation(
+        "commitSteeringHistoryBoundary",
+        "Steering model messages do not contain every entry",
+      ),
+    );
+  }
+  for (const [index, entry] of input.entries.entries()) {
+    if (!canonicalValuesEqual(input.uiMessages[firstUiPosition + index], entry.message)) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Steering entries must be the exact final canonical UI suffix",
+        ),
+      );
+    }
+    if (
+      !canonicalValuesEqual(
+        input.mergedModelMessages[firstModelPosition + index],
+        entry.modelMessage,
+      )
+    ) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitSteeringHistoryBoundary",
+          "Steering entries must be the exact final canonical model suffix",
+        ),
+      );
+    }
+  }
+  return Result.ok({ firstUiPosition, firstModelPosition });
 }
 
 function canonicalizeStoredCwd(cwd: string): string {
@@ -1312,22 +1706,11 @@ function canonicalizeStoredCwd(cwd: string): string {
 }
 
 function isCanonicalPrefix(prefix: readonly unknown[], values: readonly unknown[]): boolean {
-  return (
-    prefix.length <= values.length &&
-    prefix.every((value, index) => canonicalValuesEqual(value, values[index]))
-  );
-}
-
-function parseHistoryWorkspaceOutcome(input: {
-  readonly workspaceSnapshotId: unknown;
-  readonly workspaceStatus: unknown;
-  readonly workspaceUnavailableReason: unknown;
-}): z.infer<typeof historyWorkspaceOutcomeSchema> {
-  return historyWorkspaceOutcomeSchema.parse({
-    workspaceSnapshotId: input.workspaceSnapshotId,
-    workspaceStatus: input.workspaceStatus,
-    workspaceUnavailableReason: input.workspaceUnavailableReason,
-  });
+  if (prefix.length > values.length) return false;
+  for (let index = 0; index < prefix.length; index += 1) {
+    if (!canonicalValuesEqual(prefix[index], values[index])) return false;
+  }
+  return true;
 }
 
 type StoredSessionRowSnapshot = Omit<
@@ -1335,8 +1718,9 @@ type StoredSessionRowSnapshot = Omit<
   "historyStateId" | "canUndo" | "canRedo"
 >;
 
-function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
-  const row = sessionRowSchema.parse(rowValue);
+function projectSessionRowSnapshot(
+  row: MiniLilacStoreRowValueByKind["session"],
+): StoredSessionRowSnapshot {
   return {
     id: row.id,
     activeRunId: row.active_run_id,
@@ -1344,9 +1728,7 @@ function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
     cwd: row.cwd,
     model: row.model,
     profile: row.profile,
-    reasoning: z
-      .enum(["provider-default", "none", "minimal", "low", "medium", "high", "xhigh"])
-      .parse(row.reasoning),
+    reasoning: row.reasoning,
     title: row.title,
     inputTokens: row.input_tokens,
     inputTokensEstimated: row.input_tokens_estimated === 1,
@@ -1357,16 +1739,40 @@ function toSnapshot(rowValue: unknown): StoredSessionRowSnapshot {
   };
 }
 
-function toRun(rowValue: unknown): StoredRun {
-  const row = runRowSchema.parse(rowValue);
+function decodeSessionRowSnapshot(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<StoredSessionRowSnapshot, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decoded = decodeRequiredMiniLilacStoreRow({
+    kind: "session",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  if (decoded.status === "error") return Result.err(decoded.error);
+  return Result.ok(projectSessionRowSnapshot(decoded.value));
+}
+
+function decodeRunRow(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<StoredRun, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decodedRow = decodeRequiredMiniLilacStoreRow({
+    kind: "run",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  if (decodedRow.status === "error") return Result.err(decodedRow.error);
+  const row = decodedRow.value;
   const terminalResult = decodeMiniLilacSuperJsonPayload({
     raw: row.terminal_result_json,
     schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
     recordId: row.id,
     field: "terminal_result",
   });
-  if (terminalResult.status === "error") throw terminalResult.error;
-  return {
+  if (terminalResult.status === "error") return Result.err(terminalResult.error);
+  return Result.ok({
     id: row.id,
     sessionId: row.session_id,
     parentRunId: row.parent_run_id,
@@ -1377,12 +1783,22 @@ function toRun(rowValue: unknown): StoredRun {
     terminalResult: terminalResult.value.value ?? undefined,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
-  };
+  });
 }
 
-function toMiniMainClaudeBinding(rowValue: unknown): MiniMainClaudeSessionBinding {
-  const row = miniMainClaudeBindingRowSchema.parse(rowValue);
-  return {
+function decodeMiniMainClaudeBindingRow(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<MiniMainClaudeSessionBinding, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decoded = decodeRequiredMiniLilacStoreRow({
+    kind: "claude-binding",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  if (decoded.status === "error") return Result.err(decoded.error);
+  const row = decoded.value;
+  return Result.ok({
     bindingProtocolVersion: row.binding_protocol_version,
     providerId: row.provider_id,
     providerFamily: row.provider_family,
@@ -1401,12 +1817,22 @@ function toMiniMainClaudeBinding(rowValue: unknown): MiniMainClaudeSessionBindin
     lastReasoning: row.last_reasoning,
     revision: row.revision,
     updatedAt: row.updated_at,
-  };
+  });
 }
 
-function toMiniMainClaudeAttempt(rowValue: unknown): MiniMainClaudeSessionAttempt {
-  const row = miniMainClaudeAttemptRowSchema.parse(rowValue);
-  return {
+function decodeMiniMainClaudeAttemptRow(
+  rowValue: unknown,
+  recordId: string,
+): ResultType<MiniMainClaudeSessionAttempt, PersistedDataError | MiniLilacHistoryRecordMissing> {
+  const decoded = decodeRequiredMiniLilacStoreRow({
+    kind: "claude-attempt",
+    row: rowValue,
+    schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    recordId,
+  });
+  if (decoded.status === "error") return Result.err(decoded.error);
+  const row = decoded.value;
+  return Result.ok({
     product: row.product,
     providerId: row.provider_id,
     requestClient: row.request_client,
@@ -1423,15 +1849,7 @@ function toMiniMainClaudeAttempt(rowValue: unknown): MiniMainClaudeSessionAttemp
     state: row.state,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-  };
-}
-
-function toMiniNamedClaudeBinding(rowValue: unknown): MiniNamedClaudeSessionBinding {
-  return toMiniMainClaudeBinding(miniNamedClaudeBindingRowSchema.parse(rowValue));
-}
-
-function toMiniNamedClaudeAttempt(rowValue: unknown): MiniNamedClaudeSessionAttempt {
-  return toMiniMainClaudeAttempt(miniNamedClaudeAttemptRowSchema.parse(rowValue));
+  });
 }
 
 export type ReadonlyStoredHistoryRecoveryStatus = {
@@ -1474,9 +1892,7 @@ export type MiniLilacHistoryRecoveryReadError =
 export function readMiniLilacHistoryRecoveryStatus(
   filename: string,
 ): ReadonlyStoredHistoryRecoveryStatus {
-  const result = readMiniLilacHistoryRecoveryStatusResult(filename);
-  if (result.status === "error") throw result.error;
-  return result.value;
+  return storeResultToLegacy(readMiniLilacHistoryRecoveryStatusResult(filename));
 }
 
 function closeMiniLilacHistoryRecoveryDatabase(
@@ -1543,118 +1959,29 @@ export function readMiniLilacHistoryRecoveryStatusResult(
         readonly canonicalCwd: string;
         readonly operation: StoredHistoryOperation;
       }> = [];
-      const operationRows = database
-        .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
-        .all();
-      for (const [index, row] of operationRows.entries()) {
-        const operation = decodeMiniLilacStructuralHistoryRow({
-          kind: "operation",
-          row,
-          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-          recordId: `recovery-operation:${index}`,
+      const operations = decodeMiniLilacStructuralHistoryRows({
+        kind: "operation",
+        rows: database.query("SELECT * FROM history_operations ORDER BY prepared_at, rowid").all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "recovery-operation",
+      });
+      if (operations.status === "error") {
+        diagnostics.push({
+          table: operations.error.table,
+          field: operations.error.field,
+          version: operations.error.version,
+          issueCode: operations.error.issueCode,
+          recordId: operations.error.recordId,
+          message: operations.error.message,
         });
-        if (operation.status === "error") {
-          diagnostics.push({
-            table: operation.error.table,
-            field: operation.error.field,
-            version: operation.error.version,
-            issueCode: operation.error.issueCode,
-            recordId: operation.error.recordId,
-            message: operation.error.message,
-          });
-          outcome = Result.err(operation.error);
-          break;
-        }
-        if (operation.value.value?.kind !== "operation") {
-          outcome = Result.err(
-            new MiniLilacHistoryRecordMissing({
-              recordKind: "operation",
-              recordId: `recovery-operation:${index}`,
-              message: "Mini Lilac recovery operation was not found",
-            }),
-          );
-          break;
-        }
-        const workspace = decodeMiniLilacStructuralHistoryRow({
-          kind: "workspace",
-          row: database
-            .query("SELECT * FROM workspaces WHERE id = ?")
-            .get(operation.value.value.value.workspaceId),
-          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-          recordId: operation.value.value.value.workspaceId,
-        });
-        if (workspace.status === "error") {
-          diagnostics.push({
-            table: workspace.error.table,
-            field: workspace.error.field,
-            version: workspace.error.version,
-            issueCode: workspace.error.issueCode,
-            recordId: workspace.error.recordId,
-            message: workspace.error.message,
-          });
-          outcome = Result.err(workspace.error);
-          break;
-        }
-        if (workspace.value.value?.kind !== "workspace") {
-          outcome = Result.err(
-            new MiniLilacHistoryRecordMissing({
-              recordKind: "workspace",
-              recordId: operation.value.value.value.workspaceId,
-              message: "Mini Lilac recovery workspace was not found",
-            }),
-          );
-          break;
-        }
-        navigation.push({
-          canonicalCwd: workspace.value.value.value.canonicalCwd,
-          operation: operation.value.value.value,
-        });
-      }
-
-      if (outcome === undefined) {
-        const pendingFinalizations: Array<{
-          readonly canonicalCwd: string;
-          readonly finalization: PendingStoredRunFinalization;
-        }> = [];
-        const finalizationRows = database
-          .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
-          .all();
-        for (const [index, row] of finalizationRows.entries()) {
-          const finalization = decodeMiniLilacStructuralHistoryRow({
-            kind: "pending-finalization",
-            row,
-            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-            recordId: `recovery-finalization:${index}`,
-          });
-          if (finalization.status === "error") {
-            diagnostics.push({
-              table: finalization.error.table,
-              field: finalization.error.field,
-              version: finalization.error.version,
-              issueCode: finalization.error.issueCode,
-              recordId: finalization.error.recordId,
-              message: finalization.error.message,
-            });
-            outcome = Result.err(finalization.error);
-            break;
-          }
-          if (finalization.value.value?.kind !== "pending-finalization") {
-            outcome = Result.err(
-              new MiniLilacHistoryRecordMissing({
-                recordKind: "pending-finalization",
-                recordId: `recovery-finalization:${index}`,
-                message: "Mini Lilac recovery finalization was not found",
-              }),
-            );
-            break;
-          }
+        outcome = Result.err(operations.error);
+      } else {
+        for (const operation of operations.value.value) {
           const workspace = decodeMiniLilacStructuralHistoryRow({
             kind: "workspace",
-            row: database
-              .query("SELECT * FROM workspaces WHERE id = ?")
-              .get(finalization.value.value.value.workspaceId),
+            row: database.query("SELECT * FROM workspaces WHERE id = ?").get(operation.workspaceId),
             schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-            recordId: finalization.value.value.value.workspaceId,
+            recordId: operation.workspaceId,
           });
           if (workspace.status === "error") {
             diagnostics.push({
@@ -1672,16 +1999,79 @@ export function readMiniLilacHistoryRecoveryStatusResult(
             outcome = Result.err(
               new MiniLilacHistoryRecordMissing({
                 recordKind: "workspace",
-                recordId: finalization.value.value.value.workspaceId,
+                recordId: operation.workspaceId,
                 message: "Mini Lilac recovery workspace was not found",
               }),
             );
             break;
           }
-          pendingFinalizations.push({
+          navigation.push({
             canonicalCwd: workspace.value.value.value.canonicalCwd,
-            finalization: finalization.value.value.value,
+            operation,
           });
+        }
+      }
+
+      if (outcome === undefined) {
+        const pendingFinalizations: Array<{
+          readonly canonicalCwd: string;
+          readonly finalization: PendingStoredRunFinalization;
+        }> = [];
+        const finalizations = decodeMiniLilacStructuralHistoryRows({
+          kind: "pending-finalization",
+          rows: database
+            .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+            .all(),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: "recovery-finalization",
+        });
+        if (finalizations.status === "error") {
+          diagnostics.push({
+            table: finalizations.error.table,
+            field: finalizations.error.field,
+            version: finalizations.error.version,
+            issueCode: finalizations.error.issueCode,
+            recordId: finalizations.error.recordId,
+            message: finalizations.error.message,
+          });
+          outcome = Result.err(finalizations.error);
+        } else {
+          for (const finalization of finalizations.value.value) {
+            const workspace = decodeMiniLilacStructuralHistoryRow({
+              kind: "workspace",
+              row: database
+                .query("SELECT * FROM workspaces WHERE id = ?")
+                .get(finalization.workspaceId),
+              schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+              recordId: finalization.workspaceId,
+            });
+            if (workspace.status === "error") {
+              diagnostics.push({
+                table: workspace.error.table,
+                field: workspace.error.field,
+                version: workspace.error.version,
+                issueCode: workspace.error.issueCode,
+                recordId: workspace.error.recordId,
+                message: workspace.error.message,
+              });
+              outcome = Result.err(workspace.error);
+              break;
+            }
+            if (workspace.value.value?.kind !== "workspace") {
+              outcome = Result.err(
+                new MiniLilacHistoryRecordMissing({
+                  recordKind: "workspace",
+                  recordId: finalization.workspaceId,
+                  message: "Mini Lilac recovery workspace was not found",
+                }),
+              );
+              break;
+            }
+            pendingFinalizations.push({
+              canonicalCwd: workspace.value.value.value.canonicalCwd,
+              finalization,
+            });
+          }
         }
         if (outcome === undefined) outcome = Result.ok({ navigation, pendingFinalizations });
       }
@@ -1713,7 +2103,7 @@ export function readMiniLilacHistoryRecoveryStatusResult(
     )(diagnostic);
   }
   if (closed.status === "expected-error") return Result.err(closed.error);
-  if (closed.status === "defect") throw closed.cause;
+  if (closed.status === "defect") closed.rethrow();
   if (outcome === undefined) {
     throw new Panic({
       message: "Mini Lilac history recovery read completed without an outcome",
@@ -1778,7 +2168,7 @@ export class MiniLilacSqliteStore {
           message: "Mini Lilac schema initialization and database cleanup both failed",
         });
       }
-      if (cleanup.status === "defect") throw cleanup.cause;
+      if (cleanup.status === "defect") cleanup.rethrow();
       throw primaryFailure.cause;
     }
   }
@@ -1812,8 +2202,7 @@ export class MiniLilacSqliteStore {
   }
 
   private initializeSchema(): void {
-    const initialized = this.initializeSchemaResult();
-    if (initialized.status === "error") throw initialized.error;
+    storeResultToLegacy(this.initializeSchemaResult());
   }
 
   private initializeSchemaResult(): ResultType<void, MiniLilacSchemaInitializationError> {
@@ -1927,7 +2316,7 @@ export class MiniLilacSqliteStore {
         }
         return Result.err(cleanup.error);
       }
-      if (cleanup.status === "defect") throw cleanup.cause;
+      if (cleanup.status === "defect") cleanup.rethrow();
       if (migrated.status === "error") return Result.err(migrated.error);
       const violations = this.database.query("PRAGMA foreign_key_check").all();
       if (violations.length > 0) {
@@ -2520,9 +2909,14 @@ export class MiniLilacSqliteStore {
     }
     const rehashed = this.rehashTranscriptNodesForMigration();
     if (rehashed.status === "error") return Result.err(rehashed.error);
-    const sessions = z
-      .array(migrationSessionRowSchema)
-      .parse(this.database.query("SELECT * FROM sessions ORDER BY rowid").all());
+    const decodedSessions = decodeMiniLilacStoreRows({
+      kind: "migration-session",
+      rows: this.database.query("SELECT * FROM sessions ORDER BY rowid").all(),
+      schemaVersion: 4,
+      recordId: "v4-sessions",
+    });
+    if (decodedSessions.status === "error") return Result.err(decodedSessions.error);
+    const sessions = decodedSessions.value.value;
     const now = new Date().toISOString();
     this.database.exec(`
       CREATE TABLE history_store_metadata (
@@ -2587,8 +2981,14 @@ export class MiniLilacSqliteStore {
     for (const session of sessions) {
       const canonicalCwd = canonicalizeStoredCwd(session.cwd);
       const workspaceId = workspaceIds.get(canonicalCwd);
-      if (workspaceId === undefined)
-        throw new Error(`Workspace for '${canonicalCwd}' was not created`);
+      if (workspaceId === undefined) {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSchemaV4ToV5",
+            message: `Workspace for '${canonicalCwd}' was not created`,
+          }),
+        );
+      }
       insertSession.run(
         session.id,
         session.active_run_id,
@@ -2637,18 +3037,36 @@ export class MiniLilacSqliteStore {
       CREATE UNIQUE INDEX one_active_root_run_per_session
         ON runs(session_id) WHERE status = 'active' AND parent_run_id IS NULL;
     `);
-    const workspaceMismatchCount = z.object({ count: z.number().int().nonnegative() }).parse(
-      this.database
+    const decodedWorkspaceMismatchCount = decodeRequiredMiniLilacStoreRow({
+      kind: "count",
+      row: this.database
         .query(
           `SELECT COUNT(*) AS count FROM sessions
              JOIN workspaces ON workspaces.id = sessions.workspace_id
              WHERE sessions.cwd <> workspaces.canonical_cwd`,
         )
         .get(),
-    ).count;
+      schemaVersion: 4,
+      recordId: "v4-workspace-mismatch-count",
+    });
+    if (decodedWorkspaceMismatchCount.status === "error") {
+      if (decodedWorkspaceMismatchCount.error._tag === "MiniLilacHistoryRecordMissing") {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSchemaV4ToV5",
+            message: "Mini Lilac v4 migration workspace mismatch count was not returned",
+          }),
+        );
+      }
+      return Result.err(decodedWorkspaceMismatchCount.error);
+    }
+    const workspaceMismatchCount = decodedWorkspaceMismatchCount.value.count;
     if (workspaceMismatchCount > 0) {
-      throw new Error(
-        `Mini Lilac v4 migration produced ${workspaceMismatchCount} workspace mismatch(es)`,
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSchemaV4ToV5",
+          message: `Mini Lilac v4 migration produced ${workspaceMismatchCount} workspace mismatch(es)`,
+        }),
       );
     }
     this.createHistorySchemaTables();
@@ -2727,23 +3145,29 @@ export class MiniLilacSqliteStore {
   private migrateSessionHistoryV4(
     sessionId: string,
   ): ResultType<void, MiniLilacSchemaMigrationFailure | PersistedDataError> {
-    const session = z
-      .object({
-        id: z.string(),
-        workspace_id: z.string(),
-        active_run_id: z.string().nullable(),
-        status: sessionStatusSchema,
-        created_at: z.string(),
-        updated_at: z.string(),
-      })
-      .parse(
-        this.database
-          .query(
-            `SELECT id, workspace_id, active_run_id, status, created_at, updated_at
+    const decodedSession = decodeRequiredMiniLilacStoreRow({
+      kind: "migration-history-session",
+      row: this.database
+        .query(
+          `SELECT id, workspace_id, active_run_id, status, created_at, updated_at
              FROM sessions WHERE id = ?`,
-          )
-          .get(sessionId),
-      );
+        )
+        .get(sessionId),
+      schemaVersion: 4,
+      recordId: sessionId,
+    });
+    if (decodedSession.status === "error") {
+      if (decodedSession.error._tag === "MiniLilacHistoryRecordMissing") {
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Mini Lilac v4 session '${sessionId}' disappeared during migration`,
+          }),
+        );
+      }
+      return Result.err(decodedSession.error);
+    }
+    const session = decodedSession.value;
     let currentHeads = this.getTranscriptHeads(sessionId);
     const currentModel = decodeMiniLilacModelTranscript({
       rawValues: this.readSerializedChain(sessionId, "model", currentHeads.model_head_id),
@@ -2764,23 +3188,33 @@ export class MiniLilacSqliteStore {
       this.setTranscriptHeads(sessionId, currentHeads.model_head_id, uiHeadId);
       currentHeads = { ...currentHeads, ui_head_id: uiHeadId };
     }
-    const checkpoints = z.array(migrationCheckpointRowSchema).parse(
-      this.database
+    const decodedCheckpoints = decodeMiniLilacStoreRows({
+      kind: "migration-checkpoint",
+      rows: this.database
         .query(
           `SELECT session_id, ui_position, user_message_json, model_head_id, ui_head_id,
                     root_run_id, replay_after_seq
              FROM user_checkpoints WHERE session_id = ? ORDER BY ui_position`,
         )
         .all(sessionId),
-    );
-    const activeRootRuns = z.array(migrationRunRowSchema).parse(
-      this.database
+      schemaVersion: 4,
+      recordId: `${sessionId}:checkpoints`,
+    });
+    if (decodedCheckpoints.status === "error") return Result.err(decodedCheckpoints.error);
+    const checkpoints = decodedCheckpoints.value.value;
+    const decodedActiveRootRuns = decodeMiniLilacStoreRows({
+      kind: "migration-run",
+      rows: this.database
         .query(
           `SELECT id, status, parent_run_id FROM runs
              WHERE session_id = ? AND parent_run_id IS NULL AND status = 'active'`,
         )
         .all(sessionId),
-    );
+      schemaVersion: 4,
+      recordId: `${sessionId}:active-root-runs`,
+    });
+    if (decodedActiveRootRuns.status === "error") return Result.err(decodedActiveRootRuns.error);
+    const activeRootRuns = decodedActiveRootRuns.value.value;
     const hasActiveLifecycle = session.active_run_id !== null;
     if (
       (hasActiveLifecycle &&
@@ -2897,8 +3331,11 @@ export class MiniLilacSqliteStore {
 
     if (!orderingIsLinear) {
       if (hasActiveLifecycle || !["idle", "error", "compacting"].includes(session.status)) {
-        throw new Error(
-          `Session '${sessionId}' has unusual checkpoint ordering while its run is active`,
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' has unusual checkpoint ordering while its run is active`,
+          }),
         );
       }
       console.warn(
@@ -2911,7 +3348,12 @@ export class MiniLilacSqliteStore {
 
     if (parsedCheckpoints.length === 0) {
       if (hasActiveLifecycle) {
-        throw new Error(`Session '${sessionId}' has an active run without a v4 checkpoint`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' has an active run without a v4 checkpoint`,
+          }),
+        );
       }
       this.insertMigratedSingleState(session, currentHeads);
       return Result.ok(undefined);
@@ -2921,7 +3363,12 @@ export class MiniLilacSqliteStore {
     for (const [index, checkpoint] of parsedCheckpoints.entries()) {
       const stateId = stateIds[index];
       if (stateId === undefined) {
-        throw new Error(`Session '${sessionId}' history migration lost checkpoint state ${index}`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' history migration lost checkpoint state ${index}`,
+          }),
+        );
       }
       this.insertHistoryStateRow({
         id: stateId,
@@ -2967,7 +3414,12 @@ export class MiniLilacSqliteStore {
       const fromStateId = stateIds[index];
       const toStateId = isLast ? finalStateId : stateIds[index + 1];
       if (fromStateId === undefined || toStateId === undefined) {
-        throw new Error(`Session '${sessionId}' history migration produced an incomplete edge`);
+        return Result.err(
+          new MiniLilacSchemaMigrationFailure({
+            operation: "migrateSessionHistoryV4",
+            message: `Session '${sessionId}' history migration produced an incomplete edge`,
+          }),
+        );
       }
       insertTransition.run(
         randomUUID(),
@@ -2985,7 +3437,12 @@ export class MiniLilacSqliteStore {
     const rootStateId = stateIds[0];
     const currentStateId = finalIsOpen ? stateIds.at(-1) : finalStateId;
     if (rootStateId === undefined || currentStateId === undefined || currentStateId === null) {
-      throw new Error(`Session '${sessionId}' history migration did not produce a cursor`);
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "migrateSessionHistoryV4",
+          message: `Session '${sessionId}' history migration did not produce a cursor`,
+        }),
+      );
     }
     this.database
       .query(
@@ -3108,22 +3565,39 @@ export class MiniLilacSqliteStore {
       );
     `);
 
-    const sessionIds = z
-      .array(z.object({ id: z.string() }))
-      .parse(this.database.query("SELECT id FROM sessions ORDER BY rowid").all());
+    const decodedSessionIds = decodeMiniLilacStoreRows({
+      kind: "id",
+      rows: this.database.query("SELECT id FROM sessions ORDER BY rowid").all(),
+      schemaVersion: 2,
+      recordId: "v2-sessions",
+    });
+    if (decodedSessionIds.status === "error") return Result.err(decodedSessionIds.error);
+    const sessionIds = decodedSessionIds.value.value;
     for (const { id: sessionId } of sessionIds) {
-      const modelValues = this.database
-        .query(
-          "SELECT session_id, position, value_json FROM model_transcript WHERE session_id = ? ORDER BY position",
-        )
-        .all(sessionId)
-        .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
-      const uiValues = this.database
-        .query(
-          "SELECT session_id, position, value_json FROM ui_messages WHERE session_id = ? ORDER BY position",
-        )
-        .all(sessionId)
-        .map((value) => legacyPositionedJsonRowSchema.parse(value).value_json);
+      const decodedModelRows = decodeMiniLilacStoreRows({
+        kind: "legacy-positioned-json",
+        rows: this.database
+          .query(
+            "SELECT session_id, position, value_json FROM model_transcript WHERE session_id = ? ORDER BY position",
+          )
+          .all(sessionId),
+        schemaVersion: 2,
+        recordId: `${sessionId}:model-transcript`,
+      });
+      if (decodedModelRows.status === "error") return Result.err(decodedModelRows.error);
+      const modelValues = decodedModelRows.value.value.map((row) => row.value_json);
+      const decodedUiRows = decodeMiniLilacStoreRows({
+        kind: "legacy-positioned-json",
+        rows: this.database
+          .query(
+            "SELECT session_id, position, value_json FROM ui_messages WHERE session_id = ? ORDER BY position",
+          )
+          .all(sessionId),
+        schemaVersion: 2,
+        recordId: `${sessionId}:ui-transcript`,
+      });
+      if (decodedUiRows.status === "error") return Result.err(decodedUiRows.error);
+      const uiValues = decodedUiRows.value.value.map((row) => row.value_json);
       const modelTranscript = decodeMiniLilacModelTranscript({
         rawValues: modelValues,
         schemaVersion: 2,
@@ -3144,14 +3618,22 @@ export class MiniLilacSqliteStore {
       this.setTranscriptHeads(sessionId, modelHeadId, uiHeadId);
     }
 
-    const checkpoints = this.database
-      .query(
-        `SELECT session_id, ui_position, user_message_json, model_prefix_json,
+    const decodedLegacyCheckpoints = decodeMiniLilacStoreRows({
+      kind: "legacy-checkpoint",
+      rows: this.database
+        .query(
+          `SELECT session_id, ui_position, user_message_json, model_prefix_json,
                 ui_prefix_json, root_run_id, replay_after_seq
          FROM user_checkpoints ORDER BY session_id, ui_position`,
-      )
-      .all()
-      .map((value) => legacyCheckpointRowSchema.parse(value));
+        )
+        .all(),
+      schemaVersion: 2,
+      recordId: "v2-checkpoints",
+    });
+    if (decodedLegacyCheckpoints.status === "error") {
+      return Result.err(decodedLegacyCheckpoints.error);
+    }
+    const checkpoints = decodedLegacyCheckpoints.value.value;
     const insertCheckpoint = this.database.query(
       `INSERT INTO user_checkpoints_v3
         (session_id, ui_position, user_message_json, model_head_id, ui_head_id, root_run_id, replay_after_seq)
@@ -3226,9 +3708,15 @@ export class MiniLilacSqliteStore {
   }
 
   createSession(input: CreateStoredSession): MiniLilacSessionSnapshot {
+    return storeResultToLegacy(this.createSessionResult(input));
+  }
+
+  createSessionResult(
+    input: CreateStoredSession,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
     const now = new Date().toISOString();
     const canonicalCwd = canonicalizeStoredCwd(input.cwd);
-    this.runStoreTransaction("createSession", () => {
+    const created = this.runStoreTransactionResult("createSession", () => {
       this.database
         .query(
           `INSERT INTO workspaces (id, canonical_cwd, created_at)
@@ -3242,7 +3730,7 @@ export class MiniLilacSqliteStore {
           .get(canonicalCwd),
         recordId: input.id,
       });
-      if (decodedWorkspace.status === "error") throw decodedWorkspace.error;
+      if (decodedWorkspace.status === "error") return Result.err(decodedWorkspace.error);
       const workspace = decodedWorkspace.value;
       this.database
         .query(
@@ -3282,37 +3770,53 @@ export class MiniLilacSqliteStore {
            VALUES (?, ?, ?, ?, ?)`,
         )
         .run(input.id, rootStateId, rootStateId, rootStateId, now);
+      return Result.ok(undefined);
     });
-    return this.getSession(input.id);
+    if (created.status === "error") return Result.err(created.error);
+    return this.getSessionResult(input.id);
   }
 
   getSession(sessionId: string): MiniLilacSessionSnapshot {
-    const row = this.database.query("SELECT * FROM sessions WHERE id = ?").get(sessionId);
-    if (!row) throw new Error(`Session '${sessionId}' was not found`);
-    const snapshot = toSnapshot(row);
-    const navigation = this.getHistoryNavigation(sessionId);
-    return {
-      ...snapshot,
-      historyStateId: navigation.currentStateId,
-      canUndo: navigation.canUndo,
-      canRedo: navigation.canRedo,
-    };
+    return storeResultToLegacy(this.getSessionResult(sessionId));
+  }
+
+  getSessionResult(
+    sessionId: string,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getSession", () => {
+      const row = this.database.query("SELECT * FROM sessions WHERE id = ?").get(sessionId);
+      const snapshot = decodeSessionRowSnapshot(row, sessionId);
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      const navigation = this.getHistoryNavigationResult(sessionId);
+      if (navigation.status === "error") return Result.err(navigation.error);
+      return Result.ok({
+        ...snapshot.value,
+        historyStateId: navigation.value.currentStateId,
+        canUndo: navigation.value.canUndo,
+        canRedo: navigation.value.canRedo,
+      });
+    });
   }
 
   listSessions(): MiniLilacSessionSnapshot[] {
-    return this.database
-      .query("SELECT * FROM sessions ORDER BY created_at")
-      .all()
-      .map((row) => {
-        const snapshot = toSnapshot(row);
-        const navigation = this.getHistoryNavigation(snapshot.id);
-        return {
-          ...snapshot,
-          historyStateId: navigation.currentStateId,
-          canUndo: navigation.canUndo,
-          canRedo: navigation.canRedo,
-        };
-      });
+    const decoded = storeResultToLegacy(
+      decodeMiniLilacStoreRows({
+        kind: "session",
+        rows: this.database.query("SELECT * FROM sessions ORDER BY created_at").all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "sessions",
+      }),
+    );
+    return decoded.value.map((row) => {
+      const snapshot = projectSessionRowSnapshot(row);
+      const navigation = this.getHistoryNavigation(snapshot.id);
+      return {
+        ...snapshot,
+        historyStateId: navigation.currentStateId,
+        canUndo: navigation.canUndo,
+        canRedo: navigation.canRedo,
+      };
+    });
   }
 
   updateSessionState(
@@ -3334,22 +3838,42 @@ export class MiniLilacSqliteStore {
     runId: string,
     inputTokens: number,
   ): MiniLilacSessionSnapshot {
-    z.number().int().nonnegative().parse(inputTokens);
-    const updated = this.database
-      .query(
-        // Reported usage supersedes any post-compaction estimate. The estimate
-        // flag has to clear even when the reported count happens to equal the
-        // estimate, so a matching count is not treated as "nothing changed".
-        `UPDATE sessions SET input_tokens = ?, input_tokens_estimated = 0, updated_at = ?
-         WHERE id = ? AND active_run_id = ?
-           AND (input_tokens IS NOT ? OR input_tokens_estimated = 1)`,
-      )
-      .run(inputTokens, new Date().toISOString(), sessionId, runId, inputTokens);
-    const snapshot = this.getSession(sessionId);
-    if (updated.changes === 0 && snapshot.activeRunId !== runId) {
-      throw new Error(`Run '${runId}' is not active for session '${sessionId}'`);
-    }
-    return snapshot;
+    return storeResultToLegacy(
+      this.updateActiveRunInputTokensResult(sessionId, runId, inputTokens),
+    );
+  }
+
+  updateActiveRunInputTokensResult(
+    sessionId: string,
+    runId: string,
+    inputTokens: number,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<MiniLilacSessionSnapshot, MiniLilacStoreOperationError>(
+      "updateActiveRunInputTokens",
+      () => {
+        const updated = this.database
+          .query(
+            // Reported usage supersedes any post-compaction estimate. The estimate
+            // flag has to clear even when the reported count happens to equal the
+            // estimate, so a matching count is not treated as "nothing changed".
+            `UPDATE sessions SET input_tokens = ?, input_tokens_estimated = 0, updated_at = ?
+           WHERE id = ? AND active_run_id = ?
+             AND (input_tokens IS NOT ? OR input_tokens_estimated = 1)`,
+          )
+          .run(inputTokens, new Date().toISOString(), sessionId, runId, inputTokens);
+        const snapshot = this.getSessionResult(sessionId);
+        if (snapshot.status === "error") return Result.err(snapshot.error);
+        if (updated.changes === 0 && snapshot.value.activeRunId !== runId) {
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "updateActiveRunInputTokens",
+              message: `Run '${runId}' is not active for session '${sessionId}'`,
+            }),
+          );
+        }
+        return Result.ok(snapshot.value);
+      },
+    );
   }
 
   updateSessionTitle(
@@ -3369,29 +3893,51 @@ export class MiniLilacSqliteStore {
     request: StoredCommandRequest,
     bindings: StoredSessionBindingUpdate,
   ): MiniLilacSessionSnapshot {
-    const command = canonicalCommandPayload(request.payload);
-    return this.runStoreTransaction("updateSessionBindings", () => {
-      const previous = this.getCommandResult(sessionId, commandId, request);
-      if (previous !== undefined) return miniLilacSessionSnapshotSchema.parse(previous);
-      const snapshot = this.getSession(sessionId);
-      const activeRunCount = z
-        .object({ count: z.number().int().nonnegative() })
-        .parse(
-          this.database
-            .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
-            .get(sessionId),
-        ).count;
+    return storeResultToLegacy(
+      this.updateSessionBindingsResult(sessionId, commandId, request, bindings),
+    );
+  }
+
+  updateSessionBindingsResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+    bindings: StoredSessionBindingUpdate,
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runStoreTransactionResult("updateSessionBindings", () => {
+      const previous = this.getCommandResultResult(sessionId, commandId, request);
+      const decodedPrevious = previous.andThen(decodeStoredSessionSnapshot);
+      if (decodedPrevious.status === "error") return Result.err(decodedPrevious.error);
+      if (decodedPrevious.value !== undefined) return Result.ok(decodedPrevious.value);
+      const snapshot = this.getSessionResult(sessionId);
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      const activeRunCount = decodeRequiredMiniLilacStoreRow({
+        kind: "count",
+        row: this.database
+          .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
+          .get(sessionId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: `${sessionId}:active-run-count`,
+      });
+      if (activeRunCount.status === "error") return Result.err(activeRunCount.error);
       if (
-        !["idle", "error"].includes(snapshot.status) ||
-        snapshot.activeRunId !== null ||
-        activeRunCount > 0
+        !["idle", "error"].includes(snapshot.value.status) ||
+        snapshot.value.activeRunId !== null ||
+        activeRunCount.value.count > 0
       ) {
-        throw new Error(`Session '${sessionId}' must be quiescent to update bindings`);
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "updateSessionBindings",
+            message: `Session '${sessionId}' must be quiescent to update bindings`,
+          }),
+        );
       }
 
       const now = new Date().toISOString();
       let inputTokensEstimated = 0;
-      if (bindings.model === undefined && snapshot.inputTokensEstimated) {
+      if (bindings.model === undefined && snapshot.value.inputTokensEstimated) {
         inputTokensEstimated = 1;
       }
       this.database
@@ -3402,20 +3948,23 @@ export class MiniLilacSqliteStore {
            WHERE id = ?`,
         )
         .run(
-          bindings.model ?? snapshot.model,
-          bindings.profile ?? snapshot.profile,
-          bindings.reasoning ?? snapshot.reasoning,
+          bindings.model ?? snapshot.value.model,
+          bindings.profile ?? snapshot.value.profile,
+          bindings.reasoning ?? snapshot.value.reasoning,
           bindings.model === undefined
-            ? (snapshot.contextWindow ?? null)
+            ? (snapshot.value.contextWindow ?? null)
             : (bindings.contextWindow ?? null),
-          bindings.model === undefined ? (snapshot.inputTokens ?? null) : null,
+          bindings.model === undefined ? (snapshot.value.inputTokens ?? null) : null,
           // Clearing the count must clear the flag with it: an estimate marker
           // left on a null count renders as an estimate of nothing.
           inputTokensEstimated,
           now,
           sessionId,
         );
-      const result = this.getSession(sessionId);
+      const result = this.getSessionResult(sessionId);
+      if (result.status === "error") return Result.err(result.error);
+      const serializedResult = serializeStoreValueResult(result.value, "updateSessionBindings");
+      if (serializedResult.status === "error") return Result.err(serializedResult.error);
       this.database
         .query(
           `INSERT INTO commands
@@ -3425,37 +3974,52 @@ export class MiniLilacSqliteStore {
         .run(
           sessionId,
           commandId,
-          request.kind,
-          command.fingerprint,
-          command.json,
-          serialize(result),
+          command.value.kind,
+          command.value.fingerprint,
+          command.value.json,
+          serializedResult.value,
           now,
         );
-      return result;
+      return Result.ok(result.value);
     });
   }
 
   createRun(input: CreateStoredRun): StoredRun {
+    return storeResultToLegacy(this.createRunResult(input));
+  }
+
+  createRunResult(input: CreateStoredRun): ResultType<StoredRun, MiniLilacStoreOperationError> {
     if (input.parentRunId === undefined) {
-      throw new Error(
-        "Root runs must be created through admitRootPromptHistory so their open transition is atomic",
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "createRun",
+          message:
+            "Root runs must be created through admitRootPromptHistory so their open transition is atomic",
+        }),
       );
     }
     const now = new Date().toISOString();
-    this.database
-      .query(
-        `INSERT INTO runs
-          (id, session_id, parent_run_id, profile, depth, status, started_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?)`,
-      )
-      .run(input.id, input.sessionId, input.parentRunId ?? null, input.profile, input.depth, now);
-    return this.getRun(input.id);
+    return this.runStoreTransactionResult("createRun", () => {
+      this.database
+        .query(
+          `INSERT INTO runs
+            (id, session_id, parent_run_id, profile, depth, status, started_at)
+           VALUES (?, ?, ?, ?, ?, 'active', ?)`,
+        )
+        .run(input.id, input.sessionId, input.parentRunId ?? null, input.profile, input.depth, now);
+      return this.getRunResult(input.id);
+    });
   }
 
   getRun(runId: string): StoredRun {
-    const row = this.database.query("SELECT * FROM runs WHERE id = ?").get(runId);
-    if (!row) throw new Error(`Run '${runId}' was not found`);
-    return toRun(row);
+    return storeResultToLegacy(this.getRunResult(runId));
+  }
+
+  getRunResult(runId: string): ResultType<StoredRun, MiniLilacPersistenceError> {
+    return this.runHistoryReadResult("getRun", () => {
+      const row = this.database.query("SELECT * FROM runs WHERE id = ?").get(runId);
+      return decodeRunRow(row, runId);
+    });
   }
 
   getActiveRootRun(sessionId: string): StoredRun | null {
@@ -3466,7 +4030,7 @@ export class MiniLilacSqliteStore {
          WHERE sessions.id = ? AND runs.parent_run_id IS NULL AND runs.status = 'active'`,
       )
       .get(sessionId);
-    return row ? toRun(row) : null;
+    return row ? storeResultToLegacy(decodeRunRow(row, `${sessionId}:active-root`)) : null;
   }
 
   getLatestSelectedRootRun(sessionId: string): StoredRun | null {
@@ -3491,7 +4055,7 @@ export class MiniLilacSqliteStore {
          LIMIT 1`,
       )
       .get(sessionId, sessionId, sessionId, sessionId);
-    return row ? toRun(row) : null;
+    return row ? storeResultToLegacy(decodeRunRow(row, `${sessionId}:selected-root`)) : null;
   }
 
   finishRun(
@@ -3499,29 +4063,39 @@ export class MiniLilacSqliteStore {
     status: Exclude<MiniLilacRunStatus, "active">,
     options: { error?: string; terminalResult?: unknown } = {},
   ): void {
-    const run = this.getRun(runId);
-    if (run.parentRunId === null) {
-      throw new Error(
-        "Root runs must be terminalized through pending finalization so history closes atomically",
+    storeResultToLegacy(this.finishRunResult(runId, status, options));
+  }
+
+  finishRunResult(
+    runId: string,
+    status: Exclude<MiniLilacRunStatus, "active">,
+    options: { error?: string; terminalResult?: unknown } = {},
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const run = this.getRunResult(runId);
+    if (run.status === "error") return Result.err(run.error);
+    if (run.value.parentRunId === null) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "finishRun",
+          message:
+            "Root runs must be terminalized through pending finalization so history closes atomically",
+        }),
       );
     }
-    this.database
-      .query(
-        "UPDATE runs SET status = ?, error = ?, terminal_result_json = ?, finished_at = ? WHERE id = ?",
-      )
-      .run(
-        status,
-        options.error ?? null,
-        options.terminalResult === undefined ? null : serialize(options.terminalResult),
-        new Date().toISOString(),
-        runId,
-      );
+    const terminalResult = serializeOptionalTerminalResult(options, "finishRun");
+    if (terminalResult.status === "error") return Result.err(terminalResult.error);
+    return this.runStoreTransactionResult("finishRun", () => {
+      this.database
+        .query(
+          "UPDATE runs SET status = ?, error = ?, terminal_result_json = ?, finished_at = ? WHERE id = ?",
+        )
+        .run(status, options.error ?? null, terminalResult.value, new Date().toISOString(), runId);
+      return Result.ok(undefined);
+    });
   }
 
   getTodos(sessionId: string): MiniLilacTodoState {
-    const result = this.getTodosResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getTodosResult(sessionId));
   }
 
   getTodosResult(sessionId: string): ResultType<MiniLilacTodoState, MiniLilacPersistenceError> {
@@ -3529,34 +4103,68 @@ export class MiniLilacSqliteStore {
   }
 
   replaceTodosForRun(input: ReplaceTodosForRun): ReplaceTodosForRunResult {
-    const todos = miniLilacTodosSchema.parse(input.todos);
-    const todosJson = JSON.stringify(canonicalJsonValue(todos));
+    return storeResultToLegacy(this.replaceTodosForRunResult(input));
+  }
 
-    return this.runStoreTransaction("replaceTodosForRun", () => {
-      const activeRun = this.database
-        .query(
-          `SELECT 1
+  replaceTodosForRunResult(
+    input: ReplaceTodosForRun,
+  ): ResultType<ReplaceTodosForRunResult, MiniLilacStoreOperationError> {
+    if (input.todos.length > 50 || input.todos.some((todo) => todo.content.length > 500)) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "replaceTodosForRun",
+          message: "Todo list exceeds its persisted size limits",
+        }),
+      );
+    }
+    if (input.todos.filter((todo) => todo.status === "in_progress").length > 1) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "replaceTodosForRun",
+          message: "Todo list may contain at most one in-progress todo",
+        }),
+      );
+    }
+    const todosJson = JSON.stringify(canonicalJsonValue(input.todos));
+
+    return this.runStoreTransactionResult<ReplaceTodosForRunResult, MiniLilacStoreOperationError>(
+      "replaceTodosForRun",
+      () => {
+        const activeRun = this.database
+          .query(
+            `SELECT 1
            FROM sessions
            JOIN runs ON runs.id = ? AND runs.session_id = sessions.id
            WHERE sessions.id = ? AND sessions.active_run_id = runs.id
              AND runs.parent_run_id IS NULL AND runs.status = 'active'`,
-        )
-        .get(input.runId, input.sessionId);
-      if (!activeRun) {
-        throw new Error(`Run '${input.runId}' is not active for session '${input.sessionId}'`);
-      }
+          )
+          .get(input.runId, input.sessionId);
+        if (!activeRun) {
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "replaceTodosForRun",
+              message: `Run '${input.runId}' is not active for session '${input.sessionId}'`,
+            }),
+          );
+        }
 
-      const current = this.getTodos(input.sessionId);
-      const currentJson = JSON.stringify(canonicalJsonValue(current.todos));
-      if (currentJson === todosJson) return { state: current };
-      if (current.revision === Number.MAX_SAFE_INTEGER) {
-        throw new Error(`Session '${input.sessionId}' todo revision is exhausted`);
-      }
+        const current = this.getTodosResult(input.sessionId);
+        if (current.status === "error") return Result.err(current.error);
+        const currentJson = JSON.stringify(canonicalJsonValue(current.value.todos));
+        if (currentJson === todosJson) return Result.ok({ state: current.value });
+        if (current.value.revision === Number.MAX_SAFE_INTEGER) {
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "replaceTodosForRun",
+              message: `Session '${input.sessionId}' todo revision is exhausted`,
+            }),
+          );
+        }
 
-      const now = new Date().toISOString();
-      const updatedValue = this.database
-        .query(
-          `INSERT INTO session_todos (session_id, revision, todos_json, updated_at)
+        const now = new Date().toISOString();
+        const updatedValue = this.database
+          .query(
+            `INSERT INTO session_todos (session_id, revision, todos_json, updated_at)
            VALUES (?, 1, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
              revision = session_todos.revision + 1,
@@ -3564,28 +4172,34 @@ export class MiniLilacSqliteStore {
              updated_at = excluded.updated_at
            WHERE session_todos.todos_json <> excluded.todos_json
            RETURNING revision, todos_json`,
-        )
-        .get(input.sessionId, todosJson, now);
-      if (!updatedValue) return { state: this.getTodos(input.sessionId) };
+          )
+          .get(input.sessionId, todosJson, now);
+        if (!updatedValue) {
+          const unchanged = this.getTodosResult(input.sessionId);
+          return unchanged.status === "error"
+            ? Result.err(unchanged.error)
+            : Result.ok({ state: unchanged.value });
+        }
 
-      const decodedState = decodeMiniLilacTodos({
-        row: updatedValue,
-        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-        recordId: input.sessionId,
-      });
-      if (decodedState.status === "error") throw decodedState.error;
-      const state = decodedState.value.value;
-      this.database
-        .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
-        .run(now, input.sessionId);
-      return { state };
-    });
+        const decodedState = decodeMiniLilacTodos({
+          row: updatedValue,
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: input.sessionId,
+        });
+        if (decodedState.status === "error") return Result.err(decodedState.error);
+        const state = decodedState.value.value;
+        this.database
+          .query("UPDATE sessions SET updated_at = ? WHERE id = ?")
+          .run(now, input.sessionId);
+        return Result.ok({ state });
+      },
+    );
   }
 
   private runStoreTransaction<T>(operationName: string, operation: () => T): T {
-    const result = this.runStoreTransactionResult(operationName, () => Result.ok(operation()));
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(
+      this.runStoreTransactionResult(operationName, () => Result.ok(operation())),
+    );
   }
 
   private runStoreTransactionResult<T, E>(
@@ -3607,7 +4221,7 @@ export class MiniLilacSqliteStore {
     readonly kind: K;
     readonly row: unknown;
     readonly recordId: string;
-  }): ResultType<MiniLilacStructuralHistoryValueByKind[K] | null, PersistedDataError> {
+  }): ResultType<MiniLilacStructuralHistoryValueFor<K> | null, PersistedDataError> {
     const decoded = decodeMiniLilacStructuralHistoryRow({
       ...input,
       schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
@@ -3619,7 +4233,7 @@ export class MiniLilacSqliteStore {
     if (decoded.value.value === null) return Result.ok(null);
     // The codec preserves the input kind; this bridges that correlation, which
     // TypeScript cannot retain through the generic Extract-based predicate.
-    return Result.ok(decoded.value.value.value as MiniLilacStructuralHistoryValueByKind[K]);
+    return Result.ok(decoded.value.value.value as MiniLilacStructuralHistoryValueFor<K>);
   }
 
   private decodeRequiredStructuralHistoryRow<
@@ -3629,7 +4243,7 @@ export class MiniLilacSqliteStore {
     readonly row: unknown;
     readonly recordId: string;
   }): ResultType<
-    MiniLilacStructuralHistoryValueByKind[K],
+    MiniLilacStructuralHistoryValueFor<K>,
     PersistedDataError | MiniLilacHistoryRecordMissing
   > {
     const decoded = this.decodeStructuralHistoryRow(input);
@@ -3642,6 +4256,22 @@ export class MiniLilacSqliteStore {
         message: `Mini Lilac ${input.kind} record was not found`,
       }),
     );
+  }
+
+  private decodeStructuralHistoryRows<K extends MiniLilacStructuralHistoryRecordKind>(input: {
+    readonly kind: K;
+    readonly rows: readonly unknown[];
+    readonly recordId: string;
+  }): ResultType<readonly MiniLilacStructuralHistoryValueFor<K>[], PersistedDataError> {
+    const decoded = decodeMiniLilacStructuralHistoryRows({
+      ...input,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+    });
+    if (decoded.status === "error") {
+      this.queuePersistenceDiagnostic(decoded.error);
+      return Result.err(decoded.error);
+    }
+    return Result.ok(decoded.value.value);
   }
 
   private runHistoryReadResult<T, E>(
@@ -3679,9 +4309,7 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryStoreMetadata(): StoredHistoryStoreMetadata {
-    const result = this.getHistoryStoreMetadataResult();
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryStoreMetadataResult());
   }
 
   getHistoryStoreMetadataResult(): ResultType<
@@ -3700,9 +4328,7 @@ export class MiniLilacSqliteStore {
   }
 
   getWorkspaceForSession(sessionId: string): StoredWorkspace {
-    const result = this.getWorkspaceForSessionResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getWorkspaceForSessionResult(sessionId));
   }
 
   getWorkspaceForSessionResult(
@@ -3724,64 +4350,42 @@ export class MiniLilacSqliteStore {
   }
 
   listWorkspaces(): readonly StoredWorkspace[] {
-    const result = this.listWorkspacesResult();
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listWorkspacesResult());
   }
 
   listWorkspacesResult(): ResultType<readonly StoredWorkspace[], MiniLilacPersistenceError> {
     return this.runHistoryReadResult("listWorkspaces", () => {
-      const workspaces: StoredWorkspace[] = [];
-      for (const [index, row] of this.database
-        .query("SELECT * FROM workspaces ORDER BY created_at, rowid")
-        .all()
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "workspace",
-          row,
-          recordId: `workspace:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        workspaces.push(decoded.value);
-      }
-      return Result.ok(workspaces);
+      return this.decodeStructuralHistoryRows({
+        kind: "workspace",
+        rows: this.database.query("SELECT * FROM workspaces ORDER BY created_at, rowid").all(),
+        recordId: "workspace",
+      });
     });
   }
 
   listWorkspaceSnapshots(workspaceId: string): readonly StoredWorkspaceSnapshot[] {
-    const result = this.listWorkspaceSnapshotsResult(workspaceId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listWorkspaceSnapshotsResult(workspaceId));
   }
 
   listWorkspaceSnapshotsResult(
     workspaceId: string,
   ): ResultType<readonly StoredWorkspaceSnapshot[], MiniLilacPersistenceError> {
     return this.runHistoryReadResult("listWorkspaceSnapshots", () => {
-      const snapshots: StoredWorkspaceSnapshot[] = [];
-      for (const [index, row] of this.database
-        .query(
-          `SELECT * FROM workspace_snapshots
+      return this.decodeStructuralHistoryRows({
+        kind: "workspace-snapshot",
+        rows: this.database
+          .query(
+            `SELECT * FROM workspace_snapshots
            WHERE workspace_id = ? ORDER BY created_at, rowid`,
-        )
-        .all(workspaceId)
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "workspace-snapshot",
-          row,
-          recordId: `${workspaceId}:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        snapshots.push(decoded.value);
-      }
-      return Result.ok(snapshots);
+          )
+          .all(workspaceId),
+        recordId: workspaceId,
+      });
     });
   }
 
   listWorkspaceSnapshotGroups(): readonly StoredWorkspaceSnapshotGroup[] {
-    const result = this.listWorkspaceSnapshotGroupsResult();
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listWorkspaceSnapshotGroupsResult());
   }
 
   listWorkspaceSnapshotGroupsResult(): ResultType<
@@ -3800,16 +4404,55 @@ export class MiniLilacSqliteStore {
   }
 
   setWorkspaceSnapshotAvailability(input: SetStoredWorkspaceSnapshotAvailability): void {
-    z.string().min(1).parse(input.workspaceId);
-    const updates = z.array(workspaceSnapshotAvailabilityUpdateSchema).parse(input.updates);
-    if (new Set(updates.map((update) => update.snapshotId)).size !== updates.length) {
-      throw new Error("Workspace snapshot availability updates contain duplicate snapshot IDs");
+    storeResultToLegacy(this.setWorkspaceSnapshotAvailabilityResult(input));
+  }
+
+  setWorkspaceSnapshotAvailabilityResult(
+    input: SetStoredWorkspaceSnapshotAvailability,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    if (input.workspaceId.length === 0) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "setWorkspaceSnapshotAvailability",
+          message: "Workspace ID must not be empty",
+        }),
+      );
     }
-    this.runStoreTransaction("setWorkspaceSnapshotAvailability", () => {
+    if (
+      input.updates.some(
+        (update) =>
+          update.snapshotId.length === 0 ||
+          (update.availability !== "available" && update.detail.length === 0),
+      )
+    ) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "setWorkspaceSnapshotAvailability",
+          message: "Workspace snapshot availability update is invalid",
+        }),
+      );
+    }
+    const updates = input.updates;
+    if (new Set(updates.map((update) => update.snapshotId)).size !== updates.length) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "setWorkspaceSnapshotAvailability",
+          message: "Workspace snapshot availability updates contain duplicate snapshot IDs",
+        }),
+      );
+    }
+    return this.runStoreTransactionResult("setWorkspaceSnapshotAvailability", () => {
       const workspace = this.database
         .query("SELECT 1 FROM workspaces WHERE id = ?")
         .get(input.workspaceId);
-      if (!workspace) throw new Error(`Workspace '${input.workspaceId}' was not found`);
+      if (!workspace) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "setWorkspaceSnapshotAvailability",
+            message: `Workspace '${input.workspaceId}' was not found`,
+          }),
+        );
+      }
       for (const update of updates) {
         const changed = this.database
           .query(
@@ -3819,34 +4462,74 @@ export class MiniLilacSqliteStore {
           )
           .run(update.availability, update.detail, update.snapshotId, input.workspaceId);
         if (changed.changes !== 1) {
-          throw new Error(
-            `Workspace snapshot '${update.snapshotId}' was not found in workspace '${input.workspaceId}'`,
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "setWorkspaceSnapshotAvailability",
+              message: `Workspace snapshot '${update.snapshotId}' was not found in workspace '${input.workspaceId}'`,
+            }),
           );
         }
       }
+      return Result.ok(undefined);
     });
   }
 
   deleteUnreferencedWorkspaceSnapshots(
     input: DeleteUnreferencedStoredWorkspaceSnapshots,
   ): readonly StoredWorkspaceSnapshot[] {
-    z.string().min(1).parse(input.workspaceId);
-    const snapshotIds = input.snapshotIds
-      ? z.array(z.string().min(1)).parse(input.snapshotIds)
-      : undefined;
-    if (snapshotIds && new Set(snapshotIds).size !== snapshotIds.length) {
-      throw new Error("Unreferenced workspace snapshot deletion contains duplicate snapshot IDs");
+    return storeResultToLegacy(this.deleteUnreferencedWorkspaceSnapshotsResult(input));
+  }
+
+  deleteUnreferencedWorkspaceSnapshotsResult(
+    input: DeleteUnreferencedStoredWorkspaceSnapshots,
+  ): ResultType<readonly StoredWorkspaceSnapshot[], MiniLilacStoreOperationError> {
+    if (input.workspaceId.length === 0) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "deleteUnreferencedWorkspaceSnapshots",
+          message: "Workspace ID must not be empty",
+        }),
+      );
     }
-    return this.runStoreTransaction("deleteUnreferencedWorkspaceSnapshots", () => {
+    if (input.snapshotIds?.some((snapshotId) => snapshotId.length === 0)) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "deleteUnreferencedWorkspaceSnapshots",
+          message: "Workspace snapshot deletion contains an invalid snapshot ID",
+        }),
+      );
+    }
+    const snapshotIds = input.snapshotIds;
+    if (snapshotIds && new Set(snapshotIds).size !== snapshotIds.length) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "deleteUnreferencedWorkspaceSnapshots",
+          message: "Unreferenced workspace snapshot deletion contains duplicate snapshot IDs",
+        }),
+      );
+    }
+    return this.runStoreTransactionResult<
+      readonly StoredWorkspaceSnapshot[],
+      MiniLilacStoreOperationRejected | MiniLilacPersistenceError
+    >("deleteUnreferencedWorkspaceSnapshots", () => {
       const workspace = this.database
         .query("SELECT 1 FROM workspaces WHERE id = ?")
         .get(input.workspaceId);
-      if (!workspace) throw new Error(`Workspace '${input.workspaceId}' was not found`);
-      const candidates = this.listWorkspaceSnapshots(input.workspaceId).filter(
+      if (!workspace) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "deleteUnreferencedWorkspaceSnapshots",
+            message: `Workspace '${input.workspaceId}' was not found`,
+          }),
+        );
+      }
+      const candidates = this.listWorkspaceSnapshotsResult(input.workspaceId);
+      if (candidates.status === "error") return Result.err(candidates.error);
+      const selectedCandidates = candidates.value.filter(
         (snapshot) => snapshotIds === undefined || snapshotIds.includes(snapshot.id),
       );
       const deleted: StoredWorkspaceSnapshot[] = [];
-      for (const snapshot of candidates) {
+      for (const snapshot of selectedCandidates) {
         const result = this.database
           .query(
             `DELETE FROM workspace_snapshots
@@ -3860,7 +4543,7 @@ export class MiniLilacSqliteStore {
           .run(snapshot.id, input.workspaceId);
         if (result.changes === 1) deleted.push(snapshot);
       }
-      return deleted;
+      return Result.ok(deleted);
     });
   }
 
@@ -3868,10 +4551,8 @@ export class MiniLilacSqliteStore {
     sessionId: string,
     ownerValue?: WorkspaceHistoryAvailabilityOwner,
   ): void {
-    const owner =
-      ownerValue === undefined ? undefined : workspaceHistoryOwnerSchema.parse(ownerValue);
     const workspace = this.getWorkspaceForSession(sessionId);
-    this.assertWorkspaceHistoryAvailableForOwner(workspace.id, sessionId, owner);
+    this.assertWorkspaceHistoryAvailableForOwner(workspace.id, sessionId, ownerValue);
   }
 
   createOrReuseWorkspaceSnapshot(input: {
@@ -3882,12 +4563,33 @@ export class MiniLilacSqliteStore {
     readonly formatVersion: number;
     readonly createdAt?: string;
   }): StoredWorkspaceSnapshot {
-    z.string().min(1).parse(input.id);
-    z.string().min(1).parse(input.workspaceId);
-    z.string().min(1).parse(input.rootTreeOid);
-    z.string().min(1).parse(input.gitRef);
-    z.number().int().positive().parse(input.formatVersion);
-    return this.runStoreTransaction("createOrReuseWorkspaceSnapshot", () => {
+    return storeResultToLegacy(this.createOrReuseWorkspaceSnapshotResult(input));
+  }
+
+  createOrReuseWorkspaceSnapshotResult(input: {
+    readonly id: string;
+    readonly workspaceId: string;
+    readonly rootTreeOid: string;
+    readonly gitRef: string;
+    readonly formatVersion: number;
+    readonly createdAt?: string;
+  }): ResultType<StoredWorkspaceSnapshot, MiniLilacStoreOperationError> {
+    if (
+      input.id.length === 0 ||
+      input.workspaceId.length === 0 ||
+      input.rootTreeOid.length === 0 ||
+      input.gitRef.length === 0 ||
+      !Number.isInteger(input.formatVersion) ||
+      input.formatVersion <= 0
+    ) {
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "createOrReuseWorkspaceSnapshot",
+          message: "Workspace snapshot input is invalid",
+        }),
+      );
+    }
+    return this.runStoreTransactionResult("createOrReuseWorkspaceSnapshot", () => {
       this.database
         .query(
           `INSERT INTO workspace_snapshots
@@ -3917,20 +4619,18 @@ export class MiniLilacSqliteStore {
            WHERE workspace_id = ? AND root_tree_oid = ? AND format_version = ?`,
         )
         .get(input.workspaceId, input.rootTreeOid, input.formatVersion);
-      const decoded = this.decodeRequiredStructuralHistoryRow({
+      const snapshot = this.decodeRequiredStructuralHistoryRow({
         kind: "workspace-snapshot",
         row,
         recordId: input.id,
       });
-      if (decoded.status === "error") throw decoded.error;
-      return decoded.value;
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      return Result.ok(snapshot.value);
     });
   }
 
   getWorkspaceSnapshot(snapshotId: string): StoredWorkspaceSnapshot | null {
-    const result = this.getWorkspaceSnapshotResult(snapshotId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getWorkspaceSnapshotResult(snapshotId));
   }
 
   getWorkspaceSnapshotResult(
@@ -3946,9 +4646,7 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryState(stateId: string): StoredHistoryState {
-    const result = this.getHistoryStateResult(stateId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryStateResult(stateId));
   }
 
   getHistoryStateResult(
@@ -3964,9 +4662,7 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryStateModelMessages(stateId: string): ModelMessage[] {
-    const result = this.getHistoryStateModelMessagesResult(stateId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryStateModelMessagesResult(stateId));
   }
 
   getHistoryStateModelMessagesResult(
@@ -3998,9 +4694,7 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryStateUiMessages(stateId: string): MiniLilacUIMessage[] {
-    const result = this.getHistoryStateUiMessagesResult(stateId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryStateUiMessagesResult(stateId));
   }
 
   getHistoryStateUiMessagesResult(
@@ -4032,9 +4726,7 @@ export class MiniLilacSqliteStore {
   }
 
   getCurrentHistoryState(sessionId: string): StoredHistoryState {
-    const result = this.getCurrentHistoryStateResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getCurrentHistoryStateResult(sessionId));
   }
 
   getCurrentHistoryStateResult(
@@ -4061,14 +4753,25 @@ export class MiniLilacSqliteStore {
     readonly historyStateId: string;
     readonly providerId: string;
   }): MiniMainClaudeState {
-    const input = miniMainClaudeStateLookupSchema.parse(inputValue);
-    return this.runStoreTransaction("getMiniMainClaudeState", () => {
+    return storeResultToLegacy(this.getMiniMainClaudeStateResult(inputValue));
+  }
+
+  getMiniMainClaudeStateResult(inputValue: {
+    readonly sessionId: string;
+    readonly historyStateId: string;
+    readonly providerId: string;
+  }): ResultType<MiniMainClaudeState, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult("getMiniMainClaudeState", () => {
       const row = this.database
         .query("SELECT * FROM history_states WHERE id = ? AND session_id = ?")
         .get(input.historyStateId, input.sessionId);
       if (!row) {
-        throw new Error(
-          `History state '${input.historyStateId}' does not belong to session '${input.sessionId}'`,
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getMiniMainClaudeState",
+            message: `History state '${input.historyStateId}' does not belong to session '${input.sessionId}'`,
+          }),
         );
       }
       const decodedState = this.decodeRequiredStructuralHistoryRow({
@@ -4076,7 +4779,7 @@ export class MiniLilacSqliteStore {
         row,
         recordId: input.historyStateId,
       });
-      if (decodedState.status === "error") throw decodedState.error;
+      if (decodedState.status === "error") return Result.err(decodedState.error);
       const historyState = decodedState.value;
       const bindingRow = this.database
         .query(
@@ -4084,11 +4787,20 @@ export class MiniLilacSqliteStore {
            WHERE session_id = ? AND history_state_id = ? AND provider_id = ?`,
         )
         .get(input.sessionId, input.historyStateId, input.providerId);
-      return {
+      let binding: MiniMainClaudeSessionBinding | null = null;
+      if (bindingRow) {
+        const decodedBinding = decodeMiniMainClaudeBindingRow(
+          bindingRow,
+          `${input.sessionId}:${input.providerId}`,
+        );
+        if (decodedBinding.status === "error") return Result.err(decodedBinding.error);
+        binding = decodedBinding.value;
+      }
+      return Result.ok({
         historyState,
         providerState: historyState.providerState,
-        binding: bindingRow ? toMiniMainClaudeBinding(bindingRow) : null,
-      };
+        binding,
+      });
     });
   }
 
@@ -4098,31 +4810,59 @@ export class MiniLilacSqliteStore {
     readonly requestId: string;
     readonly attemptIndex: number;
   }): MiniMainClaudeSessionAttempt | null {
-    const input = miniMainClaudeSessionAttemptKeySchema.parse(inputValue);
-    const row = this.database
-      .query(
-        `SELECT * FROM mini_main_claude_attempts
-         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
-      )
-      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
-    return row ? toMiniMainClaudeAttempt(row) : null;
+    return storeResultToLegacy(this.getMiniMainClaudeSessionAttemptResult(inputValue));
+  }
+
+  getMiniMainClaudeSessionAttemptResult(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): ResultType<MiniMainClaudeSessionAttempt | null, MiniLilacPersistenceError> {
+    const input = inputValue;
+    return this.runHistoryReadResult("getMiniMainClaudeSessionAttempt", () => {
+      const row = this.database
+        .query(
+          `SELECT * FROM mini_main_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+        )
+        .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+      return row
+        ? decodeMiniMainClaudeAttemptRow(
+            row,
+            `${input.lilacSessionId}:${input.providerId}:${input.requestId}:${input.attemptIndex}`,
+          )
+        : Result.ok(null);
+    });
   }
 
   reserveMiniMainClaudeSessionAttempt(
     inputValue: ReserveMiniMainClaudeSessionAttempt,
   ): MiniMainClaudeSessionAttempt {
-    const input = reserveMiniMainClaudeSessionAttemptSchema.parse(inputValue);
+    return storeResultToLegacy(this.reserveMiniMainClaudeSessionAttemptResult(inputValue));
+  }
+
+  reserveMiniMainClaudeSessionAttemptResult(
+    inputValue: ReserveMiniMainClaudeSessionAttempt,
+  ): ResultType<MiniMainClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
     if ((input.sourceSessionId === null) !== (input.expectedBindingRevision === null)) {
-      throw new Error("A Claude fork attempt requires both source session and binding revision");
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "reserveMiniMainClaudeSessionAttempt",
+          message: "A Claude fork attempt requires both source session and binding revision",
+        }),
+      );
     }
-    return this.runStoreTransaction("reserveMiniMainClaudeSessionAttempt", () => {
-      const source = this.getMiniMainClaudeState({
+    return this.runStoreTransactionResult("reserveMiniMainClaudeSessionAttempt", () => {
+      const source = this.getMiniMainClaudeStateResult({
         sessionId: input.lilacSessionId,
         historyStateId: input.sourceHistoryStateId,
         providerId: input.providerId,
       });
+      if (source.status === "error") return Result.err(source.error);
       if (input.expectedBindingRevision !== null) {
-        const binding = source.binding;
+        const binding = source.value.binding;
         if (
           binding === null ||
           binding.revision !== input.expectedBindingRevision ||
@@ -4131,19 +4871,33 @@ export class MiniLilacSqliteStore {
           binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
           binding.executionScopeHash !== input.executionScopeHash
         ) {
-          throw new Error("Claude attempt source binding changed before reservation");
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "reserveMiniMainClaudeSessionAttempt",
+              message: "Claude attempt source binding changed before reservation",
+            }),
+          );
         }
       }
-      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
-        this.database
+      const activeCount = decodeRequiredMiniLilacStoreRow({
+        kind: "count",
+        row: this.database
           .query(
             `SELECT COUNT(*) AS count FROM mini_main_claude_attempts
-             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+               WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
           )
           .get(input.lilacSessionId, input.providerId),
-      ).count;
-      if (activeCount >= MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
-        throw new Error("Too many active Mini main Claude attempts are retained");
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: `${input.lilacSessionId}:${input.providerId}:active-main-attempt-count`,
+      });
+      if (activeCount.status === "error") return Result.err(activeCount.error);
+      if (activeCount.value.count >= MINI_MAIN_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniMainClaudeSessionAttempt",
+            message: "Too many active Mini main Claude attempts are retained",
+          }),
+        );
       }
       const now = new Date().toISOString();
       this.database
@@ -4172,34 +4926,62 @@ export class MiniLilacSqliteStore {
           now,
         );
       this.pruneMiniMainClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniMainClaudeSessionAttempt({
+      const attempt = this.getMiniMainClaudeSessionAttemptResult({
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       });
-      if (attempt === null) throw new Error("Reserved Claude attempt was not retained");
-      return attempt;
+      if (attempt.status === "error") return Result.err(attempt.error);
+      if (attempt.value === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniMainClaudeSessionAttempt",
+            message: "Reserved Claude attempt was not retained",
+          }),
+        );
+      }
+      return Result.ok(attempt.value);
     });
   }
 
   recordMiniMainClaudeSessionAttemptOutcome(
     inputValue: RecordMiniMainClaudeSessionAttemptOutcome,
   ): MiniMainClaudeSessionAttempt {
-    const input = recordMiniMainClaudeSessionAttemptOutcomeSchema.parse(inputValue);
-    return this.runStoreTransaction("recordMiniMainClaudeSessionAttemptOutcome", () => {
+    return storeResultToLegacy(this.recordMiniMainClaudeSessionAttemptOutcomeResult(inputValue));
+  }
+
+  recordMiniMainClaudeSessionAttemptOutcomeResult(
+    inputValue: RecordMiniMainClaudeSessionAttemptOutcome,
+  ): ResultType<MiniMainClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult<
+      MiniMainClaudeSessionAttempt,
+      MiniLilacStoreOperationError
+    >("recordMiniMainClaudeSessionAttemptOutcome", () => {
       const attemptKey = {
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       };
-      const current = this.getMiniMainClaudeSessionAttempt(attemptKey);
-      if (current === null) throw new Error(`Claude attempt '${input.requestId}' was not found`);
-      if (current.state !== "active") {
-        if (current.state === input.state) return current;
-        throw new Error(
-          `Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+      const current = this.getMiniMainClaudeSessionAttemptResult(attemptKey);
+      if (current.status === "error") return Result.err(current.error);
+      if (current.value === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: `Claude attempt '${input.requestId}' was not found`,
+          }),
+        );
+      }
+      if (current.value.state !== "active") {
+        if (current.value.state === input.state) return Result.ok(current.value);
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: `Claude attempt '${input.requestId}' is already terminal as '${current.value.state}'`,
+          }),
         );
       }
       const updated = this.database
@@ -4216,12 +4998,26 @@ export class MiniLilacSqliteStore {
           input.requestId,
           input.attemptIndex,
         );
-      if (updated.changes !== 1) throw new Error("Claude attempt outcome lost its active fence");
+      if (updated.changes !== 1) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: "Claude attempt outcome lost its active fence",
+          }),
+        );
+      }
       this.pruneMiniMainClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniMainClaudeSessionAttempt(attemptKey);
-      if (attempt === null)
-        throw new Error("Updated Claude attempt exceeded retention immediately");
-      return attempt;
+      const attempt = this.getMiniMainClaudeSessionAttemptResult(attemptKey);
+      if (attempt.status === "error") return Result.err(attempt.error);
+      if (attempt.value === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniMainClaudeSessionAttemptOutcome",
+            message: "Updated Claude attempt exceeded retention immediately",
+          }),
+        );
+      }
+      return Result.ok(attempt.value);
     });
   }
 
@@ -4229,16 +5025,39 @@ export class MiniLilacSqliteStore {
     readonly sessionId: string;
     readonly providerId: string;
   }): MiniNamedClaudeState {
-    const input = miniNamedClaudeStateLookupSchema.parse(inputValue);
-    const session = this.database.query("SELECT 1 FROM sessions WHERE id = ?").get(input.sessionId);
-    if (!session) throw new Error(`Session '${input.sessionId}' was not found`);
-    const row = this.database
-      .query(
-        `SELECT * FROM mini_named_claude_bindings
-         WHERE session_id = ? AND provider_id = ?`,
-      )
-      .get(input.sessionId, input.providerId);
-    return { binding: row ? toMiniNamedClaudeBinding(row) : null };
+    return storeResultToLegacy(this.getMiniNamedClaudeStateResult(inputValue));
+  }
+
+  getMiniNamedClaudeStateResult(inputValue: {
+    readonly sessionId: string;
+    readonly providerId: string;
+  }): ResultType<MiniNamedClaudeState, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runHistoryReadResult("getMiniNamedClaudeState", () => {
+      const session = this.database
+        .query("SELECT 1 FROM sessions WHERE id = ?")
+        .get(input.sessionId);
+      if (!session) {
+        return Result.err(
+          new MiniLilacHistoryRecordMissing({
+            recordKind: "session",
+            recordId: input.sessionId,
+            message: `Session '${input.sessionId}' was not found`,
+          }),
+        );
+      }
+      const row = this.database
+        .query(
+          `SELECT * FROM mini_named_claude_bindings
+           WHERE session_id = ? AND provider_id = ?`,
+        )
+        .get(input.sessionId, input.providerId);
+      if (!row) return Result.ok({ binding: null });
+      const binding = decodeMiniMainClaudeBindingRow(row, `${input.sessionId}:${input.providerId}`);
+      return binding.status === "error"
+        ? Result.err(binding.error)
+        : Result.ok({ binding: binding.value });
+    });
   }
 
   getMiniNamedClaudeSessionAttempt(inputValue: {
@@ -4247,76 +5066,144 @@ export class MiniLilacSqliteStore {
     readonly requestId: string;
     readonly attemptIndex: number;
   }): MiniNamedClaudeSessionAttempt | null {
-    const input = miniNamedClaudeSessionAttemptKeySchema.parse(inputValue);
-    const row = this.database
-      .query(
-        `SELECT * FROM mini_named_claude_attempts
-         WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
-      )
-      .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
-    return row ? toMiniNamedClaudeAttempt(row) : null;
+    return storeResultToLegacy(this.getMiniNamedClaudeSessionAttemptResult(inputValue));
+  }
+
+  getMiniNamedClaudeSessionAttemptResult(inputValue: {
+    readonly providerId: string;
+    readonly lilacSessionId: string;
+    readonly requestId: string;
+    readonly attemptIndex: number;
+  }): ResultType<MiniNamedClaudeSessionAttempt | null, MiniLilacPersistenceError> {
+    const input = inputValue;
+    return this.runHistoryReadResult("getMiniNamedClaudeSessionAttempt", () => {
+      const row = this.database
+        .query(
+          `SELECT * FROM mini_named_claude_attempts
+           WHERE session_id = ? AND provider_id = ? AND request_id = ? AND attempt_index = ?`,
+        )
+        .get(input.lilacSessionId, input.providerId, input.requestId, input.attemptIndex);
+      return row
+        ? decodeMiniMainClaudeAttemptRow(
+            row,
+            `${input.lilacSessionId}:${input.providerId}:${input.requestId}:${input.attemptIndex}`,
+          )
+        : Result.ok(null);
+    });
   }
 
   getMiniClaudeRetentionDiagnostics(): MiniClaudeRetentionDiagnostics {
-    const count = (sql: string) =>
-      z.object({ count: z.number().int().nonnegative() }).parse(this.database.query(sql).get())
-        .count;
-    return {
-      mainBindingCount: count("SELECT COUNT(*) AS count FROM mini_main_claude_bindings"),
-      namedBindingCount: count("SELECT COUNT(*) AS count FROM mini_named_claude_bindings"),
-      activeAttemptCount: count(
+    return storeResultToLegacy(this.getMiniClaudeRetentionDiagnosticsResult());
+  }
+
+  getMiniClaudeRetentionDiagnosticsResult(): ResultType<
+    MiniClaudeRetentionDiagnostics,
+    MiniLilacPersistenceError
+  > {
+    return this.runHistoryReadResult("getMiniClaudeRetentionDiagnostics", () => {
+      const count = (sql: string, recordId: string) =>
+        decodeRequiredMiniLilacStoreRow({
+          kind: "count",
+          row: this.database.query(sql).get(),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId,
+        });
+      const mainBindingCount = count(
+        "SELECT COUNT(*) AS count FROM mini_main_claude_bindings",
+        "main-binding-count",
+      );
+      if (mainBindingCount.status === "error") return Result.err(mainBindingCount.error);
+      const namedBindingCount = count(
+        "SELECT COUNT(*) AS count FROM mini_named_claude_bindings",
+        "named-binding-count",
+      );
+      if (namedBindingCount.status === "error") return Result.err(namedBindingCount.error);
+      const activeAttemptCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state = 'active') +
            (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state = 'active') AS count`,
-      ),
-      terminalAttemptCount: count(
+        "active-attempt-count",
+      );
+      if (activeAttemptCount.status === "error") return Result.err(activeAttemptCount.error);
+      const terminalAttemptCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_attempts WHERE state <> 'active') +
            (SELECT COUNT(*) FROM mini_named_claude_attempts WHERE state <> 'active') AS count`,
-      ),
-      orphanBindingCount: count(
+        "terminal-attempt-count",
+      );
+      if (terminalAttemptCount.status === "error") return Result.err(terminalAttemptCount.error);
+      const orphanBindingCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_bindings AS binding
             LEFT JOIN history_states AS state
               ON state.id = binding.history_state_id AND state.session_id = binding.session_id
             WHERE state.id IS NULL) +
            (SELECT COUNT(*) FROM mini_named_claude_bindings AS binding
-            LEFT JOIN history_states AS state
-              ON state.id = binding.history_state_id AND state.session_id = binding.session_id
-            WHERE state.id IS NULL) AS count`,
-      ),
-      orphanAttemptCount: count(
+             LEFT JOIN history_states AS state
+               ON state.id = binding.history_state_id AND state.session_id = binding.session_id
+             WHERE state.id IS NULL) AS count`,
+        "orphan-binding-count",
+      );
+      if (orphanBindingCount.status === "error") return Result.err(orphanBindingCount.error);
+      const orphanAttemptCount = count(
         `SELECT
            (SELECT COUNT(*) FROM mini_main_claude_attempts AS attempt
             LEFT JOIN history_states AS state
               ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
             WHERE state.id IS NULL) +
            (SELECT COUNT(*) FROM mini_named_claude_attempts AS attempt
-            LEFT JOIN history_states AS state
-              ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
-            WHERE state.id IS NULL) AS count`,
-      ),
-    };
+             LEFT JOIN history_states AS state
+               ON state.id = attempt.source_history_state_id AND state.session_id = attempt.session_id
+             WHERE state.id IS NULL) AS count`,
+        "orphan-attempt-count",
+      );
+      if (orphanAttemptCount.status === "error") return Result.err(orphanAttemptCount.error);
+      return Result.ok({
+        mainBindingCount: mainBindingCount.value.count,
+        namedBindingCount: namedBindingCount.value.count,
+        activeAttemptCount: activeAttemptCount.value.count,
+        terminalAttemptCount: terminalAttemptCount.value.count,
+        orphanBindingCount: orphanBindingCount.value.count,
+        orphanAttemptCount: orphanAttemptCount.value.count,
+      });
+    });
   }
 
   reserveMiniNamedClaudeSessionAttempt(
     inputValue: ReserveMiniNamedClaudeSessionAttempt,
   ): MiniNamedClaudeSessionAttempt {
-    const input = reserveMiniNamedClaudeSessionAttemptSchema.parse(inputValue);
-    return this.runStoreTransaction("reserveMiniNamedClaudeSessionAttempt", () => {
-      const source = this.getHistoryState(input.sourceHistoryStateId);
-      if (source.sessionId !== input.lilacSessionId) {
-        throw new Error(
-          `History state '${input.sourceHistoryStateId}' does not belong to session '${input.lilacSessionId}'`,
+    return storeResultToLegacy(this.reserveMiniNamedClaudeSessionAttemptResult(inputValue));
+  }
+
+  reserveMiniNamedClaudeSessionAttemptResult(
+    inputValue: ReserveMiniNamedClaudeSessionAttempt,
+  ): ResultType<MiniNamedClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult("reserveMiniNamedClaudeSessionAttempt", () => {
+      const source = this.getHistoryStateResult(input.sourceHistoryStateId);
+      if (source.status === "error") return Result.err(source.error);
+      if (source.value.sessionId !== input.lilacSessionId) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: `History state '${input.sourceHistoryStateId}' does not belong to session '${input.lilacSessionId}'`,
+          }),
         );
       }
-      const binding = this.getMiniNamedClaudeState({
+      const namedState = this.getMiniNamedClaudeStateResult({
         sessionId: input.lilacSessionId,
         providerId: input.providerId,
-      }).binding;
+      });
+      if (namedState.status === "error") return Result.err(namedState.error);
+      const binding = namedState.value.binding;
       if (input.expectedBindingRevision === null) {
         if (binding !== null) {
-          throw new Error("Named Claude attempt source binding changed before reservation");
+          return Result.err(
+            new MiniLilacStoreOperationRejected({
+              operation: "reserveMiniNamedClaudeSessionAttempt",
+              message: "Named Claude attempt source binding changed before reservation",
+            }),
+          );
         }
       } else if (
         binding === null ||
@@ -4328,18 +5215,32 @@ export class MiniLilacSqliteStore {
             binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
             binding.executionScopeHash !== input.executionScopeHash))
       ) {
-        throw new Error("Named Claude attempt source binding changed before reservation");
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: "Named Claude attempt source binding changed before reservation",
+          }),
+        );
       }
-      const activeCount = z.object({ count: z.number().int().nonnegative() }).parse(
-        this.database
+      const activeCount = decodeRequiredMiniLilacStoreRow({
+        kind: "count",
+        row: this.database
           .query(
             `SELECT COUNT(*) AS count FROM mini_named_claude_attempts
-             WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
+               WHERE session_id = ? AND provider_id = ? AND state = 'active'`,
           )
           .get(input.lilacSessionId, input.providerId),
-      ).count;
-      if (activeCount >= MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
-        throw new Error("Too many active Mini named Claude attempts are retained");
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: `${input.lilacSessionId}:${input.providerId}:active-named-attempt-count`,
+      });
+      if (activeCount.status === "error") return Result.err(activeCount.error);
+      if (activeCount.value.count >= MINI_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: "Too many active Mini named Claude attempts are retained",
+          }),
+        );
       }
       const now = new Date().toISOString();
       this.database
@@ -4368,35 +5269,62 @@ export class MiniLilacSqliteStore {
           now,
         );
       this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniNamedClaudeSessionAttempt({
+      const attempt = this.getMiniNamedClaudeSessionAttemptResult({
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       });
-      if (attempt === null) throw new Error("Reserved named Claude attempt was not retained");
-      return attempt;
+      if (attempt.status === "error") return Result.err(attempt.error);
+      if (attempt.value === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "reserveMiniNamedClaudeSessionAttempt",
+            message: "Reserved named Claude attempt was not retained",
+          }),
+        );
+      }
+      return Result.ok(attempt.value);
     });
   }
 
   recordMiniNamedClaudeSessionAttemptOutcome(
     inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
   ): MiniNamedClaudeSessionAttempt {
-    const input = recordMiniNamedClaudeSessionAttemptOutcomeSchema.parse(inputValue);
-    return this.runStoreTransaction("recordMiniNamedClaudeSessionAttemptOutcome", () => {
+    return storeResultToLegacy(this.recordMiniNamedClaudeSessionAttemptOutcomeResult(inputValue));
+  }
+
+  recordMiniNamedClaudeSessionAttemptOutcomeResult(
+    inputValue: RecordMiniNamedClaudeSessionAttemptOutcome,
+  ): ResultType<MiniNamedClaudeSessionAttempt, MiniLilacStoreOperationError> {
+    const input = inputValue;
+    return this.runStoreTransactionResult<
+      MiniNamedClaudeSessionAttempt,
+      MiniLilacStoreOperationError
+    >("recordMiniNamedClaudeSessionAttemptOutcome", () => {
       const attemptKey = {
         providerId: input.providerId,
         lilacSessionId: input.lilacSessionId,
         requestId: input.requestId,
         attemptIndex: input.attemptIndex,
       };
-      const current = this.getMiniNamedClaudeSessionAttempt(attemptKey);
-      if (current === null)
-        throw new Error(`Named Claude attempt '${input.requestId}' was not found`);
-      if (current.state !== "active") {
-        if (current.state === input.state) return current;
-        throw new Error(
-          `Named Claude attempt '${input.requestId}' is already terminal as '${current.state}'`,
+      const current = this.getMiniNamedClaudeSessionAttemptResult(attemptKey);
+      if (current.status === "error") return Result.err(current.error);
+      if (current.value === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: `Named Claude attempt '${input.requestId}' was not found`,
+          }),
+        );
+      }
+      if (current.value.state !== "active") {
+        if (current.value.state === input.state) return Result.ok(current.value);
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: `Named Claude attempt '${input.requestId}' is already terminal as '${current.value.state}'`,
+          }),
         );
       }
       const updated = this.database
@@ -4413,20 +5341,31 @@ export class MiniLilacSqliteStore {
           input.requestId,
           input.attemptIndex,
         );
-      if (updated.changes !== 1)
-        throw new Error("Named Claude attempt outcome lost its active fence");
+      if (updated.changes !== 1) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: "Named Claude attempt outcome lost its active fence",
+          }),
+        );
+      }
       this.pruneMiniNamedClaudeAttempts(input.lilacSessionId, input.providerId);
-      const attempt = this.getMiniNamedClaudeSessionAttempt(attemptKey);
-      if (attempt === null)
-        throw new Error("Updated named Claude attempt exceeded retention immediately");
-      return attempt;
+      const attempt = this.getMiniNamedClaudeSessionAttemptResult(attemptKey);
+      if (attempt.status === "error") return Result.err(attempt.error);
+      if (attempt.value === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "recordMiniNamedClaudeSessionAttemptOutcome",
+            message: "Updated named Claude attempt exceeded retention immediately",
+          }),
+        );
+      }
+      return Result.ok(attempt.value);
     });
   }
 
   getSessionHistory(sessionId: string): StoredSessionHistory {
-    const result = this.getSessionHistoryResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getSessionHistoryResult(sessionId));
   }
 
   getSessionHistoryResult(
@@ -4444,9 +5383,7 @@ export class MiniLilacSqliteStore {
   }
 
   getHistoryNavigation(sessionId: string): StoredHistoryNavigation {
-    const result = this.getHistoryNavigationResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryNavigationResult(sessionId));
   }
 
   getHistoryNavigationResult(
@@ -4466,9 +5403,7 @@ export class MiniLilacSqliteStore {
   }
 
   findLatestUndoableUserTransition(sessionId: string): StoredHistoryTransition | null {
-    const result = this.findLatestUndoableUserTransitionResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.findLatestUndoableUserTransitionResult(sessionId));
   }
 
   findLatestUndoableUserTransitionResult(
@@ -4505,9 +5440,7 @@ export class MiniLilacSqliteStore {
   }
 
   peekHistoryRedo(sessionId: string): StoredHistoryRedoEntry | null {
-    const result = this.peekHistoryRedoResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.peekHistoryRedoResult(sessionId));
   }
 
   peekHistoryRedoResult(
@@ -4528,9 +5461,7 @@ export class MiniLilacSqliteStore {
   }
 
   listHistoryTopology(sessionId: string): StoredHistoryTopology {
-    const result = this.listHistoryTopologyResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listHistoryTopologyResult(sessionId));
   }
 
   listHistoryTopologyResult(
@@ -4539,53 +5470,43 @@ export class MiniLilacSqliteStore {
     return this.runHistoryReadResult("listHistoryTopology", () => {
       const history = this.getSessionHistoryResult(sessionId);
       if (history.status === "error") return Result.err(history.error);
-      const states: StoredHistoryState[] = [];
-      for (const [index, row] of this.database
-        .query("SELECT * FROM history_states WHERE session_id = ? ORDER BY created_at, rowid")
-        .all(sessionId)
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "state",
-          row,
-          recordId: `${sessionId}:state:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        states.push(decoded.value);
-      }
-      const transitions: StoredHistoryTransition[] = [];
-      for (const [index, row] of this.database
-        .query("SELECT * FROM history_transitions WHERE session_id = ? ORDER BY created_at, rowid")
-        .all(sessionId)
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "transition",
-          row,
-          recordId: `${sessionId}:transition:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        transitions.push(decoded.value);
-      }
-      const redoStack: StoredHistoryRedoEntry[] = [];
-      for (const [index, row] of this.database
-        .query("SELECT * FROM history_redo_stack WHERE session_id = ? ORDER BY position")
-        .all(sessionId)
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "redo",
-          row,
-          recordId: `${sessionId}:redo:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        redoStack.push(decoded.value);
-      }
-      return Result.ok({ history: history.value, states, transitions, redoStack });
+      const states = this.decodeStructuralHistoryRows({
+        kind: "state",
+        rows: this.database
+          .query("SELECT * FROM history_states WHERE session_id = ? ORDER BY created_at, rowid")
+          .all(sessionId),
+        recordId: `${sessionId}:state`,
+      });
+      if (states.status === "error") return Result.err(states.error);
+      const transitions = this.decodeStructuralHistoryRows({
+        kind: "transition",
+        rows: this.database
+          .query(
+            "SELECT * FROM history_transitions WHERE session_id = ? ORDER BY created_at, rowid",
+          )
+          .all(sessionId),
+        recordId: `${sessionId}:transition`,
+      });
+      if (transitions.status === "error") return Result.err(transitions.error);
+      const redoStack = this.decodeStructuralHistoryRows({
+        kind: "redo",
+        rows: this.database
+          .query("SELECT * FROM history_redo_stack WHERE session_id = ? ORDER BY position")
+          .all(sessionId),
+        recordId: `${sessionId}:redo`,
+      });
+      if (redoStack.status === "error") return Result.err(redoStack.error);
+      return Result.ok({
+        history: history.value,
+        states: states.value,
+        transitions: transitions.value,
+        redoStack: redoStack.value,
+      });
     });
   }
 
   getHistoryAccounting(workspaceId?: string): StoredHistoryAccounting {
-    const result = this.getHistoryAccountingResult(workspaceId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryAccountingResult(workspaceId));
   }
 
   getHistoryAccountingResult(
@@ -4657,8 +5578,6 @@ export class MiniLilacSqliteStore {
     modelMessages: readonly ModelMessage[],
     uiMessages: readonly MiniLilacUIMessage[],
   ): InternedStoredTranscriptHeads {
-    modelMessagesSchema.parse(modelMessages);
-    miniLilacMessagesSchema.parse(uiMessages);
     this.getSession(sessionId);
     return this.runStoreTransaction("internHistoryTranscriptHeads", () => ({
       modelHeadId: this.internChain(sessionId, "model", modelMessages),
@@ -4667,22 +5586,52 @@ export class MiniLilacSqliteStore {
   }
 
   admitRootPromptHistory(input: AdmitStoredRootPromptHistory): AdmittedStoredRootPromptHistory {
+    return storeResultToLegacy(this.admitRootPromptHistoryResult(input));
+  }
+
+  admitRootPromptHistoryResult(
+    input: AdmitStoredRootPromptHistory,
+  ): ResultType<AdmittedStoredRootPromptHistory, MiniLilacStoreOperationError> {
     if (input.run.parentRunId !== undefined) {
-      throw new Error("Root prompt history admission requires a root run");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "admitRootPromptHistory",
+          "Root prompt history admission requires a root run",
+        ),
+      );
     }
-    modelMessagesSchema.parse(input.modelMessages);
-    miniLilacMessagesSchema.parse(input.uiMessages);
-    if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
-    const userMessage = miniLilacUserUIMessageSchema.parse(input.uiMessages.at(-1));
+    const lastUiMessage = input.uiMessages.at(-1);
+    if (lastUiMessage?.role !== "user") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "admitRootPromptHistory",
+          "Root prompt history admission requires a final UI user message",
+        ),
+      );
+    }
+    const userMessage: MiniLilacUserUIMessage = { ...lastUiMessage, role: "user" };
     if (input.modelMessages.at(-1)?.role !== "user") {
-      throw new Error("Root prompt history admission requires a final model user message");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "admitRootPromptHistory",
+          "Root prompt history admission requires a final model user message",
+        ),
+      );
     }
-    const command = canonicalCommandPayload(input.commandPayload);
-    return this.runStoreTransaction("admitRootPromptHistory", () => {
-      this.requireQuiescentHistorySession(input.run.sessionId, input.expectedCurrentStateId);
-      const workspace = this.getWorkspaceForSession(input.run.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const current = this.getCurrentHistoryState(input.run.sessionId);
+    const command = decodeCanonicalRootPromptCommand(input);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runStoreTransactionResult("admitRootPromptHistory", () => {
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.run.sessionId,
+        input.expectedCurrentStateId,
+      );
+      if (quiescent.status === "error") return Result.err(quiescent.error);
+      const workspace = this.getWorkspaceForSessionResult(input.run.sessionId);
+      if (workspace.status === "error") return Result.err(workspace.error);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(workspace.value.id);
+      if (available.status === "error") return Result.err(available.error);
+      const current = this.getCurrentHistoryStateResult(input.run.sessionId);
+      if (current.status === "error") return Result.err(current.error);
       const prefixHeads = {
         modelHeadId: this.internChain(
           input.run.sessionId,
@@ -4691,34 +5640,53 @@ export class MiniLilacSqliteStore {
         ),
         uiHeadId: this.internChain(input.run.sessionId, "ui", input.uiMessages.slice(0, -1)),
       };
-      this.assertHeadsEqualState(input.run.sessionId, prefixHeads, current);
-      if (current.workspaceStatus === "capture-deferred" && input.observation === undefined) {
-        throw new Error("A deferred history root requires an observed workspace boundary");
+      const equalHeads = this.assertHeadsEqualStateResult(
+        input.run.sessionId,
+        prefixHeads,
+        current.value,
+      );
+      if (equalHeads.status === "error") return Result.err(equalHeads.error);
+      if (current.value.workspaceStatus === "capture-deferred" && input.observation === undefined) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            "A deferred history root requires an observed workspace boundary",
+          ),
+        );
       }
-      let fromState = current;
+      let fromState = current.value;
       if (input.observation !== undefined) {
-        fromState = this.insertWorkspaceObservation(
+        const observed = this.insertWorkspaceObservationResult(
           input.run.sessionId,
-          current,
+          current.value,
           prefixHeads,
           input.observation,
         );
-        this.moveHistoryCursor(input.run.sessionId, fromState);
+        if (observed.status === "error") return Result.err(observed.error);
+        fromState = observed.value;
+        const moved = this.moveHistoryCursorResult(input.run.sessionId, fromState);
+        if (moved.status === "error") return Result.err(moved.error);
       }
       const fullHeads = {
         modelHeadId: this.internChain(input.run.sessionId, "model", input.modelMessages),
         uiHeadId: this.internChain(input.run.sessionId, "ui", input.uiMessages),
       };
-      const commandRow = this.getStoredCommand(input.run.sessionId, input.commandId);
+      const commandRow = this.getStoredCommandResult(input.run.sessionId, input.commandId);
+      if (commandRow.status === "error") return Result.err(commandRow.error);
       if (
-        commandRow.kind !== "prompt" ||
-        commandRow.run_id !== null ||
-        commandRow.side_effect_started !== 0 ||
-        commandRow.result_json !== null ||
-        commandRow.request_fingerprint !== command.fingerprint ||
-        commandRow.request_json !== command.json
+        commandRow.value.kind !== "prompt" ||
+        commandRow.value.run_id !== null ||
+        commandRow.value.side_effect_started !== 0 ||
+        commandRow.value.result_json !== null ||
+        commandRow.value.request_fingerprint !== command.value.fingerprint ||
+        commandRow.value.request_json !== command.value.json
       ) {
-        throw new Error(`Prompt command '${input.commandId}' is not an admissible reservation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            `Prompt command '${input.commandId}' is not an admissible reservation`,
+          ),
+        );
       }
       const now = new Date().toISOString();
       this.database
@@ -4741,9 +5709,14 @@ export class MiniLilacSqliteStore {
           input.commandId,
         );
       if (assigned.changes !== 1) {
-        throw new Error(`Prompt command '${input.commandId}' could not be assigned atomically`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            `Prompt command '${input.commandId}' could not be assigned atomically`,
+          ),
+        );
       }
-      this.insertHistoryTransitionRow({
+      const insertedTransition = this.insertHistoryTransitionRowResult({
         id: input.transitionId,
         sessionId: input.run.sessionId,
         fromStateId: fromState.id,
@@ -4755,6 +5728,7 @@ export class MiniLilacSqliteStore {
         replayAfterSeq: 0,
         createdAt: now,
       });
+      if (insertedTransition.status === "error") return Result.err(insertedTransition.error);
       this.setTranscriptHeads(input.run.sessionId, fullHeads.modelHeadId, fullHeads.uiHeadId);
       this.clearHistoryRedo(input.run.sessionId);
       const updated = this.database
@@ -4765,79 +5739,72 @@ export class MiniLilacSqliteStore {
         )
         .run(input.run.id, input.title ?? null, now, input.run.sessionId);
       if (updated.changes !== 1) {
-        throw new Error(
-          `Session '${input.run.sessionId}' could not admit root run '${input.run.id}'`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "admitRootPromptHistory",
+            `Session '${input.run.sessionId}' could not admit root run '${input.run.id}'`,
+          ),
         );
       }
-      return {
-        snapshot: this.getSession(input.run.sessionId),
+      const snapshot = this.getSessionResult(input.run.sessionId);
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      const transition = this.getHistoryTransitionResult(input.transitionId);
+      if (transition.status === "error") return Result.err(transition.error);
+      return Result.ok({
+        snapshot: snapshot.value,
         fromState,
-        transition: this.getHistoryTransition(input.transitionId),
-      };
+        transition: transition.value,
+      });
     });
   }
 
   commitSteeringHistoryBoundary(
     input: CommitStoredSteeringBoundary,
   ): CommittedStoredSteeringBoundary {
-    if (input.entries.length === 0)
-      throw new Error("A steering boundary requires at least one entry");
-    parseHistoryWorkspaceOutcome(input.workspace);
-    modelMessagesSchema.parse(input.mergedModelMessages);
-    miniLilacMessagesSchema.parse(input.uiMessages);
-    input.entries.forEach((entry, index) => {
-      miniLilacUserUIMessageSchema.parse(entry.message);
-      modelMessagesSchema.parse([entry.modelMessage]);
-      if (entry.modelMessage.role !== "user") {
-        throw new Error("Every steering entry requires one canonical model user message");
-      }
-      z.number().int().nonnegative().parse(entry.replayAfterSeq);
-      if (index < input.entries.length - 1 !== (entry.intermediateStateId !== undefined)) {
-        throw new Error(
-          "Every non-final steering entry requires exactly one intermediate state ID",
-        );
-      }
-    });
-    const firstUiPosition = input.uiMessages.length - input.entries.length;
-    if (firstUiPosition < 0) throw new Error("Steering UI messages do not contain every entry");
-    const firstModelPosition = input.mergedModelMessages.length - input.entries.length;
-    if (firstModelPosition < 0) {
-      throw new Error("Steering model messages do not contain every entry");
-    }
-    input.entries.forEach((entry, index) => {
-      if (!canonicalValuesEqual(input.uiMessages[firstUiPosition + index], entry.message)) {
-        throw new Error("Steering entries must be the exact final canonical UI suffix");
-      }
-      if (
-        !canonicalValuesEqual(
-          input.mergedModelMessages[firstModelPosition + index],
-          entry.modelMessage,
-        )
-      ) {
-        throw new Error("Steering entries must be the exact final canonical model suffix");
-      }
-    });
-    return this.runStoreTransaction("commitSteeringHistoryBoundary", () => {
-      const session = this.getSession(input.sessionId);
+    return storeResultToLegacy(this.commitSteeringHistoryBoundaryResult(input));
+  }
+
+  commitSteeringHistoryBoundaryResult(
+    input: CommitStoredSteeringBoundary,
+  ): ResultType<CommittedStoredSteeringBoundary, MiniLilacStoreOperationError> {
+    const validated = validateSteeringHistoryBoundaryInput(input);
+    if (validated.status === "error") return Result.err(validated.error);
+    const { firstUiPosition, firstModelPosition } = validated.value;
+    return this.runStoreTransactionResult("commitSteeringHistoryBoundary", () => {
+      const session = this.getSessionResult(input.sessionId);
+      if (session.status === "error") return Result.err(session.error);
       const activeRun = this.getActiveRootRun(input.sessionId);
       if (
-        session.status !== "streaming" ||
+        session.value.status !== "streaming" ||
         activeRun?.id !== input.rootRunId ||
         activeRun.parentRunId !== null
       ) {
-        throw new Error(`Run '${input.rootRunId}' is not the active root run`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            `Run '${input.rootRunId}' is not the active root run`,
+          ),
+        );
       }
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const previous = this.getHistoryTransition(input.previousOpenTransitionId);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      if (workspace.status === "error") return Result.err(workspace.error);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(workspace.value.id);
+      if (available.status === "error") return Result.err(available.error);
+      const previous = this.getHistoryTransitionResult(input.previousOpenTransitionId);
+      if (previous.status === "error") return Result.err(previous.error);
+      const history = this.getSessionHistoryResult(input.sessionId);
+      if (history.status === "error") return Result.err(history.error);
       if (
-        previous.sessionId !== input.sessionId ||
-        previous.toStateId !== null ||
-        previous.rootRunId !== input.rootRunId ||
-        this.getSessionHistory(input.sessionId).currentStateId !== previous.fromStateId
+        previous.value.sessionId !== input.sessionId ||
+        previous.value.toStateId !== null ||
+        previous.value.rootRunId !== input.rootRunId ||
+        history.value.currentStateId !== previous.value.fromStateId
       ) {
-        throw new Error(
-          `Transition '${input.previousOpenTransitionId}' is not the active boundary`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            `Transition '${input.previousOpenTransitionId}' is not the active boundary`,
+          ),
         );
       }
       const baseHeads = {
@@ -4852,66 +5819,99 @@ export class MiniLilacSqliteStore {
           input.uiMessages.slice(0, firstUiPosition),
         ),
       };
-      const canonicalUiMessages = this.getUiMessages(input.sessionId);
+      const canonicalUiMessages = this.getUiMessagesResult(input.sessionId);
+      if (canonicalUiMessages.status === "error") return Result.err(canonicalUiMessages.error);
       const baseUiMessages = input.uiMessages.slice(0, firstUiPosition);
-      if (!isCanonicalPrefix(canonicalUiMessages, baseUiMessages)) {
-        throw new Error("Steering UI boundary does not extend the canonical live transcript");
-      }
-      const fromState = this.getHistoryState(previous.fromStateId);
-      const providerState =
-        input.providerState === undefined
-          ? fromState.providerState
-          : historyProviderStateSchema.parse(input.providerState);
-      if (input.providerState !== undefined) {
-        this.assertConservativeProviderTransition(
-          fromState.id,
-          historyProviderStateSchema.parse(input.providerState),
+      if (!isCanonicalPrefix(canonicalUiMessages.value, baseUiMessages)) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering UI boundary does not extend the canonical live transcript",
+          ),
         );
       }
+      const fromState = this.getHistoryStateResult(previous.value.fromStateId);
+      if (fromState.status === "error") return Result.err(fromState.error);
+      const providerState =
+        input.providerState === undefined ? fromState.value.providerState : input.providerState;
+      if (input.providerState !== undefined) {
+        const conservative = this.assertConservativeProviderTransitionResult(
+          fromState.value.id,
+          input.providerState,
+        );
+        if (conservative.status === "error") return Result.err(conservative.error);
+      }
+      const rawFromUiMessages = this.readSerializedChainResult(
+        input.sessionId,
+        "ui",
+        fromState.value.uiHeadId,
+      );
+      if (rawFromUiMessages.status === "error") return Result.err(rawFromUiMessages.error);
       const decodedFromUiMessages = decodeMiniLilacUiTranscript({
-        rawValues: this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId),
+        rawValues: rawFromUiMessages.value,
         schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-        recordId: fromState.id,
+        recordId: fromState.value.id,
       });
-      if (decodedFromUiMessages.status === "error") throw decodedFromUiMessages.error;
+      if (decodedFromUiMessages.status === "error") return Result.err(decodedFromUiMessages.error);
       const fromUiMessages = decodedFromUiMessages.value.value;
       if (
-        previous.userMessage === null ||
-        !canonicalValuesEqual(canonicalUiMessages[fromUiMessages.length], previous.userMessage) ||
-        !canonicalValuesEqual(baseUiMessages[fromUiMessages.length], previous.userMessage)
+        previous.value.userMessage === null ||
+        !canonicalValuesEqual(
+          canonicalUiMessages.value[fromUiMessages.length],
+          previous.value.userMessage,
+        ) ||
+        !canonicalValuesEqual(baseUiMessages[fromUiMessages.length], previous.value.userMessage)
       ) {
-        throw new Error("Steering boundary does not retain the active user message");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering boundary does not retain the active user message",
+          ),
+        );
       }
       const boundaryState: CreateStoredHistoryState = {
         id: input.boundaryStateId,
         sessionId: input.sessionId,
-        workspaceId: workspace.id,
+        workspaceId: workspace.value.id,
         modelHeadId: baseHeads.modelHeadId,
         uiHeadId: baseHeads.uiHeadId,
         ...input.workspace,
         origin: "turn-boundary",
         providerState,
       };
-      this.closeHistoryTransition(input.previousOpenTransitionId, boundaryState, { select: true });
-      let currentState = this.getHistoryState(input.boundaryStateId);
+      const closedBoundary = this.closeHistoryTransitionResult(
+        input.previousOpenTransitionId,
+        boundaryState,
+        { select: true },
+      );
+      if (closedBoundary.status === "error") return Result.err(closedBoundary.error);
+      const boundary = this.getHistoryStateResult(input.boundaryStateId);
+      if (boundary.status === "error") return Result.err(boundary.error);
+      let currentState = boundary.value;
       for (const [index, entry] of input.entries.entries()) {
-        const commandRow = this.getStoredCommand(input.sessionId, entry.commandId);
+        const commandRow = this.getStoredCommandResult(input.sessionId, entry.commandId);
+        if (commandRow.status === "error") return Result.err(commandRow.error);
         if (
-          commandRow.kind !== "steer" ||
-          commandRow.run_id !== input.rootRunId ||
-          commandRow.side_effect_started !== 1 ||
-          commandRow.result_json === null
+          commandRow.value.kind !== "steer" ||
+          commandRow.value.run_id !== input.rootRunId ||
+          commandRow.value.side_effect_started !== 1 ||
+          commandRow.value.result_json === null
         ) {
-          throw new Error(
-            `Steering command '${entry.commandId}' is not admitted for this root run`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitSteeringHistoryBoundary",
+              `Steering command '${entry.commandId}' is not admitted for this root run`,
+            ),
           );
         }
         const decodedCommandPayload = decodeMiniLilacSteeringCommandRequest({
-          raw: commandRow.request_json,
+          raw: commandRow.value.request_json,
           schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
           recordId: entry.commandId,
         });
-        if (decodedCommandPayload.status === "error") throw decodedCommandPayload.error;
+        if (decodedCommandPayload.status === "error") {
+          return Result.err(decodedCommandPayload.error);
+        }
         const commandPayload = decodedCommandPayload.value.value;
         if (
           !canonicalValuesEqual(commandPayload.message, entry.message) ||
@@ -4921,11 +5921,14 @@ export class MiniLilacSqliteStore {
           (commandPayload.clientCommandId !== undefined &&
             commandPayload.clientCommandId !== entry.commandId)
         ) {
-          throw new Error(
-            `Steering command '${entry.commandId}' request does not match its boundary entry`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitSteeringHistoryBoundary",
+              `Steering command '${entry.commandId}' request does not match its boundary entry`,
+            ),
           );
         }
-        this.insertHistoryTransitionRow({
+        const insertedTransition = this.insertHistoryTransitionRowResult({
           id: entry.transitionId,
           sessionId: input.sessionId,
           fromStateId: currentState.id,
@@ -4936,6 +5939,7 @@ export class MiniLilacSqliteStore {
           rootRunId: input.rootRunId,
           replayAfterSeq: entry.replayAfterSeq,
         });
+        if (insertedTransition.status === "error") return Result.err(insertedTransition.error);
         if (entry.intermediateStateId !== undefined) {
           const nextModelHeadId = this.internChain(
             input.sessionId,
@@ -4947,12 +5951,12 @@ export class MiniLilacSqliteStore {
             "ui",
             input.uiMessages.slice(0, firstUiPosition + index + 1),
           );
-          this.closeHistoryTransition(
+          const closed = this.closeHistoryTransitionResult(
             entry.transitionId,
             {
               id: entry.intermediateStateId,
               sessionId: input.sessionId,
-              workspaceId: workspace.id,
+              workspaceId: workspace.value.id,
               modelHeadId: nextModelHeadId,
               uiHeadId: nextUiHeadId,
               ...input.workspace,
@@ -4961,11 +5965,21 @@ export class MiniLilacSqliteStore {
             },
             { select: true },
           );
-          currentState = this.getHistoryState(entry.intermediateStateId);
+          if (closed.status === "error") return Result.err(closed.error);
+          const intermediateState = this.getHistoryStateResult(entry.intermediateStateId);
+          if (intermediateState.status === "error") return Result.err(intermediateState.error);
+          currentState = intermediateState.value;
         }
       }
       const finalEntry = input.entries.at(-1);
-      if (finalEntry === undefined) throw new Error("Steering boundary lost its final entry");
+      if (finalEntry === undefined) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering boundary lost its final entry",
+          ),
+        );
+      }
       const fullHeads = {
         modelHeadId: this.internChain(input.sessionId, "model", input.mergedModelMessages),
         uiHeadId: this.internChain(input.sessionId, "ui", input.uiMessages),
@@ -4980,24 +5994,46 @@ export class MiniLilacSqliteStore {
         )
         .run(input.entries.length, new Date().toISOString(), input.sessionId, input.entries.length);
       if (updated.changes !== 1) {
-        throw new Error("Steering boundary consumed more entries than the session has queued");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitSteeringHistoryBoundary",
+            "Steering boundary consumed more entries than the session has queued",
+          ),
+        );
       }
-      return {
+      const openTransition = this.getHistoryTransitionResult(finalEntry.transitionId);
+      if (openTransition.status === "error") return Result.err(openTransition.error);
+      return Result.ok({
         currentState,
-        openTransition: this.getHistoryTransition(finalEntry.transitionId),
-      };
+        openTransition: openTransition.value,
+      });
     });
   }
 
   commitHistoryCompaction(input: CommitStoredHistoryCompaction): CommittedStoredHistoryCompaction {
-    modelMessagesSchema.parse(input.modelMessages);
+    return storeResultToLegacy(this.commitHistoryCompactionResult(input));
+  }
+
+  commitHistoryCompactionResult(
+    input: CommitStoredHistoryCompaction,
+  ): ResultType<CommittedStoredHistoryCompaction, MiniLilacStoreOperationError> {
     if (Object.prototype.hasOwnProperty.call(input, "uiMessages")) {
-      throw new Error("Manual history compaction does not accept a replacement UI transcript");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          "Manual history compaction does not accept a replacement UI transcript",
+        ),
+      );
     }
-    const result = miniLilacCompactResultSchema.parse(input.result);
-    const compactionEvent = miniLilacCompactionEventSchema.parse(input.compactionEvent);
+    const result = input.result;
+    const compactionEvent = input.compactionEvent;
     if (result.clientCommandId !== input.commandId) {
-      throw new Error(`Compaction result does not belong to command '${input.commandId}'`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          `Compaction result does not belong to command '${input.commandId}'`,
+        ),
+      );
     }
     if (
       compactionEvent.source !== "manual" ||
@@ -5010,32 +6046,50 @@ export class MiniLilacSqliteStore {
       compactionEvent.estimatedInputTokensAfter !== result.estimatedInputTokensAfter ||
       compactionEvent.error !== undefined
     ) {
-      throw new Error("Manual compaction event does not match its compact result");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          "Manual compaction event does not match its compact result",
+        ),
+      );
     }
-    parseHistoryWorkspaceOutcome(input);
-    if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
     if (input.request.kind !== "compact" || input.request.runId !== null) {
-      throw new Error("History compaction requires a session-scoped compact command");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitHistoryCompaction",
+          "History compaction requires a session-scoped compact command",
+        ),
+      );
     }
-    const command = canonicalCommandPayload(input.request.payload);
-    return this.runStoreTransaction("commitHistoryCompaction", () => {
-      this.requireQuiescentHistorySession(input.sessionId, input.expectedCurrentStateId, [
-        "idle",
-        "error",
-        "compacting",
-      ]);
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const commandRow = this.getStoredCommand(input.sessionId, input.commandId);
+    const command = decodeCanonicalStoredCommandRequest(input.request);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runStoreTransactionResult("commitHistoryCompaction", () => {
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.sessionId,
+        input.expectedCurrentStateId,
+        ["idle", "error", "compacting"],
+      );
+      if (quiescent.status === "error") return Result.err(quiescent.error);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      if (workspace.status === "error") return Result.err(workspace.error);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(workspace.value.id);
+      if (available.status === "error") return Result.err(available.error);
+      const commandRow = this.getStoredCommandResult(input.sessionId, input.commandId);
+      if (commandRow.status === "error") return Result.err(commandRow.error);
       if (
-        commandRow.kind !== input.request.kind ||
-        commandRow.run_id !== null ||
-        commandRow.side_effect_started !== 0 ||
-        commandRow.result_json !== null ||
-        commandRow.request_fingerprint !== command.fingerprint ||
-        commandRow.request_json !== command.json
+        commandRow.value.kind !== input.request.kind ||
+        commandRow.value.run_id !== null ||
+        commandRow.value.side_effect_started !== 0 ||
+        commandRow.value.result_json !== null ||
+        commandRow.value.request_fingerprint !== command.value.fingerprint ||
+        commandRow.value.request_json !== command.value.json
       ) {
-        throw new Error(`Compaction command '${input.commandId}' is not an admissible reservation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryCompaction",
+            `Compaction command '${input.commandId}' is not an admissible reservation`,
+          ),
+        );
       }
       const now = new Date().toISOString();
       if (result.status !== "compacted") {
@@ -5047,7 +6101,12 @@ export class MiniLilacSqliteStore {
           )
           .run(serialize(result), input.sessionId, input.commandId);
         if (saved.changes !== 1) {
-          throw new Error(`Compaction command '${input.commandId}' could not be saved atomically`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryCompaction",
+              `Compaction command '${input.commandId}' could not be saved atomically`,
+            ),
+          );
         }
         this.database
           .query(
@@ -5055,31 +6114,40 @@ export class MiniLilacSqliteStore {
                queued_steering_count = 0, updated_at = ? WHERE id = ?`,
           )
           .run(now, input.sessionId);
-        return {
-          state: this.getCurrentHistoryState(input.sessionId),
-          snapshot: this.getSession(input.sessionId),
-        };
+        const state = this.getCurrentHistoryStateResult(input.sessionId);
+        if (state.status === "error") return Result.err(state.error);
+        const snapshot = this.getSessionResult(input.sessionId);
+        if (snapshot.status === "error") return Result.err(snapshot.error);
+        return Result.ok({ state: state.value, snapshot: snapshot.value });
       }
-      let fromState = this.getCurrentHistoryState(input.sessionId);
+      const current = this.getCurrentHistoryStateResult(input.sessionId);
+      if (current.status === "error") return Result.err(current.error);
+      let fromState = current.value;
       if (input.observation !== undefined) {
-        fromState = this.insertWorkspaceObservation(
+        const observed = this.insertWorkspaceObservationResult(
           input.sessionId,
           fromState,
           { modelHeadId: fromState.modelHeadId, uiHeadId: fromState.uiHeadId },
           input.observation,
         );
-        this.moveHistoryCursor(input.sessionId, fromState);
+        if (observed.status === "error") return Result.err(observed.error);
+        fromState = observed.value;
+        const moved = this.moveHistoryCursorResult(input.sessionId, fromState);
+        if (moved.status === "error") return Result.err(moved.error);
       }
       if (input.providerState !== undefined) {
-        this.assertConservativeProviderTransition(
+        const conservative = this.assertConservativeProviderTransitionResult(
           fromState.id,
-          historyProviderStateSchema.parse(input.providerState),
+          input.providerState,
         );
+        if (conservative.status === "error") return Result.err(conservative.error);
       }
+      const uiMessages = this.getUiMessagesResult(input.sessionId);
+      if (uiMessages.status === "error") return Result.err(uiMessages.error);
       const heads = {
         modelHeadId: this.internChain(input.sessionId, "model", input.modelMessages),
         uiHeadId: this.internChain(input.sessionId, "ui", [
-          ...this.getUiMessages(input.sessionId),
+          ...uiMessages.value,
           {
             id: `compaction:${input.commandId}`,
             role: "assistant",
@@ -5093,11 +6161,11 @@ export class MiniLilacSqliteStore {
           },
         ]),
       };
-      const appended = this.appendHistoryTransition({
+      const appended = this.appendHistoryTransitionResult({
         state: {
           id: input.stateId,
           sessionId: input.sessionId,
-          workspaceId: workspace.id,
+          workspaceId: workspace.value.id,
           modelHeadId: heads.modelHeadId,
           uiHeadId: heads.uiHeadId,
           workspaceSnapshotId: input.workspaceSnapshotId,
@@ -5115,7 +6183,9 @@ export class MiniLilacSqliteStore {
         select: true,
         clearRedo: true,
       });
-      this.setHistoryUndoFloor(input.sessionId, appended.state.id);
+      if (appended.status === "error") return Result.err(appended.error);
+      const floor = this.setHistoryUndoFloorResult(input.sessionId, appended.value.state.id);
+      if (floor.status === "error") return Result.err(floor.error);
       const saved = this.database
         .query(
           `UPDATE commands SET side_effect_started = 1, result_json = ?
@@ -5124,7 +6194,12 @@ export class MiniLilacSqliteStore {
         )
         .run(serialize(result), input.sessionId, input.commandId);
       if (saved.changes !== 1) {
-        throw new Error(`Compaction command '${input.commandId}' could not be saved atomically`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryCompaction",
+            `Compaction command '${input.commandId}' could not be saved atomically`,
+          ),
+        );
       }
       this.database
         .query(
@@ -5138,7 +6213,9 @@ export class MiniLilacSqliteStore {
           now,
           input.sessionId,
         );
-      return { state: appended.state, snapshot: this.getSession(input.sessionId) };
+      const snapshot = this.getSessionResult(input.sessionId);
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      return Result.ok({ state: appended.value.state, snapshot: snapshot.value });
     });
   }
 
@@ -5153,9 +6230,34 @@ export class MiniLilacSqliteStore {
     readonly select?: boolean;
     readonly clearRedo?: boolean;
   }): { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition } {
-    return this.runStoreTransaction("appendHistoryTransition", () => {
+    return storeResultToLegacy(this.appendHistoryTransitionResult(input));
+  }
+
+  private appendHistoryTransitionResult(input: {
+    readonly state: CreateStoredHistoryState;
+    readonly transition:
+      | Omit<Extract<CreateStoredHistoryTransition, { kind: "user-message" }>, "toStateId">
+      | Omit<
+          Extract<CreateStoredHistoryTransition, { kind: "workspace-observation" | "compaction" }>,
+          "toStateId"
+        >;
+    readonly select?: boolean;
+    readonly clearRedo?: boolean;
+  }): ResultType<
+    { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition },
+    MiniLilacStoreOperationError
+  > {
+    return this.runStoreTransactionResult<
+      { readonly state: StoredHistoryState; readonly transition: StoredHistoryTransition },
+      MiniLilacStoreOperationError
+    >("appendHistoryTransition", () => {
       if (input.state.sessionId !== input.transition.sessionId) {
-        throw new Error(`History transition '${input.transition.id}' crosses sessions`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "appendHistoryTransition",
+            `History transition '${input.transition.id}' crosses sessions`,
+          ),
+        );
       }
       this.insertHistoryStateRow(input.state);
       this.insertHistoryTransitionRow({ ...input.transition, toStateId: input.state.id });
@@ -5165,11 +6267,21 @@ export class MiniLilacSqliteStore {
           .run(input.state.sessionId);
       }
       if (input.select) {
-        const history = this.getSessionHistory(input.state.sessionId);
+        const history = this.getSessionHistoryResult(input.state.sessionId);
+        if (history.status === "error") return Result.err(history.error);
         if (
-          !this.isStateInAncestry(input.state.sessionId, input.state.id, history.undoFloorStateId)
+          !this.isStateInAncestry(
+            input.state.sessionId,
+            input.state.id,
+            history.value.undoFloorStateId,
+          )
         ) {
-          throw new Error(`History state '${input.state.id}' is below the current undo floor`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "appendHistoryTransition",
+              `History state '${input.state.id}' is below the current undo floor`,
+            ),
+          );
         }
         this.setTranscriptHeads(
           input.state.sessionId,
@@ -5183,13 +6295,19 @@ export class MiniLilacSqliteStore {
           )
           .run(input.state.id, new Date().toISOString(), input.state.sessionId);
         if (updated.changes !== 1) {
-          throw new Error(`Session '${input.state.sessionId}' has no history cursor`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "appendHistoryTransition",
+              `Session '${input.state.sessionId}' has no history cursor`,
+            ),
+          );
         }
       }
-      return {
-        state: this.getHistoryState(input.state.id),
-        transition: this.getHistoryTransition(input.transition.id),
-      };
+      const state = this.getHistoryStateResult(input.state.id);
+      if (state.status === "error") return Result.err(state.error);
+      const transition = this.getHistoryTransitionResult(input.transition.id);
+      if (transition.status === "error") return Result.err(transition.error);
+      return Result.ok({ state: state.value, transition: transition.value });
     });
   }
 
@@ -5198,25 +6316,51 @@ export class MiniLilacSqliteStore {
     destination: CreateStoredHistoryState,
     options: { readonly select?: boolean; readonly clearRedo?: boolean } = {},
   ): StoredHistoryTransition {
-    return this.runStoreTransaction("closeHistoryTransition", () => {
-      const transition = this.getHistoryTransition(transitionId);
-      if (transition.toStateId !== null || transition.kind !== "user-message") {
-        throw new Error(`History transition '${transitionId}' is not an open user transition`);
+    return storeResultToLegacy(
+      this.closeHistoryTransitionResult(transitionId, destination, options),
+    );
+  }
+
+  private closeHistoryTransitionResult(
+    transitionId: string,
+    destination: CreateStoredHistoryState,
+    options: { readonly select?: boolean; readonly clearRedo?: boolean } = {},
+  ): ResultType<StoredHistoryTransition, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult("closeHistoryTransition", () => {
+      const transition = this.getHistoryTransitionResult(transitionId);
+      if (transition.status === "error") return Result.err(transition.error);
+      if (transition.value.toStateId !== null || transition.value.kind !== "user-message") {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "closeHistoryTransition",
+            `History transition '${transitionId}' is not an open user transition`,
+          ),
+        );
       }
       if (
-        destination.sessionId !== transition.sessionId ||
+        destination.sessionId !== transition.value.sessionId ||
         destination.origin !== "turn-boundary"
       ) {
-        throw new Error(`History transition '${transitionId}' has an invalid destination state`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "closeHistoryTransition",
+            `History transition '${transitionId}' has an invalid destination state`,
+          ),
+        );
       }
-      this.assertStateConnectedToRoot(transition.sessionId, transition.fromStateId);
-      this.insertHistoryStateRow(destination);
-      this.validateHistoryTransitionDestination(
-        transition.sessionId,
-        transition.fromStateId,
-        destination.id,
-        transition.kind,
+      const connected = this.assertStateConnectedToRootResult(
+        transition.value.sessionId,
+        transition.value.fromStateId,
       );
+      if (connected.status === "error") return Result.err(connected.error);
+      this.insertHistoryStateRow(destination);
+      const validDestination = this.validateHistoryTransitionDestinationResult(
+        transition.value.sessionId,
+        transition.value.fromStateId,
+        destination.id,
+        transition.value.kind,
+      );
+      if (validDestination.status === "error") return Result.err(validDestination.error);
       const completedAt = new Date().toISOString();
       const updated = this.database
         .query(
@@ -5225,22 +6369,37 @@ export class MiniLilacSqliteStore {
         )
         .run(destination.id, completedAt, transitionId);
       if (updated.changes !== 1) {
-        throw new Error(`History transition '${transitionId}' could not be closed`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "closeHistoryTransition",
+            `History transition '${transitionId}' could not be closed`,
+          ),
+        );
       }
       if (options.clearRedo) {
         this.database
           .query("DELETE FROM history_redo_stack WHERE session_id = ?")
-          .run(transition.sessionId);
+          .run(transition.value.sessionId);
       }
       if (options.select) {
-        const history = this.getSessionHistory(transition.sessionId);
+        const history = this.getSessionHistoryResult(transition.value.sessionId);
+        if (history.status === "error") return Result.err(history.error);
         if (
-          !this.isStateInAncestry(transition.sessionId, destination.id, history.undoFloorStateId)
+          !this.isStateInAncestry(
+            transition.value.sessionId,
+            destination.id,
+            history.value.undoFloorStateId,
+          )
         ) {
-          throw new Error(`History state '${destination.id}' is below the current undo floor`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "closeHistoryTransition",
+              `History state '${destination.id}' is below the current undo floor`,
+            ),
+          );
         }
         this.setTranscriptHeads(
-          transition.sessionId,
+          transition.value.sessionId,
           destination.modelHeadId,
           destination.uiHeadId,
         );
@@ -5249,31 +6408,63 @@ export class MiniLilacSqliteStore {
             `UPDATE session_history SET current_state_id = ?, updated_at = ?
              WHERE session_id = ?`,
           )
-          .run(destination.id, new Date().toISOString(), transition.sessionId);
+          .run(destination.id, new Date().toISOString(), transition.value.sessionId);
       }
-      return this.getHistoryTransition(transitionId);
+      return this.getHistoryTransitionResult(transitionId);
     });
   }
 
   private setHistoryUndoFloor(sessionId: string, stateId: string): void {
-    this.runStoreTransaction("setHistoryUndoFloor", () => {
-      const state = this.getHistoryState(stateId);
-      if (state.sessionId !== sessionId) {
-        throw new Error(`History state '${stateId}' does not belong to session '${sessionId}'`);
-      }
-      this.assertStateConnectedToRoot(sessionId, stateId);
-      const currentStateId = this.getSessionHistory(sessionId).currentStateId;
-      if (!this.isStateInAncestry(sessionId, currentStateId, stateId)) {
-        throw new Error(`History state '${stateId}' is not an ancestor of the current state`);
-      }
-      const updated = this.database
-        .query(
-          `UPDATE session_history SET undo_floor_state_id = ?, updated_at = ?
+    storeResultToLegacy(this.setHistoryUndoFloorResult(sessionId, stateId));
+  }
+
+  private setHistoryUndoFloorResult(
+    sessionId: string,
+    stateId: string,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<void, MiniLilacStoreOperationError>(
+      "setHistoryUndoFloor",
+      () => {
+        const state = this.getHistoryStateResult(stateId);
+        if (state.status === "error") return Result.err(state.error);
+        if (state.value.sessionId !== sessionId) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "setHistoryUndoFloor",
+              `History state '${stateId}' does not belong to session '${sessionId}'`,
+            ),
+          );
+        }
+        const connected = this.assertStateConnectedToRootResult(sessionId, stateId);
+        if (connected.status === "error") return Result.err(connected.error);
+        const history = this.getSessionHistoryResult(sessionId);
+        if (history.status === "error") return Result.err(history.error);
+        const currentStateId = history.value.currentStateId;
+        if (!this.isStateInAncestry(sessionId, currentStateId, stateId)) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "setHistoryUndoFloor",
+              `History state '${stateId}' is not an ancestor of the current state`,
+            ),
+          );
+        }
+        const updated = this.database
+          .query(
+            `UPDATE session_history SET undo_floor_state_id = ?, updated_at = ?
            WHERE session_id = ?`,
-        )
-        .run(stateId, new Date().toISOString(), sessionId);
-      if (updated.changes !== 1) throw new Error(`Session '${sessionId}' has no history cursor`);
-    });
+          )
+          .run(stateId, new Date().toISOString(), sessionId);
+        if (updated.changes !== 1) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "setHistoryUndoFloor",
+              `Session '${sessionId}' has no history cursor`,
+            ),
+          );
+        }
+        return Result.ok(undefined);
+      },
+    );
   }
 
   private pushHistoryRedo(
@@ -5281,48 +6472,97 @@ export class MiniLilacSqliteStore {
     targetStateId: string,
     userTransitionId: string,
   ): StoredHistoryRedoEntry {
-    return this.runStoreTransaction("pushHistoryRedo", () => {
-      const target = this.getHistoryState(targetStateId);
-      const transition = this.getHistoryTransition(userTransitionId);
-      if (
-        target.sessionId !== sessionId ||
-        transition.sessionId !== sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId === null ||
-        !this.isStateInAncestry(sessionId, targetStateId, transition.toStateId)
-      ) {
-        throw new Error(`Invalid redo entry for session '${sessionId}'`);
-      }
-      this.assertStateConnectedToRoot(sessionId, targetStateId);
-      const position = z.object({ position: z.number().int().nonnegative() }).parse(
+    return storeResultToLegacy(
+      this.pushHistoryRedoResult(sessionId, targetStateId, userTransitionId),
+    );
+  }
+
+  private pushHistoryRedoResult(
+    sessionId: string,
+    targetStateId: string,
+    userTransitionId: string,
+  ): ResultType<StoredHistoryRedoEntry, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<StoredHistoryRedoEntry, MiniLilacStoreOperationError>(
+      "pushHistoryRedo",
+      () => {
+        const target = this.getHistoryStateResult(targetStateId);
+        if (target.status === "error") return Result.err(target.error);
+        const transition = this.getHistoryTransitionResult(userTransitionId);
+        if (transition.status === "error") return Result.err(transition.error);
+        if (
+          target.value.sessionId !== sessionId ||
+          transition.value.sessionId !== sessionId ||
+          transition.value.kind !== "user-message" ||
+          transition.value.toStateId === null ||
+          !this.isStateInAncestry(sessionId, targetStateId, transition.value.toStateId)
+        ) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "pushHistoryRedo",
+              `Invalid redo entry for session '${sessionId}'`,
+            ),
+          );
+        }
+        const connected = this.assertStateConnectedToRootResult(sessionId, targetStateId);
+        if (connected.status === "error") return Result.err(connected.error);
+        const position = decodeRequiredMiniLilacStoreRow({
+          kind: "position",
+          row: this.database
+            .query(
+              `SELECT COALESCE(MAX(position), -1) + 1 AS position
+                 FROM history_redo_stack WHERE session_id = ?`,
+            )
+            .get(sessionId),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: `${sessionId}:next-redo-position`,
+        });
+        if (position.status === "error") return Result.err(position.error);
         this.database
           .query(
-            `SELECT COALESCE(MAX(position), -1) + 1 AS position
-               FROM history_redo_stack WHERE session_id = ?`,
-          )
-          .get(sessionId),
-      ).position;
-      this.database
-        .query(
-          `INSERT INTO history_redo_stack
+            `INSERT INTO history_redo_stack
             (session_id, position, target_state_id, user_transition_id, created_at)
            VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(sessionId, position, targetStateId, userTransitionId, new Date().toISOString());
-      const entry = this.peekHistoryRedo(sessionId);
-      if (entry === null) throw new Error(`Redo entry for session '${sessionId}' was not created`);
-      return entry;
-    });
+          )
+          .run(
+            sessionId,
+            position.value.position,
+            targetStateId,
+            userTransitionId,
+            new Date().toISOString(),
+          );
+        const entry = this.peekHistoryRedoResult(sessionId);
+        if (entry.status === "error") return Result.err(entry.error);
+        if (entry.value === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "pushHistoryRedo",
+              `Redo entry for session '${sessionId}' was not created`,
+            ),
+          );
+        }
+        return Result.ok(entry.value);
+      },
+    );
   }
 
   private popHistoryRedo(sessionId: string): StoredHistoryRedoEntry | null {
-    return this.runStoreTransaction("popHistoryRedo", () => {
-      const entry = this.peekHistoryRedo(sessionId);
-      if (entry === null) return null;
+    return storeResultToLegacy(this.popHistoryRedoResult(sessionId));
+  }
+
+  private popHistoryRedoResult(
+    sessionId: string,
+  ): ResultType<StoredHistoryRedoEntry | null, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<
+      StoredHistoryRedoEntry | null,
+      MiniLilacStoreOperationError
+    >("popHistoryRedo", () => {
+      const entry = this.peekHistoryRedoResult(sessionId);
+      if (entry.status === "error") return Result.err(entry.error);
+      if (entry.value === null) return Result.ok(null);
       this.database
         .query("DELETE FROM history_redo_stack WHERE session_id = ? AND position = ?")
-        .run(sessionId, entry.position);
-      return entry;
+        .run(sessionId, entry.value.position);
+      return Result.ok(entry.value);
     });
   }
 
@@ -5333,71 +6573,129 @@ export class MiniLilacSqliteStore {
   commitEmptyHistoryNavigation(
     input: CommitEmptyStoredHistoryNavigation,
   ): CommittedEmptyStoredHistoryNavigation {
+    return storeResultToLegacy(this.commitEmptyHistoryNavigationResult(input));
+  }
+
+  commitEmptyHistoryNavigationResult(
+    input: CommitEmptyStoredHistoryNavigation,
+  ): ResultType<CommittedEmptyStoredHistoryNavigation, MiniLilacStoreOperationError> {
     if (input.request.kind !== input.requestedAction || input.request.runId !== null) {
-      throw new Error("Empty history navigation requires a matching session-scoped command");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitEmptyHistoryNavigation",
+          "Empty history navigation requires a matching session-scoped command",
+        ),
+      );
     }
-    if (
-      z.object({ status: z.enum(["undone", "redone", "empty"]) }).parse(input.result).status !==
-      "empty"
-    ) {
-      throw new Error("Empty history navigation must persist an empty result");
+    if (input.result.status !== "empty") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitEmptyHistoryNavigation",
+          "Empty history navigation must persist an empty result",
+        ),
+      );
     }
-    const result = this.parseHistoryNavigationResult(
+    const decodedInputResult = decodeStoredHistoryNavigationResult(input.result);
+    if (decodedInputResult.status === "error") return Result.err(decodedInputResult.error);
+    const result = this.validateHistoryNavigationResult(
       input.requestedAction,
-      input.result,
+      decodedInputResult.value,
       input.commandId,
       null,
     );
-    if (result.status !== "empty") {
-      throw new Error("Empty history navigation must persist an empty result");
+    if (result.status === "error") return Result.err(result.error);
+    if (result.value.status !== "empty") {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "commitEmptyHistoryNavigation",
+          "Empty history navigation must persist an empty result",
+        ),
+      );
     }
-    const canonicalCommand = canonicalCommandPayload(input.request.payload);
-    return this.runStoreTransaction("commitEmptyHistoryNavigation", () => {
-      const command = this.getStoredCommand(input.sessionId, input.commandId);
+    const emptyResult = result.value;
+    const canonicalCommand = decodeCanonicalStoredCommandRequest(input.request);
+    if (canonicalCommand.status === "error") return Result.err(canonicalCommand.error);
+    return this.runStoreTransactionResult("commitEmptyHistoryNavigation", () => {
+      const command = this.getStoredCommandResult(input.sessionId, input.commandId);
+      if (command.status === "error") return Result.err(command.error);
       if (
-        command.kind !== input.requestedAction ||
-        command.run_id !== null ||
-        command.request_fingerprint !== canonicalCommand.fingerprint ||
-        command.request_json !== canonicalCommand.json
+        command.value.kind !== input.requestedAction ||
+        command.value.run_id !== null ||
+        command.value.request_fingerprint !== canonicalCommand.value.fingerprint ||
+        command.value.request_json !== canonicalCommand.value.json
       ) {
-        throw new Error(`Command '${input.commandId}' does not own this history navigation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `Command '${input.commandId}' does not own this history navigation`,
+          ),
+        );
       }
-      if (command.result_json !== null) {
+      if (command.value.result_json !== null) {
         const decodedResult = decodeMiniLilacSuperJsonPayload({
-          raw: command.result_json,
+          raw: command.value.result_json,
           schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
           recordId: input.commandId,
           field: "command_result",
         });
-        if (decodedResult.status === "error") throw decodedResult.error;
-        const replayed = this.parseHistoryNavigationResult(
+        if (decodedResult.status === "error") return Result.err(decodedResult.error);
+        const decodedReplay = decodeStoredHistoryNavigationResult(decodedResult.value.value);
+        if (decodedReplay.status === "error") return Result.err(decodedReplay.error);
+        const replayed = this.validateHistoryNavigationResult(
           input.requestedAction,
-          decodedResult.value.value,
+          decodedReplay.value,
           input.commandId,
           null,
         );
-        if (replayed.status !== "empty") {
-          throw new Error(`Command '${input.commandId}' already has a non-empty result`);
+        if (replayed.status === "error") return Result.err(replayed.error);
+        if (replayed.value.status !== "empty") {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitEmptyHistoryNavigation",
+              `Command '${input.commandId}' already has a non-empty result`,
+            ),
+          );
         }
-        return {
-          result: replayed,
+        const navigation = this.getHistoryNavigationResult(input.sessionId);
+        if (navigation.status === "error") return Result.err(navigation.error);
+        return Result.ok({
+          result: replayed.value,
           replayed: true,
-          navigation: this.getHistoryNavigation(input.sessionId),
-        };
+          navigation: navigation.value,
+        });
       }
-      if (command.side_effect_started !== 0) {
-        throw new Error(`Command '${input.commandId}' has an incomplete history side effect`);
+      if (command.value.side_effect_started !== 0) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `Command '${input.commandId}' has an incomplete history side effect`,
+          ),
+        );
       }
-      const history = this.getSessionHistory(input.sessionId);
-      this.requireQuiescentHistorySession(input.sessionId, history.currentStateId);
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const hasTarget =
+      const history = this.getSessionHistoryResult(input.sessionId);
+      if (history.status === "error") return Result.err(history.error);
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.sessionId,
+        history.value.currentStateId,
+      );
+      if (quiescent.status === "error") return Result.err(quiescent.error);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      if (workspace.status === "error") return Result.err(workspace.error);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(workspace.value.id);
+      if (available.status === "error") return Result.err(available.error);
+      const target =
         input.requestedAction === "undo"
-          ? this.findLatestUndoableUserTransition(input.sessionId) !== null
-          : this.peekHistoryRedo(input.sessionId) !== null;
+          ? this.findLatestUndoableUserTransitionResult(input.sessionId)
+          : this.peekHistoryRedoResult(input.sessionId);
+      if (target.status === "error") return Result.err(target.error);
+      const hasTarget = target.value !== null;
       if (hasTarget) {
-        throw new Error(`History ${input.requestedAction} is no longer empty`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `History ${input.requestedAction} is no longer empty`,
+          ),
+        );
       }
       const saved = this.database
         .query(
@@ -5405,85 +6703,142 @@ export class MiniLilacSqliteStore {
            WHERE session_id = ? AND command_id = ? AND kind = ? AND run_id IS NULL
              AND side_effect_started = 0 AND result_json IS NULL`,
         )
-        .run(serialize(result), input.sessionId, input.commandId, input.requestedAction);
+        .run(serialize(emptyResult), input.sessionId, input.commandId, input.requestedAction);
       if (saved.changes !== 1) {
-        throw new Error(`Command '${input.commandId}' empty result could not be saved atomically`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitEmptyHistoryNavigation",
+            `Command '${input.commandId}' empty result could not be saved atomically`,
+          ),
+        );
       }
-      return {
-        result,
+      const navigation = this.getHistoryNavigationResult(input.sessionId);
+      if (navigation.status === "error") return Result.err(navigation.error);
+      return Result.ok({
+        result: emptyResult,
         replayed: false,
-        navigation: this.getHistoryNavigation(input.sessionId),
-      };
+        navigation: navigation.value,
+      });
     });
   }
 
   reserveHistoryOperation(input: ReserveStoredHistoryOperation): ReservedStoredHistoryOperation {
-    historyOperationActionSchema.parse(input.requestedAction);
-    historyFilesystemModeSchema.parse(input.filesystemMode);
+    return storeResultToLegacy(this.reserveHistoryOperationResult(input));
+  }
+
+  reserveHistoryOperationResult(
+    input: ReserveStoredHistoryOperation,
+  ): ResultType<ReservedStoredHistoryOperation, MiniLilacStoreOperationError> {
     if (input.filesystemMode === "restore" && input.skipReason !== null) {
-      throw new Error("Restore-mode history operations cannot have a skip reason");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reserveHistoryOperation",
+          "Restore-mode history operations cannot have a skip reason",
+        ),
+      );
     }
-    if (input.filesystemMode === "skip") historySkipReasonSchema.parse(input.skipReason);
-    if (input.observation !== undefined) parseHistoryWorkspaceOutcome(input.observation);
-    return this.runStoreTransaction("reserveHistoryOperation", () => {
-      this.requireQuiescentHistorySession(input.sessionId, input.expectedSourceStateId);
-      const workspace = this.getWorkspaceForSession(input.sessionId);
-      this.assertWorkspaceHasNoHistoryJournal(workspace.id);
-      const command = this.getStoredCommand(input.sessionId, input.commandId);
+    return this.runStoreTransactionResult("reserveHistoryOperation", () => {
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        input.sessionId,
+        input.expectedSourceStateId,
+      );
+      if (quiescent.status === "error") return Result.err(quiescent.error);
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      if (workspace.status === "error") return Result.err(workspace.error);
+      const available = this.assertWorkspaceHasNoHistoryJournalResult(workspace.value.id);
+      if (available.status === "error") return Result.err(available.error);
+      const command = this.getStoredCommandResult(input.sessionId, input.commandId);
+      if (command.status === "error") return Result.err(command.error);
       if (
-        command.kind !== input.requestedAction ||
-        command.run_id !== null ||
-        command.result_json !== null ||
-        command.side_effect_started !== 0
+        command.value.kind !== input.requestedAction ||
+        command.value.run_id !== null ||
+        command.value.result_json !== null ||
+        command.value.side_effect_started !== 0
       ) {
-        throw new Error(`Command '${input.commandId}' cannot reserve a history operation`);
-      }
-      const source = this.getCurrentHistoryState(input.sessionId);
-      const transition = this.getHistoryTransition(input.userTransitionId);
-      if (
-        transition.sessionId !== input.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId === null
-      ) {
-        throw new Error(
-          `History operation transition '${input.userTransitionId}' is not completed`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `Command '${input.commandId}' cannot reserve a history operation`,
+          ),
         );
       }
-      this.assertStateConnectedToRoot(input.sessionId, input.targetStateId);
+      const source = this.getCurrentHistoryStateResult(input.sessionId);
+      if (source.status === "error") return Result.err(source.error);
+      const transition = this.getHistoryTransitionResult(input.userTransitionId);
+      if (transition.status === "error") return Result.err(transition.error);
+      if (
+        transition.value.sessionId !== input.sessionId ||
+        transition.value.kind !== "user-message" ||
+        transition.value.toStateId === null
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `History operation transition '${input.userTransitionId}' is not completed`,
+          ),
+        );
+      }
+      const connected = this.assertStateConnectedToRootResult(input.sessionId, input.targetStateId);
+      if (connected.status === "error") return Result.err(connected.error);
       let observedState: StoredHistoryState | null = null;
       if (input.observation !== undefined) {
-        observedState = this.insertWorkspaceObservation(
+        const observed = this.insertWorkspaceObservationResult(
           input.sessionId,
-          source,
-          { modelHeadId: source.modelHeadId, uiHeadId: source.uiHeadId },
+          source.value,
+          { modelHeadId: source.value.modelHeadId, uiHeadId: source.value.uiHeadId },
           input.observation,
         );
-      }
-      if (input.requestedAction === "undo" && transition.fromStateId !== input.targetStateId) {
-        throw new Error("Undo history operation target must be its user transition source");
+        if (observed.status === "error") return Result.err(observed.error);
+        observedState = observed.value;
       }
       if (
         input.requestedAction === "undo" &&
-        this.findLatestUndoableUserTransition(input.sessionId)?.id !== input.userTransitionId
+        transition.value.fromStateId !== input.targetStateId
       ) {
-        throw new Error(
-          "Undo history operation must use the latest transition above the undo floor",
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            "Undo history operation target must be its user transition source",
+          ),
         );
       }
-      const redo = this.peekHistoryRedo(input.sessionId);
+      if (input.requestedAction === "undo") {
+        const undoable = this.findLatestUndoableUserTransitionResult(input.sessionId);
+        if (undoable.status === "error") return Result.err(undoable.error);
+        if (undoable.value?.id !== input.userTransitionId) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "reserveHistoryOperation",
+              "Undo history operation must use the latest transition above the undo floor",
+            ),
+          );
+        }
+      }
+      const redo = this.peekHistoryRedoResult(input.sessionId);
+      if (redo.status === "error") return Result.err(redo.error);
       if (
         input.requestedAction === "redo" &&
-        (redo?.targetStateId !== input.targetStateId ||
-          redo.userTransitionId !== input.userTransitionId)
+        (redo.value?.targetStateId !== input.targetStateId ||
+          redo.value.userTransitionId !== input.userTransitionId)
       ) {
-        throw new Error("Redo history operation target must match the top redo entry");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            "Redo history operation target must match the top redo entry",
+          ),
+        );
       }
       if (
         input.requestedAction === "redo" &&
-        transition.toStateId !== null &&
-        !this.isStateInAncestry(input.sessionId, input.targetStateId, transition.toStateId)
+        transition.value.toStateId !== null &&
+        !this.isStateInAncestry(input.sessionId, input.targetStateId, transition.value.toStateId)
       ) {
-        throw new Error("Redo target must descend from its user transition destination");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            "Redo target must descend from its user transition destination",
+          ),
+        );
       }
       const now = new Date().toISOString();
       const marked = this.database
@@ -5494,7 +6849,12 @@ export class MiniLilacSqliteStore {
         )
         .run(input.sessionId, input.commandId);
       if (marked.changes !== 1) {
-        throw new Error(`Command '${input.commandId}' could not begin its history operation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `Command '${input.commandId}' could not begin its history operation`,
+          ),
+        );
       }
       this.database
         .query(
@@ -5507,10 +6867,10 @@ export class MiniLilacSqliteStore {
         .run(
           input.id,
           input.sessionId,
-          workspace.id,
+          workspace.value.id,
           input.commandId,
           input.requestedAction,
-          source.id,
+          source.value.id,
           observedState?.id ?? null,
           input.targetStateId,
           input.userTransitionId,
@@ -5519,16 +6879,22 @@ export class MiniLilacSqliteStore {
           now,
           now,
         );
-      const operation = this.getHistoryOperation(input.id);
-      if (operation === null) throw new Error(`History operation '${input.id}' was not created`);
-      return { operation, observedState };
+      const operation = this.getHistoryOperationResult(input.id);
+      if (operation.status === "error") return Result.err(operation.error);
+      if (operation.value === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reserveHistoryOperation",
+            `History operation '${input.id}' was not created`,
+          ),
+        );
+      }
+      return Result.ok({ operation: operation.value, observedState });
     });
   }
 
   getHistoryOperation(operationId: string): StoredHistoryOperation | null {
-    const result = this.getHistoryOperationResult(operationId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryOperationResult(operationId));
   }
 
   getHistoryOperationResult(
@@ -5544,9 +6910,7 @@ export class MiniLilacSqliteStore {
   }
 
   listHistoryOperations(): readonly StoredHistoryOperation[] {
-    const result = this.listHistoryOperationsResult();
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listHistoryOperationsResult());
   }
 
   listHistoryOperationsResult(): ResultType<
@@ -5554,20 +6918,13 @@ export class MiniLilacSqliteStore {
     MiniLilacPersistenceError
   > {
     return this.runHistoryReadResult("listHistoryOperations", () => {
-      const operations: StoredHistoryOperation[] = [];
-      for (const [index, row] of this.database
-        .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
-        .all()
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "operation",
-          row,
-          recordId: `operation:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        operations.push(decoded.value);
-      }
-      return Result.ok(operations);
+      return this.decodeStructuralHistoryRows({
+        kind: "operation",
+        rows: this.database
+          .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
+          .all(),
+        recordId: "operation",
+      });
     });
   }
 
@@ -5575,293 +6932,546 @@ export class MiniLilacSqliteStore {
     operationId: string,
     reasonValue: z.infer<typeof historySkipReasonSchema>,
   ): StoredHistoryOperation {
-    const reason = historySkipReasonSchema.parse(reasonValue);
-    return this.runStoreTransaction("skipPreparedHistoryRestore", () => {
-      const operation = this.getHistoryOperation(operationId);
-      if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
-      if (operation.filesystemMode !== "restore" || operation.phase !== "prepared") {
-        throw new Error(`History operation '${operationId}' cannot skip its prepared restore`);
-      }
-      const updated = this.database
-        .query(
-          `UPDATE history_operations
+    return storeResultToLegacy(this.skipPreparedHistoryRestoreResult(operationId, reasonValue));
+  }
+
+  skipPreparedHistoryRestoreResult(
+    operationId: string,
+    reasonValue: z.infer<typeof historySkipReasonSchema>,
+  ): ResultType<StoredHistoryOperation, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult<StoredHistoryOperation, MiniLilacStoreOperationError>(
+      "skipPreparedHistoryRestore",
+      () => {
+        const operation = this.getHistoryOperationResult(operationId);
+        if (operation.status === "error") return Result.err(operation.error);
+        if (operation.value === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' was not found`,
+            ),
+          );
+        }
+        if (operation.value.filesystemMode !== "restore" || operation.value.phase !== "prepared") {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' cannot skip its prepared restore`,
+            ),
+          );
+        }
+        const updated = this.database
+          .query(
+            `UPDATE history_operations
            SET filesystem_mode = 'skip', skip_reason = ?, updated_at = ?
            WHERE id = ? AND filesystem_mode = 'restore' AND phase = 'prepared'`,
-        )
-        .run(reason, new Date().toISOString(), operationId);
-      if (updated.changes !== 1) {
-        throw new Error(`History operation '${operationId}' could not skip its prepared restore`);
-      }
-      const skipped = this.getHistoryOperation(operationId);
-      if (skipped === null) throw new Error(`History operation '${operationId}' disappeared`);
-      return skipped;
-    });
+          )
+          .run(reasonValue, new Date().toISOString(), operationId);
+        if (updated.changes !== 1) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' could not skip its prepared restore`,
+            ),
+          );
+        }
+        const skipped = this.getHistoryOperationResult(operationId);
+        if (skipped.status === "error") return Result.err(skipped.error);
+        if (skipped.value === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "skipPreparedHistoryRestore",
+              `History operation '${operationId}' disappeared`,
+            ),
+          );
+        }
+        return Result.ok(skipped.value);
+      },
+    );
   }
 
   updateHistoryOperationPhase(
     operationId: string,
     phaseValue: z.infer<typeof historyOperationPhaseSchema>,
   ): StoredHistoryOperation {
-    const phase = historyOperationPhaseSchema.parse(phaseValue);
-    return this.runStoreTransaction("updateHistoryOperationPhase", () => {
-      const operation = this.getHistoryOperation(operationId);
-      if (operation === null) throw new Error(`History operation '${operationId}' was not found`);
-      const allowed =
-        operation.phase === phase ||
-        (operation.filesystemMode === "restore" &&
-          ((operation.phase === "prepared" && phase === "restoring") ||
-            (operation.phase === "restoring" && phase === "verified"))) ||
-        (operation.filesystemMode === "skip" &&
-          operation.phase === "prepared" &&
-          phase === "verified");
-      if (!allowed) {
-        throw new Error(
-          `History operation '${operationId}' cannot move from '${operation.phase}' to '${phase}'`,
-        );
-      }
-      this.database
-        .query("UPDATE history_operations SET phase = ?, updated_at = ? WHERE id = ?")
-        .run(phase, new Date().toISOString(), operationId);
-      const updated = this.getHistoryOperation(operationId);
-      if (updated === null) throw new Error(`History operation '${operationId}' was not found`);
-      return updated;
-    });
+    return storeResultToLegacy(this.updateHistoryOperationPhaseResult(operationId, phaseValue));
+  }
+
+  updateHistoryOperationPhaseResult(
+    operationId: string,
+    phaseValue: z.infer<typeof historyOperationPhaseSchema>,
+  ): ResultType<StoredHistoryOperation, MiniLilacStoreOperationError> {
+    const phase = phaseValue;
+    return this.runStoreTransactionResult<StoredHistoryOperation, MiniLilacStoreOperationError>(
+      "updateHistoryOperationPhase",
+      () => {
+        const operation = this.getHistoryOperationResult(operationId);
+        if (operation.status === "error") return Result.err(operation.error);
+        if (operation.value === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "updateHistoryOperationPhase",
+              `History operation '${operationId}' was not found`,
+            ),
+          );
+        }
+        const allowed =
+          operation.value.phase === phase ||
+          (operation.value.filesystemMode === "restore" &&
+            ((operation.value.phase === "prepared" && phase === "restoring") ||
+              (operation.value.phase === "restoring" && phase === "verified"))) ||
+          (operation.value.filesystemMode === "skip" &&
+            operation.value.phase === "prepared" &&
+            phase === "verified");
+        if (!allowed) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "updateHistoryOperationPhase",
+              `History operation '${operationId}' cannot move from '${operation.value.phase}' to '${phase}'`,
+            ),
+          );
+        }
+        this.database
+          .query("UPDATE history_operations SET phase = ?, updated_at = ? WHERE id = ?")
+          .run(phase, new Date().toISOString(), operationId);
+        const updated = this.getHistoryOperationResult(operationId);
+        if (updated.status === "error") return Result.err(updated.error);
+        if (updated.value === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "updateHistoryOperationPhase",
+              `History operation '${operationId}' was not found`,
+            ),
+          );
+        }
+        return Result.ok(updated.value);
+      },
+    );
   }
 
   commitHistoryNavigation(input: CommitStoredHistoryNavigation): CommittedStoredHistoryNavigation {
-    return this.runStoreTransaction("commitHistoryNavigation", () => {
-      const operation = this.getHistoryOperation(input.operationId);
-      if (operation === null)
-        throw new Error(`History operation '${input.operationId}' was not found`);
-      if (
-        (operation.filesystemMode === "restore" && operation.phase !== "verified") ||
-        (operation.filesystemMode === "skip" && !["prepared", "verified"].includes(operation.phase))
-      ) {
-        throw new Error(`History operation '${input.operationId}' is not ready to commit`);
-      }
-      this.assertWorkspaceHistoryAvailableForOwner(operation.workspaceId, operation.sessionId, {
-        kind: "history-operation",
-        operationId: operation.id,
-      });
-      this.requireQuiescentHistorySession(operation.sessionId, operation.sourceStateId);
-      const source = this.getHistoryState(operation.sourceStateId);
-      const target = this.getHistoryState(operation.targetStateId);
-      const transition = this.getHistoryTransition(operation.userTransitionId);
-      if (
-        source.sessionId !== operation.sessionId ||
-        target.sessionId !== operation.sessionId ||
-        transition.sessionId !== operation.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId === null
-      ) {
-        throw new Error(`History operation '${input.operationId}' has incoherent ownership`);
-      }
-      const result = this.parseHistoryNavigationResult(
-        operation.requestedAction,
-        input.result,
-        operation.commandId,
-        transition.userMessage,
-      );
-      const expectedStatus = operation.requestedAction === "undo" ? "undone" : "redone";
-      if (result.status === "empty" || result.status !== expectedStatus) {
-        throw new Error(
-          `History operation '${input.operationId}' requires a '${expectedStatus}' result`,
+    return storeResultToLegacy(this.commitHistoryNavigationResult(input));
+  }
+
+  commitHistoryNavigationResult(
+    input: CommitStoredHistoryNavigation,
+  ): ResultType<CommittedStoredHistoryNavigation, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult("commitHistoryNavigation", () => {
+      const operation = this.getHistoryOperationResult(input.operationId);
+      if (operation.status === "error") return Result.err(operation.error);
+      if (operation.value === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' was not found`,
+          ),
         );
       }
-      if (result.historyStateId !== operation.targetStateId) {
-        throw new Error(`History operation '${input.operationId}' result names the wrong state`);
+      if (
+        (operation.value.filesystemMode === "restore" && operation.value.phase !== "verified") ||
+        (operation.value.filesystemMode === "skip" &&
+          !["prepared", "verified"].includes(operation.value.phase))
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' is not ready to commit`,
+          ),
+        );
+      }
+      const available = this.assertWorkspaceHistoryAvailableForOwnerResult(
+        operation.value.workspaceId,
+        operation.value.sessionId,
+        { kind: "history-operation", operationId: operation.value.id },
+      );
+      if (available.status === "error") return Result.err(available.error);
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        operation.value.sessionId,
+        operation.value.sourceStateId,
+      );
+      if (quiescent.status === "error") return Result.err(quiescent.error);
+      const source = this.getHistoryStateResult(operation.value.sourceStateId);
+      if (source.status === "error") return Result.err(source.error);
+      const target = this.getHistoryStateResult(operation.value.targetStateId);
+      if (target.status === "error") return Result.err(target.error);
+      const transition = this.getHistoryTransitionResult(operation.value.userTransitionId);
+      if (transition.status === "error") return Result.err(transition.error);
+      if (
+        source.value.sessionId !== operation.value.sessionId ||
+        target.value.sessionId !== operation.value.sessionId ||
+        transition.value.sessionId !== operation.value.sessionId ||
+        transition.value.kind !== "user-message" ||
+        transition.value.toStateId === null
+      ) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' has incoherent ownership`,
+          ),
+        );
+      }
+      const decodedInputResult = decodeStoredHistoryNavigationResult(input.result);
+      if (decodedInputResult.status === "error") return Result.err(decodedInputResult.error);
+      const result = this.validateHistoryNavigationResult(
+        operation.value.requestedAction,
+        decodedInputResult.value,
+        operation.value.commandId,
+        transition.value.userMessage,
+      );
+      if (result.status === "error") return Result.err(result.error);
+      const expectedStatus = operation.value.requestedAction === "undo" ? "undone" : "redone";
+      if (result.value.status === "empty" || result.value.status !== expectedStatus) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' requires a '${expectedStatus}' result`,
+          ),
+        );
+      }
+      if (result.value.historyStateId !== operation.value.targetStateId) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' result names the wrong state`,
+          ),
+        );
       }
       let expectedFilesystem: MiniLilacHistoryFilesystemResult;
-      if (operation.filesystemMode === "restore") {
-        expectedFilesystem = miniLilacHistoryFilesystemResultSchema.parse({ status: "restored" });
+      if (operation.value.filesystemMode === "restore") {
+        expectedFilesystem = { status: "restored" };
       } else {
-        if (operation.skipReason === null) {
-          throw new Error(`History operation '${input.operationId}' has no filesystem skip reason`);
+        if (operation.value.skipReason === null) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' has no filesystem skip reason`,
+            ),
+          );
         }
-        expectedFilesystem = miniLilacHistoryFilesystemResultSchema.parse({
+        expectedFilesystem = {
           status: "skipped",
-          reason: operation.skipReason,
-        });
+          reason: operation.value.skipReason,
+        };
       }
-      if (!canonicalValuesEqual(result.filesystem, expectedFilesystem)) {
-        throw new Error(
-          `History operation '${input.operationId}' result has the wrong filesystem outcome`,
+      if (!canonicalValuesEqual(result.value.filesystem, expectedFilesystem)) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitHistoryNavigation",
+            `History operation '${input.operationId}' result has the wrong filesystem outcome`,
+          ),
         );
       }
-      let redoTarget = source;
-      if (operation.observedSourceStateId !== null) {
-        const observed = this.getHistoryState(operation.observedSourceStateId);
-        const incoming = this.getIncomingHistoryTransition(
-          operation.sessionId,
-          operation.observedSourceStateId,
+      let redoTarget = source.value;
+      if (operation.value.observedSourceStateId !== null) {
+        const observed = this.getHistoryStateResult(operation.value.observedSourceStateId);
+        if (observed.status === "error") return Result.err(observed.error);
+        const incoming = this.getIncomingHistoryTransitionResult(
+          operation.value.sessionId,
+          operation.value.observedSourceStateId,
         );
+        if (incoming.status === "error") return Result.err(incoming.error);
         if (
-          observed.modelHeadId !== source.modelHeadId ||
-          observed.uiHeadId !== source.uiHeadId ||
-          incoming?.kind !== "workspace-observation" ||
-          incoming.fromStateId !== source.id
+          observed.value.modelHeadId !== source.value.modelHeadId ||
+          observed.value.uiHeadId !== source.value.uiHeadId ||
+          incoming.value?.kind !== "workspace-observation" ||
+          incoming.value.fromStateId !== source.value.id
         ) {
-          throw new Error(`History operation '${input.operationId}' has an invalid observation`);
-        }
-        redoTarget = observed;
-      }
-      if (operation.requestedAction === "undo") {
-        if (
-          transition.fromStateId !== target.id ||
-          this.findLatestUndoableUserTransition(operation.sessionId)?.id !== transition.id ||
-          !this.isStateInAncestry(operation.sessionId, redoTarget.id, transition.toStateId)
-        ) {
-          throw new Error(
-            `History operation '${input.operationId}' no longer matches undo topology`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' has an invalid observation`,
+            ),
           );
         }
-        this.pushHistoryRedo(operation.sessionId, redoTarget.id, transition.id);
+        redoTarget = observed.value;
+      }
+      if (operation.value.requestedAction === "undo") {
+        const undoable = this.findLatestUndoableUserTransitionResult(operation.value.sessionId);
+        if (undoable.status === "error") return Result.err(undoable.error);
+        if (
+          transition.value.fromStateId !== target.value.id ||
+          undoable.value?.id !== transition.value.id ||
+          !this.isStateInAncestry(
+            operation.value.sessionId,
+            redoTarget.id,
+            transition.value.toStateId,
+          )
+        ) {
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' no longer matches undo topology`,
+            ),
+          );
+        }
+        const pushed = this.pushHistoryRedoResult(
+          operation.value.sessionId,
+          redoTarget.id,
+          transition.value.id,
+        );
+        if (pushed.status === "error") return Result.err(pushed.error);
       } else {
-        const redo = this.peekHistoryRedo(operation.sessionId);
+        const redo = this.peekHistoryRedoResult(operation.value.sessionId);
+        if (redo.status === "error") return Result.err(redo.error);
         if (
-          redo?.targetStateId !== target.id ||
-          redo.userTransitionId !== transition.id ||
-          !this.isStateInAncestry(operation.sessionId, target.id, transition.toStateId)
+          redo.value?.targetStateId !== target.value.id ||
+          redo.value.userTransitionId !== transition.value.id ||
+          !this.isStateInAncestry(
+            operation.value.sessionId,
+            target.value.id,
+            transition.value.toStateId,
+          )
         ) {
-          throw new Error(
-            `History operation '${input.operationId}' no longer matches redo topology`,
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "commitHistoryNavigation",
+              `History operation '${input.operationId}' no longer matches redo topology`,
+            ),
           );
         }
-        this.popHistoryRedo(operation.sessionId);
+        const popped = this.popHistoryRedoResult(operation.value.sessionId);
+        if (popped.status === "error") return Result.err(popped.error);
       }
-      this.moveHistoryCursor(operation.sessionId, target);
-      this.saveHistoryCommandResult(operation, result);
-      this.deleteHistoryOperationRow(operation.id);
-      return {
-        operation,
-        currentState: target,
-        navigation: this.getHistoryNavigation(operation.sessionId),
-      };
+      const moved = this.moveHistoryCursorResult(operation.value.sessionId, target.value);
+      if (moved.status === "error") return Result.err(moved.error);
+      const saved = this.saveHistoryCommandResultResult(operation.value, result.value);
+      if (saved.status === "error") return Result.err(saved.error);
+      const deleted = this.deleteHistoryOperationRowResult(operation.value.id);
+      if (deleted.status === "error") return Result.err(deleted.error);
+      const navigation = this.getHistoryNavigationResult(operation.value.sessionId);
+      if (navigation.status === "error") return Result.err(navigation.error);
+      return Result.ok({
+        operation: operation.value,
+        currentState: target.value,
+        navigation: navigation.value,
+      });
     });
   }
 
   abandonHistoryNavigation(
     input: AcknowledgeStoredHistoryNavigationAbandonment,
   ): StoredHistoryCommandError {
-    z.literal(true).parse(input.acknowledgePartialWorktree);
-    const parsedMessage = z.string().min(1).parse(input.message);
-    return this.runStoreTransaction("abandonHistoryNavigation", () => {
-      const operation = this.getHistoryOperation(input.operationId);
-      if (operation === null) {
-        throw new Error(`History operation '${input.operationId}' was not found`);
-      }
-      this.requireQuiescentHistorySession(operation.sessionId, operation.sourceStateId);
-      const source = this.getHistoryState(operation.sourceStateId);
-      if (operation.observedSourceStateId !== null) {
-        const observed = this.getHistoryState(operation.observedSourceStateId);
-        const incoming = this.getIncomingHistoryTransition(
-          operation.sessionId,
-          operation.observedSourceStateId,
+    return storeResultToLegacy(this.abandonHistoryNavigationResult(input));
+  }
+
+  abandonHistoryNavigationResult(
+    input: AcknowledgeStoredHistoryNavigationAbandonment,
+  ): ResultType<StoredHistoryCommandError, MiniLilacStoreOperationError> {
+    return this.runStoreTransactionResult("abandonHistoryNavigation", () => {
+      const operation = this.getHistoryOperationResult(input.operationId);
+      if (operation.status === "error") return Result.err(operation.error);
+      if (operation.value === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "abandonHistoryNavigation",
+            `History operation '${input.operationId}' was not found`,
+          ),
         );
+      }
+      const quiescent = this.requireQuiescentHistorySessionResult(
+        operation.value.sessionId,
+        operation.value.sourceStateId,
+      );
+      if (quiescent.status === "error") return Result.err(quiescent.error);
+      const source = this.getHistoryStateResult(operation.value.sourceStateId);
+      if (source.status === "error") return Result.err(source.error);
+      if (operation.value.observedSourceStateId !== null) {
+        const observed = this.getHistoryStateResult(operation.value.observedSourceStateId);
+        if (observed.status === "error") return Result.err(observed.error);
+        const incoming = this.getIncomingHistoryTransitionResult(
+          operation.value.sessionId,
+          operation.value.observedSourceStateId,
+        );
+        if (incoming.status === "error") return Result.err(incoming.error);
         if (
-          observed.modelHeadId !== source.modelHeadId ||
-          observed.uiHeadId !== source.uiHeadId ||
-          incoming?.kind !== "workspace-observation" ||
-          incoming.fromStateId !== source.id
+          observed.value.modelHeadId !== source.value.modelHeadId ||
+          observed.value.uiHeadId !== source.value.uiHeadId ||
+          incoming.value?.kind !== "workspace-observation" ||
+          incoming.value.fromStateId !== source.value.id
         ) {
-          throw new Error(`History operation '${input.operationId}' has an invalid observation`);
+          return Result.err(
+            rejectMiniLilacStoreOperation(
+              "abandonHistoryNavigation",
+              `History operation '${input.operationId}' has an invalid observation`,
+            ),
+          );
         }
       }
-      const error = storedHistoryCommandErrorSchema.parse({
+      const error: StoredHistoryCommandError = {
         type: "history-command-error",
         code: "history-recovery-abandoned",
-        commandId: operation.commandId,
-        message: parsedMessage,
-      });
-      this.saveHistoryCommandResult(operation, error);
-      this.deleteHistoryOperationRow(operation.id);
-      return error;
+        commandId: operation.value.commandId,
+        message: input.message,
+      };
+      const saved = this.saveHistoryCommandResultResult(operation.value, error);
+      if (saved.status === "error") return Result.err(saved.error);
+      const deleted = this.deleteHistoryOperationRowResult(operation.value.id);
+      if (deleted.status === "error") return Result.err(deleted.error);
+      return Result.ok(error);
     });
   }
 
   reservePendingRunFinalization(
     input: ReservePendingStoredRunFinalization,
   ): PendingStoredRunFinalization {
-    modelMessagesSchema.parse(input.modelMessages);
-    miniLilacMessagesSchema.parse(input.uiMessages);
-    const runStatus = z.enum(["completed", "cancelled", "error"]).parse(input.runStatus);
-    const sessionStatus = z.enum(["idle", "error"]).parse(input.sessionStatus);
-    const providerState =
-      input.providerState === undefined
-        ? null
-        : historyProviderStateSchema.parse(input.providerState);
-    const promotion =
-      input.claudeBindingPromotion === undefined
-        ? null
-        : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
-    const namedPromotion =
-      input.namedClaudeBindingPromotion === undefined
-        ? null
-        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
+    return storeResultToLegacy(this.reservePendingRunFinalizationResult(input));
+  }
+
+  reservePendingRunFinalizationResult(
+    input: ReservePendingStoredRunFinalization,
+  ): ResultType<PendingStoredRunFinalization, MiniLilacStoreOperationError> {
+    const runStatus = input.runStatus;
+    const sessionStatus = input.sessionStatus;
+    const providerState = input.providerState ?? null;
+    const promotion = input.claudeBindingPromotion ?? null;
+    const namedPromotion = input.namedClaudeBindingPromotion ?? null;
     if (promotion !== null && namedPromotion !== null) {
-      throw new Error("A run cannot promote both main and named Claude bindings");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reservePendingRunFinalization",
+          "A run cannot promote both main and named Claude bindings",
+        ),
+      );
     }
     if (
       (promotion !== null || namedPromotion !== null) &&
       providerState?.lastFamily !== "claude-code"
     ) {
-      throw new Error("A Claude binding promotion requires Claude provider-state metadata");
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reservePendingRunFinalization",
+          "A Claude binding promotion requires Claude provider-state metadata",
+        ),
+      );
     }
-    if (input.inputTokens !== null) z.number().int().nonnegative().parse(input.inputTokens);
-    return this.runStoreTransaction("reservePendingRunFinalization", () => {
-      const workspace = this.getWorkspaceForSession(input.sessionId);
+    if (
+      input.inputTokens !== null &&
+      (!Number.isInteger(input.inputTokens) || input.inputTokens < 0)
+    ) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "reservePendingRunFinalization",
+          "Pending run input tokens must be a non-negative integer",
+        ),
+      );
+    }
+    const terminalResult = serializeOptionalTerminalResult(input, "reservePendingRunFinalization");
+    if (terminalResult.status === "error") return Result.err(terminalResult.error);
+    const serializedPromotion =
+      promotion === null
+        ? Result.ok<string | null>(null)
+        : serializeStoreValueResult(promotion, "reservePendingRunFinalization.promotion");
+    if (serializedPromotion.status === "error") return Result.err(serializedPromotion.error);
+    const serializedNamedPromotion =
+      namedPromotion === null
+        ? Result.ok<string | null>(null)
+        : serializeStoreValueResult(namedPromotion, "reservePendingRunFinalization.namedPromotion");
+    if (serializedNamedPromotion.status === "error") {
+      return Result.err(serializedNamedPromotion.error);
+    }
+    return this.runStoreTransactionResult<
+      PendingStoredRunFinalization,
+      MiniLilacStoreOperationError
+    >("reservePendingRunFinalization", () => {
+      const workspace = this.getWorkspaceForSessionResult(input.sessionId);
+      if (workspace.status === "error") return Result.err(workspace.error);
       if (
         this.database
           .query("SELECT 1 FROM history_operations WHERE workspace_id = ?")
-          .get(workspace.id)
+          .get(workspace.value.id)
       ) {
-        throw new Error(`Workspace '${workspace.id}' has a retained history operation`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Workspace '${workspace.value.id}' has a retained history operation`,
+          ),
+        );
       }
       if (
         this.database
           .query("SELECT 1 FROM pending_run_finalizations WHERE workspace_id = ?")
-          .get(workspace.id)
+          .get(workspace.value.id)
       ) {
-        throw new Error(`Workspace '${workspace.id}' already has a pending run finalization`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Workspace '${workspace.value.id}' already has a pending run finalization`,
+          ),
+        );
       }
-      const activeRun = this.getActiveRootRun(input.sessionId);
-      const session = this.getSession(input.sessionId);
-      const transition = this.getHistoryTransition(input.openTransitionId);
+      const activeRunRow = this.database
+        .query(
+          `SELECT runs.* FROM sessions
+           JOIN runs ON runs.id = sessions.active_run_id AND runs.session_id = sessions.id
+           WHERE sessions.id = ? AND runs.parent_run_id IS NULL AND runs.status = 'active'`,
+        )
+        .get(input.sessionId);
+      const activeRun = activeRunRow
+        ? decodeRunRow(activeRunRow, `${input.sessionId}:active-root`)
+        : Result.ok(null);
+      if (activeRun.status === "error") return Result.err(activeRun.error);
+      const session = this.getSessionResult(input.sessionId);
+      if (session.status === "error") return Result.err(session.error);
+      const transition = this.getHistoryTransitionResult(input.openTransitionId);
+      if (transition.status === "error") return Result.err(transition.error);
+      const history = this.getSessionHistoryResult(input.sessionId);
+      if (history.status === "error") return Result.err(history.error);
       if (
-        !["streaming", "cancelling"].includes(session.status) ||
-        activeRun?.id !== input.runId ||
-        transition.sessionId !== input.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId !== null ||
-        transition.rootRunId !== input.runId ||
-        this.getSessionHistory(input.sessionId).currentStateId !== transition.fromStateId
+        !["streaming", "cancelling"].includes(session.value.status) ||
+        activeRun.value?.id !== input.runId ||
+        transition.value.sessionId !== input.sessionId ||
+        transition.value.kind !== "user-message" ||
+        transition.value.toStateId !== null ||
+        transition.value.rootRunId !== input.runId ||
+        history.value.currentStateId !== transition.value.fromStateId
       ) {
-        throw new Error(`Pending finalization for run '${input.runId}' is not coherent`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Pending finalization for run '${input.runId}' is not coherent`,
+          ),
+        );
       }
-      const canonicalModelMessages = this.getModelMessages(input.sessionId);
-      const canonicalUiMessages = this.getUiMessages(input.sessionId);
+      const canonicalUiMessages = this.getUiMessagesResult(input.sessionId);
+      if (canonicalUiMessages.status === "error") return Result.err(canonicalUiMessages.error);
       // Automatic in-run compaction can replace the complete model chain and
-      // currently has no persisted rewrite provenance. Both chains are schema
-      // validated; UI continuity plus the open transition identifies the turn.
-      modelMessagesSchema.parse(canonicalModelMessages);
-      if (!isCanonicalPrefix(canonicalUiMessages, input.uiMessages)) {
-        throw new Error("Final UI transcript does not extend the canonical active transcript");
+      // currently has no persisted rewrite provenance. UI continuity plus the
+      // open transition identifies the turn.
+      if (!isCanonicalPrefix(canonicalUiMessages.value, input.uiMessages)) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            "Final UI transcript does not extend the canonical active transcript",
+          ),
+        );
       }
-      const fromState = this.getHistoryState(transition.fromStateId);
+      const fromState = this.getHistoryStateResult(transition.value.fromStateId);
+      if (fromState.status === "error") return Result.err(fromState.error);
+      const rawFromUiMessages = this.readSerializedChainResult(
+        input.sessionId,
+        "ui",
+        fromState.value.uiHeadId,
+      );
+      if (rawFromUiMessages.status === "error") return Result.err(rawFromUiMessages.error);
       const decodedFromUiMessages = decodeMiniLilacUiTranscript({
-        rawValues: this.readSerializedChain(input.sessionId, "ui", fromState.uiHeadId),
+        rawValues: rawFromUiMessages.value,
         schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-        recordId: fromState.id,
+        recordId: fromState.value.id,
       });
-      if (decodedFromUiMessages.status === "error") throw decodedFromUiMessages.error;
+      if (decodedFromUiMessages.status === "error") return Result.err(decodedFromUiMessages.error);
       const fromUiMessages = decodedFromUiMessages.value.value;
-      const admittedMessage = transition.userMessage;
+      const admittedMessage = transition.value.userMessage;
       if (
         admittedMessage === null ||
-        !canonicalValuesEqual(canonicalUiMessages[fromUiMessages.length], admittedMessage) ||
+        !canonicalValuesEqual(canonicalUiMessages.value[fromUiMessages.length], admittedMessage) ||
         !canonicalValuesEqual(input.uiMessages[fromUiMessages.length], admittedMessage)
       ) {
-        throw new Error("Final UI transcript does not retain the admitted open user message");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            "Final UI transcript does not retain the admitted open user message",
+          ),
+        );
       }
       const modelHeadId = this.internChain(input.sessionId, "model", input.modelMessages);
       const uiHeadId = this.internChain(input.sessionId, "ui", input.uiMessages);
@@ -5878,32 +7488,37 @@ export class MiniLilacSqliteStore {
         .run(
           input.runId,
           input.sessionId,
-          workspace.id,
+          workspace.value.id,
           input.openTransitionId,
           modelHeadId,
           uiHeadId,
           runStatus,
           sessionStatus,
           input.error,
-          input.terminalResult === undefined ? null : serialize(input.terminalResult),
+          terminalResult.value,
           input.inputTokens,
           providerState?.lastFamily ?? null,
           storedProviderStateFlag(providerState),
-          promotion === null ? null : serialize(promotion),
-          namedPromotion === null ? null : serialize(namedPromotion),
+          serializedPromotion.value,
+          serializedNamedPromotion.value,
           now,
         );
-      const pending = this.getPendingRunFinalization(input.runId);
-      if (pending === null)
-        throw new Error(`Pending finalization for run '${input.runId}' was not created`);
-      return pending;
+      const pending = this.getPendingRunFinalizationResult(input.runId);
+      if (pending.status === "error") return Result.err(pending.error);
+      if (pending.value === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "reservePendingRunFinalization",
+            `Pending finalization for run '${input.runId}' was not created`,
+          ),
+        );
+      }
+      return Result.ok(pending.value);
     });
   }
 
   getPendingRunFinalization(runId: string): PendingStoredRunFinalization | null {
-    const result = this.getPendingRunFinalizationResult(runId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getPendingRunFinalizationResult(runId));
   }
 
   getPendingRunFinalizationResult(
@@ -5921,9 +7536,7 @@ export class MiniLilacSqliteStore {
   }
 
   listPendingRunFinalizations(): readonly PendingStoredRunFinalization[] {
-    const result = this.listPendingRunFinalizationsResult();
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listPendingRunFinalizationsResult());
   }
 
   listPendingRunFinalizationsResult(): ResultType<
@@ -5931,27 +7544,18 @@ export class MiniLilacSqliteStore {
     MiniLilacPersistenceError
   > {
     return this.runHistoryReadResult("listPendingRunFinalizations", () => {
-      const finalizations: PendingStoredRunFinalization[] = [];
-      for (const [index, row] of this.database
-        .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
-        .all()
-        .entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "pending-finalization",
-          row,
-          recordId: `pending-finalization:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        finalizations.push(decoded.value);
-      }
-      return Result.ok(finalizations);
+      return this.decodeStructuralHistoryRows({
+        kind: "pending-finalization",
+        rows: this.database
+          .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+          .all(),
+        recordId: "pending-finalization",
+      });
     });
   }
 
   listRecoverableOpenRootRuns(): readonly RecoverableStoredOpenRootRun[] {
-    const result = this.listRecoverableOpenRootRunsResult();
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.listRecoverableOpenRootRunsResult());
   }
 
   listRecoverableOpenRootRunsResult(): ResultType<
@@ -5959,7 +7563,6 @@ export class MiniLilacSqliteStore {
     MiniLilacPersistenceError
   > {
     return this.runHistoryReadResult("listRecoverableOpenRootRuns", () => {
-      const runs: RecoverableStoredOpenRootRun[] = [];
       const rows = this.database
         .query(
           `SELECT runs.id AS run_id, sessions.id AS session_id,
@@ -5978,40 +7581,26 @@ export class MiniLilacSqliteStore {
              ORDER BY runs.started_at, runs.rowid`,
         )
         .all();
-      for (const [index, row] of rows.entries()) {
-        const decoded = this.decodeRequiredStructuralHistoryRow({
-          kind: "recoverable-open-root-run",
-          row,
-          recordId: `recoverable:${index}`,
-        });
-        if (decoded.status === "error") return Result.err(decoded.error);
-        runs.push(decoded.value);
-      }
-      return Result.ok(runs);
+      return this.decodeStructuralHistoryRows({
+        kind: "recoverable-open-root-run",
+        rows,
+        recordId: "recoverable",
+      });
     });
   }
 
   recoverInterruptedRuntimeState(): void {
+    storeResultToLegacy(this.recoverInterruptedRuntimeStateResult());
+  }
+
+  recoverInterruptedRuntimeStateResult(): ResultType<void, MiniLilacStoreOperationError> {
     const now = new Date().toISOString();
-    const recovery = this.runStoreTransaction("recoverInterruptedRuntimeState", () => {
-      const interruptedAttempts = z
-        .array(
-          z.object({
-            product: z.enum(["main", "named"]),
-            request_id: z.string(),
-            session_id: z.string(),
-            provider_id: z.string(),
-            request_client: z.string(),
-            source_history_state_id: z.string(),
-            expected_binding_revision: z.number().int().positive().nullable(),
-            model: z.string(),
-            reasoning: z.string(),
-          }),
-        )
-        .parse(
-          this.database
-            .query(
-              `SELECT 'main' AS product, attempt.request_id, attempt.session_id,
+    const recovery = this.runStoreTransactionResult("recoverInterruptedRuntimeState", () => {
+      const interruptedAttempts = decodeMiniLilacStoreRows({
+        kind: "interrupted-claude-attempt",
+        rows: this.database
+          .query(
+            `SELECT 'main' AS product, attempt.request_id, attempt.session_id,
                       attempt.provider_id, attempt.request_client,
                       attempt.source_history_state_id, attempt.expected_binding_revision,
                       session.model, session.reasoning
@@ -6026,9 +7615,12 @@ export class MiniLilacSqliteStore {
                FROM mini_named_claude_attempts AS attempt
                JOIN sessions AS session ON session.id = attempt.session_id
                WHERE attempt.state = 'active'`,
-            )
-            .all(),
-        );
+          )
+          .all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "interrupted-claude-attempts",
+      });
+      if (interruptedAttempts.status === "error") return Result.err(interruptedAttempts.error);
       this.database
         .query(
           `UPDATE mini_main_claude_attempts SET state = 'uncertain', updated_at = ?
@@ -6070,33 +7662,45 @@ export class MiniLilacSqliteStore {
       this.database
         .query("DELETE FROM commands WHERE result_json IS NULL AND side_effect_started = 0")
         .run();
-      const owners = z.array(z.object({ session_id: z.string(), provider_id: z.string() })).parse(
-        this.database
+      const owners = decodeMiniLilacStoreRows({
+        kind: "claude-attempt-owner",
+        rows: this.database
           .query(
             `SELECT DISTINCT session_id, provider_id FROM mini_main_claude_attempts
-               ORDER BY session_id, provider_id`,
+                 ORDER BY session_id, provider_id`,
           )
           .all(),
-      );
-      for (const owner of owners) {
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "main-claude-attempt-owners",
+      });
+      if (owners.status === "error") return Result.err(owners.error);
+      for (const owner of owners.value.value) {
         this.pruneMiniMainClaudeAttempts(owner.session_id, owner.provider_id);
       }
-      const namedOwners = z
-        .array(z.object({ session_id: z.string(), provider_id: z.string() }))
-        .parse(
-          this.database
-            .query(
-              `SELECT DISTINCT session_id, provider_id FROM mini_named_claude_attempts
-               ORDER BY session_id, provider_id`,
-            )
-            .all(),
-        );
-      for (const owner of namedOwners) {
+      const namedOwners = decodeMiniLilacStoreRows({
+        kind: "claude-attempt-owner",
+        rows: this.database
+          .query(
+            `SELECT DISTINCT session_id, provider_id FROM mini_named_claude_attempts
+                 ORDER BY session_id, provider_id`,
+          )
+          .all(),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: "named-claude-attempt-owners",
+      });
+      if (namedOwners.status === "error") return Result.err(namedOwners.error);
+      for (const owner of namedOwners.value.value) {
         this.pruneMiniNamedClaudeAttempts(owner.session_id, owner.provider_id);
       }
-      return { interruptedAttempts, diagnostics: this.getMiniClaudeRetentionDiagnostics() };
+      const diagnostics = this.getMiniClaudeRetentionDiagnosticsResult();
+      if (diagnostics.status === "error") return Result.err(diagnostics.error);
+      return Result.ok({
+        interruptedAttempts: interruptedAttempts.value.value,
+        diagnostics: diagnostics.value,
+      });
     });
-    for (const attempt of recovery.interruptedAttempts) {
+    if (recovery.status === "error") return Result.err(recovery.error);
+    for (const attempt of recovery.value.interruptedAttempts) {
       logger.debug("mini_claude.attempt_recovered", {
         requestId: attempt.request_id,
         sessionId: attempt.session_id,
@@ -6113,103 +7717,155 @@ export class MiniLilacSqliteStore {
       });
     }
     if (
-      recovery.diagnostics.orphanBindingCount > 0 ||
-      recovery.diagnostics.orphanAttemptCount > 0
+      recovery.value.diagnostics.orphanBindingCount > 0 ||
+      recovery.value.diagnostics.orphanAttemptCount > 0
     ) {
-      logger.warn("mini_claude.retention_orphans_detected", recovery.diagnostics);
+      logger.warn("mini_claude.retention_orphans_detected", recovery.value.diagnostics);
     } else {
-      logger.debug("mini_claude.retention_diagnostics", recovery.diagnostics);
+      logger.debug("mini_claude.retention_diagnostics", recovery.value.diagnostics);
     }
+    return Result.ok(undefined);
   }
 
   commitPendingRunFinalization(
     input: CommitPendingStoredRunFinalization,
   ): CommittedPendingStoredRunFinalization {
-    parseHistoryWorkspaceOutcome(input);
-    const requestedProviderState =
-      input.providerState === undefined
-        ? null
-        : historyProviderStateSchema.parse(input.providerState);
-    const requestedPromotion =
-      input.claudeBindingPromotion === undefined
-        ? null
-        : promoteMiniMainClaudeSessionBindingSchema.parse(input.claudeBindingPromotion);
-    const requestedNamedPromotion =
-      input.namedClaudeBindingPromotion === undefined
-        ? null
-        : promoteMiniNamedClaudeSessionBindingSchema.parse(input.namedClaudeBindingPromotion);
-    return this.runStoreTransaction("commitPendingRunFinalization", () => {
-      const pending = this.getPendingRunFinalization(input.runId);
-      if (pending === null)
-        throw new Error(`Pending finalization for run '${input.runId}' was not found`);
+    return storeResultToLegacy(this.commitPendingRunFinalizationResult(input));
+  }
+
+  commitPendingRunFinalizationResult(
+    input: CommitPendingStoredRunFinalization,
+  ): ResultType<CommittedPendingStoredRunFinalization, MiniLilacStoreOperationError> {
+    const requestedProviderState = input.providerState ?? null;
+    const requestedPromotion = input.claudeBindingPromotion ?? null;
+    const requestedNamedPromotion = input.namedClaudeBindingPromotion ?? null;
+    return this.runStoreTransactionResult("commitPendingRunFinalization", () => {
+      const pending = this.getPendingRunFinalizationResult(input.runId);
+      if (pending.status === "error") return Result.err(pending.error);
+      if (pending.value === null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Pending finalization for run '${input.runId}' was not found`,
+          ),
+        );
+      }
       if (
         requestedProviderState !== null &&
-        pending.providerState !== null &&
-        !canonicalValuesEqual(requestedProviderState, pending.providerState)
+        pending.value.providerState !== null &&
+        !canonicalValuesEqual(requestedProviderState, pending.value.providerState)
       ) {
-        throw new Error("Pending finalization provider-state metadata changed before commit");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "Pending finalization provider-state metadata changed before commit",
+          ),
+        );
       }
       if (
         requestedPromotion !== null &&
-        pending.claudeBindingPromotion !== null &&
-        !canonicalValuesEqual(requestedPromotion, pending.claudeBindingPromotion)
+        pending.value.claudeBindingPromotion !== null &&
+        !canonicalValuesEqual(requestedPromotion, pending.value.claudeBindingPromotion)
       ) {
-        throw new Error("Pending finalization Claude promotion metadata changed before commit");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "Pending finalization Claude promotion metadata changed before commit",
+          ),
+        );
       }
       if (
         requestedNamedPromotion !== null &&
-        pending.namedClaudeBindingPromotion !== null &&
-        !canonicalValuesEqual(requestedNamedPromotion, pending.namedClaudeBindingPromotion)
+        pending.value.namedClaudeBindingPromotion !== null &&
+        !canonicalValuesEqual(requestedNamedPromotion, pending.value.namedClaudeBindingPromotion)
       ) {
-        throw new Error(
-          "Pending finalization named Claude promotion metadata changed before commit",
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "Pending finalization named Claude promotion metadata changed before commit",
+          ),
         );
       }
-      const providerState = requestedProviderState ?? pending.providerState;
-      const promotion = requestedPromotion ?? pending.claudeBindingPromotion;
-      const namedPromotion = requestedNamedPromotion ?? pending.namedClaudeBindingPromotion;
+      const providerState = requestedProviderState ?? pending.value.providerState;
+      const promotion = requestedPromotion ?? pending.value.claudeBindingPromotion;
+      const namedPromotion = requestedNamedPromotion ?? pending.value.namedClaudeBindingPromotion;
       if (promotion !== null && namedPromotion !== null) {
-        throw new Error("A run cannot promote both main and named Claude bindings");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "A run cannot promote both main and named Claude bindings",
+          ),
+        );
       }
       if (
         (promotion !== null || namedPromotion !== null) &&
         providerState?.lastFamily !== "claude-code"
       ) {
-        throw new Error("A Claude binding promotion requires Claude provider-state metadata");
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            "A Claude binding promotion requires Claude provider-state metadata",
+          ),
+        );
       }
-      this.assertWorkspaceHistoryAvailableForOwner(pending.workspaceId, pending.sessionId, {
-        kind: "pending-run-finalization",
-        runId: pending.runId,
-      });
-      const activeRun = this.getActiveRootRun(pending.sessionId);
-      const transition = this.getHistoryTransition(pending.openTransitionId);
-      const history = this.getSessionHistory(pending.sessionId);
+      const available = this.assertWorkspaceHistoryAvailableForOwnerResult(
+        pending.value.workspaceId,
+        pending.value.sessionId,
+        { kind: "pending-run-finalization", runId: pending.value.runId },
+      );
+      if (available.status === "error") return Result.err(available.error);
+      const activeRun = this.getActiveRootRun(pending.value.sessionId);
+      const transition = this.getHistoryTransitionResult(pending.value.openTransitionId);
+      if (transition.status === "error") return Result.err(transition.error);
+      const history = this.getSessionHistoryResult(pending.value.sessionId);
+      if (history.status === "error") return Result.err(history.error);
       if (
-        activeRun?.id !== pending.runId ||
-        transition.sessionId !== pending.sessionId ||
-        transition.kind !== "user-message" ||
-        transition.toStateId !== null ||
-        transition.rootRunId !== pending.runId ||
-        history.currentStateId !== transition.fromStateId
+        activeRun?.id !== pending.value.runId ||
+        transition.value.sessionId !== pending.value.sessionId ||
+        transition.value.kind !== "user-message" ||
+        transition.value.toStateId !== null ||
+        transition.value.rootRunId !== pending.value.runId ||
+        history.value.currentStateId !== transition.value.fromStateId
       ) {
-        throw new Error(`Pending finalization for run '${pending.runId}' is no longer coherent`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Pending finalization for run '${pending.value.runId}' is no longer coherent`,
+          ),
+        );
       }
       if (providerState !== null) {
-        this.assertConservativeProviderTransition(transition.fromStateId, providerState);
+        const conservative = this.assertConservativeProviderTransitionResult(
+          transition.value.fromStateId,
+          providerState,
+        );
+        if (conservative.status === "error") return Result.err(conservative.error);
       }
       const destination: CreateStoredHistoryState = {
         id: input.destinationStateId,
-        sessionId: pending.sessionId,
-        workspaceId: pending.workspaceId,
-        modelHeadId: pending.modelHeadId,
-        uiHeadId: pending.uiHeadId,
+        sessionId: pending.value.sessionId,
+        workspaceId: pending.value.workspaceId,
+        modelHeadId: pending.value.modelHeadId,
+        uiHeadId: pending.value.uiHeadId,
         workspaceSnapshotId: input.workspaceSnapshotId,
         workspaceStatus: input.workspaceStatus,
         workspaceUnavailableReason: input.workspaceUnavailableReason,
         origin: "turn-boundary",
         providerState,
       };
-      this.closeHistoryTransition(pending.openTransitionId, destination, { select: true });
+      const closed = this.closeHistoryTransitionResult(
+        pending.value.openTransitionId,
+        destination,
+        {
+          select: true,
+        },
+      );
+      if (closed.status === "error") return Result.err(closed.error);
+      const terminalResult = serializeOptionalTerminalResult(
+        pending.value,
+        "commitPendingRunFinalization",
+      );
+      if (terminalResult.status === "error") return Result.err(terminalResult.error);
       const now = new Date().toISOString();
       const finished = this.database
         .query(
@@ -6217,63 +7873,91 @@ export class MiniLilacSqliteStore {
            WHERE id = ? AND session_id = ? AND parent_run_id IS NULL AND status = 'active'`,
         )
         .run(
-          pending.runStatus,
-          pending.error,
-          pending.terminalResult === undefined ? null : serialize(pending.terminalResult),
+          pending.value.runStatus,
+          pending.value.error,
+          terminalResult.value,
           now,
-          pending.runId,
-          pending.sessionId,
+          pending.value.runId,
+          pending.value.sessionId,
         );
-      if (finished.changes !== 1) throw new Error(`Run '${pending.runId}' is not active`);
+      if (finished.changes !== 1) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Run '${pending.value.runId}' is not active`,
+          ),
+        );
+      }
       const updated = this.database
         .query(
           `UPDATE sessions SET status = ?, active_run_id = NULL, queued_steering_count = 0,
              input_tokens = ?, updated_at = ?
            WHERE id = ? AND active_run_id = ? AND status IN ('streaming', 'cancelling')`,
         )
-        .run(pending.sessionStatus, pending.inputTokens, now, pending.sessionId, pending.runId);
+        .run(
+          pending.value.sessionStatus,
+          pending.value.inputTokens,
+          now,
+          pending.value.sessionId,
+          pending.value.runId,
+        );
       if (updated.changes !== 1) {
-        throw new Error(`Run '${pending.runId}' is not active for session '${pending.sessionId}'`);
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "commitPendingRunFinalization",
+            `Run '${pending.value.runId}' is not active for session '${pending.value.sessionId}'`,
+          ),
+        );
       }
       let bindingPromotion: CommittedPendingStoredRunFinalization["bindingPromotion"] =
         "not-requested";
       if (promotion !== null) {
         const promoted = this.promoteMiniMainClaudeBinding(
-          pending,
-          this.getRootPromptSourceStateId(pending),
+          pending.value,
+          this.getRootPromptSourceStateId(pending.value),
           destination.id,
           promotion,
         );
         bindingPromotion = promoted ? "promoted" : "cas-failed";
       } else if (namedPromotion !== null) {
         const promoted = this.promoteMiniNamedClaudeBinding(
-          pending,
-          this.getRootPromptSourceStateId(pending),
+          pending.value,
+          this.getRootPromptSourceStateId(pending.value),
           destination.id,
           namedPromotion,
         );
         bindingPromotion = promoted ? "promoted" : "cas-failed";
       }
-      this.deletePendingRunFinalizationRow(pending.runId);
-      return {
-        pending,
-        state: this.getHistoryState(destination.id),
-        snapshot: this.getSession(pending.sessionId),
+      const deleted = this.deletePendingRunFinalizationRowResult(pending.value.runId);
+      if (deleted.status === "error") return Result.err(deleted.error);
+      const state = this.getHistoryStateResult(destination.id);
+      if (state.status === "error") return Result.err(state.error);
+      const snapshot = this.getSessionResult(pending.value.sessionId);
+      if (snapshot.status === "error") return Result.err(snapshot.error);
+      return Result.ok({
+        pending: pending.value,
+        state: state.value,
+        snapshot: snapshot.value,
         bindingPromotion,
-      };
+      });
     });
   }
 
   private getHistoryStateCanonicalMessageCount(stateId: string): number {
     const state = this.getHistoryState(stateId);
     if (state.modelHeadId === null) return 0;
-    return z.object({ depth: z.number().int().positive() }).parse(
-      this.database
-        .query(
-          `SELECT depth FROM transcript_nodes
-           WHERE id = ? AND session_id = ? AND lane = 'model'`,
-        )
-        .get(state.modelHeadId, state.sessionId),
+    return storeResultToLegacy(
+      decodeRequiredMiniLilacStoreRow({
+        kind: "depth",
+        row: this.database
+          .query(
+            `SELECT depth FROM transcript_nodes
+             WHERE id = ? AND session_id = ? AND lane = 'model'`,
+          )
+          .get(state.modelHeadId, state.sessionId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: stateId,
+      }),
     ).depth;
   }
 
@@ -6281,17 +7965,32 @@ export class MiniLilacSqliteStore {
     sourceStateId: string,
     destination: HistoryProviderState,
   ): void {
-    const source = this.getHistoryState(sourceStateId);
+    storeResultToLegacy(
+      this.assertConservativeProviderTransitionResult(sourceStateId, destination),
+    );
+  }
+
+  private assertConservativeProviderTransitionResult(
+    sourceStateId: string,
+    destination: HistoryProviderState,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const source = this.getHistoryStateResult(sourceStateId);
+    if (source.status === "error") return Result.err(source.error);
     const sourceMessageCount = this.getHistoryStateCanonicalMessageCount(sourceStateId);
     const requiresMixedHistory =
-      source.providerState?.containsCrossFamilyTurns === true ||
-      (source.providerState === null && sourceMessageCount > 0) ||
-      (source.providerState !== null && source.providerState.lastFamily !== destination.lastFamily);
+      source.value.providerState?.containsCrossFamilyTurns === true ||
+      (source.value.providerState === null && sourceMessageCount > 0) ||
+      (source.value.providerState !== null &&
+        source.value.providerState.lastFamily !== destination.lastFamily);
     if (requiresMixedHistory && !destination.containsCrossFamilyTurns) {
-      throw new Error(
-        `History state '${sourceStateId}' requires conservative cross-family metadata`,
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertConservativeProviderTransition",
+          `History state '${sourceStateId}' requires conservative cross-family metadata`,
+        ),
       );
     }
+    return Result.ok(undefined);
   }
 
   private promoteMiniMainClaudeBinding(
@@ -6376,7 +8075,10 @@ export class MiniLilacSqliteStore {
   ): boolean {
     if (
       pending.runStatus !== "completed" ||
-      !miniNamedSessionIdSchema.safeParse(pending.sessionId).success ||
+      !(
+        pending.sessionId.startsWith("sub:") &&
+        pending.sessionId.lastIndexOf(":named:") > "sub:".length
+      ) ||
       this.getRun(pending.runId).depth === 0
     ) {
       return false;
@@ -6482,16 +8184,21 @@ export class MiniLilacSqliteStore {
   }
 
   private getRootPromptSourceStateId(pending: PendingStoredRunFinalization): string {
-    const row = z.object({ from_state_id: z.string().min(1) }).parse(
-      this.database
-        .query(
-          `SELECT from_state_id FROM history_transitions
-           WHERE session_id = ? AND root_run_id = ? AND kind = 'user-message'
-             AND delivery = 'prompt'
-           ORDER BY created_at, rowid
-           LIMIT 1`,
-        )
-        .get(pending.sessionId, pending.runId),
+    const row = storeResultToLegacy(
+      decodeRequiredMiniLilacStoreRow({
+        kind: "root-prompt-source",
+        row: this.database
+          .query(
+            `SELECT from_state_id FROM history_transitions
+             WHERE session_id = ? AND root_run_id = ? AND kind = 'user-message'
+               AND delivery = 'prompt'
+             ORDER BY created_at, rowid
+             LIMIT 1`,
+          )
+          .get(pending.sessionId, pending.runId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: pending.runId,
+      }),
     );
     return row.from_state_id;
   }
@@ -6559,46 +8266,82 @@ export class MiniLilacSqliteStore {
     expectedCurrentStateId: string,
     allowedStatuses: readonly MiniLilacSessionSnapshot["status"][] = ["idle", "error"],
   ): MiniLilacSessionSnapshot {
-    const session = this.getSession(sessionId);
-    const activeRunCount = z
-      .object({ count: z.number().int().nonnegative() })
-      .parse(
-        this.database
-          .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
-          .get(sessionId),
-      ).count;
+    return storeResultToLegacy(
+      this.requireQuiescentHistorySessionResult(sessionId, expectedCurrentStateId, allowedStatuses),
+    );
+  }
+
+  private requireQuiescentHistorySessionResult(
+    sessionId: string,
+    expectedCurrentStateId: string,
+    allowedStatuses: readonly MiniLilacSessionSnapshot["status"][] = ["idle", "error"],
+  ): ResultType<MiniLilacSessionSnapshot, MiniLilacStoreOperationError> {
+    const session = this.getSessionResult(sessionId);
+    if (session.status === "error") return Result.err(session.error);
+    const activeRunCount = decodeRequiredMiniLilacStoreRow({
+      kind: "count",
+      row: this.database
+        .query("SELECT COUNT(*) AS count FROM runs WHERE session_id = ? AND status = 'active'")
+        .get(sessionId),
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: `${sessionId}:active-run-count`,
+    });
+    if (activeRunCount.status === "error") return Result.err(activeRunCount.error);
     if (
-      !allowedStatuses.includes(session.status) ||
-      session.activeRunId !== null ||
-      activeRunCount !== 0
+      !allowedStatuses.includes(session.value.status) ||
+      session.value.activeRunId !== null ||
+      activeRunCount.value.count !== 0
     ) {
-      throw new Error(`Session '${sessionId}' must be quiescent for history navigation`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "requireQuiescentHistorySession",
+          `Session '${sessionId}' must be quiescent for history navigation`,
+        ),
+      );
     }
     if (
       this.database
         .query("SELECT 1 FROM history_transitions WHERE session_id = ? AND to_state_id IS NULL")
         .get(sessionId)
     ) {
-      throw new Error(`Session '${sessionId}' has an open history transition`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "requireQuiescentHistorySession",
+          `Session '${sessionId}' has an open history transition`,
+        ),
+      );
     }
-    const current = this.getCurrentHistoryState(sessionId);
-    if (current.id !== expectedCurrentStateId) {
-      throw new Error(`Session '${sessionId}' history cursor changed before commit`);
+    const current = this.getCurrentHistoryStateResult(sessionId);
+    if (current.status === "error") return Result.err(current.error);
+    if (current.value.id !== expectedCurrentStateId) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "requireQuiescentHistorySession",
+          `Session '${sessionId}' history cursor changed before commit`,
+        ),
+      );
     }
     const heads = this.getTranscriptHeads(sessionId);
-    this.assertHeadsEqualState(
+    const equalHeads = this.assertHeadsEqualStateResult(
       sessionId,
       {
         modelHeadId: heads.model_head_id,
         uiHeadId: heads.ui_head_id,
       },
-      current,
+      current.value,
     );
-    return session;
+    if (equalHeads.status === "error") return Result.err(equalHeads.error);
+    return Result.ok(session.value);
   }
 
   private assertWorkspaceHasNoHistoryJournal(workspaceId: string): void {
-    this.assertWorkspaceHistoryAvailableForOwner(workspaceId, null, undefined);
+    storeResultToLegacy(this.assertWorkspaceHasNoHistoryJournalResult(workspaceId));
+  }
+
+  private assertWorkspaceHasNoHistoryJournalResult(
+    workspaceId: string,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    return this.assertWorkspaceHistoryAvailableForOwnerResult(workspaceId, null, undefined);
   }
 
   private assertWorkspaceHistoryAvailableForOwner(
@@ -6606,45 +8349,75 @@ export class MiniLilacSqliteStore {
     sessionId: string | null,
     owner: WorkspaceHistoryAvailabilityOwner | undefined,
   ): void {
+    storeResultToLegacy(
+      this.assertWorkspaceHistoryAvailableForOwnerResult(workspaceId, sessionId, owner),
+    );
+  }
+
+  private assertWorkspaceHistoryAvailableForOwnerResult(
+    workspaceId: string,
+    sessionId: string | null,
+    owner: WorkspaceHistoryAvailabilityOwner | undefined,
+  ): ResultType<void, MiniLilacStoreOperationError> {
     const decodedWorkspace = this.decodeRequiredStructuralHistoryRow({
       kind: "workspace",
       row: this.database.query("SELECT * FROM workspaces WHERE id = ?").get(workspaceId),
       recordId: workspaceId,
     });
-    if (decodedWorkspace.status === "error") throw decodedWorkspace.error;
+    if (decodedWorkspace.status === "error") return Result.err(decodedWorkspace.error);
     if (decodedWorkspace.value.healthStatus !== "healthy") {
-      throw new Error(`Workspace '${workspaceId}' history store is corrupt`);
-    }
-    const operations = z
-      .array(z.object({ id: z.string(), session_id: z.string() }))
-      .parse(
-        this.database
-          .query("SELECT id, session_id FROM history_operations WHERE workspace_id = ?")
-          .all(workspaceId),
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertWorkspaceHistoryAvailableForOwner",
+          `Workspace '${workspaceId}' history store is corrupt`,
+        ),
       );
+    }
+    const operations = decodeMiniLilacStoreRows({
+      kind: "history-operation-owner",
+      rows: this.database
+        .query("SELECT id, session_id FROM history_operations WHERE workspace_id = ?")
+        .all(workspaceId),
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: `${workspaceId}:history-operation-owners`,
+    });
+    if (operations.status === "error") return Result.err(operations.error);
     const ownsOperations =
       owner?.kind === "history-operation" &&
-      operations.length === 1 &&
-      operations[0]?.id === owner.operationId &&
-      operations[0].session_id === sessionId;
-    if (operations.length > 0 && !ownsOperations) {
-      throw new Error(`Workspace '${workspaceId}' has a retained history operation`);
-    }
-    const finalizations = z
-      .array(z.object({ run_id: z.string(), session_id: z.string() }))
-      .parse(
-        this.database
-          .query("SELECT run_id, session_id FROM pending_run_finalizations WHERE workspace_id = ?")
-          .all(workspaceId),
+      operations.value.value.length === 1 &&
+      operations.value.value[0]?.id === owner.operationId &&
+      operations.value.value[0].session_id === sessionId;
+    if (operations.value.value.length > 0 && !ownsOperations) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertWorkspaceHistoryAvailableForOwner",
+          `Workspace '${workspaceId}' has a retained history operation`,
+        ),
       );
+    }
+    const finalizations = decodeMiniLilacStoreRows({
+      kind: "pending-finalization-owner",
+      rows: this.database
+        .query("SELECT run_id, session_id FROM pending_run_finalizations WHERE workspace_id = ?")
+        .all(workspaceId),
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: `${workspaceId}:pending-finalization-owners`,
+    });
+    if (finalizations.status === "error") return Result.err(finalizations.error);
     const ownsFinalization =
       owner?.kind === "pending-run-finalization" &&
-      finalizations.length === 1 &&
-      finalizations[0]?.run_id === owner.runId &&
-      finalizations[0].session_id === sessionId;
-    if (finalizations.length > 0 && !ownsFinalization) {
-      throw new Error(`Workspace '${workspaceId}' has a pending run finalization`);
+      finalizations.value.value.length === 1 &&
+      finalizations.value.value[0]?.run_id === owner.runId &&
+      finalizations.value.value[0].session_id === sessionId;
+    if (finalizations.value.value.length > 0 && !ownsFinalization) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertWorkspaceHistoryAvailableForOwner",
+          `Workspace '${workspaceId}' has a pending run finalization`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   private assertHeadsEqualState(
@@ -6652,16 +8425,28 @@ export class MiniLilacSqliteStore {
     heads: InternedStoredTranscriptHeads,
     state: StoredHistoryState,
   ): void {
+    storeResultToLegacy(this.assertHeadsEqualStateResult(sessionId, heads, state));
+  }
+
+  private assertHeadsEqualStateResult(
+    sessionId: string,
+    heads: InternedStoredTranscriptHeads,
+    state: StoredHistoryState,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     if (
       state.sessionId !== sessionId ||
       heads.modelHeadId !== state.modelHeadId ||
       heads.uiHeadId !== state.uiHeadId
     ) {
-      throw new Error(
-        `Session '${sessionId}' canonical transcript does not match its history cursor ` +
-          `(model ${heads.modelHeadId}/${state.modelHeadId}, ui ${heads.uiHeadId}/${state.uiHeadId})`,
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertHeadsEqualState",
+          `Session '${sessionId}' canonical transcript does not match its history cursor ` +
+            `(model ${heads.modelHeadId}/${state.modelHeadId}, ui ${heads.uiHeadId}/${state.uiHeadId})`,
+        ),
       );
     }
+    return Result.ok(undefined);
   }
 
   private insertWorkspaceObservation(
@@ -6670,8 +8455,20 @@ export class MiniLilacSqliteStore {
     heads: InternedStoredTranscriptHeads,
     observation: StoredHistoryObservationInput,
   ): StoredHistoryState {
-    this.assertHeadsEqualState(sessionId, heads, source);
-    return this.appendHistoryTransition({
+    return storeResultToLegacy(
+      this.insertWorkspaceObservationResult(sessionId, source, heads, observation),
+    );
+  }
+
+  private insertWorkspaceObservationResult(
+    sessionId: string,
+    source: StoredHistoryState,
+    heads: InternedStoredTranscriptHeads,
+    observation: StoredHistoryObservationInput,
+  ): ResultType<StoredHistoryState, MiniLilacStoreOperationError> {
+    const equalHeads = this.assertHeadsEqualStateResult(sessionId, heads, source);
+    if (equalHeads.status === "error") return Result.err(equalHeads.error);
+    return this.appendHistoryTransitionResult({
       state: {
         id: observation.stateId,
         sessionId,
@@ -6690,33 +8487,67 @@ export class MiniLilacSqliteStore {
         fromStateId: source.id,
         kind: "workspace-observation",
       },
-    }).state;
+    }).map((appended) => appended.state);
   }
 
   private moveHistoryCursor(sessionId: string, state: StoredHistoryState): void {
-    this.assertStateConnectedToRoot(sessionId, state.id);
+    storeResultToLegacy(this.moveHistoryCursorResult(sessionId, state));
+  }
+
+  private moveHistoryCursorResult(
+    sessionId: string,
+    state: StoredHistoryState,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const connected = this.assertStateConnectedToRootResult(sessionId, state.id);
+    if (connected.status === "error") return Result.err(connected.error);
     this.setTranscriptHeads(sessionId, state.modelHeadId, state.uiHeadId);
     const updated = this.database
       .query("UPDATE session_history SET current_state_id = ?, updated_at = ? WHERE session_id = ?")
       .run(state.id, new Date().toISOString(), sessionId);
-    if (updated.changes !== 1) throw new Error(`Session '${sessionId}' has no history cursor`);
+    if (updated.changes !== 1) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "moveHistoryCursor",
+          `Session '${sessionId}' has no history cursor`,
+        ),
+      );
+    }
+    return Result.ok(undefined);
   }
 
   private getStoredCommand(sessionId: string, commandId: string): z.infer<typeof commandRowSchema> {
+    return storeResultToLegacy(this.getStoredCommandResult(sessionId, commandId));
+  }
+
+  private getStoredCommandResult(
+    sessionId: string,
+    commandId: string,
+  ): ResultType<z.infer<typeof commandRowSchema>, MiniLilacPersistenceError> {
     const value = this.database
       .query(
         `SELECT kind, run_id, request_fingerprint, request_json, side_effect_started, result_json
          FROM commands WHERE session_id = ? AND command_id = ?`,
       )
       .get(sessionId, commandId);
-    if (!value) throw new Error(`Command '${commandId}' was not reserved`);
-    return commandRowSchema.parse(value);
+    return decodeRequiredMiniLilacStoreRow({
+      kind: "command",
+      row: value,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: commandId,
+    });
   }
 
   private getIncomingHistoryTransition(
     sessionId: string,
     stateId: string,
   ): StoredHistoryTransition | null {
+    return storeResultToLegacy(this.getIncomingHistoryTransitionResult(sessionId, stateId));
+  }
+
+  private getIncomingHistoryTransitionResult(
+    sessionId: string,
+    stateId: string,
+  ): ResultType<StoredHistoryTransition | null, MiniLilacPersistenceError> {
     const row = this.database
       .query("SELECT * FROM history_transitions WHERE session_id = ? AND to_state_id = ?")
       .get(sessionId, stateId);
@@ -6725,42 +8556,68 @@ export class MiniLilacSqliteStore {
       row,
       recordId: stateId,
     });
-    if (decoded.status === "error") throw decoded.error;
-    return decoded.value;
+    return decoded;
   }
 
   private parseHistoryNavigationResult(
     action: z.infer<typeof historyOperationActionSchema>,
-    value: unknown,
+    result: StoredHistoryNavigationResult,
     commandId: string,
     expectedMessage: MiniLilacUserUIMessage | null,
   ): StoredHistoryNavigationResult {
-    const status = z.object({ status: z.enum(["undone", "redone", "empty"]) }).parse(value).status;
+    return storeResultToLegacy(
+      this.validateHistoryNavigationResult(action, result, commandId, expectedMessage),
+    );
+  }
+
+  private validateHistoryNavigationResult(
+    action: z.infer<typeof historyOperationActionSchema>,
+    result: StoredHistoryNavigationResult,
+    commandId: string,
+    expectedMessage: MiniLilacUserUIMessage | null,
+  ): ResultType<StoredHistoryNavigationResult, MiniLilacStoreOperationError> {
+    const status = result.status;
     if ((action === "undo" && status === "redone") || (action === "redo" && status === "undone")) {
-      throw new Error(
-        `History ${action} requires a '${action === "undo" ? "undone" : "redone"}' or empty result`,
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "parseHistoryNavigationResult",
+          `History ${action} requires a '${action === "undo" ? "undone" : "redone"}' or empty result`,
+        ),
       );
     }
-    const result =
-      action === "undo"
-        ? storedUndoHistoryResultSchema.parse(value)
-        : storedRedoHistoryResultSchema.parse(value);
     if (result.clientCommandId !== commandId) {
-      throw new Error(`History result command ID does not match command '${commandId}'`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "parseHistoryNavigationResult",
+          `History result command ID does not match command '${commandId}'`,
+        ),
+      );
     }
     if (
       result.status !== "empty" &&
       (expectedMessage === null || !canonicalValuesEqual(result.message, expectedMessage))
     ) {
-      throw new Error(`History ${action} result does not contain its exact user message`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "parseHistoryNavigationResult",
+          `History ${action} result does not contain its exact user message`,
+        ),
+      );
     }
-    return result;
+    return Result.ok(result);
   }
 
   private saveHistoryCommandResult(
     operation: StoredHistoryOperation,
     result: StoredHistoryNavigationResult | StoredHistoryCommandError,
   ): void {
+    storeResultToLegacy(this.saveHistoryCommandResultResult(operation, result));
+  }
+
+  private saveHistoryCommandResultResult(
+    operation: StoredHistoryOperation,
+    result: StoredHistoryNavigationResult | StoredHistoryCommandError,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const saved = this.database
       .query(
         `UPDATE commands SET result_json = ?
@@ -6769,31 +8626,60 @@ export class MiniLilacSqliteStore {
       )
       .run(serialize(result), operation.sessionId, operation.commandId, operation.requestedAction);
     if (saved.changes !== 1) {
-      throw new Error(`Command '${operation.commandId}' result could not be saved atomically`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "saveHistoryCommandResult",
+          `Command '${operation.commandId}' result could not be saved atomically`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   private deleteHistoryOperationRow(operationId: string): void {
+    storeResultToLegacy(this.deleteHistoryOperationRowResult(operationId));
+  }
+
+  private deleteHistoryOperationRowResult(
+    operationId: string,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const deleted = this.database
       .query("DELETE FROM history_operations WHERE id = ?")
       .run(operationId);
-    if (deleted.changes !== 1)
-      throw new Error(`History operation '${operationId}' was not deleted`);
+    if (deleted.changes !== 1) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "deleteHistoryOperationRow",
+          `History operation '${operationId}' was not deleted`,
+        ),
+      );
+    }
+    return Result.ok(undefined);
   }
 
   private deletePendingRunFinalizationRow(runId: string): void {
+    storeResultToLegacy(this.deletePendingRunFinalizationRowResult(runId));
+  }
+
+  private deletePendingRunFinalizationRowResult(
+    runId: string,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const deleted = this.database
       .query("DELETE FROM pending_run_finalizations WHERE run_id = ?")
       .run(runId);
     if (deleted.changes !== 1) {
-      throw new Error(`Pending finalization for run '${runId}' was not deleted`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "deletePendingRunFinalizationRow",
+          `Pending finalization for run '${runId}' was not deleted`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   getHistoryTransition(transitionId: string): StoredHistoryTransition {
-    const result = this.getHistoryTransitionResult(transitionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getHistoryTransitionResult(transitionId));
   }
 
   getHistoryTransitionResult(
@@ -6811,17 +8697,7 @@ export class MiniLilacSqliteStore {
   }
 
   private insertHistoryStateRow(input: CreateStoredHistoryState): void {
-    historyWorkspaceStatusSchema.parse(input.workspaceStatus);
-    historyStateOriginSchema.parse(input.origin);
-    if (input.workspaceUnavailableReason !== null) {
-      historyWorkspaceUnavailableReasonSchema.parse(input.workspaceUnavailableReason);
-    }
-    if (input.modelHeadId !== null) z.number().int().positive().parse(input.modelHeadId);
-    if (input.uiHeadId !== null) z.number().int().positive().parse(input.uiHeadId);
-    const providerState =
-      input.providerState === undefined || input.providerState === null
-        ? null
-        : historyProviderStateSchema.parse(input.providerState);
+    const providerState = input.providerState ?? null;
     const hasProviderMetadataColumns = this.database
       .query(
         "SELECT 1 FROM pragma_table_info('history_states') WHERE name = 'last_provider_family'",
@@ -6874,58 +8750,90 @@ export class MiniLilacSqliteStore {
   }
 
   private insertHistoryTransitionRow(input: CreateStoredHistoryTransition): void {
-    historyTransitionKindSchema.parse(input.kind);
-    const from = this.getHistoryState(input.fromStateId);
-    if (from.sessionId !== input.sessionId) {
-      throw new Error(`History transition '${input.id}' crosses sessions`);
+    storeResultToLegacy(this.insertHistoryTransitionRowResult(input));
+  }
+
+  private insertHistoryTransitionRowResult(
+    input: CreateStoredHistoryTransition,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const from = this.getHistoryStateResult(input.fromStateId);
+    if (from.status === "error") return Result.err(from.error);
+    if (from.value.sessionId !== input.sessionId) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "insertHistoryTransitionRow",
+          `History transition '${input.id}' crosses sessions`,
+        ),
+      );
     }
-    this.assertStateConnectedToRoot(input.sessionId, input.fromStateId);
+    const connected = this.assertStateConnectedToRootResult(input.sessionId, input.fromStateId);
+    if (connected.status === "error") return Result.err(connected.error);
     if (
       this.database
         .query("SELECT 1 FROM history_transitions WHERE session_id = ? AND to_state_id IS NULL")
         .get(input.sessionId)
     ) {
-      throw new Error(`Session '${input.sessionId}' already has an open history transition`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "insertHistoryTransitionRow",
+          `Session '${input.sessionId}' already has an open history transition`,
+        ),
+      );
     }
     const toStateId = input.toStateId ?? null;
-    if (
-      toStateId === null &&
-      this.getSessionHistory(input.sessionId).currentStateId !== input.fromStateId
-    ) {
-      throw new Error(`Open history transition '${input.id}' must start at the current state`);
+    if (toStateId === null) {
+      const history = this.getSessionHistoryResult(input.sessionId);
+      if (history.status === "error") return Result.err(history.error);
+      if (history.value.currentStateId !== input.fromStateId) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "insertHistoryTransitionRow",
+            `Open history transition '${input.id}' must start at the current state`,
+          ),
+        );
+      }
     }
     if (toStateId !== null) {
-      this.validateHistoryTransitionDestination(
+      const validDestination = this.validateHistoryTransitionDestinationResult(
         input.sessionId,
         input.fromStateId,
         toStateId,
         input.kind,
       );
+      if (validDestination.status === "error") return Result.err(validDestination.error);
     }
     if (input.kind === "user-message") {
-      const rootRunId = z.string().min(1).parse(input.rootRunId);
-      historyDeliverySchema.parse(input.delivery);
-      miniLilacUserUIMessageSchema.parse(input.userMessage);
-      z.number().int().nonnegative().parse(input.replayAfterSeq);
-      const rootRun = z
-        .object({ parent_run_id: z.string().nullable() })
-        .parse(
-          this.database
-            .query("SELECT parent_run_id FROM runs WHERE id = ? AND session_id = ?")
-            .get(rootRunId, input.sessionId),
+      const rootRunId = input.rootRunId;
+      const rootRun = decodeRequiredMiniLilacStoreRow({
+        kind: "root-run-parent",
+        row: this.database
+          .query("SELECT parent_run_id FROM runs WHERE id = ? AND session_id = ?")
+          .get(rootRunId, input.sessionId),
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: rootRunId,
+      });
+      if (rootRun.status === "error") return Result.err(rootRun.error);
+      if (rootRun.value.parent_run_id !== null) {
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "insertHistoryTransitionRow",
+            `History transition '${input.id}' must reference a root run`,
+          ),
         );
-      if (rootRun.parent_run_id !== null) {
-        throw new Error(`History transition '${input.id}' must reference a root run`);
       }
-      const command = this.getStoredCommand(input.sessionId, input.commandId);
+      const command = this.getStoredCommandResult(input.sessionId, input.commandId);
+      if (command.status === "error") return Result.err(command.error);
       if (
-        command.kind !== input.delivery ||
-        command.run_id !== rootRunId ||
-        command.side_effect_started !== 1 ||
-        command.result_json === null
+        command.value.kind !== input.delivery ||
+        command.value.run_id !== rootRunId ||
+        command.value.side_effect_started !== 1 ||
+        command.value.result_json === null
       ) {
-        throw new Error(
-          `${input.delivery === "prompt" ? "Prompt" : "Steering"} command '${input.commandId}' is not bound to root run '${rootRunId}'`,
+        return Result.err(
+          rejectMiniLilacStoreOperation(
+            "insertHistoryTransitionRow",
+            `${input.delivery === "prompt" ? "Prompt" : "Steering"} command '${input.commandId}' is not bound to root run '${rootRunId}'`,
+          ),
         );
       }
     }
@@ -6956,6 +8864,7 @@ export class MiniLilacSqliteStore {
         input.createdAt ?? new Date().toISOString(),
         completedAt,
       );
+    return Result.ok(undefined);
   }
 
   private validateHistoryTransitionDestination(
@@ -6964,24 +8873,49 @@ export class MiniLilacSqliteStore {
     toStateId: string,
     kind: z.infer<typeof historyTransitionKindSchema>,
   ): void {
-    const destination = this.getHistoryState(toStateId);
-    if (destination.sessionId !== sessionId) {
-      throw new Error(`History transition from '${fromStateId}' crosses sessions`);
+    storeResultToLegacy(
+      this.validateHistoryTransitionDestinationResult(sessionId, fromStateId, toStateId, kind),
+    );
+  }
+
+  private validateHistoryTransitionDestinationResult(
+    sessionId: string,
+    fromStateId: string,
+    toStateId: string,
+    kind: z.infer<typeof historyTransitionKindSchema>,
+  ): ResultType<void, MiniLilacStoreOperationError> {
+    const destination = this.getHistoryStateResult(toStateId);
+    if (destination.status === "error") return Result.err(destination.error);
+    if (destination.value.sessionId !== sessionId) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History transition from '${fromStateId}' crosses sessions`,
+        ),
+      );
     }
     const expectedOrigin = {
       "user-message": "turn-boundary",
       "workspace-observation": "workspace-observation",
       compaction: "compaction",
     } as const;
-    if (destination.origin !== expectedOrigin[kind]) {
-      throw new Error(
-        `History transition kind '${kind}' requires destination origin '${expectedOrigin[kind]}'`,
+    if (destination.value.origin !== expectedOrigin[kind]) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History transition kind '${kind}' requires destination origin '${expectedOrigin[kind]}'`,
+        ),
       );
     }
     if (
       this.database.query("SELECT 1 FROM history_transitions WHERE to_state_id = ?").get(toStateId)
     ) {
-      throw new Error(`History state '${toStateId}' already has an incoming transition`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History state '${toStateId}' already has an incoming transition`,
+        ),
+      );
     }
     const cycle = this.database
       .query(
@@ -6996,10 +8930,25 @@ export class MiniLilacSqliteStore {
          SELECT 1 FROM ancestry WHERE state_id = ? LIMIT 1`,
       )
       .get(fromStateId, sessionId, toStateId);
-    if (cycle) throw new Error(`History transition to '${toStateId}' would create a cycle`);
+    if (cycle) {
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "validateHistoryTransitionDestination",
+          `History transition to '${toStateId}' would create a cycle`,
+        ),
+      );
+    }
+    return Result.ok(undefined);
   }
 
   private assertStateConnectedToRoot(sessionId: string, stateId: string): void {
+    storeResultToLegacy(this.assertStateConnectedToRootResult(sessionId, stateId));
+  }
+
+  private assertStateConnectedToRootResult(
+    sessionId: string,
+    stateId: string,
+  ): ResultType<void, MiniLilacStoreOperationRejected> {
     const row = this.database
       .query(
         `WITH RECURSIVE ancestry(state_id) AS (
@@ -7018,15 +8967,20 @@ export class MiniLilacSqliteStore {
       )
       .get(stateId, sessionId, sessionId);
     if (!row) {
-      throw new Error(`History state '${stateId}' is not connected to session '${sessionId}' root`);
+      return Result.err(
+        rejectMiniLilacStoreOperation(
+          "assertStateConnectedToRoot",
+          `History state '${stateId}' is not connected to session '${sessionId}' root`,
+        ),
+      );
     }
+    return Result.ok(undefined);
   }
 
   private isStateInAncestry(sessionId: string, startStateId: string, stateId: string): boolean {
-    return Boolean(
-      this.database
-        .query(
-          `WITH RECURSIVE ancestry(state_id) AS (
+    const row = this.database
+      .query(
+        `WITH RECURSIVE ancestry(state_id) AS (
              SELECT ?
              UNION ALL
              SELECT transition.from_state_id
@@ -7034,16 +8988,14 @@ export class MiniLilacSqliteStore {
              JOIN history_transitions AS transition
                ON transition.session_id = ? AND transition.to_state_id = ancestry.state_id
            )
-           SELECT 1 FROM ancestry WHERE state_id = ? LIMIT 1`,
-        )
-        .get(startStateId, sessionId, stateId),
-    );
+         SELECT 1 FROM ancestry WHERE state_id = ? LIMIT 1`,
+      )
+      .get(startStateId, sessionId, stateId);
+    return row !== null;
   }
 
   getModelMessages(sessionId: string): ModelMessage[] {
-    const result = this.getModelMessagesResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getModelMessagesResult(sessionId));
   }
 
   getModelMessagesResult(sessionId: string): ResultType<ModelMessage[], MiniLilacPersistenceError> {
@@ -7079,9 +9031,7 @@ export class MiniLilacSqliteStore {
   }
 
   getUiMessages(sessionId: string): MiniLilacUIMessage[] {
-    const result = this.getUiMessagesResult(sessionId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.getUiMessagesResult(sessionId));
   }
 
   getUiMessagesResult(
@@ -7146,26 +9096,31 @@ export class MiniLilacSqliteStore {
     let parentHash = "root";
     for (const valueJson of values) {
       const equivalent: z.infer<typeof transcriptNodeRowSchema> | undefined = compareEquivalent
-        ? this.database
-            .query(
-              `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
-               WHERE session_id = ? AND lane = ? AND parent_id IS ?`,
-            )
-            .all(sessionId, lane, parentId)
-            .map((value) => transcriptNodeRowSchema.parse(value))
-            .find((value) => {
-              const stored = this.decodeTranscriptNodeValue(
-                lane,
-                value.value_json,
-                `${sessionId}:${value.id}`,
-              );
-              const candidate = this.decodeTranscriptNodeValue(
-                lane,
-                valueJson,
-                `${sessionId}:candidate`,
-              );
-              return canonicalValuesEqual(stored, candidate);
-            })
+        ? storeResultToLegacy(
+            decodeMiniLilacStoreRows({
+              kind: "transcript-node",
+              rows: this.database
+                .query(
+                  `SELECT id, parent_id, depth, value_json, hash FROM transcript_nodes
+                   WHERE session_id = ? AND lane = ? AND parent_id IS ?`,
+                )
+                .all(sessionId, lane, parentId),
+              schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+              recordId: `${sessionId}:${lane}:children`,
+            }),
+          ).value.find((value) => {
+            const stored = this.decodeTranscriptNodeValue(
+              lane,
+              value.value_json,
+              `${sessionId}:${value.id}`,
+            );
+            const candidate = this.decodeTranscriptNodeValue(
+              lane,
+              valueJson,
+              `${sessionId}:candidate`,
+            );
+            return canonicalValuesEqual(stored, candidate);
+          })
         : undefined;
       if (equivalent !== undefined) {
         parentId = equivalent.id;
@@ -7185,7 +9140,14 @@ export class MiniLilacSqliteStore {
         )
         .get(sessionId, lane, hash);
       if (existingValue) {
-        const existing = transcriptNodeRowSchema.parse(existingValue);
+        const existing = storeResultToLegacy(
+          decodeRequiredMiniLilacStoreRow({
+            kind: "transcript-node",
+            row: existingValue,
+            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+            recordId: `${sessionId}:${lane}:${hash}`,
+          }),
+        );
         if (
           existing.parent_id !== parentId ||
           existing.depth !== parentDepth + 1 ||
@@ -7198,14 +9160,19 @@ export class MiniLilacSqliteStore {
         parentHash = existing.hash;
         continue;
       }
-      const inserted = transcriptNodeRowSchema.pick({ id: true }).parse(
-        this.database
-          .query(
-            `INSERT INTO transcript_nodes
-              (session_id, lane, parent_id, depth, value_json, hash)
-             VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
-          )
-          .get(sessionId, lane, parentId, parentDepth + 1, valueJson, hash),
+      const inserted: MiniLilacStoreRowValueByKind["transcript-node-id"] = storeResultToLegacy(
+        decodeRequiredMiniLilacStoreRow({
+          kind: "transcript-node-id",
+          row: this.database
+            .query(
+              `INSERT INTO transcript_nodes
+                (session_id, lane, parent_id, depth, value_json, hash)
+               VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
+            )
+            .get(sessionId, lane, parentId, parentDepth + 1, valueJson, hash),
+          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+          recordId: `${sessionId}:${lane}:${hash}`,
+        }),
       );
       parentId = inserted.id;
       parentDepth += 1;
@@ -7247,7 +9214,14 @@ export class MiniLilacSqliteStore {
     const value = this.database
       .query("SELECT model_head_id, ui_head_id FROM session_transcript_heads WHERE session_id = ?")
       .get(sessionId);
-    return value ? transcriptHeadRowSchema.parse(value) : { model_head_id: null, ui_head_id: null };
+    const decoded = decodeMiniLilacStoreRow({
+      kind: "transcript-head",
+      row: value,
+      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+      recordId: sessionId,
+    });
+    const heads = storeResultToLegacy(decoded).value;
+    return heads ?? { model_head_id: null, ui_head_id: null };
   }
 
   private setTranscriptHeads(
@@ -7271,9 +9245,7 @@ export class MiniLilacSqliteStore {
     lane: "model" | "ui",
     headId: number | null,
   ): string[] | null {
-    const result = this.readSerializedChainResult(sessionId, lane, headId);
-    if (result.status === "error") throw result.error;
-    return result.value;
+    return storeResultToLegacy(this.readSerializedChainResult(sessionId, lane, headId));
   }
 
   private readSerializedChainResult(
@@ -7315,64 +9287,146 @@ export class MiniLilacSqliteStore {
     commandId: string,
     request: StoredCommandRequest,
   ): unknown | undefined {
-    const command = canonicalCommandPayload(request.payload);
-    const value = this.database
-      .query(
-        `SELECT kind, run_id, request_fingerprint, request_json, side_effect_started, result_json
-         FROM commands WHERE session_id = ? AND command_id = ?`,
-      )
-      .get(sessionId, commandId);
-    if (!value) return undefined;
-    const row = commandRowSchema.parse(value);
-    if (row.kind !== request.kind) {
-      throw new Error(`Command '${commandId}' was already used for '${row.kind}'`);
-    }
-    if (request.runId !== null && row.run_id !== request.runId) {
-      throw new Error(`Command '${commandId}' was already used for a different run`);
-    }
-    if (row.request_fingerprint !== command.fingerprint || row.request_json !== command.json) {
-      throw new Error(`Command '${commandId}' was already used with a different payload`);
-    }
-    if (row.result_json === null) throw new Error(`Command '${commandId}' is pending`);
-    const decoded = decodeMiniLilacSuperJsonPayload({
-      raw: row.result_json,
-      schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-      recordId: commandId,
-      field: "command_result",
+    return storeResultToLegacy(this.getCommandResultResult(sessionId, commandId, request));
+  }
+
+  getCommandResultResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<unknown | undefined, MiniLilacStoreOperationError> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runHistoryReadResult("getCommandResult", () => {
+      const value = this.database
+        .query(
+          `SELECT kind, run_id, request_fingerprint, request_json, side_effect_started, result_json
+           FROM commands WHERE session_id = ? AND command_id = ?`,
+        )
+        .get(sessionId, commandId);
+      if (!value) return Result.ok(undefined);
+      const decodedRow = decodeRequiredMiniLilacStoreRow({
+        kind: "command",
+        row: value,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: commandId,
+      });
+      if (decodedRow.status === "error") {
+        if (decodedRow.error._tag !== "MiniLilacHistoryRecordMissing") {
+          this.queuePersistenceDiagnostic(decodedRow.error);
+        }
+        return Result.err(decodedRow.error);
+      }
+      const row = decodedRow.value;
+      if (row.kind !== command.value.kind) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' was already used for '${row.kind}'`,
+          }),
+        );
+      }
+      if (command.value.runId !== null && row.run_id !== command.value.runId) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' was already used for a different run`,
+          }),
+        );
+      }
+      if (
+        row.request_fingerprint !== command.value.fingerprint ||
+        row.request_json !== command.value.json
+      ) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' was already used with a different payload`,
+          }),
+        );
+      }
+      if (row.result_json === null) {
+        return Result.err(
+          new MiniLilacStoreOperationRejected({
+            operation: "getCommandResult",
+            message: `Command '${commandId}' is pending`,
+          }),
+        );
+      }
+      const decoded = decodeMiniLilacSuperJsonPayload({
+        raw: row.result_json,
+        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+        recordId: commandId,
+        field: "command_result",
+      });
+      if (decoded.status === "error") {
+        this.queuePersistenceDiagnostic(decoded.error);
+        return Result.err(decoded.error);
+      }
+      return Result.ok(decoded.value.value);
     });
-    if (decoded.status === "error") throw decoded.error;
-    return decoded.value.value;
   }
 
   reserveCommand(sessionId: string, commandId: string, request: StoredCommandRequest): void {
-    const command = canonicalCommandPayload(request.payload);
-    this.database
-      .query(
-        `INSERT INTO commands
-          (session_id, command_id, kind, run_id, request_fingerprint, request_json, side_effect_started, result_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
-      )
-      .run(
-        sessionId,
-        commandId,
-        request.kind,
-        request.runId,
-        command.fingerprint,
-        command.json,
-        new Date().toISOString(),
-      );
+    storeResultToLegacy(this.reserveCommandResult(sessionId, commandId, request));
+  }
+
+  reserveCommandResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runHistoryReadResult("reserveCommand", () => {
+      this.database
+        .query(
+          `INSERT INTO commands
+            (session_id, command_id, kind, run_id, request_fingerprint, request_json, side_effect_started, result_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
+        )
+        .run(
+          sessionId,
+          commandId,
+          command.value.kind,
+          command.value.runId,
+          command.value.fingerprint,
+          command.value.json,
+          new Date().toISOString(),
+        );
+      return Result.ok(undefined);
+    });
   }
 
   releaseCommand(sessionId: string, commandId: string, request: StoredCommandRequest): void {
-    const command = canonicalCommandPayload(request.payload);
-    this.database
-      .query(
-        `DELETE FROM commands
-         WHERE session_id = ? AND command_id = ? AND kind = ?
-           AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
-           AND side_effect_started = 0 AND result_json IS NULL`,
-      )
-      .run(sessionId, commandId, request.kind, request.runId, command.fingerprint, command.json);
+    storeResultToLegacy(this.releaseCommandResult(sessionId, commandId, request));
+  }
+
+  releaseCommandResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runHistoryReadResult("releaseCommand", () => {
+      this.database
+        .query(
+          `DELETE FROM commands
+           WHERE session_id = ? AND command_id = ? AND kind = ?
+             AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
+             AND side_effect_started = 0 AND result_json IS NULL`,
+        )
+        .run(
+          sessionId,
+          commandId,
+          command.value.kind,
+          command.value.runId,
+          command.value.fingerprint,
+          command.value.json,
+        );
+      return Result.ok(undefined);
+    });
   }
 
   markCommandSideEffectStarted(
@@ -7380,18 +9434,40 @@ export class MiniLilacSqliteStore {
     commandId: string,
     request: StoredCommandRequest,
   ): void {
-    const command = canonicalCommandPayload(request.payload);
-    const marked = this.database
-      .query(
-        `UPDATE commands SET side_effect_started = 1
-         WHERE session_id = ? AND command_id = ? AND kind = ?
-           AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
-           AND side_effect_started = 0 AND result_json IS NULL`,
-      )
-      .run(sessionId, commandId, request.kind, request.runId, command.fingerprint, command.json);
-    if (marked.changes !== 1) {
-      throw new Error(`Command '${commandId}' could not begin its side effect`);
-    }
+    storeResultToLegacy(this.markCommandSideEffectStartedResult(sessionId, commandId, request));
+  }
+
+  markCommandSideEffectStartedResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    if (command.status === "error") return Result.err(command.error);
+    return this.runHistoryReadResult("markCommandSideEffectStarted", () => {
+      const marked = this.database
+        .query(
+          `UPDATE commands SET side_effect_started = 1
+           WHERE session_id = ? AND command_id = ? AND kind = ?
+             AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
+             AND side_effect_started = 0 AND result_json IS NULL`,
+        )
+        .run(
+          sessionId,
+          commandId,
+          command.value.kind,
+          command.value.runId,
+          command.value.fingerprint,
+          command.value.json,
+        );
+      if (marked.changes === 1) return Result.ok(undefined);
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "markCommandSideEffectStarted",
+          message: `Command '${commandId}' could not begin its side effect`,
+        }),
+      );
+    });
   }
 
   saveCommandResult(
@@ -7400,23 +9476,43 @@ export class MiniLilacSqliteStore {
     request: StoredCommandRequest,
     result: unknown,
   ): void {
-    const command = canonicalCommandPayload(request.payload);
-    const saved = this.database
-      .query(
-        `UPDATE commands SET result_json = ?
-         WHERE session_id = ? AND command_id = ? AND kind = ?
-           AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
-           AND side_effect_started = 1 AND result_json IS NULL`,
-      )
-      .run(
-        serialize(result),
-        sessionId,
-        commandId,
-        request.kind,
-        request.runId,
-        command.fingerprint,
-        command.json,
+    storeResultToLegacy(this.saveCommandResultResult(sessionId, commandId, request, result));
+  }
+
+  saveCommandResultResult(
+    sessionId: string,
+    commandId: string,
+    request: StoredCommandRequest,
+    result: unknown,
+  ): ResultType<void, MiniLilacStoreOperationRejected | MiniLilacSqliteDriverFailure> {
+    const command = decodeCanonicalStoredCommandRequest(request);
+    if (command.status === "error") return Result.err(command.error);
+    const serializedResult = serializeStoreValueResult(result, "saveCommandResult");
+    if (serializedResult.status === "error") return Result.err(serializedResult.error);
+    return this.runHistoryReadResult("saveCommandResult", () => {
+      const saved = this.database
+        .query(
+          `UPDATE commands SET result_json = ?
+           WHERE session_id = ? AND command_id = ? AND kind = ?
+             AND run_id IS ? AND request_fingerprint = ? AND request_json = ?
+             AND side_effect_started = 1 AND result_json IS NULL`,
+        )
+        .run(
+          serializedResult.value,
+          sessionId,
+          commandId,
+          command.value.kind,
+          command.value.runId,
+          command.value.fingerprint,
+          command.value.json,
+        );
+      if (saved.changes === 1) return Result.ok(undefined);
+      return Result.err(
+        new MiniLilacStoreOperationRejected({
+          operation: "saveCommandResult",
+          message: `Command '${commandId}' result could not be saved`,
+        }),
       );
-    if (saved.changes !== 1) throw new Error(`Command '${commandId}' result could not be saved`);
+    });
   }
 }

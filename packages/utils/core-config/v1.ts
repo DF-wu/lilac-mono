@@ -1,3 +1,4 @@
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
@@ -254,52 +255,32 @@ const webExtractProvidersSchema = z
   .transform((providers) => uniqueItems(providers))
   .default(["tavily"]);
 
+export function migrateWebExtractConfigValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const providers = Reflect.get(value, "providers");
+  const provider = Reflect.get(value, "provider");
+  if (providers !== undefined || provider === undefined) return value;
+  return { ...value, providers: [provider] };
+}
+
 const webExtractConfigValueSchema = z.preprocess(
-  (value) => {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return value;
-    }
-
-    const extractConfig = value as {
-      provider?: unknown;
-      providers?: unknown;
-    };
-
-    if (extractConfig.providers !== undefined || extractConfig.provider === undefined) {
-      return value;
-    }
-
-    return {
-      ...extractConfig,
-      providers: [extractConfig.provider],
-    };
-  },
+  migrateWebExtractConfigValue,
   z.object({
     providers: webExtractProvidersSchema,
   }),
 );
 
+export function migrateWebConfigValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const extract = Reflect.get(value, "extract");
+  const search = Reflect.get(value, "search");
+  if (extract !== undefined || search === undefined) return value;
+  return { ...value, extract: search };
+}
+
 export const webExtractConfigSchema = z
   .preprocess(
-    (value) => {
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        return value;
-      }
-
-      const webConfig = value as {
-        extract?: unknown;
-        search?: unknown;
-      };
-
-      if (webConfig.extract !== undefined || webConfig.search === undefined) {
-        return value;
-      }
-
-      return {
-        ...webConfig,
-        extract: webConfig.search,
-      };
-    },
+    migrateWebConfigValue,
     z.object({
       extract: webExtractConfigValueSchema.default({
         providers: ["tavily"],
@@ -452,7 +433,9 @@ export const heartbeatSchema = z
   .object({
     enabled: z.boolean().default(false),
     cron: cronExpr5Schema.default("*/30 * * * *"),
-    every: z.unknown().optional(),
+    every: z
+      .never({ error: "surface.heartbeat.every has been removed; use surface.heartbeat.cron" })
+      .optional(),
     quietAfterActivityMs: z
       .number()
       .int()
@@ -471,15 +454,6 @@ export const heartbeatSchema = z
         timezone: z.string().trim().min(1).optional(),
       })
       .optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (value.every !== undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["every"],
-        message: "surface.heartbeat.every has been removed; use surface.heartbeat.cron",
-      });
-    }
   })
   .transform((value) => ({
     enabled: value.enabled,
@@ -680,15 +654,34 @@ export const coreConfigSchema = coreConfigInputSchemaV1;
 
 export type ParsedCoreConfigV1 = z.infer<typeof coreConfigInputSchemaV1>;
 
+export class CoreConfigV1Invalid extends TaggedError("CoreConfigV1Invalid")<{
+  readonly cause: z.ZodError;
+  readonly message: string;
+}> {}
+
+export function decodeCoreConfigV1(
+  raw: unknown,
+): ResultType<ParsedCoreConfigV1, CoreConfigV1Invalid> {
+  const parsed = coreConfigInputSchemaV1.safeParse(raw);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new CoreConfigV1Invalid({
+          cause: parsed.error,
+          message: parsed.error.issues.map((issue) => issue.message).join("; "),
+        }),
+      );
+}
+
 export function parseCoreConfigV1(raw: unknown): ParsedCoreConfigV1 {
   return coreConfigInputSchemaV1.parse(raw);
 }
 
-export function parseCoreConfigV1ToUniversal(
+function coreConfigV1ToUniversal(
+  parsed: ParsedCoreConfigV1,
   raw: unknown,
   options?: CoreConfigParseOptions,
 ): UniversalCoreConfig {
-  const parsed = parseCoreConfigV1(raw);
   if (options?.onUnknownKey) {
     for (const path of collectUnknownConfigKeyPaths(raw, parsed)) {
       options.onUnknownKey(path);
@@ -841,6 +834,24 @@ export function parseCoreConfigV1ToUniversal(
       ),
     },
   };
+}
+
+export function decodeCoreConfigV1ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): ResultType<UniversalCoreConfig, CoreConfigV1Invalid> {
+  const parsed = decodeCoreConfigV1(raw);
+  if (parsed.status === "error") return Result.err(parsed.error);
+  return Result.ok(coreConfigV1ToUniversal(parsed.value, raw, options));
+}
+
+export function parseCoreConfigV1ToUniversal(
+  raw: unknown,
+  options?: CoreConfigParseOptions,
+): UniversalCoreConfig {
+  const result = decodeCoreConfigV1ToUniversal(raw, options);
+  if (result.status === "error") throw result.error.cause;
+  return result.value;
 }
 
 export class V1CoreConfigParser implements ConfigParser {

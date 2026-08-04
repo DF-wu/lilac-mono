@@ -9,6 +9,7 @@ import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   buildThreadSummaryInstructions,
   createConversationThreadToolService,
+  ConversationThreadOperationFailed,
   ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
 } from "../../src/conversation/thread-service";
@@ -1618,7 +1619,10 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
       summarizer: async ({ threadId }) => {
         attemptedThreadIds.push(threadId);
-        throw new Error("model rejected request");
+        throw new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: "model rejected request",
+        });
       },
     });
 
@@ -1659,7 +1663,10 @@ describe("conversation thread store", () => {
       summarizer: async () => {
         started.resolve();
         await release.promise;
-        throw new Error("stale attempt failed");
+        throw new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: "stale attempt failed",
+        });
       },
     });
     const run = service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
@@ -1676,7 +1683,7 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
-  it("continues summarization after sqlite busy failures", async () => {
+  it("does not classify SQLite-looking Error text as a driver failure", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);
     const threadStore = new ConversationThreadStore(dbPath);
@@ -1712,13 +1719,14 @@ describe("conversation thread store", () => {
     ]);
 
     const attemptedThreadIds: string[] = [];
+    const busyDefect = new Error("SQLITE_BUSY: database is locked");
     const service = new ConversationThreadService({
       store: threadStore,
       getConfig: async () => testConfig(),
       summarizer: async ({ threadId }) => {
         attemptedThreadIds.push(threadId);
         if (threadId === "discord:channel:c1:busy-a1") {
-          throw new Error("SQLITE_BUSY: database is locked");
+          throw busyDefect;
         }
         return {
           title: threadId,
@@ -1729,17 +1737,25 @@ describe("conversation thread store", () => {
       },
     });
 
-    const run = await service.runSummarization({ now: Date.now() + 3 * 60 * 60 * 1000 });
-    expect(run.failed).toBe(1);
-    expect(run.summarized).toBe(1);
-    expect(run.failures[0]?.threadId).toBe("discord:channel:c1:busy-a1");
-    expect(attemptedThreadIds).toEqual([
-      "discord:channel:c1:busy-a1",
-      "discord:channel:c1:busy-b1",
-    ]);
-    expect(readThreadResult(threadStore, "discord:channel:c1:busy-b1")?.summary?.title).toBe(
-      "discord:channel:c1:busy-b1",
+    await expect(service.runSummarization({ now: Date.now() + 3 * 60 * 60 * 1000 })).rejects.toBe(
+      busyDefect,
     );
+    expect(attemptedThreadIds).toEqual(["discord:channel:c1:busy-a1"]);
+
+    const panic = new Panic({ message: "thread summarization invariant failed" });
+    const panicService = new ConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+      summarizer: async () => {
+        throw panic;
+      },
+    });
+    await expect(
+      panicService.runSummarization({
+        threadId: "discord:channel:c1:busy-b1",
+        now: Date.now() + 3 * 60 * 60 * 1000,
+      }),
+    ).rejects.toBe(panic);
 
     searchStore.close();
     threadStore.close();
@@ -2525,9 +2541,11 @@ describe("conversation thread store", () => {
     });
 
     await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
-    const plan = await service.planAutoInjectSearch({
-      text: "Long message about precomputed topic",
-    });
+    const plan = okValue(
+      await service.planAutoInjectSearch({
+        text: "Long message about precomputed topic",
+      }),
+    );
     const result = await serviceSearch(service, {
       query: plan.searches[0]!.queries,
       queryAboutness: plan.searches[0]!.aboutness,
@@ -2569,7 +2587,9 @@ describe("conversation thread store", () => {
       }),
     });
 
-    const plan = await service.planAutoInjectSearch({ text: "Long message with many facets" });
+    const plan = okValue(
+      await service.planAutoInjectSearch({ text: "Long message with many facets" }),
+    );
 
     expect(plan.searches).toHaveLength(3);
     expect(plan.searches[0]?.queries).toEqual(["one", "one alias", "one exact"]);
@@ -2617,7 +2637,10 @@ describe("conversation thread store", () => {
       getConfig: async () => testConfig(),
       getEmbeddingAdapter: async () => equalEmbeddingAdapter,
       queryAboutnessSummarizer: async () => {
-        throw new Error("query capture unavailable");
+        throw new ConversationThreadOperationFailed({
+          operation: "capture-query-aboutness",
+          message: "query capture unavailable",
+        });
       },
       summarizer: async ({ threadId }) => ({
         title: threadId.endsWith(":fb-3") ? "Newer fallback" : "Older fallback",

@@ -14,8 +14,12 @@ import {
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
   ToolResultArtifactContentMismatch,
   ToolResultArtifactDecryptAuthenticationFailed,
+  ToolResultArtifactInvalidInput,
   ToolResultArtifactMaintenanceAndCleanupFailure,
+  ToolResultArtifactReadAndCleanupFailure,
+  ToolResultArtifactStorageFailure,
   ToolResultArtifactTooLargeError,
+  ToolResultArtifactWriteAndCleanupFailure,
 } from "../src/tool-result-artifact-store";
 import { ToolResultArtifactMetadataAbsent } from "../src/tool-result-artifact-metadata-codec";
 
@@ -42,6 +46,14 @@ function createToolResultArtifactStore(rootDir: string) {
       adaptToolResultArtifactReadToAvailability(await store.readWindow(...params)),
     maintain: (now?: number) => value(store.maintain(now)),
   };
+}
+
+function sourceThatThrows(cause: unknown): Readable {
+  return new Readable({
+    read() {
+      this.emit("error", cause);
+    },
+  });
 }
 
 describe("tool result artifact store", () => {
@@ -143,8 +155,8 @@ describe("tool result artifact store", () => {
   });
 
   it("rejects strings, files, and streams above the hard artifact limit without residue", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
-    await store.init();
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
     const sourcePath = path.join(baseDir, "oversized.txt");
     await writeFile(sourcePath, "123456");
     const common = {
@@ -157,31 +169,139 @@ describe("tool result artifact store", () => {
       maxArtifactBytes: 5,
     };
 
-    await expect(store.create({ ...common, content: "123456" })).rejects.toBeInstanceOf(
+    const stringResult = await store.create({ ...common, content: "123456" });
+    expect(stringResult.status === "error" && stringResult.error).toBeInstanceOf(
       ToolResultArtifactTooLargeError,
     );
     expect(await readdir(store.rootDir)).toEqual([]);
 
-    await expect(store.createFromFile({ ...common, sourcePath })).rejects.toBeInstanceOf(
+    const fileResult = await store.createFromFile({ ...common, sourcePath });
+    expect(fileResult.status === "error" && fileResult.error).toBeInstanceOf(
       ToolResultArtifactTooLargeError,
     );
     expect(await readdir(store.rootDir)).toEqual([]);
 
-    await expect(
-      store.createFromStream({ ...common, source: Readable.from(["123", "456"]) }),
-    ).rejects.toBeInstanceOf(ToolResultArtifactTooLargeError);
+    const streamResult = await store.createFromStream({
+      ...common,
+      source: Readable.from(["123", "456"]),
+    });
+    expect(streamResult.status === "error" && streamResult.error).toBeInstanceOf(
+      ToolResultArtifactTooLargeError,
+    );
+    expect(await readdir(store.rootDir)).toEqual([]);
+
+    const invalidLimit = await store.create({
+      ...common,
+      content: "small",
+      maxArtifactBytes: Number.NaN,
+    });
+    expect(invalidLimit.status === "error" && invalidLimit.error).toBeInstanceOf(
+      ToolResultArtifactInvalidInput,
+    );
     expect(await readdir(store.rootDir)).toEqual([]);
   });
 
-  it("escalates failed atomic cleanup as Panic", async () => {
+  it("releases exclusive storage access after an operation error", async () => {
     const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
     expect((await store.init()).status).toBe("ok");
-    const source = new Readable({
+    const failedSource = new Readable({
       read() {
         this.destroy(new Error("source failed"));
       },
     });
-    const remove = spyOn(fs, "rm").mockRejectedValue(new Error("cleanup failed"));
+    const failed = await store.createFromStream({
+      scopeId: "scope-a",
+      requestId: "request-a",
+      toolCallId: "failed",
+      toolName: "plugin-tool",
+      source: failedSource,
+      ttlMs: 1000,
+      maxBytesPerScope: 100,
+    });
+    expect(failed.status).toBe("error");
+
+    const created = await store.create({
+      scopeId: "scope-a",
+      requestId: "request-a",
+      toolCallId: "succeeded",
+      toolName: "plugin-tool",
+      content: "stored",
+      ttlMs: 1000,
+      maxBytesPerScope: 100,
+    });
+    expect(created.status).toBe("ok");
+  });
+
+  it("maps non-Error stream failures without retaining raw values or encrypted residue", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const failures: readonly unknown[] = [
+      "raw-string-secret",
+      { privateValue: "raw-object-secret" },
+    ];
+
+    for (const [index, failure] of failures.entries()) {
+      const result = await store.createFromStream({
+        scopeId: "scope-a",
+        requestId: "request-a",
+        toolCallId: `tool-${index}`,
+        toolName: "plugin-tool",
+        source: sourceThatThrows(failure),
+        ttlMs: 1000,
+        maxBytesPerScope: 100,
+      });
+
+      expect(result.status === "error" && result.error).toBeInstanceOf(
+        ToolResultArtifactStorageFailure,
+      );
+      if (result.status === "error" && result.error instanceof ToolResultArtifactStorageFailure) {
+        expect(result.error).toMatchObject({ operation: "write-content", code: "UNKNOWN" });
+      }
+      expect(JSON.stringify(result)).not.toContain("raw-string-secret");
+      expect(JSON.stringify(result)).not.toContain("raw-object-secret");
+      expect(await readdir(store.rootDir)).toEqual([]);
+    }
+  });
+
+  it("returns an owned combined error when stream operation and cleanup both fail", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const remove = spyOn(fs, "rm").mockRejectedValueOnce("raw-cleanup-secret");
+
+    try {
+      const result = await store.createFromStream({
+        scopeId: "scope-a",
+        requestId: "request-a",
+        toolCallId: "tool-a",
+        toolName: "plugin-tool",
+        source: sourceThatThrows("raw-operation-secret"),
+        ttlMs: 1000,
+        maxBytesPerScope: 100,
+      });
+
+      expect(result.status === "error" && result.error).toBeInstanceOf(
+        ToolResultArtifactWriteAndCleanupFailure,
+      );
+      if (
+        result.status === "error" &&
+        result.error instanceof ToolResultArtifactWriteAndCleanupFailure
+      ) {
+        expect(result.error.primaryError).toBeInstanceOf(ToolResultArtifactStorageFailure);
+        expect(result.error.cleanupErrors).toHaveLength(1);
+        expect(result.error.cleanupErrors[0]).toMatchObject({ operation: "remove-artifact" });
+      }
+      expect(JSON.stringify(result)).not.toContain("raw-operation-secret");
+      expect(JSON.stringify(result)).not.toContain("raw-cleanup-secret");
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
+  it("preserves cleanup Panic identity after an ordinary stream failure", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const cleanupPanic = new Panic({ message: "cleanup invariant failed" });
+    const remove = spyOn(fs, "rm").mockRejectedValueOnce(cleanupPanic);
 
     try {
       await expect(
@@ -190,13 +310,174 @@ describe("tool result artifact store", () => {
           requestId: "request-a",
           toolCallId: "tool-a",
           toolName: "plugin-tool",
-          source,
+          source: sourceThatThrows("ordinary stream failure"),
           ttlMs: 1000,
           maxBytesPerScope: 100,
         }),
-      ).rejects.toBeInstanceOf(Panic);
+      ).rejects.toBe(cleanupPanic);
+      expect(remove).toHaveBeenCalled();
     } finally {
       remove.mockRestore();
+    }
+  });
+
+  it("attempts stream cleanup before rethrowing the exact primary Panic", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const primaryPanic = new Panic({ message: "stream invariant failed" });
+    const remove = spyOn(fs, "rm");
+
+    try {
+      await expect(
+        store.createFromStream({
+          scopeId: "scope-a",
+          requestId: "request-a",
+          toolCallId: "tool-a",
+          toolName: "plugin-tool",
+          source: sourceThatThrows(primaryPanic),
+          ttlMs: 1000,
+          maxBytesPerScope: 100,
+        }),
+      ).rejects.toBe(primaryPanic);
+      expect(remove).toHaveBeenCalled();
+      expect(await readdir(store.rootDir)).toEqual([]);
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
+  it("gives the primary stream Panic precedence after cleanup also panics", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const primaryPanic = new Panic({ message: "stream invariant failed" });
+    const cleanupPanic = new Panic({ message: "cleanup invariant failed" });
+    const remove = spyOn(fs, "rm").mockRejectedValueOnce(cleanupPanic);
+
+    try {
+      await expect(
+        store.createFromStream({
+          scopeId: "scope-a",
+          requestId: "request-a",
+          toolCallId: "tool-a",
+          toolName: "plugin-tool",
+          source: sourceThatThrows(primaryPanic),
+          ttlMs: 1000,
+          maxBytesPerScope: 100,
+        }),
+      ).rejects.toBe(primaryPanic);
+      expect(remove).toHaveBeenCalled();
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
+  it("returns a typed combined error when encrypted-window work and close both fail", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("window-content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    const handle = await fs.open(path.join(store.rootDir, contentEntry), "r");
+    const open = spyOn(fs, "open").mockResolvedValueOnce(handle);
+    const operation = spyOn(handle, "stat").mockRejectedValueOnce(new Error("header failed"));
+    const close = spyOn(handle, "close").mockRejectedValueOnce(new Error("close failed"));
+
+    try {
+      const result = await store.readWindow(created.value.uri, "session-a", {
+        start: { type: "offset", offset: 0 },
+        maxCharacters: 10,
+        maxLines: 10,
+      });
+
+      expect(result.status === "error" && result.error).toBeInstanceOf(
+        ToolResultArtifactReadAndCleanupFailure,
+      );
+      if (
+        result.status === "error" &&
+        result.error instanceof ToolResultArtifactReadAndCleanupFailure
+      ) {
+        expect(result.error.primaryError).toMatchObject({ operation: "read-content" });
+        expect(result.error.cleanupError).toMatchObject({ operation: "read-content" });
+      }
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      open.mockRestore();
+      operation.mockRestore();
+      close.mockRestore();
+      await handle.close();
+    }
+  });
+
+  it("always closes encrypted-window handles and preserves the exact primary Panic", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("window-content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    const primaryPanic = new Panic({ message: "window header invariant failed" });
+    const cleanupPanic = new Panic({ message: "window close invariant failed" });
+    const handle = await fs.open(path.join(store.rootDir, contentEntry), "r");
+    const open = spyOn(fs, "open").mockResolvedValueOnce(handle);
+    const operation = spyOn(handle, "stat").mockRejectedValueOnce(primaryPanic);
+    const close = spyOn(handle, "close").mockRejectedValueOnce(cleanupPanic);
+
+    try {
+      await expect(
+        store.readWindow(created.value.uri, "session-a", {
+          start: { type: "offset", offset: 0 },
+          maxCharacters: 10,
+          maxLines: 10,
+        }),
+      ).rejects.toBe(primaryPanic);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      open.mockRestore();
+      operation.mockRestore();
+      close.mockRestore();
+      await handle.close();
+    }
+  });
+
+  it("closes the ciphertext handle before rethrowing a decryption-path Panic", async () => {
+    const primaryPanic = new Panic({ message: "content diagnostic invariant failed" });
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"), {
+      onDiagnostic: () => {
+        throw primaryPanic;
+      },
+    });
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("window-content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    const contentFile = path.join(store.rootDir, contentEntry);
+    const encrypted = await readFile(contentFile);
+    encrypted[12] = (encrypted[12] ?? 0) ^ 1;
+    await writeFile(contentFile, encrypted);
+    const headerHandle = await fs.open(contentFile, "r");
+    const ciphertextHandle = await fs.open(contentFile, "r");
+    const headerClose = spyOn(headerHandle, "close");
+    const ciphertextClose = spyOn(ciphertextHandle, "close");
+    const open = spyOn(fs, "open")
+      .mockResolvedValueOnce(headerHandle)
+      .mockResolvedValueOnce(ciphertextHandle);
+
+    try {
+      await expect(
+        store.readWindow(created.value.uri, "session-a", {
+          start: { type: "offset", offset: 0 },
+          maxCharacters: 10,
+          maxLines: 10,
+        }),
+      ).rejects.toBe(primaryPanic);
+      expect(headerClose).toHaveBeenCalledTimes(1);
+      expect(ciphertextClose).toHaveBeenCalledTimes(1);
+    } finally {
+      open.mockRestore();
+      headerClose.mockRestore();
+      ciphertextClose.mockRestore();
     }
   });
 
@@ -274,7 +555,50 @@ describe("tool result artifact store", () => {
     expect(await adaptToolResultArtifactReadToUnavailablePolicy(store, read)).toEqual({
       ok: false,
     });
+    expect(await readdir(store.rootDir)).toEqual(entriesBeforeRead);
+    expect(await readFile(metadataFile)).toEqual(metadataBeforeRead);
+
+    expect(
+      await adaptToolResultArtifactReadToUnavailablePolicy(store, read, {
+        kind: "maintain-after-unavailable",
+        onMaintenanceError: "unavailable",
+      }),
+    ).toEqual({ ok: false });
     expect(await readdir(store.rootDir)).toEqual([]);
+  });
+
+  it("applies the explicit read maintenance failure disposition", async () => {
+    const store = createResultToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    expect((await store.init()).status).toBe("ok");
+    const created = await store.create(artifactParams("content"));
+    if (created.status === "error") throw created.error;
+    const contentEntry = (await readdir(store.rootDir)).find((entry) => entry.endsWith(".bin"));
+    if (!contentEntry) throw new Error("expected content entry");
+    await writeFile(
+      path.join(store.rootDir, contentEntry),
+      Buffer.concat([await readFile(path.join(store.rootDir, contentEntry)), Buffer.from([0])]),
+    );
+    const read = await store.read(created.value.uri, "session-a");
+    expect(read.status === "error" && read.error).toBeInstanceOf(ToolResultArtifactContentMismatch);
+    const remove = spyOn(fs, "rm").mockRejectedValue(new Error("maintenance cleanup failed"));
+
+    try {
+      await expect(
+        adaptToolResultArtifactReadToUnavailablePolicy(store, read, {
+          kind: "maintain-after-unavailable",
+          onMaintenanceError: "reject",
+        }),
+      ).rejects.toBeInstanceOf(ToolResultArtifactMaintenanceAndCleanupFailure);
+
+      expect(
+        await adaptToolResultArtifactReadToUnavailablePolicy(store, read, {
+          kind: "maintain-after-unavailable",
+          onMaintenanceError: "unavailable",
+        }),
+      ).toEqual({ ok: false });
+    } finally {
+      remove.mockRestore();
+    }
   });
 
   it("classifies absent metadata without mutation until maintenance", async () => {

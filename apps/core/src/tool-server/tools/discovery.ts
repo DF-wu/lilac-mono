@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ServerTool } from "../types";
 import {
@@ -8,6 +9,24 @@ import {
 } from "../../discovery/discovery-service";
 import { parseToolInput } from "../validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
+
+class DiscoveryToolFailure extends TaggedError("DiscoveryToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptDiscoveryResultToToolHost<TValue>(
+  result: ResultType<TValue, DiscoveryToolFailure>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function decodeDiscoveryCallableId(
+  callableId: string,
+): ResultType<"discovery.search", DiscoveryToolFailure> {
+  if (callableId === "discovery.search") return Result.ok(callableId);
+  return Result.err(new DiscoveryToolFailure({ message: `Invalid callable ID '${callableId}'` }));
+}
 
 const discoverySourceSchema = z.enum(["conversation", "prompt", "heartbeat"]);
 
@@ -119,9 +138,7 @@ export class Discovery implements ServerTool {
   }
 
   async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
-    if (callableId !== "discovery.search") {
-      throw new Error(`Invalid callable ID '${callableId}'`);
-    }
+    adaptDiscoveryResultToToolHost(decodeDiscoveryCallableId(callableId));
 
     const input = parseToolInput({
       callableId,

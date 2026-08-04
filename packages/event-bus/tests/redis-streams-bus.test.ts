@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { Result, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import Redis from "ioredis";
 import SuperJSON from "superjson";
+import { env } from "@stanley2058/lilac-utils";
+import type { ModelMessage } from "ai";
+
 import {
   computeCoreLineagePrefixDigestV1,
   createLilacBus,
@@ -15,8 +18,7 @@ import {
   type RawMessageDecodeOutcome,
   type RedisMessageDecodeFailure,
 } from "../index";
-import { env } from "@stanley2058/lilac-utils";
-import type { ModelMessage } from "ai";
+import { RedisConnectionPool } from "../redis-connection-pool";
 
 const TEST_REDIS_URL = env.redisUrl || "redis://127.0.0.1:6379";
 
@@ -59,7 +61,453 @@ function requireDecodeFailure(message: RawMessageDecodeOutcome): RedisMessageDec
   throw new Error("Expected a Redis message decode failure");
 }
 
+function subscriberPoolStats(raw: ReturnType<typeof createRedisStreamsBus>) {
+  const pool = Reflect.get(raw, "subPool");
+  if (!(pool instanceof RedisConnectionPool))
+    throw new Error("Redis subscriber pool is unavailable");
+  return pool.stats();
+}
+
 describe("RedisStreamsBus", () => {
+  it("fails typed fetches for malformed XREAD stream, entry, and id responses", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const keyPrefix = `test:lilac-event-bus:${randomId("malformed-xread")}`;
+    const streamKey = `${keyPrefix}:evt.adapter`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const bus = createLilacBus(raw);
+    const malformedResponses: readonly unknown[] = [
+      [],
+      [[`${streamKey}:unexpected`, []]],
+      [[streamKey, [["1-0"]]]],
+      [[streamKey, [["invalid-id", []]]]],
+    ];
+    try {
+      for (const response of malformedResponses) {
+        Reflect.set(redis, "xread", async () => response);
+        const fetched = await bus.fetchTopic("evt.adapter", { offset: { type: "begin" } });
+        expect(fetched.status).toBe("error");
+        if (fetched.status === "error") {
+          expect(fetched.error._tag).toBe("EventFetchTransportFailed");
+        }
+      }
+    } finally {
+      await raw.close();
+      redis.disconnect();
+    }
+  });
+
+  it("fails closed for malformed watermark, XADD, XTRIM, and retirement responses", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const raw = createRedisStreamsBus({
+      redis,
+      keyPrefix: `test:lilac-event-bus:${randomId("malformed-command-response")}`,
+    });
+    const bus = createLilacBus(raw);
+    try {
+      Reflect.set(redis, "xrevrange", async () => [["invalid-id", []]]);
+      const watermark = await bus.getTopicWatermark("evt.adapter");
+      expect(watermark.status).toBe("error");
+      if (watermark.status === "error") {
+        expect(watermark.error._tag).toBe("EventTopicOperationFailed");
+      }
+
+      Reflect.set(redis, "xadd", async () => "invalid-id");
+      await expect(
+        bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+          runId: "run-1",
+          revisionId: "revision-1",
+          state: "running",
+          previousState: "queued",
+          ts: 1,
+        }),
+      ).rejects.toBeInstanceOf(Panic);
+
+      Reflect.set(redis, "eval", async () => "invalid-count");
+      await expect(bus.trimTopicBeforeCheckpoint("evt.adapter", "1-0", 10)).rejects.toBeInstanceOf(
+        Panic,
+      );
+      await expect(
+        bus.retireTopicConsumerGroup("evt.adapter", "retired", true),
+      ).rejects.toBeInstanceOf(Panic);
+    } finally {
+      await raw.close();
+      redis.disconnect();
+    }
+  });
+
+  it("surfaces a malformed acknowledged-prefix XTRIM response as Panic", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const duplicate = redis.duplicate();
+    const keyPrefix = `test:lilac-event-bus:${randomId("malformed-acknowledged-trim")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const nextRead = Promise.withResolvers<unknown>();
+    const acknowledged = Promise.withResolvers<void>();
+    const secondReadStarted = Promise.withResolvers<void>();
+    let readCount = 0;
+    let disconnected = false;
+    Reflect.set(redis, "duplicate", () => duplicate);
+    Reflect.set(redis, "eval", async () => "invalid-count");
+    Reflect.set(redis, "xpending", async () => [["1-0", "consumer", 1, 1]]);
+    Reflect.set(duplicate, "xgroup", async () => "OK");
+    Reflect.set(duplicate, "xreadgroup", async () => {
+      readCount += 1;
+      if (readCount === 1) {
+        return [[streamKey, [["1-0", ["type", "test", "ts", "1", "data", "null"]]]]];
+      }
+      secondReadStarted.resolve();
+      return await nextRead.promise;
+    });
+    Reflect.set(duplicate, "xack", async () => {
+      acknowledged.resolve();
+      return 1;
+    });
+    Reflect.set(duplicate, "disconnect", () => {
+      if (disconnected) return;
+      disconnected = true;
+      nextRead.reject(new Error("Connection is closed."));
+    });
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "malformed-acknowledged-trim",
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 5_000 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await acknowledged.promise;
+    await secondReadStarted.promise;
+    await expect(raw.flushPendingTrims()).rejects.toBeInstanceOf(Panic);
+    requireOk(await subscription.stop());
+    await expect(raw.close()).rejects.toBeInstanceOf(Panic);
+    redis.disconnect();
+  });
+
+  it("returns a delivery transport failure for a malformed subscription XREAD response", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const duplicate = redis.duplicate();
+    const keyPrefix = `test:lilac-event-bus:${randomId("malformed-subscription-xread")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    Reflect.set(redis, "duplicate", () => duplicate);
+    Reflect.set(duplicate, "xread", async () => [[streamKey, [["invalid-id", []]]]]);
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 50 } },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    const done = await subscription.done;
+    expect(done.status).toBe("error");
+    if (done.status === "error") expect(done.error._tag).toBe("EventDeliveryTransportFailed");
+    requireOk(await subscription.stop());
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("does not convert an arbitrary read rejection into cancellation after stop", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const duplicate = redis.duplicate();
+    const read = Promise.withResolvers<unknown>();
+    const readStarted = Promise.withResolvers<void>();
+    const rejection = new Error("forced read race failure");
+    let disconnected = false;
+    Reflect.set(redis, "duplicate", () => duplicate);
+    Reflect.set(duplicate, "xread", async () => {
+      readStarted.resolve();
+      return await read.promise;
+    });
+    Reflect.set(duplicate, "disconnect", () => {
+      if (disconnected) return;
+      disconnected = true;
+      read.reject(rejection);
+    });
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 5_000 } },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await readStarted.promise;
+    const stopping = subscription.stop();
+    const done = await subscription.done;
+    expect(done.status).toBe("error");
+    if (done.status === "error" && done.error._tag === "EventDeliveryTransportFailed") {
+      expect(done.error.cause).toBe(rejection);
+    }
+    requireOk(await stopping);
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("preserves Panic from a read rejection racing with stop", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const duplicate = redis.duplicate();
+    const read = Promise.withResolvers<unknown>();
+    const readStarted = Promise.withResolvers<void>();
+    const panic = new Panic({ message: "read race invariant" });
+    let disconnected = false;
+    Reflect.set(redis, "duplicate", () => duplicate);
+    Reflect.set(duplicate, "xread", async () => {
+      readStarted.resolve();
+      return await read.promise;
+    });
+    Reflect.set(duplicate, "disconnect", () => {
+      if (disconnected) return;
+      disconnected = true;
+      read.reject(panic);
+    });
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        { mode: "tail", offset: { type: "begin" }, batch: { maxWaitMs: 5_000 } },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await readStarted.promise;
+    const doneCause = subscription.done.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    const stoppingCause = subscription.stop().then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    expect(await doneCause).toBe(panic);
+    expect(await stoppingCause).toBe(panic);
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("preserves an ephemeral loop Panic after DESTROY and lease cleanup failures", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const duplicate = redis.duplicate();
+    const read = Promise.withResolvers<unknown>();
+    const readStarted = Promise.withResolvers<void>();
+    const panic = new Panic({ message: "ephemeral loop invariant" });
+    let disconnectCalls = 0;
+    let destroyCalls = 0;
+    Reflect.set(redis, "duplicate", () => duplicate);
+    Reflect.set(duplicate, "xgroup", async () => "OK");
+    Reflect.set(duplicate, "xreadgroup", async () => {
+      readStarted.resolve();
+      return await read.promise;
+    });
+    Reflect.set(duplicate, "disconnect", () => {
+      disconnectCalls += 1;
+      if (disconnectCalls === 1) {
+        read.reject(panic);
+        return;
+      }
+      throw new Error("lease disconnect failed");
+    });
+    Reflect.set(redis, "xgroup", async (command: string) => {
+      if (command === "DESTROY") destroyCalls += 1;
+      throw new Error("group destroy failed");
+    });
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "panic-ephemeral",
+          ephemeral: true,
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 5_000 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await readStarted.promise;
+    const doneCause = subscription.done.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    const stopCause = subscription.stop().then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    expect(await doneCause).toBe(panic);
+    expect(await stopCause).toBe(panic);
+    expect(destroyCalls).toBe(1);
+    expect(disconnectCalls).toBe(2);
+    expect(subscriberPoolStats(raw)).toEqual({ max: 1, created: 0, available: 0, inUse: 0 });
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("preserves a work loop Panic after DELCONSUMER cleanup failure", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const duplicate = redis.duplicate();
+    const read = Promise.withResolvers<unknown>();
+    const readStarted = Promise.withResolvers<void>();
+    const panic = new Panic({ message: "work loop invariant" });
+    let disconnectCalls = 0;
+    let pendingCalls = 0;
+    let delconsumerCalls = 0;
+    Reflect.set(redis, "duplicate", () => duplicate);
+    Reflect.set(duplicate, "xgroup", async () => "OK");
+    Reflect.set(duplicate, "xreadgroup", async () => {
+      readStarted.resolve();
+      return await read.promise;
+    });
+    Reflect.set(duplicate, "disconnect", () => {
+      disconnectCalls += 1;
+      if (disconnectCalls === 1) read.reject(panic);
+    });
+    Reflect.set(redis, "xpending", async () => {
+      pendingCalls += 1;
+      return [];
+    });
+    Reflect.set(redis, "xgroup", async (command: string) => {
+      if (command === "DELCONSUMER") delconsumerCalls += 1;
+      throw new Error("consumer cleanup failed");
+    });
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+    const subscription = requireOk(
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "panic-work",
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 5_000 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await readStarted.promise;
+    const doneCause = subscription.done.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    const stopCause = subscription.stop().then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    expect(await doneCause).toBe(panic);
+    expect(await stopCause).toBe(panic);
+    expect(pendingCalls).toBe(1);
+    expect(delconsumerCalls).toBe(1);
+    expect(disconnectCalls).toBe(2);
+    expect(subscriberPoolStats(raw)).toEqual({ max: 1, created: 0, available: 0, inUse: 0 });
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("rejects malformed XGROUP create and cleanup responses", async () => {
+    const createRedis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const createDuplicate = createRedis.duplicate();
+    Reflect.set(createRedis, "duplicate", () => createDuplicate);
+    Reflect.set(createDuplicate, "xgroup", async () => "INVALID");
+    const createRaw = createRedisStreamsBus({ redis: createRedis });
+    const failedStart = await createRaw.subscribe(
+      "topic",
+      {
+        mode: "work",
+        subscriptionId: "malformed-create",
+        offset: { type: "begin" },
+      },
+      async () => ({ disposition: "commit" }),
+    );
+    expect(failedStart.status).toBe("error");
+    await createRaw.close();
+    createRedis.disconnect();
+
+    const cleanupRedis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const cleanupDuplicate = cleanupRedis.duplicate();
+    const read = Promise.withResolvers<unknown>();
+    const readStarted = Promise.withResolvers<void>();
+    let disconnected = false;
+    Reflect.set(cleanupRedis, "duplicate", () => cleanupDuplicate);
+    Reflect.set(cleanupDuplicate, "xgroup", async () => "OK");
+    Reflect.set(cleanupDuplicate, "xreadgroup", async () => {
+      readStarted.resolve();
+      return await read.promise;
+    });
+    Reflect.set(cleanupDuplicate, "disconnect", () => {
+      if (disconnected) return;
+      disconnected = true;
+      read.reject(new Error("Connection is closed."));
+    });
+    Reflect.set(cleanupRedis, "xgroup", async () => "INVALID");
+    const cleanupRaw = createRedisStreamsBus({
+      redis: cleanupRedis,
+      subscriberPool: { max: 1 },
+    });
+    const subscription = requireOk(
+      await cleanupRaw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "malformed-cleanup",
+          ephemeral: true,
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 5_000 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await readStarted.promise;
+    const stopped = await subscription.stop();
+    expect(stopped.status).toBe("error");
+    if (stopped.status === "error") expect(stopped.error._tag).toBe("EventDeliveryStopFailed");
+    await cleanupRaw.close();
+    cleanupRedis.disconnect();
+
+    const consumerRedis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const consumerDuplicate = consumerRedis.duplicate();
+    const consumerRead = Promise.withResolvers<unknown>();
+    const consumerReadStarted = Promise.withResolvers<void>();
+    let consumerDisconnected = false;
+    Reflect.set(consumerRedis, "duplicate", () => consumerDuplicate);
+    Reflect.set(consumerDuplicate, "xgroup", async () => "OK");
+    Reflect.set(consumerDuplicate, "xreadgroup", async () => {
+      consumerReadStarted.resolve();
+      return await consumerRead.promise;
+    });
+    Reflect.set(consumerDuplicate, "disconnect", () => {
+      if (consumerDisconnected) return;
+      consumerDisconnected = true;
+      consumerRead.reject(new Error("Connection is closed."));
+    });
+    Reflect.set(consumerRedis, "xpending", async () => []);
+    Reflect.set(consumerRedis, "xgroup", async () => "INVALID");
+    const consumerRaw = createRedisStreamsBus({
+      redis: consumerRedis,
+      subscriberPool: { max: 1 },
+    });
+    const consumerSubscription = requireOk(
+      await consumerRaw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "malformed-delconsumer",
+          offset: { type: "begin" },
+          batch: { maxWaitMs: 5_000 },
+        },
+        async () => ({ disposition: "commit" }),
+      ),
+    );
+    await consumerReadStarted.promise;
+    const consumerStopped = await consumerSubscription.stop();
+    expect(consumerStopped.status).toBe("error");
+    if (consumerStopped.status === "error") {
+      expect(consumerStopped.error._tag).toBe("EventDeliveryStopFailed");
+    }
+    await consumerRaw.close();
+    consumerRedis.disconnect();
+  });
+
   it("returns bounded evidence for malformed SuperJSON data", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("malformed-superjson")}`;

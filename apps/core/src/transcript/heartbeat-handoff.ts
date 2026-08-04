@@ -1,4 +1,6 @@
 import type { AssistantContent, ModelMessage, ToolContent } from "ai";
+import { Result } from "better-result";
+import { z } from "zod";
 
 export { isHeartbeatSessionId } from "../heartbeat/common";
 
@@ -14,6 +16,16 @@ const SURFACE_SEND_PATTERN = /\bsurface\.messages\.send\b/u;
 const LILAC_MCP_PREFIX = "mcp__lilac__";
 const SURFACE_SEND_TEXT_PATTERN =
   /surface\.messages\.send\b[\s\S]*?(?:--text(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(\S+)))/gu;
+
+interface HeartbeatInputObject extends Record<string, HeartbeatInputValue> {}
+type HeartbeatInputValue =
+  | null
+  | boolean
+  | number
+  | string
+  | HeartbeatInputValue[]
+  | HeartbeatInputObject;
+const heartbeatInputSchema: z.ZodType<HeartbeatInputValue> = z.json();
 
 export type HeartbeatHandoffTranscript = {
   messages: ModelMessage[];
@@ -58,7 +70,10 @@ export function extractHeartbeatSurfaceSendHandoffs(
     if (message.role === "assistant" && Array.isArray(message.content)) {
       for (const part of message.content) {
         if (part.type === "tool-call") {
-          const sendTexts = extractSurfaceSendTexts(part.toolName, part.input);
+          const sendTexts = extractSurfaceSendTexts(
+            part.toolName,
+            projectHeartbeatToolInput(part.input),
+          );
           if (sendTexts.length === 0) continue;
           pendingTexts.set(part.toolCallId, [
             ...(pendingTexts.get(part.toolCallId) ?? []),
@@ -115,15 +130,21 @@ function compactHeartbeatHandoffMessages(messages: readonly ModelMessage[]): Mod
     if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
 
     const content: AssistantContent = message.content.map((part) =>
-      part.type === "tool-result"
-        ? { ...part, output: HEARTBEAT_HANDOFF_TOOL_OUTPUT }
-        : { ...part },
+      part.type === "tool-result" ? { ...part, output: HEARTBEAT_HANDOFF_TOOL_OUTPUT } : part,
     );
     return { ...message, content };
   });
 }
 
-function extractSurfaceSendTexts(toolName: string | undefined, input: unknown): string[] {
+function projectHeartbeatToolInput(input: unknown): HeartbeatInputValue {
+  const decoded = heartbeatInputSchema.safeParse(input);
+  return decoded.success ? decoded.data : String(input);
+}
+
+function extractSurfaceSendTexts(
+  toolName: string | undefined,
+  input: HeartbeatInputValue,
+): string[] {
   const localToolName = toolName?.startsWith(LILAC_MCP_PREFIX)
     ? toolName.slice(LILAC_MCP_PREFIX.length)
     : toolName;
@@ -158,26 +179,26 @@ function extractSurfaceSendTexts(toolName: string | undefined, input: unknown): 
   return SURFACE_SEND_PATTERN.test(text) ? [text] : [];
 }
 
-function extractDirectSurfaceSendText(input: unknown): string | null {
+function extractDirectSurfaceSendText(input: HeartbeatInputValue | undefined): string | null {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  const text = (input as Record<string, unknown>)["text"];
+  const text = input["text"];
   return typeof text === "string" ? text : null;
 }
 
-function extractBatchSurfaceSendTexts(input: unknown): string[] {
+function extractBatchSurfaceSendTexts(input: HeartbeatInputValue): string[] {
   if (!input || typeof input !== "object" || Array.isArray(input)) return [];
 
-  const toolCalls = (input as Record<string, unknown>)["tool_calls"];
+  const toolCalls = input["tool_calls"];
   if (!Array.isArray(toolCalls)) return [];
 
   const texts: string[] = [];
   for (const toolCall of toolCalls) {
     if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) continue;
 
-    const tool = (toolCall as Record<string, unknown>)["tool"];
+    const tool = toolCall["tool"];
     if (tool !== "surface.messages.send") continue;
 
-    const parameters = (toolCall as Record<string, unknown>)["parameters"];
+    const parameters = toolCall["parameters"];
     const text = extractDirectSurfaceSendText(parameters);
     if (text) {
       texts.push(text);
@@ -190,7 +211,7 @@ function extractBatchSurfaceSendTexts(input: unknown): string[] {
   return texts;
 }
 
-function extractCandidateStrings(value: unknown): string[] {
+function extractCandidateStrings(value: HeartbeatInputValue): string[] {
   if (typeof value === "string") return [value];
   if (!value || typeof value !== "object") return [];
   if (Array.isArray(value)) return value.flatMap((item) => extractCandidateStrings(item));
@@ -198,14 +219,14 @@ function extractCandidateStrings(value: unknown): string[] {
   return Object.values(value).flatMap((item) => extractCandidateStrings(item));
 }
 
-function safeStringify(value: unknown): string {
+function safeStringify(value: HeartbeatInputValue): string {
   if (typeof value === "string") return value;
 
-  try {
-    return JSON.stringify(value) ?? String(value);
-  } catch {
-    return String(value);
-  }
+  const serialized = Result.try({
+    try: () => JSON.stringify(value) ?? String(value),
+    catch: () => "[unserializable heartbeat input]",
+  });
+  return serialized.status === "ok" ? serialized.value : serialized.error;
 }
 
 function extractAssistantSummary(messages: readonly ModelMessage[]): string | undefined {

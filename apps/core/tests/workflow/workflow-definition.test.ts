@@ -2,9 +2,24 @@ import { describe, expect, it } from "bun:test";
 
 import {
   canonicalJson,
-  validateWorkflowArgs,
-  validateWorkflowSource,
+  validateWorkflowArgsUnchecked,
+  validateWorkflowSourceUnchecked,
 } from "../../src/workflow/workflow-definition";
+
+const validateWorkflowArgsResult = validateWorkflowArgsUnchecked;
+const validateWorkflowSourceResult = validateWorkflowSourceUnchecked;
+
+function validateWorkflowArgs(input: Parameters<typeof validateWorkflowArgsUnchecked>[0]) {
+  const result = validateWorkflowArgsUnchecked(input);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
+
+function validateWorkflowSource(input: Parameters<typeof validateWorkflowSourceUnchecked>[0]) {
+  const result = validateWorkflowSourceUnchecked(input);
+  if (result.status === "error") throw result.error;
+  return result.value;
+}
 
 const BASE_AGENT_CALL = 'return agent(`Audit ${args.directory}`, { profile: "explore" });';
 
@@ -42,6 +57,32 @@ export default defineWorkflow({
 }
 
 describe("workflow definition validation", () => {
+  it("returns expected source and argument validation failures as typed values", () => {
+    const invalidSource = validateWorkflowSourceResult({
+      name: "Audit",
+      source: source("Audit"),
+    });
+    expect(invalidSource.status).toBe("error");
+    if (invalidSource.status === "error") {
+      expect(invalidSource.error._tag).toBe("WorkflowDefinitionInvalid");
+      expect(invalidSource.error.message).toContain("kebab-case");
+    }
+
+    const validated = validateWorkflowSourceResult({ name: "audit-routes", source: source() });
+    expect(validated.status).toBe("ok");
+    if (validated.status === "error") return;
+    const invalidArgs = validateWorkflowArgsResult({
+      inputSchema: validated.value.inputSchema,
+      args: { directory: 12 },
+      maxInputBytes: validated.value.limits.maxInputBytes,
+    });
+    expect(invalidArgs.status).toBe("error");
+    if (invalidArgs.status === "error") {
+      expect(invalidArgs.error._tag).toBe("WorkflowArgumentsInvalid");
+      expect(invalidArgs.error.message).toContain("expected string");
+    }
+  });
+
   it("normalizes static metadata and deterministically hashes canonical values", () => {
     const validated = validateWorkflowSource({ name: "audit-routes", source: source() });
     expect(validated.metadata).toEqual({ name: "audit-routes", description: "Audit routes" });

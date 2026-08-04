@@ -71,4 +71,13 @@ declare module "open-protocol-sdk" {
     readonly kind: string;
     readonly payload?: string;
   }
+
+  export interface GenericProtocolEvent<T> {
+    readonly kind: string;
+    readonly payload?: T;
+  }
+
+  export type GenericProtocolVariant<T> =
+    | { readonly kind: "created"; readonly payload?: T }
+    | { readonly kind: "updated"; readonly payload?: T };
 }

@@ -2,10 +2,13 @@ import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   CORE_PROMPT_FILES,
   ensurePromptWorkspace,
   getDiscordUserAliasValue,
+  isPanic,
+  opaqueErrorCause,
   resolveHeartbeatPromptPaths,
   resolvePromptDir,
   type CoreConfig,
@@ -183,6 +186,42 @@ type TimeWindow = {
   endTs: number;
 };
 
+export class DiscoverySearchInputError extends TaggedError("DiscoverySearchInputError")<{
+  readonly field: "query" | "offsetTime" | "lookbackTime";
+  readonly message: string;
+}> {}
+
+export class DiscoverySearchOperationError extends TaggedError("DiscoverySearchOperationError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export class DiscoveryCloseError extends TaggedError("DiscoveryCloseError")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export type DiscoverySearchError = DiscoverySearchInputError | DiscoverySearchOperationError;
+
+type DiscoveryTimeInputError = DiscoverySearchInputError;
+
+function adaptDiscoverySearchInputResultToHost<T>(
+  result: ResultType<T, DiscoverySearchInputError>,
+): T {
+  if (result.status === "ok") return result.value;
+  throw result.error;
+}
+
+function adaptDiscoverySearchResultToHost<T>(result: ResultType<T, DiscoverySearchError>): T {
+  if (result.status === "ok") return result.value;
+  throw result.error;
+}
+
+function adaptDiscoveryCloseResultToHost(result: ResultType<void, DiscoveryCloseError>): void {
+  if (result.status === "ok") return;
+  throw result.error;
+}
+
 const RELATIVE_DURATION_RE = /^(?:\d+(?:ms|s|m|h|d|w))+$/u;
 const RELATIVE_DURATION_PART_RE = /(\d+)(ms|s|m|h|d|w)/gu;
 const DIGITS_RE = /^\d+$/u;
@@ -288,11 +327,17 @@ function stripFrontmatter(raw: string): string {
   return raw.slice(idx + "\n---".length).replace(/^\s+/u, "");
 }
 
-function parseRelativeDurationMs(rawInput: string, fieldName: string): number {
+function parseRelativeDurationMs(
+  rawInput: string,
+  fieldName: "offsetTime" | "lookbackTime",
+): ResultType<number, DiscoveryTimeInputError> {
   const raw = rawInput.trim();
   if (!RELATIVE_DURATION_RE.test(raw)) {
-    throw new Error(
-      `${fieldName} must be a positive relative duration like '30m', '24h', or '7d'.`,
+    return Result.err(
+      new DiscoverySearchInputError({
+        field: fieldName,
+        message: `${fieldName} must be a positive relative duration like '30m', '24h', or '7d'.`,
+      }),
     );
   }
 
@@ -313,54 +358,79 @@ function parseRelativeDurationMs(rawInput: string, fieldName: string): number {
   }
 
   if (matched !== raw.length || total <= 0) {
-    throw new Error(
-      `${fieldName} must be a positive relative duration like '30m', '24h', or '7d'.`,
+    return Result.err(
+      new DiscoverySearchInputError({
+        field: fieldName,
+        message: `${fieldName} must be a positive relative duration like '30m', '24h', or '7d'.`,
+      }),
     );
   }
 
-  return total;
+  return Result.ok(total);
 }
 
-function parseEpochMs(value: number): number {
+function parseEpochMs(value: number): ResultType<number, DiscoveryTimeInputError> {
   if (!Number.isFinite(value) || value < 0) {
-    throw new Error("numeric time values must be positive");
+    return Result.err(
+      new DiscoverySearchInputError({
+        field: "offsetTime",
+        message: "numeric time values must be positive",
+      }),
+    );
   }
-  if (value === 0) return 0;
-  return value < 1_000_000_000_000 ? value * 1000 : value;
+  if (value === 0) return Result.ok(0);
+  return Result.ok(value < 1_000_000_000_000 ? value * 1000 : value);
 }
 
-function resolveOffsetTimeMs(input: string | number | undefined, nowMs: number): number {
-  if (input === undefined) return nowMs;
+function resolveOffsetTimeMs(
+  input: string | number | undefined,
+  nowMs: number,
+): ResultType<number, DiscoveryTimeInputError> {
+  if (input === undefined) return Result.ok(nowMs);
   if (typeof input === "number") {
     const parsed = parseEpochMs(input);
-    return parsed === 0 ? nowMs : parsed;
+    if (parsed.status === "error") return parsed;
+    return Result.ok(parsed.value === 0 ? nowMs : parsed.value);
   }
 
   const raw = input.trim();
-  if (raw === "0") return nowMs;
+  if (raw === "0") return Result.ok(nowMs);
   if (DIGITS_RE.test(raw)) {
     return resolveOffsetTimeMs(Number(raw), nowMs);
   }
   if (RELATIVE_DURATION_RE.test(raw)) {
-    return nowMs - parseRelativeDurationMs(raw, "offsetTime");
+    const duration = parseRelativeDurationMs(raw, "offsetTime");
+    if (duration.status === "error") return duration;
+    return Result.ok(nowMs - duration.value);
   }
 
   const parsed = Date.parse(raw);
   if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(
-      "offsetTime must be an ISO-8601 timestamp, a unix epoch, 0, or a positive relative duration.",
+    return Result.err(
+      new DiscoverySearchInputError({
+        field: "offsetTime",
+        message:
+          "offsetTime must be an ISO-8601 timestamp, a unix epoch, 0, or a positive relative duration.",
+      }),
     );
   }
-  return parsed;
+  return Result.ok(parsed);
 }
 
-function resolveLookbackDurationMs(input: string | number | undefined): number | undefined {
-  if (input === undefined) return undefined;
+function resolveLookbackDurationMs(
+  input: string | number | undefined,
+): ResultType<number | undefined, DiscoveryTimeInputError> {
+  if (input === undefined) return Result.ok(undefined);
   if (typeof input === "number") {
     if (!Number.isFinite(input) || input <= 0) {
-      throw new Error("lookbackTime must be a positive duration.");
+      return Result.err(
+        new DiscoverySearchInputError({
+          field: "lookbackTime",
+          message: "lookbackTime must be a positive duration.",
+        }),
+      );
     }
-    return Math.floor(input);
+    return Result.ok(Math.floor(input));
   }
 
   const raw = input.trim();
@@ -371,18 +441,28 @@ function resolveLookbackDurationMs(input: string | number | undefined): number |
   return parseRelativeDurationMs(raw, "lookbackTime");
 }
 
-function resolveTimeWindow(input: DiscoverySearchInput, nowMs: number): TimeWindow | undefined {
+function resolveTimeWindow(
+  input: DiscoverySearchInput,
+  nowMs: number,
+): ResultType<TimeWindow | undefined, DiscoveryTimeInputError> {
   const lookbackMs = resolveLookbackDurationMs(input.lookbackTime);
-  if (lookbackMs === undefined) {
+  if (lookbackMs.status === "error") return lookbackMs;
+  if (lookbackMs.value === undefined) {
     if (input.offsetTime !== undefined) {
-      throw new Error("offsetTime requires lookbackTime.");
+      return Result.err(
+        new DiscoverySearchInputError({
+          field: "offsetTime",
+          message: "offsetTime requires lookbackTime.",
+        }),
+      );
     }
-    return undefined;
+    return Result.ok(undefined);
   }
 
   const endTs = resolveOffsetTimeMs(input.offsetTime, nowMs);
-  const startTs = endTs - lookbackMs;
-  return { startTs, endTs };
+  if (endTs.status === "error") return endTs;
+  const startTs = endTs.value - lookbackMs.value;
+  return Result.ok({ startTs, endTs: endTs.value });
 }
 
 function isTextFile(filePath: string): boolean {
@@ -744,13 +824,15 @@ class SqliteDiscoveryStore {
     `);
 
     const existingFtsUpdateTrigger = this.db
-      .query("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
-      .get("discovery_documents_au") as { sql: string } | null;
+      .query<{ sql: string | null }, [string]>(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+      )
+      .get("discovery_documents_au");
     const hasContentSensitiveFtsUpdateTrigger =
-      existingFtsUpdateTrigger?.sql.includes("AFTER UPDATE OF title, text") === true &&
-      existingFtsUpdateTrigger.sql.includes(
+      existingFtsUpdateTrigger?.sql?.includes("AFTER UPDATE OF title, text") === true &&
+      existingFtsUpdateTrigger.sql?.includes(
         "WHEN old.title IS NOT new.title OR old.text IS NOT new.text",
-      );
+      ) === true;
     if (!hasContentSensitiveFtsUpdateTrigger) {
       this.db.run("DROP TRIGGER IF EXISTS discovery_documents_au");
     }
@@ -1013,8 +1095,21 @@ export class DiscoveryService {
     this.store = new SqliteDiscoveryStore(params.dbPath);
   }
 
+  closeResult(): ResultType<void, DiscoveryCloseError> {
+    return Result.try({
+      try: () => this.store.close(),
+      catch: (caught) => {
+        if (isPanic(caught)) throw caught;
+        return new DiscoveryCloseError({
+          cause: opaqueErrorCause(caught, "Opaque discovery close failure"),
+          message: "Failed to close discovery storage",
+        });
+      },
+    });
+  }
+
   close(): void {
-    this.store.close();
+    adaptDiscoveryCloseResultToHost(this.closeResult());
   }
 
   private async getConfig(): Promise<CoreConfig | null> {
@@ -1370,13 +1465,40 @@ export class DiscoveryService {
     return groups;
   }
 
+  async searchResult(
+    input: DiscoverySearchInput,
+  ): Promise<ResultType<DiscoverySearchResult, DiscoverySearchError>> {
+    return Result.tryPromise({
+      try: () => this.searchOperation(input),
+      catch: (caught) => {
+        if (isPanic(caught)) throw caught;
+        if (DiscoverySearchInputError.is(caught)) return caught;
+        return new DiscoverySearchOperationError({
+          cause: opaqueErrorCause(caught, "Opaque discovery search failure"),
+          message: "Discovery search failed",
+        });
+      },
+    });
+  }
+
   async search(input: DiscoverySearchInput): Promise<DiscoverySearchResult> {
+    return adaptDiscoverySearchResultToHost(await this.searchResult(input));
+  }
+
+  private async searchOperation(input: DiscoverySearchInput): Promise<DiscoverySearchResult> {
     await this.syncAllSources();
 
-    const ftsQuery = normalizeFtsQuery(input.query);
-    if (!ftsQuery) {
-      throw new Error("query must not be empty");
-    }
+    const normalizedQuery = normalizeFtsQuery(input.query);
+    const ftsQuery = adaptDiscoverySearchInputResultToHost(
+      normalizedQuery
+        ? Result.ok(normalizedQuery)
+        : Result.err(
+            new DiscoverySearchInputError({
+              field: "query",
+              message: "query must not be empty",
+            }),
+          ),
+    );
 
     const sources = [
       ...new Set(input.sources ?? (["conversation", "prompt", "heartbeat"] as const)),
@@ -1388,7 +1510,7 @@ export class DiscoveryService {
     const limit = clampPositiveInt(input.limit, 10, DISCOVERY_LIMIT_MAX);
     const verbose = input.verbose ?? false;
     const nowMs = Date.now();
-    const window = resolveTimeWindow(input, nowMs);
+    const window = adaptDiscoverySearchInputResultToHost(resolveTimeWindow(input, nowMs));
     const candidateLimit = Math.min(500, Math.max(limit * 8, 50));
     const cfg = await this.getConfig();
 

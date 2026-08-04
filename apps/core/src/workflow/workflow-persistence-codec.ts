@@ -7,9 +7,11 @@ import {
   type PersistedDataIssueCode,
   type PersistenceProvenance,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
+import { projectRuntimeError } from "../runtime/error-format";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 import {
   jsonValueSchema,
   workflowOperationSchema,
@@ -366,11 +368,12 @@ function decodeJson(input: {
   readonly version: number;
   readonly recordId: string;
 }): ResultType<unknown, MalformedSerialization> {
-  try {
-    const value: unknown = JSON.parse(input.raw);
-    return Result.ok(value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const parsed = Result.try({
+    try: () => JSON.parse(input.raw),
+    catch: projectRuntimeError("Opaque workflow persistence JSON failure"),
+  });
+  if (parsed.status === "error") {
+    preserveToolPanic(parsed.error);
     return Result.err(
       new MalformedSerialization(
         diagnostic({
@@ -383,6 +386,7 @@ function decodeJson(input: {
       ),
     );
   }
+  return Result.ok(parsed.value);
 }
 
 function decodeJsonField<T>(input: {

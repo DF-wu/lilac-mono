@@ -66,7 +66,8 @@ export function normalizeConfiguredModelProviderOptions(
 }
 
 function editDistance(a: string, b: string): number {
-  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  let previous: number[] = [];
+  for (let index = 0; index <= b.length; index += 1) previous.push(index);
 
   for (let aIndex = 1; aIndex <= a.length; aIndex += 1) {
     const current = [aIndex];

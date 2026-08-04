@@ -9,6 +9,7 @@ import {
   bundledRemoteRunnerErrorMessage,
   rethrowBundledRemoteRunnerPanic,
 } from "../../src/ssh/remote-js/bundled-runner-failure";
+import { opaqueErrorCause } from "../../src/ssh/remote-js/remote-runner-utils";
 
 const runnerPath = path.resolve(import.meta.dir, "../../src/ssh/remote-js/remote-runner.cjs");
 const errorEnvelopeSchema = z.object({ ok: z.literal(false), error: z.string() });
@@ -61,8 +62,9 @@ describe("bundled remote runner stdin boundary", () => {
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
 
-    expect(() => rethrowBundledRemoteRunnerPanic(proxy)).not.toThrow();
-    expect(bundledRemoteRunnerErrorMessage(proxy)).toBe("Opaque bundled remote runner failure");
+    const projected = opaqueErrorCause(proxy, "Opaque bundled remote runner failure");
+    const error = rethrowBundledRemoteRunnerPanic(projected);
+    expect(bundledRemoteRunnerErrorMessage(error)).toBe("Opaque bundled remote runner failure");
   });
 
   it("denies byte reads through a symlink into a blocked directory", async () => {
@@ -114,6 +116,34 @@ describe("bundled remote runner stdin boundary", () => {
 
       const result = await runBundledRunner(
         JSON.stringify({ op: "apply_patch", denyPaths: [deniedDir], input: { patchText } }),
+        root,
+      );
+      const envelope = errorEnvelopeSchema.parse(JSON.parse(result.stdout));
+
+      expect(envelope.error).toContain("Access denied");
+      await expect(readFile(target, "utf8")).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("denies apply_patch descendants when the filesystem root is denied", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lilac-bundled-patch-root-deny-"));
+    const target = path.join(root, "created.txt");
+    try {
+      const patchText = [
+        "*** Begin Patch",
+        "*** Add File: created.txt",
+        "+blocked",
+        "*** End Patch",
+      ].join("\n");
+
+      const result = await runBundledRunner(
+        JSON.stringify({
+          op: "apply_patch",
+          denyPaths: [path.parse(root).root],
+          input: { patchText },
+        }),
         root,
       );
       const envelope = errorEnvelopeSchema.parse(JSON.parse(result.stdout));

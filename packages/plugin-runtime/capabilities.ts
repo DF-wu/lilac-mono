@@ -16,42 +16,52 @@ export type DynamicToolPluginModule<TRuntimeContext> = {
   readonly default: LilacToolPlugin<TRuntimeContext, Level1ToolSpec<TRuntimeContext>, ServerTool>;
 };
 
-export type PluginFunctionCapability = (...args: never[]) => unknown;
+export type PluginFunctionCapability = (...args: unknown[]) => unknown;
+
+type Level1EditTargetsCapability = NonNullable<Level1ToolSpec<unknown>["editTargets"]>;
 
 export type ToolPluginMetaCapabilitySnapshot = Readonly<ToolPluginMeta>;
 
 export type ToolPluginCapabilitySnapshot<TRuntimeContext> = {
   readonly plugin: LilacToolPlugin<TRuntimeContext, Level1ToolSpec<TRuntimeContext>, ServerTool>;
   readonly meta: ToolPluginMetaCapabilitySnapshot;
-  readonly create: PluginFunctionCapability;
+  readonly create: LilacToolPlugin<
+    TRuntimeContext,
+    Level1ToolSpec<TRuntimeContext>,
+    ServerTool
+  >["create"];
 };
 
 export type Level1ToolSpecCapabilitySnapshot<TRuntimeContext> = {
   readonly spec: Level1ToolSpec<TRuntimeContext>;
   readonly name: string;
   readonly supportsBatch?: boolean;
-  readonly createTool: PluginFunctionCapability;
-  readonly isEnabled: PluginFunctionCapability;
-  readonly editTargets?: PluginFunctionCapability;
-  readonly formatArgs?: PluginFunctionCapability;
-  readonly summarizeFailure?: PluginFunctionCapability;
+  readonly createTool: Level1ToolSpec<TRuntimeContext>["createTool"];
+  readonly isEnabled: Level1ToolSpec<TRuntimeContext>["isEnabled"];
+  readonly editTargets?: NonNullable<Level1ToolSpec<TRuntimeContext>["editTargets"]>;
+  readonly formatArgs?: NonNullable<Level1ToolSpec<TRuntimeContext>["formatArgs"]>;
+  readonly summarizeFailure?: NonNullable<Level1ToolSpec<TRuntimeContext>["summarizeFailure"]>;
 };
 
 export type ServerToolCapabilitySnapshot = {
   readonly tool: ServerTool;
   readonly id: string;
-  readonly init: PluginFunctionCapability;
-  readonly destroy: PluginFunctionCapability;
-  readonly list: PluginFunctionCapability;
-  readonly call: PluginFunctionCapability;
+  readonly init: ServerTool["init"];
+  readonly destroy: ServerTool["destroy"];
+  readonly list: ServerTool["list"];
+  readonly call: ServerTool["call"];
 };
 
 export type ToolPluginInstanceCapabilitySnapshot<TRuntimeContext> = {
   readonly instance: ToolPluginInstance<Level1ToolSpec<TRuntimeContext>, ServerTool>;
   readonly level1: readonly Level1ToolSpecCapabilitySnapshot<TRuntimeContext>[];
   readonly level2: readonly ServerToolCapabilitySnapshot[];
-  readonly init?: PluginFunctionCapability;
-  readonly destroy?: PluginFunctionCapability;
+  readonly init?: NonNullable<
+    ToolPluginInstance<Level1ToolSpec<TRuntimeContext>, ServerTool>["init"]
+  >;
+  readonly destroy?: NonNullable<
+    ToolPluginInstance<Level1ToolSpec<TRuntimeContext>, ServerTool>["destroy"]
+  >;
 };
 
 export type DynamicToolPluginModuleCapabilitySnapshot<TRuntimeContext> = {
@@ -59,14 +69,19 @@ export type DynamicToolPluginModuleCapabilitySnapshot<TRuntimeContext> = {
   readonly plugin: ToolPluginCapabilitySnapshot<TRuntimeContext>;
 };
 
-type CapturedToolPlugin = Omit<ToolPluginCapabilitySnapshot<unknown>, "plugin">;
+type CapturedToolPlugin = {
+  readonly meta: ToolPluginMetaCapabilitySnapshot;
+  readonly create: PluginFunctionCapability;
+};
 type CapturedLevel1ToolSpec = Omit<Level1ToolSpecCapabilitySnapshot<unknown>, "spec">;
 type CapturedServerTool = Omit<ServerToolCapabilitySnapshot, "tool">;
 type CapturedToolPluginInstance = {
   readonly level1: readonly Level1ToolSpecCapabilitySnapshot<unknown>[];
   readonly level2: readonly ServerToolCapabilitySnapshot[];
-  readonly init?: PluginFunctionCapability;
-  readonly destroy?: PluginFunctionCapability;
+  readonly init?: NonNullable<ToolPluginInstance<Level1ToolSpec<unknown>, ServerTool>["init"]>;
+  readonly destroy?: NonNullable<
+    ToolPluginInstance<Level1ToolSpec<unknown>, ServerTool>["destroy"]
+  >;
 };
 
 const toolPluginCapabilities = new WeakMap<object, CapturedToolPlugin>();
@@ -76,7 +91,9 @@ const serverToolCapabilities = new WeakMap<object, CapturedServerTool>();
 const toolPluginInstanceCapabilities = new WeakMap<object, CapturedToolPluginInstance>();
 const dynamicToolPluginModuleCapabilities = new WeakMap<
   object,
-  ToolPluginCapabilitySnapshot<unknown>
+  CapturedToolPlugin & {
+    readonly plugin: LilacToolPlugin<unknown, Level1ToolSpec<unknown>, ServerTool>;
+  }
 >();
 
 export function getLevel1ToolSpecCapabilitySnapshot<TRuntimeContext>(
@@ -106,6 +123,27 @@ export function isFunctionCapability(value: unknown): value is PluginFunctionCap
 }
 
 const functionSchema = z.custom<PluginFunctionCapability>(isFunctionCapability);
+const level1EditTargetsFunctionSchema = z.custom<Level1EditTargetsCapability>(isFunctionCapability);
+const level1CreateToolFunctionSchema =
+  z.custom<Level1ToolSpec<unknown>["createTool"]>(isFunctionCapability);
+const level1IsEnabledFunctionSchema =
+  z.custom<Level1ToolSpec<unknown>["isEnabled"]>(isFunctionCapability);
+const level1FormatArgsFunctionSchema =
+  z.custom<NonNullable<Level1ToolSpec<unknown>["formatArgs"]>>(isFunctionCapability);
+const level1SummarizeFailureFunctionSchema =
+  z.custom<NonNullable<Level1ToolSpec<unknown>["summarizeFailure"]>>(isFunctionCapability);
+const serverToolInitFunctionSchema = z.custom<ServerTool["init"]>(isFunctionCapability);
+const serverToolDestroyFunctionSchema = z.custom<ServerTool["destroy"]>(isFunctionCapability);
+const serverToolListFunctionSchema = z.custom<ServerTool["list"]>(isFunctionCapability);
+const serverToolCallFunctionSchema = z.custom<ServerTool["call"]>(isFunctionCapability);
+const pluginInstanceInitFunctionSchema =
+  z.custom<NonNullable<ToolPluginInstance<Level1ToolSpec<unknown>, ServerTool>["init"]>>(
+    isFunctionCapability,
+  );
+const pluginInstanceDestroyFunctionSchema =
+  z.custom<NonNullable<ToolPluginInstance<Level1ToolSpec<unknown>, ServerTool>["destroy"]>>(
+    isFunctionCapability,
+  );
 
 const pluginMetaShapeSchema = z
   .object({
@@ -128,11 +166,11 @@ const level1ToolSpecShapeSchema = z
   .object({
     name: z.string().trim().min(1),
     supportsBatch: z.boolean().optional(),
-    createTool: functionSchema,
-    isEnabled: functionSchema,
-    editTargets: functionSchema.optional(),
-    formatArgs: functionSchema.optional(),
-    summarizeFailure: functionSchema.optional(),
+    createTool: level1CreateToolFunctionSchema,
+    isEnabled: level1IsEnabledFunctionSchema,
+    editTargets: level1EditTargetsFunctionSchema.optional(),
+    formatArgs: level1FormatArgsFunctionSchema.optional(),
+    summarizeFailure: level1SummarizeFailureFunctionSchema.optional(),
   })
   .passthrough();
 
@@ -154,10 +192,10 @@ export function validateLevel1ToolSpecCapability(value: unknown): boolean {
 const level2ToolShapeSchema = z
   .object({
     id: z.string().trim().min(1),
-    init: functionSchema,
-    destroy: functionSchema,
-    list: functionSchema,
-    call: functionSchema,
+    init: serverToolInitFunctionSchema,
+    destroy: serverToolDestroyFunctionSchema,
+    list: serverToolListFunctionSchema,
+    call: serverToolCallFunctionSchema,
   })
   .passthrough();
 
@@ -180,8 +218,8 @@ const pluginInstanceShapeSchema = z
   .object({
     level1: z.array(z.custom<Level1ToolSpec<unknown>>(validateLevel1ToolSpecCapability)).optional(),
     level2: z.array(serverToolSchema).optional(),
-    init: functionSchema.optional(),
-    destroy: functionSchema.optional(),
+    init: pluginInstanceInitFunctionSchema.optional(),
+    destroy: pluginInstanceDestroyFunctionSchema.optional(),
   })
   .passthrough();
 
@@ -377,14 +415,13 @@ export function safePluginExceptionCause(cause: unknown): Error {
 export function mapCapabilityInspectionException(params: {
   capability: ConstructorParameters<typeof ToolPluginCapabilityError>[0]["capability"];
   pluginId?: string;
-  cause: unknown;
+  cause: Error;
 }): ToolPluginCapabilityError {
-  const cause = safePluginExceptionCause(params.cause);
   return new ToolPluginCapabilityError({
     capability: params.capability,
     pluginId: params.pluginId,
-    issues: [cause.message],
-    cause,
+    issues: [params.cause.message],
+    cause: params.cause,
     message: `Failed to inspect ${params.capability} capability${params.pluginId ? ` for plugin '${params.pluginId}'` : ""}`,
   });
 }
@@ -417,6 +454,18 @@ function missingCapabilitySnapshot<T>(
   );
 }
 
+function capturePluginInspection<T, E>(params: {
+  run: () => ResultType<T, E>;
+  mapException: (cause: Error) => E;
+}): ResultType<T, E> {
+  try {
+    return params.run();
+  } catch (cause) {
+    if (isPluginPanic(cause)) throw cause;
+    return Result.err(params.mapException(safePluginExceptionCause(cause)));
+  }
+}
+
 export function decodeDynamicToolPluginModule<TRuntimeContext>(
   value: unknown,
 ): ResultType<
@@ -426,28 +475,37 @@ export function decodeDynamicToolPluginModule<TRuntimeContext>(
   const schema = z.custom<DynamicToolPluginModule<TRuntimeContext>>(
     validateDynamicToolPluginModuleCapability,
   );
-  try {
-    const parsed = schema.safeParse(value);
-    if (parsed.success) {
-      const captured = dynamicToolPluginModuleCapabilities.get(parsed.data);
-      if (captured) {
-        // The complete validator already captured this exact receiver; only its generic runtime
-        // parameter is restored here without reading plugin-owned properties again.
-        const plugin = z
-          .custom<LilacToolPlugin<TRuntimeContext, Level1ToolSpec<TRuntimeContext>, ServerTool>>()
-          .parse(captured.plugin);
-        return Result.ok({
-          module: parsed.data,
-          plugin: { plugin, meta: captured.meta, create: captured.create },
-        });
+  return capturePluginInspection({
+    run: () => {
+      const parsed = schema.safeParse(value);
+      if (parsed.success) {
+        const captured = dynamicToolPluginModuleCapabilities.get(parsed.data);
+        if (captured) {
+          // The complete validator already captured this exact receiver; only its generic runtime
+          // parameter is restored here without reading plugin-owned properties again.
+          const plugin = z
+            .custom<LilacToolPlugin<TRuntimeContext, Level1ToolSpec<TRuntimeContext>, ServerTool>>()
+            .parse(captured.plugin);
+          const create = z
+            .custom<
+              LilacToolPlugin<
+                TRuntimeContext,
+                Level1ToolSpec<TRuntimeContext>,
+                ServerTool
+              >["create"]
+            >()
+            .parse(captured.create);
+          return Result.ok({
+            module: parsed.data,
+            plugin: { plugin, meta: captured.meta, create },
+          });
+        }
+        return missingCapabilitySnapshot("module");
       }
-      return missingCapabilitySnapshot("module");
-    }
-    return invalidCapabilityResult({ parsed, capability: "module" });
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapCapabilityInspectionException({ capability: "module", cause }));
-  }
+      return invalidCapabilityResult({ parsed, capability: "module" });
+    },
+    mapException: (cause) => mapCapabilityInspectionException({ capability: "module", cause }),
+  });
 }
 
 export function decodeToolPlugin<TRuntimeContext>(
@@ -456,18 +514,29 @@ export function decodeToolPlugin<TRuntimeContext>(
   const schema = z.custom<
     LilacToolPlugin<TRuntimeContext, Level1ToolSpec<TRuntimeContext>, ServerTool>
   >(validateToolPluginCapability);
-  try {
-    const parsed = schema.safeParse(value);
-    if (parsed.success) {
-      const captured = toolPluginCapabilities.get(parsed.data);
-      if (captured) return Result.ok({ plugin: parsed.data, ...captured });
-      return missingCapabilitySnapshot("plugin");
-    }
-    return invalidCapabilityResult({ parsed, capability: "plugin" });
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapCapabilityInspectionException({ capability: "plugin", cause }));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = schema.safeParse(value);
+      if (parsed.success) {
+        const captured = toolPluginCapabilities.get(parsed.data);
+        if (captured) {
+          const create = z
+            .custom<
+              LilacToolPlugin<
+                TRuntimeContext,
+                Level1ToolSpec<TRuntimeContext>,
+                ServerTool
+              >["create"]
+            >()
+            .parse(captured.create);
+          return Result.ok({ plugin: parsed.data, meta: captured.meta, create });
+        }
+        return missingCapabilitySnapshot("plugin");
+      }
+      return invalidCapabilityResult({ parsed, capability: "plugin" });
+    },
+    mapException: (cause) => mapCapabilityInspectionException({ capability: "plugin", cause }),
+  });
 }
 
 export function decodeToolPluginInstance<TRuntimeContext>(
@@ -477,32 +546,31 @@ export function decodeToolPluginInstance<TRuntimeContext>(
   const schema = z.custom<ToolPluginInstance<Level1ToolSpec<TRuntimeContext>, ServerTool>>(
     validateToolPluginInstanceCapability,
   );
-  try {
-    const parsed = schema.safeParse(value);
-    if (parsed.success) {
-      const captured = toolPluginInstanceCapabilities.get(parsed.data);
-      if (captured) {
-        const level1 = captured.level1.map((snapshot) => ({
-          ...snapshot,
-          spec: z.custom<Level1ToolSpec<TRuntimeContext>>().parse(snapshot.spec),
-        }));
-        return Result.ok({
-          instance: parsed.data,
-          level1,
-          level2: captured.level2,
-          init: captured.init,
-          destroy: captured.destroy,
-        });
+  return capturePluginInspection({
+    run: () => {
+      const parsed = schema.safeParse(value);
+      if (parsed.success) {
+        const captured = toolPluginInstanceCapabilities.get(parsed.data);
+        if (captured) {
+          const level1 = captured.level1.map((snapshot) => ({
+            ...snapshot,
+            spec: z.custom<Level1ToolSpec<TRuntimeContext>>().parse(snapshot.spec),
+          }));
+          return Result.ok({
+            instance: parsed.data,
+            level1,
+            level2: captured.level2,
+            init: captured.init,
+            destroy: captured.destroy,
+          });
+        }
+        return missingCapabilitySnapshot("instance", pluginId);
       }
-      return missingCapabilitySnapshot("instance", pluginId);
-    }
-    return invalidCapabilityResult({ parsed, capability: "instance", pluginId });
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(
+      return invalidCapabilityResult({ parsed, capability: "instance", pluginId });
+    },
+    mapException: (cause) =>
       mapCapabilityInspectionException({ capability: "instance", pluginId, cause }),
-    );
-  }
+  });
 }
 
 export function decodeLevel1ToolSpec<TRuntimeContext>(
@@ -510,36 +578,38 @@ export function decodeLevel1ToolSpec<TRuntimeContext>(
   value: unknown,
 ): ResultType<Level1ToolSpecCapabilitySnapshot<TRuntimeContext>, ToolPluginCapabilityError> {
   const schema = z.custom<Level1ToolSpec<TRuntimeContext>>(validateLevel1ToolSpecCapability);
-  try {
-    const parsed = schema.safeParse(value);
-    if (parsed.success) {
-      const captured = level1ToolSpecCapabilities.get(parsed.data);
-      if (captured) return Result.ok({ spec: parsed.data, ...captured });
-      return missingCapabilitySnapshot("level1", pluginId);
-    }
-    return invalidCapabilityResult({ parsed, capability: "level1", pluginId });
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapCapabilityInspectionException({ capability: "level1", pluginId, cause }));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = schema.safeParse(value);
+      if (parsed.success) {
+        const captured = level1ToolSpecCapabilities.get(parsed.data);
+        if (captured) return Result.ok({ spec: parsed.data, ...captured });
+        return missingCapabilitySnapshot("level1", pluginId);
+      }
+      return invalidCapabilityResult({ parsed, capability: "level1", pluginId });
+    },
+    mapException: (cause) =>
+      mapCapabilityInspectionException({ capability: "level1", pluginId, cause }),
+  });
 }
 
 export function decodeServerTool(
   pluginId: string,
   value: unknown,
 ): ResultType<ServerToolCapabilitySnapshot, ToolPluginCapabilityError> {
-  try {
-    const parsed = serverToolSchema.safeParse(value);
-    if (parsed.success) {
-      const captured = serverToolCapabilities.get(parsed.data);
-      if (captured) return Result.ok({ tool: parsed.data, ...captured });
-      return missingCapabilitySnapshot("level2", pluginId);
-    }
-    return invalidCapabilityResult({ parsed, capability: "level2", pluginId });
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapCapabilityInspectionException({ capability: "level2", pluginId, cause }));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = serverToolSchema.safeParse(value);
+      if (parsed.success) {
+        const captured = serverToolCapabilities.get(parsed.data);
+        if (captured) return Result.ok({ tool: parsed.data, ...captured });
+        return missingCapabilitySnapshot("level2", pluginId);
+      }
+      return invalidCapabilityResult({ parsed, capability: "level2", pluginId });
+    },
+    mapException: (cause) =>
+      mapCapabilityInspectionException({ capability: "level2", pluginId, cause }),
+  });
 }
 
 export function invalidHookResult(params: {
@@ -556,15 +626,14 @@ export function invalidHookResult(params: {
 
 export function mapHookResultInspectionException(
   pluginId: string,
-  cause: unknown,
+  cause: Error,
 ): ToolPluginCapabilityError {
-  const safeCause = safePluginExceptionCause(cause);
-  const issues = [safeCause.message];
+  const issues = [cause.message];
   return new ToolPluginCapabilityError({
     capability: "hook_result",
     pluginId,
     issues,
-    cause: safeCause,
+    cause,
     message: `Invalid hook result for plugin '${pluginId}': ${issues.join("; ")}`,
   });
 }
@@ -573,152 +642,154 @@ export function decodeLevel1ExecutableMetadata(
   pluginId: string,
   value: unknown,
 ): ResultType<Level1ExecutableMetadata, ToolPluginCapabilityError> {
-  try {
-    const parsed = level1ExecutableMetadataSchema.safeParse(value);
-    return Result.ok(parsed.success ? parsed.data : {});
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = level1ExecutableMetadataSchema.safeParse(value);
+      return Result.ok(parsed.success ? parsed.data : {});
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeVoidHookResult(
   pluginId: string,
   value: unknown,
 ): ResultType<void, ToolPluginCapabilityError> {
-  try {
-    const parsed = voidHookResultSchema.safeParse(value);
-    if (parsed.success) return Result.ok();
-    return Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = voidHookResultSchema.safeParse(value);
+      return parsed.success
+        ? Result.ok()
+        : Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeBooleanHookResult(
   pluginId: string,
   value: unknown,
 ): ResultType<boolean, ToolPluginCapabilityError> {
-  try {
-    const parsed = booleanHookResultSchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = booleanHookResultSchema.safeParse(value);
+      return parsed.success
+        ? Result.ok(parsed.data)
+        : Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeStringHookResult(
   pluginId: string,
   value: unknown,
 ): ResultType<string, ToolPluginCapabilityError> {
-  try {
-    const parsed = stringHookResultSchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = stringHookResultSchema.safeParse(value);
+      return parsed.success
+        ? Result.ok(parsed.data)
+        : Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeStringArrayHookResult(
   pluginId: string,
   value: unknown,
 ): ResultType<readonly string[], ToolPluginCapabilityError> {
-  try {
-    const parsed = stringArrayHookResultSchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = stringArrayHookResultSchema.safeParse(value);
+      return parsed.success
+        ? Result.ok(parsed.data)
+        : Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeServerToolListResult(
   pluginId: string,
   value: unknown,
 ): ResultType<ServerToolListResult, ToolPluginCapabilityError> {
-  try {
-    const parsed = serverToolListResultShapeSchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = serverToolListResultShapeSchema.safeParse(value);
+      return parsed.success
+        ? Result.ok(parsed.data)
+        : Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeLevel1ToolFailureSummary(
   pluginId: string,
   value: unknown,
 ): ResultType<Level1ToolFailureSummary, ToolPluginCapabilityError> {
-  try {
-    const parsed = level1FailureSummaryShapeSchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(mapHookResultInspectionException(pluginId, cause));
-  }
+  return capturePluginInspection({
+    run: () => {
+      const parsed = level1FailureSummaryShapeSchema.safeParse(value);
+      return parsed.success
+        ? Result.ok(parsed.data)
+        : Result.err(invalidHookResult({ pluginId, issues: [parsed.error.message] }));
+    },
+    mapException: (cause) => mapHookResultInspectionException(pluginId, cause),
+  });
 }
 
 export function decodeDisabledPluginIds(
   value: unknown,
 ): ResultType<readonly string[], ToolPluginCapabilityError> {
-  try {
-    const parsed = disabledPluginIdsSchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(
+  return capturePluginInspection({
+    run: () => {
+      const parsed = disabledPluginIdsSchema.safeParse(value);
+      if (parsed.success) return Result.ok(parsed.data);
+      return Result.err(
+        new ToolPluginCapabilityError({
+          capability: "hook_result",
+          issues: [parsed.error.message],
+          cause: parsed.error,
+          message: `Invalid getDisabledPluginIds result: ${parsed.error.message}`,
+        }),
+      );
+    },
+    mapException: (cause) =>
       new ToolPluginCapabilityError({
         capability: "hook_result",
-        issues: [parsed.error.message],
-        cause: parsed.error,
-        message: `Invalid getDisabledPluginIds result: ${parsed.error.message}`,
+        issues: [cause.message],
+        cause,
+        message: `Invalid getDisabledPluginIds result: ${cause.message}`,
       }),
-    );
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    const safeCause = safePluginExceptionCause(cause);
-    return Result.err(
-      new ToolPluginCapabilityError({
-        capability: "hook_result",
-        issues: [safeCause.message],
-        cause: safeCause,
-        message: `Invalid getDisabledPluginIds result: ${safeCause.message}`,
-      }),
-    );
-  }
+  });
 }
 
 export function decodeLevel1RegistrationKey(
   pluginId: string,
   value: unknown,
 ): ResultType<string, ToolPluginManagerHookError> {
-  try {
-    const parsed = level1RegistrationKeySchema.safeParse(value);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(
+  return capturePluginInspection({
+    run: () => {
+      const parsed = level1RegistrationKeySchema.safeParse(value);
+      if (parsed.success) return Result.ok(parsed.data);
+      return Result.err(
+        new ToolPluginManagerHookError({
+          hook: "getLevel1RegistrationKey",
+          pluginId,
+          cause: parsed.error,
+          message: `Plugin manager getLevel1RegistrationKey failed for '${pluginId}': ${parsed.error.message}`,
+        }),
+      );
+    },
+    mapException: (cause) =>
       new ToolPluginManagerHookError({
         hook: "getLevel1RegistrationKey",
         pluginId,
-        cause: parsed.error,
-        message: `Plugin manager getLevel1RegistrationKey failed for '${pluginId}': ${parsed.error.message}`,
+        cause,
+        message: `Plugin manager getLevel1RegistrationKey failed for '${pluginId}': ${cause.message}`,
       }),
-    );
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    const safeCause = safePluginExceptionCause(cause);
-    return Result.err(
-      new ToolPluginManagerHookError({
-        hook: "getLevel1RegistrationKey",
-        pluginId,
-        cause: safeCause,
-        message: `Plugin manager getLevel1RegistrationKey failed for '${pluginId}': ${safeCause.message}`,
-      }),
-    );
-  }
+  });
 }

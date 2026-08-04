@@ -4,6 +4,7 @@ import type {
   MiniLilacModelSummary,
   MiniLilacProfileSummary,
 } from "@stanley2058/mini-lilac-client";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 export interface Choice {
   readonly id: string;
@@ -73,6 +74,19 @@ export interface PreflightIO {
   question(prompt: string): Promise<string>;
 }
 
+export class PreflightSelectionUnavailable extends TaggedError("PreflightSelectionUnavailable")<{
+  readonly title: string;
+  readonly message: string;
+}> {}
+
+export class PreflightSelectionUnknown extends TaggedError("PreflightSelectionUnknown")<{
+  readonly title: string;
+  readonly selection: string;
+  readonly message: string;
+}> {}
+
+export type PreflightSelectionError = PreflightSelectionUnavailable | PreflightSelectionUnknown;
+
 export function createReadlinePreflightIO(
   input: NodeJS.ReadableStream = process.stdin,
   output: NodeJS.WritableStream = process.stdout,
@@ -94,15 +108,28 @@ export async function selectChoice(
   title: string,
   choices: readonly Choice[],
   preselectedId: string | undefined,
-): Promise<Choice> {
-  if (choices.length === 0) throw new Error(`No ${title.toLowerCase()} available`);
+): Promise<ResultType<Choice, PreflightSelectionError>> {
+  if (choices.length === 0) {
+    return Result.err(
+      new PreflightSelectionUnavailable({
+        title,
+        message: `No ${title.toLowerCase()} available`,
+      }),
+    );
+  }
 
   if (preselectedId !== undefined) {
     const match = choices.find((choice) => choice.id === preselectedId);
     if (match === undefined) {
-      throw new Error(`Unknown selection '${preselectedId}' for ${title.toLowerCase()}`);
+      return Result.err(
+        new PreflightSelectionUnknown({
+          title,
+          selection: preselectedId,
+          message: `Unknown selection '${preselectedId}' for ${title.toLowerCase()}`,
+        }),
+      );
     }
-    return match;
+    return Result.ok(match);
   }
 
   const defaultIndex = defaultChoiceIndex(choices);
@@ -111,7 +138,7 @@ export async function selectChoice(
   for (;;) {
     const answer = await io.question(`Select 1-${choices.length} [${defaultIndex + 1}]: `);
     const choice = resolveChoiceInput(answer, choices, defaultIndex);
-    if (choice !== undefined) return choice;
+    if (choice !== undefined) return Result.ok(choice);
     io.write("Invalid selection, try again.\n");
   }
 }

@@ -10,7 +10,7 @@ import type { ModelMessage } from "ai";
 import { Panic, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
-  buildCoreLineageManifestV1,
+  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
   computeCoreLineagePrefixDigestV1,
   type CoreLineageAtomV1,
   type CoreLineageManifestV1,
@@ -19,8 +19,10 @@ import {
 
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
-  computeCorePrimaryClaudeTerminalHead,
+  computeCorePrimaryClaudeTerminalHead as computeCorePrimaryClaudeTerminalHeadResult,
   CoreOwnedBlobIntegrityError,
+  type CoreClaudeAttemptMutationError,
+  type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
 } from "../../src/transcript/transcript-store";
 import { selectCorePrimaryClaudePrefix } from "../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
@@ -28,6 +30,96 @@ import { selectCorePrimaryClaudePrefix } from "../../src/surface/bridge/bus-agen
 function resultValue<T, E>(result: ResultType<T, E>): T {
   if (result.status === "error") throw result.error;
   return result.value;
+}
+
+function resultError<T, E>(result: ResultType<T, E>): E {
+  if (result.status === "ok") throw new Error("expected Result error");
+  return result.error;
+}
+
+function computeCorePrimaryClaudeTerminalHead(
+  input: Parameters<typeof computeCorePrimaryClaudeTerminalHeadResult>[0],
+) {
+  return resultValue(computeCorePrimaryClaudeTerminalHeadResult(input));
+}
+
+function attemptMutationValue<T>(result: ResultType<T, CoreClaudeAttemptMutationError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptTransactionConflict":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
+  if (result.status === "ok") return result.value;
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
+}
+
+function getNamedBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCoreNamedClaudeSessionBinding"]>[0],
+) {
+  return bindingValue(store.getCoreNamedClaudeSessionBinding(input));
+}
+
+function getPrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return bindingValue(store.getCorePrimaryClaudeSessionBinding(input));
+}
+
+function promoteNamedBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["promoteCoreNamedClaudeSessionBinding"]>[0],
+) {
+  return attemptMutationValue(store.promoteCoreNamedClaudeSessionBinding(input));
+}
+
+function promotePrimaryBinding(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["promoteCorePrimaryClaudeSessionBinding"]>[0],
+) {
+  return attemptMutationValue(store.promoteCorePrimaryClaudeSessionBinding(input));
+}
+
+function reserveNamedAttempt(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["reserveCoreNamedClaudeSessionAttempt"]>[0],
+) {
+  return attemptMutationValue(store.reserveCoreNamedClaudeSessionAttempt(input));
+}
+
+function recordNamedAttemptOutcome(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["recordCoreNamedClaudeSessionAttemptOutcome"]>[0],
+) {
+  return attemptMutationValue(store.recordCoreNamedClaudeSessionAttemptOutcome(input));
+}
+
+function reservePrimaryAttempt(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["reserveCorePrimaryClaudeSessionAttempt"]>[0],
+) {
+  return attemptMutationValue(store.reserveCorePrimaryClaudeSessionAttempt(input));
+}
+
+function recordPrimaryAttemptOutcome(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["recordCorePrimaryClaudeSessionAttemptOutcome"]>[0],
+) {
+  return attemptMutationValue(store.recordCorePrimaryClaudeSessionAttemptOutcome(input));
+}
+
+function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
+  return resultValue(buildCoreLineageManifestResultV1(...args));
 }
 
 function getRequestTranscript(
@@ -77,6 +169,24 @@ function getCoreRequestAtomMetadata(
   input: Parameters<SqliteTranscriptStore["getCoreRequestAtomMetadata"]>[0],
 ) {
   return resultValue(store.getCoreRequestAtomMetadata(input));
+}
+
+function putCoreOwnedBlob(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["putCoreOwnedBlob"]>[0],
+) {
+  return resultValue(store.putCoreOwnedBlob(input));
+}
+
+function getCoreOwnedBlob(
+  store: SqliteTranscriptStore,
+  input: Parameters<SqliteTranscriptStore["getCoreOwnedBlob"]>[0],
+) {
+  return resultValue(store.getCoreOwnedBlob(input));
+}
+
+function getCoreRetentionDiagnostics(store: SqliteTranscriptStore) {
+  return resultValue(store.getCoreRetentionDiagnostics());
 }
 
 function getCorePrimaryLineageManifest(
@@ -153,7 +263,7 @@ function seedPrimaryBinding(store: SqliteTranscriptStore, requestId: string, ses
     lastFamily: "claude-code",
     containsCrossFamilyTurns: false,
   } as const;
-  store.reserveCorePrimaryClaudeSessionAttempt({
+  reservePrimaryAttempt(store, {
     providerId: "claude-code",
     requestClient: "discord",
     lilacSessionId: sessionId,
@@ -201,7 +311,7 @@ function seedPrimaryBinding(store: SqliteTranscriptStore, requestId: string, ses
     lastReasoning: "medium",
   });
   expect(
-    store.promoteCorePrimaryClaudeSessionBinding({
+    promotePrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -209,13 +319,85 @@ function seedPrimaryBinding(store: SqliteTranscriptStore, requestId: string, ses
       attemptIndex: 0,
     }),
   ).toBe(true);
-  const binding = store.getCorePrimaryClaudeSessionBinding({
+  const binding = getPrimaryBinding(store, {
     providerId: "claude-code",
     requestClient: "discord",
     lilacSessionId: sessionId,
   });
   if (!binding) throw new Error("seed primary binding missing");
   return { binding, canonicalMessages: [...inputMessages, ...responseMessages], manifest };
+}
+
+function seedNamedBinding(store: SqliteTranscriptStore, requestId: string, sessionId: string) {
+  const messages = [
+    { role: "user", content: `input:${requestId}` },
+    { role: "assistant", content: `response:${requestId}` },
+  ] satisfies ModelMessage[];
+  const candidateSessionId = crypto.randomUUID();
+  reserveNamedAttempt(store, {
+    providerId: "claude-code",
+    requestClient: "discord",
+    lilacSessionId: sessionId,
+    executionScopeHashVersion: 1,
+    executionScopeHash: "scope",
+    requestId,
+    attemptIndex: 0,
+    candidateSessionId,
+    sourceSessionId: null,
+    expectedBindingRevision: null,
+  });
+  resultValue(
+    store.saveRequestTranscript({
+      requestId,
+      sessionId,
+      requestClient: "unknown",
+      messages,
+    }),
+  );
+  resultValue(
+    store.publishCoreNamedClaudeSuccess({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+      requestId,
+      attemptIndex: 0,
+      terminalRequestId: requestId,
+      terminalCanonicalHeadHash: hashCanonicalMessagesV1(messages).hash,
+      terminalCanonicalMessageCount: messages.length,
+      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+      nativeCwd: "/workspace",
+      nativeLastModified: 10,
+      nativeContextTokens: 100,
+      nativeContextMaxTokens: 1_000,
+      lastModelSpecifier: "claude-code/sonnet",
+      lastReasoning: "medium",
+    }),
+  );
+  expect(
+    promoteNamedBinding(store, {
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: sessionId,
+      requestId,
+      attemptIndex: 0,
+    }),
+  ).toBe(true);
+}
+
+function expectCorruptBinding<T>(
+  result: ResultType<T, CoreClaudeBindingReadError | CoreClaudeAttemptMutationError>,
+  bindingKind: "named" | "primary",
+): void {
+  expect(result.status).toBe("error");
+  if (result.status === "ok") throw new Error("Expected corrupt binding failure");
+  switch (result.error._tag) {
+    case "CoreClaudeBindingCorrupt":
+      expect(result.error.bindingKind).toBe(bindingKind);
+      return;
+    case "TranscriptTransactionConflict":
+    case "TranscriptStoreSqliteDriverFailure":
+      throw result.error;
+  }
 }
 
 function downgradePrimaryBindingSchemaToV4(dbPath: string, corruptHead = false): void {
@@ -824,7 +1006,9 @@ describe("SqliteTranscriptStore", () => {
       }
     }
     expect(() =>
-      store.deleteUnlinkedCheckpointCandidate({ requestId: "panic-checkpoint" }),
+      store.deleteUnlinkedCheckpointCandidate({
+        requestId: "panic-checkpoint",
+      }),
     ).toThrow(callbackPanic);
 
     expect(
@@ -1405,7 +1589,7 @@ describe("SqliteTranscriptStore", () => {
     downgradePrimaryBindingSchemaToV4(dbPath);
 
     const migrated = new SqliteTranscriptStore(dbPath);
-    const binding = migrated.getCorePrimaryClaudeSessionBinding({
+    const binding = getPrimaryBinding(migrated, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: "v4-session",
@@ -1464,7 +1648,7 @@ describe("SqliteTranscriptStore", () => {
 
     const migrated = new SqliteTranscriptStore(dbPath);
     expect(
-      migrated.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(migrated, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: "v4-stale-session",
@@ -1494,7 +1678,7 @@ describe("SqliteTranscriptStore", () => {
       stableNamedRequestClient: "discord",
     });
     const firstCandidate = crypto.randomUUID();
-    store.reserveCoreNamedClaudeSessionAttempt({
+    reserveNamedAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -1535,7 +1719,7 @@ describe("SqliteTranscriptStore", () => {
       lastReasoning: "low",
     });
     expect(
-      store.promoteCoreNamedClaudeSessionBinding({
+      promoteNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1543,7 +1727,7 @@ describe("SqliteTranscriptStore", () => {
         attemptIndex: 0,
       }),
     ).toBe(true);
-    const base = store.getCoreNamedClaudeSessionBinding({
+    const base = getNamedBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -1552,7 +1736,7 @@ describe("SqliteTranscriptStore", () => {
     expect(base?.revision).toBe(1);
 
     const reserveCompeting = (requestId: string, candidateSessionId: string) =>
-      store.reserveCoreNamedClaudeSessionAttempt({
+      reserveNamedAttempt(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1598,7 +1782,7 @@ describe("SqliteTranscriptStore", () => {
       });
     }
     expect(
-      store.promoteCoreNamedClaudeSessionBinding({
+      promoteNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1607,7 +1791,7 @@ describe("SqliteTranscriptStore", () => {
       }),
     ).toBe(true);
     expect(
-      store.promoteCoreNamedClaudeSessionBinding({
+      promoteNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1644,7 +1828,7 @@ describe("SqliteTranscriptStore", () => {
       requestClient: "unknown",
       messages: terminal,
     });
-    first.reserveCoreNamedClaudeSessionAttempt({
+    reserveNamedAttempt(first, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -1673,7 +1857,7 @@ describe("SqliteTranscriptStore", () => {
       lastModelSpecifier: "claude-code/sonnet",
       lastReasoning: "medium",
     });
-    first.reserveCoreNamedClaudeSessionAttempt({
+    reserveNamedAttempt(first, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: "sub:parent:named:crashed",
@@ -1695,7 +1879,7 @@ describe("SqliteTranscriptStore", () => {
 
     const recovered = new SqliteTranscriptStore(dbPath);
     expect(
-      recovered.getCoreNamedClaudeSessionBinding({
+      getNamedBinding(recovered, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1725,7 +1909,7 @@ describe("SqliteTranscriptStore", () => {
     raw.run("DELETE FROM request_transcripts WHERE request_id = ?", ["succeeded-pending"]);
     raw.close();
     expect(
-      recovered.getCoreNamedClaudeSessionBinding({
+      getNamedBinding(recovered, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1740,7 +1924,7 @@ describe("SqliteTranscriptStore", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage5-"));
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
-    store.reserveCoreNamedClaudeSessionAttempt({
+    reserveNamedAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: "sub:parent:named:bounded",
@@ -1753,7 +1937,7 @@ describe("SqliteTranscriptStore", () => {
       expectedBindingRevision: null,
     });
     for (let attemptIndex = 0; attemptIndex < 40; attemptIndex += 1) {
-      store.reserveCoreNamedClaudeSessionAttempt({
+      reserveNamedAttempt(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: "sub:parent:named:bounded",
@@ -1765,7 +1949,7 @@ describe("SqliteTranscriptStore", () => {
         sourceSessionId: null,
         expectedBindingRevision: null,
       });
-      store.recordCoreNamedClaudeSessionAttemptOutcome({
+      recordNamedAttemptOutcome(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: "sub:parent:named:bounded",
@@ -1802,7 +1986,7 @@ describe("SqliteTranscriptStore", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage5-"));
     const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
     const sessionId = "sub:parent:named:save-failure";
-    store.reserveCoreNamedClaudeSessionAttempt({
+    reserveNamedAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -1814,26 +1998,28 @@ describe("SqliteTranscriptStore", () => {
       sourceSessionId: null,
       expectedBindingRevision: null,
     });
-    expect(() =>
-      store.publishCoreNamedClaudeSuccess({
-        providerId: "claude-code",
-        requestClient: "discord",
-        lilacSessionId: sessionId,
-        requestId: "missing-terminal",
-        attemptIndex: 0,
-        terminalRequestId: "missing-terminal",
-        terminalCanonicalHeadHash: "not-saved",
-        terminalCanonicalMessageCount: 2,
-        providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
-        nativeCwd: "/workspace",
-        nativeLastModified: 10,
-        nativeContextTokens: 100,
-        nativeContextMaxTokens: 1_000,
-        lastModelSpecifier: "claude-code/sonnet",
-        lastReasoning: "medium",
-      }),
-    ).toThrow("failed publication verification");
-    store.recordCoreNamedClaudeSessionAttemptOutcome({
+    expect(
+      resultError(
+        store.publishCoreNamedClaudeSuccess({
+          providerId: "claude-code",
+          requestClient: "discord",
+          lilacSessionId: sessionId,
+          requestId: "missing-terminal",
+          attemptIndex: 0,
+          terminalRequestId: "missing-terminal",
+          terminalCanonicalHeadHash: "not-saved",
+          terminalCanonicalMessageCount: 2,
+          providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+          nativeCwd: "/workspace",
+          nativeLastModified: 10,
+          nativeContextTokens: 100,
+          nativeContextMaxTokens: 1_000,
+          lastModelSpecifier: "claude-code/sonnet",
+          lastReasoning: "medium",
+        }),
+      ).message,
+    ).toContain("failed publication verification");
+    recordNamedAttemptOutcome(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -1842,7 +2028,7 @@ describe("SqliteTranscriptStore", () => {
       state: "failed",
     });
     expect(
-      store.getCoreNamedClaudeSessionBinding({
+      getNamedBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -1862,7 +2048,7 @@ describe("SqliteTranscriptStore", () => {
       { role: "user", content: "publish" },
       { role: "assistant", content: "candidate" },
     ] satisfies ModelMessage[];
-    store.reserveCoreNamedClaudeSessionAttempt({
+    reserveNamedAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -1937,7 +2123,7 @@ describe("SqliteTranscriptStore", () => {
       END;
     `);
     fence.close();
-    expect(() => store.publishCoreNamedClaudeSuccess(publicationInput)).toThrow(
+    expect(resultError(store.publishCoreNamedClaudeSuccess(publicationInput)).message).toContain(
       "lost its unmarked fence",
     );
     expect(getRequestTranscript(store, { requestId })?.providerState).toBeNull();
@@ -2067,7 +2253,7 @@ describe("SqliteTranscriptStore", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage6-"));
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
-    const blob = store.putCoreOwnedBlob({
+    const blob = putCoreOwnedBlob(store, {
       bytes: new TextEncoder().encode("owned attachment"),
       mediaType: "text/plain",
       filename: "attachment.txt",
@@ -2138,18 +2324,20 @@ describe("SqliteTranscriptStore", () => {
       END;
     `);
 
-    expect(() =>
-      store.admitCoreSurfaceProjection({
-        requestClient: "discord",
-        surfaceId: "discord:rollback",
-        sessionId: "rollback",
-        messageId: "discarded",
-        projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
-        canonicalMessages: [{ role: "user", content: "discard me" }],
-        sourceFacts: {},
-        ownedBlobs: [],
-      }),
-    ).toThrow("was not retained");
+    expect(
+      resultError(
+        store.admitCoreSurfaceProjection({
+          requestClient: "discord",
+          surfaceId: "discord:rollback",
+          sessionId: "rollback",
+          messageId: "discarded",
+          projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+          canonicalMessages: [{ role: "user", content: "discard me" }],
+          sourceFacts: {},
+          ownedBlobs: [],
+        }),
+      ).message,
+    ).toContain("was not retained");
     expect(
       raw
         .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM projection_admission_audit")
@@ -2170,12 +2358,12 @@ describe("SqliteTranscriptStore", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-retention-"));
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
-    const retainedBlob = store.putCoreOwnedBlob({
+    const retainedBlob = putCoreOwnedBlob(store, {
       bytes: new TextEncoder().encode("retained"),
       mediaType: "text/plain",
       filename: "retained.txt",
     });
-    const orphanBlob = store.putCoreOwnedBlob({
+    const orphanBlob = putCoreOwnedBlob(store, {
       bytes: new TextEncoder().encode("orphan"),
       mediaType: "text/plain",
       filename: "orphan.txt",
@@ -2193,7 +2381,7 @@ describe("SqliteTranscriptStore", () => {
       sourceFacts: {},
       ownedBlobs: [retainedBlob],
     });
-    expect(store.getCoreRetentionDiagnostics()).toMatchObject({
+    expect(getCoreRetentionDiagnostics(store)).toMatchObject({
       unreferencedProjectionCount: 1,
       ownedBlobBytes: retainedBlob.byteLength + orphanBlob.byteLength,
       unreferencedOwnedBlobCount: 1,
@@ -2211,10 +2399,13 @@ describe("SqliteTranscriptStore", () => {
         byteLength: retainedBlob.byteLength,
       },
     ]);
-    expect(reopened.getCoreOwnedBlob({ sha256: orphanBlob.sha256 }).sha256).toBe(orphanBlob.sha256);
+    expect(getCoreOwnedBlob(reopened, { sha256: orphanBlob.sha256 }).sha256).toBe(
+      orphanBlob.sha256,
+    );
     expect(reopened.deleteCoreOwnedBlobIfUnreferenced({ sha256: orphanBlob.sha256 })).toBe(true);
-    expect(() => reopened.getCoreOwnedBlob({ sha256: orphanBlob.sha256 })).toThrow("is missing");
-    expect(reopened.getCoreRetentionDiagnostics()).toMatchObject({
+    const missingBlob = reopened.getCoreOwnedBlob({ sha256: orphanBlob.sha256 });
+    expect(missingBlob.status).toBe("error");
+    expect(getCoreRetentionDiagnostics(reopened)).toMatchObject({
       unreferencedProjectionCount: 1,
       ownedBlobBytes: retainedBlob.byteLength,
       unreferencedOwnedBlobCount: 0,
@@ -2251,7 +2442,7 @@ describe("SqliteTranscriptStore", () => {
       projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
     } as const;
     const first = new SqliteTranscriptStore(dbPath);
-    const blob = first.putCoreOwnedBlob({
+    const blob = putCoreOwnedBlob(first, {
       bytes: originalBytes,
       mediaType: "text/plain",
       filename: "blob.txt",
@@ -2355,12 +2546,14 @@ describe("SqliteTranscriptStore", () => {
     const replacementMessages = [
       { role: "assistant", content: "different projection" },
     ] satisfies ModelMessage[];
-    expect(() =>
-      store.saveCorePrimaryLineageManifest({
-        requestId: "destination",
-        manifest: manifestFor([atom], replacementMessages, [requestAlias]),
-      }),
-    ).toThrow("is immutable");
+    expect(
+      resultError(
+        store.saveCorePrimaryLineageManifest({
+          requestId: "destination",
+          manifest: manifestFor([atom], replacementMessages, [requestAlias]),
+        }),
+      ).message,
+    ).toContain("is immutable");
 
     store.saveRequestTranscript({
       requestId: "provider-mismatch",
@@ -2368,32 +2561,36 @@ describe("SqliteTranscriptStore", () => {
       requestClient: "discord",
       messages: sourceMessages,
     });
-    expect(() =>
-      store.saveCorePrimaryLineageManifest({
-        requestId: "provider-mismatch",
-        manifest: manifestFor(
-          [
-            {
-              ...atom,
-              providerFamily: "ai-sdk",
-              containsCrossFamilyTurns: false,
-            },
-          ],
-          sourceMessages,
-          [requestAlias],
-        ),
-      }),
-    ).toThrow("stale-request-provider-lineage");
+    expect(
+      resultError(
+        store.saveCorePrimaryLineageManifest({
+          requestId: "provider-mismatch",
+          manifest: manifestFor(
+            [
+              {
+                ...atom,
+                providerFamily: "ai-sdk",
+                containsCrossFamilyTurns: false,
+              },
+            ],
+            sourceMessages,
+            [requestAlias],
+          ),
+        }),
+      ).message,
+    ).toContain("stale-request-provider-lineage");
 
-    expect(() =>
-      store.saveRequestTranscript({
-        requestId: "wrong-scope",
-        sessionId: "other-session",
-        requestClient: "discord",
-        messages: sourceMessages,
-        corePrimaryLineage: manifest,
-      }),
-    ).toThrow("stale-request-lineage");
+    expect(
+      resultError(
+        store.saveRequestTranscript({
+          requestId: "wrong-scope",
+          sessionId: "other-session",
+          requestClient: "discord",
+          messages: sourceMessages,
+          corePrimaryLineage: manifest,
+        }),
+      ).message,
+    ).toContain("stale-request-lineage");
     expect(getRequestTranscript(store, { requestId: "wrong-scope" })).toBeNull();
 
     const ordinaryMessages = [
@@ -2405,26 +2602,28 @@ describe("SqliteTranscriptStore", () => {
       requestClient: "discord",
       messages: ordinaryMessages,
     });
-    expect(() =>
-      store.saveRequestTranscript({
-        requestId: "invalid-checkpoint-owner",
-        sessionId: "session",
-        requestClient: "discord",
-        messages: ordinaryMessages,
-        corePrimaryLineage: buildCoreLineageManifestV1([
-          {
-            atoms: [
-              {
-                kind: "checkpoint",
-                requestId: "ordinary",
-                transcriptDigest: hashCanonicalMessagesV1(ordinaryMessages).hash,
-              },
-            ],
-            canonicalMessages: ordinaryMessages,
-          },
-        ]),
-      }),
-    ).toThrow("stale-checkpoint-lineage");
+    expect(
+      resultError(
+        store.saveRequestTranscript({
+          requestId: "invalid-checkpoint-owner",
+          sessionId: "session",
+          requestClient: "discord",
+          messages: ordinaryMessages,
+          corePrimaryLineage: buildCoreLineageManifestV1([
+            {
+              atoms: [
+                {
+                  kind: "checkpoint",
+                  requestId: "ordinary",
+                  transcriptDigest: hashCanonicalMessagesV1(ordinaryMessages).hash,
+                },
+              ],
+              canonicalMessages: ordinaryMessages,
+            },
+          ]),
+        }),
+      ).message,
+    ).toContain("stale-checkpoint-lineage");
 
     store.saveRequestTranscript({
       requestId: "unlinked-checkpoint",
@@ -2445,29 +2644,33 @@ describe("SqliteTranscriptStore", () => {
         canonicalMessages: ordinaryMessages,
       },
     ]);
-    expect(() =>
-      store.saveRequestTranscript({
-        requestId: "unlinked-checkpoint-owner",
-        sessionId: "session",
-        requestClient: "discord",
-        messages: ordinaryMessages,
-        corePrimaryLineage: checkpointManifest,
-      }),
-    ).toThrow("stale-checkpoint-lineage");
+    expect(
+      resultError(
+        store.saveRequestTranscript({
+          requestId: "unlinked-checkpoint-owner",
+          sessionId: "session",
+          requestClient: "discord",
+          messages: ordinaryMessages,
+          corePrimaryLineage: checkpointManifest,
+        }),
+      ).message,
+    ).toContain("stale-checkpoint-lineage");
     store.linkSurfaceMessagesToRequest({
       requestId: "unlinked-checkpoint",
       created: [{ platform: "discord", channelId: "other-session", messageId: "wrong-output" }],
       last: { platform: "discord", channelId: "other-session", messageId: "wrong-output" },
     });
-    expect(() =>
-      store.saveRequestTranscript({
-        requestId: "wrong-scope-checkpoint-owner",
-        sessionId: "session",
-        requestClient: "discord",
-        messages: ordinaryMessages,
-        corePrimaryLineage: checkpointManifest,
-      }),
-    ).toThrow("stale-checkpoint-lineage");
+    expect(
+      resultError(
+        store.saveRequestTranscript({
+          requestId: "wrong-scope-checkpoint-owner",
+          sessionId: "session",
+          requestClient: "discord",
+          messages: ordinaryMessages,
+          corePrimaryLineage: checkpointManifest,
+        }),
+      ).message,
+    ).toContain("stale-checkpoint-lineage");
 
     store.close();
     await fs.rm(dir, { recursive: true, force: true });
@@ -2497,7 +2700,7 @@ describe("SqliteTranscriptStore", () => {
       created: [checkpointOutputRef],
       last: checkpointOutputRef,
     });
-    const blob = store.putCoreOwnedBlob({
+    const blob = putCoreOwnedBlob(store, {
       bytes: new TextEncoder().encode("retained"),
       mediaType: "text/plain",
       filename: "retained.txt",
@@ -2614,7 +2817,7 @@ describe("SqliteTranscriptStore", () => {
       containsCrossFamilyTurns: false,
     } as const;
     const candidateSessionId = crypto.randomUUID();
-    store.reserveCorePrimaryClaudeSessionAttempt({
+    reservePrimaryAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -2663,7 +2866,7 @@ describe("SqliteTranscriptStore", () => {
     });
     expect(store.listSurfaceMessagesForRequest({ requestId: "primary-1" })).toEqual([]);
     expect(
-      store.promoteCorePrimaryClaudeSessionBinding({
+      promotePrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2672,7 +2875,7 @@ describe("SqliteTranscriptStore", () => {
       }),
     ).toBe(true);
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2689,14 +2892,14 @@ describe("SqliteTranscriptStore", () => {
       providerState,
     );
 
-    const clean = store.getCorePrimaryClaudeSessionBinding({
+    const clean = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
     if (!clean) throw new Error("clean binding missing");
     const reservePublished = (requestId: string) => {
-      store.reserveCorePrimaryClaudeSessionAttempt({
+      reservePrimaryAttempt(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2747,7 +2950,7 @@ describe("SqliteTranscriptStore", () => {
     reservePublished("primary-winner");
     reservePublished("primary-stale");
     expect(
-      store.promoteCorePrimaryClaudeSessionBinding({
+      promotePrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2756,7 +2959,7 @@ describe("SqliteTranscriptStore", () => {
       }),
     ).toBe(true);
     expect(
-      store.promoteCorePrimaryClaudeSessionBinding({
+      promotePrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2774,7 +2977,7 @@ describe("SqliteTranscriptStore", () => {
       })?.state,
     ).toBe("failed");
 
-    const current = store.getCorePrimaryClaudeSessionBinding({
+    const current = getPrimaryBinding(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -2788,27 +2991,27 @@ describe("SqliteTranscriptStore", () => {
     corrupt.close();
     store.close();
     const lazyVerification = new SqliteTranscriptStore(dbPath);
-    expect(lazyVerification.getCoreRetentionDiagnostics()).toMatchObject({
+    expect(getCoreRetentionDiagnostics(lazyVerification)).toMatchObject({
       primaryBindingCount: 1,
       unverifiablePrimaryBindingCount: 0,
     });
-    const retiredBinding = lazyVerification.getCorePrimaryClaudeSessionBinding({
+    const unreadableBinding = lazyVerification.getCorePrimaryClaudeSessionBinding({
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
-    expect(retiredBinding).toBeNull();
-    expect(
-      selectCorePrimaryClaudePrefix({
-        lineage: manifest,
-        canonicalMessages: inputMessages,
-        binding: retiredBinding,
-        executionScopeHash: "scope",
-        executionCwd: "/workspace",
-      }),
-    ).toEqual({ mode: "fresh", reason: "missing-binding" });
-    expect(lazyVerification.getCoreRetentionDiagnostics()).toMatchObject({
-      primaryBindingCount: 0,
+    expect(unreadableBinding.status).toBe("error");
+    if (unreadableBinding.status === "error") {
+      switch (unreadableBinding.error._tag) {
+        case "CoreClaudeBindingCorrupt":
+          expect(unreadableBinding.error.bindingKind).toBe("primary");
+          break;
+        case "TranscriptStoreSqliteDriverFailure":
+          throw unreadableBinding.error;
+      }
+    }
+    expect(getCoreRetentionDiagnostics(lazyVerification)).toMatchObject({
+      primaryBindingCount: 1,
       unverifiablePrimaryBindingCount: 0,
       orphanSucceededAttemptCount: 0,
     });
@@ -2841,12 +3044,12 @@ describe("SqliteTranscriptStore", () => {
     const first = new SqliteTranscriptStore(dbPath);
     const publishPending = (requestId: string, expectedBindingRevision: number | null) => {
       const candidateSessionId = crypto.randomUUID();
-      const binding = first.getCorePrimaryClaudeSessionBinding({
+      const binding = getPrimaryBinding(first, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
       });
-      first.reserveCorePrimaryClaudeSessionAttempt({
+      reservePrimaryAttempt(first, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2897,7 +3100,7 @@ describe("SqliteTranscriptStore", () => {
       return candidateSessionId;
     };
     const recoveredCandidate = publishPending("recover-pending", null);
-    first.reserveCorePrimaryClaudeSessionAttempt({
+    reservePrimaryAttempt(first, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: "crashed-owner",
@@ -2913,14 +3116,14 @@ describe("SqliteTranscriptStore", () => {
 
     const recovered = new SqliteTranscriptStore(dbPath);
     expect(
-      recovered.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(recovered, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
       })?.claudeSessionId,
     ).toBe(recoveredCandidate);
     expect(
-      recovered.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(recovered, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -2955,7 +3158,7 @@ describe("SqliteTranscriptStore", () => {
       lastFamily: "claude-code",
       containsCrossFamilyTurns: false,
     } as const;
-    first.reserveCorePrimaryClaudeSessionAttempt({
+    reservePrimaryAttempt(first, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3047,7 +3250,7 @@ describe("SqliteTranscriptStore", () => {
     const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(inputMessages)]);
     const response = [{ role: "assistant", content: "candidate" }] satisfies ModelMessage[];
     const candidateSessionId = crypto.randomUUID();
-    store.reserveCorePrimaryClaudeSessionAttempt({
+    reservePrimaryAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3114,7 +3317,7 @@ describe("SqliteTranscriptStore", () => {
     }
     expect(getRequestTranscript(store, { requestId: "atomic-primary" })?.providerState).toBeNull();
     expect(
-      store.getCorePrimaryClaudeSessionBinding({
+      getPrimaryBinding(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3133,7 +3336,7 @@ describe("SqliteTranscriptStore", () => {
       END;
     `);
     fence.close();
-    expect(() => store.publishCorePrimaryClaudeSuccess(publicationInput)).toThrow(
+    expect(resultError(store.publishCorePrimaryClaudeSuccess(publicationInput)).message).toContain(
       "lost its unmarked fence",
     );
     expect(getRequestTranscript(store, { requestId: "atomic-primary" })?.providerState).toBeNull();
@@ -3146,7 +3349,7 @@ describe("SqliteTranscriptStore", () => {
         attemptIndex: 0,
       })?.state,
     ).toBe("active");
-    store.recordCorePrimaryClaudeSessionAttemptOutcome({
+    recordPrimaryAttemptOutcome(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3154,7 +3357,7 @@ describe("SqliteTranscriptStore", () => {
       attemptIndex: 0,
       state: "failed",
     });
-    store.reserveCorePrimaryClaudeSessionAttempt({
+    reservePrimaryAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
       lilacSessionId: sessionId,
@@ -3168,7 +3371,7 @@ describe("SqliteTranscriptStore", () => {
     });
 
     for (let attemptIndex = 1; attemptIndex <= 40; attemptIndex += 1) {
-      store.reserveCorePrimaryClaudeSessionAttempt({
+      reservePrimaryAttempt(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3180,7 +3383,7 @@ describe("SqliteTranscriptStore", () => {
         sourceSessionId: null,
         expectedBindingRevision: null,
       });
-      store.recordCorePrimaryClaudeSessionAttemptOutcome({
+      recordPrimaryAttemptOutcome(store, {
         providerId: "claude-code",
         requestClient: "discord",
         lilacSessionId: sessionId,
@@ -3209,6 +3412,227 @@ describe("SqliteTranscriptStore", () => {
         .get(sessionId),
     ).toEqual({ state: "active" });
     retained.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("keeps corrupt named and primary bindings as immutable reservation fences", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-corrupt-binding-fences-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+    const namedSessionId = "corrupt-named-fence";
+    const primarySessionId = "corrupt-primary-fence";
+    seedNamedBinding(store, "named-fence-head", namedSessionId);
+    seedPrimaryBinding(store, "primary-fence-head", primarySessionId);
+
+    const mutation = new Database(dbPath);
+    mutation.run(
+      `UPDATE core_named_claude_bindings SET canonical_head_hash = 'corrupt'
+       WHERE session_id = ?`,
+      [namedSessionId],
+    );
+    mutation.run(
+      `UPDATE core_primary_claude_bindings SET prefix_digest = 'corrupt'
+       WHERE session_id = ?`,
+      [primarySessionId],
+    );
+
+    expectCorruptBinding(
+      store.getCoreNamedClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: namedSessionId,
+      }),
+      "named",
+    );
+    expectCorruptBinding(
+      store.reserveCoreNamedClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: namedSessionId,
+        executionScopeHashVersion: 1,
+        executionScopeHash: "scope",
+        requestId: "named-fence-reserve",
+        attemptIndex: 0,
+        candidateSessionId: crypto.randomUUID(),
+        sourceSessionId: null,
+        expectedBindingRevision: null,
+      }),
+      "named",
+    );
+    expectCorruptBinding(
+      store.promoteCoreNamedClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: namedSessionId,
+        requestId: "named-fence-head",
+        attemptIndex: 0,
+      }),
+      "named",
+    );
+
+    expectCorruptBinding(
+      store.getCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: primarySessionId,
+      }),
+      "primary",
+    );
+    expectCorruptBinding(
+      store.reserveCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: primarySessionId,
+        executionScopeHashVersion: 1,
+        executionScopeHash: "scope",
+        requestId: "primary-fence-reserve",
+        attemptIndex: 0,
+        candidateSessionId: crypto.randomUUID(),
+        sourceSessionId: null,
+        expectedBindingRevision: null,
+      }),
+      "primary",
+    );
+    expectCorruptBinding(
+      store.promoteCorePrimaryClaudeSessionBinding({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: primarySessionId,
+        requestId: "primary-fence-head",
+        attemptIndex: 0,
+      }),
+      "primary",
+    );
+
+    expect(
+      mutation
+        .query<{ canonical_head_hash: string }, [string]>(
+          "SELECT canonical_head_hash FROM core_named_claude_bindings WHERE session_id = ?",
+        )
+        .get(namedSessionId),
+    ).toEqual({ canonical_head_hash: "corrupt" });
+    expect(
+      mutation
+        .query<{ prefix_digest: string }, [string]>(
+          "SELECT prefix_digest FROM core_primary_claude_bindings WHERE session_id = ?",
+        )
+        .get(primarySessionId),
+    ).toEqual({ prefix_digest: "corrupt" });
+    expect(
+      mutation
+        .query<{ count: number }, [string, string]>(
+          `SELECT COUNT(*) AS count FROM core_named_claude_attempts
+           WHERE session_id = ? AND request_id = ?`,
+        )
+        .get(namedSessionId, "named-fence-reserve"),
+    ).toEqual({ count: 0 });
+    expect(
+      mutation
+        .query<{ count: number }, [string, string]>(
+          `SELECT COUNT(*) AS count FROM core_primary_claude_attempts
+           WHERE session_id = ? AND request_id = ?`,
+        )
+        .get(primarySessionId, "primary-fence-reserve"),
+    ).toEqual({ count: 0 });
+    expect(
+      mutation
+        .query<{ state: string }, [string, string]>(
+          `SELECT state FROM core_named_claude_attempts
+           WHERE session_id = ? AND request_id = ?`,
+        )
+        .get(namedSessionId, "named-fence-head"),
+    ).toEqual({ state: "succeeded" });
+    expect(
+      mutation
+        .query<{ state: string }, [string, string]>(
+          `SELECT state FROM core_primary_claude_attempts
+           WHERE session_id = ? AND request_id = ?`,
+        )
+        .get(primarySessionId, "primary-fence-head"),
+    ).toEqual({ state: "succeeded" });
+
+    mutation.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("rolls back a reserved named attempt when retention pruning fails", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-named-reserve-atomicity-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+    const owner = {
+      providerId: "claude-code",
+      requestClient: "discord" as const,
+      lilacSessionId: "named-reserve-atomicity",
+      executionScopeHashVersion: 1 as const,
+      executionScopeHash: "scope",
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    };
+    for (let attemptIndex = 0; attemptIndex < 32; attemptIndex += 1) {
+      reserveNamedAttempt(store, {
+        ...owner,
+        requestId: `terminal-${attemptIndex}`,
+        attemptIndex,
+        candidateSessionId: crypto.randomUUID(),
+      });
+      recordNamedAttemptOutcome(store, {
+        providerId: owner.providerId,
+        requestClient: owner.requestClient,
+        lilacSessionId: owner.lilacSessionId,
+        requestId: `terminal-${attemptIndex}`,
+        attemptIndex,
+        state: "failed",
+      });
+    }
+
+    const mutation = new Database(dbPath);
+    mutation.run(
+      `INSERT INTO core_named_claude_attempts
+       SELECT product, request_client, session_id, provider_id, source_terminal_request_id,
+              source_canonical_head_hash, source_canonical_message_count,
+              execution_scope_hash_version, execution_scope_hash, 'overflow', 100,
+              candidate_session_id, source_session_id, expected_binding_revision, state,
+              terminal_request_id, terminal_canonical_head_hash,
+              terminal_canonical_message_count, native_cwd, native_last_modified,
+              native_context_tokens, native_context_max_tokens, last_model_specifier,
+              last_reasoning, created_ts, updated_ts
+       FROM core_named_claude_attempts LIMIT 1`,
+    );
+    mutation.run(`
+      CREATE TRIGGER fail_named_attempt_prune
+      BEFORE DELETE ON core_named_claude_attempts
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated retention prune failure');
+      END
+    `);
+
+    const failedReservation = store.reserveCoreNamedClaudeSessionAttempt({
+      ...owner,
+      requestId: "must-roll-back",
+      attemptIndex: 101,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    expect(failedReservation.status).toBe("error");
+    if (failedReservation.status === "error") {
+      switch (failedReservation.error._tag) {
+        case "TranscriptTransactionConflict":
+          throw new Error(`Unexpected transaction conflict: ${failedReservation.error.reason}`);
+        case "TranscriptStoreSqliteDriverFailure":
+          expect(failedReservation.error.code).toBe("SQLITE_CONSTRAINT_TRIGGER");
+          break;
+      }
+    }
+    expect(
+      mutation
+        .query<{ count: number }, []>(
+          "SELECT COUNT(*) AS count FROM core_named_claude_attempts WHERE request_id = 'must-roll-back'",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
+
+    mutation.close();
+    store.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
 });

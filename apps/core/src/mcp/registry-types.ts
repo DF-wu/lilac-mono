@@ -5,7 +5,7 @@ import type { Result } from "better-result";
 import type { CatalogToolIdentity } from "./catalog-identity";
 import type { McpServerDefinition, McpTransportConfig } from "./config-types";
 import type { McpConfigFileResult } from "./config-file";
-import type { McpRegistryReloadError } from "./registry";
+import type { McpRegistryReloadFailure, McpRegistryStateError } from "./registry";
 import type { McpValueResolutionContext } from "./value-source";
 
 export type McpRegistryPhase = "configuration" | "connection" | "discovery" | "runtime";
@@ -94,6 +94,7 @@ export type McpRegistryDependencies = {
 
 export type McpRegistryOptions = {
   readonly configPath: string;
+  readonly reportFatalError: (error: Error) => void;
   readonly initDeadlineMs?: number;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly readTextFile?: (filePath: string) => Promise<string>;
@@ -102,8 +103,8 @@ export type McpRegistryOptions = {
 
 export interface McpRegistryApi {
   init(): Promise<void>;
-  waitUntilInitialized?(): Promise<void>;
-  reload(serverId?: string): Promise<Result<readonly McpReloadOutcome[], McpRegistryReloadError>>;
+  waitUntilInitialized?(): Promise<Result<void, McpRegistryStateError>>;
+  reload(serverId?: string): Promise<Result<readonly McpReloadOutcome[], McpRegistryReloadFailure>>;
   getConfigStatus?(): McpRegistryConfigStatus;
   list(): readonly McpServerStatus[];
   getTools(): readonly McpCatalogTool[];

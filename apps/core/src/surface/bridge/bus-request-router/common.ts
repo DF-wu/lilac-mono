@@ -3,9 +3,10 @@ import {
   getDiscordUserAliasValue,
   isPanic,
   isRecord,
-  parseCoreConfig,
+  parseCoreConfigResult,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 import { z } from "zod";
 
 import type { MsgRef } from "../../types";
@@ -240,13 +241,9 @@ export function bufferedPromptRequestIdForActiveRequest(activeRequestId: string)
 }
 
 export function parseDiscordMsgRefFromAdapterEvent(data: {
-  platform: string;
   channelId: string;
   messageId: string;
 }): MsgRef {
-  if (data.platform !== "discord") {
-    throw new Error(`Unsupported platform '${data.platform}'`);
-  }
   return {
     platform: "discord",
     channelId: data.channelId,
@@ -412,18 +409,22 @@ export function getDiscordFlags(raw: unknown): DiscordFlags {
 
 export type RouterConfigOverride = Record<string, unknown>;
 
-export async function withDefaultToolsConfig(config: RouterConfigOverride): Promise<CoreConfig> {
-  const parsed = await parseCoreConfig(config);
+export function withDefaultToolsConfig(
+  config: RouterConfigOverride,
+): ReturnType<typeof parseCoreConfigResult> {
+  const parsedResult = parseCoreConfigResult(config);
+  if (parsedResult.status === "error") return parsedResult;
+  const parsed = parsedResult.value;
   const agent = isRecord(config.agent) ? config.agent : {};
   const systemPrompt = typeof agent.systemPrompt === "string" ? agent.systemPrompt : "";
 
-  return {
+  return Result.ok({
     ...parsed,
     agent: {
       ...parsed.agent,
       systemPrompt,
     },
-  };
+  });
 }
 
 export type RouterAdapterMessage = EvtAdapterMessageCreatedData;

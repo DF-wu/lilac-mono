@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 import type { ModelMessage, UserContent } from "ai";
+import { Result, type Result as ResultType } from "better-result";
 import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import {
   buildCoreLineageManifestV1,
@@ -24,6 +25,7 @@ import {
 
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  type CoreOwnedBlobIntegrityError,
   type CoreOwnedBlobReference,
   type CoreSurfaceProjection,
   type TranscriptSnapshot,
@@ -32,6 +34,7 @@ import {
 import {
   appendDiscordAttachmentsToUserContent,
   createDiscordAttachmentState,
+  getDiscordAttachmentOwnershipError,
   getDiscordOwnedBlobReferences,
   takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
@@ -69,6 +72,17 @@ export type {
 
 const DISCORD_REFERENCE_TYPE_FORWARD = 1;
 const DISCORD_SURFACE_ID_PREFIX = "discord:";
+
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
+  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+  if (created.status === "ok") return created.value;
+  return {
+    state: "fresh-only",
+    lineageVersion: 1,
+    currentCanonicalStart: 0,
+    reason: "lineage-fallback-construction-failed",
+  };
+}
 
 type ProjectionCapableStore = TranscriptStore &
   Required<
@@ -300,18 +314,24 @@ async function composeSelectedDiscordChain(input: {
   currentMessageIds: readonly string[];
   transcriptStore?: TranscriptStore;
   discordUserAliasById?: ReadonlyMap<string, string>;
-}): Promise<{
-  messages: ModelMessage[];
-  mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-  corePrimaryLineage: CorePrimaryLineageV1;
-}> {
+}): Promise<
+  ResultType<
+    {
+      messages: ModelMessage[];
+      mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+      corePrimaryLineage: CorePrimaryLineageV1;
+    },
+    CoreOwnedBlobIntegrityError
+  >
+> {
   const projectionStore = isProjectionCapableStore(input.transcriptStore)
     ? input.transcriptStore
     : undefined;
   const attachmentState = createDiscordAttachmentState({
     ownBlob: projectionStore
-      ? ({ bytes, mediaType, filename }) =>
-          projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename })
+      ? ({ bytes, mediaType, filename }) => {
+          return projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename });
+        }
       : undefined,
   });
   try {
@@ -396,8 +416,8 @@ async function composeSelectedDiscordChain(input: {
           projectedByMessageId.set(messageId, stored.canonicalMessages);
           continue;
         }
-        const source = messageById.get(messageId);
-        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        // `merged` is derived from `immutableChain`, so every selected ID has this source entry.
+        const source = messageById.get(messageId)!;
         const candidate = await renderSurfaceProjectionCandidate({
           message: source,
           isBot: source.authorId === input.botUserId,
@@ -439,8 +459,7 @@ async function composeSelectedDiscordChain(input: {
       }
       for (const messageId of chunk.messageIds) {
         if (projections.get(messageId) || !projectionStore) continue;
-        const source = messageById.get(messageId);
-        if (!source) throw new Error(`Selected Discord message '${messageId}' was not found`);
+        const source = messageById.get(messageId)!;
         const segmentMessageIds = projectionSegmentIdsByMessageId.get(messageId) ?? [messageId];
         const segmentMessages = mergeProjectedSurfaceMessages(
           segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
@@ -577,7 +596,11 @@ async function composeSelectedDiscordChain(input: {
     );
     let corePrimaryLineage: CorePrimaryLineageV1;
     if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
-      corePrimaryLineage = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+      const built = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+      corePrimaryLineage =
+        built.status === "ok"
+          ? built.value
+          : createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart);
     } else {
       let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
       if (hasEmptyLineageSegment) {
@@ -589,16 +612,18 @@ async function composeSelectedDiscordChain(input: {
       } else {
         reason = "projection-store-unavailable";
       }
-      corePrimaryLineage = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+      corePrimaryLineage = createFreshOnlyLineage(reason, currentCanonicalStart);
     }
-    return {
+    const ownershipError = getDiscordAttachmentOwnershipError(attachmentState);
+    if (ownershipError) return Result.err(ownershipError);
+    return Result.ok({
       messages,
       mergedGroups: merged.map((chunk) => ({
         authorId: chunk.authorId,
         messageIds: [...chunk.messageIds],
       })),
       corePrimaryLineage,
-    };
+    });
   } finally {
     if (projectionStore) {
       for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
@@ -1235,21 +1260,17 @@ async function getReactionsByMessageId(input: {
 export async function composeRequestMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRequestOpts,
-): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
-  }
-
+): Promise<ResultType<RequestCompositionResult, CoreOwnedBlobIntegrityError>> {
   // Step 1: fetch reply chain from the adapter store / platform.
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
   if (!triggerMsg) {
-    return {
+    return Result.ok({
       messages: [],
       chainMessageIds: [],
       mergedGroups: [],
-      corePrimaryLineage: createCorePrimaryLineageFreshOnlyV1("empty-selection"),
-    };
+      corePrimaryLineage: createFreshOnlyLineage("empty-selection"),
+    });
   }
 
   const chain =
@@ -1271,7 +1292,7 @@ export async function composeRequestMessages(
         });
 
   const filteredChain = chain.filter((m) => {
-    const isChat = getDiscordIsChatFromRaw(m.raw);
+    const isChat = m.isChat;
     if (!(isChat ?? true)) return false;
     return !isDiscordSessionDividerText(m.text);
   });
@@ -1318,22 +1339,19 @@ export async function composeRequestMessages(
     discordUserAliasById: opts.discordUserAliasById,
   });
 
-  return {
-    messages: composed.messages,
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok({
+    messages: composed.value.messages,
     chainMessageIds: transformedChain.map((m) => m.messageId),
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: composed.value.mergedGroups,
+    corePrimaryLineage: composed.value.corePrimaryLineage,
+  });
 }
 
 export async function composeRecentChannelMessages(
   adapter: SurfaceAdapter,
   opts: ComposeRecentChannelMessagesOpts,
-): Promise<RequestCompositionResult> {
-  if (opts.platform !== "discord") {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
-  }
-
+): Promise<ResultType<RequestCompositionResult, CoreOwnedBlobIntegrityError>> {
   // Reply precedence: if the trigger is a Discord reply (even when the router
   // classified it as a "mention" trigger because it wasn't a reply-to-bot),
   // treat it as an explicit reply-chain continuation.
@@ -1419,12 +1437,13 @@ export async function composeRecentChannelMessages(
           discordUserAliasById: opts.discordUserAliasById,
         });
 
-        return {
-          messages: composed.messages,
+        if (composed.status === "error") return Result.err(composed.error);
+        return Result.ok({
+          messages: composed.value.messages,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
-          mergedGroups: composed.mergedGroups,
-          corePrimaryLineage: composed.corePrimaryLineage,
-        };
+          mergedGroups: composed.value.mergedGroups,
+          corePrimaryLineage: composed.value.corePrimaryLineage,
+        });
       }
     }
   }
@@ -1594,37 +1613,35 @@ export async function composeRecentChannelMessages(
     discordUserAliasById: opts.discordUserAliasById,
   });
 
-  return {
-    messages: composed.messages,
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok({
+    messages: composed.value.messages,
     chainMessageIds: chain.map((m) => m.messageId),
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: composed.value.mergedGroups,
+    corePrimaryLineage: composed.value.corePrimaryLineage,
+  });
 }
 
 export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<ModelMessage | null> {
+): Promise<ResultType<ModelMessage | null, CoreOwnedBlobIntegrityError>> {
   const composed = await composeSingleMessageWithLineage(adapter, opts);
-  return composed?.messages[0] ?? null;
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok(composed.value?.messages[0] ?? null);
 }
 
 export async function composeSingleMessageWithLineage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<RequestCompositionResult | null> {
-  if (opts.platform !== "discord") {
-    throw new Error(`Unsupported platform '${opts.platform}'`);
-  }
-
+): Promise<ResultType<RequestCompositionResult | null, CoreOwnedBlobIntegrityError>> {
   const m = await adapter.readMsg(opts.msgRef);
-  if (!m) return null;
+  if (!m) return Result.ok(null);
 
-  if (!shouldIncludeInModelContext(m)) return null;
+  if (!shouldIncludeInModelContext(m)) return Result.ok(null);
 
   // Never include session divider markers in model context.
-  if (isDiscordSessionDividerSurfaceMessageAnyAuthor(m)) return null;
+  if (isDiscordSessionDividerSurfaceMessageAnyAuthor(m)) return Result.ok(null);
 
   let text = m.text.trim().length > 0 ? m.text : (getForwardSnapshotTextFromRaw(m.raw) ?? m.text);
   const contentTransform = m.userId !== opts.botUserId ? opts.transformUserText : undefined;
@@ -1658,10 +1675,11 @@ export async function composeSingleMessageWithLineage(
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
   });
-  return {
-    messages: composed.messages,
+  if (composed.status === "error") return Result.err(composed.error);
+  return Result.ok({
+    messages: composed.value.messages,
     chainMessageIds: [m.ref.messageId],
-    mergedGroups: composed.mergedGroups,
-    corePrimaryLineage: composed.corePrimaryLineage,
-  };
+    mergedGroups: composed.value.mergedGroups,
+    corePrimaryLineage: composed.value.corePrimaryLineage,
+  });
 }

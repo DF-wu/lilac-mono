@@ -9,16 +9,19 @@ import {
 } from "./baseline.ts";
 import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
 import { failureFlowBaseline } from "./failure-flow.baseline.ts";
-import type { ArchitectureManifest } from "./manifest.ts";
+import type { ArchitectureManifest, WorkspaceArchitecture } from "./manifest.ts";
 import {
   architectureManifest,
   assertArchitectureManifestIntegrity,
+  PACKAGE_WIDE_ARCHITECTURE_RULES,
   zeroBaselineScopesByWorkspace,
 } from "./manifest.ts";
 import type { ArchitectureDiagnostic } from "./model.ts";
 import { ARCHITECTURE_RULES } from "./model.ts";
 import { createWorkspaceProgram, type WorkspaceProgram } from "./program.ts";
+import { assertStage7EnforcementPreflight } from "./stage7-preflight.ts";
 import { validateWorkspaceInventory } from "./workspace-inventory.ts";
+import { syntaxBaseline } from "../oxlint-plugins/syntax-baseline.mts";
 
 export type ProgramFactory = (
   repositoryRoot: string,
@@ -67,6 +70,7 @@ export function analyzeArchitecture(
         packageRoots,
         activeEventDeliveryApiPackages,
         activePersistenceInfrastructure,
+        manifest.approvedExceptionAdapters ?? [],
       ),
     );
   }
@@ -74,21 +78,30 @@ export function analyzeArchitecture(
 }
 
 export function inventoryManifest(manifest: ArchitectureManifest): ArchitectureManifest {
+  const inventoryRuleZones = (workspace: WorkspaceArchitecture) =>
+    Object.fromEntries(
+      ARCHITECTURE_RULES.map((rule) => [
+        rule,
+        PACKAGE_WIDE_ARCHITECTURE_RULES.has(rule)
+          ? [{ include: "**" }]
+          : (workspace.ruleZones[rule] ?? []),
+      ]),
+    );
+  if (manifest.approvedExceptionAdapters === undefined) {
+    return {
+      version: manifest.version,
+      workspaces: manifest.workspaces.map((workspace) => ({
+        ...workspace,
+        exceptionAdapters: [],
+        ruleZones: inventoryRuleZones(workspace),
+      })),
+    };
+  }
   return {
     ...manifest,
     workspaces: manifest.workspaces.map((workspace) => ({
       ...workspace,
-      ruleZones: Object.fromEntries(
-        ARCHITECTURE_RULES.map((rule) => [
-          rule,
-          rule === "architecture/open-protocol-normalization" ||
-          rule === "architecture/complete-tool-codec-registry" ||
-          rule === "architecture/result-decoder-contract" ||
-          rule === "architecture/unknown-free-module"
-            ? (workspace.ruleZones[rule] ?? [])
-            : [{ include: "**" }],
-        ]),
-      ),
+      ruleZones: inventoryRuleZones(workspace),
     })),
   };
 }
@@ -117,6 +130,10 @@ async function main(): Promise<void> {
     throw new Error(`Unknown architecture command: ${command}`);
   }
   await validateWorkspaceInventory(repositoryRoot);
+  assertStage7EnforcementPreflight(architectureManifest, {
+    semantic: [boundaryValidationBaseline, failureFlowBaseline],
+    syntax: syntaxBaseline,
+  });
   const manifest =
     command === "check" ? architectureManifest : inventoryManifest(architectureManifest);
   const findings = analyzeArchitecture(repositoryRoot, manifest);

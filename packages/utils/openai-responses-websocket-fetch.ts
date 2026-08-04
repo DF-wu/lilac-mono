@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
+
 import type { ResponsesTransportMode } from "./env";
-import { isRecord } from "./runtime-utils";
+import { isPanic, isRecord } from "./runtime-utils";
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
 const CONTINUATION_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -39,6 +42,50 @@ type ResponsesRequestBody = JsonObject & {
   previous_response_id?: JsonValue;
   store?: JsonValue;
 };
+
+const responsesRequestBodySchema: z.ZodType<ResponsesRequestBody> = z.record(z.string(), z.json());
+
+export class ResponsesRequestBodyInvalid extends TaggedError("ResponsesRequestBodyInvalid")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+export function decodeResponsesRequestBody(
+  text: string,
+): ResultType<ResponsesRequestBody, ResponsesRequestBodyInvalid> {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(text);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+    return Result.err(
+      new ResponsesRequestBodyInvalid({
+        cause,
+        message: "Responses request body is not valid JSON",
+      }),
+    );
+  }
+  const parsed = responsesRequestBodySchema.safeParse(decoded);
+  return parsed.success
+    ? Result.ok(parsed.data)
+    : Result.err(
+        new ResponsesRequestBodyInvalid({
+          cause: parsed.error,
+          message: "Responses request body is not a JSON object",
+        }),
+      );
+}
+
+export function projectResponsesStreamError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause));
+}
+
+export function signalResponsesStreamError<T>(
+  controller: ReadableStreamDefaultController<T>,
+  error: Error,
+): void {
+  controller.error(error);
+}
 
 type ResponsesContinuationCacheEntry = {
   requestShapeHash: string;
@@ -142,7 +189,9 @@ export function createOpenAIResponsesWebSocketFetch(
     if (!socket) return;
     try {
       socket.close();
-    } catch {}
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
+    }
   }
 
   function clearIdleCloseTimer(): void {
@@ -252,7 +301,7 @@ export function createOpenAIResponsesWebSocketFetch(
       try {
         socket = new WebSocketCtor(socketUrl, { headers });
       } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
+        reject(projectResponsesStreamError(error));
         return;
       }
 
@@ -356,12 +405,9 @@ export function createOpenAIResponsesWebSocketFetch(
       return forwardWithSseNormalization();
     }
 
-    let parsedBody: ResponsesRequestBody;
-    try {
-      parsedBody = parseJsonObject(encodedBody);
-    } catch {
-      return forwardWithSseNormalization();
-    }
+    const decodedBody = decodeResponsesRequestBody(encodedBody);
+    if (decodedBody.status === "error") return forwardWithSseNormalization();
+    const parsedBody = decodedBody.value;
 
     if (parsedBody.stream !== true) {
       return forwardWithSseNormalization();
@@ -477,7 +523,8 @@ export function createOpenAIResponsesWebSocketFetch(
             controller.enqueue(bytes);
             forwardedEventCount++;
             return true;
-          } catch {
+          } catch (cause) {
+            if (isPanic(cause)) throw cause;
             cleanup({ closeConnection: true });
             return false;
           }
@@ -529,48 +576,48 @@ export function createOpenAIResponsesWebSocketFetch(
             if (cleanedUp) return;
             if (!text) return;
 
-            let eventJson: Record<string, unknown>;
+            let eventJson: unknown;
             try {
-              eventJson = JSON.parse(text) as Record<string, unknown>;
-            } catch {
+              eventJson = JSON.parse(text);
+            } catch (cause) {
+              if (isPanic(cause)) throw cause;
               return;
             }
 
             const eventRecord = asRecord(eventJson);
-            if (eventRecord) {
-              responseTurnState ??= extractTurnState(eventRecord, options.turnStateHeaderName);
-              const nextResponseId = extractResponseId(eventRecord);
-              if (nextResponseId) {
-                responseId = nextResponseId;
-              }
-
-              updateOutputItemDraft(outputItemDrafts, eventRecord);
-              const doneItem = extractOutputItemDone(eventRecord);
-              if (doneItem) {
-                outputItems.push(mergeOutputItemDraft(doneItem, outputItemDrafts));
-              }
-              if (
-                options.turnStateHeaderName &&
-                readString(eventRecord.type) === "response.metadata"
-              ) {
-                return;
-              }
+            if (!eventRecord) return;
+            responseTurnState ??= extractTurnState(eventRecord, options.turnStateHeaderName);
+            const nextResponseId = extractResponseId(eventRecord);
+            if (nextResponseId) {
+              responseId = nextResponseId;
             }
 
-            const normalized = normalizeResponsesEvent(eventJson, normalizeEvent);
-
-            if (isPreviousResponseNotFoundError(normalized) && retryWithoutOptimization()) {
+            updateOutputItemDraft(outputItemDrafts, eventRecord);
+            const doneItem = extractOutputItemDone(eventRecord);
+            if (doneItem) {
+              outputItems.push(mergeOutputItemDraft(doneItem, outputItemDrafts));
+            }
+            const projectedEvent = projectResponsesEvent(eventRecord);
+            if (options.turnStateHeaderName && projectedEvent.type === "response.metadata") {
               return;
             }
 
-            const type = typeof normalized.type === "string" ? normalized.type : "";
+            const normalized = projectResponsesEvent(
+              normalizeResponsesEvent(eventRecord, normalizeEvent),
+            );
+
+            if (isPreviousResponseNotFoundError(normalized.record) && retryWithoutOptimization()) {
+              return;
+            }
+
+            const type = normalized.type;
             if (forwardedEventCount === 0 && isPreOutputMetadataEvent(type)) {
-              pendingPreOutputEvents.push(normalized);
+              pendingPreOutputEvents.push(normalized.record);
               return;
             }
 
             if (!flushPendingPreOutputEvents()) return;
-            if (!enqueueNormalizedEvent(normalized)) return;
+            if (!enqueueNormalizedEvent(normalized.record)) return;
 
             if (type === "error") {
               canPersistContinuation = false;
@@ -593,7 +640,8 @@ export function createOpenAIResponsesWebSocketFetch(
               }
               try {
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              } catch {
+              } catch (cause) {
+                if (isPanic(cause)) throw cause;
                 cleanup({ closeConnection: true });
                 return;
               }
@@ -603,7 +651,9 @@ export function createOpenAIResponsesWebSocketFetch(
               }
               try {
                 controller.close();
-              } catch {}
+              } catch (cause) {
+                if (isPanic(cause)) throw cause;
+              }
             }
           })().catch((error: unknown) => {
             canPersistContinuation = false;
@@ -612,8 +662,13 @@ export function createOpenAIResponsesWebSocketFetch(
               storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
             }
             try {
-              controller.error(error instanceof Error ? error : new Error(String(error)));
-            } catch {}
+              signalResponsesStreamError(
+                controller,
+                isPanic(error) ? error : projectResponsesStreamError(error),
+              );
+            } catch (cause) {
+              if (isPanic(cause)) throw cause;
+            }
           });
         };
 
@@ -623,7 +678,7 @@ export function createOpenAIResponsesWebSocketFetch(
           if (useReusableConnection) {
             storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
           }
-          controller.error(extractWebSocketError(event));
+          signalResponsesStreamError(controller, extractWebSocketError(event));
         };
 
         const onClose = () => {
@@ -633,16 +688,28 @@ export function createOpenAIResponsesWebSocketFetch(
             storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
           }
           try {
-            controller.error(new Error("WebSocket closed before a terminal response event"));
-          } catch {}
+            signalResponsesStreamError(
+              controller,
+              new Error("WebSocket closed before a terminal response event"),
+            );
+          } catch (cause) {
+            if (isPanic(cause)) throw cause;
+          }
         };
 
         const onAbort = () => {
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
           try {
-            controller.error(signal?.reason ?? new DOMException("Aborted", "AbortError"));
-          } catch {}
+            signalResponsesStreamError(
+              controller,
+              projectResponsesStreamError(
+                signal?.reason ?? new DOMException("Aborted", "AbortError"),
+              ),
+            );
+          } catch (cause) {
+            if (isPanic(cause)) throw cause;
+          }
         };
 
         connection.addEventListener("message", onMessage);
@@ -665,7 +732,7 @@ export function createOpenAIResponsesWebSocketFetch(
           if (useReusableConnection) {
             storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
           }
-          controller.error(error instanceof Error ? error : new Error(String(error)));
+          signalResponsesStreamError(controller, projectResponsesStreamError(error));
         }
       },
     });
@@ -811,15 +878,6 @@ function buildContinuationCacheEntry(input: {
 
 function continuationCacheKey(entry: ResponsesContinuationCacheEntry): string {
   return `${entry.requestShapeHash}:${entry.prefixHash}`;
-}
-
-function parseJsonObject(text: string): ResponsesRequestBody {
-  const parsed = JSON.parse(text) as unknown;
-  const record = asRecord(parsed);
-  if (!record) {
-    throw new Error("Request body is not a JSON object");
-  }
-  return cloneJsonObject(record);
 }
 
 function cloneJsonObject(value: Record<string, unknown>): JsonObject {
@@ -1262,8 +1320,8 @@ function stripCodexReplayIds(item: JsonObject): JsonObject {
   return cloned;
 }
 
-function asJsonArray(value: unknown): JsonValue[] | null {
-  return Array.isArray(value) ? (value as JsonValue[]) : null;
+function asJsonArray(value: JsonValue | undefined): JsonValue[] | null {
+  return Array.isArray(value) ? value : null;
 }
 
 function sliceJsonArrayPrefix(
@@ -1280,7 +1338,7 @@ function sliceJsonArrayPrefix(
 }
 
 function cloneJsonValue(value: JsonValue): JsonValue {
-  return JSON.parse(JSON.stringify(value)) as JsonValue;
+  return structuredClone(value);
 }
 
 function stableJsonHash(value: JsonValue | undefined): string {
@@ -1292,11 +1350,11 @@ function stableJsonStringify(value: JsonValue | undefined): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJsonStringify).join(",")}]`;
 
-  const record = asRecord(value);
+  const record = asJsonObject(value);
   if (!record) return JSON.stringify(value);
   return `{${Object.keys(record)
     .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key] as JsonValue)}`)
+    .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`)
     .join(",")}}`;
 }
 
@@ -1315,8 +1373,8 @@ function deepEqualJson(left: JsonValue | undefined, right: JsonValue | undefined
 
   if (typeof left === "object" || typeof right === "object") {
     if (typeof left !== "object" || typeof right !== "object") return false;
-    const leftRecord = asRecord(left);
-    const rightRecord = asRecord(right);
+    const leftRecord = asJsonObject(left);
+    const rightRecord = asJsonObject(right);
     if (!leftRecord || !rightRecord) return false;
 
     const leftKeys = Object.keys(leftRecord).sort();
@@ -1325,12 +1383,7 @@ function deepEqualJson(left: JsonValue | undefined, right: JsonValue | undefined
     for (let i = 0; i < leftKeys.length; i += 1) {
       if (leftKeys[i] !== rightKeys[i]) return false;
       const key = leftKeys[i]!;
-      if (
-        !deepEqualJson(
-          leftRecord[key] as JsonValue | undefined,
-          rightRecord[key] as JsonValue | undefined,
-        )
-      ) {
+      if (!deepEqualJson(leftRecord[key], rightRecord[key])) {
         return false;
       }
     }
@@ -1338,6 +1391,13 @@ function deepEqualJson(left: JsonValue | undefined, right: JsonValue | undefined
   }
 
   return false;
+}
+
+function asJsonObject(value: JsonValue | undefined): JsonObject | null {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
 }
 
 function isJsonObject(value: JsonObject | null): value is JsonObject {
@@ -1406,7 +1466,7 @@ function maybeNormalizeResponsesSseResponse(input: {
 
           controller.close();
         } catch (error) {
-          controller.error(error instanceof Error ? error : new Error(String(error)));
+          signalResponsesStreamError(controller, projectResponsesStreamError(error));
         } finally {
           try {
             reader.releaseLock();
@@ -1465,6 +1525,18 @@ function normalizeResponsesEvent(
   const normalized = normalizeEvent ? normalizeEvent(event) : event;
   const withResponseFailureHandled = normalizeResponsesFailureEvent(normalized);
   return normalizeErrorEventShape(withResponseFailureHandled);
+}
+
+type ProjectedResponsesEvent = {
+  readonly record: Record<string, unknown>;
+  readonly type: string;
+};
+
+function projectResponsesEvent(record: Record<string, unknown>): ProjectedResponsesEvent {
+  return {
+    record,
+    type: typeof record.type === "string" ? record.type : "",
+  };
 }
 
 function normalizeResponsesFailureEvent(event: Record<string, unknown>): Record<string, unknown> {
@@ -1682,7 +1754,7 @@ function readHeaderValue(headers: unknown, name: string): string | null | undefi
 
   const getter = record.get;
   if (typeof getter === "function") {
-    const value = (getter as (headerName: string) => unknown).call(headers, name);
+    const value = Reflect.apply(getter, headers, [name]);
     if (typeof value === "string") return value;
     if (value === null) return null;
     if (value !== undefined) return String(value);
@@ -1748,12 +1820,7 @@ async function decodeWebSocketData(event: Event): Promise<string | null> {
 }
 
 function extractWebSocketError(event: Event): Error {
-  if (event && typeof event === "object" && "message" in event) {
-    const message = (event as { message?: unknown }).message;
-    if (typeof message === "string" && message.length > 0) {
-      return new Error(message);
-    }
-  }
-
-  return new Error("WebSocket error");
+  return new Error(
+    event instanceof ErrorEvent && event.message ? event.message : "WebSocket error",
+  );
 }

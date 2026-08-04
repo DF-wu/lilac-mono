@@ -24,10 +24,10 @@ import {
 import { createRequire } from "node:module";
 import path from "node:path";
 
-import { isPanic, opaqueErrorCause } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
+import { projectRuntimeError } from "../../runtime/error-format";
 import {
   SshExecutionAdapterError,
   SshExecutionCancelledError,
@@ -41,6 +41,7 @@ import {
   sshExecScriptJson,
 } from "../../ssh/ssh-exec";
 import { getRemoteRunnerJsText, type RemoteRunnerSourceReadError } from "../../ssh/remote-js";
+import { preserveToolPanic } from "../tool-result-adapters";
 
 const requirePackageJson = createRequire(import.meta.url);
 
@@ -148,12 +149,12 @@ function toBundledRemoteEditRequest(
 }
 
 function decodeRemoteFsRunnerPackageSpec(): ResultType<string, RemoteFsRunnerSetupError> {
-  let rawPackageJson: unknown;
-  try {
-    rawPackageJson = requirePackageJson("@stanley2058/lilac-remote-fs-runner/package.json");
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque remote fs runner setup failure");
+  const loaded = Result.try({
+    try: (): unknown => requirePackageJson("@stanley2058/lilac-remote-fs-runner/package.json"),
+    catch: projectRuntimeError("Opaque remote fs runner setup failure"),
+  });
+  if (loaded.status === "error") {
+    const cause = preserveToolPanic(loaded.error);
     return Result.err(
       new RemoteFsRunnerSetupError({
         cause,
@@ -161,7 +162,7 @@ function decodeRemoteFsRunnerPackageSpec(): ResultType<string, RemoteFsRunnerSet
       }),
     );
   }
-  const packageJson = remoteFsRunnerPackageSchema.safeParse(rawPackageJson);
+  const packageJson = remoteFsRunnerPackageSchema.safeParse(loaded.value);
   if (!packageJson.success) {
     return Result.err(
       new RemoteFsRunnerSetupError({
@@ -270,16 +271,17 @@ __LILAC_INPUT__
         signal: params.signal,
         maxOutputChars: params.maxOutputChars,
       }),
-    catch: (caught) => {
-      if (isPanic(caught)) throw caught;
-      const cause = opaqueErrorCause(caught, "Opaque remote fs SSH adapter failure");
-      return new SshExecutionAdapterError({
+    catch: projectRuntimeError("Opaque remote fs SSH adapter failure"),
+  });
+  if (executed.status === "error") {
+    const cause = preserveToolPanic(executed.error);
+    return Result.err(
+      new SshExecutionAdapterError({
         cause,
         message: "remote fs runner SSH execution adapter failed",
-      });
-    },
-  });
-  if (executed.status === "error") return Result.err(executed.error);
+      }),
+    );
+  }
   const res = executed.value;
 
   if (res.aborted) return Result.err(new SshExecutionCancelledError({ message: "aborted" }));

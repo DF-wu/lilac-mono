@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   MCP_CONFIG_VERSION,
@@ -6,6 +7,7 @@ import {
   type McpServerDefinition,
   type UniversalMcpConfig,
 } from "./config-types";
+import { opaqueErrorMessage } from "./error-format";
 
 export const mcpServerIdSchema = z
   .string()
@@ -58,40 +60,44 @@ const stdioServerInputSchemaV1 = z.strictObject({
   env: z.record(z.string().min(1), mcpValueSourceSchema).optional(),
 });
 
-const httpServerInputSchemaV1 = z
-  .strictObject({
-    transport: z.literal("http"),
-    url: z.string().min(1),
-    headers: z.record(z.string().min(1), mcpValueSourceSchema).optional(),
-    auth: mcpAuthConfigSchema.optional(),
-  })
-  .superRefine((value, context) => {
-    let url: URL;
-    try {
-      url = new URL(value.url);
-    } catch {
-      context.addIssue({ code: "custom", path: ["url"], message: "url must be an absolute URL" });
-      return;
-    }
+const httpServerInputObjectSchemaV1 = z.strictObject({
+  transport: z.literal("http"),
+  url: z.string().min(1),
+  headers: z.record(z.string().min(1), mcpValueSourceSchema).optional(),
+  auth: mcpAuthConfigSchema.optional(),
+});
 
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      context.addIssue({
-        code: "custom",
-        path: ["url"],
-        message: "url must use http: or https:; HTTP+SSE is not a supported transport",
-      });
-    }
+function validateHttpServerInputV1(
+  value: z.infer<typeof httpServerInputObjectSchemaV1>,
+  context: z.RefinementCtx,
+): void {
+  if (!URL.canParse(value.url)) {
+    context.addIssue({ code: "custom", path: ["url"], message: "url must be an absolute URL" });
+    return;
+  }
+  const url = new URL(value.url);
 
-    if (!value.auth) return;
-    for (const header of Object.keys(value.headers ?? {})) {
-      if (header.toLowerCase() !== "authorization") continue;
-      context.addIssue({
-        code: "custom",
-        path: ["headers", header],
-        message: "an Authorization header cannot be combined with OAuth configuration",
-      });
-    }
-  });
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    context.addIssue({
+      code: "custom",
+      path: ["url"],
+      message: "url must use http: or https:; HTTP+SSE is not a supported transport",
+    });
+  }
+
+  if (!value.auth) return;
+  for (const header of Object.keys(value.headers ?? {})) {
+    if (header.toLowerCase() !== "authorization") continue;
+    context.addIssue({
+      code: "custom",
+      path: ["headers", header],
+      message: "an Authorization header cannot be combined with OAuth configuration",
+    });
+  }
+}
+
+const httpServerInputSchemaV1 =
+  httpServerInputObjectSchemaV1.superRefine(validateHttpServerInputV1);
 
 export const mcpServerInputSchemaV1 = z.discriminatedUnion("transport", [
   stdioServerInputSchemaV1,
@@ -158,18 +164,28 @@ function toUniversalConfig(input: McpConfigInputV1): UniversalMcpConfig {
   return { configVersion: MCP_CONFIG_VERSION, servers };
 }
 
-function toConfigInputV1(config: UniversalMcpConfig): McpConfigInputV1 {
-  if (config.configVersion !== MCP_CONFIG_VERSION) {
-    throw new Error(`Cannot serialize unsupported MCP config version ${config.configVersion}`);
-  }
+type McpConfigSerializationInput = Omit<UniversalMcpConfig, "configVersion"> & {
+  readonly configVersion: number;
+};
 
-  const servers: Record<string, unknown> = {};
+export class McpConfigSerializationFailed extends TaggedError("McpConfigSerializationFailed")<{
+  readonly reason: "id-mismatch" | "invalid-output" | "unsupported-version";
+  readonly message: string;
+}> {}
+
+function toConfigInputV1(
+  config: McpConfigSerializationInput,
+): ResultType<McpConfigInputV1, McpConfigSerializationFailed> {
+  const servers: Record<string, McpServerInputV1> = {};
   for (const id of Object.keys(config.servers).sort()) {
     const server = config.servers[id];
     if (!server) continue;
     if (server.id !== id) {
-      throw new Error(
-        `Cannot serialize MCP server ${JSON.stringify(id)} with mismatched ID ${JSON.stringify(server.id)}`,
+      return Result.err(
+        new McpConfigSerializationFailed({
+          reason: "id-mismatch",
+          message: `Cannot serialize MCP server ${JSON.stringify(id)} with mismatched ID ${JSON.stringify(server.id)}`,
+        }),
       );
     }
 
@@ -189,11 +205,22 @@ function toConfigInputV1(config: UniversalMcpConfig): McpConfigInputV1 {
             ...(Object.keys(transport.headers).length === 0
               ? {}
               : { headers: sortRecord(transport.headers) }),
-            ...(transport.auth === undefined ? {} : { auth: transport.auth }),
+            ...(transport.auth === undefined
+              ? {}
+              : {
+                  auth: {
+                    type: transport.auth.type,
+                    grant: transport.auth.grant,
+                    client: transport.auth.client,
+                    ...(transport.auth.scopes === undefined
+                      ? {}
+                      : { scopes: [...transport.auth.scopes] }),
+                  },
+                }),
           };
   }
 
-  return mcpConfigInputSchemaV1.parse({ configVersion: MCP_CONFIG_VERSION, servers });
+  return Result.ok({ configVersion: MCP_CONFIG_VERSION, servers });
 }
 
 /** Parse an already-decoded YAML document using its required version discriminator. */
@@ -228,14 +255,41 @@ export function parseMcpConfigYaml(source: string): McpConfigParseResult {
   try {
     document = Bun.YAML.parse(source);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = opaqueErrorMessage(error);
     return { ok: false, issues: [`<root>: failed to parse YAML: ${message}`] };
   }
   return parseMcpConfigDocument(document);
 }
 
-/** Serialize normalized config as deterministic v1 YAML and validate the emitted shape. */
-export function serializeMcpConfigYaml(config: UniversalMcpConfig): string {
+export function serializeMcpConfigYamlResult(
+  config: McpConfigSerializationInput,
+): ResultType<string, McpConfigSerializationFailed> {
+  if (config.configVersion !== MCP_CONFIG_VERSION) {
+    return Result.err(
+      new McpConfigSerializationFailed({
+        reason: "unsupported-version",
+        message: `Cannot serialize unsupported MCP configVersion ${JSON.stringify(config.configVersion)} (supported: ${MCP_CONFIG_VERSION})`,
+      }),
+    );
+  }
   const input = toConfigInputV1(config);
-  return `${Bun.YAML.stringify(input, null, 2)}\n`;
+  if (input.status === "error") return input;
+  const source = `${Bun.YAML.stringify(input.value, null, 2)}\n`;
+  const reparsed = parseMcpConfigYaml(source);
+  if (!reparsed.ok) {
+    return Result.err(
+      new McpConfigSerializationFailed({
+        reason: "invalid-output",
+        message: `Serialized MCP configuration is invalid: ${reparsed.issues.join("; ")}`,
+      }),
+    );
+  }
+  return Result.ok(source);
+}
+
+/** Framework compatibility adapter for callers that require a throwing serializer. */
+export function serializeMcpConfigYaml(config: McpConfigSerializationInput): string {
+  const serialized = serializeMcpConfigYamlResult(config);
+  if (serialized.status === "error") throw serialized.error;
+  return serialized.value;
 }

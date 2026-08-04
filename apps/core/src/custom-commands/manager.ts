@@ -25,6 +25,10 @@ type CustomCommandErrorDetails = {
   readonly message: string;
 };
 
+type CustomCommandModule = {
+  readonly execute: (args: readonly unknown[], context: CustomCommandContext) => unknown;
+};
+
 export class CustomCommandImportError extends TaggedError("CustomCommandImportError")<
   CustomCommandErrorDetails & { readonly cause: unknown }
 > {}
@@ -106,6 +110,7 @@ type CustomCommandArgumentValueError =
   | CustomCommandNumberArgumentError
   | CustomCommandBooleanArgumentError;
 export type CustomCommandArgumentValue = string | number | boolean;
+type ParsedCustomCommandArgument = CustomCommandArgumentValue | undefined;
 export type CustomCommandInvocationError =
   | CustomCommandUnknownError
   | CustomCommandUnterminatedQuoteError
@@ -127,12 +132,30 @@ export function customCommandInvocationErrorText(error: CustomCommandInvocationE
   }
 }
 
+function decodeCustomCommandModule(value: unknown): CustomCommandModule | null {
+  if (!isRecord(value) || typeof value["execute"] !== "function") return null;
+  const execute = value["execute"];
+  return {
+    execute: (args, context) => execute.call(value, args, context),
+  };
+}
+
 async function importCustomCommandModule(params: {
   commandName: string;
   entrypointPath: string;
-}): Promise<ResultType<unknown, CustomCommandImportError>> {
+}): Promise<
+  ResultType<CustomCommandModule, CustomCommandImportError | CustomCommandExecuteMissingError>
+> {
   try {
-    return Result.ok(await import(pathToFileURL(params.entrypointPath).href));
+    const imported: unknown = await import(pathToFileURL(params.entrypointPath).href);
+    const commandModule = decodeCustomCommandModule(imported);
+    if (commandModule) return Result.ok(commandModule);
+    return Result.err(
+      new CustomCommandExecuteMissingError({
+        ...params,
+        message: `Command '${params.commandName}' must export async execute(args, ctx).`,
+      }),
+    );
   } catch (caught) {
     if (isPanic(caught)) throw caught;
     const cause = opaqueErrorCause(caught, "Opaque custom-command import failure");
@@ -150,9 +173,23 @@ function invokeCustomCommand(params: {
   commandName: string;
   entrypointPath: string;
   run: () => unknown;
-}): ResultType<unknown, CustomCommandExecuteThrownError> {
+}): ResultType<
+  Promise<
+    ResultType<
+      CustomCommandResult,
+      CustomCommandExecuteRejectedError | CustomCommandResultInvalidError
+    >
+  >,
+  CustomCommandExecuteThrownError
+> {
   try {
-    return Result.ok(params.run());
+    return Result.ok(
+      settleCustomCommand({
+        commandName: params.commandName,
+        entrypointPath: params.entrypointPath,
+        execution: params.run(),
+      }),
+    );
   } catch (caught) {
     if (isPanic(caught)) throw caught;
     const cause = opaqueErrorCause(caught, "Opaque custom-command execution failure");
@@ -171,9 +208,23 @@ async function settleCustomCommand(params: {
   commandName: string;
   entrypointPath: string;
   execution: unknown;
-}): Promise<ResultType<unknown, CustomCommandExecuteRejectedError>> {
+}): Promise<
+  ResultType<
+    CustomCommandResult,
+    CustomCommandExecuteRejectedError | CustomCommandResultInvalidError
+  >
+> {
   try {
-    return Result.ok(await params.execution);
+    const value: unknown = await params.execution;
+    const decoded = decodeCustomCommandResult(value);
+    if (decoded !== null) return Result.ok(decoded);
+    return Result.err(
+      new CustomCommandResultInvalidError({
+        commandName: params.commandName,
+        entrypointPath: params.entrypointPath,
+        message: `Command '${params.commandName}' returned an invalid tool result payload.`,
+      }),
+    );
   } catch (caught) {
     if (isPanic(caught)) throw caught;
     const cause = opaqueErrorCause(caught, "Opaque custom-command rejection");
@@ -304,14 +355,14 @@ export type LoadedCustomCommand = DiscoveredCustomCommand & {
 
 export type ParsedCustomCommandInvocation = {
   command: LoadedCustomCommand;
-  args: unknown[];
+  args: ParsedCustomCommandArgument[];
   prompt: string | null;
   text: string;
   source: "text" | "discord-slash";
 };
 
 type ParsedArgsAndPrompt = {
-  args: unknown[];
+  args: ParsedCustomCommandArgument[];
   prompt: string | null;
 };
 
@@ -422,7 +473,7 @@ export class CustomCommandManager {
       );
     }
 
-    const args: unknown[] = [];
+    const args: ParsedCustomCommandArgument[] = [];
     for (const arg of command.def.args) {
       const value = rawArgs[arg.key];
       if (value === undefined || value === null) {
@@ -469,42 +520,14 @@ export class CustomCommandManager {
     const imported = await importCustomCommandModule({ commandName, entrypointPath });
     if (imported.status === "error") return imported;
 
-    if (!isRecord(imported.value) || typeof imported.value["execute"] !== "function") {
-      return Result.err(
-        new CustomCommandExecuteMissingError({
-          commandName,
-          entrypointPath,
-          message: `Command '${commandName}' must export async execute(args, ctx).`,
-        }),
-      );
-    }
-
-    const execute = imported.value["execute"];
+    const commandModule = imported.value;
     const execution = invokeCustomCommand({
       commandName,
       entrypointPath,
-      run: () => execute.call(imported.value, params.args, params.context),
+      run: () => commandModule.execute(params.args, params.context),
     });
     if (execution.status === "error") return execution;
-
-    const settled = await settleCustomCommand({
-      commandName,
-      entrypointPath,
-      execution: execution.value,
-    });
-    if (settled.status === "error") return settled;
-
-    const decoded: CustomCommandResult | null = decodeCustomCommandResult(settled.value);
-    if (decoded === null) {
-      return Result.err(
-        new CustomCommandResultInvalidError({
-          commandName,
-          entrypointPath,
-          message: `Command '${commandName}' returned an invalid tool result payload.`,
-        }),
-      );
-    }
-    return Result.ok(decoded);
+    return execution.value;
   }
 
   formatPreview(invocation: ParsedCustomCommandInvocation): string {
@@ -537,7 +560,9 @@ export class CustomCommandManager {
     command: LoadedCustomCommand,
     tokens: readonly string[],
   ): ResultType<ParsedArgsAndPrompt, CustomCommandInvocationError> {
-    const out: unknown[] = Array.from({ length: command.def.args.length });
+    const out: ParsedCustomCommandArgument[] = Array.from({
+      length: command.def.args.length,
+    });
     let pos = 0;
     let promptStartIndex: number | null = null;
 

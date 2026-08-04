@@ -6,6 +6,7 @@ import {
   type SyntaxBaselineEntry,
   type SyntaxFinding,
 } from "./check-syntax-ratchet.mts";
+import { FINAL_PACKAGE_WIDE_SYNTAX_RULES } from "./syntax-policy.mts";
 
 function entry(overrides: Partial<SyntaxBaselineEntry> = {}): SyntaxBaselineEntry {
   return {
@@ -31,6 +32,18 @@ function finding(overrides: Partial<SyntaxFinding> = {}): SyntaxFinding {
 }
 
 describe("repository syntax ratchet", () => {
+  it("declares the final package-wide syntax gate", () => {
+    expect(FINAL_PACKAGE_WIDE_SYNTAX_RULES).toEqual([
+      "no-nested-ternary",
+      "lilac/no-local-is-record",
+      "lilac/no-exception-flow",
+      "lilac/no-inline-async-result-callback",
+      "lilac/no-presentation-decoder-import",
+      "lilac/no-store-inline-decoding",
+      "lilac/no-direct-sqlite-transaction",
+    ]);
+  });
+
   it("matches as a repository-wide multiset and cannot hide a multi-file digest collision", () => {
     const first = entry();
     const baseline: SyntaxBaseline = {

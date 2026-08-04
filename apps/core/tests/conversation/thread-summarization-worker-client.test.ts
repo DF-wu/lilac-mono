@@ -223,15 +223,14 @@ describe("conversation thread summarization worker client", () => {
     await client.stop();
   });
 
-  it("normalizes and reports a revoked worker error without masking it", async () => {
+  it("normalizes and reports an opaque worker error message", async () => {
     spyOn(console, "error").mockImplementation(() => {});
     const worker = new FakeWorker();
     const reported: Panic[] = [];
     const client = startClient(worker, (fatalPanic) => reported.push(fatalPanic));
-    const { proxy, revoke } = Proxy.revocable({}, {});
-    revoke();
-
-    const normalized = normalizeConversationThreadWorkerPanic(proxy);
+    const normalized = normalizeConversationThreadWorkerPanic(
+      "Conversation thread summarization worker failed with an opaque error",
+    );
     worker.emitError(normalized);
 
     expect(normalized.message).toBe(

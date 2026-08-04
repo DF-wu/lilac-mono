@@ -1,5 +1,5 @@
-import { describe, expect, it } from "bun:test";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   createLilacBus,
@@ -20,6 +20,7 @@ import {
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
+import { Logger } from "@stanley2058/simple-module-logger";
 
 import { startBusRequestRouter } from "../../../src/surface/bridge/bus-request-router";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/bridge/bus-request-router/gate";
@@ -47,6 +48,11 @@ type TestRawBus = RawBus & {
   failStopsFor(topic: string, cause: unknown): void;
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
+
+class RouterTestHookFailure extends TaggedError("RouterTestHookFailure")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
 
 function expectStarted<T>(started: ResultType<T, EventDeliveryStartFailed>): T {
   if (started.status === "ok") return started.value;
@@ -1023,6 +1029,67 @@ describe("startBusRequestRouter", () => {
 
     await sub.stop();
     await router.stop();
+  });
+
+  it("logs suppression TaggedErrors through the redacted bridge projection", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const logger = new Logger({ module: "bus-request-router-test" });
+    const sessionId = "suppression-log";
+    const messageId = "message";
+    const router = await startBusRequestRouter({
+      adapter: new FakeAdapter({
+        [`${sessionId}:${messageId}`]: {
+          ref: { platform: "discord", channelId: sessionId, messageId },
+          session: { platform: "discord", channelId: sessionId },
+          userId: "user",
+          text: "hello",
+          ts: Date.now(),
+          raw: { reference: {} },
+        },
+      }),
+      bus,
+      subscriptionId: "router-suppression-log",
+      config: parseCoreConfigV1ToUniversal({}),
+      logger,
+      shouldSuppressAdapterEvent: async () => {
+        throw new RouterTestHookFailure({
+          cause: { authorization: "Bearer cause-secret" },
+          message: "hook failed token=sk-super-secret",
+        });
+      },
+    });
+    const logged = spyOn(logger, "error").mockImplementation(() => undefined);
+
+    try {
+      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+        platform: "discord",
+        channelId: sessionId,
+        messageId,
+        userId: "user",
+        text: "hello",
+        ts: Date.now(),
+        raw: {
+          discord: { isDMBased: true, mentionsBot: false, replyToBot: false, botUserId: "bot" },
+        },
+      });
+
+      const call = logged.mock.calls.find(
+        ([message]) => message === "router suppression hook failed; proceeding",
+      );
+      expect(call).toBeDefined();
+      expect(call?.[1]).toMatchObject({
+        errorTag: "BusRequestRouterSuppressionFailed",
+        errorMessage: "Router suppression hook failed",
+      });
+      expect(call?.[1]).not.toHaveProperty("cause");
+      expect(call?.[2]).toBeUndefined();
+      expect(JSON.stringify(call?.[1])).not.toContain("cause-secret");
+      expect(JSON.stringify(call?.[1])).not.toContain("sk-super-secret");
+    } finally {
+      await router.stop();
+      logged.mockRestore();
+    }
   });
 
   it("skips active channel batch when gate returns forward=false", async () => {

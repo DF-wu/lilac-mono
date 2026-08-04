@@ -8,10 +8,12 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
+import { Result } from "better-result";
 
 import type { SurfaceAdapter } from "../../adapter";
 import type { MsgRef } from "../../types";
 import type { TranscriptStore } from "../../../transcript/transcript-store";
+import { adaptEventPublishResultToHost } from "../../../shared/event-bus-result";
 import {
   composeRecentChannelMessages,
   composeRequestMessages,
@@ -71,30 +73,34 @@ export async function publishBusRequest(params: {
     lastUserPreview: getLastUserPreview(params.input.messages),
   });
 
-  await params.bus.publish(
-    lilacEventTypes.CmdRequestMessage,
-    {
-      queue: params.input.queue,
-      messages: params.input.messages,
-      corePrimaryLineage: params.input.corePrimaryLineage,
-      ...(params.input.modelOverride ? { modelOverride: params.input.modelOverride } : {}),
-      raw: {
-        ...(params.input.raw && typeof params.input.raw === "object"
-          ? (params.input.raw as Record<string, unknown>)
-          : {}),
-        sessionMode: params.input.sessionMode,
-        sessionConfigId: params.input.sessionConfigId,
-        ...(params.input.parentChannelId ? { parentChannelId: params.input.parentChannelId } : {}),
+  adaptEventPublishResultToHost(
+    await params.bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        queue: params.input.queue,
+        messages: params.input.messages,
+        corePrimaryLineage: params.input.corePrimaryLineage,
         ...(params.input.modelOverride ? { modelOverride: params.input.modelOverride } : {}),
+        raw: {
+          ...(params.input.raw && typeof params.input.raw === "object"
+            ? (params.input.raw as Record<string, unknown>)
+            : {}),
+          sessionMode: params.input.sessionMode,
+          sessionConfigId: params.input.sessionConfigId,
+          ...(params.input.parentChannelId
+            ? { parentChannelId: params.input.parentChannelId }
+            : {}),
+          ...(params.input.modelOverride ? { modelOverride: params.input.modelOverride } : {}),
+        },
       },
-    },
-    {
-      headers: {
-        request_id: params.input.requestId,
-        session_id: params.input.sessionId,
-        request_client: "discord",
+      {
+        headers: {
+          request_id: params.input.requestId,
+          session_id: params.input.sessionId,
+          request_client: "discord",
+        },
       },
-    },
+    ),
   );
 }
 
@@ -138,6 +144,8 @@ export async function publishComposedRequest(params: {
       msgRef: params.input.msgRef,
     },
   });
+  if (composed.status === "error") return Result.err(composed.error);
+  const composition = composed.value;
 
   await publishBusRequest({
     logger: params.logger,
@@ -151,8 +159,8 @@ export async function publishComposedRequest(params: {
       triggerType: params.input.triggerType,
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
-      messages: composed.messages,
-      corePrimaryLineage: composed.corePrimaryLineage,
+      messages: composition.messages,
+      corePrimaryLineage: composition.corePrimaryLineage,
       raw: {
         authenticatedOrigin: {
           platform: "discord",
@@ -160,15 +168,16 @@ export async function publishComposedRequest(params: {
           messageRef: params.input.msgRef,
         },
         triggerType: params.input.triggerType,
-        chainMessageIds: composed.chainMessageIds,
-        mergedGroups: composed.mergedGroups,
+        chainMessageIds: composition.chainMessageIds,
+        mergedGroups: composition.mergedGroups,
         participantUserIds: uniqueNonEmptyStrings(
-          composed.mergedGroups.map((group) => group.authorId),
+          composition.mergedGroups.map((group) => group.authorId),
           { exclude: self.userId },
         ),
       },
     },
   });
+  return Result.ok(undefined);
 }
 
 export async function publishActiveChannelPrompt(params: {
@@ -232,6 +241,8 @@ export async function publishActiveChannelPrompt(params: {
           triggerMsgRef: params.input.triggerMsgRef,
           triggerType: params.input.triggerType,
         });
+  if (composed.status === "error") return Result.err(composed.error);
+  const composition = composed.value;
 
   const originMessage = params.input.triggerMsgRef
     ? await params.adapter.readMsg(params.input.triggerMsgRef).catch(() => null)
@@ -249,8 +260,8 @@ export async function publishActiveChannelPrompt(params: {
       triggerType: params.input.triggerType ?? "active",
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
-      messages: composed.messages,
-      corePrimaryLineage: composed.corePrimaryLineage,
+      messages: composition.messages,
+      corePrimaryLineage: composition.corePrimaryLineage,
       raw: {
         ...(originMessage && params.input.triggerMsgRef
           ? {
@@ -262,15 +273,16 @@ export async function publishActiveChannelPrompt(params: {
             }
           : {}),
         triggerType: params.input.triggerType ?? "active",
-        chainMessageIds: composed.chainMessageIds,
-        mergedGroups: composed.mergedGroups,
+        chainMessageIds: composition.chainMessageIds,
+        mergedGroups: composition.mergedGroups,
         participantUserIds: uniqueNonEmptyStrings(
-          composed.mergedGroups.map((group) => group.authorId),
+          composition.mergedGroups.map((group) => group.authorId),
           { exclude: self.userId },
         ),
       },
     },
   });
+  return Result.ok(undefined);
 }
 
 export async function publishSingleMessageToActiveRequest(params: {
@@ -304,7 +316,9 @@ export async function publishSingleMessageToActiveRequest(params: {
     transformUserText: params.input.transformUserText,
   });
 
-  if (!composed) return;
+  if (composed.status === "error") return Result.err(composed.error);
+  if (!composed.value) return Result.ok(undefined);
+  const composition = composed.value;
 
   const surfaceMessage = await params.adapter.readMsg(params.input.msgRef);
 
@@ -320,8 +334,8 @@ export async function publishSingleMessageToActiveRequest(params: {
       triggerType: "active",
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
-      messages: composed.messages,
-      corePrimaryLineage: composed.corePrimaryLineage,
+      messages: composition.messages,
+      corePrimaryLineage: composition.corePrimaryLineage,
       raw: {
         ...(surfaceMessage
           ? {
@@ -339,6 +353,7 @@ export async function publishSingleMessageToActiveRequest(params: {
       },
     },
   });
+  return Result.ok(undefined);
 }
 
 export async function publishSingleMessagePrompt(params: {
@@ -372,7 +387,9 @@ export async function publishSingleMessagePrompt(params: {
     transformUserText: params.input.transformUserText,
   });
 
-  if (!composed) return;
+  if (composed.status === "error") return Result.err(composed.error);
+  if (!composed.value) return Result.ok(undefined);
+  const composition = composed.value;
 
   const surfaceMessage = await params.adapter.readMsg(params.input.msgRef);
 
@@ -388,8 +405,8 @@ export async function publishSingleMessagePrompt(params: {
       triggerType: "active",
       sessionMode: params.input.sessionMode,
       modelOverride: params.input.modelOverride,
-      messages: composed.messages,
-      corePrimaryLineage: composed.corePrimaryLineage,
+      messages: composition.messages,
+      corePrimaryLineage: composition.corePrimaryLineage,
       raw: {
         ...(surfaceMessage
           ? {
@@ -409,6 +426,7 @@ export async function publishSingleMessagePrompt(params: {
       },
     },
   });
+  return Result.ok(undefined);
 }
 
 export async function publishSurfaceOutputReanchor(input: {
@@ -419,25 +437,27 @@ export async function publishSurfaceOutputReanchor(input: {
   replyTo?: MsgRef;
   mode?: "steer" | "interrupt";
 }) {
-  await input.bus.publish(
-    lilacEventTypes.CmdSurfaceOutputReanchor,
-    {
-      inheritReplyTo: input.inheritReplyTo,
-      mode: input.mode,
-      replyTo: input.replyTo
-        ? {
-            platform: input.replyTo.platform,
-            channelId: input.replyTo.channelId,
-            messageId: input.replyTo.messageId,
-          }
-        : undefined,
-    },
-    {
-      headers: {
-        request_id: input.requestId,
-        session_id: input.sessionId,
-        request_client: "discord",
+  adaptEventPublishResultToHost(
+    await input.bus.publish(
+      lilacEventTypes.CmdSurfaceOutputReanchor,
+      {
+        inheritReplyTo: input.inheritReplyTo,
+        mode: input.mode,
+        replyTo: input.replyTo
+          ? {
+              platform: input.replyTo.platform,
+              channelId: input.replyTo.channelId,
+              messageId: input.replyTo.messageId,
+            }
+          : undefined,
       },
-    },
+      {
+        headers: {
+          request_id: input.requestId,
+          session_id: input.sessionId,
+          request_client: "discord",
+        },
+      },
+    ),
   );
 }

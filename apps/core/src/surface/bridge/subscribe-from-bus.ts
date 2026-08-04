@@ -39,13 +39,15 @@ import {
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 
 import type { TranscriptStore } from "../../transcript/transcript-store";
+import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
+import { formatBridgeTaggedErrorForLog } from "./bridge-log";
 
 class CmdRequestRequiredHeadersMissing extends TaggedError("CmdRequestRequiredHeadersMissing")<{
   readonly message: string;
 }> {}
 
 class CmdRequestCancelFailed extends TaggedError("CmdRequestCancelFailed")<{
-  readonly cause: unknown;
+  readonly cause: BusToAdapterEffectFailed;
   readonly message: string;
 }> {}
 
@@ -65,7 +67,7 @@ class CmdSurfaceRequiredHeadersMissing extends TaggedError("CmdSurfaceRequiredHe
 }> {}
 
 class CmdSurfaceReanchorFailed extends TaggedError("CmdSurfaceReanchorFailed")<{
-  readonly cause: unknown;
+  readonly cause: BusToAdapterEffectFailed;
   readonly message: string;
 }> {}
 
@@ -85,7 +87,7 @@ class EvtRequestRequiredHeadersMissing extends TaggedError("EvtRequestRequiredHe
 }> {}
 
 class EvtRequestStopTypingFailed extends TaggedError("EvtRequestStopTypingFailed")<{
-  readonly cause: unknown;
+  readonly cause: BusToAdapterEffectFailed;
   readonly message: string;
 }> {}
 
@@ -101,12 +103,12 @@ function applyEvtRequestDeliveryPolicy(error: EvtRequestDeliveryError): Delivery
 }
 
 class OutReqPushFailed extends TaggedError("OutReqPushFailed")<{
-  readonly cause: unknown;
+  readonly cause: BusToAdapterEffectFailed;
   readonly message: string;
 }> {}
 
 class OutReqFinishFailed extends TaggedError("OutReqFinishFailed")<{
-  readonly cause: unknown;
+  readonly cause: BusToAdapterEffectFailed;
   readonly message: string;
 }> {}
 
@@ -207,7 +209,10 @@ async function runBusToAdapterBestEffort(input: {
 }): Promise<void> {
   const result = await captureBusToAdapterEffect(input.operation, input.effect);
   if (result.status === "ok" || !input.logger || !input.logLevel || !input.logMessage) return;
-  input.logger[input.logLevel](input.logMessage, input.context ?? {}, result.error.cause);
+  input.logger[input.logLevel](
+    input.logMessage,
+    formatBridgeTaggedErrorForLog(result.error, input.context),
+  );
 }
 
 function observeSubscriptionDone(
@@ -217,11 +222,10 @@ function observeSubscriptionDone(
 ): void {
   void subscription.done.then((done) => {
     if (done.status === "ok") return;
-    logger.error("event subscription stopped", {
-      topic,
-      errorTag: done.error._tag,
-      errorMessage: done.error.message,
-    });
+    logger.error(
+      "event subscription stopped",
+      formatBridgeTaggedErrorForLog(done.error, { topic }),
+    );
   });
 }
 
@@ -358,8 +362,7 @@ async function cleanupGithubAck(input: { logger: Logger; requestId: string; sess
   if (deleted.status === "error" && !errorMessage(deleted.error.cause).includes("404")) {
     input.logger.warn(
       "failed to delete github ack reaction",
-      { requestId: input.requestId },
-      deleted.error.cause,
+      formatBridgeTaggedErrorForLog(deleted.error, { requestId: input.requestId }),
     );
   }
 }
@@ -543,12 +546,11 @@ export async function bridgeBusToAdapter(params: {
       if (cancelled.status === "ok") return Result.ok(undefined);
       logger.error(
         "failed to cancel active relay",
-        { requestId, sessionId },
-        cancelled.error.cause,
+        formatBridgeTaggedErrorForLog(cancelled.error, { requestId, sessionId }),
       );
       return Result.err(
         new CmdRequestCancelFailed({
-          cause: cancelled.error.cause,
+          cause: cancelled.error,
           message: "Failed to cancel active relay",
         }),
       );
@@ -617,10 +619,13 @@ export async function bridgeBusToAdapter(params: {
         }),
       );
       if (reanchored.status === "ok") return Result.ok(undefined);
-      logger.error("reanchor failed", { requestId, sessionId }, reanchored.error.cause);
+      logger.error(
+        "reanchor failed",
+        formatBridgeTaggedErrorForLog(reanchored.error, { requestId, sessionId }),
+      );
       return Result.err(
         new CmdSurfaceReanchorFailed({
-          cause: reanchored.error.cause,
+          cause: reanchored.error,
           message: "Output reanchor failed",
         }),
       );
@@ -704,16 +709,15 @@ export async function bridgeBusToAdapter(params: {
             if (stoppedTyping.status === "error") {
               logger.debug(
                 "failed to stop relay typing from lifecycle event",
-                {
+                formatBridgeTaggedErrorForLog(stoppedTyping.error, {
                   requestId,
                   sessionId,
                   lifecycleState: msg.data.state,
-                },
-                stoppedTyping.error.cause,
+                }),
               );
               return Result.err(
                 new EvtRequestStopTypingFailed({
-                  cause: stoppedTyping.error.cause,
+                  cause: stoppedTyping.error,
                   message: "Failed to stop relay typing from lifecycle event",
                 }),
               );
@@ -789,12 +793,11 @@ export async function bridgeBusToAdapter(params: {
         if (stoppedTyping.status === "error") {
           logger.debug(
             "failed to stop relay typing after delayed terminal lifecycle",
-            { requestId, sessionId },
-            stoppedTyping.error.cause,
+            formatBridgeTaggedErrorForLog(stoppedTyping.error, { requestId, sessionId }),
           );
           return Result.err(
             new EvtRequestStopTypingFailed({
-              cause: stoppedTyping.error.cause,
+              cause: stoppedTyping.error,
               message: "Failed to stop relay typing after delayed terminal lifecycle",
             }),
           );
@@ -962,22 +965,24 @@ export async function bridgeBusToAdapter(params: {
       void runBusToAdapterBestEffort({
         operation: "publish-output-created",
         effect: async () => {
-          await bus.publish(
-            lilacEventTypes.EvtSurfaceOutputMessageCreated,
-            {
-              msgRef: {
-                platform: msgRef.platform,
-                channelId: msgRef.channelId,
-                messageId: msgRef.messageId,
+          adaptEventPublishResultToHost(
+            await bus.publish(
+              lilacEventTypes.EvtSurfaceOutputMessageCreated,
+              {
+                msgRef: {
+                  platform: msgRef.platform,
+                  channelId: msgRef.channelId,
+                  messageId: msgRef.messageId,
+                },
               },
-            },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: input.platform,
+              {
+                headers: {
+                  request_id: requestId,
+                  session_id: sessionId,
+                  request_client: input.platform,
+                },
               },
-            },
+            ),
           );
         },
         logger,
@@ -1023,22 +1028,24 @@ export async function bridgeBusToAdapter(params: {
         void runBusToAdapterBestEffort({
           operation: "publish-output-created",
           effect: async () => {
-            await bus.publish(
-              lilacEventTypes.EvtSurfaceOutputMessageCreated,
-              {
-                msgRef: {
-                  platform: ref.platform,
-                  channelId: ref.channelId,
-                  messageId: ref.messageId,
+            adaptEventPublishResultToHost(
+              await bus.publish(
+                lilacEventTypes.EvtSurfaceOutputMessageCreated,
+                {
+                  msgRef: {
+                    platform: ref.platform,
+                    channelId: ref.channelId,
+                    messageId: ref.messageId,
+                  },
                 },
-              },
-              {
-                headers: {
-                  request_id: requestId,
-                  session_id: sessionId,
-                  request_client: input.platform,
+                {
+                  headers: {
+                    request_id: requestId,
+                    session_id: sessionId,
+                    request_client: input.platform,
+                  },
                 },
-              },
+              ),
             );
           },
           logger,
@@ -1204,11 +1211,10 @@ export async function bridgeBusToAdapter(params: {
         });
         return;
       }
-      logger.warn("failed to delete unlinked transcript checkpoint", {
-        requestId,
-        sessionId,
-        errorTag: deleted.error.name,
-      });
+      logger.warn(
+        "failed to delete unlinked transcript checkpoint",
+        formatBridgeTaggedErrorForLog(deleted.error, { requestId, sessionId }),
+      );
     };
 
     const relayStop = async () => {
@@ -1257,10 +1263,13 @@ export async function bridgeBusToAdapter(params: {
     ): Promise<ResultType<void, OutReqPushFailed>> => {
       const pushed = await captureBusToAdapterEffect("push-output", () => out.push(part));
       if (pushed.status === "ok") return Result.ok(undefined);
-      logger.error("failed to push relay output", { requestId, sessionId }, pushed.error.cause);
+      logger.error(
+        "failed to push relay output",
+        formatBridgeTaggedErrorForLog(pushed.error, { requestId, sessionId }),
+      );
       return Result.err(
         new OutReqPushFailed({
-          cause: pushed.error.cause,
+          cause: pushed.error,
           message: "Failed to push relay output",
         }),
       );
@@ -1269,10 +1278,13 @@ export async function bridgeBusToAdapter(params: {
     const finishOutput = async (): Promise<ResultType<SurfaceOutputResult, OutReqFinishFailed>> => {
       const finished = await captureBusToAdapterEffect("finish-output", () => out.finish());
       if (finished.status === "ok") return Result.ok(finished.value);
-      logger.error("failed to finish relay output", { requestId, sessionId }, finished.error.cause);
+      logger.error(
+        "failed to finish relay output",
+        formatBridgeTaggedErrorForLog(finished.error, { requestId, sessionId }),
+      );
       return Result.err(
         new OutReqFinishFailed({
-          cause: finished.error.cause,
+          cause: finished.error,
           message: "Failed to finish relay output",
         }),
       );

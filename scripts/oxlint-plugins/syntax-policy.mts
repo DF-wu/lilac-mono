@@ -18,6 +18,22 @@ export interface SyntacticPolicy {
   }[];
 }
 
+export const ACTIVE_SYNTAX_RULES = [
+  "lilac/no-exception-flow",
+  "lilac/no-inline-async-result-callback",
+  "lilac/no-presentation-decoder-import",
+  "lilac/no-store-inline-decoding",
+  "lilac/no-direct-sqlite-transaction",
+] as const;
+
+export type ActiveSyntaxRule = (typeof ACTIVE_SYNTAX_RULES)[number];
+
+export const FINAL_PACKAGE_WIDE_SYNTAX_RULES = [
+  "no-nested-ternary",
+  "lilac/no-local-is-record",
+  ...ACTIVE_SYNTAX_RULES,
+] as const;
+
 export const SYNTACTIC_POLICY: SyntacticPolicy = {
   canonicalRecordGuards: [
     {

@@ -2,11 +2,13 @@ import path from "node:path";
 import { open, opendir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 
+import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import {
   discoverSkills,
-  findWorkspaceRoot,
+  findWorkspaceRootResult,
   formatAvailableSkillsSection,
-  parseSkillMarkdown,
+  isPanic,
+  parseSkillMarkdownResult,
   type DiscoveredSkill,
   type SkillScanRoot,
   type SkillWarning,
@@ -48,15 +50,90 @@ export type MiniLilacSkillCatalogOptions = {
   onWarning?: (warning: SkillWarning) => void;
 };
 
+export class MiniLilacSkillUnavailable extends TaggedError("MiniLilacSkillUnavailable")<{
+  readonly name: string;
+  readonly message: string;
+}> {}
+
+export class MiniLilacSkillFilesystemFailed extends TaggedError("MiniLilacSkillFilesystemFailed")<{
+  readonly name: string;
+  readonly operation: "resolve-file" | "resolve-directory" | "read-file" | "list-resources";
+  readonly message: string;
+}> {}
+
+export class MiniLilacSkillPathInvalid extends TaggedError("MiniLilacSkillPathInvalid")<{
+  readonly name: string;
+  readonly issue: "file-symlink" | "directory-symlink";
+  readonly message: string;
+}> {}
+
+export class MiniLilacSkillReadAndCleanupFailed extends TaggedError(
+  "MiniLilacSkillReadAndCleanupFailed",
+)<{
+  readonly name: string;
+  readonly readError: MiniLilacSkillFilesystemFailed;
+  readonly cleanupError: MiniLilacSkillFilesystemFailed;
+  readonly message: string;
+}> {}
+
+export class MiniLilacSkillContentInvalid extends TaggedError("MiniLilacSkillContentInvalid")<{
+  readonly name: string;
+  readonly issue: "too-large" | "markdown" | "identity" | "instructions-too-large";
+  readonly message: string;
+}> {}
+
+export class MiniLilacSkillDiscoveryFailed extends TaggedError("MiniLilacSkillDiscoveryFailed")<{
+  readonly workspaceRoot: string;
+  readonly message: string;
+}> {}
+
+export type MiniLilacSkillLoadError =
+  | MiniLilacSkillUnavailable
+  | MiniLilacSkillFilesystemFailed
+  | MiniLilacSkillReadAndCleanupFailed
+  | MiniLilacSkillPathInvalid
+  | MiniLilacSkillContentInvalid;
+
+type SkillCapture<T, E> =
+  | { readonly status: "ok"; readonly value: T }
+  | { readonly status: "error"; readonly error: E }
+  | { readonly status: "panic"; readonly panic: Panic };
+
+function throwSkillPanic(panic: Panic): never {
+  throw panic;
+}
+
+function captureSkillSync<T, E>(operation: () => T, error: E): SkillCapture<T, E> {
+  try {
+    return { status: "ok", value: operation() };
+  } catch (cause) {
+    if (isPanic(cause)) return { status: "panic", panic: cause };
+    return { status: "error", error };
+  }
+}
+
+async function captureSkillPromise<T, E>(
+  operation: () => Promise<T>,
+  error: E,
+): Promise<SkillCapture<T, E>> {
+  try {
+    return { status: "ok", value: await operation() };
+  } catch (cause) {
+    if (isPanic(cause)) return { status: "panic", panic: cause };
+    return { status: "error", error };
+  }
+}
+
 export class MiniLilacSkillCatalogSnapshot {
   readonly summaries: readonly MiniLilacSkillSummary[];
   private readonly byName: ReadonlyMap<string, DiscoveredSkill>;
 
   constructor(skills: readonly DiscoveredSkill[]) {
     this.byName = new Map(skills.map((skill) => [skill.name, skill]));
-    this.summaries = skills.map((skill) =>
-      miniLilacSkillSummarySchema.parse({ name: skill.name, description: skill.description }),
-    );
+    this.summaries = skills.map((skill) => ({
+      name: skill.name,
+      description: skill.description,
+    }));
   }
 
   promptSection(contextWindow?: number): string | null {
@@ -73,79 +150,239 @@ export class MiniLilacSkillCatalogSnapshot {
     return `${catalog}\n\n${SKILL_USAGE_INSTRUCTIONS}`;
   }
 
-  async load(name: string): Promise<MiniLilacSkillLoadResult> {
+  async loadResult(
+    name: string,
+  ): Promise<ResultType<MiniLilacSkillLoadResult, MiniLilacSkillLoadError>> {
     const skill = this.byName.get(name);
-    if (skill === undefined) throw new Error(`Skill '${name}' is not available`);
-    const canonicalLocation = await realpath(skill.location);
-    if (path.normalize(canonicalLocation) !== path.normalize(path.resolve(skill.location))) {
-      throw new Error(`Skill '${name}' resolves through a symbolic link`);
-    }
-    const handle = await open(canonicalLocation, "r");
-    const raw = await (async () => {
-      try {
-        const buffer = Buffer.alloc(MAX_SKILL_FILE_BYTES + 1);
-        let offset = 0;
-        while (offset < buffer.length) {
-          const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, null);
-          if (bytesRead === 0) break;
-          offset += bytesRead;
-        }
-        if (offset > MAX_SKILL_FILE_BYTES) {
-          throw new Error(`Skill '${name}' exceeds ${MAX_SKILL_FILE_BYTES} bytes`);
-        }
-        return buffer.subarray(0, offset).toString("utf8");
-      } finally {
-        await handle.close();
-      }
-    })();
-    const parsed = parseSkillMarkdown(raw);
-    if (parsed.name !== name) throw new Error(`Skill '${name}' changed identity while loading`);
-    if (parsed.body.length > MAX_SKILL_INSTRUCTION_CHARS) {
-      throw new Error(
-        `Skill '${name}' instructions exceed ${MAX_SKILL_INSTRUCTION_CHARS} characters`,
+    if (skill === undefined) {
+      return Result.err(
+        new MiniLilacSkillUnavailable({ name, message: `Skill '${name}' is not available` }),
       );
     }
-    const canonicalBaseDirectory = await realpath(skill.baseDir);
-    if (path.normalize(canonicalBaseDirectory) !== path.normalize(path.resolve(skill.baseDir))) {
-      throw new Error(`Skill '${name}' directory resolves through a symbolic link`);
+    const location = await this.resolvePath(name, skill.location, "resolve-file");
+    if (location.status === "error") return Result.err(location.error);
+    const canonicalLocation = location.value;
+    if (path.normalize(canonicalLocation) !== path.normalize(path.resolve(skill.location))) {
+      return Result.err(
+        new MiniLilacSkillPathInvalid({
+          name,
+          issue: "file-symlink",
+          message: `Skill '${name}' resolves through a symbolic link`,
+        }),
+      );
     }
+    const raw = await this.readSkillFile(name, canonicalLocation);
+    if (raw.status === "error") return Result.err(raw.error);
+    const parsed = parseSkillMarkdownResult(raw.value);
+    if (parsed.status === "error") {
+      return Result.err(
+        new MiniLilacSkillContentInvalid({
+          name,
+          issue: "markdown",
+          message: `Skill '${name}' is invalid: ${parsed.error.message}`,
+        }),
+      );
+    }
+    if (parsed.value.name !== name) {
+      return Result.err(
+        new MiniLilacSkillContentInvalid({
+          name,
+          issue: "identity",
+          message: `Skill '${name}' changed identity while loading`,
+        }),
+      );
+    }
+    if (parsed.value.body.length > MAX_SKILL_INSTRUCTION_CHARS) {
+      return Result.err(
+        new MiniLilacSkillContentInvalid({
+          name,
+          issue: "instructions-too-large",
+          message: `Skill '${name}' instructions exceed ${MAX_SKILL_INSTRUCTION_CHARS} characters`,
+        }),
+      );
+    }
+    const baseDirectory = await this.resolvePath(name, skill.baseDir, "resolve-directory");
+    if (baseDirectory.status === "error") return Result.err(baseDirectory.error);
+    const canonicalBaseDirectory = baseDirectory.value;
+    if (path.normalize(canonicalBaseDirectory) !== path.normalize(path.resolve(skill.baseDir))) {
+      return Result.err(
+        new MiniLilacSkillPathInvalid({
+          name,
+          issue: "directory-symlink",
+          message: `Skill '${name}' directory resolves through a symbolic link`,
+        }),
+      );
+    }
+    const listed = await this.listResources(name, canonicalBaseDirectory);
+    if (listed.status === "error") return Result.err(listed.error);
+    return Result.ok({
+      name,
+      description: parsed.value.description,
+      instructions: parsed.value.body,
+      baseDirectory: skill.baseDir,
+      resources: listed.value.resources,
+      resourceListingTruncated: listed.value.truncated,
+    });
+  }
+
+  /** Compatibility adapter for the skill tool's established rejection contract. */
+  async load(name: string): Promise<MiniLilacSkillLoadResult> {
+    const loaded = await this.loadResult(name);
+    if (loaded.status === "error") throw loaded.error;
+    return loaded.value;
+  }
+
+  private async resolvePath(
+    name: string,
+    inputPath: string,
+    operation: "resolve-file" | "resolve-directory",
+  ): Promise<ResultType<string, MiniLilacSkillFilesystemFailed>> {
+    const resolved = await captureSkillPromise(
+      () => realpath(inputPath),
+      new MiniLilacSkillFilesystemFailed({
+        name,
+        operation,
+        message: `Failed to resolve skill '${name}'`,
+      }),
+    );
+    if (resolved.status === "panic") return throwSkillPanic(resolved.panic);
+    if (resolved.status === "error") return Result.err(resolved.error);
+    return Result.ok(resolved.value);
+  }
+
+  private async readSkillFile(
+    name: string,
+    location: string,
+  ): Promise<
+    ResultType<
+      string,
+      | MiniLilacSkillFilesystemFailed
+      | MiniLilacSkillReadAndCleanupFailed
+      | MiniLilacSkillContentInvalid
+    >
+  > {
+    const opened = await captureSkillPromise(
+      () => open(location, "r"),
+      new MiniLilacSkillFilesystemFailed({
+        name,
+        operation: "read-file",
+        message: `Failed to open skill '${name}'`,
+      }),
+    );
+    if (opened.status === "panic") return throwSkillPanic(opened.panic);
+    if (opened.status === "error") return Result.err(opened.error);
+    const handle = opened.value;
+
+    const readError = new MiniLilacSkillFilesystemFailed({
+      name,
+      operation: "read-file",
+      message: `Failed to read skill '${name}'`,
+    });
+    const read = await captureSkillPromise(async () => {
+      const buffer = Buffer.alloc(MAX_SKILL_FILE_BYTES + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, null);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset > MAX_SKILL_FILE_BYTES) {
+        return Result.err(
+          new MiniLilacSkillContentInvalid({
+            name,
+            issue: "too-large",
+            message: `Skill '${name}' exceeds ${MAX_SKILL_FILE_BYTES} bytes`,
+          }),
+        );
+      }
+      return Result.ok(buffer.subarray(0, offset).toString("utf8"));
+    }, readError);
+
+    const cleanupError = new MiniLilacSkillFilesystemFailed({
+      name,
+      operation: "read-file",
+      message: `Failed to close skill '${name}'`,
+    });
+    const closed = await captureSkillPromise(() => handle.close(), cleanupError);
+
+    if (read.status === "panic") return throwSkillPanic(read.panic);
+    if (closed.status === "panic") return throwSkillPanic(closed.panic);
+    let ownedReadError: MiniLilacSkillFilesystemFailed | MiniLilacSkillContentInvalid | undefined;
+    if (read.status === "error") ownedReadError = read.error;
+    else if (read.value.status === "error") ownedReadError = read.value.error;
+    if (ownedReadError && closed.status === "error") {
+      const normalizedReadError =
+        ownedReadError instanceof MiniLilacSkillFilesystemFailed
+          ? ownedReadError
+          : new MiniLilacSkillFilesystemFailed({
+              name,
+              operation: "read-file",
+              message: ownedReadError.message,
+            });
+      return Result.err(
+        new MiniLilacSkillReadAndCleanupFailed({
+          name,
+          readError: normalizedReadError,
+          cleanupError: closed.error,
+          message: `Failed to read and close skill '${name}'`,
+        }),
+      );
+    }
+    if (ownedReadError) return Result.err(ownedReadError);
+    if (closed.status === "error") return Result.err(closed.error);
+    if (read.status === "error") return Result.err(read.error);
+    if (read.value.status === "error") return Result.err(read.value.error);
+    return Result.ok(read.value.value);
+  }
+
+  private async listResources(
+    name: string,
+    baseDirectory: string,
+  ): Promise<
+    ResultType<
+      { readonly resources: string[]; readonly truncated: boolean },
+      MiniLilacSkillFilesystemFailed
+    >
+  > {
     const resources: string[] = [];
     let resourceListingTruncated = false;
-    const directory = await opendir(canonicalBaseDirectory);
-    for await (const entry of directory) {
-      if (entry.name === "SKILL.md" || entry.name === ".git" || entry.name === "node_modules") {
-        continue;
-      }
-      if (!entry.isFile() && !entry.isDirectory()) continue;
-      if (resources.length === MAX_SKILL_RESOURCES) {
-        resourceListingTruncated = true;
-        break;
-      }
-      resources.push(`${entry.name}${entry.isDirectory() ? "/" : ""}`);
-    }
+    const listed = await captureSkillPromise(
+      async () => {
+        const directory = await opendir(baseDirectory);
+        for await (const entry of directory) {
+          if (entry.name === "SKILL.md" || entry.name === ".git" || entry.name === "node_modules") {
+            continue;
+          }
+          if (!entry.isFile() && !entry.isDirectory()) continue;
+          if (resources.length === MAX_SKILL_RESOURCES) {
+            resourceListingTruncated = true;
+            break;
+          }
+          resources.push(`${entry.name}${entry.isDirectory() ? "/" : ""}`);
+        }
+      },
+      new MiniLilacSkillFilesystemFailed({
+        name,
+        operation: "list-resources",
+        message: `Failed to list resources for skill '${name}'`,
+      }),
+    );
+    if (listed.status === "panic") return throwSkillPanic(listed.panic);
+    if (listed.status === "error") return Result.err(listed.error);
     resources.sort();
-    return miniLilacSkillLoadResultSchema.parse({
-      name,
-      description: parsed.description,
-      instructions: parsed.body,
-      baseDirectory: skill.baseDir,
-      resources,
-      resourceListingTruncated,
-    });
+    return Result.ok({ resources, truncated: resourceListingTruncated });
   }
 }
 
 export class MiniLilacSkillCatalog {
   constructor(private readonly options: MiniLilacSkillCatalogOptions) {}
 
-  async discover(cwd: string): Promise<MiniLilacSkillCatalogSnapshot> {
-    const workspaceRoot = (() => {
-      try {
-        return findWorkspaceRoot(cwd);
-      } catch {
-        return path.resolve(cwd);
-      }
-    })();
+  async discoverResult(
+    cwd: string,
+  ): Promise<ResultType<MiniLilacSkillCatalogSnapshot, MiniLilacSkillDiscoveryFailed>> {
+    const foundWorkspaceRoot = findWorkspaceRootResult(cwd);
+    const workspaceRoot =
+      foundWorkspaceRoot.status === "ok" ? foundWorkspaceRoot.value : path.resolve(cwd);
     const homeDir = this.options.homeDir ?? homedir();
     const roots: SkillScanRoot[] = [
       {
@@ -164,51 +401,91 @@ export class MiniLilacSkillCatalog {
         precedence: 100,
       },
     ];
-    try {
-      const discovered = await discoverSkills({
+    const discovered = await captureSkillPromise(
+      () =>
+        discoverSkills({
+          workspaceRoot,
+          dataDir: this.options.dataDir,
+          homeDir,
+          roots,
+          maxSkills: MAX_DISCOVERED_SKILLS * 2,
+          maxScanEntries: MAX_DISCOVERED_SKILLS * 16,
+        }),
+      new MiniLilacSkillDiscoveryFailed({
         workspaceRoot,
-        dataDir: this.options.dataDir,
-        homeDir,
-        roots,
-        maxSkills: MAX_DISCOVERED_SKILLS * 2,
-        maxScanEntries: MAX_DISCOVERED_SKILLS * 16,
-      });
-      discovered.warnings.forEach((warning) => this.options.onWarning?.(warning));
-      const skills: DiscoveredSkill[] = [];
-      for (const skill of discovered.skills) {
-        try {
-          const canonicalLocation = await realpath(skill.location);
-          if (path.normalize(canonicalLocation) !== path.normalize(path.resolve(skill.location))) {
-            this.options.onWarning?.({
-              location: skill.location,
-              message: "skill resolves through a symbolic link",
-            });
-            continue;
-          }
-          skills.push(skill);
-          if (skills.length === MAX_DISCOVERED_SKILLS) {
-            if (discovered.skills.length > skills.length) {
-              this.options.onWarning?.({
-                location: workspaceRoot,
-                message: `skill discovery capped at ${MAX_DISCOVERED_SKILLS} entries`,
-              });
-            }
-            break;
-          }
-        } catch (error) {
-          this.options.onWarning?.({
-            location: skill.location,
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-      return new MiniLilacSkillCatalogSnapshot(skills);
-    } catch (error) {
-      this.options.onWarning?.({
-        location: workspaceRoot,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      return new MiniLilacSkillCatalogSnapshot([]);
+        message: "Skill discovery failed",
+      }),
+    );
+    if (discovered.status === "panic") return throwSkillPanic(discovered.panic);
+    if (discovered.status === "error") return Result.err(discovered.error);
+    for (const warning of discovered.value.warnings) {
+      const emitted = this.emitWarning(workspaceRoot, warning);
+      if (emitted.status === "error") return Result.err(emitted.error);
     }
+    const skills: DiscoveredSkill[] = [];
+    for (const skill of discovered.value.skills) {
+      const resolved = await captureSkillPromise(
+        () => realpath(skill.location),
+        new MiniLilacSkillDiscoveryFailed({
+          workspaceRoot,
+          message: "Skill path resolution failed",
+        }),
+      );
+      if (resolved.status === "panic") return throwSkillPanic(resolved.panic);
+      if (resolved.status === "error") {
+        const emitted = this.emitWarning(workspaceRoot, {
+          location: skill.location,
+          message: "skill path resolution failed",
+        });
+        if (emitted.status === "error") return Result.err(emitted.error);
+        continue;
+      }
+      if (path.normalize(resolved.value) !== path.normalize(path.resolve(skill.location))) {
+        const emitted = this.emitWarning(workspaceRoot, {
+          location: skill.location,
+          message: "skill resolves through a symbolic link",
+        });
+        if (emitted.status === "error") return Result.err(emitted.error);
+        continue;
+      }
+      skills.push(skill);
+      if (skills.length === MAX_DISCOVERED_SKILLS) {
+        if (discovered.value.skills.length > skills.length) {
+          const emitted = this.emitWarning(workspaceRoot, {
+            location: workspaceRoot,
+            message: `skill discovery capped at ${MAX_DISCOVERED_SKILLS} entries`,
+          });
+          if (emitted.status === "error") return Result.err(emitted.error);
+        }
+        break;
+      }
+    }
+    return Result.ok(new MiniLilacSkillCatalogSnapshot(skills));
+  }
+
+  private emitWarning(
+    workspaceRoot: string,
+    warning: SkillWarning,
+  ): ResultType<void, MiniLilacSkillDiscoveryFailed> {
+    const emitted = captureSkillSync(
+      () => this.options.onWarning?.(warning),
+      new MiniLilacSkillDiscoveryFailed({
+        workspaceRoot,
+        message: "Skill warning callback failed",
+      }),
+    );
+    if (emitted.status === "panic") return throwSkillPanic(emitted.panic);
+    if (emitted.status === "error") return Result.err(emitted.error);
+    return Result.ok(undefined);
+  }
+
+  async discover(cwd: string): Promise<MiniLilacSkillCatalogSnapshot> {
+    const discovered = await this.discoverResult(cwd);
+    if (discovered.status === "ok") return discovered.value;
+    this.options.onWarning?.({
+      location: discovered.error.workspaceRoot,
+      message: discovered.error.message,
+    });
+    return new MiniLilacSkillCatalogSnapshot([]);
   }
 }

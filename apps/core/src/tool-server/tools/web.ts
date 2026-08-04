@@ -17,6 +17,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   createDefaultWebSearchProviders,
@@ -26,6 +27,7 @@ import {
   type WebSearchProvider,
 } from "./web-search";
 import type { RequestContext } from "../types";
+import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 
 const getPageModeSchema = z.enum(["auto", "fetch", "browser", "extract", "provider-only"]);
 
@@ -138,12 +140,57 @@ type WebProviderFailure = {
   message: string;
 };
 
-type FirecrawlScrapeResponse = {
-  success?: boolean;
-  error?: string;
-  message?: string;
-  data?: unknown;
-};
+const firecrawlScrapeResponseSchema = z.object({
+  success: z.boolean().optional(),
+  error: z.string().optional(),
+  message: z.string().optional(),
+  data: z
+    .object({
+      url: z.string().nullable().optional(),
+      title: z.string().nullable().optional(),
+      html: z.string().nullable().optional(),
+      markdown: z.string().nullable().optional(),
+      content: z.string().nullable().optional(),
+      metadata: z
+        .object({
+          sourceURL: z.string().nullable().optional(),
+          title: z.string().nullable().optional(),
+        })
+        .nullable()
+        .optional(),
+    })
+    .nullable()
+    .optional(),
+});
+
+type FirecrawlScrapeResponse = z.output<typeof firecrawlScrapeResponseSchema>;
+
+export class FirecrawlScrapeResponseInvalid extends TaggedError("FirecrawlScrapeResponseInvalid")<{
+  readonly message: string;
+}> {}
+
+class WebToolFailure extends TaggedError("WebToolFailure")<{
+  readonly message: string;
+}> {}
+
+function adaptWebResultToToolHost<TValue>(result: ResultType<TValue, WebToolFailure>): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalWebFailureToToolHost(message: string): never {
+  return adaptWebResultToToolHost(Result.err(new WebToolFailure({ message })));
+}
+
+export function decodeFirecrawlScrapeResponse(
+  value: unknown,
+): ResultType<FirecrawlScrapeResponse, FirecrawlScrapeResponseInvalid> {
+  const decoded = firecrawlScrapeResponseSchema.safeParse(value);
+  if (decoded.success) return Result.ok(decoded.data);
+  return Result.err(
+    new FirecrawlScrapeResponseInvalid({ message: "Firecrawl returned an invalid response" }),
+  );
+}
 
 function createAbortError(message = "request aborted"): Error {
   const error = new Error(message);
@@ -386,23 +433,8 @@ function supportsHtmlExtractFormat(providerId: WebSearchProviderId): boolean {
   return providerId === "firecrawl";
 }
 
-function getRecordString(record: Record<string, unknown>, key: string): string | null {
-  const value = record[key];
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-}
-
 function getFirecrawlTitle(payload: FirecrawlScrapeResponse, fallbackUrl: string): string {
-  if (isRecord(payload.data) && isRecord(payload.data.metadata)) {
-    const metadataTitle = getRecordString(payload.data.metadata, "title");
-    if (metadataTitle) return metadataTitle;
-  }
-
-  if (isRecord(payload.data)) {
-    const payloadTitle = getRecordString(payload.data, "title");
-    if (payloadTitle) return payloadTitle;
-  }
-
-  return fallbackUrl;
+  return payload.data?.metadata?.title?.trim() || payload.data?.title?.trim() || fallbackUrl;
 }
 
 async function readResponseTextWithLimit(params: {
@@ -414,7 +446,9 @@ async function readResponseTextWithLimit(params: {
 
   const contentLength = contentLengthFromHeaders(params.res.headers);
   if (contentLength !== null && contentLength > params.maxBytes) {
-    throw new Error(`response too large (${contentLength} bytes > ${params.maxBytes} byte limit)`);
+    signalWebFailureToToolHost(
+      `response too large (${contentLength} bytes > ${params.maxBytes} byte limit)`,
+    );
   }
 
   if (!params.res.body) {
@@ -622,7 +656,7 @@ export class Web implements ServerTool {
 
     const apiKey = env.tools.web.tavilyApiKey;
     if (!apiKey) {
-      throw new Error("TAVILY_API_KEY is not configured.");
+      signalWebFailureToToolHost("TAVILY_API_KEY is not configured.");
     }
 
     const apiBaseUrlRaw = env.tools.web.tavilyApiBaseUrl?.trim();
@@ -638,7 +672,7 @@ export class Web implements ServerTool {
 
     const apiKey = env.tools.web.exa.apiKey;
     if (!apiKey) {
-      throw new Error("EXA_API_KEY is not configured.");
+      signalWebFailureToToolHost("EXA_API_KEY is not configured.");
     }
 
     const baseUrlRaw = env.tools.web.exa.baseUrl?.trim();
@@ -696,17 +730,17 @@ export class Web implements ServerTool {
   ): Promise<unknown> {
     if (callableId === "fetch") return this.callFetch(rawInput, opts);
     if (callableId === "search") return this.callSearch(rawInput, opts);
-    throw new Error("Invalid callable ID");
+    return signalWebFailureToToolHost("Invalid callable ID");
   }
 
   private async callFetch(
-    rawInput: unknown,
+    rawInput: Record<string, unknown>,
     opts?: {
       signal?: AbortSignal;
       context?: RequestContext;
     },
   ) {
-    const input = getPageSchema.parse(rawInput);
+    const input = parseToolInput({ callableId: "fetch", input: rawInput, schema: getPageSchema });
     await this.refreshWebConfig();
 
     const mode = input.mode ?? this.webFetchDefaultMode;
@@ -737,12 +771,16 @@ export class Web implements ServerTool {
   }
 
   private async callSearch(
-    rawInput: unknown,
+    rawInput: Record<string, unknown>,
     opts?: {
       signal?: AbortSignal;
     },
   ) {
-    const input = webSearchInputSchema.parse(rawInput);
+    const input = parseToolInput({
+      callableId: "search",
+      input: rawInput,
+      schema: webSearchInputSchema,
+    });
 
     await this.refreshWebConfig();
 
@@ -829,7 +867,7 @@ export class Web implements ServerTool {
     const pwPath = chromium.executablePath();
     const pwExists = await Bun.file(pwPath).exists();
     if (!pwExists) {
-      throw new Error(
+      signalWebFailureToToolHost(
         "Chromium is not available. Install system chromium, or run: tools onboarding.playwright",
       );
     }
@@ -1106,7 +1144,7 @@ export class Web implements ServerTool {
       case "firecrawl": {
         const apiKey = env.tools.web.firecrawl.apiKey;
         if (!apiKey) {
-          throw new Error("FIRECRAWL_API_KEY is not configured.");
+          signalWebFailureToToolHost("FIRECRAWL_API_KEY is not configured.");
         }
 
         const apiBaseUrlRaw = env.tools.web.firecrawl.apiBaseUrl?.trim();
@@ -1132,29 +1170,32 @@ export class Web implements ServerTool {
           signal,
         });
 
-        let payload: FirecrawlScrapeResponse;
+        let rawPayload: unknown;
         try {
-          payload = (await response.json()) as FirecrawlScrapeResponse;
+          rawPayload = await response.json();
         } catch {
           return {
             isError: true,
             error: `Firecrawl scrape failed (${response.status}): invalid JSON response.`,
           };
         }
-
-        if (!response.ok || payload.success === false) {
-          const detail =
-            (typeof payload.error === "string" && payload.error) ||
-            (typeof payload.message === "string" && payload.message) ||
-            response.statusText ||
-            "unknown error";
+        const decodedPayload = decodeFirecrawlScrapeResponse(rawPayload);
+        if (decodedPayload.status === "error") {
           return {
             isError: true,
-            error: `Firecrawl scrape failed (${response.status}): ${detail}`,
+            error: `Firecrawl scrape failed (${response.status}): invalid response contract.`,
+          };
+        }
+        const payload = decodedPayload.value;
+
+        if (!response.ok || payload.success === false) {
+          return {
+            isError: true,
+            error: `Firecrawl scrape failed (${response.status}): ${response.statusText || "request failed"}`,
           };
         }
 
-        if (!isRecord(payload.data)) {
+        if (!payload.data) {
           return {
             isError: true,
             error: "Firecrawl scrape returned no content.",
@@ -1162,14 +1203,11 @@ export class Web implements ServerTool {
         }
 
         const resultUrl =
-          (isRecord(payload.data.metadata) &&
-            getRecordString(payload.data.metadata, "sourceURL")) ||
-          getRecordString(payload.data, "url") ||
-          url;
+          payload.data.metadata?.sourceURL?.trim() || payload.data.url?.trim() || url;
         const title = getFirecrawlTitle(payload, resultUrl);
 
         if (format === "html") {
-          const html = getRecordString(payload.data, "html");
+          const html = payload.data.html?.trim();
           if (!html) {
             return {
               isError: true,
@@ -1190,8 +1228,7 @@ export class Web implements ServerTool {
           };
         }
 
-        const markdown =
-          getRecordString(payload.data, "markdown") ?? getRecordString(payload.data, "content");
+        const markdown = payload.data.markdown?.trim() ?? payload.data.content?.trim();
         if (!markdown) {
           return {
             isError: true,

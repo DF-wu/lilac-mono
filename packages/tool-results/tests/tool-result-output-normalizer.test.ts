@@ -370,6 +370,12 @@ describe("tool result output normalizer", () => {
     });
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
+    const hostileToJson: Record<string, string> = {};
+    Object.defineProperty(hostileToJson, "toJSON", {
+      value: () => {
+        throw new Error("ordinary serialization failure");
+      },
+    });
 
     for (const value of [cyclic, 1n, undefined]) {
       expect(
@@ -385,6 +391,33 @@ describe("tool result output normalizer", () => {
         }),
       ).toEqual({ type: "error-text", value: "[tool result is not JSON-serializable]" });
     }
+    expect(
+      await normalize(
+        { type: "json", value: hostileToJson },
+        { toolCallId: "hostile", toolName: "plugin" },
+      ),
+    ).toEqual({ type: "text", value: "[tool result is not JSON-serializable]" });
+  });
+
+  it("preserves exact Panic identity from hostile JSON serialization", async () => {
+    const normalize = createToolResultOutputNormalizer({
+      owner: { requestId: "request-a", scopeId: "scope-a" },
+      getOutputConfig: outputConfig,
+    });
+    const panic = new Panic({ message: "hostile toJSON invariant failed" });
+    const hostileToJson: Record<string, string> = {};
+    Object.defineProperty(hostileToJson, "toJSON", {
+      value: () => {
+        throw panic;
+      },
+    });
+
+    await expect(
+      normalize(
+        { type: "json", value: hostileToJson },
+        { toolCallId: "panic", toolName: "plugin" },
+      ),
+    ).rejects.toBe(panic);
   });
 
   it("does not let a public built-in tool name bypass overflow handling", async () => {
@@ -626,7 +659,7 @@ describe("tool result output normalizer", () => {
     if (error.type === "error-text") expect(error.value).toContain("tool-result://");
   });
 
-  it("keeps the no-URI overflow reference when artifact persistence rejects", async () => {
+  it("does not hide a store implementation that violates its Result contract", async () => {
     const normalize = createToolResultOutputNormalizer({
       artifacts: {
         rootDir: baseDir,
@@ -644,16 +677,12 @@ describe("tool result output normalizer", () => {
       getOutputConfig: outputConfig,
     });
 
-    const normalized = await normalize(
-      { type: "text", value: "0123456789abcdefghij" },
-      { toolCallId: "rejected", toolName: "plugin" },
-    );
-
-    expect(normalized).toEqual({
-      type: "text",
-      value:
-        "[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nThe complete output could not be retained. Narrow the request or re-run the tool.",
-    });
+    await expect(
+      normalize(
+        { type: "text", value: "0123456789abcdefghij" },
+        { toolCallId: "rejected", toolName: "plugin" },
+      ),
+    ).rejects.toThrow("adapter rejected");
   });
 
   it("preserves artifact Panic identity through overflow normalization", async () => {

@@ -9,14 +9,19 @@ import {
   type EventDeliveryStopFailed,
   type EventFetchContractInvalid,
   type EventFetchTransportFailed,
+  type EventPublishContractInvalid,
+  type EventPublishTransportFailed,
+  type EventTopicOperationFailed,
+  type EventTopicOperationUnsupported,
   type LilacBus,
   type OutReqTopic,
 } from "@stanley2058/lilac-event-bus";
-import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
+import { createLogger, env, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { type ChildToolState, renderSubagentDisplay } from "../tools/subagent";
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import {
   DurableWorkflowStore,
   signalDurableWorkflowReadErrorToHost,
@@ -26,6 +31,7 @@ import {
   adaptWorkflowArtifactResultToException,
   readWorkflowValueArtifact,
 } from "./workflow-artifact-store";
+import { formatWorkflowErrorForLog } from "./workflow-error-log";
 import { resolveWorkflowSubagentToolResult } from "./workflow-subagent-output";
 
 export type WorkflowLiveParentCompletion = {
@@ -66,6 +72,9 @@ type ChildOutputBatch = {
   next?: Cursor;
 };
 
+type WorkflowLiveParentTopicError = EventTopicOperationFailed | EventTopicOperationUnsupported;
+type WorkflowLiveParentPublishError = EventPublishContractInvalid | EventPublishTransportFailed;
+
 export class WorkflowLiveParentRunEventFailed extends TaggedError(
   "WorkflowLiveParentRunEventFailed",
 )<{
@@ -99,10 +108,19 @@ export function applyWorkflowLiveParentDeliveryPolicy(
 
 async function captureRunEvent(
   runId: string,
-  handle: () => Promise<void>,
+  handle: () => Promise<void | ResultType<void, WorkflowLiveParentTopicError>>,
 ): Promise<ResultType<void, WorkflowLiveParentRunEventFailed>> {
   try {
-    await handle();
+    const handled = await handle();
+    if (handled?.status === "error") {
+      return Result.err(
+        new WorkflowLiveParentRunEventFailed({
+          cause: handled.error,
+          runId,
+          message: "Live-parent workflow event handling failed",
+        }),
+      );
+    }
     return Result.ok(undefined);
   } catch (cause) {
     if (Panic.is(cause)) throw cause;
@@ -197,7 +215,15 @@ function toCompletionIdentity(
   store: DurableWorkflowStore,
 ): WorkflowLiveParentCompletionIdentity {
   if (run.completionTarget.kind !== "live_parent") {
-    throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
+    return adaptToolResultToHost(
+      Result.err(
+        new WorkflowLiveParentRunEventFailed({
+          cause: null,
+          runId: run.runId,
+          message: `Workflow run ${run.runId} has no live-parent completion target`,
+        }),
+      ),
+    );
   }
   const operations = store.listOperations(run.runId, { limit: 1_000 });
   if (operations.status === "error") signalDurableWorkflowReadErrorToHost(operations.error);
@@ -223,7 +249,15 @@ async function toCompletion(
 ): Promise<WorkflowLiveParentCompletion> {
   const identity = toCompletionIdentity(run, store);
   if (run.completionTarget.kind !== "live_parent") {
-    throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
+    return adaptToolResultToHost(
+      Result.err(
+        new WorkflowLiveParentRunEventFailed({
+          cause: null,
+          runId: run.runId,
+          message: `Workflow run ${run.runId} has no live-parent completion target`,
+        }),
+      ),
+    );
   }
   const revisionResult = store.getRevision(run.revisionId);
   if (revisionResult.status === "error") signalDurableWorkflowReadErrorToHost(revisionResult.error);
@@ -288,7 +322,7 @@ export class WorkflowLiveParentBridge {
           message.type === lilacEventTypes.EvtWorkflowRunChanged
         ) {
           return await captureRunEvent(message.data.runId, async () => {
-            await this.handleRunEvent(message.data.runId);
+            return await this.handleRunEvent(message.data.runId);
           });
         }
         return Result.ok(undefined);
@@ -325,13 +359,20 @@ export class WorkflowLiveParentBridge {
       if (this.parents.has(parentRequestId) || this.protectedParents.has(parentRequestId)) continue;
       const timer = setTimeout(() => {
         this.protectedParents.delete(parentRequestId);
-        void this.reconcileOrphans().catch((error: unknown) => {
-          this.logger.error(
-            "live-parent orphan reconciliation failed after parent protection expired",
-            { parentRequestId },
-            error,
-          );
-        });
+        void (async () => {
+          const [settled] = await Promise.allSettled([this.reconcileOrphans()]);
+          if (settled.status === "rejected") {
+            if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
+            const error =
+              settled.reason instanceof Error
+                ? settled.reason
+                : new Error("Opaque live-parent orphan reconciliation failure");
+            this.logger.error(
+              "live-parent orphan reconciliation failed after parent protection expired",
+              { parentRequestId, ...formatWorkflowErrorForLog(error) },
+            );
+          }
+        })();
       }, options?.protectionMs ?? 120_000);
       timer.unref?.();
       this.protectedParents.set(parentRequestId, timer);
@@ -376,8 +417,20 @@ export class WorkflowLiveParentBridge {
     }
     const ready = Promise.all(
       [...runsById.values()].map(async (run) => {
-        if (isTerminalRun(run)) await this.reconcileTerminalChildActivity(run, signal);
-        else await this.ensureChildActivityForwarding(run, signal);
+        if (isTerminalRun(run)) {
+          const reconciled = await this.reconcileTerminalChildActivity(run, signal);
+          if (reconciled.status === "error") {
+            adaptToolResultToHost(
+              Result.err(
+                new WorkflowLiveParentRunEventFailed({
+                  cause: reconciled.error,
+                  runId: run.runId,
+                  message: "Live-parent terminal child activity reconciliation failed",
+                }),
+              ),
+            );
+          }
+        } else await this.ensureChildActivityForwarding(run, signal);
       }),
     ).then(() => {});
     let closed = false;
@@ -478,19 +531,21 @@ export class WorkflowLiveParentBridge {
         return await Promise.all(
           listed.value.map(async (run) => {
             const identity = toCompletionIdentity(run, this.input.store);
-            try {
+            const [settled] = await Promise.allSettled([
+              toCompletion(
+                run,
+                this.input.store,
+                this.input.dataDir ?? env.dataDir,
+                this.input.toolResultArtifacts,
+              ),
+            ]);
+            if (settled.status === "fulfilled") {
               return {
                 loaded: true as const,
-                completion: await toCompletion(
-                  run,
-                  this.input.store,
-                  this.input.dataDir ?? env.dataDir,
-                  this.input.toolResultArtifacts,
-                ),
+                completion: settled.value,
               };
-            } catch (error) {
-              return { loaded: false as const, identity, error };
             }
+            return { loaded: false as const, identity, error: settled.reason };
           }),
         );
       },
@@ -533,7 +588,12 @@ export class WorkflowLiveParentBridge {
         });
         for (const transition of transitions) {
           await this.stopChildActivityForRun(transition.run.runId);
-          await this.publishRunCancelled(transition.run, transition.previousState, detail);
+          const published = await this.publishRunCancelled(
+            transition.run,
+            transition.previousState,
+            detail,
+          );
+          if (published.status === "error") throw published.error;
         }
         this.notify(signal);
       },
@@ -561,17 +621,20 @@ export class WorkflowLiveParentBridge {
     for (const waiter of waiters) waiter();
   }
 
-  private async handleRunEvent(runId: string): Promise<void> {
+  private async handleRunEvent(
+    runId: string,
+  ): Promise<ResultType<void, WorkflowLiveParentTopicError>> {
     const runResult = this.input.store.getRun(runId);
     if (runResult.status === "error") signalDurableWorkflowReadErrorToHost(runResult.error);
     const run = runResult.value;
-    if (!run || run.completionTarget.kind !== "live_parent") return;
+    if (!run || run.completionTarget.kind !== "live_parent") return Result.ok(undefined);
     const signal = this.parents.get(run.completionTarget.parentRequestId);
     if (signal) {
       if (isTerminalRun(run)) {
-        await this.reconcileTerminalChildActivity(run, signal);
+        const reconciled = await this.reconcileTerminalChildActivity(run, signal);
+        if (reconciled.status === "error") return Result.err(reconciled.error);
         this.notify(signal);
-        return;
+        return Result.ok(undefined);
       }
 
       const forwarding = await this.ensureChildActivityForwarding(run, signal);
@@ -585,7 +648,7 @@ export class WorkflowLiveParentBridge {
           true,
         );
       }
-      return;
+      return Result.ok(undefined);
     }
     if (
       this.orphanHandlingEnabled &&
@@ -593,6 +656,7 @@ export class WorkflowLiveParentBridge {
     ) {
       await this.reconcileOrphans();
     }
+    return Result.ok(undefined);
   }
 
   private async ensureChildActivityForwarding(
@@ -600,7 +664,15 @@ export class WorkflowLiveParentBridge {
     signal: ParentSignal,
   ): Promise<ChildActivityForwarding> {
     if (run.completionTarget.kind !== "live_parent") {
-      throw new Error(`Workflow run ${run.runId} has no live-parent completion target`);
+      return adaptToolResultToHost(
+        Result.err(
+          new WorkflowLiveParentRunEventFailed({
+            cause: null,
+            runId: run.runId,
+            message: `Workflow run ${run.runId} has no live-parent completion target`,
+          }),
+        ),
+      );
     }
     const target = run.completionTarget;
     let forwarding = this.childActivitySubscriptions.get(run.runId);
@@ -813,22 +885,39 @@ export class WorkflowLiveParentBridge {
         await forwarding.publishToolStatus(update);
         return;
       }
-      await this.input.bus.publish(lilacEventTypes.EvtAgentOutputToolCall, update, {
-        headers: {
-          request_id: target.parentRequestId,
-          session_id: target.parentSessionId,
-          request_client: target.parentRequestClient,
+      const published = await this.input.bus.publish(
+        lilacEventTypes.EvtAgentOutputToolCall,
+        update,
+        {
+          headers: {
+            request_id: target.parentRequestId,
+            session_id: target.parentSessionId,
+            request_client: target.parentRequestClient,
+          },
         },
-      });
-    });
-    forwarding.publicationTail = publish.catch((error: unknown) => {
-      if (Panic.is(error)) throw error;
-      this.logger.warn(
-        "live-parent subagent progress publish failed",
-        { runId: forwarding.runId },
-        error,
       );
+      if (published.status === "error") {
+        this.logger.warn("live-parent subagent progress publish failed", {
+          runId: forwarding.runId,
+          ...formatTaggedErrorForLog(published.error),
+        });
+      }
     });
+    forwarding.publicationTail = (async () => {
+      const [settled] = await Promise.allSettled([publish]);
+      if (settled.status === "rejected") {
+        if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
+        const error =
+          settled.reason instanceof Error
+            ? settled.reason
+            : new Error("Opaque live-parent progress publication failure");
+        this.logger.warn(
+          "live-parent subagent progress publish failed",
+          { runId: forwarding.runId },
+          error,
+        );
+      }
+    })();
     await forwarding.publicationTail;
   }
 
@@ -879,8 +968,8 @@ export class WorkflowLiveParentBridge {
   private async reconcileTerminalChildActivity(
     run: WorkflowRun,
     signal: ParentSignal,
-  ): Promise<void> {
-    if (run.completionTarget.kind !== "live_parent") return;
+  ): Promise<ResultType<void, WorkflowLiveParentTopicError>> {
+    if (run.completionTarget.kind !== "live_parent") return Result.ok(undefined);
     const target = run.completionTarget;
     const forwarding =
       this.childActivitySubscriptions.get(run.runId) ??
@@ -893,7 +982,9 @@ export class WorkflowLiveParentBridge {
       forwarding.updateSeq = 0;
       for (const childRequestId of this.resolveChildRequestIds(run, target)) {
         const topic = outReqTopic(childRequestId);
-        const watermark = await this.input.bus.getTopicWatermark(topic);
+        const watermarkResult = await this.input.bus.getTopicWatermark(topic);
+        if (watermarkResult.status === "error") return Result.err(watermarkResult.error);
+        const watermark = watermarkResult.value;
         if (!watermark) continue;
         let cursor: string | undefined;
         let reachedWatermark = false;
@@ -930,6 +1021,7 @@ export class WorkflowLiveParentBridge {
       if (this.parents.get(target.parentRequestId) === signal) {
         await this.publishParentDisplay(forwarding, target, fallbackDisplay, true);
       }
+      return Result.ok(undefined);
     } finally {
       if (this.childActivitySubscriptions.get(run.runId) === forwarding) {
         this.childActivitySubscriptions.delete(run.runId);
@@ -1004,17 +1096,17 @@ export class WorkflowLiveParentBridge {
     for (const transition of orphaned) {
       await this.stopChildActivityForRun(transition.run.runId);
       if (!transition.cancelled) continue;
-      await this.publishRunCancelled(
+      const published = await this.publishRunCancelled(
         transition.run,
         transition.previousState,
         transition.run.terminalDetail ?? "Orphaned subagent",
-      ).catch((error: unknown) => {
-        this.logger.warn(
-          "orphaned workflow cancellation event publication failed",
-          { runId: transition.run.runId },
-          error,
-        );
-      });
+      );
+      if (published.status === "error") {
+        this.logger.warn("orphaned workflow cancellation event publication failed", {
+          runId: transition.run.runId,
+          ...formatTaggedErrorForLog(published.error),
+        });
+      }
     }
     if (orphaned.length > 0) {
       this.logger.warn("orphaned live-parent subagent workflows", {
@@ -1031,15 +1123,16 @@ export class WorkflowLiveParentBridge {
       detail,
     });
     if (cancelled?.state !== "cancelled") return;
-    await this.publishRunCancelled(cancelled, run.state, detail);
+    const published = await this.publishRunCancelled(cancelled, run.state, detail);
+    if (published.status === "error") throw published.error;
   }
 
   private async publishRunCancelled(
     run: WorkflowRun,
     previousState: WorkflowRun["state"],
     detail: string,
-  ): Promise<void> {
-    await this.input.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+  ): Promise<ResultType<void, WorkflowLiveParentPublishError>> {
+    const changed = await this.input.bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
       runId: run.runId,
       revisionId: run.revisionId,
       state: "cancelled",
@@ -1047,12 +1140,15 @@ export class WorkflowLiveParentBridge {
       detail,
       ts: this.now(),
     });
-    await this.input.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+    if (changed.status === "error") return Result.err(changed.error);
+    const ready = await this.input.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
       runId: run.runId,
       revisionId: run.revisionId,
       state: "cancelled",
       summary: detail,
       ts: this.now(),
     });
+    if (ready.status === "error") return Result.err(ready.error);
+    return Result.ok(undefined);
   }
 }

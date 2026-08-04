@@ -4,24 +4,35 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import ts from "typescript-codegen";
 
-import { analyzeWorkspace, declarationPackageName } from "./analyzer.ts";
+import {
+  analyzeWorkspace,
+  assertCoreFinalExceptionAdaptersResolve,
+  declarationPackageName,
+} from "./analyzer.ts";
 import { applyBaselines, baselineFromFindings, formatBaselineModule } from "./baseline.ts";
 import { boundaryValidationBaseline } from "./boundary-validation.baseline.ts";
 import { failureFlowBaseline } from "./failure-flow.baseline.ts";
 import { createFingerprint } from "./fingerprint.ts";
 import type {
+  ApprovedExceptionAdapter,
   ArchitectureManifest,
+  ExceptionAdapter,
   OpenProtocolAdapter,
   PersistedCodecRegistration,
   ResultDecoderRegistration,
   SqliteTransactionAdapterRegistration,
   ToolCodecRegistryRegistration,
   WorkspaceArchitecture,
+  WorkspaceArchitectureStatus,
   ZeroBaselineScope,
 } from "./manifest.ts";
 import {
+  ACTIVE_WORKSPACES,
   architectureManifest,
   assertArchitectureManifestIntegrity,
+  EXACT_REGISTRATION_ARCHITECTURE_RULES,
+  FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES,
+  WORKSPACE_STATUSES,
   zeroBaselineScopeOwns,
 } from "./manifest.ts";
 import type {
@@ -31,8 +42,9 @@ import type {
   BaselineEntry,
 } from "./model.ts";
 import { createWorkspaceProgram } from "./program.ts";
-import { analyzeArchitecture } from "./runner.ts";
+import { analyzeArchitecture, inventoryManifest } from "./runner.ts";
 import { isProductionFileName } from "./source-policy.ts";
+import { assertStage7EnforcementPreflight } from "./stage7-preflight.ts";
 import {
   assertWorkspaceInventoryMatches,
   compareWorkspaceInventory,
@@ -85,6 +97,49 @@ const BASE_WORKSPACE = {
 
 const fixtureProgram = createWorkspaceProgram(REPOSITORY_ROOT, BASE_WORKSPACE).program;
 
+function fixtureExceptionSyntaxKinds(
+  direction: ExceptionAdapter["direction"],
+): ApprovedExceptionAdapter["syntaxKinds"] {
+  switch (direction) {
+    case "capture-external":
+      return ["catch-clause", "rejection-callback"];
+    case "signal-host":
+      return ["throw-statement", "host-rejection-call", "registered-host-signal-call"];
+    case "observe-panic":
+      return ["panic-observation"];
+  }
+}
+
+function fixtureExceptionRelationship(
+  adapter: ExceptionAdapter,
+): ApprovedExceptionAdapter["relationship"] {
+  if (adapter.externalApi.package === "global" || adapter.externalApi.package === "Intl") {
+    return "language-runtime";
+  }
+  if (adapter.externalApi.package === "better-result") return "panic-brand";
+  if (adapter.direction === "signal-host" && adapter.category === "result-to-framework") {
+    return "host-contract";
+  }
+  return "external-package";
+}
+
+function fixtureExceptionApproval(
+  adapter: ExceptionAdapter,
+  workspace: string = BASE_WORKSPACE.name,
+): ApprovedExceptionAdapter {
+  return {
+    workspace,
+    callable: adapter.identity,
+    category: adapter.category,
+    externalApi: adapter.externalApi,
+    mode: adapter.direction,
+    syntaxKinds: fixtureExceptionSyntaxKinds(adapter.direction),
+    relationship: fixtureExceptionRelationship(adapter),
+    provenance: "workspace-reviewed-manifest",
+    reason: adapter.reason,
+  };
+}
+
 function findingsFor(
   rule: ArchitectureRule,
   file: string,
@@ -95,7 +150,15 @@ function findingsFor(
     ...overrides,
     ruleZones: { [rule]: [{ include: file }] },
   } satisfies WorkspaceArchitecture;
-  return analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram);
+  return analyzeWorkspace(
+    workspace,
+    FIXTURE_ROOT,
+    fixtureProgram,
+    undefined,
+    undefined,
+    undefined,
+    workspace.exceptionAdapters.map((adapter) => fixtureExceptionApproval(adapter)),
+  );
 }
 
 function openProtocolAdapter(
@@ -169,6 +232,159 @@ function fixtureResultDecoder(exportName: string): ResultDecoderRegistration {
 }
 
 describe("boundary validation rules", () => {
+  test("rejects stale, broad, and fabricated final exception registrations", () => {
+    const signalRegistration = (exportName: string) => ({
+      identity: { module: "stage7-boundary.ts", exportName },
+      category: "compatibility" as const,
+      externalApi: { package: "global", exportName: "language host failure signal" },
+      direction: "signal-host" as const,
+      reason: "Fixture host signal.",
+    });
+    const verify = (exportName: string, registration = signalRegistration(exportName)): void => {
+      const workspace = {
+        ...BASE_WORKSPACE,
+        name: "apps/core",
+        exceptionAdapters: [registration],
+      } satisfies WorkspaceArchitecture;
+      assertCoreFinalExceptionAdaptersResolve(
+        workspace,
+        FIXTURE_ROOT,
+        fixtureProgram,
+        fixtureProgram.getTypeChecker(),
+        [["stage7-boundary.ts", exportName, "signal"]],
+        [],
+        [],
+        [],
+      );
+    };
+
+    expect(() => verify("signalExceptionBoundary")).not.toThrow();
+    expect(() => verify("ClassFieldExceptionBoundary.signal")).not.toThrow();
+    expect(() => verify("missingExceptionBoundary")).toThrow("does not resolve to production code");
+    expect(() => verify("unrelatedExceptionBoundary")).toThrow(
+      "has no smallest-callable signal-host relationship",
+    );
+    expect(() =>
+      verify("signalExceptionBoundary", {
+        ...signalRegistration("signalExceptionBoundary"),
+        externalApi: { package: "global", exportName: "fabricated signal" },
+      }),
+    ).toThrow("has fabricated or mismatched signal-host metadata");
+  });
+
+  test("validates every exception adapter registration outside the Core catalogs", () => {
+    const registration = (exportName: string, externalExportName: string) => ({
+      identity: { module: "stage7-boundary.ts", exportName },
+      category: "compatibility" as const,
+      externalApi: { package: "global", exportName: externalExportName },
+      direction: "signal-host" as const,
+      reason: "Fixture host signal.",
+    });
+    const verify = (adapter: ReturnType<typeof registration>, approved = true): void => {
+      const workspaceName = "apps/tool-bridge";
+      analyzeWorkspace(
+        { ...BASE_WORKSPACE, name: workspaceName, exceptionAdapters: [adapter] },
+        FIXTURE_ROOT,
+        fixtureProgram,
+        undefined,
+        undefined,
+        undefined,
+        approved ? [fixtureExceptionApproval(adapter, workspaceName)] : [],
+      );
+    };
+
+    expect(() =>
+      verify(registration("missingExceptionBoundary", "language host failure signal")),
+    ).toThrow("does not resolve to production code");
+    expect(() =>
+      verify(registration("unrelatedExceptionBoundary", "language host failure signal")),
+    ).toThrow("has no recognizable externalApi or host relationship");
+    expect(() =>
+      verify(registration("signalExceptionBoundary", "language host failure signal"), false),
+    ).toThrow("is not an exact member of the approved global catalog");
+    expect(() =>
+      verify({
+        ...registration("signalExceptionBoundary", "operation"),
+        externalApi: { package: "fixture-sdk", exportName: "operation" },
+      }),
+    ).toThrow("has no recognizable externalApi or host relationship");
+  });
+
+  test("rejects a non-Core generic adapter appended outside the approved global catalog", () => {
+    const forgedAdapter = {
+      identity: { module: "client.ts", exportName: "captureBridgeFailure" },
+      category: "compatibility" as const,
+      externalApi: { package: "global", exportName: "language host failure signal" },
+      direction: "signal-host" as const,
+      reason: "Copied generic host signal metadata.",
+    };
+    const forgedManifest: ArchitectureManifest = {
+      ...architectureManifest,
+      workspaces: architectureManifest.workspaces.map((workspace) =>
+        workspace.name === "apps/tool-bridge"
+          ? { ...workspace, exceptionAdapters: [...workspace.exceptionAdapters, forgedAdapter] }
+          : workspace,
+      ),
+    };
+
+    expect(() => assertArchitectureManifestIntegrity(forgedManifest)).toThrow(
+      "is not an exact member of the approved global catalog",
+    );
+  });
+
+  test("rejects copied generic adapter approval when the required digest is omitted", () => {
+    const forgedAdapter = {
+      identity: { module: "client.ts", exportName: "captureBridgeFailure" },
+      category: "compatibility" as const,
+      externalApi: { package: "global", exportName: "language host failure signal" },
+      direction: "signal-host" as const,
+      reason: "Copied generic host signal metadata and approval.",
+    };
+    const forgedManifest = {
+      version: architectureManifest.version,
+      approvedExceptionAdapters: [
+        ...architectureManifest.approvedExceptionAdapters,
+        fixtureExceptionApproval(forgedAdapter, "apps/tool-bridge"),
+      ],
+      workspaces: architectureManifest.workspaces.map((workspace) =>
+        workspace.name === "apps/tool-bridge"
+          ? { ...workspace, exceptionAdapters: [...workspace.exceptionAdapters, forgedAdapter] }
+          : workspace,
+      ),
+    };
+
+    expect(() =>
+      // @ts-expect-error catalog and digest are an inseparable manifest contract
+      assertArchitectureManifestIntegrity(forgedManifest),
+    ).toThrow("must declare the approved global catalog and its exact digest");
+  });
+
+  test("rejects appended registration and approval when the catalog digest is stale", () => {
+    const forgedAdapter = {
+      identity: { module: "client.ts", exportName: "captureBridgeFailure" },
+      category: "compatibility" as const,
+      externalApi: { package: "global", exportName: "language host failure signal" },
+      direction: "signal-host" as const,
+      reason: "Copied generic host signal metadata and approval with stale digest.",
+    };
+    const forgedManifest: ArchitectureManifest = {
+      ...architectureManifest,
+      approvedExceptionAdapters: [
+        ...architectureManifest.approvedExceptionAdapters,
+        fixtureExceptionApproval(forgedAdapter, "apps/tool-bridge"),
+      ],
+      workspaces: architectureManifest.workspaces.map((workspace) =>
+        workspace.name === "apps/tool-bridge"
+          ? { ...workspace, exceptionAdapters: [...workspace.exceptionAdapters, forgedAdapter] }
+          : workspace,
+      ),
+    };
+
+    expect(() => assertArchitectureManifestIntegrity(forgedManifest)).toThrow(
+      "Approved global exception adapter catalog digest mismatch",
+    );
+  });
+
   test("resolves imported schemas and aliases but permits registered decoder ownership", () => {
     const findings = findingsFor("architecture/no-unregistered-decoder", "**", {
       boundaryDecoders: [
@@ -181,6 +397,143 @@ describe("boundary validation rules", () => {
     expect(findings).toHaveLength(1);
     expect(findings[0]?.location?.line).toBe(18);
     expect(findings[0]?.suggestion).toContain("registered boundary decoder");
+  });
+
+  test("tracks unknown member reads to exact registered boundary interpreters", () => {
+    const findings = findingsFor("architecture/no-unknown-member-read", "stage7-boundary.ts", {
+      boundaryDecoders: [
+        {
+          identity: { module: "stage7-boundary.ts", exportName: "registeredCustomMember" },
+          category: "request",
+        },
+        {
+          identity: { module: "stage7-boundary.ts", exportName: "registeredCollectStrings" },
+          category: "request",
+        },
+        {
+          identity: { module: "stage7-boundary.ts", exportName: "registeredCollectReflect" },
+          category: "request",
+        },
+      ],
+    });
+    const identities = findings.map(({ identity }) => identity);
+    for (const symbol of [
+      "readUnknownMember",
+      "destructureUnknownMember",
+      "decodeCustomMember",
+      "iterateUnknown",
+      "spreadUnknown",
+      "objectValuesUnknown",
+      "objectEntriesUnknown",
+      "objectSpreadUnknown",
+      "collectStrings",
+      "collectAliased",
+      "collectReflect",
+      "collectBound",
+      "collectObjectCallApply",
+      "collectReflectCall",
+      "collectReflectBound",
+      "collectCoercerApply",
+      "collectCoercerBound",
+    ]) {
+      expect(identities.some((identity) => identity.includes(`#${symbol}`))).toBeTrue();
+    }
+    const hasOperation = (symbol: string, operation: string): boolean =>
+      findings.some(
+        (finding) =>
+          finding.identity.includes(`#${symbol}`) &&
+          finding.message.includes(`Operation ${operation}`),
+      );
+    for (const operation of [
+      "values.call(Object, value)",
+      "values.apply(Object, [value])",
+      "entries.call(Object, value)",
+      "entries.apply(Object, [value])",
+    ]) {
+      expect(hasOperation("collectObjectCallApply", operation)).toBeTrue();
+    }
+    for (const operation of ["values(value)", "entries(value)", "stringify(item)"]) {
+      expect(hasOperation("collectBound", operation)).toBeTrue();
+    }
+    for (const operation of [
+      'get.call(Reflect, value, "id")',
+      'get.apply(Reflect, [value, "count"])',
+      'has.apply(Reflect, [value, "label"])',
+      'has.call(Reflect, value, "name")',
+    ]) {
+      expect(hasOperation("collectReflectCall", operation)).toBeTrue();
+    }
+    for (const operation of ['get(value, "id")', 'has(value, "label")']) {
+      expect(hasOperation("collectReflectBound", operation)).toBeTrue();
+    }
+    for (const operation of [
+      'String.apply(undefined, [Reflect.get(value, "id")])',
+      'Number.apply(undefined, [Reflect.get(value, "count")])',
+      'Boolean.apply(undefined, [Reflect.get(value, "active")])',
+    ]) {
+      expect(hasOperation("collectCoercerApply", operation)).toBeTrue();
+    }
+    for (const operation of [
+      "String.call(undefined, reflectedId)",
+      "Number.call(undefined, reflectedCount)",
+      'Boolean.call(undefined, get.call(Reflect, value, "active"))',
+    ]) {
+      expect(hasOperation("collectReflectCall", operation)).toBeTrue();
+    }
+    for (const operation of [
+      'stringify(Reflect.get(value, "id"))',
+      'toNumber(Reflect.get(value, "count"))',
+      'toBoolean(Reflect.get(value, "active"))',
+    ]) {
+      expect(hasOperation("collectCoercerBound", operation)).toBeTrue();
+    }
+    expect(
+      identities.some((identity) => identity.includes("#registeredCollectStrings")),
+    ).toBeFalse();
+    expect(identities.some((identity) => identity.includes("#collectTypedStrings"))).toBeFalse();
+    expect(identities.some((identity) => identity.includes("#collectTypedEntries"))).toBeFalse();
+    expect(identities.some((identity) => identity.includes("#collectTypedCoercions"))).toBeFalse();
+    expect(
+      identities.some((identity) => identity.includes("#collectTypedWrapperMatrix")),
+    ).toBeFalse();
+    expect(
+      identities.some((identity) => identity.includes("#registeredCollectReflect")),
+    ).toBeFalse();
+  });
+
+  test("requires exact provenance for custom decoders with unknown-bearing inputs", () => {
+    const findings = findingsFor(
+      "architecture/no-unregistered-custom-decoder",
+      "stage7-boundary.ts",
+      {
+        boundaryDecoders: [
+          {
+            identity: { module: "stage7-boundary.ts", exportName: "registeredCustomMember" },
+            category: "request",
+          },
+          {
+            identity: { module: "stage7-boundary.ts", exportName: "registeredCollectStrings" },
+            category: "request",
+          },
+          {
+            identity: { module: "stage7-boundary.ts", exportName: "registeredCollectReflect" },
+            category: "request",
+          },
+        ],
+      },
+    );
+    expect(findings.map(({ identity }) => identity)).toEqual([
+      expect.stringContaining("#decodeCustomMember"),
+      expect.stringContaining("#collectStrings"),
+      expect.stringContaining("#collectAliased"),
+      expect.stringContaining("#collectReflect"),
+      expect.stringContaining("#collectBound"),
+      expect.stringContaining("#collectObjectCallApply"),
+      expect.stringContaining("#collectReflectCall"),
+      expect.stringContaining("#collectReflectBound"),
+      expect.stringContaining("#collectCoercerApply"),
+      expect.stringContaining("#collectCoercerBound"),
+    ]);
   });
 
   test("rejects domain unknown including z.input while allowing typed output and reasoned opaque utilities", () => {
@@ -213,13 +566,26 @@ describe("boundary validation rules", () => {
     expect(findings.some((finding) => finding.location?.line === 52)).toBeTrue();
   });
 
+  test("matches reasoned opaque function-valued type properties exactly", () => {
+    const findings = findingsFor("architecture/no-domain-unknown", "domain.ts", {
+      opaqueUnknown: [
+        {
+          identity: { module: "domain.ts", exportName: "OpaqueFunctionContract.accept" },
+          reason: "Fixture function property deliberately accepts an opaque extension value.",
+        },
+      ],
+    });
+    expect(findings.some((finding) => finding.location?.line === 56)).toBeFalse();
+    expect(findings.some((finding) => finding.location?.line === 57)).toBeTrue();
+  });
+
   test("exception adapters exempt only their exact callable unknown parameters", () => {
     const findings = findingsFor("architecture/no-domain-unknown", "exception-adapter.ts", {
       exceptionAdapters: [
         {
           identity: { module: "exception-adapter.ts", exportName: "exactExceptionAdapter" },
           category: "external-to-result",
-          externalApi: { package: "fixture", exportName: "operation" },
+          externalApi: { package: "global", exportName: "language exception capture" },
           direction: "capture-external",
           reason: "Fixture exact exception adapter.",
         },
@@ -248,7 +614,7 @@ describe("boundary validation rules", () => {
     expect(findings.map((finding) => finding.message)).toEqual([
       "Predicate isDomain promises a structured type from unknown.",
       "Predicate overloaded promises a structured type from unknown.",
-      "Predicate <callback> promises a structured type from unknown.",
+      "Predicate filter.<callback@1> promises a structured type from unknown.",
     ]);
   });
 
@@ -446,6 +812,45 @@ describe("Stage 2 union rules", () => {
     });
     expect(aliasInput).toEqual([]);
 
+    const genericInput = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
+      openProtocolAdapters: [
+        openProtocolAdapter("normalizeProtocolEvent"),
+        openProtocolAdapter("normalizeGenericProtocolEvent", {
+          externalProtocol: {
+            package: "open-protocol-sdk",
+            exportName: "GenericProtocolEvent",
+          },
+        }),
+      ],
+    });
+    expect(genericInput).toEqual([]);
+
+    const externalGenericOutput = findingsFor(
+      "architecture/open-protocol-normalization",
+      "unions.ts",
+      {
+        openProtocolAdapters: [
+          openProtocolAdapter("normalizeProtocolEvent"),
+          openProtocolAdapter("normalizeGenericProtocolEvent", {
+            externalProtocol: {
+              package: "open-protocol-sdk",
+              exportName: "GenericProtocolEvent",
+            },
+          }),
+          openProtocolAdapter("normalizeToExternalGenericVariants", {
+            externalProtocol: {
+              package: "open-protocol-sdk",
+              exportName: "GenericProtocolEvent",
+            },
+          }),
+        ],
+      },
+    );
+    expect(externalGenericOutput).toHaveLength(1);
+    expect(externalGenericOutput[0]?.message).toContain(
+      "return type is not a project-owned closed discriminated union",
+    );
+
     for (const exportName of ["normalizeWrappedProtocolEvent", "normalizeUnionProtocolEvent"]) {
       const inexact = findingsFor("architecture/open-protocol-normalization", "unions.ts", {
         openProtocolAdapters: [
@@ -570,6 +975,9 @@ describe("Stage 2 union rules", () => {
     const tui = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "apps/mini-lilac-tui",
     );
+    const agent = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/agent",
+    );
     expect(acp?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
       { include: "session-history.ts" },
     ]);
@@ -585,7 +993,6 @@ describe("Stage 2 union rules", () => {
     ]);
     expect(tui?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
       { include: "src/ui-message-chunk-projection.ts" },
-      { include: "src/render.ts" },
     ]);
     expect(tui?.openProtocolAdapters).toEqual([
       {
@@ -599,11 +1006,27 @@ describe("Stage 2 union rules", () => {
         reason: "Projects the open AI SDK stream protocol into local TUI chunk variants.",
       },
     ]);
+    expect(agent?.ruleZones["architecture/open-protocol-normalization"]).toEqual([
+      { include: "ai-sdk-pi-agent.ts" },
+    ]);
+    expect(agent?.openProtocolAdapters).toEqual([
+      {
+        identity: { module: "ai-sdk-pi-agent.ts", exportName: "projectAiSdkTextStreamPart" },
+        externalProtocol: { package: "ai", exportName: "TextStreamPart" },
+        protocolParameter: 0,
+        fallbackVariant: { discriminant: "kind", value: "unsupported" },
+        reason:
+          "Projects generic AI SDK TextStreamPart tool instantiations into a closed agent stream union.",
+      },
+    ]);
     expect(
       architectureManifest.workspaces
         .filter(
           (workspace) =>
-            workspace.root !== "apps/acp-controller" && workspace.root !== "apps/mini-lilac-tui",
+            workspace.root !== "apps/acp-controller" &&
+            workspace.root !== "apps/mini-lilac-tui" &&
+            workspace.root !== "packages/agent" &&
+            workspace.root !== "packages/claude-code-bridge",
         )
         .every(
           (workspace) =>
@@ -635,12 +1058,43 @@ describe("Stage 2 union rules", () => {
     const miniClient = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "packages/mini-lilac-client",
     );
-    expect(acp?.boundaryDecoders).toEqual([]);
+    expect(acp?.boundaryDecoders).toEqual([
+      {
+        identity: { module: "external-adapters.ts", exportName: "projectExternalFailure" },
+        category: "projection",
+      },
+      ...["decodeRunRecord", "decodeSessionIndex"].map((exportName) => ({
+        identity: { module: "run-store.ts", exportName },
+        category: "persistence" as const,
+      })),
+      {
+        identity: {
+          module: "external-adapters.ts",
+          exportName: "replaceExternalFailureMessage",
+        },
+        category: "projection",
+      },
+    ]);
     expect(tui?.boundaryDecoders).toEqual([
+      {
+        identity: { module: "src/opentui-boundary.ts", exportName: "decodeDraftExtmarkData" },
+        category: "plugin",
+      },
+      {
+        identity: { module: "src/preferences.ts", exportName: "decodeBindingPreferences" },
+        category: "persistence",
+      },
       {
         identity: {
           module: "src/ui-message-chunk-projection.ts",
           exportName: "projectMiniLilacStreamChunk",
+        },
+        category: "projection",
+      },
+      {
+        identity: {
+          module: "src/terminal-runtime-adapter.ts",
+          exportName: "resolveTerminalShutdownOutcome",
         },
         category: "projection",
       },
@@ -662,19 +1116,38 @@ describe("Stage 2 union rules", () => {
         }),
       ),
     ]);
-    expect(miniClient?.boundaryDecoders).toEqual([
-      {
-        identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunk" },
-        category: "wire",
-      },
-    ]);
+    expect(miniClient?.boundaryDecoders).toContainEqual({
+      identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunkResult" },
+      category: "wire",
+    });
     expect(miniServer?.boundaryDecoders).toEqual([
+      ...["decodeMiniLilacHttpRequest", "decodeMiniLilacUiMessages"].map((exportName) => ({
+        identity: { module: "src/server.ts", exportName },
+        category: "request" as const,
+      })),
+      {
+        identity: { module: "src/main.ts", exportName: "decodeMiniLilacCliOptions" },
+        category: "request",
+      },
       {
         identity: { module: "src/main.ts", exportName: "parseCliArgs" },
         category: "request",
       },
+      {
+        identity: { module: "src/server.ts", exportName: "adaptMiniLilacPersistenceResult" },
+        category: "projection",
+      },
+      {
+        identity: { module: "src/server.ts", exportName: "classifyHttpOperationFailure" },
+        category: "projection",
+      },
     ]);
-    expect(remoteRunner?.boundaryDecoders).toEqual([]);
+    expect(remoteRunner?.boundaryDecoders).toEqual([
+      {
+        identity: { module: "src/cli.ts", exportName: "opaqueErrorCause" },
+        category: "projection",
+      },
+    ]);
     expect(fs?.boundaryDecoders).toEqual([
       {
         identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeJson" },
@@ -712,60 +1185,49 @@ describe("Stage 2 union rules", () => {
         },
         category: "wire",
       },
+      {
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeRemoteRunnerResponseValue",
+        },
+        category: "wire",
+      },
+      {
+        identity: { module: "src/filesystem-operation.ts", exportName: "decodeFilesystemFailure" },
+        category: "projection",
+      },
+      {
+        identity: { module: "src/ripgrep.ts", exportName: "decodeRipgrepMatchLine" },
+        category: "wire",
+      },
     ]);
-    expect(
-      miniRuntime?.boundaryDecoders.some(
-        (decoder) => decoder.identity.exportName === "SessionActor.summarizeForCompaction",
-      ),
-    ).toBeFalse();
+    expect(miniRuntime?.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/session-service.ts",
+        exportName: "SessionActor.summarizeForCompaction",
+      },
+      category: "projection",
+    });
   });
 
-  test("registers exact stream validation and ChatTransport host rejection adapters", () => {
+  test("registers exact Mini Lilac stream capture and host adapters", () => {
     const miniClient = architectureManifest.workspaces.find(
       (workspace) => workspace.root === "packages/mini-lilac-client",
     );
-    expect(miniClient?.exceptionAdapters).toEqual([
-      {
-        identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunk" },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/mini-lilac-client",
-          exportName: "miniLilacUnsupportedUIMessageChunkSchema",
-        },
-        direction: "signal-host",
-        reason:
-          "Rejects malformed reserved data-* sentinels and stream chunks through the existing stream host contract.",
-      },
-      {
-        identity: {
-          module: "mini-lilac-transport.ts",
-          exportName: "validateUnsupportedSentinel",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "ai", exportName: "Schema.validate" },
-        direction: "signal-host",
-        reason: "Rejects an invalid unsupported-chunk sentinel through the stream host contract.",
-      },
-      {
-        identity: {
-          module: "mini-lilac-transport.ts",
-          exportName: "parseMiniLilacStream.transform",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "global", exportName: "TransformStream.transform" },
-        direction: "signal-host",
-        reason: "Propagates malformed event-stream frames through the stream host contract.",
-      },
-      {
-        identity: {
-          module: "mini-lilac-transport.ts",
-          exportName: "MiniLilacTransport.responseStream",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "ai", exportName: "ChatTransport" },
-        direction: "signal-host",
-        reason: "Reports an invalid chat response through the ChatTransport rejection contract.",
-      },
+    expect(
+      miniClient?.exceptionAdapters.map((adapter) => [
+        adapter.identity.exportName,
+        adapter.direction,
+      ]),
+    ).toEqual([
+      ["captureMiniLilacPromiseOutcome", "capture-external"],
+      ["captureMiniLilacStreamRead", "capture-external"],
+      ["captureMiniLilacSyncOutcome", "capture-external"],
+      ["parseMiniLilacStream.pull", "capture-external"],
+      ["parseMiniLilacStream.pull", "signal-host"],
+      ["parseMiniLilacStream.transform", "signal-host"],
+      ["resultToMiniLilacCompatibilityFailure", "signal-host"],
+      ["throwMiniLilacPanic", "signal-host"],
     ]);
   });
 
@@ -781,11 +1243,19 @@ describe("Stage 2 union rules", () => {
     expect(core?.operationalResultApis.filter((api) => modules.has(api.module))).toEqual([
       {
         module: "src/heartbeat/heartbeat-service.ts",
-        exportName: "startHeartbeatService.startHeartbeatLifecycleResult",
+        exportName: "reloadHeartbeatCoreConfig",
       },
       {
         module: "src/heartbeat/heartbeat-service.ts",
-        exportName: "startHeartbeatService.stopHeartbeatLifecycleResult",
+        exportName: "computeHeartbeatCronAtMs",
+      },
+      {
+        module: "src/heartbeat/heartbeat-service.ts",
+        exportName: "startHeartbeatServiceResult.startHeartbeatLifecycleResult",
+      },
+      {
+        module: "src/heartbeat/heartbeat-service.ts",
+        exportName: "startHeartbeatServiceResult.stopHeartbeatLifecycleResult",
       },
       {
         module: "src/tool-server/request-message-cache.ts",
@@ -799,61 +1269,84 @@ describe("Stage 2 union rules", () => {
     expect(
       core?.exceptionAdapters
         .filter((adapter) => modules.has(adapter.identity.module))
-        .map((adapter) => ({
-          identity: adapter.identity,
-          category: adapter.category,
-          externalApi: adapter.externalApi,
-          direction: adapter.direction,
-        })),
+        .filter((adapter) => adapter.identity.exportName.startsWith("adapt"))
+        .map((adapter) => [adapter.identity.exportName, adapter.direction]),
     ).toEqual([
-      {
+      ["adaptRequestMessageCacheStartResultToHost", "signal-host"],
+      ["adaptRequestMessageCacheStopResultToHost", "signal-host"],
+    ]);
+    expect(
+      core?.exceptionAdapters
+        .filter(
+          (adapter) =>
+            adapter.identity.module === "src/heartbeat/heartbeat-service.ts" &&
+            adapter.identity.exportName.startsWith("startHeartbeatService.stop"),
+        )
+        .map((adapter) => [adapter.identity.exportName, adapter.direction]),
+    ).toEqual([]);
+    expect(core?.exceptionAdapters).toContainEqual(
+      expect.objectContaining({
         identity: {
-          module: "src/heartbeat/heartbeat-service.ts",
-          exportName: "adaptHeartbeatLifecycleStartResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "startHeartbeatService",
+          module: "src/shared/event-bus-result.ts",
+          exportName: "adaptEventPublishResultToHost",
         },
         direction: "signal-host",
-      },
-      {
-        identity: {
-          module: "src/heartbeat/heartbeat-service.ts",
-          exportName: "adaptHeartbeatLifecycleStopResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "HeartbeatService.stop",
-        },
-        direction: "signal-host",
-      },
-      {
-        identity: {
-          module: "src/tool-server/request-message-cache.ts",
-          exportName: "adaptRequestMessageCacheStartResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "createRequestMessageCache",
-        },
-        direction: "signal-host",
-      },
-      {
-        identity: {
-          module: "src/tool-server/request-message-cache.ts",
-          exportName: "adaptRequestMessageCacheStopResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "RequestMessageCache.stop",
-        },
-        direction: "signal-host",
-      },
+      }),
+    );
+  });
+
+  test("keeps every reviewed semantic and syntax baseline empty", () => {
+    expect(boundaryValidationBaseline).toEqual({});
+    expect(failureFlowBaseline).toEqual({});
+    expect(syntaxBaseline).toEqual({});
+  });
+
+  test("registers exact workspace-history host and Panic behavior without Legacy inference", () => {
+    const runtime = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-runtime",
+    );
+    const adapters =
+      runtime?.exceptionAdapters.filter(
+        (adapter) => adapter.identity.module === "src/workspace-history-store.ts",
+      ) ?? [];
+
+    expect(
+      adapters
+        .filter((adapter) => adapter.direction === "signal-host")
+        .map((adapter) => adapter.identity.exportName),
+    ).toEqual([
+      "superviseOutcome.rejection.reject",
+      "throwFailure",
+      "WorkspaceHistoryStore.constructor",
+      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.captureResult",
+      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.invalidateCaptureCacheResult",
+      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.prepareRestore",
+      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.resumePreparedRestore",
+      "WorkspaceHistoryStore.withWorkspaceLockResult",
+      "WorkspaceHistoryStore.resumeLocked",
+      "WorkspaceHistoryStore.publicResult",
+      "WorkspaceHistoryStore.publicWorkspaceResult",
+      "WorkspaceHistoryStore.validateSourceGitDirectory",
+      "WorkspaceHistoryStore.runGit",
+      "WorkspaceHistoryStore.runPrivateGitToHandle",
+      "WorkspaceHistoryStore.withWorkspaceLock",
+      "WorkspaceHistoryStore.withWorkspaceLockOutcome.withStoreLock.<callback@2>.lockedStore.capture",
+    ]);
+    expect(
+      adapters.some(
+        (adapter) =>
+          adapter.direction === "signal-host" && adapter.identity.exportName.endsWith("Legacy"),
+      ),
+    ).toBeFalse();
+    expect(
+      adapters
+        .filter((adapter) => adapter.direction === "observe-panic")
+        .map((adapter) => adapter.identity.exportName),
+    ).toEqual([
+      "attemptHost",
+      "attemptHostSync",
+      "superviseOutcome",
+      "WorkspaceHistoryStore.writeCaptureCache.<callback>",
     ]);
   });
 
@@ -913,21 +1406,7 @@ describe("Stage 2 union rules", () => {
           direction: adapter.direction,
           externalApi: adapter.externalApi,
         })),
-    ).toEqual([
-      {
-        category: "defect-supervisor",
-        direction: "observe-panic",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-      },
-      {
-        category: "external-to-result",
-        direction: "capture-external",
-        externalApi: {
-          package: "@stanley2058/lilac-event-bus",
-          exportName: "LilacBus.publish",
-        },
-      },
-    ]);
+    ).toEqual([]);
   });
 
   test("registers workflow wait resolver Result and exception boundaries", () => {
@@ -972,10 +1451,7 @@ describe("Stage 2 union rules", () => {
       );
     }
     for (const exportName of [
-      "WorkflowWaitResolver.captureWorkflowWaitResolverTrim",
       "WorkflowWaitResolver.captureWorkflowWaitResolverConsumerGroupRetirement",
-      "WorkflowWaitResolver.captureWorkflowWaitResolverBarrierPublication",
-      "WorkflowWaitResolver.captureWorkflowWaitResolverWakeupPublication",
     ]) {
       expect(
         core?.exceptionAdapters
@@ -1006,20 +1482,29 @@ describe("Stage 2 union rules", () => {
       (workspace) => workspace.root === "packages/remote-fs-runner",
     );
 
-    expect(core?.status).toBe("migrating");
-    expect(coding?.status).toBe("migrating");
-    expect(plugins?.status).toBe("migrating");
-    expect(utils?.status).toBe("migrating");
+    expect(core?.status).toBe("migrated");
+    expect(coding?.status).toBe("migrated");
+    expect(plugins?.status).toBe("migrated");
+    expect(remoteRunner?.status).toBe("migrated");
+    expect(utils?.status).toBe("migrated");
     expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
       "decodeThreadSummarizationWorkerRequest",
     );
     expect(core?.boundaryDecoders.map((decoder) => decoder.identity.exportName)).toContain(
       "decodeThreadSummarizationWorkerResponse",
     );
-    expect(coding?.boundaryDecoders).toContainEqual({
-      identity: { module: "src/filesystem.ts", exportName: "createFilesystemTools.toModelOutput" },
-      category: "projection",
-    });
+    expect(
+      coding?.boundaryDecoders
+        .filter((decoder) =>
+          decoder.identity.exportName.startsWith("createFilesystemTools.toModelOutput"),
+        )
+        .map((decoder) => decoder.identity.exportName),
+    ).toEqual([
+      "createFilesystemTools.toModelOutput@1",
+      "createFilesystemTools.toModelOutput@2",
+      "createFilesystemTools.toModelOutput@3",
+      "createFilesystemTools.toModelOutput@4",
+    ]);
     expect(utils?.boundaryDecoders).toContainEqual({
       identity: { module: "custom-commands.ts", exportName: "decodeCustomCommandResult" },
       category: "plugin",
@@ -1045,14 +1530,13 @@ describe("Stage 2 union rules", () => {
       reason:
         "Checks exact Panic identity while treating hostile classifier inspection as ordinary opaque failure.",
     });
-    expect(utils?.exceptionAdapters).toContainEqual({
-      identity: { module: "runtime-utils.ts", exportName: "isPanic" },
-      category: "defect-supervisor",
-      externalApi: { package: "better-result", exportName: "Panic.is" },
-      direction: "observe-panic",
-      reason:
-        "Recognizes genuine Panic while containing hostile proxy classification traps as ordinary opaque failure.",
-    });
+    expect(
+      utils?.exceptionAdapters.find(
+        (adapter) =>
+          adapter.identity.module === "runtime-utils.ts" &&
+          adapter.identity.exportName === "isPanic",
+      ),
+    ).toMatchObject({ direction: "capture-external" });
     expect(
       plugins?.boundaryDecoders.some(
         (decoder) => decoder.identity.exportName === "decodeDynamicToolPluginModule",
@@ -1068,9 +1552,7 @@ describe("Stage 2 union rules", () => {
     ).toBeFalse();
     expect(
       plugins?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName === "loadToolPluginModuleCapability" &&
-          adapter.direction === "capture-external",
+        (adapter) => adapter.identity.exportName === "loadToolPluginModuleCapability",
       ),
     ).toBeTrue();
     expect(
@@ -1078,98 +1560,26 @@ describe("Stage 2 union rules", () => {
         (adapter) => adapter.identity.exportName === "CustomCommandManager.execute",
       ),
     ).toBeFalse();
+    const removedBroadAdapters = new Set([
+      "rethrowBundledRemoteRunnerPanic",
+      "startConversationThreadSummarizationWorker.handleWorkerPanic",
+      "ConversationThread.call",
+      "signalConversationThreadWorkerPanicToProcess",
+      "createProcessHandlers.reportFatalError",
+      "decodeRemoteFsRunnerPackageSpec",
+    ]);
     expect(
       core?.exceptionAdapters.filter((adapter) =>
-        [
-          "rethrowConversationThreadWorkerPanic",
-          "rethrowBusAgentRunnerPanic",
-          "rethrowBundledRemoteRunnerPanic",
-        ].includes(adapter.identity.exportName),
+        removedBroadAdapters.has(adapter.identity.exportName),
       ),
-    ).toHaveLength(3);
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName ===
-            "startConversationThreadSummarizationWorker.handleWorkerPanic" &&
-          adapter.category === "defect-supervisor" &&
-          adapter.direction === "observe-panic",
-      ),
-    ).toBeTrue();
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.module === "src/tool-server/tools/conversation-thread.ts" &&
-          adapter.identity.exportName === "ConversationThread.call" &&
-          adapter.category === "result-to-framework" &&
-          adapter.externalApi.exportName === "ServerTool.call" &&
-          adapter.direction === "signal-host",
-      ),
-    ).toBeTrue();
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.module === "src/runtime/create-core-runtime.ts" &&
-          adapter.identity.exportName === "adaptCustomCommandInitializationResultToStartup" &&
-          adapter.category === "result-to-framework" &&
-          adapter.direction === "signal-host" &&
-          adapter.reason.includes("host startup"),
-      ),
-    ).toBeTrue();
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName === "signalConversationThreadWorkerPanicToProcess" &&
-          adapter.category === "result-to-framework" &&
-          adapter.direction === "signal-host",
-      ),
-    ).toBeTrue();
+    ).toEqual([]);
     expect(
       core?.exceptionAdapters.some(
         (adapter) => adapter.identity.exportName === "startBusAgentRunner.drainSessionQueue",
       ),
     ).toBeFalse();
     expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName ===
-            "startBusAgentRunner.startSessionQueueDrain.superviseDetachedDrain" &&
-          adapter.category === "defect-supervisor" &&
-          adapter.direction === "observe-panic",
-      ),
-    ).toBeTrue();
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName === "createProcessHandlers.reportFatalError" &&
-          adapter.category === "result-to-framework" &&
-          adapter.direction === "signal-host",
-      ),
-    ).toBeTrue();
-    expect(
-      remoteRunner?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName === "preservePanic" &&
-          adapter.category === "defect-supervisor",
-      ),
-    ).toBeTrue();
-    const remoteRunnerCaptureAdapters = remoteRunner?.exceptionAdapters
-      .filter((adapter) => adapter.direction === "capture-external")
-      .map((adapter) => adapter.identity.exportName);
-    expect(remoteRunnerCaptureAdapters).toContain("spawnDaemon");
-    expect(remoteRunnerCaptureAdapters).toContain("releaseStartupLock");
-    expect(remoteRunnerCaptureAdapters).not.toContain("tryAcquireStartupLock");
-    expect(
-      core?.exceptionAdapters.find(
-        (adapter) => adapter.identity.exportName === "decodeRemoteFsRunnerPackageSpec",
-      ),
-    ).toMatchObject({ category: "external-to-result", direction: "capture-external" });
-    expect(
-      core?.exceptionAdapters.some(
-        (adapter) =>
-          adapter.identity.exportName === "decodeRemoteFsRunnerPackageSpec" &&
-          adapter.category === "result-to-framework",
-      ),
+      remoteRunner?.exceptionAdapters.some((adapter) => adapter.identity.exportName === "<module>"),
     ).toBeFalse();
   });
 
@@ -1190,15 +1600,11 @@ describe("Stage 2 union rules", () => {
       "architecture/no-unredacted-tagged-error-log",
       "architecture/fallible-api-result",
     ] as const) {
-      expect(core.ruleZones[rule]).toContainEqual({
-        include: "src/conversation/thread-worker.ts",
-      });
-      expect(plugins.ruleZones[rule]).toContainEqual({ include: "manager.ts" });
-      expect(remoteRunner.ruleZones[rule]).toEqual([{ include: "src/cli.ts" }]);
+      expect(core.ruleZones[rule]).toEqual([{ include: "**" }]);
+      expect(plugins.ruleZones[rule]).toEqual([{ include: "**" }]);
+      expect(remoteRunner.ruleZones[rule]).toEqual([{ include: "**" }]);
     }
-    expect(core.ruleZones["architecture/no-domain-unknown"]).toContainEqual({
-      include: "src/custom-commands/manager.ts",
-    });
+    expect(core.ruleZones["architecture/no-domain-unknown"]).toEqual([{ include: "**" }]);
     expect(core.operationalResultApis).toContainEqual({
       module: "src/custom-commands/manager.ts",
       exportName: "CustomCommandManager.execute",
@@ -1240,42 +1646,25 @@ describe("Stage 2 union rules", () => {
       "adaptPluginLifecycleResultToHost",
       "adaptPluginListResultToElysia",
     ]) {
-      expect(core.exceptionAdapters).toContainEqual(
-        expect.objectContaining({
-          identity: { module: "src/tool-server/create-tool-server.ts", exportName },
-          category: "result-to-framework",
-          direction: "signal-host",
-        }),
-      );
+      expect(
+        core.exceptionAdapters.some(
+          (adapter) =>
+            adapter.identity.module === "src/tool-server/create-tool-server.ts" &&
+            adapter.identity.exportName === exportName,
+        ),
+      ).toBeTrue();
     }
-    for (const registration of [
-      {
-        exportName: "observeToolCallRejection",
-        category: "defect-supervisor",
-        direction: "observe-panic",
-      },
-      {
-        exportName: "superviseToolCallRejections",
-        category: "defect-supervisor",
-        direction: "observe-panic",
-      },
-      {
-        exportName: "signalFatalToolCallDefectToProcess",
-        category: "result-to-framework",
-        direction: "signal-host",
-      },
-    ] as const) {
-      expect(core.exceptionAdapters).toContainEqual(
-        expect.objectContaining({
-          identity: {
-            module: "src/tool-server/create-tool-server.ts",
-            exportName: registration.exportName,
-          },
-          category: registration.category,
-          direction: registration.direction,
-        }),
-      );
-    }
+    expect(
+      core.exceptionAdapters.filter(
+        (adapter) =>
+          adapter.identity.module === "src/tool-server/create-tool-server.ts" &&
+          [
+            "observeToolCallRejection",
+            "superviseToolCallRejections",
+            "signalFatalToolCallDefectToProcess",
+          ].includes(adapter.identity.exportName),
+      ),
+    ).toEqual([]);
     expect(plugins.operationalResultApis).toContainEqual({
       module: "manager.ts",
       exportName: "ToolPluginManager.reload",
@@ -1357,6 +1746,9 @@ describe("Stage 2 union rules", () => {
     expect(() =>
       assertArchitectureManifestIntegrity({
         version: 1,
+        approvedExceptionAdapters: architectureManifest.approvedExceptionAdapters,
+        approvedExceptionAdapterCatalogSha256:
+          architectureManifest.approvedExceptionAdapterCatalogSha256,
         workspaces: [
           {
             ...BASE_WORKSPACE,
@@ -1445,7 +1837,7 @@ describe("Stage 4 event architecture rules", () => {
         expect.objectContaining({
           identity: {
             module: "event-dead-letter.ts",
-            exportName: "checkedDeadLetterAcceptance",
+            exportName: "captureDeadLetterAcceptance.catch",
           },
           category: "defect-supervisor",
           direction: "observe-panic",
@@ -1539,10 +1931,7 @@ describe("Stage 4 event architecture rules", () => {
         }),
       ]),
     );
-    for (const exportName of [
-      "captureWorkflowTerminalReceiptAdoption",
-      "captureWorkflowIdleCancellationPublication",
-    ]) {
+    for (const exportName of ["captureWorkflowTerminalReceiptAdoption"]) {
       expect(
         core.exceptionAdapters
           .filter(
@@ -2716,7 +3105,7 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         (count, workspace) => count + workspace.persistedCodecs.length,
         0,
       ),
-    ).toBe(21);
+    ).toBe(25);
     expect(core.persistedCodecs.every(({ status }) => status === "enforced")).toBeTrue();
     expect(mini.persistedCodecs.every(({ status }) => status === "enforced")).toBeTrue();
     expect(mini.persistedStoreConsumers.every(({ status }) => status === "enforced")).toBeTrue();
@@ -2778,6 +3167,548 @@ describe("Stage 6 persistence and SQLite architecture", () => {
         ].includes(rule),
       ),
     ).toEqual([]);
+  });
+});
+
+describe("Stage 7 enforcement preflight", () => {
+  const emptyBaselines = {
+    semantic: [{}, {}] as const,
+    syntax: {},
+  } satisfies Parameters<typeof assertStage7EnforcementPreflight>[1];
+
+  type AdapterlessWorkspace = Omit<WorkspaceArchitecture, "exceptionAdapters"> & {
+    readonly exceptionAdapters: readonly [];
+  };
+
+  function migratedWorkspace(
+    overrides: Partial<Omit<WorkspaceArchitecture, "exceptionAdapters">> = {},
+  ): AdapterlessWorkspace {
+    return {
+      ...BASE_WORKSPACE,
+      exceptionAdapters: [],
+      status: "migrated",
+      ruleZones: Object.fromEntries(
+        FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES.map((rule) => [rule, [{ include: "**" }]]),
+      ),
+      ...overrides,
+    };
+  }
+
+  test("declares all 18 active workspaces migrated", () => {
+    const roots = ACTIVE_WORKSPACES.map(([root]) => root);
+    expect(Object.keys(WORKSPACE_STATUSES).sort()).toEqual([...roots].sort());
+    expect(roots).toHaveLength(18);
+    for (const workspace of architectureManifest.workspaces) {
+      const status: WorkspaceArchitectureStatus = WORKSPACE_STATUSES[workspace.root];
+      expect(status).toBe("migrated");
+      expect(workspace.status).toBe(status);
+    }
+  });
+
+  test("integrates the first five migrated packages with exact live registrations", () => {
+    const migrated = [
+      "packages/bash-safety",
+      "packages/tool-results",
+      "packages/fs",
+      "packages/plugin-runtime",
+      "packages/remote-fs-runner",
+    ];
+    const boundaryBaseline: ArchitectureBaseline = boundaryValidationBaseline;
+    const failureBaseline: ArchitectureBaseline = failureFlowBaseline;
+    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
+    for (const root of migrated) {
+      const workspace = architectureManifest.workspaces.find(
+        (candidate) => candidate.root === root,
+      );
+      expect(workspace?.status).toBe("migrated");
+      for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
+        expect(workspace?.ruleZones[rule]).toEqual([{ include: "**" }]);
+      }
+      expect(boundaryBaseline[root]).toBeUndefined();
+      expect(failureBaseline[root]).toBeUndefined();
+      expect(typedSyntaxBaseline[root]).toBeUndefined();
+    }
+
+    const bashSafety = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/bash-safety",
+    );
+    expect(
+      bashSafety?.exceptionAdapters.map((adapter) => [
+        adapter.identity.exportName,
+        adapter.direction,
+      ]),
+    ).toEqual([
+      ["parseBashCommand.catch", "capture-external"],
+      ["parseBashCommand.catch", "signal-host"],
+      ["resolveRmPaths.catch", "capture-external"],
+      ["resolveRmPaths.catch", "signal-host"],
+    ]);
+
+    const fs = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/fs",
+    );
+    expect(fs?.boundaryDecoders).toContainEqual({
+      identity: { module: "src/filesystem-operation.ts", exportName: "decodeFilesystemFailure" },
+      category: "projection",
+    });
+    expect(fs?.boundaryDecoders).toContainEqual({
+      identity: { module: "src/ripgrep.ts", exportName: "decodeRipgrepMatchLine" },
+      category: "wire",
+    });
+
+    const toolResults = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/tool-results",
+    );
+    expect(
+      toolResults?.exceptionAdapters.some(
+        ({ identity }) =>
+          identity.exportName === "createOverflowReferenceNormalizer.normalizeCapturedText",
+      ),
+    ).toBeFalse();
+    expect(toolResults?.operationalResultApis).toContainEqual({
+      module: "src/tool-result-output-normalizer.ts",
+      exportName: "serializeOutput",
+    });
+    expect(
+      toolResults?.exceptionAdapters
+        .filter(({ identity }) => identity.exportName === "serializeOutput")
+        .map((adapter) => adapter.direction),
+    ).toEqual(["capture-external", "signal-host"]);
+  });
+
+  test("integrates wave-two packages with exact specialized registrations", () => {
+    const roots = [
+      "packages/utils",
+      "packages/event-bus",
+      "packages/coding-tools",
+      "packages/mini-lilac-client",
+      "packages/claude-code-bridge",
+    ];
+    const boundaryBaseline: ArchitectureBaseline = boundaryValidationBaseline;
+    const failureBaseline: ArchitectureBaseline = failureFlowBaseline;
+    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
+    for (const root of roots) {
+      const workspace = architectureManifest.workspaces.find(
+        (candidate) => candidate.root === root,
+      );
+      expect(workspace?.status).toBe("migrated");
+      for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
+        expect(workspace?.ruleZones[rule]).toEqual([{ include: "**" }]);
+      }
+      expect(boundaryBaseline[root]).toBeUndefined();
+      expect(failureBaseline[root]).toBeUndefined();
+      expect(typedSyntaxBaseline[root]).toBeUndefined();
+    }
+
+    const utils = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/utils",
+    );
+    expect(utils?.persistedCodecs).toContainEqual({
+      status: "enforced",
+      identity: { module: "codex-oauth.ts", exportName: "decodeCodexTokens" },
+      inputParameter: 0,
+      fixtureCatalog: { module: "codex-oauth.ts", exportName: "codexTokensCodecCases" },
+      provenance: ["current", "migrated", "missing-defaulted"],
+    });
+    expect(utils?.persistedStoreConsumers).toContainEqual({
+      status: "enforced",
+      identity: { module: "codex-oauth.ts", exportName: "readCodexTokensResult" },
+      codecs: [{ module: "codex-oauth.ts", exportName: "decodeCodexTokens" }],
+    });
+    expect(utils?.ruleZones["architecture/persisted-codec-contract"]).toContainEqual({
+      include: "codex-oauth.ts",
+    });
+    expect(utils?.ruleZones["architecture/no-result-err-in-sqlite-callback"]).toEqual([
+      { include: "persistence.ts" },
+    ]);
+
+    const claude = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/claude-code-bridge",
+    );
+    expect(claude?.openProtocolAdapters).not.toContainEqual(
+      expect.objectContaining({
+        identity: { module: "claude-code-run.ts", exportName: "projectClaudeSdkMessage" },
+      }),
+    );
+    expect(claude?.boundaryDecoders).toContainEqual({
+      identity: { module: "claude-code-run.ts", exportName: "projectClaudeSdkMessage" },
+      category: "plugin",
+    });
+    expect(claude?.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "claude-code-run.ts",
+        exportName: "materializeClaudeCodeRunResult.observeSdkMessage",
+      },
+      category: "plugin",
+    });
+    expect(claude?.ruleZones["architecture/open-protocol-normalization"]).toEqual([]);
+    expect(claude?.operationalResultApis).toContainEqual({
+      module: "claude-code-run.ts",
+      exportName: "MaterializedClaudeCodeRun.createUtilityModelResult",
+    });
+
+    const eventBus = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/event-bus",
+    );
+    expect(eventBus?.operationalResultApis).toContainEqual({
+      module: "lilac-bus.ts",
+      exportName: "LilacBus.subscribeTopic",
+    });
+
+    const codingTools = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/coding-tools",
+    );
+    expect(codingTools?.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "src/instructions.ts",
+        exportName: "decodePreviouslyLoadedInstructionPaths",
+      },
+      category: "projection",
+    });
+
+    const miniClient = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-client",
+    );
+    expect(miniClient?.boundaryDecoders).toContainEqual({
+      identity: { module: "mini-lilac-transport.ts", exportName: "decodeMiniLilacBoundary" },
+      category: "wire",
+    });
+  });
+
+  test("requires every final package-wide rule zone before marking a workspace migrated", () => {
+    const valid = migratedWorkspace();
+    expect(() =>
+      assertStage7EnforcementPreflight({ version: 1, workspaces: [valid] }, emptyBaselines),
+    ).not.toThrow();
+
+    const missingRule = FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES[0];
+    expect(() =>
+      assertStage7EnforcementPreflight(
+        {
+          version: 1,
+          workspaces: [
+            {
+              ...valid,
+              ruleZones: { ...valid.ruleZones, [missingRule]: [] },
+            },
+          ],
+        },
+        emptyBaselines,
+      ),
+    ).toThrow(`package-wide rule ${missingRule}`);
+  });
+
+  test("requires exact registration zones and operational Result API registration", () => {
+    const decoder = fixtureResultDecoder("decodeKnownToolObservation");
+    const withDecoder = migratedWorkspace({
+      resultDecoders: [decoder],
+      operationalResultApis: [decoder.identity],
+    });
+    expect(() =>
+      assertStage7EnforcementPreflight({ version: 1, workspaces: [withDecoder] }, emptyBaselines),
+    ).toThrow("exact architecture/result-decoder-contract zones must equal registered modules");
+
+    const withZone = migratedWorkspace({
+      ruleZones: {
+        ...withDecoder.ruleZones,
+        "architecture/result-decoder-contract": [{ include: decoder.identity.module }],
+      },
+      resultDecoders: [decoder],
+    });
+    expect(() =>
+      assertStage7EnforcementPreflight({ version: 1, workspaces: [withZone] }, emptyBaselines),
+    ).toThrow("unregistered operational Result API");
+
+    const withExtraZone = migratedWorkspace({
+      ruleZones: {
+        ...withDecoder.ruleZones,
+        "architecture/result-decoder-contract": [
+          { include: decoder.identity.module },
+          { include: "**" },
+        ],
+      },
+      resultDecoders: [decoder],
+      operationalResultApis: [decoder.identity],
+    });
+    expect(() =>
+      assertStage7EnforcementPreflight({ version: 1, workspaces: [withExtraZone] }, emptyBaselines),
+    ).toThrow("exact architecture/result-decoder-contract zones must equal registered modules");
+  });
+
+  test("does not infer a Result return contract from event-consumer ownership", () => {
+    const identity = { module: "consumer.ts", exportName: "startLegacyConsumer" };
+    const workspace = migratedWorkspace({
+      eventDeliveryConsumers: [
+        {
+          identity,
+          apiPackage: "@example/event-bus",
+          operations: ["subscribeTopic"],
+        },
+      ],
+    });
+
+    expect(() =>
+      assertStage7EnforcementPreflight({ version: 1, workspaces: [workspace] }, emptyBaselines),
+    ).not.toThrow();
+  });
+
+  test("rejects stale operational Result API identities in migrated workspaces", () => {
+    const workspace = migratedWorkspace({
+      operationalResultApis: [{ module: "result.ts", exportName: "missingResultApi" }],
+    });
+    expect(() => analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram)).toThrow(
+      "must resolve to exactly one callable implementation; found 0",
+    );
+  });
+
+  test("resolves an exact operational Result contract method signature", () => {
+    const workspace = migratedWorkspace({
+      operationalResultApis: [
+        {
+          module: "stage4-events.ts",
+          exportName: "LegacyFixtureDeliveryApi.subscribeTopicResult",
+        },
+      ],
+    });
+    expect(() => analyzeWorkspace(workspace, FIXTURE_ROOT, fixtureProgram)).not.toThrow();
+  });
+
+  test("requires zero semantic and syntax baselines for a migrated workspace", () => {
+    const workspace = migratedWorkspace();
+    const semanticBaseline: ArchitectureBaseline = {
+      fixture: {
+        "architecture/no-domain-unknown": [
+          {
+            fingerprint: "semantic",
+            identity: "domain.ts#decode[Parameter]@1",
+            location: { file: "domain.ts", line: 1, column: 1 },
+            reason: "Fixture debt",
+          },
+        ],
+      },
+    };
+    expect(() =>
+      assertStage7EnforcementPreflight(
+        { version: 1, workspaces: [workspace] },
+        { semantic: [semanticBaseline], syntax: {} },
+      ),
+    ).toThrow("every semantic and syntax baseline to be empty");
+
+    const syntax: SyntaxBaseline = {
+      fixture: {
+        "lilac/no-exception-flow": [
+          {
+            workspace: "fixture",
+            module: "domain",
+            symbol: "decode",
+            kind: "throw",
+            digest: "a".repeat(64),
+            reason: "Fixture debt",
+          },
+        ],
+      },
+    };
+    expect(() =>
+      assertStage7EnforcementPreflight(
+        { version: 1, workspaces: [workspace] },
+        { semantic: [], syntax },
+      ),
+    ).toThrow("every semantic and syntax baseline to be empty");
+
+    expect(() =>
+      assertStage7EnforcementPreflight(
+        { version: 1, workspaces: [workspace] },
+        {
+          semantic: [{ ghost: semanticBaseline.fixture }],
+          syntax: {},
+        },
+      ),
+    ).toThrow("unknown workspace partition ghost");
+  });
+
+  test("promotes wave-three workspaces with no active baseline partitions", () => {
+    const waveThree = new Set([
+      "apps/acp-controller",
+      "apps/mini-lilac",
+      "apps/mini-lilac-server",
+      "apps/mini-lilac-tui",
+      "apps/tool-bridge",
+      "packages/agent",
+    ]);
+    const workspaces = architectureManifest.workspaces.filter(({ root }) => waveThree.has(root));
+    const semanticBaseline: ArchitectureBaseline = boundaryValidationBaseline;
+    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
+    expect(workspaces).toHaveLength(waveThree.size);
+    expect(workspaces.every(({ status }) => status === "migrated")).toBeTrue();
+    for (const workspace of waveThree) {
+      expect(semanticBaseline[workspace]).toBeUndefined();
+      expect(typedSyntaxBaseline[workspace]).toBeUndefined();
+    }
+    expect(() =>
+      assertStage7EnforcementPreflight(architectureManifest, {
+        semantic: [boundaryValidationBaseline, failureFlowBaseline],
+        syntax: syntaxBaseline,
+      }),
+    ).not.toThrow();
+  });
+
+  test("promotes Mini Lilac Runtime with exact reviewed boundaries and no baseline debt", () => {
+    const runtime = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-runtime",
+    );
+    if (!runtime) throw new Error("Mini Lilac Runtime workspace missing");
+    const semanticBaseline: ArchitectureBaseline = boundaryValidationBaseline;
+    const typedFailureBaseline: ArchitectureBaseline = failureFlowBaseline;
+    const typedSyntaxBaseline: SyntaxBaseline = syntaxBaseline;
+
+    expect(runtime.status).toBe("migrated");
+    for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
+      expect(runtime.ruleZones[rule]).toEqual([{ include: "**" }]);
+    }
+    expect(semanticBaseline[runtime.root]).toBeUndefined();
+    expect(typedFailureBaseline[runtime.root]).toBeUndefined();
+    expect(typedSyntaxBaseline[runtime.root]).toBeUndefined();
+    expect(runtime.capabilityPredicates).toContainEqual({
+      identity: {
+        module: "src/sqlite-transcript-projection.ts",
+        exportName: "acceptsMiniLilacPersistedSuperJsonValue",
+      },
+      reason:
+        "Checks only whether a persisted opaque value survives the exact SuperJSON representation round trip.",
+    });
+    expect(runtime.capabilityPredicates).toContainEqual({
+      identity: { module: "src/workspace-history-store.ts", exportName: "isMissingExecutable" },
+      reason:
+        "Checks only the exact Node filesystem ENOENT capability on an opaque process failure.",
+    });
+    expect(runtime.operationalResultApis).toContainEqual({
+      module: "src/config.ts",
+      exportName: "loadRuntimeConfigResult",
+    });
+    expect(runtime.operationalResultApis).toContainEqual({
+      module: "src/workspace-history-store.ts",
+      exportName: "WorkspaceHistoryStore.captureResult",
+    });
+    expect(runtime.operationalResultApis).toContainEqual({
+      module: "src/webfetch.ts",
+      exportName: "executeWebfetchResult",
+    });
+    expect(runtime.operationalResultApis).not.toContainEqual({
+      module: "src/webfetch.ts",
+      exportName: "executeWebfetch",
+    });
+    expect(() =>
+      assertStage7EnforcementPreflight(architectureManifest, {
+        semantic: [boundaryValidationBaseline, failureFlowBaseline],
+        syntax: syntaxBaseline,
+      }),
+    ).not.toThrow();
+  });
+
+  test("does not retain settled broad runtime, TUI, and Agent cleanup identities", () => {
+    const runtime = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-runtime",
+    );
+    const tui = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "apps/mini-lilac-tui",
+    );
+    const agent = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/agent",
+    );
+    if (!runtime || !tui || !agent) throw new Error("settled review workspaces missing");
+
+    const removedRuntimeAdapters = new Set([
+      "executeWebfetch",
+      "ModelCatalog.cancelResponseReader",
+      "loadProviderAuthResult",
+      "WorkspaceHistoryStore.writeAtomicPrivateFile",
+    ]);
+    expect(
+      runtime.exceptionAdapters.filter((adapter) =>
+        removedRuntimeAdapters.has(adapter.identity.exportName),
+      ),
+    ).toEqual([]);
+    expect(
+      tui.exceptionAdapters.some(
+        (adapter) => adapter.identity.exportName === "resolveTerminalShutdownOutcome",
+      ),
+    ).toBeFalse();
+    expect(agent.boundaryDecoders).toContainEqual({
+      identity: {
+        module: "atomic-tool-execution.ts",
+        exportName: "resolveAtomicToolFailureAfterCleanup",
+      },
+      category: "projection",
+    });
+    expect(
+      agent.exceptionAdapters.some(
+        (adapter) => adapter.identity.exportName === "cleanupFailedAtomicToolCall",
+      ),
+    ).toBeTrue();
+  });
+
+  test("pins reviewed Event Bus and Tool Results cleanup adapter ownership", () => {
+    const eventBus = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/event-bus",
+    );
+    const toolResults = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/tool-results",
+    );
+    if (!eventBus || !toolResults) throw new Error("reviewed cleanup workspaces missing");
+
+    expect(eventBus.exceptionAdapters).toContainEqual(
+      expect.objectContaining({
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "RedisStreamsBus.subscribe.cleanupLease.<callback>",
+        },
+        direction: "capture-external",
+      }),
+    );
+    expect(
+      eventBus.exceptionAdapters.filter((adapter) =>
+        [
+          "RedisStreamsBus.subscribe.cleanupLease",
+          "RedisStreamsBus.subscribe.stop.then.<callback@2>",
+        ].includes(adapter.identity.exportName),
+      ),
+    ).toEqual([]);
+    expect(
+      toolResults.exceptionAdapters.some(
+        (adapter) =>
+          adapter.identity.exportName === "createToolResultArtifactStore.rethrowAfterCleanup",
+      ),
+    ).toBeFalse();
+  });
+
+  test("inventory expands only package-wide rules and preserves every exact registration zone", () => {
+    const exactRuleZones = Object.fromEntries(
+      [...EXACT_REGISTRATION_ARCHITECTURE_RULES].map((rule) => [
+        rule,
+        [{ include: `exact/${rule.slice("architecture/".length)}.ts` }],
+      ]),
+    );
+    const manifest: ArchitectureManifest = {
+      version: 1,
+      workspaces: [
+        {
+          ...BASE_WORKSPACE,
+          ruleZones: {
+            ...exactRuleZones,
+            "architecture/no-domain-unknown": [{ include: "partial/**" }],
+          },
+        },
+      ],
+    };
+    const inventory = inventoryManifest(manifest).workspaces[0];
+    if (!inventory) throw new Error("inventory workspace missing");
+
+    for (const rule of FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES) {
+      expect(inventory.ruleZones[rule]).toEqual([{ include: "**" }]);
+    }
+    for (const rule of EXACT_REGISTRATION_ARCHITECTURE_RULES) {
+      expect(inventory.ruleZones[rule]).toEqual(manifest.workspaces[0]?.ruleZones[rule]);
+    }
   });
 });
 
@@ -2964,15 +3895,45 @@ describe("real declaration integration", () => {
       { module: "src/mcp/config-file.ts", exportName: "readMcpConfigFile" },
       { module: "src/mcp/config-file.ts", exportName: "writeMcpConfigFileAtomic" },
       { module: "src/mcp/config-file.ts", exportName: "mutateMcpConfigFile" },
+      {
+        module: "src/mcp/credential-file.ts",
+        exportName: "resolveMcpOAuthCredentialPathResult",
+      },
+      {
+        module: "src/mcp/credential-file.ts",
+        exportName: "readMcpOAuthCredentialFileResult",
+      },
+      {
+        module: "src/mcp/credential-file.ts",
+        exportName: "writeMcpOAuthCredentialFileAtomicResult",
+      },
+      {
+        module: "src/mcp/credential-file.ts",
+        exportName: "updateMcpOAuthCredentialFileResult",
+      },
+      { module: "src/mcp/oauth-provider.ts", exportName: "captureOAuthAttempt" },
+      {
+        module: "src/mcp/oauth-provider.ts",
+        exportName: "McpOAuthProvider.startAuthorizationResult",
+      },
+      {
+        module: "src/mcp/oauth-provider.ts",
+        exportName: "McpOAuthProvider.completeAuthorizationResult",
+      },
+      {
+        module: "src/mcp/oauth-provider.ts",
+        exportName: "McpOAuthProvider.createPendingAuthorization",
+      },
+      {
+        module: "src/mcp/oauth-provider.ts",
+        exportName: "McpOAuthProviderService.startAuthorizationResult",
+      },
       { module: "src/mcp/value-source.ts", exportName: "resolveJsonPointer" },
       { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSource" },
       { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSourceMap" },
       { module: "src/mcp/value-source.ts", exportName: "validateHttpHeaders" },
     ]);
-    expect(core.ruleZones["architecture/fallible-api-result"]?.slice(0, 2)).toEqual([
-      { include: "src/mcp/value-source.ts" },
-      { include: "src/mcp/config-file.ts" },
-    ]);
+    expect(core.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
     expect(
       core.exceptionAdapters
         .filter((adapter) =>
@@ -3013,15 +3974,21 @@ describe("real declaration integration", () => {
       },
     ]);
     expect(
-      core.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "McpRegistry.reconcileServer",
-      ),
-    ).toBeFalse();
-    expect(
-      core.exceptionAdapters.some(
-        (adapter) => adapter.identity.exportName === "McpRegistry.initializeCandidate",
-      ),
-    ).toBeFalse();
+      core.exceptionAdapters
+        .filter(
+          (adapter) =>
+            adapter.identity.exportName === "McpRegistry.reconcileServer" ||
+            adapter.identity.exportName.startsWith("McpRegistry.initializeCandidate"),
+        )
+        .map((adapter) => [adapter.identity.exportName, adapter.direction]),
+    ).toEqual([
+      ["McpRegistry.initializeCandidate", "capture-external"],
+      ["McpRegistry.reconcileServer", "capture-external"],
+      [
+        "McpRegistry.initializeCandidate.withDeadline.<callback@2>.onUncaughtError",
+        "capture-external",
+      ],
+    ]);
     expect(
       core.exceptionAdapters.find(
         (adapter) => adapter.identity.exportName === "opaqueErrorMessage",
@@ -3032,13 +3999,79 @@ describe("real declaration integration", () => {
       externalApi: { package: "global", exportName: "Error.message" },
       direction: "capture-external",
     });
-    const nonPilot = architectureManifest.workspaces.find(
-      (workspace) => workspace.root === "apps/tool-bridge",
+
+    const operationalResultApiKeys = new Set(
+      core.operationalResultApis.map((identity) => `${identity.module}#${identity.exportName}`),
     );
-    if (!nonPilot) throw new Error("non-pilot workspace missing");
-    expect(nonPilot.ruleZones["architecture/no-unhandled-exception-contract"]).toEqual([]);
-    expect(nonPilot.ruleZones["architecture/no-unredacted-tagged-error-log"]).toEqual([]);
-    expect(nonPilot.ruleZones["architecture/fallible-api-result"]).toEqual([]);
+    for (const key of [
+      "src/conversation/thread-materializer-worker-protocol.ts#decodeThreadMaterializerWorkerRequest",
+      "src/conversation/thread-materializer-worker-protocol.ts#decodeThreadMaterializerWorkerResponse",
+      "src/github/github-app.ts#decodeGithubAppSecret",
+      "src/github/github-app.ts#readGithubAppSecretResult",
+      "src/github/github-user-token.ts#decodeGithubUserTokenSecret",
+      "src/github/github-user-token.ts#readGithubUserTokenSecretResult",
+      "src/github/webhook/github-webhook-server.ts#captureGithubWebhookOperation",
+      "src/github/webhook/github-webhook-server.ts#superviseGithubWebhookHandler",
+      "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCoreNamedClaudeSessionBinding",
+      "src/transcript/transcript-store.ts#SqliteTranscriptStore.readCoreNamedClaudeSessionBinding",
+      "src/transcript/transcript-store.ts#SqliteTranscriptStore.getCorePrimaryClaudeSessionBinding",
+      "src/transcript/transcript-store.ts#SqliteTranscriptStore.readCorePrimaryClaudeSessionBinding",
+    ]) {
+      expect(operationalResultApiKeys).toContain(key);
+    }
+
+    for (const [module, exportName] of [
+      [
+        "src/surface/bridge/bus-agent-runner/output-publisher.ts",
+        "createAgentOutputPublisher.enqueue.superviseSettlement",
+      ],
+      ["src/surface/discord/discord-adapter.ts", "DiscordAdapter.emit.catch.<callback@1>"],
+      ["src/workflow/workflow-engine.ts", "WorkflowEngine.claimAndLaunch.catch.<callback@1>"],
+      ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.respondToHostCall"],
+      ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.result.<callback>"],
+    ] as const) {
+      expect(core.exceptionAdapters).toContainEqual(
+        expect.objectContaining({
+          identity: { module, exportName },
+          category: "defect-supervisor",
+          externalApi: { package: "better-result", exportName: "Panic.is" },
+          direction: "observe-panic",
+        }),
+      );
+    }
+    expect(core.exceptionAdapters).toContainEqual(
+      expect.objectContaining({
+        identity: {
+          module: "src/surface/discord/discord-adapter.ts",
+          exportName: "DiscordAdapter.reportDetachedPanic.queueMicrotask.<callback@1>",
+        },
+        category: "defect-supervisor",
+        direction: "signal-host",
+      }),
+    );
+    for (const [module, exportName] of [
+      ["src/runtime/create-core-runtime.ts", "startCoreMcpServices"],
+      ["src/surface/discord/discord-adapter.ts", "DiscordAdapter.emit"],
+      ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.terminate"],
+    ] as const) {
+      expect(
+        core.exceptionAdapters.some(
+          (adapter) =>
+            adapter.identity.module === module && adapter.identity.exportName === exportName,
+        ),
+      ).toBeFalse();
+    }
+    const runtime = architectureManifest.workspaces.find(
+      (workspace) => workspace.root === "packages/mini-lilac-runtime",
+    );
+    if (!runtime) throw new Error("Mini Lilac Runtime workspace missing");
+    expect(runtime.ruleZones["architecture/no-unhandled-exception-contract"]).toEqual([
+      { include: "**" },
+    ]);
+    expect(runtime.ruleZones["architecture/no-unredacted-tagged-error-log"]).toEqual([
+      { include: "**" },
+    ]);
+    expect(runtime.ruleZones["architecture/fallible-api-result"]).toEqual([{ include: "**" }]);
   });
 
   test("resolves Bun-realpathed cross-workspace declarations to package identities", () => {
@@ -3258,6 +4291,18 @@ describe("ratchet infrastructure", () => {
       "error",
       "warning",
     ]);
+
+    const ghostBaseline = {
+      ghost: boundary.fixture,
+    } satisfies ArchitectureBaseline;
+    const ghost = applyBaselines([finding], ghostBaseline, {});
+    expect(ghost.matched).toBe(0);
+    expect(ghost.diagnostics).toContainEqual(finding);
+    expect(
+      ghost.diagnostics.some((diagnostic) =>
+        diagnostic.fingerprint.startsWith("partition-mismatch:"),
+      ),
+    ).toBeTrue();
   });
 
   test("creates exactly one Program per active workspace", () => {

@@ -54,7 +54,6 @@ import {
 
 const readErrorCodeSchema = z.enum(READ_ERROR_CODES);
 const editErrorCodeSchema = z.enum(EDIT_ERROR_CODES);
-const searchFailureOutputZod = z.object({ error: z.string() }).passthrough();
 const warningZod = z.object({
   code: z.literal("LINE_TOO_LONG_FOR_HASHLINE"),
   message: z.string(),
@@ -381,68 +380,93 @@ function truncateUnicodeString(
   return `${characters.slice(0, maxCharacters - marker.length).join("")}${marker}`;
 }
 
-function truncateSearchEntryStrings(value: unknown, maxStringCharacters: number): unknown {
-  if (typeof value === "string") {
-    return truncateUnicodeString(value, maxStringCharacters);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => truncateSearchEntryStrings(item, maxStringCharacters));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
+type BoundedSearchOutput = GlobOutput | FuzzySearchOutput | GrepOutput;
+type BoundedSearchEntry =
+  | string
+  | Extract<GlobOutput, { mode: "detailed" }>["entries"][number]
+  | FuzzySearchOutput["results"][number]
+  | GrepOutput["results"][number];
+
+function truncateSearchEntryStrings(
+  value: BoundedSearchEntry,
+  maxStringCharacters: number,
+): BoundedSearchEntry {
+  if (typeof value === "string") return truncateUnicodeString(value, maxStringCharacters);
+
+  const entries = Object.entries(value).map(([key, item]) => {
+    if (typeof item === "string") return [key, truncateUnicodeString(item, maxStringCharacters)];
+    if (Array.isArray(item)) {
+      return [
         key,
-        truncateSearchEntryStrings(item, maxStringCharacters),
-      ]),
-    );
-  }
-  return value;
+        item.map((submatch) => ({
+          ...submatch,
+          match: truncateUnicodeString(submatch.match, maxStringCharacters),
+        })),
+      ];
+    }
+    return [key, item];
+  });
+  return Object.fromEntries(entries) as BoundedSearchEntry;
 }
 
-function boundSearchOutput<T extends { truncated: boolean }>(
+function searchEntries(
+  output: BoundedSearchOutput,
+  entriesKey: "paths" | "entries" | "results",
+): BoundedSearchEntry[] {
+  if (entriesKey === "paths" && "paths" in output) return output.paths;
+  if (entriesKey === "entries" && "entries" in output) return output.entries;
+  if (entriesKey === "results" && "results" in output) return output.results;
+  return [];
+}
+
+function removeSearchDiagnostics(output: BoundedSearchOutput): void {
+  if ("warnings" in output) delete output.warnings;
+  if ("degradedFromHashline" in output) delete output.degradedFromHashline;
+}
+
+function hasSearchFailure(output: BoundedSearchOutput): boolean {
+  return typeof output.error === "string";
+}
+
+function boundSearchOutput<T extends BoundedSearchOutput>(
   output: T,
   entriesKey: "paths" | "entries" | "results",
   maxBytes: number,
 ): T {
-  if (maxBytes < 2) throw new RangeError("Search maxBytes must be at least 2.");
-  const serializedBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
-  if (serializedBytes(output) <= maxBytes) return output;
+  const effectiveConfiguredMaxBytes = Math.max(2, maxBytes);
+  const serializedBytes = (value: BoundedSearchOutput) =>
+    Buffer.byteLength(JSON.stringify(value), "utf8");
+  if (serializedBytes(output) <= effectiveConfiguredMaxBytes) return output;
 
   const next = structuredClone(output);
-  const record = next as unknown as Record<string, unknown>;
   next.truncated = true;
-  record["truncationHint"] = SEARCH_TRUNCATION_HINT;
-  const entries = record[entriesKey];
+  next.truncationHint = SEARCH_TRUNCATION_HINT;
+  const entries = searchEntries(next, entriesKey);
   const minimum = structuredClone(next);
-  const minimumRecord = minimum as unknown as Record<string, unknown>;
-  minimumRecord[entriesKey] = [];
-  delete minimumRecord["warnings"];
-  delete minimumRecord["degradedFromHashline"];
-  if (typeof minimumRecord["error"] === "string") {
-    minimumRecord["error"] = truncateUnicodeString(minimumRecord["error"], 160, true);
+  searchEntries(minimum, entriesKey).splice(0);
+  removeSearchDiagnostics(minimum);
+  if (typeof minimum.error === "string") {
+    minimum.error = truncateUnicodeString(minimum.error, 160, true);
   }
-  const effectiveMaxBytes = Math.max(maxBytes, serializedBytes(minimum));
+  const effectiveMaxBytes = Math.max(effectiveConfiguredMaxBytes, serializedBytes(minimum));
 
-  if (Array.isArray(entries)) {
-    while (entries.length > 1 && serializedBytes(next) > effectiveMaxBytes) entries.pop();
+  while (entries.length > 1 && serializedBytes(next) > effectiveMaxBytes) entries.pop();
 
-    let maxStringCharacters = Math.max(1, Math.floor(effectiveMaxBytes / 4));
-    while (entries.length === 1 && serializedBytes(next) > effectiveMaxBytes) {
-      entries[0] = truncateSearchEntryStrings(entries[0], maxStringCharacters);
-      if (maxStringCharacters === 1) {
-        entries.pop();
-        break;
-      }
-      maxStringCharacters = Math.max(1, Math.floor(maxStringCharacters / 2));
+  let maxStringCharacters = Math.max(1, Math.floor(effectiveMaxBytes / 4));
+  while (entries.length === 1 && serializedBytes(next) > effectiveMaxBytes) {
+    entries[0] = truncateSearchEntryStrings(entries[0]!, maxStringCharacters);
+    if (maxStringCharacters === 1) {
+      entries.pop();
+      break;
     }
+    maxStringCharacters = Math.max(1, Math.floor(maxStringCharacters / 2));
   }
 
   if (serializedBytes(next) <= effectiveMaxBytes) return next;
 
   // Error results should continue to communicate failure, even when their details are bounded.
-  const originalError = typeof record["error"] === "string" ? record["error"] : undefined;
-  delete record["warnings"];
-  delete record["degradedFromHashline"];
+  const originalError = next.error;
+  removeSearchDiagnostics(next);
 
   if (originalError !== undefined && serializedBytes(next) > effectiveMaxBytes) {
     const errorCharacters = Array.from(originalError).length;
@@ -450,11 +474,11 @@ function boundSearchOutput<T extends { truncated: boolean }>(
     let high = errorCharacters;
     let best = "Error";
 
-    record["error"] = best;
+    next.error = best;
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
       const candidate = truncateUnicodeString(originalError, middle, true);
-      record["error"] = candidate;
+      next.error = candidate;
       if (serializedBytes(next) <= effectiveMaxBytes) {
         best = candidate;
         low = middle + 1;
@@ -462,12 +486,12 @@ function boundSearchOutput<T extends { truncated: boolean }>(
         high = middle - 1;
       }
     }
-    record["error"] = best;
+    next.error = best;
   }
 
-  if (serializedBytes(next) > effectiveMaxBytes && Array.isArray(entries)) entries.splice(0);
+  if (serializedBytes(next) > effectiveMaxBytes) entries.splice(0);
   if (serializedBytes(next) > effectiveMaxBytes && originalError !== undefined) {
-    record["error"] = "Error";
+    next.error = "Error";
   }
 
   if (serializedBytes(next) > effectiveMaxBytes) return minimum;
@@ -1166,63 +1190,6 @@ export function fsTool(
           };
         })();
 
-        const loadedInstructionCount =
-          withInstructions.success &&
-          "loadedInstructions" in withInstructions &&
-          Array.isArray(withInstructions.loadedInstructions)
-            ? withInstructions.loadedInstructions.length
-            : 0;
-
-        let textReadSummary;
-        if (withInstructions.success && !("kind" in withInstructions)) {
-          let returnedChars: number;
-          switch (withInstructions.format) {
-            case "raw":
-              returnedChars = withInstructions.content.length;
-              break;
-            case "numbered":
-              returnedChars = withInstructions.numberedContent.length;
-              break;
-            case "hashline":
-              returnedChars = withInstructions.hashlineContent.length;
-              break;
-          }
-          textReadSummary = {
-            outputFormat: withInstructions.format,
-            startLine: withInstructions.startLine,
-            endLine: withInstructions.endLine,
-            totalLines: withInstructions.totalLines,
-            hasMoreLines: withInstructions.hasMoreLines,
-            truncatedByChars: withInstructions.truncatedByChars,
-            returnedLines: Math.max(0, withInstructions.endLine - withInstructions.startLine + 1),
-            returnedChars,
-          };
-        }
-
-        let attachmentSummary;
-        if (
-          withInstructions.success &&
-          "kind" in withInstructions &&
-          withInstructions.kind === "attachment"
-        ) {
-          attachmentSummary = {
-            kind: "attachment" as const,
-            mimeType: withInstructions.mimeType,
-            filename: withInstructions.filename,
-            bytes: withInstructions.bytes,
-          };
-        }
-
-        logger.info("fs.readFile done", {
-          path: withInstructions.resolvedPath,
-          ok: withInstructions.success,
-          target: cwdTarget.kind,
-          loadedInstructions: loadedInstructionCount,
-          ...textReadSummary,
-          ...attachmentSummary,
-          error: withInstructions.success ? undefined : withInstructions.error,
-        });
-
         return withInstructions;
       },
       toModelOutput: async ({ toolCallId, output }) => {
@@ -1348,14 +1315,6 @@ export function fsTool(
             return { mode, truncated: false, entries: [], error: remoteResult.error.message };
           })();
 
-          logger.info("fs.glob done", {
-            entryCount: countGlobItems(res),
-            truncated: res.truncated,
-            error: res.error,
-            mode: res.mode,
-            effectiveBackend: res.effectiveBackend,
-          });
-
           const output = stripGlobMetadata(res);
           return boundSearchOutput(
             output,
@@ -1375,7 +1334,7 @@ export function fsTool(
         logger.info("fs.glob done", {
           entryCount: countGlobItems(res),
           truncated: res.truncated,
-          error: res.error,
+          failureMessage: res.error,
           mode: res.mode,
           effectiveBackend: res.effectiveBackend,
         });
@@ -1388,7 +1347,7 @@ export function fsTool(
         );
       },
       toModelOutput: ({ output }): ToolResultOutput =>
-        searchFailureOutputZod.safeParse(output).success
+        hasSearchFailure(output)
           ? { type: "error-json", value: output }
           : { type: "json", value: output },
     }),
@@ -1440,14 +1399,6 @@ export function fsTool(
                   };
                 }
 
-                logger.info("fs.fuzzySearch done", {
-                  resultCount: res.results.length,
-                  totalMatched: res.totalMatched,
-                  truncated: res.truncated,
-                  error: res.error,
-                  effectiveBackend: res.effectiveBackend,
-                });
-
                 return boundSearchOutput(stripFuzzySearchMetadata(res), "results", maxOutputBytes);
               }
 
@@ -1462,14 +1413,14 @@ export function fsTool(
                 resultCount: res.results.length,
                 totalMatched: res.totalMatched,
                 truncated: res.truncated,
-                error: res.error,
+                failureMessage: res.error,
                 effectiveBackend: res.effectiveBackend,
               });
 
               return boundSearchOutput(stripFuzzySearchMetadata(res), "results", maxOutputBytes);
             },
             toModelOutput: ({ output }): ToolResultOutput =>
-              searchFailureOutputZod.safeParse(output).success
+              hasSearchFailure(output)
                 ? { type: "error-json", value: output }
                 : { type: "json", value: output },
           }),
@@ -1555,14 +1506,6 @@ export function fsTool(
             }
           }
 
-          logger.info("fs.grep done", {
-            resultCount: countGrepItems(res),
-            truncated: res.truncated,
-            error: res.error,
-            mode: res.mode,
-            effectiveBackend: res.effectiveBackend,
-          });
-
           return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
         }
 
@@ -1580,7 +1523,7 @@ export function fsTool(
         logger.info("fs.grep done", {
           resultCount: countGrepItems(res),
           truncated: res.truncated,
-          error: res.error,
+          failureMessage: res.error,
           mode: res.mode,
           effectiveBackend: res.effectiveBackend,
         });
@@ -1588,7 +1531,7 @@ export function fsTool(
         return boundSearchOutput(stripGrepMetadata(res), "results", maxOutputBytes);
       },
       toModelOutput: ({ output }): ToolResultOutput =>
-        searchFailureOutputZod.safeParse(output).success
+        hasSearchFailure(output)
           ? { type: "error-json", value: output }
           : { type: "json", value: output },
     }),
@@ -1811,13 +1754,6 @@ export function fsTool(
                 await fileSystem.editFile({ ...editPayload, dangerouslyAllow }, opCwd),
               );
             })();
-
-        logger.info("fs.editFile done", {
-          path: res.resolvedPath,
-          ok: res.success,
-          error: res.success ? undefined : res.error,
-          replacementsMade: res.success ? res.replacementsMade : undefined,
-        });
 
         return res;
       },

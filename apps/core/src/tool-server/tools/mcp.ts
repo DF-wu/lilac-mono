@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Result } from "better-result";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   MCP_CONFIG_VERSION,
@@ -75,10 +75,18 @@ function safeReloadOutcomes(outcomes: readonly McpReloadOutcome[]): readonly Mcp
   }));
 }
 
-function resultToMcpToolValue<T, E extends Error>(result: Result<T, E>): T {
+class McpToolFailure extends TaggedError("McpToolFailure")<{
+  readonly message: string;
+}> {}
+
+function resultToMcpToolValue<T, E extends Error>(result: ResultType<T, E>): T {
   if (result.status === "ok") return result.value;
   // ServerTool reports failures through the host's exception channel; never throw the TaggedError.
   throw new Error(result.error.message);
+}
+
+function signalMcpFailureToToolHost(message: string): never {
+  return resultToMcpToolValue(Result.err(new McpToolFailure({ message })));
 }
 
 export class McpManagement implements ServerTool {
@@ -181,10 +189,15 @@ export class McpManagement implements ServerTool {
         servers: { [serverId]: transport },
       });
       if (!parsed.ok) {
-        throw new Error(`Could not normalize MCP server input: ${parsed.issues.join("; ")}`);
+        return signalMcpFailureToToolHost(
+          `Could not normalize MCP server input: ${parsed.issues.join("; ")}`,
+        );
       }
       const server = parsed.config.servers[serverId];
-      if (!server) throw new Error(`Could not normalize MCP server ${JSON.stringify(serverId)}`);
+      if (!server)
+        return signalMcpFailureToToolHost(
+          `Could not normalize MCP server ${JSON.stringify(serverId)}`,
+        );
 
       return await this.enqueueManagementOperation(async () => {
         const mutation = resultToMcpToolValue(
@@ -271,13 +284,13 @@ export class McpManagement implements ServerTool {
       });
       const callback = this.params.callback;
       if (!callback) {
-        throw new Error(
+        return signalMcpFailureToToolHost(
           "MCP OAuth callback listener is not configured. Restart Lilac Core, then retry mcp.auth.",
         );
       }
       const callbackStatus = callback.start();
       if (callbackStatus.status === "unavailable") {
-        throw new Error(
+        return signalMcpFailureToToolHost(
           `MCP OAuth callback listener is unavailable on ${callbackStatus.hostname}:${callbackStatus.port}. Ensure the port is free, then retry mcp.auth.`,
         );
       }
@@ -311,22 +324,22 @@ export class McpManagement implements ServerTool {
       });
     }
 
-    throw new Error(`Invalid callable ID '${callableId}'`);
+    return signalMcpFailureToToolHost(`Invalid callable ID '${callableId}'`);
   }
 
   private enqueueManagementOperation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.mutationQueue.then(operation);
-    this.mutationQueue = result.then(
-      () => undefined,
-      () => undefined,
-    );
+    this.mutationQueue = Promise.allSettled([result]).then(() => undefined);
     return result;
   }
 
   private async waitUntilRegistryInitialized(): Promise<void> {
     const waitUntilInitialized = this.params.registry.waitUntilInitialized;
     if (!waitUntilInitialized)
-      throw new Error("MCP registry initialization barrier is unavailable");
-    await waitUntilInitialized.call(this.params.registry);
+      return signalMcpFailureToToolHost("MCP registry initialization barrier is unavailable");
+    const initialized = await waitUntilInitialized.call(this.params.registry);
+    if (initialized.status === "error") {
+      return signalMcpFailureToToolHost(initialized.error.message);
+    }
   }
 }

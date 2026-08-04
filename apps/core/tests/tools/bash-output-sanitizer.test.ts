@@ -3,13 +3,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { Panic } from "better-result";
 
 import {
+  BashOutputCleanupError,
+  BashOutputStreamAndCleanupError,
   createBashOutputSanitizerTransform,
   getPreOverflowRawByteLimit,
   MAX_PRE_OVERFLOW_RAW_BYTES,
   MIN_PRE_OVERFLOW_RAW_BYTES,
   readSanitizedStreamTextCapped,
+  readSanitizedStreamTextCappedResult,
 } from "../../src/tools/bash-output-sanitizer";
 import { redactLiteralSecrets } from "../../src/tools/bash-safety/format";
 
@@ -363,5 +367,172 @@ describe("bash output sanitizer stream", () => {
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it("returns cleanup-only failure after successful stream processing", async () => {
+    const calls: string[] = [];
+    const rawSecret = "RAW_TOKEN=cleanup-secret /private/raw-spill";
+    const result = await readSanitizedStreamTextCappedResult(
+      streamFromStrings(["output beyond cap"]),
+      4,
+      {
+        overflowFilePath: "/private/raw-spill",
+        overflowOperations: {
+          async open() {
+            calls.push("open");
+            return {
+              async write() {
+                calls.push("write");
+              },
+              async close() {
+                calls.push("close");
+                throw new Error(rawSecret);
+              },
+              async abort() {
+                calls.push("abort");
+              },
+            };
+          },
+          async remove() {
+            calls.push("remove");
+          },
+        },
+      },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(BashOutputCleanupError.is(result.error)).toBe(true);
+      expect(result.error.message).not.toContain("cleanup-secret");
+      expect(result.error.message).not.toContain("/private/raw-spill");
+    }
+    expect(calls).toEqual(["open", "write", "close", "abort", "remove"]);
+  });
+
+  it("preserves spill operation and every cleanup failure", async () => {
+    const calls: string[] = [];
+    const result = await readSanitizedStreamTextCappedResult(
+      streamFromStrings(["output beyond cap"]),
+      4,
+      {
+        overflowFilePath: "/private/raw-spill",
+        overflowOperations: {
+          async open() {
+            calls.push("open");
+            return {
+              async write() {
+                calls.push("write");
+                throw new Error("RAW_TOKEN=write-secret /private/raw-spill");
+              },
+              async close() {
+                calls.push("close");
+              },
+              async abort() {
+                calls.push("abort");
+                throw new Error("RAW_TOKEN=abort-secret /private/raw-spill");
+              },
+            };
+          },
+          async remove() {
+            calls.push("remove");
+            throw new Error("RAW_TOKEN=remove-secret /private/raw-spill");
+          },
+        },
+      },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(BashOutputStreamAndCleanupError.is(result.error)).toBe(true);
+      if (BashOutputStreamAndCleanupError.is(result.error)) {
+        expect(result.error.primary.operation).toBe("writing overflow output");
+        expect(result.error.cleanup.failures.map((failure) => failure.operation)).toEqual([
+          "aborting overflow output",
+          "removing incomplete overflow output",
+        ]);
+        const safeMessages = [
+          result.error.message,
+          result.error.primary.message,
+          result.error.cleanup.message,
+          ...result.error.cleanup.failures.map((failure) => failure.message),
+        ].join("\n");
+        expect(safeMessages).not.toContain("secret");
+        expect(safeMessages).not.toContain("/private/raw-spill");
+      }
+    }
+    expect(calls).toEqual(["open", "write", "abort", "remove"]);
+  });
+
+  it("runs every cleanup attempt before propagating the exact Panic", async () => {
+    const panic = new Panic({ message: "spill cleanup invariant" });
+    const calls: string[] = [];
+    let caught: unknown;
+    try {
+      await readSanitizedStreamTextCappedResult(streamFromStrings(["output beyond cap"]), 4, {
+        overflowFilePath: "/private/raw-spill",
+        overflowOperations: {
+          async open() {
+            calls.push("open");
+            return {
+              async write() {
+                calls.push("write");
+                throw new Error("start cleanup");
+              },
+              async close() {
+                calls.push("close");
+              },
+              async abort() {
+                calls.push("abort");
+                throw panic;
+              },
+            };
+          },
+          async remove() {
+            calls.push("remove");
+          },
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(panic);
+    expect(calls).toEqual(["open", "write", "abort", "remove"]);
+  });
+
+  it("cleans the raw spill before propagating an exact operation Panic", async () => {
+    const panic = new Panic({ message: "spill write invariant" });
+    const calls: string[] = [];
+    let caught: unknown;
+    try {
+      await readSanitizedStreamTextCappedResult(streamFromStrings(["output beyond cap"]), 4, {
+        overflowFilePath: "/private/raw-spill",
+        overflowOperations: {
+          async open() {
+            calls.push("open");
+            return {
+              async write() {
+                calls.push("write");
+                throw panic;
+              },
+              async close() {
+                calls.push("close");
+              },
+              async abort() {
+                calls.push("abort");
+              },
+            };
+          },
+          async remove() {
+            calls.push("remove");
+          },
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBe(panic);
+    expect(calls).toEqual(["open", "write", "abort", "remove"]);
   });
 });

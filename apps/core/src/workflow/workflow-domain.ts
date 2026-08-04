@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { MODEL_REASONING_EFFORTS } from "@stanley2058/lilac-utils";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 export const WORKFLOW_MANUAL_RECONCILIATION_DETAIL =
   "Manual reconciliation required: terminal request outcome is ambiguous; cancel this run and create a new run";
@@ -95,16 +96,37 @@ export const workflowResourcePolicySchema = workflowResourcePolicyInputSchema.su
 );
 export type WorkflowResourcePolicy = z.infer<typeof workflowResourcePolicySchema>;
 
+export class WorkflowResourcePolicyInvalid extends TaggedError("WorkflowResourcePolicyInvalid")<{
+  readonly message: string;
+}> {}
+
 function sortedUnique(values: readonly string[]): string[] {
   return [...new Set(values)].sort(compareCodeUnits);
 }
 
-export function normalizeWorkflowResourcePolicy(input: unknown): WorkflowResourcePolicy {
-  const parsed = workflowResourcePolicyInputSchema.parse(input);
-  return workflowResourcePolicySchema.parse({
-    ...parsed,
-    waits: sortedUnique(parsed.waits),
+export function normalizeWorkflowResourcePolicyResult(
+  input: unknown,
+): ResultType<WorkflowResourcePolicy, WorkflowResourcePolicyInvalid> {
+  const parsed = workflowResourcePolicyInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return Result.err(
+      new WorkflowResourcePolicyInvalid({
+        message: parsed.error.issues[0]?.message ?? "Workflow resource policy is invalid",
+      }),
+    );
+  }
+  const normalized = workflowResourcePolicySchema.safeParse({
+    ...parsed.data,
+    waits: sortedUnique(parsed.data.waits),
   });
+  if (!normalized.success) {
+    return Result.err(
+      new WorkflowResourcePolicyInvalid({
+        message: normalized.error.issues[0]?.message ?? "Workflow resource policy is invalid",
+      }),
+    );
+  }
+  return Result.ok(normalized.data);
 }
 
 export const workflowLimitsSchema = z.strictObject({

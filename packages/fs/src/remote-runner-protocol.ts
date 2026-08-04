@@ -463,21 +463,26 @@ function formatIssues(error: z.ZodError): readonly string[] {
   });
 }
 
-function decodeJson(
+function decodeJson<T, E, Context>(
   boundary: string,
   text: string,
-): ResultType<unknown, RemoteRunnerMalformedJsonError> {
-  return Result.try({
-    try: () => JSON.parse(text),
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new RemoteRunnerMalformedJsonError({
+  decode: (value: unknown, context: Context) => ResultType<T, E>,
+  context: Context,
+): ResultType<T, E | RemoteRunnerMalformedJsonError> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (cause) {
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new RemoteRunnerMalformedJsonError({
         boundary,
         cause,
         message: `${boundary} contained malformed JSON`,
-      });
-    },
-  });
+      }),
+    );
+  }
+  return decode(value, context);
 }
 
 function knownBundledOperation(operation: string): boolean {
@@ -572,9 +577,7 @@ export function decodeBundledRemoteRunnerRequestJson(
   text: string,
   boundary = "bundled runner stdin",
 ): ResultType<BundledRemoteRunnerRequest, RemoteRunnerRequestDecodeError> {
-  const json = decodeJson(boundary, text);
-  if (json.status === "error") return Result.err(json.error);
-  return decodeBundledRemoteRunnerRequest(json.value, boundary);
+  return decodeJson(boundary, text, decodeBundledRemoteRunnerRequest, boundary);
 }
 
 export function decodeRemoteFsRequest(
@@ -597,9 +600,7 @@ export function decodeRemoteFsRequestJson(
   text: string,
   boundary = "remote fs CLI stdin",
 ): ResultType<RemoteFsRequest, RemoteRunnerRequestDecodeError> {
-  const json = decodeJson(boundary, text);
-  if (json.status === "error") return Result.err(json.error);
-  return decodeRemoteFsRequest(json.value, boundary);
+  return decodeJson(boundary, text, decodeRemoteFsRequest, boundary);
 }
 
 export function decodeRemoteFsDaemonRequest(
@@ -622,9 +623,7 @@ export function decodeRemoteFsDaemonRequestJson(
   text: string,
   boundary = "remote fs daemon socket",
 ): ResultType<RemoteFsDaemonRequest, RemoteRunnerRequestDecodeError> {
-  const json = decodeJson(boundary, text);
-  if (json.status === "error") return Result.err(json.error);
-  return decodeRemoteFsDaemonRequest(json.value, boundary);
+  return decodeJson(boundary, text, decodeRemoteFsDaemonRequest, boundary);
 }
 
 const responseEnvelopeSchema = z.discriminatedUnion("ok", [
@@ -670,9 +669,17 @@ export function decodeRemoteRunnerResponseJson<T>(
   text: string,
   valueSchema: z.ZodType<T>,
 ): ResultType<T, RemoteRunnerResponseDecodeError> {
-  const json = decodeJson("remote runner response", text);
-  if (json.status === "error") return Result.err(json.error);
-  return decodeRemoteRunnerResponse(operation, json.value, valueSchema);
+  return decodeJson("remote runner response", text, decodeRemoteRunnerResponseValue, {
+    operation,
+    valueSchema,
+  });
+}
+
+function decodeRemoteRunnerResponseValue<T>(
+  value: unknown,
+  context: { readonly operation: string; readonly valueSchema: z.ZodType<T> },
+): ResultType<T, Exclude<RemoteRunnerResponseDecodeError, RemoteRunnerMalformedJsonError>> {
+  return decodeRemoteRunnerResponse(context.operation, value, context.valueSchema);
 }
 
 export const decodeRemoteReadTextResponseJson = (text: string) =>

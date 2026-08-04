@@ -39,6 +39,21 @@ function makeUsage(params: {
 }
 
 describe("ModelCapability", () => {
+  it("preserves external fetch rejection identity in the legacy resolver", async () => {
+    const failure = new Error("registry unavailable");
+    const rejectingFetch: typeof fetch = Object.assign(
+      async (_input: Parameters<typeof fetch>[0]): Promise<Response> => {
+        throw failure;
+      },
+      { preconnect: fetch.preconnect },
+    );
+    const capability = new ModelCapability({
+      fetch: rejectingFetch,
+    });
+
+    await expect(capability.resolve("openai/gpt-test")).rejects.toBe(failure);
+  });
+
   it("maps codex/* provider to openai/* for models.dev lookup", async () => {
     const registry = {
       openai: {
@@ -329,6 +344,11 @@ describe("ModelCapability", () => {
     await expect(mc.resolve("openai-compatible/llama-3.1-8b")).rejects.toThrow(
       "Model capability lookup intentionally disabled",
     );
+    const result = await mc.resolveResult("openai-compatible/llama-3.1-8b");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error._tag).toBe("ModelCapabilityResolutionFailed");
+    }
   });
 
   it("treats aliased force-unknown providers as unresolved", async () => {

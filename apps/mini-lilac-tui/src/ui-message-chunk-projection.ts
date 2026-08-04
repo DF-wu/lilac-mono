@@ -25,19 +25,6 @@ import {
   type ToolProjection,
 } from "./tool-observation-projection";
 
-type NonToolRenderedChunkType =
-  | "text-start"
-  | "text-delta"
-  | "text-end"
-  | "reasoning-start"
-  | "reasoning-delta"
-  | "reasoning-end"
-  | "error"
-  | "source-url"
-  | "source-document"
-  | "file"
-  | "finish";
-
 export type RenderedUIMessageChunk =
   | { readonly type: "text-start"; readonly id: string }
   | { readonly type: "text-delta"; readonly id: string; readonly delta: string }
@@ -90,43 +77,6 @@ export type ProjectedUIMessageChunk =
 
 type FinishUIMessageChunk = Extract<RenderedUIMessageChunk, { type: "finish" }>;
 
-function projectRenderedChunk(
-  chunk: Extract<UIMessageChunk, { type: NonToolRenderedChunkType }>,
-): RenderedUIMessageChunk {
-  switch (chunk.type) {
-    case "text-start":
-    case "text-end":
-    case "reasoning-start":
-    case "reasoning-end":
-      return { type: chunk.type, id: chunk.id };
-    case "text-delta":
-    case "reasoning-delta":
-      return { type: chunk.type, id: chunk.id, delta: chunk.delta };
-    case "error":
-      return { type: "error", errorText: chunk.errorText };
-    case "source-url":
-      return {
-        type: "source-url",
-        ...(chunk.title === undefined ? {} : { title: chunk.title }),
-        url: chunk.url,
-      };
-    case "source-document":
-      return {
-        type: "source-document",
-        title: chunk.title,
-        mediaType: chunk.mediaType,
-        ...(chunk.filename === undefined ? {} : { filename: chunk.filename }),
-      };
-    case "file":
-      return { type: "file", mediaType: chunk.mediaType };
-    case "finish":
-      return {
-        type: "finish",
-        ...(chunk.finishReason === undefined ? {} : { finishReason: chunk.finishReason }),
-      };
-  }
-}
-
 export type ProjectedMiniLilacStreamChunk =
   | { readonly kind: "finish"; readonly chunk: FinishUIMessageChunk }
   | { readonly kind: "cursor"; readonly cursor: MiniLilacStreamCursor }
@@ -165,9 +115,17 @@ export interface ProjectedInitialMessage {
 
 interface RawToolState {
   readonly toolName: string;
-  input: unknown;
+  input: OpaqueToolInput;
   bashOutput: string;
   active: boolean;
+}
+
+interface OpaqueToolInput {
+  read(): unknown;
+}
+
+function opaqueToolInput<T>(value: T): OpaqueToolInput {
+  return { read: () => value };
 }
 
 function projectCanonicalDataChunk(part: MiniLilacUIMessageDataPart): ProjectedDataChunk {
@@ -294,16 +252,12 @@ export class UIMessageChunkProjectionState {
     this.approvalToolIds.clear();
   }
 
-  project(chunk: UIMessageChunk): ProjectedUIMessageChunk {
-    return projectUIMessageChunk(chunk, this);
-  }
-
   projectToolStart(toolCallId: string, toolName: string): ProjectedUIMessageChunk {
     const existing = this.tools.get(toolCallId);
     if (existing !== undefined && !existing.active) return { kind: "ignored" };
     this.tools.set(toolCallId, {
       toolName,
-      input: undefined,
+      input: opaqueToolInput(undefined),
       bashOutput: "",
       active: true,
     });
@@ -313,11 +267,11 @@ export class UIMessageChunkProjectionState {
   projectToolInput<T>(toolCallId: string, toolName: string, input: T): ProjectedUIMessageChunk {
     const state = this.ensureTool(toolCallId, toolName);
     if (!state.active) return { kind: "ignored" };
-    state.input = input;
+    state.input = opaqueToolInput(input);
     return this.toolChunk(toolCallId, {
       toolName: state.toolName,
       lifecycle: "active",
-      input: state.input,
+      input: state.input.read(),
     });
   }
 
@@ -329,12 +283,12 @@ export class UIMessageChunkProjectionState {
   ): ProjectedUIMessageChunk {
     const state = this.ensureTool(toolCallId, toolName);
     if (!state.active) return { kind: "ignored" };
-    state.input = input;
+    state.input = opaqueToolInput(input);
     state.active = false;
     return this.toolChunk(toolCallId, {
       toolName: state.toolName,
       lifecycle: "error",
-      input: state.input,
+      input: state.input.read(),
       errorText,
     });
   }
@@ -346,7 +300,7 @@ export class UIMessageChunkProjectionState {
     return this.toolChunk(toolCallId, {
       toolName: state.toolName,
       lifecycle: "error",
-      input: state.input,
+      input: state.input.read(),
       errorText,
       ...(state.bashOutput.length === 0
         ? {}
@@ -361,7 +315,7 @@ export class UIMessageChunkProjectionState {
     return this.toolChunk(toolCallId, {
       toolName: state.toolName,
       lifecycle: "denied",
-      input: state.input,
+      input: state.input.read(),
     });
   }
 
@@ -372,7 +326,7 @@ export class UIMessageChunkProjectionState {
     return this.toolChunk(toolCallId, {
       toolName: state.toolName,
       lifecycle: "approval",
-      input: state.input,
+      input: state.input.read(),
     });
   }
 
@@ -383,8 +337,8 @@ export class UIMessageChunkProjectionState {
     return this.toolChunk(
       state.toolCallId,
       approved
-        ? { toolName: state.tool.toolName, lifecycle: "active", input: state.tool.input }
-        : { toolName: state.tool.toolName, lifecycle: "denied", input: state.tool.input },
+        ? { toolName: state.tool.toolName, lifecycle: "active", input: state.tool.input.read() }
+        : { toolName: state.tool.toolName, lifecycle: "denied", input: state.tool.input.read() },
     );
   }
 
@@ -396,7 +350,7 @@ export class UIMessageChunkProjectionState {
         {
           toolName: state.toolName,
           lifecycle: "cancelled",
-          input: state.input,
+          input: state.input.read(),
           ...(reason === undefined ? {} : { reason }),
           ...(state.bashOutput.length === 0
             ? {}
@@ -424,7 +378,12 @@ export class UIMessageChunkProjectionState {
   private ensureTool(toolCallId: string, toolName = "tool"): RawToolState {
     const existing = this.tools.get(toolCallId);
     if (existing !== undefined) return existing;
-    const state = { toolName, input: undefined, bashOutput: "", active: true };
+    const state = {
+      toolName,
+      input: opaqueToolInput(undefined),
+      bashOutput: "",
+      active: true,
+    };
     this.tools.set(toolCallId, state);
     return state;
   }
@@ -441,7 +400,7 @@ export class UIMessageChunkProjectionState {
       const deltaProjection = this.toolChunk(toolCallId, {
         toolName: state.toolName,
         lifecycle: "active",
-        input: state.input,
+        input: state.input.read(),
         partial: output,
       });
       if (deltaProjection.kind !== "tool" || deltaProjection.projection.kind !== "bash") {
@@ -453,14 +412,14 @@ export class UIMessageChunkProjectionState {
       return this.toolChunk(toolCallId, {
         toolName: state.toolName,
         lifecycle: "active",
-        input: state.input,
+        input: state.input.read(),
         partial: { type: "output-delta", delta: state.bashOutput },
       });
     }
     const projected = this.toolChunk(toolCallId, {
       toolName: state.toolName,
       lifecycle: "success",
-      input: state.input,
+      input: state.input.read(),
       output,
       ...(state.bashOutput.length === 0
         ? {}
@@ -497,17 +456,47 @@ export function projectUIMessageChunk(
   if (chunk.type.startsWith("data-")) return { kind: "ignored" };
   switch (chunk.type) {
     case "text-start":
-    case "text-delta":
     case "text-end":
     case "reasoning-start":
-    case "reasoning-delta":
     case "reasoning-end":
+      return { kind: "rendered", chunk: { type: chunk.type, id: chunk.id } };
+    case "text-delta":
+    case "reasoning-delta":
+      return {
+        kind: "rendered",
+        chunk: { type: chunk.type, id: chunk.id, delta: chunk.delta },
+      };
     case "error":
+      return { kind: "rendered", chunk: { type: "error", errorText: chunk.errorText } };
     case "source-url":
+      return {
+        kind: "rendered",
+        chunk: {
+          type: "source-url",
+          ...(chunk.title === undefined ? {} : { title: chunk.title }),
+          url: chunk.url,
+        },
+      };
     case "source-document":
+      return {
+        kind: "rendered",
+        chunk: {
+          type: "source-document",
+          title: chunk.title,
+          mediaType: chunk.mediaType,
+          ...(chunk.filename === undefined ? {} : { filename: chunk.filename }),
+        },
+      };
     case "file":
+      return { kind: "rendered", chunk: { type: "file", mediaType: chunk.mediaType } };
     case "finish":
-      return { kind: "rendered", chunk: projectRenderedChunk(chunk) };
+      return {
+        kind: "rendered",
+        chunk: {
+          type: "finish",
+          ...(chunk.finishReason === undefined ? {} : { finishReason: chunk.finishReason }),
+        },
+      };
     case "tool-input-start":
       return state.projectToolStart(chunk.toolCallId, chunk.toolName);
     case "tool-input-available":
@@ -576,7 +565,7 @@ export function projectMiniLilacStreamChunk(
     if (chunk.type === "output-rollback") state.rollbackTools(chunk.rollback.toolCallIds);
     return { kind: "renderer", chunk: { kind: "data", chunk } };
   }
-  const projected = state.project(wireChunk);
+  const projected = projectUIMessageChunk(wireChunk, state);
   if (projected.kind === "rendered" && projected.chunk.type === "finish") {
     return { kind: "finish", chunk: projected.chunk };
   }

@@ -1,8 +1,24 @@
 import { z } from "zod";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 /* eslint-disable @typescript-eslint/no-explicit-any -- Zod v4 does not expose stable public types for the .def internals used here; Stage 2/3 should replace this with narrow local accessors. */
 
 export type CliLineMode = "all" | "required";
+
+class ZodCliProjectionInvalid extends TaggedError("ZodCliProjectionInvalid")<{
+  readonly message: string;
+}> {}
+
+function adaptZodCliResultToToolHost<TValue>(
+  result: ResultType<TValue, ZodCliProjectionInvalid>,
+): TValue {
+  if (result.status === "ok") return result.value;
+  throw new Error(result.error.message);
+}
+
+function signalZodCliFailureToToolHost(message: string): never {
+  return adaptZodCliResultToToolHost(Result.err(new ZodCliProjectionInvalid({ message })));
+}
 
 type Condition = {
   discriminator: string;
@@ -21,7 +37,7 @@ type FieldOccurrence = {
     base: z.ZodTypeAny;
     isOptional: boolean;
     hasDefault: boolean;
-    defaultValue: unknown;
+    formattedDefaultValue: string;
   };
   condition: Condition | null;
   description: string;
@@ -125,7 +141,7 @@ function formatAggregatedFieldLine(
 
   const defaults = occurrences
     .filter((o) => o.meta.hasDefault)
-    .map((o) => formatValue(o.meta.defaultValue));
+    .map((o) => o.meta.formattedDefaultValue);
   if (defaults.length && defaults.every((d) => d === defaults[0])) {
     modifiers.push(`Default: ${defaults[0]}`);
   }
@@ -204,7 +220,7 @@ function collectVariants(schema: z.ZodTypeAny): Variant[] {
     }
 
     default:
-      throw new Error(
+      return signalZodCliFailureToToolHost(
         `Unsupported schema for CLI lines: ${(def as any)?.type ?? "unknown"}. Expected object/union/intersection.`,
       );
   }
@@ -247,7 +263,8 @@ function conditionToText(c: Condition): string {
 }
 
 function getObjectShape(schema: z.ZodTypeAny): Record<string, z.ZodTypeAny> {
-  return (schema as unknown as { shape: Record<string, z.ZodTypeAny> }).shape;
+  if (schema instanceof z.ZodObject) return schema.shape;
+  return signalZodCliFailureToToolHost("Expected a Zod object schema while rendering CLI help.");
 }
 
 function extractLiteralValues(schema: z.ZodTypeAny): unknown[] {
@@ -321,12 +338,12 @@ function unwrapModifiers(
   base: z.ZodTypeAny;
   isOptional: boolean;
   hasDefault: boolean;
-  defaultValue: unknown;
+  formattedDefaultValue: string;
 } {
   let current: z.ZodTypeAny = schema;
   let isOptional = false;
   let hasDefault = false;
-  let defaultValue: unknown = undefined;
+  let formattedDefaultValue = "";
 
   // Zod v4 represents optional/default/etc as wrappers.
   while (true) {
@@ -336,7 +353,7 @@ function unwrapModifiers(
       case "default": {
         isOptional = true;
         hasDefault = true;
-        defaultValue = (def as any).defaultValue;
+        formattedDefaultValue = formatValue((def as any).defaultValue);
         current = (def as any).innerType;
         continue;
       }
@@ -349,7 +366,9 @@ function unwrapModifiers(
       }
 
       case "nullable": {
-        throw new Error(`Field "${ctx.key}" uses nullable(); prefer optional() for CLI flags.`);
+        return signalZodCliFailureToToolHost(
+          `Field "${ctx.key}" uses nullable(); prefer optional() for CLI flags.`,
+        );
       }
 
       case "pipe": {
@@ -364,7 +383,7 @@ function unwrapModifiers(
       }
 
       default:
-        return { base: current, isOptional, hasDefault, defaultValue };
+        return { base: current, isOptional, hasDefault, formattedDefaultValue };
     }
   }
 }

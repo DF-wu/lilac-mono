@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { z } from "zod";
 
 import { findWorkspaceRoot } from "./find-root";
+import { isPanic } from "./runtime-utils";
 
 export const DEFAULT_PROMPT_DIRNAME = "prompts";
 export const HEARTBEAT_PROMPT_FILENAME = "HEARTBEAT.md";
@@ -122,7 +123,8 @@ async function exists(filePath: string): Promise<boolean> {
   try {
     await Bun.file(filePath).stat();
     return true;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return false;
   }
 }
@@ -139,7 +141,8 @@ function parsePromptTemplateState(raw: string): PromptTemplateState | null {
   let parsedRaw: unknown;
   try {
     parsedRaw = JSON.parse(raw) as unknown;
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return null;
   }
 
@@ -167,7 +170,8 @@ async function loadPromptTemplateState(promptDir: string): Promise<PromptTemplat
   let raw: string;
   try {
     raw = await Bun.file(statePath).text();
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return null;
   }
 
@@ -208,7 +212,8 @@ function promptTemplateBaselinePath(promptDir: string, name: CorePromptFileName)
 async function readTextIfExists(filePath: string): Promise<string | null> {
   try {
     return await Bun.file(filePath).text();
-  } catch {
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
     return null;
   }
 }
@@ -635,7 +640,8 @@ export async function promptWorkspaceSignature(options?: { dataDir?: string }): 
     try {
       const stat = await Bun.file(p).stat();
       maxMtimeMs = Math.max(maxMtimeMs ?? 0, stat.mtimeMs);
-    } catch {
+    } catch (cause) {
+      if (isPanic(cause)) throw cause;
       // Missing files will be created by ensurePromptWorkspace(); signature remains stable.
       continue;
     }

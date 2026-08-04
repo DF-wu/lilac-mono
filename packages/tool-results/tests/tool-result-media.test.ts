@@ -87,4 +87,31 @@ describe("tool result media", () => {
     expect(JSON.stringify(view[0])).toContain("Resize the image");
     expect(JSON.stringify(view[1])).toContain(Buffer.alloc(4, "new").toString("base64"));
   });
+
+  it("bounds malformed percent-encoded data URLs without throwing", () => {
+    const malformedUrl = "data:text/plain,%";
+    const messages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "malformed-data-url",
+            toolName: "read_file",
+            output: {
+              type: "content",
+              value: [{ type: "file-url", url: malformedUrl, mediaType: "text/plain" }],
+            },
+          },
+        ],
+      },
+    ];
+
+    expect(
+      boundToolResultMediaForModelView(messages, {
+        maxBytesPerPart: 1,
+        maxBytesTotal: 1,
+      }),
+    ).toEqual(messages);
+  });
 });

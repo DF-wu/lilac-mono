@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
-import { parseFriendlyByteSize, parseFriendlyDurationMs } from "../friendly-units";
+import {
+  parseFriendlyByteSize,
+  parseFriendlyByteSizeResult,
+  parseFriendlyDurationMs,
+  parseFriendlyDurationMsResult,
+} from "../friendly-units";
 
 describe("friendly units", () => {
   it("parses decimal and binary byte sizes", () => {
@@ -23,5 +28,26 @@ describe("friendly units", () => {
     expect(() => parseFriendlyByteSize(Number.POSITIVE_INFINITY)).toThrow();
     expect(() => parseFriendlyDurationMs("1min")).toThrow();
     expect(() => parseFriendlyDurationMs(-1)).toThrow();
+
+    let caught: unknown;
+    try {
+      parseFriendlyByteSize("1wat");
+    } catch (cause) {
+      caught = cause;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    if (caught instanceof Error) expect(caught.constructor).toBe(Error);
+  });
+
+  it("returns typed failures without throwing", () => {
+    const invalidBytes = parseFriendlyByteSizeResult("1wat");
+    expect(invalidBytes.status).toBe("error");
+    if (invalidBytes.status === "error") {
+      expect(invalidBytes.error._tag).toBe("FriendlyUnitInvalid");
+    }
+
+    const duration = parseFriendlyDurationMsResult("2s");
+    expect(duration.status).toBe("ok");
+    if (duration.status === "ok") expect(duration.value).toBe(2_000);
   });
 });

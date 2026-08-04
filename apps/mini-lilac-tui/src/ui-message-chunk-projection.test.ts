@@ -11,6 +11,13 @@ import {
   UIMessageChunkProjectionState,
 } from "./ui-message-chunk-projection";
 
+function createProjectionState() {
+  const state = new UIMessageChunkProjectionState();
+  return Object.assign(state, {
+    project: (chunk: UIMessageChunk) => projectUIMessageChunk(chunk, state),
+  });
+}
+
 describe("projectUIMessageChunk", () => {
   it("projects non-tool SDK chunks and adapts tool chunks at the observation boundary", () => {
     const input = { command: "bun test" };
@@ -79,13 +86,13 @@ describe("projectUIMessageChunk", () => {
       { kind: "rendered", chunk: { type: "finish", finishReason: "stop" } },
     ]);
 
-    const state = new UIMessageChunkProjectionState();
-    expect(state.project(inputChunk)).toMatchObject({
+    const state = createProjectionState();
+    expect(projectUIMessageChunk(inputChunk, state)).toMatchObject({
       kind: "tool",
       toolCallId: "tool-input",
       projection: { kind: "bash", command: "bun test", state: { status: "active" } },
     });
-    expect(state.project(outputChunk)).toMatchObject({
+    expect(projectUIMessageChunk(outputChunk, state)).toMatchObject({
       kind: "tool",
       toolCallId: "tool-output",
       projection: { kind: "unknown-tool", state: { status: "success" } },
@@ -202,7 +209,7 @@ describe("tool chunk projection state", () => {
         ],
       },
     ])[0]?.parts[0];
-    const state = new UIMessageChunkProjectionState();
+    const state = createProjectionState();
     state.project({
       type: "tool-input-available",
       toolCallId: "bash-1",
@@ -230,7 +237,7 @@ describe("tool chunk projection state", () => {
   });
 
   it("accumulates Bash deltas and falls back to them for a malformed final output", () => {
-    const state = new UIMessageChunkProjectionState();
+    const state = createProjectionState();
     state.project({
       type: "tool-input-available",
       toolCallId: "bash-partial",
@@ -267,7 +274,7 @@ describe("tool chunk projection state", () => {
   });
 
   it("ignores malformed Bash deltas, preserves partial output on error, and rejects late output", () => {
-    const state = new UIMessageChunkProjectionState();
+    const state = createProjectionState();
     state.project({
       type: "tool-input-available",
       toolCallId: "bash-errors",
@@ -358,7 +365,7 @@ describe("tool chunk projection state", () => {
   });
 
   it("projects approval, denial, and abort as explicit tool states", () => {
-    const state = new UIMessageChunkProjectionState();
+    const state = createProjectionState();
     state.project({
       type: "tool-input-available",
       toolCallId: "fetch-approval",
@@ -405,7 +412,7 @@ describe("tool chunk projection state", () => {
   });
 
   it("keeps cancellation terminal for every later chunk until rollback", () => {
-    const state = new UIMessageChunkProjectionState();
+    const state = createProjectionState();
     state.project({
       type: "tool-input-available",
       toolCallId: "cancelled-tool",
@@ -506,7 +513,7 @@ describe("tool chunk projection state", () => {
       projection: { kind: "malformed-known-tool", malformedField: "input" },
     });
 
-    const state = new UIMessageChunkProjectionState();
+    const state = createProjectionState();
     state.project({
       type: "tool-input-available",
       toolCallId: "reused",

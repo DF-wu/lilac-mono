@@ -102,21 +102,19 @@ export type ConversationThreadSummarizationWorkerTransport = {
 };
 
 export function rethrowConversationThreadWorkerPanic(
-  cause: unknown,
+  cause: Panic | null,
   beforeRethrow?: (panic: Panic) => void,
 ): void {
-  if (!isPanic(cause)) return;
+  if (!cause) return;
   beforeRethrow?.(cause);
   throw cause;
 }
 
-export function normalizeConversationThreadWorkerPanic(cause: unknown): Panic {
-  if (isPanic(cause)) return cause;
-  const message = opaqueErrorMessage(
-    cause,
-    "Conversation thread summarization worker failed with an opaque error",
-  );
-  return new Panic({ message: message || "Conversation thread summarization worker failed" });
+export function normalizeConversationThreadWorkerPanic(cause: Panic | string): Panic {
+  if (Panic.is(cause)) return cause;
+  return new Panic({
+    message: cause || "Conversation thread summarization worker failed with an opaque error",
+  });
 }
 
 function createSummarizationWorkerTransport(): ConversationThreadSummarizationWorkerTransport {
@@ -135,7 +133,7 @@ function createSummarizationWorkerTransport(): ConversationThreadSummarizationWo
     },
     onError(listener) {
       worker.onerror = (event) => {
-        const cause = event.error ?? event.message;
+        const cause = Panic.is(event.error) ? event.error : event.message;
         listener(normalizeConversationThreadWorkerPanic(cause));
       };
     },
@@ -290,7 +288,7 @@ export function startConversationThreadSummarizationWorker(params: {
     } catch (cause) {
       pending.delete(request.id);
       jobs.delete(request.id);
-      rethrowConversationThreadWorkerPanic(cause);
+      if (Panic.is(cause)) rethrowConversationThreadWorkerPanic(cause);
       return Result.err(
         new ConversationThreadSummarizationTransportError({
           operation: "post-message",

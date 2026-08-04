@@ -141,8 +141,8 @@ describe("continue directives", () => {
 });
 
 describe("session safety mode", () => {
-  it("inherits restricted safety mode from parent when child has local prompts", async () => {
-    const cfg = await withDefaultToolsConfig({
+  it("inherits restricted safety mode from parent when child has local prompts", () => {
+    const parsed = withDefaultToolsConfig({
       surface: {
         router: {
           sessionModes: {
@@ -152,7 +152,9 @@ describe("session safety mode", () => {
         },
       },
     });
+    expect(parsed.status).toBe("ok");
+    if (parsed.status === "error") return;
 
-    expect(resolveSessionSafetyMode(cfg, "child", "parent")).toBe("restricted");
+    expect(resolveSessionSafetyMode(parsed.value, "child", "parent")).toBe("restricted");
   });
 });

@@ -65,8 +65,9 @@ class RecordingRegistry implements McpRegistryApi {
 
   async init(): Promise<void> {}
 
-  waitUntilInitialized(): Promise<void> {
-    return this.waitUntilInitializedImpl();
+  async waitUntilInitialized() {
+    await this.waitUntilInitializedImpl();
+    return Result.ok(undefined);
   }
 
   async reload(serverId?: string) {
