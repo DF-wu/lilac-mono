@@ -8,9 +8,9 @@ import {
   type TimerOptions,
   type WriteStream,
 } from "@stanley2058/simple-module-logger";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { isPanic, isRecord, opaqueErrorMessage } from "./runtime-utils";
-import { redactErrorTextForLog } from "./tagged-error-log";
+import { isPanic, isRecord } from "./runtime-utils";
 
 function hasTestGlobals(): boolean {
   return "describe" in globalThis && "it" in globalThis;
@@ -117,23 +117,119 @@ function resolveOpenObserveLogLevel(fallback: LogLevel): LogLevel {
   return fromEnv ?? fallback;
 }
 
-function reportOpenObserveFailure(message: string): void {
-  try {
-    process.stderr.write(`[openobserve] ${redactErrorTextForLog(message)}\n`);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    // Ignore stderr write failures.
-  }
-}
-
-function toSingleLine(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
-}
-
 const MAX_OBJECT_FIELDS_PER_ARG = 40;
+const MAX_RETAINED_RECORDS = 2_000;
+const MAX_RETAINED_BYTES = 8 * 1024 * 1024;
+const MAX_RECORD_BYTES = 256 * 1024;
+const MAX_BATCH_RECORDS = 200;
+const MAX_BATCH_BYTES = 1024 * 1024;
+const MAX_PENDING_BYTES = MAX_RETAINED_BYTES - MAX_BATCH_BYTES;
+const OPEN_OBSERVE_REQUEST_TIMEOUT_MS = 5_000;
+const OPEN_OBSERVE_DIAGNOSTIC_INTERVAL_MS = 30_000;
+let openObserveOutcomeSequence = 0;
 
 type OpenObserveFieldValue = string | number | boolean | null;
 type OpenObserveRecord = Record<string, OpenObserveFieldValue>;
+type SerializedOpenObserveRecord = {
+  readonly json: string;
+  readonly bytes: number;
+};
+
+type OpenObserveFailureKind = "timeout" | "request" | "http";
+
+class OpenObserveTimeout extends TaggedError("OpenObserveTimeout")<{
+  readonly message: string;
+}> {}
+
+class OpenObserveRequestFailed extends TaggedError("OpenObserveRequestFailed")<{
+  readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class OpenObserveHttpFailed extends TaggedError("OpenObserveHttpFailed")<{
+  readonly status: number;
+  readonly message: string;
+}> {}
+
+type OpenObserveDeliveryFailure =
+  | OpenObserveTimeout
+  | OpenObserveRequestFailed
+  | OpenObserveHttpFailed;
+
+function projectOpenObserveRequestFailure(cause: unknown): OpenObserveRequestFailed {
+  if (isPanic(cause)) throw cause;
+  return new OpenObserveRequestFailed({
+    cause,
+    message: "OpenObserve request failed",
+  });
+}
+
+function signalOpenObservePanic(cause: unknown): void {
+  const panic = isPanic(cause)
+    ? cause
+    : new Panic({ cause, message: "OpenObserve flush rejected with an opaque defect" });
+  queueMicrotask(() => {
+    throw panic;
+  });
+}
+
+export type OpenObserveAggregateDiagnostics = {
+  readonly streamCount: number;
+  readonly retainedRecords: number;
+  readonly retainedBytes: number;
+  readonly pendingRecords: number;
+  readonly pendingBytes: number;
+  readonly activeRecords: number;
+  readonly activeBytes: number;
+  readonly inFlightRequests: number;
+  readonly droppedRecords: number;
+  readonly droppedBytes: number;
+  readonly oversizeDroppedRecords: number;
+  readonly overflowDroppedRecords: number;
+  readonly succeededBatches: number;
+  readonly failedBatches: number;
+  readonly timeoutFailures: number;
+  readonly requestFailures: number;
+  readonly httpFailures: number;
+  readonly lastSuccessAtMs: number | null;
+  readonly lastFailureAtMs: number | null;
+  readonly lastFailureKind: OpenObserveFailureKind | null;
+  readonly lastHttpStatus: number | null;
+};
+
+type OpenObserveDiagnosticValues = Omit<OpenObserveAggregateDiagnostics, "streamCount">;
+type OpenObserveStreamDiagnostics = OpenObserveDiagnosticValues & {
+  readonly lastSuccessSequence: number;
+  readonly lastFailureSequence: number;
+};
+type MutableOpenObserveAggregateDiagnostics = {
+  -readonly [Key in keyof OpenObserveAggregateDiagnostics]: OpenObserveAggregateDiagnostics[Key];
+};
+
+function emptyOpenObserveDiagnostics(): OpenObserveDiagnosticValues {
+  return {
+    retainedRecords: 0,
+    retainedBytes: 0,
+    pendingRecords: 0,
+    pendingBytes: 0,
+    activeRecords: 0,
+    activeBytes: 0,
+    inFlightRequests: 0,
+    droppedRecords: 0,
+    droppedBytes: 0,
+    oversizeDroppedRecords: 0,
+    overflowDroppedRecords: 0,
+    succeededBatches: 0,
+    failedBatches: 0,
+    timeoutFailures: 0,
+    requestFailures: 0,
+    httpFailures: 0,
+    lastSuccessAtMs: null,
+    lastFailureAtMs: null,
+    lastFailureKind: null,
+    lastHttpStatus: null,
+  };
+}
 
 function isPrimitive(value: unknown): value is string | number | boolean | null {
   return (
@@ -222,9 +318,27 @@ function normalizeRecordForOpenObserve(record: unknown): OpenObserveRecord | nul
 }
 
 class OpenObserveJsonlStream implements WriteStream {
-  private readonly queue: OpenObserveRecord[] = [];
+  private readonly queue: SerializedOpenObserveRecord[] = [];
+  private activeBatch: readonly SerializedOpenObserveRecord[] = [];
+  private pendingBytes = 0;
+  private activeBytes = 0;
   private flushScheduled = false;
   private flushing = false;
+  private droppedRecords = 0;
+  private droppedBytes = 0;
+  private oversizeDroppedRecords = 0;
+  private overflowDroppedRecords = 0;
+  private succeededBatches = 0;
+  private failedBatches = 0;
+  private timeoutFailures = 0;
+  private requestFailures = 0;
+  private httpFailures = 0;
+  private lastSuccessAtMs: number | null = null;
+  private lastFailureAtMs: number | null = null;
+  private lastFailureKind: OpenObserveFailureKind | null = null;
+  private lastHttpStatus: number | null = null;
+  private lastSuccessSequence = 0;
+  private lastFailureSequence = 0;
 
   constructor(private readonly config: OpenObserveConfig) {}
 
@@ -237,7 +351,9 @@ class OpenObserveJsonlStream implements WriteStream {
         const parsed = JSON.parse(line) as unknown;
         const normalized = normalizeRecordForOpenObserve(parsed);
         if (normalized) {
-          this.queue.push(normalized);
+          const json = JSON.stringify(normalized);
+          const bytes = Buffer.byteLength(json, "utf8");
+          this.enqueue({ json, bytes });
         }
       } catch (cause) {
         if (isPanic(cause)) throw cause;
@@ -249,12 +365,71 @@ class OpenObserveJsonlStream implements WriteStream {
     return true;
   }
 
+  diagnostics(): OpenObserveStreamDiagnostics {
+    return {
+      retainedRecords: this.activeBatch.length + this.queue.length,
+      retainedBytes: this.activeBytes + this.pendingBytes,
+      pendingRecords: this.queue.length,
+      pendingBytes: this.pendingBytes,
+      activeRecords: this.activeBatch.length,
+      activeBytes: this.activeBytes,
+      inFlightRequests: this.activeBatch.length > 0 ? 1 : 0,
+      droppedRecords: this.droppedRecords,
+      droppedBytes: this.droppedBytes,
+      oversizeDroppedRecords: this.oversizeDroppedRecords,
+      overflowDroppedRecords: this.overflowDroppedRecords,
+      succeededBatches: this.succeededBatches,
+      failedBatches: this.failedBatches,
+      timeoutFailures: this.timeoutFailures,
+      requestFailures: this.requestFailures,
+      httpFailures: this.httpFailures,
+      lastSuccessAtMs: this.lastSuccessAtMs,
+      lastFailureAtMs: this.lastFailureAtMs,
+      lastFailureKind: this.lastFailureKind,
+      lastHttpStatus: this.lastHttpStatus,
+      lastSuccessSequence: this.lastSuccessSequence,
+      lastFailureSequence: this.lastFailureSequence,
+    };
+  }
+
+  private enqueue(record: SerializedOpenObserveRecord): void {
+    if (record.bytes > MAX_RECORD_BYTES) {
+      this.recordDrop(record, "oversize");
+      return;
+    }
+
+    this.queue.push(record);
+    this.pendingBytes += record.bytes;
+
+    while (
+      this.activeBatch.length + this.queue.length > MAX_RETAINED_RECORDS ||
+      this.pendingBytes > MAX_PENDING_BYTES ||
+      this.activeBytes + this.pendingBytes > MAX_RETAINED_BYTES
+    ) {
+      const evicted = this.queue.shift();
+      if (!evicted) break;
+      this.pendingBytes -= evicted.bytes;
+      this.recordDrop(evicted, "overflow");
+    }
+  }
+
+  private recordDrop(record: SerializedOpenObserveRecord, reason: "oversize" | "overflow"): void {
+    this.droppedRecords += 1;
+    this.droppedBytes += record.bytes;
+    if (reason === "oversize") {
+      this.oversizeDroppedRecords += 1;
+    } else {
+      this.overflowDroppedRecords += 1;
+    }
+    reportOpenObserveDiagnostics();
+  }
+
   private scheduleFlush(): void {
     if (this.flushScheduled) return;
     this.flushScheduled = true;
     queueMicrotask(() => {
       this.flushScheduled = false;
-      void this.flush();
+      void this.flush().catch(signalOpenObservePanic);
     });
   }
 
@@ -264,19 +439,56 @@ class OpenObserveJsonlStream implements WriteStream {
 
     try {
       while (this.queue.length > 0) {
-        const batch = this.queue.splice(0, 200);
-        await this.postBatch(batch);
+        const batch = this.takeBatch();
+        try {
+          const result = await this.postBatch(batch.body);
+
+          if (result.status === "ok") {
+            this.succeededBatches += 1;
+            this.lastSuccessAtMs = Date.now();
+            this.lastSuccessSequence = ++openObserveOutcomeSequence;
+          } else {
+            this.recordFailure(result.error);
+            reportOpenObserveDiagnostics();
+          }
+        } finally {
+          this.activeBatch = [];
+          this.activeBytes = 0;
+        }
       }
     } finally {
       this.flushing = false;
-      if (this.queue.length > 0) {
+      if (this.activeBatch.length === 0 && this.queue.length > 0) {
         this.scheduleFlush();
       }
     }
   }
 
-  private async postBatch(batch: readonly OpenObserveRecord[]): Promise<void> {
-    if (batch.length === 0) return;
+  private takeBatch(): { readonly body: string } {
+    const batch: SerializedOpenObserveRecord[] = [];
+    let bodyBytes = 2;
+
+    while (batch.length < MAX_BATCH_RECORDS) {
+      const next = this.queue[0];
+      if (!next) break;
+      const addedBytes = next.bytes + (batch.length > 0 ? 1 : 0);
+      if (bodyBytes + addedBytes > MAX_BATCH_BYTES) break;
+
+      this.queue.shift();
+      this.pendingBytes -= next.bytes;
+      batch.push(next);
+      bodyBytes += addedBytes;
+    }
+
+    const body = `[${batch.map((record) => record.json).join(",")}]`;
+    this.activeBatch = batch;
+    this.activeBytes =
+      batch.reduce((total, record) => total + record.bytes, 0) + Buffer.byteLength(body, "utf8");
+    return { body };
+  }
+
+  private async postBatch(body: string): Promise<ResultType<void, OpenObserveDeliveryFailure>> {
+    const controller = new AbortController();
 
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -285,42 +497,148 @@ class OpenObserveJsonlStream implements WriteStream {
       headers.Authorization = this.config.authorizationHeader;
     }
 
-    try {
-      const response = await fetch(this.config.endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(batch),
-      });
+    const request = Result.tryPromise({
+      try: () =>
+        fetch(this.config.endpoint, {
+          method: "POST",
+          headers,
+          body,
+          signal: controller.signal,
+        }),
+      catch: projectOpenObserveRequestFailure,
+    });
 
-      if (!response.ok) {
-        const details = await this.readResponseDetails(response);
-        reportOpenObserveFailure(
-          `log ingest failed (${response.status} ${response.statusText}) to ${this.config.endpoint}${details ? `: ${details}` : ""}`,
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<{ readonly kind: "timeout"; readonly error: OpenObserveTimeout }>(
+      (resolve) => {
+        timeoutId = setTimeout(() => {
+          resolve({
+            kind: "timeout",
+            error: new OpenObserveTimeout({
+              message: "OpenObserve request exceeded its deadline",
+            }),
+          });
+        }, OPEN_OBSERVE_REQUEST_TIMEOUT_MS);
+        timeoutId.unref?.();
+      },
+    );
+
+    try {
+      const outcome = await Promise.race([
+        request.then((result) => ({ kind: "response" as const, result })),
+        timeout,
+      ]);
+      if (outcome.kind === "timeout") {
+        controller.abort();
+        await request;
+        return Result.err(outcome.error);
+      }
+
+      const response = outcome.result;
+      if (response.status === "error") return Result.err(response.error);
+      if (!response.value.ok) {
+        return Result.err(
+          new OpenObserveHttpFailed({
+            status: response.value.status,
+            message: "OpenObserve rejected a log batch",
+          }),
         );
       }
-    } catch (error) {
-      if (isPanic(error)) throw error;
-      const message = redactErrorTextForLog(
-        opaqueErrorMessage(error, "Unknown OpenObserve request failure"),
-      );
-      reportOpenObserveFailure(`log ingest request failed to ${this.config.endpoint}: ${message}`);
+      return Result.ok(undefined);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
-  private async readResponseDetails(response: Response): Promise<string | undefined> {
-    try {
-      const text = (await response.text()).trim();
-      if (!text) return undefined;
-      const singleLine = toSingleLine(text);
-      return singleLine.slice(0, 300);
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      return undefined;
+  private recordFailure(error: OpenObserveDeliveryFailure): void {
+    this.failedBatches += 1;
+    this.lastFailureAtMs = Date.now();
+    this.lastFailureSequence = ++openObserveOutcomeSequence;
+    this.lastHttpStatus = null;
+
+    switch (error._tag) {
+      case "OpenObserveTimeout":
+        this.timeoutFailures += 1;
+        this.lastFailureKind = "timeout";
+        return;
+      case "OpenObserveRequestFailed":
+        this.requestFailures += 1;
+        this.lastFailureKind = "request";
+        return;
+      case "OpenObserveHttpFailed":
+        this.httpFailures += 1;
+        this.lastFailureKind = "http";
+        this.lastHttpStatus = error.status;
+        return;
     }
   }
 }
 
 const OPEN_OBSERVE_STREAMS = new Map<string, OpenObserveJsonlStream>();
+let lastOpenObserveDiagnosticAtMs = Number.NEGATIVE_INFINITY;
+
+export function getOpenObserveDiagnostics(): OpenObserveAggregateDiagnostics {
+  const aggregate: MutableOpenObserveAggregateDiagnostics = {
+    streamCount: OPEN_OBSERVE_STREAMS.size,
+    ...emptyOpenObserveDiagnostics(),
+  };
+  let lastSuccessSequence = 0;
+  let lastFailureSequence = 0;
+
+  for (const stream of OPEN_OBSERVE_STREAMS.values()) {
+    const current = stream.diagnostics();
+    aggregate.retainedRecords += current.retainedRecords;
+    aggregate.retainedBytes += current.retainedBytes;
+    aggregate.pendingRecords += current.pendingRecords;
+    aggregate.pendingBytes += current.pendingBytes;
+    aggregate.activeRecords += current.activeRecords;
+    aggregate.activeBytes += current.activeBytes;
+    aggregate.inFlightRequests += current.inFlightRequests;
+    aggregate.droppedRecords += current.droppedRecords;
+    aggregate.droppedBytes += current.droppedBytes;
+    aggregate.oversizeDroppedRecords += current.oversizeDroppedRecords;
+    aggregate.overflowDroppedRecords += current.overflowDroppedRecords;
+    aggregate.succeededBatches += current.succeededBatches;
+    aggregate.failedBatches += current.failedBatches;
+    aggregate.timeoutFailures += current.timeoutFailures;
+    aggregate.requestFailures += current.requestFailures;
+    aggregate.httpFailures += current.httpFailures;
+
+    if (current.lastSuccessAtMs !== null && current.lastSuccessSequence > lastSuccessSequence) {
+      lastSuccessSequence = current.lastSuccessSequence;
+      aggregate.lastSuccessAtMs = current.lastSuccessAtMs;
+    }
+    if (current.lastFailureAtMs !== null && current.lastFailureSequence > lastFailureSequence) {
+      lastFailureSequence = current.lastFailureSequence;
+      aggregate.lastFailureAtMs = current.lastFailureAtMs;
+      aggregate.lastFailureKind = current.lastFailureKind;
+      aggregate.lastHttpStatus = current.lastHttpStatus;
+    }
+  }
+
+  return aggregate;
+}
+
+function reportOpenObserveDiagnostics(): void {
+  const now = Date.now();
+  if (now - lastOpenObserveDiagnosticAtMs < OPEN_OBSERVE_DIAGNOSTIC_INTERVAL_MS) return;
+  lastOpenObserveDiagnosticAtMs = now;
+
+  const diagnostics = getOpenObserveDiagnostics();
+  const message =
+    `[openobserve] delivery degraded failures=${diagnostics.failedBatches}` +
+    ` timeout=${diagnostics.timeoutFailures} request=${diagnostics.requestFailures}` +
+    ` http=${diagnostics.httpFailures} dropped_records=${diagnostics.droppedRecords}` +
+    ` last_http_status=${diagnostics.lastHttpStatus ?? "none"}` +
+    ` dropped_bytes=${diagnostics.droppedBytes} retained_records=${diagnostics.retainedRecords}` +
+    ` retained_bytes=${diagnostics.retainedBytes} in_flight=${diagnostics.inFlightRequests}\n`;
+
+  try {
+    process.stderr.write(message);
+  } catch (cause) {
+    if (isPanic(cause)) throw cause;
+  }
+}
 
 function getOpenObserveStream(config: OpenObserveConfig): OpenObserveJsonlStream {
   const key = `${config.endpoint}\n${config.authorizationHeader ?? ""}`;
@@ -332,11 +650,15 @@ function getOpenObserveStream(config: OpenObserveConfig): OpenObserveJsonlStream
   return stream;
 }
 
-function createMirroredTimer(localTimer: ITimer, mirrorTimer: ITimer): ITimer {
+function createMirroredTimer(
+  localTimer: ITimer,
+  mirrorTimer: ITimer,
+  fatalMirrorTimer: ITimer,
+): ITimer {
   return {
     log(level, message, ...args) {
       if (level === "fatal") {
-        mirrorTimer.log(level, message, ...args);
+        fatalMirrorTimer.logError(message, ...args);
         localTimer.log(level, message, ...args);
         return;
       }
@@ -361,7 +683,7 @@ function createMirroredTimer(localTimer: ITimer, mirrorTimer: ITimer): ITimer {
       mirrorTimer.logError(message, ...args);
     },
     logFatal(message, ...args) {
-      mirrorTimer.logFatal(message, ...args);
+      fatalMirrorTimer.logError(message, ...args);
       localTimer.logFatal(message, ...args);
     },
     debug(message, ...args) {
@@ -381,7 +703,7 @@ function createMirroredTimer(localTimer: ITimer, mirrorTimer: ITimer): ITimer {
       mirrorTimer.error(message, ...args);
     },
     fatal(message, ...args) {
-      mirrorTimer.fatal(message, ...args);
+      fatalMirrorTimer.error(message, ...args);
       localTimer.fatal(message, ...args);
     },
   };
@@ -391,6 +713,7 @@ class MirroredLogger extends Logger {
   constructor(
     private readonly localLogger: Logger,
     private readonly mirrorLogger: Logger,
+    private readonly fatalMirrorLogger: Logger,
   ) {
     super({
       logLevel: "fatal",
@@ -399,7 +722,7 @@ class MirroredLogger extends Logger {
 
   override log(level: LogLevel, message: unknown, ...args: unknown[]): void {
     if (level === "fatal") {
-      this.mirrorLogger.log(level, message, ...args);
+      this.fatalMirrorLogger.logError(message, ...args);
       this.localLogger.log(level, message, ...args);
       return;
     }
@@ -429,7 +752,7 @@ class MirroredLogger extends Logger {
   }
 
   override logFatal(message: unknown, ...args: unknown[]): void {
-    this.mirrorLogger.logFatal(message, ...args);
+    this.fatalMirrorLogger.logError(message, ...args);
     this.localLogger.logFatal(message, ...args);
   }
 
@@ -454,7 +777,7 @@ class MirroredLogger extends Logger {
   }
 
   override fatal(message: unknown, ...args: unknown[]): void {
-    this.mirrorLogger.fatal(message, ...args);
+    this.fatalMirrorLogger.error(message, ...args);
     this.localLogger.fatal(message, ...args);
   }
 
@@ -466,10 +789,15 @@ class MirroredLogger extends Logger {
   override setModule(module: string): void {
     this.localLogger.setModule(module);
     this.mirrorLogger.setModule(module);
+    this.fatalMirrorLogger.setModule(module);
   }
 
   override timer(options?: TimerOptions): ITimer {
-    return createMirroredTimer(this.localLogger.timer(options), this.mirrorLogger.timer(options));
+    return createMirroredTimer(
+      this.localLogger.timer(options),
+      this.mirrorLogger.timer(options),
+      this.fatalMirrorLogger.timer(options),
+    );
   }
 }
 
@@ -506,6 +834,10 @@ export function createLogger(options: CreateLoggerOptions = {}): Logger {
     stderr: openObserveStream,
   };
   const mirrorLogger = new Logger(mirrorLoggerOptions);
+  const fatalMirrorLogger = new Logger({
+    ...mirrorLoggerOptions,
+    logLevel: "error",
+  });
 
-  return new MirroredLogger(localLogger, mirrorLogger);
+  return new MirroredLogger(localLogger, mirrorLogger, fatalMirrorLogger);
 }
